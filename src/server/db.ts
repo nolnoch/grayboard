@@ -352,7 +352,8 @@ export interface Repo {
     // Whether two users share any team: the human-reach rule's teammates, in one statement (A7e3).
     shareAny(r: Read, userA: number, userB: number): Promise<boolean>;
   };
-  // The writes return promises (#807 P3 A6d2); the reads stay synchronous until A7, as the alias reads do.
+  // Every read and write returns a promise (#807 P3 A6d2, A7i) but openDelegations: core's synchronous resolveDelegation
+  // calls it per candidate, so it is core's port until P3 forks core, as hostedHolds is.
   messages: {
     // files: unbound uploads (ids) of their uploader (the sending session's
     // address set, #284 PR 4 S5, and its user, #367), bound in the insert's
@@ -368,28 +369,28 @@ export interface Repo {
     ): Promise<MessageRow>;
     // The writer's signed-in user of each message and post that has one
     // recorded (rows from before F-10, bounces and system posts have none).
-    writerUsers(r: Read, messageIds: number[], postIds: number[]): { messages: Map<number, string>; posts: Map<number, string> };
+    writerUsers(r: Read, messageIds: number[], postIds: number[]): Promise<{ messages: Map<number, string>; posts: Map<number, string> }>;
     // Which of these messages `delegate` wrote: each has a delegation.requested row targeting its recipient (#256).
-    delegationIds(r: Read, messageIds: number[]): Set<number>;
+    delegationIds(r: Read, messageIds: number[]): Promise<Set<number>>;
     // The row alone, without its attachments: an access or ack check.
-    getById(r: Read, id: number): MessageRow | undefined;
+    getById(r: Read, id: number): Promise<MessageRow | undefined>;
     // The bounces an ended session's end sent (#284 decision 4): an ID ends once.
     // since: only an end's own bounces, made at or after its time (a reopened ID can end again, #475).
-    bouncesFrom(r: Read, id: string, since?: number): MessageRow[];
+    bouncesFrom(r: Read, id: string, since?: number): Promise<MessageRow[]>;
     // A session's direct messages, sent or received by any of its addresses
     // (#284 S8): with peer, only those between the set and peer.
-    history(r: Read, addresses: string[], peer?: string, limit?: number, beforeId?: number): MessageRow[];
-    thread(r: Read, id: number): MessageRow[];
-    unreadSince(r: Read, streams: { type: "direct" | "team"; ref: string; since: number }[]): MessageRow[];
+    history(r: Read, addresses: string[], peer?: string, limit?: number, beforeId?: number): Promise<MessageRow[]>;
+    thread(r: Read, id: number): Promise<MessageRow[]>;
+    unreadSince(r: Read, streams: { type: "direct" | "team"; ref: string; since: number }[]): Promise<MessageRow[]>;
     // Direct messages to each of recipients still past its cursor, sent by
     // someone else; recipients with none are absent.
-    queuedTo(r: Read, recipients: string[]): Map<string, number>;
+    queuedTo(r: Read, recipients: string[]): Promise<Map<string, number>>;
     // Direct messages from any of senders still past each recipient's cursor, per recipient.
-    undeliveredFrom(r: Read, senders: string[], olderThan?: number): { recipient: string; n: number; oldest_id: number }[];
+    undeliveredFrom(r: Read, senders: string[], olderThan?: number): Promise<{ recipient: string; n: number; oldest_id: number }[]>;
     // Direct messages to any of readers since `since` that their recipient hasn't acked, oldest first.
-    receivedUnacked(r: Read, readers: string[], since: number): MessageRow[];
+    receivedUnacked(r: Read, readers: string[], since: number): Promise<MessageRow[]>;
     // Direct messages from any of senders since `since` sent pending and not acked by their sender, oldest first.
-    sentPending(r: Read, senders: string[], since: number): MessageRow[];
+    sentPending(r: Read, senders: string[], since: number): Promise<MessageRow[]>;
     ack(tx: Tx, reader: string, id: number): Promise<void>;
     // A launcher's delegation requests since `since` it hasn't taken (#252, countOpenDelegations).
     openDelegations(r: Read, launcher: string, since: number): number;
@@ -432,9 +433,9 @@ export interface Repo {
   };
   slack: {
     links(r: Read): Promise<SlackLink[]>;
-    // Synchronous for now (#807 P3 A6b): core's delegation fallback calls it. application.helloFacts reads it on the
-    // caller's handle.
-    linkFor(r: Read, userId: number): SlackLink | undefined;
+    // application.helloFacts reads it on the caller's handle; delegate reads it before core's synchronous
+    // resolveDelegation runs (#807 P3 A7i).
+    linkFor(r: Read, userId: number): Promise<SlackLink | undefined>;
     linkBySlackUser(r: Read, slackUser: string): Promise<SlackLink | undefined>;
     // Replaces the user's earlier link, if any.
     link(tx: Tx, userId: number, slackUser: string, dmChannel: string): Promise<void>;
@@ -1438,11 +1439,11 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
           return attachments.length ? { ...row, attachments } : row;
         })();
       },
-      getById(r, id) {
+      async getById(r, id) {
         const c = sqliteOf(r);
         return c.query<MessageRow, [number]>(`SELECT ${MSG_COLS} FROM messages WHERE id = ?`).get(id) ?? undefined;
       },
-      writerUsers(r, messageIds, postIds) {
+      async writerUsers(r, messageIds, postIds) {
         const c = sqliteOf(r);
         const pairs = (table: "messages" | "posts", column: "sender_user" | "author_user", ids: number[]) => new Map(ids.length === 0 ? [] :
           c.query<{ id: number; user: string }, [string]>(`SELECT id, ${column} AS user FROM ${table} WHERE id IN (SELECT value FROM json_each(?)) AND ${column} IS NOT NULL`)
@@ -1457,7 +1458,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       // a slow transaction or a clock step. CROSS JOIN fixes the order
       // (messages first), so the planner can't drive from access_log by
       // action alone.
-      delegationIds(r, messageIds) {
+      async delegationIds(r, messageIds) {
         const c = sqliteOf(r);
         return new Set(c.query<{ id: number }, [string]>(
           `SELECT m.id FROM messages m
@@ -1467,11 +1468,11 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
            WHERE m.id IN (SELECT value FROM json_each(?))`,
         ).all(JSON.stringify(messageIds)).map((r) => r.id));
       },
-      bouncesFrom(r, id, since = 0) {
+      async bouncesFrom(r, id, since = 0) {
         const c = sqliteOf(r);
         return c.query<MessageRow, [string, number]>(`SELECT ${MSG_COLS} FROM messages WHERE sender = ? AND kind = 'bounce' AND created_at >= ? ORDER BY id`).all(id, since);
       },
-      history(r, addresses, peer, limit = 20, beforeId) {
+      async history(r, addresses, peer, limit = 20, beforeId) {
         const c = sqliteOf(r);
         const set = JSON.stringify(addresses);
         const before = beforeId ?? Number.MAX_SAFE_INTEGER;
@@ -1494,7 +1495,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
         ).all(set, before, cap));
       },
       // The whole thread containing message `id`: walk up to its root, then down.
-      thread(r, id) {
+      async thread(r, id) {
         const c = sqliteOf(r);
         return att(c, c.query<MessageRow, [number]>(`
           WITH RECURSIVE up(id, parent_id) AS (
@@ -1510,7 +1511,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
           SELECT ${M_MSG_COLS} FROM messages m JOIN tree t ON m.id = t.id ORDER BY m.id ASC
         `).all(id));
       },
-      unreadSince(r, streams) {
+      async unreadSince(r, streams) {
         const c = sqliteOf(r);
         if (streams.length === 0) return [];
         const all: MessageRow[] = [];
@@ -1524,20 +1525,20 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
         all.sort((a, b) => a.id - b.id);
         return att(c, all);
       },
-      queuedTo(r, recipients) {
+      async queuedTo(r, recipients) {
         const c = sqliteOf(r);
         const rows = c.query<{ recipient: string; n: number }, [string]>(
           QUEUED_TO_SQL,
         ).all(JSON.stringify(recipients));
         return new Map(rows.map((r) => [r.recipient, r.n]));
       },
-      undeliveredFrom(r, senders, olderThan = Number.MAX_SAFE_INTEGER) {
+      async undeliveredFrom(r, senders, olderThan = Number.MAX_SAFE_INTEGER) {
         const c = sqliteOf(r);
         return c.query<{ recipient: string; n: number; oldest_id: number }, [string, number]>(
           UNDELIVERED_FROM_SQL,
         ).all(JSON.stringify(senders), olderThan);
       },
-      receivedUnacked(r, readers, since) {
+      async receivedUnacked(r, readers, since) {
         const c = sqliteOf(r);
         return att(c, c.query<MessageRow, [string, number]>(
           `SELECT ${M_MSG_COLS} FROM messages m
@@ -1546,7 +1547,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
             ORDER BY m.id ASC`,
         ).all(JSON.stringify(readers), since));
       },
-      sentPending(r, senders, since) {
+      async sentPending(r, senders, since) {
         const c = sqliteOf(r);
         return att(c, c.query<MessageRow, [string, number]>(
           SENT_PENDING_SQL,
@@ -1649,7 +1650,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
           "SELECT l.*, u.email FROM slack_links l JOIN users u ON u.id = l.user_id ORDER BY l.user_id",
         ).all();
       },
-      linkFor(r, userId) {
+      async linkFor(r, userId) {
         const db = sqliteOf(r);
         return db.query<SlackLink, [number]>(
           "SELECT l.*, u.email FROM slack_links l JOIN users u ON u.id = l.user_id WHERE l.user_id = ?",

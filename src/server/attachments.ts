@@ -15,12 +15,17 @@ import { decidePure, recordDecision, type Actor, type PureRequest } from "./poli
 // null for the Slack bridge's humans, which have no session. `user` is the
 // reading user's email, always set on a server: an unsent upload is readable
 // only by the user who made it, not by whoever holds its address next (#367).
-function readRequest(repo: Repo, r: Read, handle: string, idText: string, principal: string | null, user: string) {
+// The carrying message is read before core's synchronous attachmentReach asks about it (#807 P3 A7i).
+async function readRequest(repo: Repo, r: Read, handle: string, idText: string, principal: string | null, user: string) {
   const db = repo.coreOn(r);
   const id = Number(idText);
   const row = Number.isInteger(id) && id > 0 ? getAttachment(db, id) : undefined;
   const addresses = addressSet(db, handle, principal);
-  const dmVisible = (messageId: number) => participant(repo.messages.getById(r, messageId), addresses);
+  const carrier = row?.message_id != null ? await repo.messages.getById(r, row.message_id) : undefined;
+  const dmVisible = (messageId: number) => {
+    if (messageId !== row?.message_id) throw new Error(`readRequest: message ${messageId} is not the attachment's carrier`);
+    return participant(carrier, addresses);
+  };
   const req: PureRequest = { verb: "attachment.read", identity: handle, attachment: idText.slice(0, 32), reach: row && attachmentReach(db, handle, row, dmVisible, { addresses, principal: user }) };
   return { row, req };
 }
@@ -29,8 +34,8 @@ function readRequest(repo: Repo, r: Read, handle: string, idText: string, princi
 // its `attachment.download_refused` row and an `authz.decision` row (security audit F-01, #851). `detail` joins the
 // first. `r` is the caller's handle: `repo.read` for the download's first read and the Slack bridge's, the recheck body's `Tx`
 // inside it. `writeAudit` joins an open transaction and queues otherwise, so neither row needs deferring.
-export function requestAttachment(repo: Repo, r: Read, handle: string, idText: string, principal: string | null, actor: Actor & { user: string }, detail: Record<string, unknown> = {}): { row: AttachmentRow } | { refused: string } {
-  const { row, req } = readRequest(repo, r, handle, idText, principal, actor.user);
+export async function requestAttachment(repo: Repo, r: Read, handle: string, idText: string, principal: string | null, actor: Actor & { user: string }, detail: Record<string, unknown> = {}): Promise<{ row: AttachmentRow } | { refused: string }> {
+  const { row, req } = await readRequest(repo, r, handle, idText, principal, actor.user);
   const d = decidePure({}, req);
   // An allow has a row: the rule refuses an attachment that doesn't exist.
   if (d.allow) return { row: row! };

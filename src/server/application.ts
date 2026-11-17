@@ -270,7 +270,7 @@ async function drainDirect(hub: Hub, session: ApplicationSession, addresses: str
   d.runs++;
   const run = d.chain.then(async () => {
     const streams = await Promise.all(addresses.map(async (a) => ({ type: "direct" as const, ref: a, since: await hub.repo.cursors.get(hub.repo.read, a, "direct", a) })));
-    const unread = hub.repo.messages.unreadSince(hub.repo.read, streams);
+    const unread = await hub.repo.messages.unreadSince(hub.repo.read, streams);
     await testPauseAsync("server:drain:after-read");
     for (const message of unread) {
       if (!session.active) return;
@@ -359,7 +359,7 @@ export type HelloFacts = { teams: string[]; linked: boolean };
 async function helloFacts(hub: Hub, authed: AuthedUser, r: Read): Promise<HelloFacts> {
   const { repo } = hub;
   const teams = (await repo.teams.listForUser(r, authed.user_id)).map((t) => formatTeamAddress(t.name));
-  return { teams, linked: !!repo.slack.linkFor(r, authed.user_id) };
+  return { teams, linked: !!(await repo.slack.linkFor(r, authed.user_id)) };
 }
 // Reads nothing: whether the bridge runs is in memory, read when the fields are built.
 function helloFields(hub: Hub, authed: AuthedUser, f: HelloFacts): SessionFacts {
@@ -373,10 +373,10 @@ function helloFields(hub: Hub, authed: AuthedUser, f: HelloFacts): SessionFacts 
 
 // The sentences a session's instructions carry for its addresses: active
 // claims, and direct messages it sent that still haven't arrived a day later.
-function noticesFor(hub: Hub, r: Read, addresses: string[], first: string[] = []): string[] {
+async function noticesFor(hub: Hub, r: Read, addresses: string[], first: string[] = []): Promise<string[]> {
   return [
     ...first,
-    ...undeliveredInstruction(hub.repo.messages.undeliveredFrom(r, addresses, hub.now() - STALE_UNDELIVERED_MS), (h) => lastSeen(hub.repo.coreOn(r), h)),
+    ...undeliveredInstruction(await hub.repo.messages.undeliveredFrom(r, addresses, hub.now() - STALE_UNDELIVERED_MS), (h) => lastSeen(hub.repo.coreOn(r), h)),
     // Last, as the plugin appends notices: the longest, so the one a cut takes.
     ...claimsInstruction(listClaims(hub.repo.coreOn(r)), addresses),
   ];
@@ -675,13 +675,21 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
   }
   // What follows ends, after their commit: a bounce goes to a live sender now, as a send does (a drain would
   // resend that session's unacked messages too), the woken handles drain, and the freed upload bytes go.
+  // The bounce reads await (#807 P3 A7i), so this runs on after its caller returns, in the same order: bounces, then
+  // the wake and the sweep, which run even when a bounce read fails (its senders get the bounce on their next drain).
   function afterEnds(woken: Set<string>, ends: { id: string; at: number }[]): void {
-    for (const { id, at } of ends) for (const b of repo.messages.bouncesFrom(repo.read, id, at)) {
-      const to = hub.registry.get(b.recipient);
-      if (to) deliverDirect(to, b);
-    }
-    wake(hub, onCommit(repo.read), [...woken]);
-    void sweepBlobs(repo.coreOn(repo.read), repo.blobs, queuedTx(repo));
+    void (async () => {
+      try {
+        for (const { id, at } of ends) for (const b of await repo.messages.bouncesFrom(repo.read, id, at)) {
+          const to = hub.registry.get(b.recipient);
+          if (to) deliverDirect(to, b);
+        }
+      } catch (error) {
+        console.error("[grayboard] delivering an end's bounces failed:", error);
+      }
+      wake(hub, onCommit(repo.read), [...woken]);
+      void sweepBlobs(repo.coreOn(repo.read), repo.blobs, queuedTx(repo));
+    })();
   }
   // The hosted store ends a released child's ID in the release's transaction (#475 item 1); this runs its
   // after-commit half for every hosted commit, whichever path released it.
@@ -798,11 +806,11 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
   // Its alias, audit and binding row commit in one transaction through the write queue (#807 D4); the registry
   // changes after the commit, so a rolled-back attach leaves an earlier connection in place. `current` runs inside
   // that transaction: the bridge's checks went stale while the write waited (an unlink or stop queued ahead of it).
-  async function attachHuman(authed: AuthedUser, sink: DeliverySink, current?: (tx: Tx) => string | null): Promise<{ session: ApplicationSession; ok: HelloResult }> {
+  async function attachHuman(authed: AuthedUser, sink: DeliverySink, current?: (tx: Tx) => string | null | Promise<string | null>): Promise<{ session: ApplicationSession; ok: HelloResult }> {
     const addr = `${authed.user_email}/${HUMAN_NAME}`;
     return repo.write(async tx => {
       if ((await repo.users.findById(tx, authed.user_id))?.disabled_at != null) fail("unauthenticated", "session is closed");
-      const stale = current?.(tx);
+      const stale = await current?.(tx);
       if (stale) fail("unauthenticated", stale);
       if (!(await repo.aliases.find(tx, addr))) {
         await repo.aliases.create(tx, { scope_kind: "person", scope_ref: authed.user_email, name: HUMAN_NAME }, authed.user_email);
@@ -812,7 +820,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
       // Read in the body, on its Tx, for the hello the committed callback builds (#807 P3 A7g).
       const hello = await helloFacts(hub, authed, tx);
       // Again after the awaits (#807 P3 A7f3 audit): a stop outside the write queue lands meanwhile; the throw rolls the create back.
-      const late = current?.(tx);
+      const late = await current?.(tx);
       if (late) fail("unauthenticated", late);
       touchAlias(repo.coreOn(tx), addr);
       logBinding(repo.coreOn(tx), HUMAN_NAME, addr, "bound");
@@ -925,7 +933,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     setHolds(hub, session, holdsOf(repo.coreOn(tx), id));
     // The first bind of a user's session after the bridge died carries the death notice, once.
     const owed = await owedBridgeNotice(repo, tx, authed.user_email);
-    const notices = noticesFor(hub, tx, session.addresses, owed ? [owed] : []);
+    const notices = await noticesFor(hub, tx, session.addresses, owed ? [owed] : []);
     return { alias: address, held: [...session.holds], ...(notices.length ? { notices } : {}) };
   }
 
@@ -1174,7 +1182,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
       await valid(session, false, r);
       if (!Number.isInteger(limit) || limit < 1 || limit > 100) fail("bad_request", "invalid pending limit");
       const streams = await Promise.all(session.addresses.map(async (a) => ({ type: "direct" as const, ref: a, since: await repo.cursors.get(r, a, "direct", a) })));
-      const messages = repo.messages.unreadSince(r, streams).slice(0, limit);
+      const messages = (await repo.messages.unreadSince(r, streams)).slice(0, limit);
       const seen = new Set<string>();
       const all: Pending[] = [];
       for (const a of session.addresses) {
@@ -1244,7 +1252,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     async acknowledgeDm(tx: Tx, session: ApplicationSession, id: number) {
       await valid(session, false, tx);
       childState(session, "dm_ack");
-      const m = repo.messages.getById(tx, id), mine = session.addresses;
+      const m = await repo.messages.getById(tx, id), mine = session.addresses;
       const reader = !m || m.recipient_type !== "user" ? null
         : mine.includes(m.recipient) ? m.recipient
         : m.pending && mine.includes(m.sender) ? m.sender
@@ -1345,7 +1353,7 @@ async function candidates(hub: Hub, r: Read, authed: AuthedUser, suggestedInput:
   const seen = await repo.aliases.seen(r, all.map(full));
   const free = (n: string) => n !== HUMAN_NAME && holderOf(repo.coreOn(r), full(n)) === null;
   const names = all.filter(free);
-  const queued = repo.messages.queuedTo(r, names.map(full));
+  const queued = await repo.messages.queuedTo(r, names.map(full));
   const claims = new Map<string, number>();
   for (const c of listClaims(repo.coreOn(r))) claims.set(c.holder, (claims.get(c.holder) ?? 0) + 1);
   const suggested = suggestedInput !== null && free(suggestedInput) ? suggestedInput : null;
@@ -1445,7 +1453,7 @@ type PreparedSend = { from: string; to: string; body: string; parentId: number |
 // The address a send goes out as: `as` when given (#284 S3), else for a
 // reply the held alias its parent reached or was sent as (S4), else the
 // primary.
-function sendAs(hub: Hub, r: Read, session: ApplicationSession, as: string | undefined, parentId: number | null): string {
+async function sendAs(hub: Hub, r: Read, session: ApplicationSession, as: string | undefined, parentId: number | null): Promise<string> {
   if (as !== undefined) {
     try {
       return actingAs(as, asAddresses(session), session.authed.user_email);
@@ -1454,7 +1462,7 @@ function sendAs(hub: Hub, r: Read, session: ApplicationSession, as: string | und
       throw e;
     }
   }
-  const parent = parentId === null ? undefined : hub.repo.messages.getById(r, parentId);
+  const parent = parentId === null ? undefined : await hub.repo.messages.getById(r, parentId);
   return (parent && participant(parent, session.addresses) ? replySender(parent, session.holds) : null) ?? session.primary;
 }
 
@@ -1482,12 +1490,12 @@ async function prepareSend(
   // An ID's deliverability is checked in the write's transaction (writeSend).
   // A team's alias the sender may not see reads as one nobody has (#1014), unless this replies in a thread with it:
   // a handle that wrote to you is one you may answer.
-  const replyingTo = (address: string) => {
+  const replyingTo = async (address: string) => {
     if (parentId === null) return false;
-    const parent = repo.messages.getById(r, parentId);
+    const parent = await repo.messages.getById(r, parentId);
     return participant(parent, session.addresses) && replyPeer(parent, session.addresses) === address;
   };
-  if (to.kind === "alias" && (!(await repo.aliases.find(r, to.address)) || ((await teamAliasHidden(repo, r, session.sessionId || from, to.address)) && !replyingTo(to.address)))) {
+  if (to.kind === "alias" && (!(await repo.aliases.find(r, to.address)) || ((await teamAliasHidden(repo, r, session.sessionId || from, to.address)) && !(await replyingTo(to.address))))) {
     fail("not_found", `identity "${to.address}" not found; peer_list shows exact handles`);
   }
   const req: AuthzRequest = { verb: "msg.send", from, to: to.address };
@@ -1498,7 +1506,7 @@ async function prepareSend(
   }
 
   if (parentId !== null) {
-    const parent = repo.messages.getById(r, parentId);
+    const parent = await repo.messages.getById(r, parentId);
     if (!participant(parent, session.addresses)) fail("not_found", `parent_id ${parentId} is not a message you sent or received`);
     const peer = replyPeer(parent, session.addresses);
     if (to.address !== peer) fail("bad_request", replyPeerError(parentId, peer));
@@ -1543,7 +1551,7 @@ async function writeSend(hub: Hub, tx: Tx, session: ApplicationSession, p: Prepa
         delivered_now: false,
         ...f,
         ...(seen ? { recipient_last_seen: `${age(hub.now() - seen)} ago` } : {}),
-        undelivered_from_you: repo.messages.undeliveredFrom(tx, session.addresses).find((u) => u.recipient === p.to)?.n ?? 1,
+        undelivered_from_you: (await repo.messages.undeliveredFrom(tx, session.addresses)).find((u) => u.recipient === p.to)?.n ?? 1,
         note: queuedNote(p.to, seen),
         ...wake,
       };
@@ -1616,7 +1624,7 @@ async function writeOnce<W extends Written>(
 async function handleSend(
   hub: Hub, tx: Tx, session: ApplicationSession, recipient: string, body: string, parentId: number | null, pending: boolean, ids: unknown, resend: boolean, as: string | undefined,
 ): Promise<SendResult> {
-  const p = await prepareSend(hub, tx, session, sendAs(hub, tx, session, as, parentId), recipient, body, parentId, pending, ids);
+  const p = await prepareSend(hub, tx, session, await sendAs(hub, tx, session, as, parentId), recipient, body, parentId, pending, ids);
   // Keyed by what the server resolved, so two spellings of one call collide.
   const args = { to: p.to, body: p.body, parent_id: p.parentId, pending: p.pending, attachments: p.digests };
   const out = await writeOnce(hub, tx, session, "dm_send", p.from, args, resend, p.ids, sp => writeSend(hub, sp, session, p));
@@ -1654,8 +1662,10 @@ async function handleDelegate(hub: Hub, tx: Tx, session: ApplicationSession, m: 
   const online = (h: string) => hub.registry.get(h)?.active === true;
   // The human fallback's reachability is the server's own knowledge: the
   // bridge is running and this user is linked (#191).
-  // On `h`: the dedup savepoint's Tx where the call runs inside it (the caller's refuses statements while it's open).
-  const humanReachable = (h: Tx) => () => hub.slackRunning() && !!repo.slack.linkFor(h, authed.user_id);
+  // The link is read on `h` before core's synchronous resolveDelegation runs (#807 P3 A7i): `h` is the dedup
+  // savepoint's Tx where the call runs inside it (the caller's refuses statements while it's open). Whether the bridge
+  // runs is in memory, read when core asks.
+  const humanReachable = async (h: Tx) => { const linked = !!(await repo.slack.linkFor(h, authed.user_id)); return () => hub.slackRunning() && linked; };
   const args = { to: to ?? null, persona: m.persona, task: m.task, context: m.context ?? null };
   // Where a refused send was headed, for its audit row.
   let picked: string | undefined;
@@ -1718,7 +1728,7 @@ async function handleDelegate(hub: Hub, tx: Tx, session: ApplicationSession, m: 
         if (pre === undefined || t !== to) throw new Error(`delegate: reach for an address not decided first ("${t}")`);
         return emit(sp, pre);
       };
-      const d = resolveDelegation(repo.coreOn(sp), session.primary, authed.user_email, { ...m, to }, online, humanReachable(sp), (h) => session.addresses.includes(h), open(sp), hub.delegateOpenCap, reach);
+      const d = resolveDelegation(repo.coreOn(sp), session.primary, authed.user_email, { ...m, to }, online, await humanReachable(sp), (h) => session.addresses.includes(h), open(sp), hub.delegateOpenCap, reach);
       picked = d.to;
       const w = await writeSend(hub, sp, session, await prepareSend(hub, sp, session, session.primary, d.to, d.body, null, true, undefined));
       const payload: DelegateResult = { ...w.payload, ...delegateOkFields(d, w.payload) };
@@ -1783,7 +1793,7 @@ async function handleDelegate(hub: Hub, tx: Tx, session: ApplicationSession, m: 
 async function handleRetract(hub: Hub, tx: Tx, session: ApplicationSession, id: number): Promise<{ note?: string }> {
   const { repo, registry } = hub;
   const mine = session.addresses;
-  const m = repo.messages.getById(tx, id);
+  const m = await repo.messages.getById(tx, id);
   if (!m) {
     const done = await repo.audit.last(tx, "message.retracted", `message:${id}`);
     const by = done?.detail ? (JSON.parse(done.detail) as { sender?: string }).sender : undefined;
@@ -1905,7 +1915,7 @@ type WriterMark = { other_user?: true; ungranted?: true; delegated?: true };
 // Decided up front (#807 P3 A7f2), one await per (verb, writer): msg.wake for every foreign writer, delegate.to for
 // the writers of delegation requests; the marks are then read synchronously.
 async function writerMarks(repo: Repo, r: Read, session: ApplicationSession, messageIds: number[], postIds: number[]) {
-  const writers = repo.messages.writerUsers(r, messageIds, postIds);
+  const writers = await repo.messages.writerUsers(r, messageIds, postIds);
   const me = session.authed.user_email;
   const decided = new Map<string, boolean>();
   const settle = async (verb: "msg.wake" | "delegate.to", user: string) => {
@@ -1914,7 +1924,7 @@ async function writerMarks(repo: Repo, r: Read, session: ApplicationSession, mes
   };
   const may = (verb: "msg.wake" | "delegate.to", user: string) => decided.get(`${verb} ${user}`)!;
   const foreign = messageIds.filter((id) => { const u = writers.messages.get(id); return u !== undefined && u !== me; });
-  const delegations = foreign.length ? repo.messages.delegationIds(r, foreign) : new Set<number>();
+  const delegations = foreign.length ? await repo.messages.delegationIds(r, foreign) : new Set<number>();
   for (const u of new Set([...writers.messages.values(), ...writers.posts.values()])) if (u !== undefined && u !== me) await settle("msg.wake", u);
   for (const id of delegations) await settle("delegate.to", writers.messages.get(id)!);
   const mark = (user: string | undefined, judged: boolean): WriterMark =>
@@ -1939,7 +1949,7 @@ async function handleHistory(hub: Hub, r: Read, session: ApplicationSession, pee
   const peerFull = peer ? (await resolvePeer(repo, r, session.primary, peer, session.sessionId || session.primary)).address : undefined;
   const mine = session.addresses;
   // Newest `lim` before beforeId, shown oldest first as in local mode.
-  const rows = repo.messages.history(r, mine, peerFull, lim, beforeId).reverse();
+  const rows = (await repo.messages.history(r, mine, peerFull, lim, beforeId)).reverse();
   const sent = (m: MessageRow) => mine.includes(m.sender) && m.recipient_type === "user" && !mine.includes(m.recipient);
   // The cursor of each recipient a sent, unstamped message needs, read once before the rows are shaped (#807 P3 A6a).
   const unstamped = [...new Set(rows.filter((m) => sent(m) && m.delivered_at === null).map((m) => m.recipient))];
@@ -1960,9 +1970,11 @@ async function handleInbox(hub: Hub, r: Read, session: ApplicationSession, days:
   } catch (e) {
     return fail("bad_request", (e as Error).message);
   }
-  const owed = unanswered(mine, repo.messages.receivedUnacked(r, mine, since), (id) => repo.messages.thread(r, id), session.primary);
-  const promises = promised(mine, repo.messages.sentPending(r, mine, hub.now() - PROMISE_DAYS * 86_400_000), (id) => repo.messages.thread(r, id));
-  const queued = repo.messages.undeliveredFrom(r, mine).map((u) => {
+  const received = await repo.messages.receivedUnacked(r, mine, since);
+  const owed = unanswered(mine, received, await threadsOf(repo, r, received), session.primary);
+  const sentPending = await repo.messages.sentPending(r, mine, hub.now() - PROMISE_DAYS * 86_400_000);
+  const promises = promised(mine, sentPending, await threadsOf(repo, r, sentPending));
+  const queued = (await repo.messages.undeliveredFrom(r, mine)).map((u) => {
     const seen = lastSeen(repo.coreOn(r), u.recipient);
     return { to: u.recipient, n: u.n, oldest_id: u.oldest_id, ...(seen ? { last_seen: `${age(hub.now() - seen)} ago` } : {}) };
   });
@@ -1974,10 +1986,26 @@ async function handleInbox(hub: Hub, r: Read, session: ApplicationSession, days:
   };
 }
 
+// The threads of `rows`, read before the shared inbox helpers ask for them synchronously (#807 P3 A7i): one read per
+// thread, as their own memo makes, since a thread's members share the rows read for the first of them.
+async function threadsOf(repo: Repo, r: Read, rows: MessageRow[]): Promise<(id: number) => MessageRow[]> {
+  const byId = new Map<number, MessageRow[]>();
+  for (const m of rows) {
+    if (byId.has(m.id)) continue;
+    const t = await repo.messages.thread(r, m.id);
+    for (const x of t) byId.set(x.id, t);
+  }
+  return (id) => {
+    const t = byId.get(id);
+    if (t === undefined) throw new Error(`threadsOf: message ${id}'s thread was not read first`);
+    return t;
+  };
+}
+
 async function handleThread(r: Read, session: ApplicationSession, messageId: number, repo: Repo): Promise<DirectMessage[]> {
   const mine = (m: MessageRow | undefined): m is MessageRow => participant(m, session.addresses);
-  if (!mine(repo.messages.getById(r, messageId))) fail("not_found", `message ${messageId} not found`);
-  const rows = repo.messages.thread(r, messageId).filter(mine);
+  if (!mine(await repo.messages.getById(r, messageId))) fail("not_found", `message ${messageId} not found`);
+  const rows = (await repo.messages.thread(r, messageId)).filter(mine);
   const marks = await writerMarks(repo, r, session, rows.map((m) => m.id), []);
   return rows.map((m) => ({ ...showMessage(m), ...marks.message(m.id) }));
 }
@@ -1987,7 +2015,7 @@ async function handleThread(r: Read, session: ApplicationSession, messageId: num
 // address's cursor; only your own direct messages count (S8).
 async function handleAck(tx: Tx, session: ApplicationSession, messageIds: number[], repo: Repo, at: number | null): Promise<void> {
   for (const msgId of messageIds) {
-    const msg = repo.messages.getById(tx, msgId);
+    const msg = await repo.messages.getById(tx, msgId);
     if (!msg || msg.recipient_type !== "user" || !session.addresses.includes(msg.recipient)) continue;
     if (at !== null) await repo.messages.markDelivered(tx, msgId, at);
     await repo.cursors.advance(tx, msg.recipient, "direct", msg.recipient, msgId);

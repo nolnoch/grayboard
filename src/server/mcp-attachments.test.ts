@@ -149,7 +149,7 @@ test("#807 P1c-14b: a download's message read runs on the pool, its recheck on t
   const checks: { inTxn: boolean; handle: "pool" | "tx" }[] = [];
   const original = store.repo.messages.getById.bind(store.repo.messages);
   const spy = spyOn(store.repo.messages, "getById").mockImplementation((r, messageId) => {
-    if (new Error().stack?.includes("dmVisible")) checks.push({ inTxn: store.db.inTransaction, handle: r === store.repo.read ? "pool" : "tx" });
+    if (new Error().stack?.includes("readRequest")) checks.push({ inTxn: store.db.inTransaction, handle: r === store.repo.read ? "pool" : "tx" });
     return original(r, messageId);
   });
   try {
