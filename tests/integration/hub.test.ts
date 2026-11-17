@@ -199,7 +199,7 @@ test("revoking or disabling a user closes their open connections; a disable the 
   // Disabled behind the server's back (no admin route): the next tick closes it.
   await api(root, "POST", "/api/admin/enable-user", { email: B });
   const late = await srv.connected(await login(B), "be3");
-  await seed(srv.app.repo, tx => srv.app.repo.users.setDisabled(tx, srv.app.repo.users.findByEmail(B)!.id, true));
+  await seed(srv.app.repo, async tx => srv.app.repo.users.setDisabled(tx, (await srv.app.repo.users.findByEmail(tx, B))!.id, true));
   await srv.app.revalidate();
   await late.next(closed);
   await a.call("board_list");

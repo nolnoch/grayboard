@@ -25,14 +25,17 @@ test("no source file outside policy.ts calls a pre-seam rule helper", () => {
 // The synchronous loader is SQLite-only (#807 P3 A7e1): every `authorizeNow`, `policyNow` and hand-driven `decide(`
 // outside tests is a caller #807 A7f/B must convert to the async `authorize`, so their count only falls. The table is
 // exact: a new use fails until it's argued for, and a removed one fails until its row is lowered, so a freed slot
-// can't be reused.
+// can't be reused. A7e3 raised application.ts, http.ts and teams.ts once: the store's team, principal and user reads
+// went async, and their synchronous callers that can't await yet (team guards, helloOkFields, onAliasCreated, bindTarget,
+// recheckAliases, healthz, the roster beside its guard) moved to policyNow. policy.ts counts its drivers' `decide(`.
 const SYNC_TWIN = /\bauthorizeNow\b|\bpolicyNow\b|\bdecide\(/g;
 const SYNC_TWIN_CEILING: Record<string, number> = {
   "src/server/access.ts": 16,
-  "src/server/application.ts": 13,
+  "src/server/application.ts": 16,
   "src/server/db.ts": 2,
-  "src/server/http.ts": 7,
-  "src/server/policy.ts": 8,
+  "src/server/http.ts": 12,
+  "src/server/policy.ts": 9,
+  "src/server/teams.ts": 2,
 };
 
 test("the synchronous policy loader gains no callers", () => {

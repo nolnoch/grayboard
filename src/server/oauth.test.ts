@@ -588,7 +588,7 @@ test("a disabled user is refused at the callback back to the client, and audited
     return callbackOutcome(await browser.request(base + "/oauth/google/callback?" + new URLSearchParams({ state, code: "fake-google-code" })), a);
   };
   expect(await signIn()).toBe("consent");
-  const user = storage.repo.users.findByEmail("you@example.com")!;
+  const user = (await storage.repo.users.findByEmail(storage.repo.read, "you@example.com"))!;
   await seed(storage.repo, () => storage.db.run("UPDATE users SET disabled_at = ? WHERE id = ?", [clock, user.id]));
   expect(await signIn()).toBe(REFUSED.disabled);
   expect(accessAudits(storage.db, "oauth.user_refused")).toEqual([expect.objectContaining({ actor: "you@example.com", detail: { client_id: "native" } })]);
@@ -611,7 +611,7 @@ test("a Google account presenting a linked user's email is refused at the callba
     { action: "auth.subject_refused", actor: "you@example.com", detail: JSON.stringify({ reason: "subject_mismatch", provider: "google", issuer: GOOGLE_ISSUER, client_id: "native" }) },
   ]);
   expect(storage.db.query("SELECT COUNT(*) AS n FROM oauth_browsers").get()).toEqual({ n: 1 });
-  expect(storage.repo.users.findByEmail("you@example.com")!.idp_subject).toBe("google-first");
+  expect((await storage.repo.users.findByEmail(storage.repo.read, "you@example.com"))!.idp_subject).toBe("google-first");
 });
 
 // #928 D4: an email one IdP's account holds never signs in from another IdP, either way round, until an admin
@@ -629,7 +629,7 @@ for (const [first, second] of [["google", "okta"], ["okta", "google"]] as const)
     };
     const issuer = (idp: "google" | "okta") => idp === "okta" ? okta.issuer : GOOGLE_ISSUER;
     expect(await signIn(first)).toBe("consent");
-    expect(storage.repo.users.findByEmail("you@example.com")).toMatchObject({ idp_issuer: issuer(first), idp_subject: first + "-you" });
+    expect((await storage.repo.users.findByEmail(storage.repo.read, "you@example.com"))).toMatchObject({ idp_issuer: issuer(first), idp_subject: first + "-you" });
     // The CLI prints this. This server lists only the second provider, so the holder goes unnamed (its issuer may be an
     // org's own host); the text names the person's email, the provider and the admin's remedy, nothing else.
     const label = second === "okta" ? "Okta" : "Google";
@@ -638,9 +638,9 @@ for (const [first, second] of [["google", "okta"], ["okta", "google"]] as const)
     expect(accessAudits(storage.db, "auth.subject_refused").map(r => [r.actor, r.detail])).toEqual([
       ["you@example.com", { reason: "issuer_mismatch", holding_issuer: issuer(first), provider: second, issuer: issuer(second), client_id: "native" }],
     ]);
-    await storage.repo.write(tx => storage.repo.users.clearSubject(tx, storage.repo.users.findByEmail("you@example.com")!.id));
+    await storage.repo.write(async tx => storage.repo.users.clearSubject(tx, (await storage.repo.users.findByEmail(tx, "you@example.com"))!.id));
     expect(await signIn(second)).toBe("consent");
-    expect(storage.repo.users.findByEmail("you@example.com")).toMatchObject({ idp_issuer: issuer(second), idp_subject: second + "-you" });
+    expect((await storage.repo.users.findByEmail(storage.repo.read, "you@example.com"))).toMatchObject({ idp_issuer: issuer(second), idp_subject: second + "-you" });
     expect(storage.db.query("SELECT COUNT(*) AS n FROM oauth_browsers").get()).toEqual({ n: 2 });
   });
 }
@@ -1534,7 +1534,7 @@ test("a login code is refused with a wrong verifier, redirect or client, and for
     expect(await r.json()).toEqual({ error: "invalid_grant" });
   }
   // None of those spent it; a disabled user's still can't redeem it (the row is kept to exercise the check).
-  const user = storage.repo.users.findByEmail("you@example.com")!;
+  const user = (await storage.repo.users.findByEmail(storage.repo.read, "you@example.com"))!;
   await seed(storage.repo, () => storage.db.run("UPDATE users SET disabled_at = ? WHERE id = ?", [clock, user.id]));
   expect((await post("/oauth/token", cliTokenParams(a))).status).toBe(400);
   await seed(storage.repo, () => storage.db.run("UPDATE users SET disabled_at = NULL WHERE id = ?", [user.id]));
@@ -1551,7 +1551,7 @@ test("the grayboard-cli cutover revokes earlier grants and pending codes under i
   await seed(storage.repo, () => storage.db.run("DELETE FROM server_state WHERE key = 'builtin_clients_cli'"));
   const old = await issueOAuth(storage.repo, service.resource, "op@example.com", ["grayboard:tools"], clock, CLI_CLIENT_ID);
   const other = await issueOAuth(storage.repo, service.resource, "op@example.com", ["grayboard:tools"], clock, "native");
-  const user = storage.repo.users.findByEmail("op@example.com")!;
+  const user = (await storage.repo.users.findByEmail(storage.repo.read, "op@example.com"))!;
   const pending = (clientId: string) => seed(storage.repo, () => storage.db.run("INSERT INTO oauth_codes(hash, user_id, expires_at, data) VALUES (?, ?, ?, ?)",
     [hashToken(random()), user.id, clock + OAUTH_TTL.code, JSON.stringify({ clientId, resource: service.resource, scopes: ["grayboard:tools"], redirectUri: "http://127.0.0.1/callback", codeChallenge: random() })]));
   await pending(CLI_CLIENT_ID); await pending("native");

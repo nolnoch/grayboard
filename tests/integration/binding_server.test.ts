@@ -700,7 +700,7 @@ test("the bridge's human connection binds and unbinds nothing", async () => {
   // #284 port: on master (#402) the bridge attaches its human through the
   // application's trusted method, not a WSS frame, so the refusals are the
   // application's.
-  const user = srv.app.repo.users.findByEmail(A)!;
+  const user = (await srv.app.repo.users.findByEmail(srv.app.repo.read, A))!;
   const pushes: string[] = [];
   const sink = { deliver: (e: any) => { if (e.kind === "direct") pushes.push(e.message.body); }, closed() {} };
   const { session, ok } = await srv.app.application.attachHuman({ user_id: user.id, user_email: A, session_id: 0 }, sink);

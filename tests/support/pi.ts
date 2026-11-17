@@ -1232,8 +1232,8 @@ export async function hostedPeer(srv: HostedServer, dir: string): Promise<Peer> 
   // share a collaborative team, the cross-user wake grant (#806).
   const repo = srv.app.repo;
   await seed(repo, async tx => {
-    const alice = await repo.users.upsertByEmail(tx, "alice@example.com", null), bob = repo.users.findByEmail("bob@example.com")!;
-    const team = repo.teams.findByName("peers") ?? await repo.teams.create(tx, "peers", alice.id);
+    const alice = await repo.users.upsertByEmail(tx, "alice@example.com", null), bob = (await repo.users.findByEmail(tx, "bob@example.com"))!;
+    const team = (await repo.teams.findByName(tx, "peers")) ?? await repo.teams.create(tx, "peers", alice.id);
     await repo.teams.addMember(tx, team.id, alice.id, "owner");
     await repo.teams.addMember(tx, team.id, bob.id);
     await repo.teams.setPolicy(tx, team.id, "collaborative");

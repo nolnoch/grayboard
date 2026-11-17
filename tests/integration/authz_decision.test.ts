@@ -238,7 +238,7 @@ describe("pre-seam refusals", () => {
     expect((await srv.api(a, "POST", "/api/teams", { name: "eng" })).status).toBe(201);
     expect((await srv.api(c, "POST", "/api/teams/eng/leave")).status).toBe(404);
     expect((await srv.api(root, "POST", "/api/teams/eng/leave")).status).toBe(404);
-    expect(srv.app.repo.teams.isMember(srv.app.repo.teams.findByName("eng")!.id, srv.app.repo.users.findByEmail(A)!.id)).toBe(true);
+    expect((await srv.app.repo.teams.isMember(srv.app.repo.read, (await srv.app.repo.teams.findByName(srv.app.repo.read, "eng"))!.id, (await srv.app.repo.users.findByEmail(srv.app.repo.read, A))!.id))).toBe(true);
     expect(rows().filter((r) => r.verb === "team.leave")).toEqual([
       { actor: C, target: "team:eng", verb: "team.leave", allow: false, rule: "team.member" },
       { actor: ROOT, target: "team:eng", verb: "team.leave", allow: false, rule: "team.member" },
@@ -246,7 +246,7 @@ describe("pre-seam refusals", () => {
   });
 
   // A hosted session's own row: its server-side ID, from the user, the client and the raw ID it sends.
-  const hostedId = (email: string, raw: string) => hostedSessionId(srv.app.repo.users.findByEmail(email)!.id, HOSTED_CLIENT, raw);
+  const hostedId = async (email: string, raw: string) => hostedSessionId((await srv.app.repo.users.findByEmail(srv.app.repo.read, email))!.id, HOSTED_CLIENT, raw);
   // A copy of row `from` under ID `id`, with `set`'s columns changed: the state only a hash collision (or another
   // client's session) could give.
   const forgeRow = (id: string, from: string, set: Record<string, string | number>) => {
@@ -258,9 +258,9 @@ describe("pre-seam refusals", () => {
 
   test("session_end naming another user's or another client's hosted session reads as not found and leaves one row each, after the hosted rollback", async () => {
     const [a, b] = await Promise.all([srv.hosted(A, "fe"), srv.hosted(B, "be")]);
-    const [theirs, mine] = [hostedId(A, a.sessionId), hostedId(B, b.sessionId)];
+    const [theirs, mine] = [await hostedId(A, a.sessionId), await hostedId(B, b.sessionId)];
     // B's session through another OAuth client: a copy of B's row under that client's ID.
-    const otherClient = hostedSessionId(srv.app.repo.users.findByEmail(B)!.id, "another-client", b.sessionId);
+    const otherClient = hostedSessionId((await srv.app.repo.users.findByEmail(srv.app.repo.read, B))!.id, "another-client", b.sessionId);
     await forgeRow(otherClient, mine, { client_id: "another-client" });
     const unknown = hostedSessionId(1, HOSTED_CLIENT, "nobody");
     for (const id of [theirs, otherClient, unknown]) {
@@ -280,8 +280,8 @@ describe("pre-seam refusals", () => {
     await srv.login(A);
     const b = await srv.hosted(B, "be");
     // Forged under the ID B's next session will send, owned by A.
-    const forged = hostedId(B, "forged");
-    await forgeRow(forged, hostedId(B, b.sessionId), { user_id: srv.app.repo.users.findByEmail(A)!.id });
+    const forged = await hostedId(B, "forged");
+    await forgeRow(forged, await hostedId(B, b.sessionId), { user_id: (await srv.app.repo.users.findByEmail(srv.app.repo.read, A))!.id });
     // Refused while the exchange selects its row, before any tool runs: the HTTP 404 it always was.
     const e = await srv.hosted(B, null, { sessionId: "forged" }).then(() => null, (x: Error) => x);
     expect(e?.message).toContain(`{"code":"not_found","message":"resource not found"}`);
@@ -295,8 +295,8 @@ describe("pre-seam refusals", () => {
   test("registering a child whose hosted row is another user's reads as not found and leaves one row, after the hosted rollback", async () => {
     await srv.login(A);
     const b = await srv.hosted(B, "be");
-    const mine = hostedId(B, b.sessionId), forged = hostedId(B, "child");
-    await forgeRow(forged, mine, { user_id: srv.app.repo.users.findByEmail(A)!.id });
+    const mine = await hostedId(B, b.sessionId), forged = await hostedId(B, "child");
+    await forgeRow(forged, mine, { user_id: (await srv.app.repo.users.findByEmail(srv.app.repo.read, A))!.id });
     await expect(b.subscriber.call("session_register", { child: "child" })).rejects.toMatchObject({ code: "not_found" });
     const got = accessAudits(srv.app.db, "authz.decision").filter((r) => r.detail.verb === "hosted.session");
     expect(got.map((r) => [r.actor, r.target, r.detail.rule, r.detail.session])).toEqual([[B, forged, "hosted.other_user", mine]]);

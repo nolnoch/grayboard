@@ -263,7 +263,7 @@ export interface Repo {
     signIn(tx: Tx, issuer: string, subject: string, email: string, displayName: string | null): Promise<IdpSignIn>;
     // Forgets a user's IdP issuer and subject, so the next sign-in with the email, from any IdP, links its account.
     clearSubject(tx: Tx, userId: number): Promise<void>;
-    findByEmail(email: string): User | undefined;
+    findByEmail(r: Read, email: string): Promise<User | undefined>;
     findById(userId: number): User | undefined;
     // findById(id)?.disabled_at != null, cached on authGeneration (#853).
     isDisabled(userId: number): boolean;
@@ -281,15 +281,18 @@ export interface Repo {
     revokeDev(tx: Tx): Promise<number>;
     touch(tx: Tx, sessionId: number, now: number): Promise<void>;
   };
+  // Policy's reads on the caller's handle (#807 P3 A7e3), as are the teams reads below and users.findByEmail.
   principals: {
-    findByName(name: string): PrincipalRow | undefined;
+    findByName(r: Read, name: string): Promise<PrincipalRow | undefined>;
+    // Who an address acts for (#284 S12): an ID's registering user, an alias's scope owner, a team broadcast's team.
+    of(r: Read, address: string): Promise<Principal | null>;
   };
   // Policy's reads (and resolveMention's alias reads), synchronously on the SQLite connection (#807 P3 A7e1): the
   // loader authorizeNow drives, and the core Access seam's, until #807 B makes them async. Inside the caller's own
-  // transaction they read its writes. principalOf is who an address acts for (#284 S12): an ID's registering user,
-  // an alias's scope owner, a team broadcast's team. SQLite only: a Postgres Repo won't have it. policy.test.ts
-  // ratchets its callers.
-  policyNow: PolicyReadsSync & AccessReadsSync;
+  // transaction they read its writes. principalOf is principals.of. teamsOf and teamMembers serve the synchronous
+  // helpers that can't await yet (helloOkFields, onAliasCreated, the roster read beside its guard). SQLite only: a
+  // Postgres Repo won't have it. policy.test.ts ratchets its callers.
+  policyNow: PolicyReadsSync & AccessReadsSync & { teamsOf(userId: number): Team[]; teamMembers(teamId: number): TeamMember[] };
   // Names in scopes, keyed by address. The writes return promises (#807 P3 A6d); the reads stay synchronous until
   // async Access (A7): `listForScope` and `seen` feed the synchronous session builder, and `countForScope` (only async bodies call it) moves with them so the group's reads go async together.
   aliases: {
@@ -307,13 +310,13 @@ export interface Repo {
     // Also deletes the alias's read points.
     remove(tx: Tx, address: string): Promise<void>;
   };
-  // The writes return promises (#807 P3 A6g); the reads stay synchronous until A7, as the alias reads do.
+  // The writes return promises (#807 P3 A6g), and so do the reads, on the caller's handle (A7e3).
   teams: {
     // Inserts the team's principal in the same transaction; rejects with
     // PrincipalTaken if another principal has the name.
     create(tx: Tx, name: string, createdBy: number): Promise<Team>;
-    findByName(name: string): Team | undefined;
-    listForUser(userId: number): Team[];
+    findByName(r: Read, name: string): Promise<Team | undefined>;
+    listForUser(r: Read, userId: number): Promise<Team[]>;
     // Adds a member with an explicit role; an existing member is left as is
     // (false). Roles change through setRole.
     addMember(tx: Tx, teamId: number, userId: number, role?: TeamRole): Promise<boolean>;
@@ -323,18 +326,20 @@ export interface Repo {
     removeMember(tx: Tx, teamId: number, userId: number): Promise<void>;
     // The member's previous role, or null when it isn't a member.
     setRole(tx: Tx, teamId: number, userId: number, role: TeamRole): Promise<TeamRole | null>;
-    isOwner(teamId: number, userId: number): boolean;
-    listMembers(teamId: number): { user_id: number; email: string; role: TeamRole }[];
-    listMemberUserIds(teamId: number): number[];
-    isMember(teamId: number, userId: number): boolean;
+    isOwner(r: Read, teamId: number, userId: number): Promise<boolean>;
+    listMembers(r: Read, teamId: number): Promise<TeamMember[]>;
+    listMemberUserIds(r: Read, teamId: number): Promise<number[]>;
+    isMember(r: Read, teamId: number, userId: number): Promise<boolean>;
     // The previous policy, or null when the team is gone.
     setPolicy(tx: Tx, teamId: number, policy: TeamPolicy): Promise<TeamPolicy | null>;
     // Whether two users share a team whose policy is 'collaborative' or
     // 'delegating': the grant under which one's agents may wake the other's (#806).
-    shareCollaborative(userA: number, userB: number): boolean;
+    shareCollaborative(r: Read, userA: number, userB: number): Promise<boolean>;
     // Whether two users share a team whose policy is 'delegating': the grant
     // under which one's session may delegate to the other's launcher (#256).
-    shareDelegating(userA: number, userB: number): boolean;
+    shareDelegating(r: Read, userA: number, userB: number): Promise<boolean>;
+    // Whether two users share any team: the human-reach rule's teammates, in one statement (A7e3).
+    shareAny(r: Read, userA: number, userB: number): Promise<boolean>;
   };
   // The writes return promises (#807 P3 A6d2); the reads stay synchronous until A7, as the alias reads do.
   messages: {
@@ -896,6 +901,7 @@ function seedSchema(db: Database, first: boolean): void {
 // role and reads as owner only for the team's creator (OWNER_SQL), so no
 // backfill is needed; every write since stores an explicit role.
 export type TeamRole = "owner" | "member";
+export type TeamMember = { user_id: number; email: string; role: TeamRole };
 const OWNER_SQL = `(tm.role = 'owner' OR (tm.role IS NULL AND tm.user_id = (SELECT created_by FROM teams WHERE id = tm.team_id)))`;
 
 export class LastOwner extends Error {
@@ -948,15 +954,16 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
     }
   };
   // Whether two users share a team whose policy is one of `policies`: one indexed lookup (principle 11).
-  const sharePolicy = (userA: number, userB: number, policies: readonly TeamPolicy[]): boolean =>
-    !!db.query<{ x: number }, (number | string)[]>(
+  // Whether two users share a team, of one of these policies when given (#807 P3 A7e3: none for shareAny).
+  const sharePolicy = (c: Database, userA: number, userB: number, policies?: readonly TeamPolicy[]): boolean =>
+    !!c.query<{ x: number }, (number | string)[]>(
       `SELECT 1 AS x FROM team_members a
        JOIN team_members b ON b.team_id = a.team_id AND b.user_id = ?
-       JOIN teams t ON t.id = a.team_id AND t.policy IN (${policies.map(() => "?").join(", ")})
+       ${policies ? `JOIN teams t ON t.id = a.team_id AND t.policy IN (${policies.map(() => "?").join(", ")})` : ""}
        WHERE a.user_id = ? LIMIT 1`,
-    ).get(userB, ...policies, userA);
-  const principalByName = (name: string): PrincipalRow | undefined =>
-    db.query<PrincipalRow, [string]>("SELECT * FROM principals WHERE name = ?").get(name) ?? undefined;
+    ).get(userB, ...(policies ?? []), userA);
+  const principalByName = (c: Database, name: string): PrincipalRow | undefined =>
+    c.query<PrincipalRow, [string]>("SELECT * FROM principals WHERE name = ?").get(name) ?? undefined;
   // Each changed row tells the observers after its transaction commits (#399); a rollback drops the notice with
   // the change. `null`: any row may have changed (a grant or a user), so observers check every one.
   const observers = new Set<(changed: string | null) => void>();
@@ -1066,27 +1073,32 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
     c.query<Alias, [string]>(`SELECT ${ALIAS_COLS} FROM aliases WHERE address = ?`).get(address) ?? undefined;
   const aliasesNamed = (c: Database, name: string): Alias[] =>
     c.query<Alias, [string]>(`SELECT ${ALIAS_COLS} FROM aliases WHERE name = ? ORDER BY address`).all(name);
-  const userByEmail = (email: string): User | undefined =>
-    db.query<User, [string]>("SELECT * FROM users WHERE email = ?").get(email) ?? undefined;
-  const teamByName = (name: string): Team | undefined =>
-    db.query<Team, [string]>("SELECT * FROM teams WHERE name = ?").get(name) ?? undefined;
-  const teamsOf = (userId: number): Team[] =>
-    db.query<Team, [number]>(`SELECT t.* FROM teams t JOIN team_members tm ON tm.team_id = t.id WHERE tm.user_id = ?`).all(userId);
-  const isOwner = (teamId: number, userId: number): boolean =>
-    !!db.query<{ x: number }, [number, number]>(
+  const userByEmail = (c: Database, email: string): User | undefined =>
+    c.query<User, [string]>("SELECT * FROM users WHERE email = ?").get(email) ?? undefined;
+  const teamByName = (c: Database, name: string): Team | undefined =>
+    c.query<Team, [string]>("SELECT * FROM teams WHERE name = ?").get(name) ?? undefined;
+  const teamsOf = (c: Database, userId: number): Team[] =>
+    c.query<Team, [number]>(`SELECT t.* FROM teams t JOIN team_members tm ON tm.team_id = t.id WHERE tm.user_id = ?`).all(userId);
+  const isOwner = (c: Database, teamId: number, userId: number): boolean =>
+    !!c.query<{ x: number }, [number, number]>(
       `SELECT 1 AS x FROM team_members tm WHERE tm.team_id = ? AND tm.user_id = ? AND ${OWNER_SQL}`,
     ).get(teamId, userId);
-  const isMember = (teamId: number, userId: number): boolean =>
-    !!db.query<{ x: number }, [number, number]>("SELECT 1 AS x FROM team_members WHERE team_id = ? AND user_id = ?").get(teamId, userId);
-  const shareCollaborative = (userA: number, userB: number) => sharePolicy(userA, userB, ["collaborative", "delegating"]);
-  const shareDelegating = (userA: number, userB: number) => sharePolicy(userA, userB, ["delegating"]);
-  const principalOf = (address: string): Principal | null => {
+  const isMember = (c: Database, teamId: number, userId: number): boolean =>
+    !!c.query<{ x: number }, [number, number]>("SELECT 1 AS x FROM team_members WHERE team_id = ? AND user_id = ?").get(teamId, userId);
+  const teamMembers = (c: Database, teamId: number): TeamMember[] =>
+    c.query<{ user_id: number; email: string; owner: number }, [number]>(
+      `SELECT u.id as user_id, u.email, ${OWNER_SQL} AS owner FROM users u
+       JOIN team_members tm ON tm.user_id = u.id WHERE tm.team_id = ?`,
+    ).all(teamId).map(({ owner, ...m }) => ({ ...m, role: owner ? "owner" : "member" }));
+  const shareCollaborative = (c: Database, userA: number, userB: number) => sharePolicy(c, userA, userB, ["collaborative", "delegating"]);
+  const shareDelegating = (c: Database, userA: number, userB: number) => sharePolicy(c, userA, userB, ["delegating"]);
+  const principalOf = (c: Database, address: string): Principal | null => {
     const p = addressParts(address);
     if (!p || p.kind === "bare") return null;
     const name = p.kind === "id"
-      ? db.query<{ principal: string | null }, [string]>("SELECT principal FROM ids WHERE id = ?").get(p.address)?.principal
+      ? c.query<{ principal: string | null }, [string]>("SELECT principal FROM ids WHERE id = ?").get(p.address)?.principal
       : p.kind === "alias" ? p.scope : p.name;
-    const row = name ? principalByName(name) : undefined;
+    const row = name ? principalByName(c, name) : undefined;
     // team:x names a team, never a service; a person scope (an email) is only a user's.
     if (!row || (p.kind === "team" && row.kind !== "team")) return null;
     if (p.kind === "alias" && (p.scopeKind === "person") !== (row.kind === "user")) return null;
@@ -1163,7 +1175,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       async clearSubject(tx, userId) {
         sqliteOf(tx).run("UPDATE users SET idp_issuer = NULL, idp_subject = NULL WHERE id = ?", [userId]);
       },
-      findByEmail: userByEmail,
+      async findByEmail(r, email) { return userByEmail(sqliteOf(r), email); },
       findById: userById,
       isDisabled(userId) {
         return cachedUser(userId)?.disabled_at != null;
@@ -1228,11 +1240,22 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
     },
 
     principals: {
-      findByName: principalByName,
+      async findByName(r, name) { return principalByName(sqliteOf(r), name); },
+      async of(r, address) { return principalOf(sqliteOf(r), address); },
     },
 
     policyNow: {
-      principalByName, principalOf, teamByName, isMember, isOwner, teamsOf, shareCollaborative, shareDelegating, userByEmail,
+      principalByName: name => principalByName(db, name),
+      principalOf: address => principalOf(db, address),
+      teamByName: name => teamByName(db, name),
+      isMember: (teamId, userId) => isMember(db, teamId, userId),
+      isOwner: (teamId, userId) => isOwner(db, teamId, userId),
+      shareAny: (userA, userB) => sharePolicy(db, userA, userB),
+      shareCollaborative: (userA, userB) => shareCollaborative(db, userA, userB),
+      shareDelegating: (userA, userB) => shareDelegating(db, userA, userB),
+      userByEmail: email => userByEmail(db, email),
+      teamsOf: userId => teamsOf(db, userId),
+      teamMembers: teamId => teamMembers(db, teamId),
       alias: address => aliasAt(db, address),
       aliasesNamed: name => aliasesNamed(db, name),
     },
@@ -1294,8 +1317,8 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
           }
         })();
       },
-      findByName: teamByName,
-      listForUser: teamsOf,
+      async findByName(r, name) { return teamByName(sqliteOf(r), name); },
+      async listForUser(r, userId) { return teamsOf(sqliteOf(r), userId); },
       async addMember(tx, teamId, userId, role = "member") {
         const db = sqliteOf(tx);
         return db.run(
@@ -1322,19 +1345,14 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
           return row.owner ? "owner" : "member";
         })();
       },
-      isOwner,
-      listMembers(teamId) {
-        return db.query<{ user_id: number; email: string; owner: number }, [number]>(
-          `SELECT u.id as user_id, u.email, ${OWNER_SQL} AS owner FROM users u
-           JOIN team_members tm ON tm.user_id = u.id WHERE tm.team_id = ?`,
-        ).all(teamId).map(({ owner, ...m }) => ({ ...m, role: owner ? "owner" : "member" }));
-      },
-      listMemberUserIds(teamId) {
-        return db.query<{ user_id: number }, [number]>(
+      async isOwner(r, teamId, userId) { return isOwner(sqliteOf(r), teamId, userId); },
+      async listMembers(r, teamId) { return teamMembers(sqliteOf(r), teamId); },
+      async listMemberUserIds(r, teamId) {
+        return sqliteOf(r).query<{ user_id: number }, [number]>(
           "SELECT user_id FROM team_members WHERE team_id = ?",
-        ).all(teamId).map(r => r.user_id);
+        ).all(teamId).map(row => row.user_id);
       },
-      isMember,
+      async isMember(r, teamId, userId) { return isMember(sqliteOf(r), teamId, userId); },
       async setPolicy(tx, teamId, policy) {
         const db = sqliteOf(tx);
         return db.transaction(() => {
@@ -1344,8 +1362,9 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
           return (TEAM_POLICIES as readonly string[]).includes(row.policy) ? row.policy as TeamPolicy : "open";
         })();
       },
-      shareCollaborative,
-      shareDelegating,
+      async shareAny(r, userA, userB) { return sharePolicy(sqliteOf(r), userA, userB); },
+      async shareCollaborative(r, userA, userB) { return shareCollaborative(sqliteOf(r), userA, userB); },
+      async shareDelegating(r, userA, userB) { return shareDelegating(sqliteOf(r), userA, userB); },
     },
 
     messages: {

@@ -66,7 +66,7 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: hosted admission 
   let last: { status: number; retryAfter: string | null; body: string } | undefined;
   try {
     const { token, authed } = await issueOAuth(srv.app.repo, srv.app.oauth.resource, "alice@example.com");
-    const user = srv.app.repo.users.findByEmail("alice@example.com")!;
+    const user = (await srv.app.repo.users.findByEmail(srv.app.repo.read, "alice@example.com"))!;
     await seed(srv.app.repo, tx => srv.app.repo.aliases.create(tx, { scope_kind: "person", scope_ref: user.email, name: "be" }, user.email));
     await client.connect(new StreamableHTTPClientTransport(new URL(`${srv.base}/mcp`), {
       requestInit: { headers: { Authorization: `Bearer ${token}` } },

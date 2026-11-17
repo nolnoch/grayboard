@@ -60,11 +60,11 @@ test("#807: a team route that arrives while another body holds the write queue w
   const holder = hold(srv.app.db);
   const created = srv.api(token, "POST", "/api/teams", { name: "core" });
   await until(() => write.mock.calls.length > 0, 5000, "the team route reached the write queue");
-  expect(srv.app.repo.teams.findByName("core")).toBeFalsy();
+  expect((await srv.app.repo.teams.findByName(srv.app.repo.read, "core"))).toBeFalsy();
   holder.release();
   await holder.done;
   expect(await created).toMatchObject({ status: 201, body: { name: "core" } });
-  expect(srv.app.repo.teams.findByName("core")).toBeTruthy();
+  expect((await srv.app.repo.teams.findByName(srv.app.repo.read, "core"))).toBeTruthy();
   write.mockRestore();
 });
 
@@ -98,7 +98,7 @@ for (const [route, action] of [["revoke-session", "auth.session_revoked"], ["dis
     await expect(call(`/api/admin/${route}`, { email: "bob@example.com" }, root)).rejects.toThrow("disk full");
     audit.mockRestore();
     expect(disconnected).toEqual([]);
-    const bob = repo.users.findByEmail("bob@example.com")!;
+    const bob = (await repo.users.findByEmail(repo.read, "bob@example.com"))!;
     // Rolled back: no audit row, bob still enabled and signed in.
     expect(await repo.audit.last(repo.read, action, "bob@example.com")).toBeUndefined();
     expect(bob.disabled_at).toBeNull();

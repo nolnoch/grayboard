@@ -355,7 +355,7 @@ function helloOkFields(hub: Hub, authed: AuthedUser, r: Read): SessionFacts {
   const { repo } = hub;
   return {
     user_email: authed.user_email,
-    teams: repo.teams.listForUser(authed.user_id).map((t) => formatTeamAddress(t.name)),
+    teams: repo.policyNow.teamsOf(authed.user_id).map((t) => formatTeamAddress(t.name)),
     human: { handle: `${authed.user_email}/${HUMAN_NAME}`, linked: hub.slackRunning() && !!repo.slack.linkFor(r, authed.user_id) },
     attachment_limits: repo.attachmentLimits,
   };
@@ -393,7 +393,7 @@ function bindTarget(hub: Hub, authed: AuthedUser, input: string): Target {
   let scope: AliasScope;
   try {
     scope = aliasScope(address, (k) => {
-      const kind = repo.principals.findByName(k)?.kind;
+      const kind = repo.policyNow.principalByName(k)?.kind;
       return kind === "team" || kind === "service" ? kind : null;
     });
   } catch (e) {
@@ -681,7 +681,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     const body = (tx: Tx) => {
       const revoked: (AliasUse & { reason: string })[] = [];
       for (const u of aliasUses(repo.coreOn(tx), principal)) {
-        const p = repo.principals.findByName(u.principal);
+        const p = repo.policyNow.principalByName(u.principal);
         const d = p ? authorizeNow(repo, {}, { verb: "scope.act", principal: p, scope: u }) : undefined;
         const reason = !p ? `principal ${u.principal} no longer exists` : d && !d.allow ? d.reason : null;
         if (reason) revoked.push({ ...u, reason });

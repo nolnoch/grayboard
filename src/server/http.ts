@@ -61,7 +61,7 @@ export function healthz(repo: Repo, now = performance.now(), gate: LagGate = DEF
   if (!cached || now - cached.at >= HEALTH_TTL_MS) {
     let ok = true;
     try {
-      repo.users.findByEmail("__healthz__");
+      repo.policyNow.userByEmail("__healthz__");
     } catch (e) {
       // A deploy check that sees this 503 needs the cause in the journal.
       console.error(`[grayboard] healthz: ${(e as Error).stack ?? e}`);
@@ -151,9 +151,9 @@ function authLogout(authed: AuthedUser, repo: Repo): Promise<Response> {
   });
 }
 
-function whoami(authed: AuthedUser, repo: Repo): Response {
+async function whoami(authed: AuthedUser, repo: Repo): Promise<Response> {
   const identities = repo.aliases.listForScope(repo.read, "person", authed.user_email).map(i => i.name);
-  const teams      = repo.teams.listForUser(authed.user_id).map(t => t.name);
+  const teams      = (await repo.teams.listForUser(repo.read, authed.user_id)).map(t => t.name);
   return json({ email: authed.user_email, identities, teams });
 }
 
@@ -402,8 +402,8 @@ export async function attachmentRelease(idStr: string, url: URL, authed: AuthedU
 
 // ── teams ────────────────────────────────────────────────────────────────────
 
-function teamList(authed: AuthedUser, repo: Repo): Response {
-  return json(repo.teams.listForUser(authed.user_id).map(t => ({ name: t.name, created_at: t.created_at })));
+async function teamList(authed: AuthedUser, repo: Repo): Promise<Response> {
+  return json((await repo.teams.listForUser(repo.read, authed.user_id)).map(t => ({ name: t.name, created_at: t.created_at })));
 }
 
 async function teamCreate(req: Request, authed: AuthedUser, repo: Repo): Promise<Response> {
@@ -412,7 +412,7 @@ async function teamCreate(req: Request, authed: AuthedUser, repo: Repo): Promise
   const name = body.name.toLowerCase();
   if (!isValidIdentityName(name)) return badRequest("invalid team name");
   return repo.write(async (tx) => {
-    if (repo.teams.findByName(name)) return conflict(`team "${name}" already exists`);
+    if (await repo.teams.findByName(tx, name)) return conflict(`team "${name}" already exists`);
     // The team's board shares its name, so the name must be free as a board too.
     if (getBoard(repo.coreOn(tx), name)) return conflict(`a board named "#${name}" already exists`);
     let team: Team;
@@ -439,7 +439,7 @@ function teamJoin(): Response {
 // A team the caller isn't in reads as not found, like its board; an admin
 // can't leave a team it isn't in. A refusal is recorded (policy.ts).
 function memberTeam(h: Read, teamName: string, authed: AuthedUser, repo: Repo): Team | null {
-  const req: AuthzRequest = { verb: "team.leave", user: { id: authed.user_id, email: authed.user_email }, team: repo.teams.findByName(teamName.toLowerCase()) };
+  const req: AuthzRequest = { verb: "team.leave", user: { id: authed.user_id, email: authed.user_email }, team: repo.policyNow.teamByName(teamName.toLowerCase()) };
   const d = authorizeNow(repo, {}, req);
   if (!d.allow) {
     recordDecision(repo, h, { user: authed.user_email }, req, d, { team_requested: teamName.toLowerCase() });
@@ -452,7 +452,7 @@ function memberTeam(h: Read, teamName: string, authed: AuthedUser, repo: Repo): 
 // marks the audit row when an admin isn't a member. A denial is recorded
 // (policy.ts), and reads as not found.
 function managedTeam(h: Read, teamName: string, authed: AuthedUser, repo: Repo, config: Config): { team: Team; audit: { as_admin?: true } } | null {
-  const req: AuthzRequest = { verb: "team.read", user: { id: authed.user_id, email: authed.user_email }, team: repo.teams.findByName(teamName.toLowerCase()) };
+  const req: AuthzRequest = { verb: "team.read", user: { id: authed.user_id, email: authed.user_email }, team: repo.policyNow.teamByName(teamName.toLowerCase()) };
   const d = authorizeNow(repo, { admins: config.admins }, req);
   if (!d.allow) {
     recordDecision(repo, h, { user: authed.user_email }, req, d, { team_requested: teamName.toLowerCase() });
@@ -468,7 +468,7 @@ function managedTeam(h: Read, teamName: string, authed: AuthedUser, repo: Repo, 
 // owning. A non-member still reads not found; a member who isn't an owner
 // is refused, naming who can. Every decision is recorded (policy.ts).
 function ownedTeam(h: Read, teamName: string, authed: AuthedUser, repo: Repo, config: Config): { team: Team; audit: { as_admin?: true } } | Response {
-  const req: AuthzRequest = { verb: "team.manage", user: { id: authed.user_id, email: authed.user_email }, team: repo.teams.findByName(teamName.toLowerCase()) };
+  const req: AuthzRequest = { verb: "team.manage", user: { id: authed.user_id, email: authed.user_email }, team: repo.policyNow.teamByName(teamName.toLowerCase()) };
   const d = authorizeNow(repo, { admins: config.admins }, req);
   recordDecision(repo, h, { user: authed.user_email }, req, d, { team_requested: teamName.toLowerCase() });
   if (!d.allow) return d.code === "not_found" ? notFound() : forbidden(d.reason);
@@ -506,7 +506,7 @@ async function teamAdd(teamName: string, req: Request, authed: AuthedUser, repo:
     if (body.role !== undefined && body.role !== "owner" && body.role !== "member") return badRequest(`role must be "owner" or "member"`);
     const role = body.role as TeamRole | undefined;
     const email = body.email.toLowerCase();
-    const user  = repo.users.findByEmail(email);
+    const user  = await repo.users.findByEmail(tx, email);
     if (!user) return jsonErr("not_found", `${email} has never signed in to grayboard; they need to run grayboard login first`, 404);
     if (await repo.teams.addMember(tx, team.id, user.id, role ?? "member")) {
       onTeamJoined(repo, tx, team, email);
@@ -535,8 +535,8 @@ async function teamRemove(teamName: string, req: Request, authed: AuthedUser, re
     const { team } = managed;
     if (!body?.email) return badRequest("email required");
     const email = body.email.toLowerCase();
-    const user  = repo.users.findByEmail(email);
-    if (!user || !repo.teams.isMember(team.id, user.id)) {
+    const user  = await repo.users.findByEmail(tx, email);
+    if (!user || !(await repo.teams.isMember(tx, team.id, user.id))) {
       return jsonErr("not_found", `${email} is not a member of team "${team.name}"`, 404);
     }
     try {
@@ -598,7 +598,9 @@ async function teamDeleteAlias(teamName: string, req: Request, authed: AuthedUse
 function teamMembers(teamName: string, authed: AuthedUser, repo: Repo, config: Config): Response {
   const managed = managedTeam(repo.read, teamName, authed, repo, config);
   if (!managed) return notFound();
-  return json(repo.teams.listMembers(managed.team.id));
+  // Synchronously beside the guard (#807 P3 A7e3): an await between them would let a member removed meanwhile read
+  // the roster. A7f moves both to the async loader together.
+  return json(repo.policyNow.teamMembers(managed.team.id));
 }
 
 // ── admin ────────────────────────────────────────────────────────────────────
@@ -610,7 +612,7 @@ async function adminRevokeSession(req: Request, authed: AuthedUser, repo: Repo, 
   if (!body?.email) return badRequest("email required");
   // The live sessions go after the commit: a rolled-back revoke leaves them up, as it leaves their tokens valid.
   const target = await repo.write(async (tx: Tx) => {
-    const target = repo.users.findByEmail(body.email.toLowerCase());
+    const target = await repo.users.findByEmail(tx, body.email.toLowerCase());
     if (!target) return null;
     await repo.sessions.revokeAllForUser(tx, target.id);
     writeAudit(repo, tx, "auth.session_revoked", authed.user_email, body.email);
@@ -625,7 +627,7 @@ async function adminDisableUser(
   const body = await parseBody<{ email: string }>(req);
   if (!body?.email) return badRequest("email required");
   const target = await repo.write(async (tx: Tx) => {
-    const target = repo.users.findByEmail(body.email.toLowerCase());
+    const target = await repo.users.findByEmail(tx, body.email.toLowerCase());
     if (!target) return null;
     await repo.users.setDisabled(tx, target.id, true);
     writeAudit(repo, tx, "auth.user_disabled", authed.user_email, body.email);
@@ -640,7 +642,7 @@ async function adminEnableUser(req: Request, authed: AuthedUser, repo: Repo, sla
   const body = await parseBody<{ email: string }>(req);
   if (!body?.email) return badRequest("email required");
   const target = await repo.write(async tx => {
-    const target = repo.users.findByEmail(body.email.toLowerCase());
+    const target = await repo.users.findByEmail(tx, body.email.toLowerCase());
     if (!target) return null;
     await repo.users.setDisabled(tx, target.id, false);
     writeAudit(repo, tx, "auth.user_enabled", authed.user_email, body.email);
@@ -659,7 +661,7 @@ async function adminUnlinkIdp(req: Request, authed: AuthedUser, repo: Repo, conf
   const body = await parseBody<{ email: string }>(req);
   if (!body?.email) return badRequest("email required");
   return repo.write(async tx => {
-    const target = repo.users.findByEmail(body.email.toLowerCase());
+    const target = await repo.users.findByEmail(tx, body.email.toLowerCase());
     if (!target) return notFound();
     await repo.users.clearSubject(tx, target.id);
     writeAudit(repo, tx, "auth.subject_cleared", authed.user_email, target.email, {

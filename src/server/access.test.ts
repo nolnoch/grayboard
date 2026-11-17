@@ -204,6 +204,6 @@ test("mayActIn: a user acts in its own person scope and its teams' scopes; servi
   expect(may(bob, "service", "ci")).toBe("service principals arrive with #270");
   expect(may({ kind: "service", name: "ci" }, "team", "eng")).toBe("service principals arrive with #270");
   expect(may({ kind: "team", name: "eng" }, "team", "eng")).toBe("eng is a team, not a user");
-  await seed(repo, (tx) => repo.teams.removeMember(tx, repo.teams.findByName("eng")!.id, repo.users.findByEmail("bob@example.com")!.id));
+  await seed(repo, async (tx) => repo.teams.removeMember(tx, (await repo.teams.findByName(tx, "eng"))!.id, (await repo.users.findByEmail(tx, "bob@example.com"))!.id));
   expect(may(bob, "team", "eng")).toBe("bob@example.com isn't a member of team eng");
 });

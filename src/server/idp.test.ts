@@ -45,7 +45,7 @@ test("idpSignIn refuses an email another provider holds, naming that provider an
   expect(await signIn(repo, okta, id("a@example.com", "o-1"))).toEqual({ refused: expect.stringContaining("linked to another provider's account, not Okta") });
   expect(accessAudits(db, "auth.subject_refused").map(r => [r.actor, r.detail])[0]).toEqual(
     ["a@example.com", { reason: "issuer_mismatch", holding_issuer: GOOGLE_ISSUER, provider: "okta", issuer: okta.issuer, client_id: "native" }]);
-  expect(repo.users.findByEmail("a@example.com")).toMatchObject({ idp_issuer: GOOGLE_ISSUER, idp_subject: "s-1" });
+  expect((await repo.users.findByEmail(repo.read, "a@example.com"))).toMatchObject({ idp_issuer: GOOGLE_ISSUER, idp_subject: "s-1" });
 });
 
 // #928 D6/D10: the gap no integration test covers, Config to providers. Tests inject providers; a server builds them
