@@ -8,6 +8,8 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDatabase } from "./db.ts";
+import { queueFor } from "./store/queue.ts";
+import { until } from "../../tests/support/until.ts";
 import { createOAuthServer, type OAuthPrincipal } from "./oauth.ts";
 import { hashToken, verifySessionToken } from "./auth.ts";
 import { OAUTH_TTL } from "./oauth-types.ts";
@@ -1525,4 +1527,34 @@ test("the grayboard-cli cutover revokes earlier grants and pending codes under i
   service = makeService();
   expect(service.isGrantActive(later.grantId)).toBe(true);
   expect(codes().sort()).toEqual([CLI_CLIENT_ID, "native"]);
+});
+
+// #971: a code, refresh token or consent request that expires while its write waits in the write queue is refused: the
+// body judges expiry against the clock it reads at its write, not one read before the wait.
+async function expiresWhileQueued(bump: number, act: () => Promise<Response>): Promise<Response> {
+  let release: (() => void) | undefined;
+  const held = queueFor(storage.db).run(() => new Promise<void>(r => { release = r; }));
+  const write = storage.repo.write;
+  let entered = false;
+  storage.repo.write = ((...args: Parameters<typeof write>) => { entered = true; return write.apply(storage.repo, args); }) as typeof write;
+  let response: Promise<Response> | undefined;
+  try {
+    response = act();
+    response.catch(() => {}); // a failed wait below is the test's error, not an unhandled rejection
+    await until(() => entered, 5000, "the route reaches its write");
+    clock += bump;
+  } finally { storage.repo.write = write; release?.(); await held; }
+  return response;
+}
+for (const grant of ["authorization_code", "refresh_token"] as const) test(`#971: ${grant === "authorization_code" ? "a code" : "a refresh token"} that expires while its redemption waits behind another write body is refused`, async () => {
+  const a = await issue();
+  const params = grant === "authorization_code" ? tokenParams(a)
+    : { client_id: "native", grant_type: "refresh_token", refresh_token: (await redeem(a)).refresh_token, resource: service.resource };
+  const response = await expiresWhileQueued(grant === "authorization_code" ? OAUTH_TTL.code : OAUTH_TTL.refresh, () => post("/oauth/token", params));
+  expect(response.status).toBe(400);
+});
+test("#971: a consent decision whose request expires while it waits behind another write body is refused", async () => {
+  const browser = new Browser();
+  const data = await loginConsent(browser, authorization().url);
+  expect((await expiresWhileQueued(OAUTH_TTL.request, () => decide(browser, data))).status).toBe(400);
 });

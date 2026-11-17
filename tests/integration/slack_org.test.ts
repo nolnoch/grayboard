@@ -148,7 +148,7 @@ test("attachments cross the org bridge both ways for a hosted session, and the a
   expect(sent.actor).toBe("alice@example.com");
   // The relay's drain started inside be's /mcp request, but carries every
   // queued item: its rows carry no request's address (security audit F-19).
-  expect(auditOrigins(srv.app.db, "attachment.sent_to_slack")).toEqual([{ ip: null, ua: null }]);
+  expect(auditOrigins(srv.app.db, "attachment.sent_to_slack")).toEqual([{ ip: null, ua: null, client_id: null }]);
   const sha256 = createHash("sha256").update(png).digest("hex");
   expect(sent.detail).toEqual({ identity: "alice@example.com/human", channel: DM, thread_ts: s.ts, slack_file: s.files[0].id, sha256 });
   // Binding says which message carried each file, to whom: be's to the human, the human's reply to be.

@@ -384,13 +384,14 @@ test("production MCP storage errors are generic 500s, not invalid-token guesses"
 
 // #521 item 6: the launcher declaration rides a real HTTP request's `_meta` and is stored for that session; the
 // next initialize carries the launcher sentence only once delivery is live (#521 4).
-test("HTTP: a launcher declared in _meta is stored for its session; an unleased initialize carries no launcher sentence", async () => {
-  const token = await login();
-  const open = async (raw: string, launcher: boolean) => {
+test("HTTP: a launcher declared in _meta is stored for its session; initialize carries the launcher sentence once a delivery lease opens", async () => {
+  // One grant with both scopes, as a harness installation holds (docs/server-hosted-mcp.md): the subscriber role adds only its header.
+  const token = await login("alice@example.com", ["grayboard:tools", "grayboard:delivery"]);
+  const open = async (raw: string, launcher: boolean, subscriber = false) => {
     const client = new Client({ name: "http-test", version: "1" }, { supportedProtocolVersions: ["2026-07-28"], versionNegotiation: { mode: { pin: "2026-07-28" } } });
     clients.push(client);
     await client.connect(new StreamableHTTPClientTransport(new URL(`${base}/mcp`), {
-      requestInit: { headers: { Authorization: `Bearer ${token}` } },
+      requestInit: { headers: { Authorization: `Bearer ${token}`, ...(subscriber ? { "X-Grayboard-Client": "subscriber" } : {}) } },
       fetch: async (input, init) => {
         const req = await withMeta(new Request(input, init), OPENCODE_SESSION_META, raw);
         return fetch(launcher ? await withMeta(req, GRAYBOARD_LAUNCHER_META, true) : req);
@@ -406,8 +407,14 @@ test("HTTP: a launcher declared in _meta is stored for its session; an unleased 
   const flags = (app.db.query(`SELECT i.launcher FROM aliases a JOIN alias_holds h ON h.address = a.address JOIN ids i ON i.id = h.id WHERE a.address IN ('alice@example.com/lead', 'alice@example.com/plain') ORDER BY a.address`).all() as { launcher: number }[]).map((r) => r.launcher);
   expect(flags).toEqual([1, 0]);
   // A second initialize of each session, with no declaration on the wire and no delivery lease: neither carries
-  // the sentence, since a launcher whose delivery isn't live is no delegation target (#521 4). With a lease, the
-  // text follows the stored flag (src/server/hosted.test.ts, #473 and #531 cases).
+  // the sentence, since a launcher whose delivery isn't live is no delegation target (#521 4).
   expect((await open("lead-root", false)).getInstructions()).not.toContain(sentence);
+  expect((await open("plain-root", false)).getInstructions()).not.toContain(sentence);
+  // #883: a delivery lease opened over HTTP by each session's subscriber role: the next initialize follows the stored flag.
+  for (const raw of ["lead-root", "plain-root"]) {
+    const opened = await (await open(raw, false, true)).callTool({ name: "delivery_open", arguments: {} });
+    expect(opened.isError).not.toBe(true);
+  }
+  expect((await open("lead-root", false)).getInstructions()).toContain(sentence);
   expect((await open("plain-root", false)).getInstructions()).not.toContain(sentence);
 });
