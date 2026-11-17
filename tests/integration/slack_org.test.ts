@@ -495,7 +495,7 @@ test("#807: a push the Slack human can no longer see is acked through the write 
   expect((await api(bob, "POST", "/api/teams", { name: "ops" })).status).toBe(201);
   await fe.call("board_create", { name: "ops-room", purpose: "ops only", team: "ops" });
   const hidden = await fe.call<BoardPostResult>("board_post", { board: "ops-room", body: "not for alice" });
-  // The push a mention left while alice could see the board (from a team she has since left), still undelivered.
+  // A push alice's human can't see (she isn't in ops), as an undelivered mention left from before she lost the board would be.
   const human = "alice@example.com/human";
   const db = srv.app.db;
   await seed(db, () => db.prepare(`INSERT INTO outbox (handle, post_id, reason) VALUES (?, ?, 'mention')`).run(human, hidden.post_id));
