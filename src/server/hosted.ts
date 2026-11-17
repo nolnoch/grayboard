@@ -391,8 +391,8 @@ export function createHostedSessions(application: Application, options: { now?: 
   // setDisabled ends a disabled user's rows itself, so that pass is a backstop). A test's injected clock calls
   // it directly. The commits tell reconcile which rows changed.
   // Through the write queue (startup's first sweep too, which the server's `ready` waits for before anything serves,
-  // #807 P3 A4). `nested`: inside the caller's transaction (a capacity refusal's re-sweep), as its savepoint, on
-  // `outer`, that transaction's Tx.
+  // #807 P3 A4). `nested`: inside the caller's transaction (a capacity refusal's re-sweep), on `outer`, that
+  // transaction's Tx.
   function sweep(full = true, mode: "queued" | "nested" = "queued", outer?: Tx): Promise<void> {
     if (stopped) return Promise.resolve();
     if (full) sweptAt = now();
@@ -410,8 +410,9 @@ export function createHostedSessions(application: Application, options: { now?: 
     };
     if (mode === "queued") return store.write(body);
     if (!outer) throw new Error("a nested sweep runs in its caller's transaction: pass its Tx");
-    // No savepoint of its own (#807 P3 A1b): its only caller (`full`, under admission) runs inside withGate's rowFor
-    // savepoint, and a throw here rolls that back whole, as a refusal rolls this sweep back.
+    // No savepoint of its own (#807 P3 A1b): its caller (`full`, under admission) runs inside withGate's rowFor
+    // savepoint or register's write body, and neither catches, so a throw here rolls that back whole, as a refusal
+    // rolls this sweep back. A catch added around either would commit a half-done sweep.
     body(outer);
     return Promise.resolve();
   }
