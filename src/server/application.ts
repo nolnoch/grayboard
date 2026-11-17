@@ -579,9 +579,11 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
   // logged and audited id.end_failed, and leaves the others ended. Only a revoked alias's end is retried while
   // the server runs (revalidate re-checks it); a startup leftover's is
   // retried at the next start, and its holds stay until then (#475 item 2).
-  function endIds(ids: string[], why: string): void {
-    if (!ids.length) return;
-    repo.post(tx => endIdsIn(tx, ids, why), ends => afterEnds(ends.woken, ends.bounced), "session ends");
+  // Settles once the ends are written; a failure of the whole write is logged, not rejected (the next start retries).
+  function endIds(ids: string[], why: string): Promise<void> {
+    if (!ids.length) return Promise.resolve();
+    return repo.write(tx => endIdsIn(tx, ids, why), ends => afterEnds(ends.woken, ends.bounced))
+      .then(() => {}, error => console.error("[grayboard] session ends failed:", error));
   }
   type Ends = { woken: Set<string>; bounced: { id: string; at: number }[] };
   // endIds's body, inside a write body: `tx` is that body's. Each end's savepoint runs on its own Tx.
@@ -625,7 +627,8 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
   // session a previous run left unended, because only a hello re-attached one.
   // End each at start, as the grace sweep would have: holds and claims
   // released, mail bounced. A hosted ID is the hosted store's to end.
-  endIds(unendedIds(repo.coreOn(repo.read)).filter((id) => !repo.hosted.owned(repo.read, id)), "wss_removed");
+  // The startup leftovers' ends (#807 P3 A1): the server's `ready` waits for them.
+  const ready = endIds(unendedIds(repo.coreOn(repo.read)).filter((id) => !repo.hosted.owned(repo.read, id)), "wss_removed");
   // Re-checks the aliases that sessions act as (S9) against policy.ts (scope.act), for
   // one principal's sessions or (null) every session's, and revokes the ones
   // it now refuses. by: the user whose act changed the access (an admin's
@@ -860,6 +863,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
   }
 
   const application = {
+    ready,
     repo,
     admitHosted,
     // `suggested`: the name the session's checkout suggested (#443), offered first while free.
@@ -1169,14 +1173,15 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     // Catches a user disabled with no server route to say so (a database
     // reset, an operator edit), and an alias its session's principal may no
     // longer act as (S9's backstop to accessChanged).
-    revalidate() {
+    // Its promise settles once the alias recheck is written (a failure there is logged, not rejected).
+    revalidate(): Promise<void> {
       for (const observer of [...observers]) observerLive(observer);
       const users = new Set<number>();
       for (const s of hub.sessions) {
         if (!s.human && repo.users.findById(s.authed.user_id)?.disabled_at != null) users.add(s.authed.user_id);
       }
       for (const id of users) application.disconnectUser(id);
-      void recheckAliases(null, null);
+      return recheckAliases(null, null);
     },
     sweepHellos: () => { hub.helloLimiter.sweep(); hostedRequestLimiter.sweep(); hostedSubscriberLimiter.sweep(); hub.delegateLimiter.sweep(); },
     /** How many users have a bind or hosted-request bucket, for tests. */

@@ -41,6 +41,7 @@ const ended = (id: string) => srv.app.db.prepare(`SELECT detail FROM access_log 
 async function restart(): Promise<void> {
   await srv.stop();
   srv = start(join(dbDir, "bus.db"));
+  await srv.app.ready;
 }
 
 // hosted twin: #451 (end)
@@ -109,7 +110,7 @@ test("a session whose end fails is audited and retried at the next revalidate; t
 
   // The session still writes as an alias it may not: the next revalidate ends it.
   repo.mailOn = mailOn;
-  srv.app.revalidate();
+  await srv.app.revalidate();
   expect(row(bad.id)!.ended_at).toBe(clock);
   expect(ended(bad.id)).toEqual([expect.objectContaining({ why: "revoked" })]);
 });

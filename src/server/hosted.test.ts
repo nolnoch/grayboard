@@ -1072,7 +1072,7 @@ test("a revoked tools-only hosted root's ownership ends, audited once: a later r
   expect(aliasUser(database.db, "ops/lead")).toBeNull();
   // Both rechecks, the principal's and the server's sweep, find the use gone.
   await application.accessChanged(database.repo.read, principal.authed.user_email, "admin@example.com");
-  application.revalidate();
+  await application.revalidate();
   expect(audits()).toEqual(revoked);
 });
 
