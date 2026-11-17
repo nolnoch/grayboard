@@ -31,11 +31,12 @@ test("no source file outside policy.ts calls a pre-seam rule helper", () => {
 // can't be reused. A7e3 raised application.ts, http.ts and teams.ts once: the store's team, principal and user reads
 // went async, and their synchronous callers that couldn't await yet moved to policyNow. A7f1 moved http.ts's team
 // guards, roster, claim list and act-as check, and teams.ts's onAliasCreated, to `authorize` and the store's reads;
-// http.ts keeps healthz's probe. policy.ts counts its drivers' `decide(`.
+// http.ts keeps healthz's probe. A7f2 moved application.ts's binds, alias recheck, sends, delegation reach and writer
+// marks; it keeps helloOkFields's team list (A7g). policy.ts counts its drivers' `decide(`.
 const SYNC_TWIN = /\bauthorizeNow\b|\bpolicyNow\b|\bdecide\(/g;
 const SYNC_TWIN_CEILING: Record<string, number> = {
   "src/server/access.ts": 16,
-  "src/server/application.ts": 16,
+  "src/server/application.ts": 1,
   "src/server/db.ts": 2,
   "src/server/http.ts": 1,
   "src/server/policy.ts": 9,
