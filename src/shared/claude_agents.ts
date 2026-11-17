@@ -20,6 +20,10 @@
 //                         ends that child's session at its SubagentStop (#555)
 //   model, effort         hosted only: the root session's latest model and
 //                         effort (#545), each written whole by one hook event
+//                         (a root call's effort drops itself when a model
+//                         switch overtook it, #561)
+//   hook-error            hosted only: why the last root fact write failed,
+//                         removed when one succeeds (#561)
 //   signin                hosted only: the live sign-in link (#500), which the
 //                         plugin's server writes and its post-tool-use hook shows
 //
@@ -47,6 +51,7 @@ import { isAlive, procStart, procStarts } from "./proc.ts";
 import { SESSION_FACT_MAX } from "./protocol.ts";
 import { validSourceId } from "./session_meta.ts";
 import { SIGN_IN_FLOW_MS, signInUrl } from "./signin.ts";
+import { testPause } from "./testpause.ts";
 
 /**
  * The live sign-in link (#500). The plugin's server writes it while its flow
@@ -80,6 +85,10 @@ export const sessionDir = (base: string, claudePid: number) => join(agentsRoot(b
 /** The root's facts, one file each. */
 export const FACTS = ["model", "effort"] as const;
 export type Fact = (typeof FACTS)[number];
+/** Why the last fact-writing hook event failed; the plugin says it (#561). */
+export const HOOK_ERROR = "hook-error";
+const HOOK_ERROR_MAX = 1024;
+// The events that write facts.
 // A model id or effort level: printable ASCII without spaces, as Claude Code's
 // are (`claude-opus-5-5`, `claude-opus-5-5[1m]`, `high`), no longer than the
 // server keeps, so what it shows is what the hook wrote.
@@ -99,6 +108,13 @@ const dropFact = (dir: string, fact: Fact) => rmSync(join(dir, fact), { force: t
 function noFact(dir: string, fact: Fact) {
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   put(join(dir, fact), "");
+}
+
+// A file's identity without opening it (a planted FIFO or link never blocks,
+// #588): put() renames a new inode into place, so every write changes it.
+function stamp(path: string): string {
+  const s = lstatSync(path, { throwIfNoEntry: false });
+  return s ? `${s.ino}:${s.mtimeMs}:${s.ctimeMs}` : "";
 }
 
 // Write through a temporary name, so a reader never sees a partial file.
@@ -166,7 +182,53 @@ function ageMs(path: string, now: number): number | undefined {
  * link is only ever a `systemMessage` (the user's line): `additionalContext`,
  * a `reason` and exit-2 stderr all reach the model.
  */
-export function runHook(event: string, stdin: string, o: { base: string; env: Record<string, string | undefined>; hosted: boolean; now?: number }): string | undefined {
+type HookOptions = { base: string; env: Record<string, string | undefined>; hosted: boolean; now?: number };
+export function runHook(event: string, stdin: string, o: HookOptions): string | undefined {
+  const errorPath = () => {
+    const pid = Number(o.env.CLAUDE_PID);
+    return Number.isSafeInteger(pid) && pid > 1 ? join(sessionDir(o.base, pid), HOOK_ERROR) : undefined;
+  };
+  const failed = (error: unknown) => {
+    // Hosted: the hook says nothing (it must never block a call), so a fact it
+    // couldn't write would leave the last one standing with no signal. Its
+    // reason goes in a file the plugin says once (#561), without the per-process
+    // temporary's pid, so a lasting failure reads the same from every hook; on a
+    // full disk that write fails too, and stays silent.
+    try {
+      const path = errorPath();
+      if (!path) return;
+      const text = `${event}: ${error instanceof Error ? error.message : String(error)}`.replace(/\.tmp\.\d+/g, ".tmp").replace(CONTROLS, " ").slice(0, HOOK_ERROR_MAX);
+      put(path, text);
+    } catch { /* nothing more to say it with */ }
+  };
+  const cleared = () => {
+    const path = errorPath();
+    if (path) try { rmSync(path, { force: true }); } catch (error) { failed(error); }
+  };
+  // Only a root fact write's failure is said, and only a finished one clears
+  // it: a subagent's record, an invalid input or the prune after the facts says
+  // nothing about them. Two root hooks racing can leave a newer success's
+  // removal overwritten by an older failure; the next root call clears it.
+  const facts: FactWrite = { state: "none" };
+  let out: string | undefined;
+  try { out = hookEvent(event, stdin, o, facts); }
+  catch (error) {
+    // Hosted: hookEvent rethrows only for this, and the hook exits 0 regardless.
+    if (facts.state === "writing") failed(error);
+    else if (facts.state === "written") cleared();
+    if (o.hosted) return undefined;
+    throw error;
+  }
+  if (facts.state === "written") cleared();
+  return out;
+}
+
+// Hosted only: whether this hook event has started (or finished) writing the root's facts.
+type FactWrite = { state: "none" | "writing" | "written" };
+// C0, DEL and C1: a fact error's text is one plain line on the plugin's stderr.
+const CONTROLS = /[\x00-\x1f\x7f-\x9f]+/g;
+
+function hookEvent(event: string, stdin: string, o: HookOptions, facts: FactWrite): string | undefined {
   try {
     const pid = Number(o.env.CLAUDE_PID);
     if (!Number.isSafeInteger(pid) || pid <= 1) return;
@@ -187,11 +249,13 @@ export function runHook(event: string, stdin: string, o: { base: string; env: Re
       // recycled pid, and treats the dir as its harness's (proc.ts's rule).
       put(join(dir, "start"), start ?? "");
       if (!o.hosted && validSourceId(input.session_id)) put(join(dir, "current"), JSON.stringify({ session: input.session_id, start: start ?? "", token: `${now}-${process.pid}-${Math.random().toString(36).slice(2)}` }));
-      if (o.hosted) {
+      if (o.hosted && (input.source !== "clear" || validFact(input.model))) {
         // A new process starts with no facts, even in a dir an earlier holder of
         // this pid left; a /clear keeps both of its process's facts.
+        facts.state = "writing";
         if (input.source !== "clear") for (const fact of FACTS) dropFact(dir, fact);
         putFact(dir, "model", input.model);
+        facts.state = "written";
       }
       pruneSessions(o.base, pid);
     } else if (event === "pre-tool-use") {
@@ -200,6 +264,8 @@ export function runHook(event: string, stdin: string, o: { base: string; env: Re
       const agent = input.agent_id;
       const content = agent === undefined ? ROOT : validSourceId(agent) && agent !== ROOT ? agent : undefined;
       if (content === undefined) return;
+      // The model file as this call's effort found it, taken first (see below).
+      const modelAt = o.hosted && content === ROOT ? stamp(join(dir, "model")) : undefined;
       mkdirSync(dir, { recursive: true, mode: 0o700 });
       put(join(dir, id), JSON.stringify({ agent: content === ROOT ? null : content, ...(!o.hosted && validSourceId(input.session_id) ? { session: input.session_id } : {}) }));
       pruneRecords(dir, now);
@@ -209,8 +275,19 @@ export function runHook(event: string, stdin: string, o: { base: string; env: Re
       // A null level is none too, should a build send one (#563 item 4).
       if (o.hosted && content === ROOT) {
         const level = (input.effort as { level?: unknown } | null | undefined)?.level;
+        testPause("hook-root-effort", o.env);
+        facts.state = "writing";
         if (level === undefined || level === null) noFact(dir, "effort");
         else putFact(dir, "effort", level);
+        // A model switch while this hook ran (#561 item 7): PostModelSwitch writes
+        // the model, then drops the effort, so a write of the old model's effort
+        // landing after that drop would stand. The model file changed under us:
+        // drop ours, and the next root call names the new model's. A switch
+        // whose write lands after this check drops ours itself; one that landed
+        // before the first stamp, while Claude Code was spawning this hook, isn't
+        // caught, and the next root call heals it.
+        if (stamp(join(dir, "model")) !== modelAt) dropFact(dir, "effort");
+        facts.state = "written";
       }
     } else if (event === "post-tool-use") {
       // PostToolUse and PostToolUseFailure (a signed-out call's result is an error).
@@ -220,8 +297,10 @@ export function runHook(event: string, stdin: string, o: { base: string; env: Re
     } else if (event === "model-switch") {
       // The new model's effort shows at the root's next grayboard call.
       if (o.hosted && validFact(input.to_model)) {
+        facts.state = "writing";
         putFact(dir, "model", input.to_model);
         dropFact(dir, "effort");
+        facts.state = "written";
       }
     } else if (event === "subagent-stop") {
       if (!o.hosted) return;
@@ -249,6 +328,7 @@ export function runHook(event: string, stdin: string, o: { base: string; env: Re
       throw error;
     }
     if (!o.hosted && event === "session-end") throw error;
+    if (o.hosted) throw error;
     // Attribution failures are said by the reader's missing-record error.
   }
 }
@@ -412,9 +492,10 @@ export function readCurrent(base: string, pid: number, harnessStart: string | nu
  * facts a hook wrote: an empty file is `null` (the host has none, #558), a
  * missing one is left out (unknown). A fact file that can't be read or isn't
  * one is left out and passed to `bad` (the caller says it), so the other fact
- * still goes.
+ * still goes. A hook's failed fact write (`hook-error`) is passed to `bad` as
+ * "hook", its control characters folded again.
  */
-export function readFacts(base: string, claudePid: number, harnessStart: string | null, bad: (fact: Fact, error: string) => void): { model?: string | null; effort?: string | null } | undefined {
+export function readFacts(base: string, claudePid: number, harnessStart: string | null, bad: (what: Fact | "hook", error: string) => void): { model?: string | null; effort?: string | null } | undefined {
   const dir = sessionDir(base, claudePid);
   let start: string;
   try { start = readFileSync(join(dir, "start"), "utf8"); } catch { return undefined; }
@@ -430,7 +511,27 @@ export function readFacts(base: string, claudePid: number, harnessStart: string 
     else if (validFact(value)) out[fact] = value;
     else bad(fact, `${join(dir, fact)} isn't a Claude Code ${fact}`);
   }
+  // A hook that couldn't write a fact (#561); unreadable is as good as absent.
+  let failure: string | undefined;
+  try { failure = readSmall(join(dir, HOOK_ERROR), HOOK_ERROR_MAX * 4).replace(CONTROLS, " "); } catch { /* none */ }
+  if (failure !== undefined) bad("hook", failure);
   return out;
+}
+
+/** The facts as the hooks last wrote them, read by `read` (readFacts's arguments bound); a problem is said once, again only after a read without it. */
+export function factReader(read: (bad: (what: Fact | "hook", error: string) => void) => ReturnType<typeof readFacts>, say: (text: string) => void): () => ReturnType<typeof readFacts> {
+  const said = new Set<string>();
+  return () => {
+    const seen = new Set<string>();
+    const out = read((what, error) => {
+      const text = what === "hook" ? `a grayboard hook failed, so the server may show a stale model or effort: ${error}` : `the server gets no ${what} for this session: ${error}`;
+      seen.add(text);
+      if (!said.has(text)) { said.add(text); say(text); }
+    });
+    // Nothing read (another process's dir) says nothing about what's fixed.
+    if (out !== undefined) for (const text of said) if (!seen.has(text)) said.delete(text);
+    return out;
+  };
 }
 
 const calledPath = (base: string, claudePid: number, agent: string) =>
