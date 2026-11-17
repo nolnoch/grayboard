@@ -1779,8 +1779,10 @@ function oauthOps(db: Database, hosted: HostedStoreOf): OAuthOps {
         if (!r || !b) return missing;
         if (r.browserHash !== browserHash || (r.consentSessionHash !== null && r.consentSessionHash !== sessionHash)) return invalid;
         const bound = { ...r, consentSessionHash: sessionHash };
-        db.run("UPDATE oauth_requests SET data = ? WHERE hash = ?", [JSON.stringify(bound), requestHash]);
-        return ok(bound);
+        // Binds once in one statement (D3): a binder racing another browser session for the request loses here.
+        const set = db.query<{ hash: string }, [string, string, string, string]>(`UPDATE oauth_requests SET data = ? WHERE hash = ?
+          AND coalesce(json_extract(data, '$.consentSessionHash'), ?) = ? RETURNING hash`).get(JSON.stringify(bound), requestHash, sessionHash, sessionHash);
+        return set ? ok(bound) : missing;
       }).immediate();
     },
     createBrowserSession(input, now, replaceHash) {
@@ -1807,7 +1809,8 @@ function oauthOps(db: Database, hosted: HostedStoreOf): OAuthOps {
         const c = input.code;
         if (input.approve && (!sameAuthorization(r, c) || c.userId !== b.userId || !hash(c.codeHash) ||
             !deadline(c.createdAt, c.expiresAt, now, OAUTH_TTL.code))) return invalid;
-        db.run("DELETE FROM oauth_requests WHERE hash = ?", [input.requestHash]);
+        // The delete consumes the request (D3): of two concurrent decisions only one deletes a row.
+        if (!db.query<{ hash: string }, [string]>("DELETE FROM oauth_requests WHERE hash = ? RETURNING hash").get(input.requestHash)) return missing;
         if (!input.approve) return ok(null);
         db.run("INSERT INTO oauth_codes(hash, user_id, expires_at, data) VALUES (?, ?, ?, ?)", [c.codeHash, c.userId, c.expiresAt, JSON.stringify({ ...authorizationData(c),
           codeHash: c.codeHash, userId: c.userId, createdAt: c.createdAt, expiresAt: c.expiresAt })]);
@@ -1841,7 +1844,8 @@ function oauthOps(db: Database, hosted: HostedStoreOf): OAuthOps {
           scopes: c.scopes, createdAt: now, expiresAt: input.grantExpiresAt, revokedAt: null };
         db.run("INSERT INTO oauth_grants(id, user_id, expires_at, data) VALUES (?, ?, ?, ?)", [g.id, g.userId, g.expiresAt, JSON.stringify(g)]);
         // The statement that sets grant_id spends the code (D3), so of two concurrent redeemers one wins at any isolation
-        // level. The grant goes in first because grant_id references it; a loser withdraws it and answers as a replay.
+        // level. The grant goes in first because grant_id references it; a loser withdraws it and answers as a replay, or
+        // not_found when the code or the winner's grant is gone.
         if (!spendCode("grant_id", g.id, input.codeHash)) {
           db.run("DELETE FROM oauth_grants WHERE id = ?", [g.id]);
           const winner = codeRow(input.codeHash)?.grant_id;
@@ -1863,7 +1867,7 @@ function oauthOps(db: Database, hosted: HostedStoreOf): OAuthOps {
         if (unusable) return unusable;
         if (!hash(input.tokenHash) || (input.label !== null && typeof input.label !== "string")) return invalid;
         const session = createSession(c.userId, input.tokenHash, input.label, now);
-        // As redeemCode: setting session_id spends the code; a loser withdraws its session and answers as a replay.
+        // As redeemCode: setting session_id spends the code; a loser withdraws its session and answers as a replay (or not_found).
         if (!spendCode("session_id", session.id, input.codeHash)) {
           db.run("DELETE FROM sessions WHERE id = ?", [session.id]);
           const winner = codeRow(input.codeHash)?.session_id;

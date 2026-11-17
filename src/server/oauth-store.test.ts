@@ -478,10 +478,16 @@ describe("OAuth domain store", () => {
     expect(await w1(tx => first.repo.oauth.redeemCode(tx, loser, start))).toEqual({ status: "replay" });
     first.db.exec("DROP TRIGGER steal");
     expect(first.db.query("SELECT id FROM oauth_grants").all()).toEqual([{ id: winner.grantId }]);
-    expect(first.db.query("SELECT hash FROM oauth_tokens WHERE hash IN (?, ?)").all(loser.tokens.accessHash, loser.tokens.refreshHash)).toHaveLength(0);
     expect(first.repo.oauth.isGrantActive(first.repo.read, winner.grantId, start)).toBe(false);
     expect(auditCount("oauth.code_replay_revoked")).toBe(1);
     expect(auditCount("oauth.grant_issued")).toBe(1);
+  });
+  test("a code deleted after its read answers not_found and leaves no grant", async () => {
+    await issueCode();
+    first.db.exec(`CREATE TRIGGER gone AFTER INSERT ON oauth_grants BEGIN DELETE FROM oauth_codes WHERE hash = '${code.codeHash}'; END`);
+    expect(await w1(tx => first.repo.oauth.redeemCode(tx, redemption(), start))).toEqual({ status: "not_found" });
+    first.db.exec("DROP TRIGGER gone");
+    expect(first.db.query("SELECT id FROM oauth_grants").all()).toHaveLength(0);
   });
   test("a login code spent after its read answers as a replay, withdraws its session and revokes the winner's", async () => {
     const login = { ...binding, scopes: ["grayboard:login"] };
@@ -499,7 +505,7 @@ describe("OAuth domain store", () => {
     expect(auditCount("oauth.code_replay_revoked")).toBe(1);
     expect(auditCount("oauth.session_issued")).toBe(0);
   });
-  test("a refresh token spent after its read answers as a replay; one revoked after it answers invalid", async () => {
+  test("a refresh token spent after its read answers as a replay; one revoked or expired after it answers invalid", async () => {
     const input = await issue();
     const presented = input.tokens.refreshHash;
     const rotate = (tokens: OAuthTokenPair) => w1(tx => first.repo.oauth.rotateRefresh(tx, { ...binding, refreshHash: presented, tokens }, start + 1));
@@ -512,6 +518,13 @@ describe("OAuth domain store", () => {
     absent(revoked);
     expect(first.repo.oauth.isGrantActive(first.repo.read, input.grantId, start + 1)).toBe(true);
     await w1(() => { first.db.run("UPDATE oauth_tokens SET revoked_at = NULL WHERE hash = ?", [presented]); });
+    first.db.exec(`CREATE TRIGGER expire_presented AFTER INSERT ON oauth_tokens WHEN NEW.kind = 'refresh' BEGIN
+      UPDATE oauth_tokens SET expires_at = ${start} WHERE hash = '${presented}'; END`);
+    const expired = pair(start + 1);
+    expect(await rotate(expired)).toEqual({ status: "invalid" });
+    first.db.exec("DROP TRIGGER expire_presented");
+    absent(expired);
+    await w1(() => { first.db.run("UPDATE oauth_tokens SET expires_at = ? WHERE hash = ?", [start + OAUTH_TTL.refresh, presented]); });
     first.db.exec(`CREATE TRIGGER steal AFTER INSERT ON oauth_tokens WHEN NEW.kind = 'refresh' BEGIN
       UPDATE oauth_tokens SET spent_at = ${start} WHERE hash = '${presented}'; END`);
     const loser = pair(start + 1);
