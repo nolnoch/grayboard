@@ -133,13 +133,15 @@ function signInUrl(text) {
 // src/shared/testpause.ts
 import { existsSync } from "fs";
 import { dirname } from "path";
+var parent = process.ppid;
+var abandoned = (file) => !existsSync(dirname(file)) || process.ppid !== parent;
 function testPause(point, env = process.env) {
   const file = env.BUS_TEST_PAUSE_FILE;
   if (env.BUS_TEST_PAUSE !== point || !file)
     return;
   console.error(`[grayboard] test pause hit: ${point}`);
   while (!existsSync(file)) {
-    if (!existsSync(dirname(file))) {
+    if (abandoned(file)) {
       console.error(`[grayboard] test pause abandoned: ${point}`);
       process.exit(1);
     }
