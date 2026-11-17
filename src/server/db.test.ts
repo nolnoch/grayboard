@@ -726,31 +726,31 @@ test("#807 P1c-7: user writes run on the handle they're given", async () => {
 // before it reads any argument, so a kept Tx is refused whatever the rest of the call says.
 test("#807 P1c-8: the OAuth store runs on the handle it's given", async () => {
   const { repo } = openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
-  const kept = await seed(repo, tx => {
-    repo.oauth.cleanup(tx, 1);
+  const kept = await seed(repo, async tx => {
+    await repo.oauth.cleanup(tx, 1);
     return tx;
   });
   const settled = /used after its transaction settled/;
   const x = {} as never;
   const o = repo.oauth;
-  expect(() => o.createRequest(kept, x, 1)).toThrow(settled);
-  expect(() => o.bindRequestSession(kept, "r", "b", "s", 1)).toThrow(settled);
-  expect(() => o.createBrowserSession(kept, x, 1)).toThrow(settled);
-  expect(() => o.revokeBrowserSession(kept, "s")).toThrow(settled);
-  expect(() => o.decideRequest(kept, x, 1)).toThrow(settled);
-  expect(() => o.redeemCode(kept, x, 1)).toThrow(settled);
-  expect(() => o.redeemLoginCode(kept, x, 1)).toThrow(settled);
-  expect(() => o.rotateRefresh(kept, x, 1)).toThrow(settled);
-  expect(() => o.revokeToken(kept, "t", "c", 1)).toThrow(settled);
-  expect(() => o.revokePreBuiltinGrants(kept, ["c"], 1)).toThrow(settled);
-  expect(() => o.cleanup(kept, 1)).toThrow(settled);
-  expect(() => o.findRequest(kept, "r", "b", 1)).toThrow(settled);
-  expect(() => o.findBrowserSession(kept, "s", 1)).toThrow(settled);
-  expect(() => o.findCodeScopes(kept, "c", "c", "r", "u", 1)).toThrow(settled);
-  expect(() => o.findRefreshGrant(kept, "h", "c", "r", 1)).toThrow(settled);
+  await expect(o.createRequest(kept, x, 1)).rejects.toThrow(settled);
+  await expect(o.bindRequestSession(kept, "r", "b", "s", 1)).rejects.toThrow(settled);
+  await expect(o.createBrowserSession(kept, x, 1)).rejects.toThrow(settled);
+  await expect(o.revokeBrowserSession(kept, "s")).rejects.toThrow(settled);
+  await expect(o.decideRequest(kept, x, 1)).rejects.toThrow(settled);
+  await expect(o.redeemCode(kept, x, 1)).rejects.toThrow(settled);
+  await expect(o.redeemLoginCode(kept, x, 1)).rejects.toThrow(settled);
+  await expect(o.rotateRefresh(kept, x, 1)).rejects.toThrow(settled);
+  await expect(o.revokeToken(kept, "t", "c", 1)).rejects.toThrow(settled);
+  await expect(o.revokePreBuiltinGrants(kept, ["c"], 1)).rejects.toThrow(settled);
+  await expect(o.cleanup(kept, 1)).rejects.toThrow(settled);
+  await expect(o.findRequest(kept, "r", "b", 1)).rejects.toThrow(settled);
+  await expect(o.findBrowserSession(kept, "s", 1)).rejects.toThrow(settled);
+  await expect(o.findCodeScopes(kept, "c", "c", "r", "u", 1)).rejects.toThrow(settled);
+  await expect(o.findRefreshGrant(kept, "h", "c", "r", 1)).rejects.toThrow(settled);
   expect(() => o.findActiveAccess(kept, "h", "r", [], 1)).toThrow(settled);
   expect(() => o.isGrantActive(kept, "g", 1)).toThrow(settled);
-  expect(() => o.revokeToken({} as Tx, "t", "c", 1)).toThrow("not a SQLite store handle");
+  await expect(o.revokeToken({} as Tx, "t", "c", 1)).rejects.toThrow("not a SQLite store handle");
   expect(o.isGrantActive(repo.read, "g", 1)).toBe(false);
   // A warm access cache still resolves the handle first.
   const issued = await issueOAuth(repo, "https://grayboard.example.com/mcp");

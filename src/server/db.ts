@@ -1651,28 +1651,29 @@ function makeOAuthStore(hosted: HostedStoreOf): OAuthStore {
     return o;
   };
   return {
-    createRequest: (tx, ...a) => on(tx).createRequest(...a),
-    findRequest: (r, ...a) => on(r).findRequest(...a),
-    bindRequestSession: (tx, ...a) => on(tx).bindRequestSession(...a),
-    createBrowserSession: (tx, ...a) => on(tx).createBrowserSession(...a),
-    findBrowserSession: (r, ...a) => on(r).findBrowserSession(...a),
-    revokeBrowserSession: (tx, ...a) => on(tx).revokeBrowserSession(...a),
-    decideRequest: (tx, ...a) => on(tx).decideRequest(...a),
-    findCodeScopes: (r, ...a) => on(r).findCodeScopes(...a),
-    redeemCode: (tx, ...a) => on(tx).redeemCode(...a),
-    redeemLoginCode: (tx, ...a) => on(tx).redeemLoginCode(...a),
-    findRefreshGrant: (r, ...a) => on(r).findRefreshGrant(...a),
-    rotateRefresh: (tx, ...a) => on(tx).rotateRefresh(...a),
-    revokeToken: (tx, ...a) => on(tx).revokeToken(...a),
+    createRequest: async (tx, ...a) => on(tx).createRequest(...a),
+    findRequest: async (r, ...a) => on(r).findRequest(...a),
+    bindRequestSession: async (tx, ...a) => on(tx).bindRequestSession(...a),
+    createBrowserSession: async (tx, ...a) => on(tx).createBrowserSession(...a),
+    findBrowserSession: async (r, ...a) => on(r).findBrowserSession(...a),
+    revokeBrowserSession: async (tx, ...a) => on(tx).revokeBrowserSession(...a),
+    decideRequest: async (tx, ...a) => on(tx).decideRequest(...a),
+    findCodeScopes: async (r, ...a) => on(r).findCodeScopes(...a),
+    redeemCode: async (tx, ...a) => on(tx).redeemCode(...a),
+    redeemLoginCode: async (tx, ...a) => on(tx).redeemLoginCode(...a),
+    findRefreshGrant: async (r, ...a) => on(r).findRefreshGrant(...a),
+    rotateRefresh: async (tx, ...a) => on(tx).rotateRefresh(...a),
+    revokeToken: async (tx, ...a) => on(tx).revokeToken(...a),
     findActiveAccess: (r, ...a) => on(r).findActiveAccess(...a),
     isGrantActive: (r, ...a) => on(r).isGrantActive(...a),
-    revokePreBuiltinGrants: (tx, ...a) => on(tx).revokePreBuiltinGrants(...a),
-    cleanup: (tx, ...a) => on(tx).cleanup(...a),
+    revokePreBuiltinGrants: async (tx, ...a) => on(tx).revokePreBuiltinGrants(...a),
+    cleanup: async (tx, ...a) => on(tx).cleanup(...a),
   };
 }
 
 // The store's methods without their handle, bound to one connection.
-type OAuthOps = { [K in keyof OAuthStore]: OAuthStore[K] extends (h: never, ...a: infer A) => infer R ? (...a: A) => R : never };
+// Synchronous: the store wraps each async method's result in a promise.
+type OAuthOps = { [K in keyof OAuthStore]: OAuthStore[K] extends (h: never, ...a: infer A) => infer R ? (...a: A) => Awaited<R> : never };
 function oauthOps(db: Database, hosted: HostedStoreOf): OAuthOps {
   const createSession = (userId: number, tokenHash: string, label: string | null, now: number) => insertSession(db, userId, tokenHash, label, now);
   const audit = (action: AuditAction, g: OAuthGrant, now: number, detail: Record<string, unknown> = {}) => {

@@ -553,13 +553,17 @@ test("actual access revocation between factory and dispatch prevents mutation", 
   const client = await connect();
   const original = oauth.isAuthorized;
   let checks = 0;
+  // The revoke answers with a promise (#807 P3 A6c), so seedSync's post would queue it; seed runs it now on the idle
+  // queue, and it commits a few microtasks later, before the dispatch's check. Awaited below, so a failure shows.
+  let revoking: Promise<void> | undefined;
   oauth.isAuthorized = principal => {
     const valid = original(principal);
-    if (++checks === 1) seedSync(store.repo, tx => store.repo.oauth.revokeToken(tx, principal.accessHash, principal.clientId, Date.now()));
+    if (++checks === 1) revoking = seed(store.repo, tx => store.repo.oauth.revokeToken(tx, principal.accessHash, principal.clientId, Date.now()));
     return valid;
   };
   try {
     await expect(client.callTool({ name: "board_create", arguments: { name: "blocked", purpose: "must not mutate" } })).rejects.toThrow("invalid_token");
+    await revoking;
     expect(checks).toBeGreaterThanOrEqual(2);
     expect(store.db.query("SELECT name FROM boards WHERE name = 'blocked'").get()).toBeNull();
   } finally { oauth.isAuthorized = original; }
