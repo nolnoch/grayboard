@@ -420,10 +420,12 @@ export function createHostedSessions(application: Application, options: { now?: 
     if (fullQueued?.promise) return fullQueued.promise;
     const mine: { promise?: Promise<void> } = {};
     fullQueued = mine;
+    // Cleared again when it settles: a write refused before its body starts (a failed BEGIN) must not leave every
+    // later request sharing its rejection.
     mine.promise = store.write(async tx => {
       if (fullQueued === mine) fullQueued = undefined;
       return readAll(tx);
-    }, applyAll);
+    }, applyAll).finally(() => { if (fullQueued === mine) fullQueued = undefined; });
     return mine.promise;
   }
   async function readAll(tx: Tx) {
