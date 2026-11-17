@@ -106,16 +106,16 @@ export class FileStorage implements KeyValueStorage {
 // returns the live capability for the same session and ownership) and both
 // admit every item. Undefined when another process holds it; that process
 // runs tools-only (DeliveryHeldElsewhere) and waits with waitDelivery.
-export function tryDelivery(path: string): Lock | undefined {
+export function tryDelivery(path: string, busyMs?: number): Lock | undefined {
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-  return tryAcquire(path);
+  return tryAcquire(path, busyMs);
 }
-// Retries tryDelivery every `intervalMs` (5 s) until it wins; rejects when
-// `signal` aborts.
+// Retries tryDelivery every `intervalMs` (5 s), with no busy wait, until it
+// wins; rejects when `signal` aborts.
 export async function waitDelivery(path: string, signal: AbortSignal, intervalMs = 5_000): Promise<Lock> {
   for (;;) {
     signal.throwIfAborted();
-    const lock = tryDelivery(path);
+    const lock = tryDelivery(path, 0);
     if (lock) return lock;
     await sleep(intervalMs, undefined, { signal });
   }

@@ -58,7 +58,7 @@ beforeEach(async () => {
 });
 afterEach(async () => {
   await router.close();
-  hosted.close(); application.stopExpiry(); oauth.close();
+  await hosted.close(); application.stopExpiry(); oauth.close();
   store.db.close();
   rmSync(dir, { recursive: true, force: true });
 });

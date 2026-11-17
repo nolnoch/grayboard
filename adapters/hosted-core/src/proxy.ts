@@ -390,15 +390,23 @@ export class ToolProxy {
   // 401 the transport's onUnauthorized retry didn't fix (SdkHttpError 401, or
   // the SDK's UnauthorizedError for a credential without onUnauthorized).
   private loginNeeded(error: unknown): AccessExpired | undefined {
-    for (let e = error, depth = 0; e && depth < 8; e = e instanceof Error ? e.cause : undefined, depth++) {
-      if (e instanceof AccessExpired) return e;
-      if (e instanceof InsufficientScope) return new AccessExpired(this.options.harness, this.options.loginAction, "login_required");
-      if (e instanceof UnauthorizedError || e instanceof SdkHttpError && e.status === 401) return new AccessExpired(this.options.harness, this.options.loginAction, "expired");
-    }
-    return undefined;
+    const cause = signOutCause(error);
+    return cause === undefined || cause instanceof AccessExpired ? cause : new AccessExpired(this.options.harness, this.options.loginAction, cause);
   }
 
   private transportFailure(error: unknown): boolean {
     return error instanceof ServerUnreachable || !!this.loginNeeded(error);
   }
+}
+
+// Why only a new login can make `error`'s request succeed, from its cause
+// chain, or undefined when a login wouldn't help: an AccessExpired as thrown,
+// else the reason one would carry.
+export function signOutCause(error: unknown): AccessExpired | "login_required" | "expired" | undefined {
+  for (let e = error, depth = 0; e && depth < 8; e = e instanceof Error ? e.cause : undefined, depth++) {
+    if (e instanceof AccessExpired) return e;
+    if (e instanceof InsufficientScope) return "login_required";
+    if (e instanceof UnauthorizedError || e instanceof SdkHttpError && e.status === 401) return "expired";
+  }
+  return undefined;
 }

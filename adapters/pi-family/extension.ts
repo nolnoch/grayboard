@@ -26,9 +26,9 @@ import * as signIns from "../hosted-core/src/offer.ts";
 import type { Flow, Last, Origin, Outcome, SignInState } from "../hosted-core/src/offer.ts";
 import type { SessionFacts } from "../hosted-core/src/port.ts";
 import { AccessExpired, accessExpiry, Refusal } from "../hosted-core/src/model.ts";
-import { CallAborted, failure, hostTools, snapshotTools, type CallHooks, type NativeTool, type ToolProxy } from "../hosted-core/src/proxy.ts";
+import { CallAborted, failure, hostTools, signOutCause, snapshotTools, type CallHooks, type NativeTool, type ToolProxy } from "../hosted-core/src/proxy.ts";
 import { outputOf } from "../hosted-core/src/results.ts";
-import { RootDelivery } from "../hosted-core/src/root.ts";
+import { NotStarted, RootDelivery } from "../hosted-core/src/root.ts";
 import { openBrowser } from "../../src/shared/browser.ts";
 import { configuredIdentity, describeLocation, sessionIdentity } from "../../src/shared/identity.ts";
 
@@ -75,6 +75,13 @@ export const RESUME_HINT = "run /grayboard resume";
 // A tool call that failed: the call itself is what to retry.
 const RETRY_HINT = "call the tool again";
 const SOURCE = "grayboard";
+// How long a model call waits for the instructions before going out without
+// them, and how long after a timeout or failure it skips the fetch: a server
+// that accepts connections and stalls would otherwise hold every prompt for
+// the connect timeout (#438-25).
+export const INSTRUCTIONS_WAIT_MS = 2_000;
+export const INSTRUCTIONS_BACKOFF_MS = 30_000;
+const LATE = Symbol("late");
 
 // A tool's arguments and MCP result as both entries' tools take and return
 // them: text and image blocks, and an error said in text when the server
@@ -472,14 +479,41 @@ export function createGrayboard(h: Harness): Grayboard {
   // System-prompt section: the server's instructions for this session. A
   // child registers first: the text an unregistered session gets tells it to
   // bind, which the server refuses a child.
+  // Bounded by INSTRUCTIONS_WAIT_MS; a timeout or failure is said once until a
+  // fetch succeeds, and starts INSTRUCTIONS_BACKOFF_MS without fetching, which
+  // a timed-out fetch that then lands ends (its text is cached). A sign-out
+  // (the sign-in path says it; the first call after a login fetches), a root
+  // still starting, and a shutdown are neither said nor backed off.
+  let quietUntil = 0;
+  let failing = false;
   const instructions = async (): Promise<string | undefined> => {
-    if (!session) return undefined;
-    try {
+    if (!session || Date.now() < quietUntil) return undefined;
+    const s = session;
+    const fetching = (async () => {
       if (root) return await root.instructions();
       if (!proxy) return undefined;
-      if (role.kind === "child") await enlist(role, session.id);
-      return await proxy.instructions(session.id);
-    } catch { return undefined; }
+      if (role.kind === "child") await enlist(role, s.id);
+      return await proxy.instructions(s.id);
+    })();
+    fetching.catch(() => {}); // a fetch that outlives the deadline settles unobserved
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const late = new Promise<typeof LATE>(resolve => { timer = setTimeout(() => resolve(LATE), INSTRUCTIONS_WAIT_MS); });
+    let why: string;
+    try {
+      const text = await Promise.race([fetching, late]);
+      if (text !== LATE) { failing = false; return text; }
+      why = `took longer than ${INSTRUCTIONS_WAIT_MS} ms`;
+    } catch (error) {
+      if (closed || signOutCause(error) || error instanceof NotStarted) return undefined;
+      why = `failed: ${message(error)}`;
+    } finally { clearTimeout(timer); }
+    if (closed) return undefined;
+    const until = quietUntil = Date.now() + INSTRUCTIONS_BACKOFF_MS;
+    // Late but answered: the backoff it started ends.
+    fetching.then(() => { if (quietUntil === until) { quietUntil = 0; failing = false; } }, () => {});
+    if (!failing) log(`fetching the instructions ${why}, so they aren't refreshed; trying again after ${INSTRUCTIONS_BACKOFF_MS / 1000} s or once a fetch answers`, "warning");
+    failing = true;
+    return undefined;
   };
 
   // ---- /grayboard ----

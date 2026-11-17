@@ -14216,13 +14216,13 @@ class LockTimeout extends Error {
 }
 var SQLITE_BUSY = 5;
 var held = new Set;
-function tryAcquire(path) {
+function tryAcquire(path, busyMs = 50) {
   const file = resolve(path);
   if (held.has(file))
     return;
   const db = new DatabaseSync(file);
   try {
-    db.exec("PRAGMA busy_timeout=50");
+    db.exec(`PRAGMA busy_timeout=${Math.max(0, Math.trunc(busyMs))}`);
     db.exec("BEGIN EXCLUSIVE");
   } catch (error) {
     db.close();
@@ -14248,17 +14248,17 @@ function tryAcquire(path) {
   };
 }
 async function acquire(path, options) {
-  const deadline = Date.now() + options.deadlineMs;
+  const deadline = performance.now() + options.deadlineMs;
   for (;; ) {
     options.signal?.throwIfAborted();
-    const lock = tryAcquire(path);
+    const lock = tryAcquire(path, 0);
     if (lock)
       return lock;
     await options.onBusy?.();
-    const left = deadline - Date.now();
+    const left = deadline - performance.now();
     if (left <= 0)
       throw new LockTimeout(resolve(path));
-    await sleep(Math.min(100, left), undefined, options.signal ? { signal: options.signal } : undefined);
+    await sleep(Math.min(100 + Math.random() * 10, left), undefined, options.signal ? { signal: options.signal } : undefined);
   }
 }
 
@@ -32105,14 +32105,14 @@ class FileStorage {
     return raw === undefined ? {} : SessionState.parse(raw);
   }
 }
-function tryDelivery(path) {
+function tryDelivery(path, busyMs) {
   mkdirSync(dirname(path), { recursive: true, mode: 448 });
-  return tryAcquire(path);
+  return tryAcquire(path, busyMs);
 }
 async function waitDelivery(path, signal, intervalMs = 5000) {
   for (;; ) {
     signal.throwIfAborted();
-    const lock = tryDelivery(path);
+    const lock = tryDelivery(path, 0);
     if (lock)
       return lock;
     await sleep4(intervalMs, undefined, { signal });
@@ -36275,19 +36275,23 @@ class ToolProxy {
     }
   }
   loginNeeded(error) {
-    for (let e = error, depth = 0;e && depth < 8; e = e instanceof Error ? e.cause : undefined, depth++) {
-      if (e instanceof AccessExpired)
-        return e;
-      if (e instanceof InsufficientScope)
-        return new AccessExpired(this.options.harness, this.options.loginAction, "login_required");
-      if (e instanceof UnauthorizedError || e instanceof SdkHttpError && e.status === 401)
-        return new AccessExpired(this.options.harness, this.options.loginAction, "expired");
-    }
-    return;
+    const cause = signOutCause(error);
+    return cause === undefined || cause instanceof AccessExpired ? cause : new AccessExpired(this.options.harness, this.options.loginAction, cause);
   }
   transportFailure(error) {
     return error instanceof ServerUnreachable || !!this.loginNeeded(error);
   }
+}
+function signOutCause(error) {
+  for (let e = error, depth = 0;e && depth < 8; e = e instanceof Error ? e.cause : undefined, depth++) {
+    if (e instanceof AccessExpired)
+      return e;
+    if (e instanceof InsufficientScope)
+      return "login_required";
+    if (e instanceof UnauthorizedError || e instanceof SdkHttpError && e.status === 401)
+      return "expired";
+  }
+  return;
 }
 
 // adapters/hosted-core/src/client.ts

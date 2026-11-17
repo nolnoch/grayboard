@@ -874,7 +874,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
       // A failed drain or lease detach mustn't skip the final heartbeat or leave
       // the hosted timer running against a closed database (#423).
       try { await Promise.all([...forwarding].map(stream => stream.stop())); }
-      finally { try { unlistenHosted(); resources.close(); delivery.close(); } finally { hosted.close(); } }
+      finally { try { unlistenHosted(); resources.close(); delivery.close(); } finally { await hosted.close(); } }
       await modern.close();
       await Promise.allSettled([...bodyReads]);
       while (closing.size) await Promise.all([...closing]);
