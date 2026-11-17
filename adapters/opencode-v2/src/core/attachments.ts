@@ -24,28 +24,31 @@ export type HostedAttachmentOptions = {
   roots: string[];
   cwd?: string;
   env?: Record<string, string | undefined>;
-  limits(): Promise<AttachmentLimits>;
+  // `signal`: the tool call's; the caps wait on the shared connection.
+  limits(signal?: AbortSignal): Promise<AttachmentLimits>;
   unreleased(id: number, error: Error): void;
 };
 
 export class HostedAttachments {
   constructor(readonly options: HostedAttachmentOptions) {}
-  async send<T>(paths: unknown, sessionID: string, send: (ids: number[]) => Promise<T>): Promise<T> {
-    const files = await readAttachmentFiles(paths, this.options.roots, { limits: await this.options.limits(), cwd: this.options.cwd });
-    return sendWithUploads(files, this.transport(sessionID), send);
+  // `signal` (one tool call's abort) stops the uploads and the download; it
+  // never stops a release, so an aborted send still frees what it uploaded.
+  async send<T>(paths: unknown, sessionID: string, send: (ids: number[]) => Promise<T>, signal?: AbortSignal): Promise<T> {
+    const files = await readAttachmentFiles(paths, this.options.roots, { limits: await this.options.limits(signal), cwd: this.options.cwd });
+    return sendWithUploads(files, this.transport(sessionID, signal), send);
   }
-  async get(args: { id?: unknown; dir?: unknown }, sessionID: string): Promise<SavedAttachment> {
+  async get(args: { id?: unknown; dir?: unknown }, sessionID: string, signal?: AbortSignal): Promise<SavedAttachment> {
     const id = checkAttachmentId(args.id);
     const target = await saveTarget(args.dir, this.options.roots, serverBusDir(this.options.resource.href), this.options.env, this.options.cwd);
-    return downloadAttachment(id, target, (await this.options.limits()).file, this.transport(sessionID));
+    return downloadAttachment(id, target, (await this.options.limits(signal)).file, this.transport(sessionID, signal));
   }
   // The hosted attachment routes act as the bound session whose raw source ID
   // rides in X-Grayboard-Session (the canonical encodeURIComponent form).
-  private transport(sessionID: string): AttachmentTransport {
+  private transport(sessionID: string, signal?: AbortSignal): AttachmentTransport {
     const base = `${this.options.resource.href.replace(/\/$/, "")}/attachments`;
     return {
       upload: async file => {
-        const response = await this.http("POST", `${base}?filename=${encodeURIComponent(file.filename)}`, sessionID, transferTimeoutMs(file.data.length), file.data);
+        const response = await this.http("POST", `${base}?filename=${encodeURIComponent(file.filename)}`, sessionID, transferTimeoutMs(file.data.length), file.data, signal);
         const stored = z.object({ id: z.number().int().positive() }).safeParse(await response.json().catch(() => undefined));
         if (!stored.success) throw new Error("Invalid attachment upload response");
         return stored.data.id;
@@ -62,7 +65,7 @@ export class HostedAttachments {
       },
       download: async (id, maxBytes) => {
         const ms = transferTimeoutMs(maxBytes);
-        const response = await this.http("GET", `${base}/${id}`, sessionID, ms);
+        const response = await this.http("GET", `${base}/${id}`, sessionID, ms, undefined, signal);
         const reader = response.body?.getReader();
         if (!reader) throw new Error(`attachment ${id}: empty download`);
         const chunks: Uint8Array[] = [];
@@ -88,8 +91,8 @@ export class HostedAttachments {
   }
   // One authorized byte request, retried once after onUnauthorized as the
   // MCP transport does; the host remains the only credential refresher.
-  private async http(method: "POST" | "GET" | "DELETE", url: string, sessionID: string, ms: number, body?: Uint8Array): Promise<Response> {
-    const signal = AbortSignal.any([AbortSignal.timeout(ms), this.options.signal]);
+  private async http(method: "POST" | "GET" | "DELETE", url: string, sessionID: string, ms: number, body?: Uint8Array, call?: AbortSignal): Promise<Response> {
+    const signal = AbortSignal.any([AbortSignal.timeout(ms), this.options.signal, ...(call ? [call] : [])]);
     for (let attempt = 0; ; attempt++) {
       const token = await this.options.auth.token();
       if (!token) throw new AccessExpired(this.options.harness, this.options.loginAction, "login_required");

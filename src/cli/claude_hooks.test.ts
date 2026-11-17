@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { claudeHooks, hooksDisabledBy, installClaudeHooks, recordHookInstalled, removeClaudeHooks, sessionStartOutput } from "./claude_hooks.ts";
@@ -90,6 +90,22 @@ test("install replaces its own hooks, keeps everyone else's, and leaves an uncha
   });
   expect(installClaudeHooks(BIN, path)).toBe(false);
   expect(JSON.parse(readFileSync(path, "utf8"))).toEqual(cfg);
+});
+
+// #439: `update` rewrites ~/.claude/settings.json through the atomic writer,
+// so a dotfiles symlink stays a link and the file keeps its mode.
+test("install and remove rewrite a symlinked settings.json at its target, keeping the link and the mode", () => {
+  const path = tmpSettings();
+  const target = join(mkdtempSync(join(tmpdir(), "gb-dotfiles-")), "settings.json");
+  writeFileSync(target, JSON.stringify({ model: "x" }));
+  chmodSync(target, 0o600);
+  rmSync(path, { force: true });
+  symlinkSync(target, path);
+  expect(installClaudeHooks(BIN, path)).toBe(true);
+  expect(removeClaudeHooks(path)).toBe(true);
+  expect(lstatSync(path).isSymbolicLink()).toBe(true);
+  expect(JSON.parse(readFileSync(target, "utf8"))).toEqual({ model: "x" });
+  expect(statSync(target).mode & 0o777).toBe(0o600);
 });
 
 test("remove drops only its own hooks and reports whether they were there", () => {

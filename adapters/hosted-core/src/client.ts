@@ -14,7 +14,7 @@ import type { Temporary } from "./children.js";
 import { failureMessage } from "./diagnostics.js";
 import type { Login } from "./login.js";
 import { accessExpiry } from "./model.js";
-import { failure, ToolProxy, type CallHooks, type NativeTool } from "./proxy.js";
+import { CallAborted, failure, ToolProxy, type CallHooks, type NativeTool } from "./proxy.js";
 import type { SessionFacts } from "./port.js";
 import { SubscriberError, Wire, type WireOptions } from "./wire.js";
 import { GRAYBOARD_SESSION_META } from "../../../src/shared/session_meta.ts";
@@ -143,10 +143,14 @@ export class HostedClient {
   // refusal, the transport, a JSON-RPC error) comes back as an error result
   // with the retry hint and failureText's detail. `proxy` is any call (pi's
   // child wraps its unattributed retry, so a converted failure never
-  // triggers that retry's whoami probe).
-  async call(proxy: Pick<ToolProxy, "call">, tool: string, args: Record<string, unknown>, sessionID: string): Promise<CallToolResult> {
-    try { return await proxy.call(tool, args, sessionID); }
-    catch (error) { return failure(failureText(error, this.options.retryHint)); }
+  // triggers that retry's whoami probe). A call `signal` aborted throws
+  // (CallAborted): the harness cancelled it, so there's no one to read a result.
+  async call(proxy: Pick<ToolProxy, "call">, tool: string, args: Record<string, unknown>, sessionID: string, signal?: AbortSignal): Promise<CallToolResult> {
+    try { return await proxy.call(tool, args, sessionID, signal); }
+    catch (error) {
+      if (signal?.aborted) throw error instanceof CallAborted ? error : new CallAborted({ cause: error });
+      return failure(failureText(error, this.options.retryHint));
+    }
   }
 
   // One Login.watch per session: a change of the grant store's epoch (a
