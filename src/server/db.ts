@@ -375,11 +375,16 @@ export interface Repo {
     advance(tx: Tx, address: string, streamType: "direct" | "team", streamRef: string, messageId: number): Promise<void>;
   };
   audit: {
+    // Synchronous on every store (#807 P3 A6h): writeAudit and recordDecision call it at ~100 sites, many in
+    // synchronous code inside a body. The row joins tx's transaction: it commits and rolls back with it (a savepoint's
+    // with the savepoint), and `last` on the same tx sees it. A store whose statements are async (Postgres) buffers
+    // the row on tx and inserts the buffer inside the transaction before COMMIT, never after; its `last` searches the
+    // buffer, newest first, before the table.
     write(tx: Tx, row: AccessLogRow): void;
     // The most recent row for this action+target, for dedup windows and
     // "has this happened recently" checks. Undefined when none exists.
-    last(r: Read, action: string, target: string): AccessLogRow | undefined;
-    prune(tx: Tx, olderThanMs: number): void;
+    last(r: Read, action: string, target: string): Promise<AccessLogRow | undefined>;
+    prune(tx: Tx, olderThanMs: number): Promise<void>;
   };
   slack: {
     links(r: Read): Promise<SlackLink[]>;
@@ -1488,10 +1493,10 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       write(tx, row) {
         insertAudit(sqliteOf(tx), row.at, row.actor, row.action, row.target, row.detail);
       },
-      last(r, action, target) {
+      async last(r, action, target) {
         return sqliteOf(r).query<AccessLogRow, [string, string]>(ACCESS_LOG_LAST_SQL).get(action, target) ?? undefined;
       },
-      prune(tx, olderThanMs) {
+      async prune(tx, olderThanMs) {
         sqliteOf(tx).run("DELETE FROM access_log WHERE at < ?", [olderThanMs]);
       },
     },

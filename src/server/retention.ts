@@ -13,8 +13,8 @@ export function pruneMessages(repo: Repo, tx: Tx, cutoffMs: number): Promise<voi
   return repo.messages.prune(tx, cutoffMs);
 }
 
-export function pruneAudit(repo: Repo, tx: Tx, cutoffMs: number): void {
-  repo.audit.prune(tx, cutoffMs);
+export function pruneAudit(repo: Repo, tx: Tx, cutoffMs: number): Promise<void> {
+  return repo.audit.prune(tx, cutoffMs);
 }
 
 function msUntilMidnightUTC(): number {

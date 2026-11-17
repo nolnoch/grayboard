@@ -138,7 +138,7 @@ export class SlackBridge implements SlackLinker {
         // unsuppressed row itself is what's owed, so a notice armed but not
         // yet delivered survives a restart. `last()` before the insert and
         // the clamp ride out clock skew in both directions.
-        const last = repo.audit.last(tx, "bridge.notified", target);
+        const last = await repo.audit.last(tx, "bridge.notified", target);
         const prior = last && at - last.at >= 0 && at - last.at < BRIDGE_NOTIFY_DEDUP_MS;
         writeAudit(repo, tx, "bridge.stopped", null, target, {
           reason: reason.detail,

@@ -396,11 +396,11 @@ test("writeAudit under another body's hold waits for it rather than writing into
   let release!: () => void;
   const holder = queueFor(db).run(() => new Promise<void>(r => { release = r; }));
   writeAudit(repo, repo.read, "hosted.stream_closed", null, "s-1", { reason: "test" });
-  expect(repo.audit.last(repo.read, "hosted.stream_closed", "s-1")).toBeUndefined();
+  expect(await repo.audit.last(repo.read, "hosted.stream_closed", "s-1")).toBeUndefined();
   release();
   await holder;
   await queueFor(db).run(() => {});
-  expect(repo.audit.last(repo.read, "hosted.stream_closed", "s-1")).toBeDefined();
+  expect(await repo.audit.last(repo.read, "hosted.stream_closed", "s-1")).toBeDefined();
 });
 
 // #807 P1b-4e: a write body may await. Its transaction stays open, and the queue held, across the await; meanwhile

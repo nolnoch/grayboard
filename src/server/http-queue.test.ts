@@ -100,7 +100,7 @@ for (const [route, action] of [["revoke-session", "auth.session_revoked"], ["dis
     expect(disconnected).toEqual([]);
     const bob = repo.users.findByEmail("bob@example.com")!;
     // Rolled back: no audit row, bob still enabled and signed in.
-    expect(repo.audit.last(repo.read, action, "bob@example.com")).toBeUndefined();
+    expect(await repo.audit.last(repo.read, action, "bob@example.com")).toBeUndefined();
     expect(bob.disabled_at).toBeNull();
     expect((await handleHttp(new Request("http://localhost/api/whoami", { headers: { Authorization: `Bearer ${bobToken}` } }),
       repo, config, touches, () => {}, undefined, hooks, "127.0.0.1")).status).toBe(200);
