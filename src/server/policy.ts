@@ -1,5 +1,8 @@
 // The server's authorization seam (#806). Every allow-or-deny decision the
-// server makes about who may do what is `authorize()`: pure, writing nothing.
+// server makes about who may do what is `decide()`'s, writing nothing. Its rules
+// are generators that yield each storage read they need (#807 P3 A7e): one set of
+// rule bodies, driven synchronously over `repo.policyNow` by `authorizeNow` (the
+// SQLite-only loader, until #807 B), or with no reads at all by `decidePure`.
 // The caller that owns a requested act records its decision with
 // `recordDecision` (an `authz.decision` row: every deny, and the allows of
 // team management and admin routes); filter checks (board visibility, mention
@@ -10,10 +13,10 @@
 import type { Read } from "./store/tx.ts";
 import { addressParts, type ScopeKind } from "../core/addresses.ts";
 import type { AttachmentReach } from "../core/attachments.ts";
-import type { Principal } from "../core/resolver.ts";
+import type { Principal, Resolver } from "../core/resolver.ts";
 import { HUMAN_NAME, HUMAN_RESERVED } from "../shared/addressing.ts";
 import { writeAudit } from "./audit.ts";
-import type { Repo, Team } from "./db.ts";
+import type { Alias, PrincipalRow, Repo, Team, User } from "./db.ts";
 import { RateLimiter, type RateLimit } from "./rate_limit.ts";
 
 // Who besides you can reach your human (your phone, through the Slack
@@ -74,21 +77,74 @@ export type Actor = { user: string | null; address?: string; session?: string };
 const allow = (rule: string): Decision => ({ allow: true, rule });
 const deny = (rule: string, reason: string, code: "forbidden" | "not_found" = "forbidden"): Decision => ({ allow: false, code, reason, rule });
 
-export function authorize(repo: Repo, ctx: PolicyContext, req: AuthzRequest): Decision {
+// Every storage read a rule makes, synchronously. `repo.policyNow` implements it (and AccessReadsSync) over the
+// SQLite connection (#807 P3 A7e1): reads in the caller's own transaction see its writes, as routeReads gives them.
+export interface PolicyReadsSync extends Resolver {
+  principalByName(name: string): PrincipalRow | undefined;
+  teamByName(name: string): Team | undefined;
+  isMember(teamId: number, userId: number): boolean;
+  isOwner(teamId: number, userId: number): boolean;
+  teamsOf(userId: number): Team[];
+  shareCollaborative(userA: number, userB: number): boolean;
+  shareDelegating(userA: number, userB: number): boolean;
+  userByEmail(email: string): User | undefined;
+}
+
+// The alias reads serverAccess's resolveMention makes beside its policy decisions (B5b moves them).
+export interface AccessReadsSync {
+  alias(address: string): Alias | undefined;
+  aliasesNamed(name: string): Alias[];
+}
+
+type ReadName = keyof PolicyReadsSync;
+type Op = { [K in ReadName]: { read: K; args: Parameters<PolicyReadsSync[K]> } }[ReadName];
+// A rule: yields the reads it needs, one at a time, and returns its answer.
+type Rule<T> = Generator<Op, T, unknown>;
+
+function* ask<K extends ReadName>(read: K, ...args: Parameters<PolicyReadsSync[K]>): Generator<Op, ReturnType<PolicyReadsSync[K]>, unknown> {
+  return (yield { read, args } as Op) as ReturnType<PolicyReadsSync[K]>;
+}
+
+// Runs a rule to its answer, each yielded read answered synchronously from `reads`. A read that throws propagates.
+function drive<T>(g: Rule<T>, reads: PolicyReadsSync): T {
+  for (let s = g.next(); ; ) {
+    if (s.done) return s.value;
+    const { read, args } = s.value;
+    s = g.next((reads[read] as (...a: unknown[]) => unknown).apply(reads, args));
+  }
+}
+
+// The decision over the SQLite connection's reads, synchronously: the form for callers that can't await yet (#807
+// P3 A7f converts them to the async loader). The reads see the caller's own transaction when it holds one.
+export function authorizeNow(repo: Repo, ctx: PolicyContext, req: AuthzRequest): Decision {
+  return drive(decide(ctx, req), repo.policyNow);
+}
+
+// The verbs whose rules read no storage: their callers hand over every fact.
+export type PureRequest = Extract<AuthzRequest, { verb: "session.act" | "hosted.session" | "attachment.read" | "admin" }>;
+
+// The decision of a verb that reads nothing, with no store at all. A rule that asks for a read here is a bug: it throws.
+export function decidePure(ctx: PolicyContext, req: PureRequest): Decision {
+  const s = decide(ctx, req).next();
+  if (!s.done) throw new Error(`policy: ${req.verb} asked for a storage read (${s.value.read})`);
+  return s.value;
+}
+
+export function* decide(ctx: PolicyContext, req: AuthzRequest): Rule<Decision> {
   switch (req.verb) {
     case "msg.send":
     case "human.reach": {
-      const rule = humanRule(repo, ctx.humanReach ?? "team", req.from, req.to);
+      const rule = yield* humanRule(ctx.humanReach ?? "team", req.from, req.to);
       return rule.allow ? allow(rule.rule) : deny(rule.rule, `${req.to} is a person's phone, reachable only by their teammates' agents`);
     }
     case "scope.act":
-      return actIn(repo, req.principal, req.scope);
+      return yield* actIn(req.principal, req.scope);
     case "alias.bind":
-      return req.name === HUMAN_NAME ? deny("alias.human_reserved", HUMAN_RESERVED) : actIn(repo, req.principal, req.scope);
+      return req.name === HUMAN_NAME ? deny("alias.human_reserved", HUMAN_RESERVED) : yield* actIn(req.principal, req.scope);
     case "act_as":
       if (req.name === HUMAN_NAME) return deny("alias.human_reserved", HUMAN_RESERVED);
       if (!req.scope) return deny("scope.ownerless", `no principal owns the scope of "${req.address}"`);
-      return actIn(repo, req.principal, req.scope);
+      return yield* actIn(req.principal, req.scope);
     case "session.act":
       return sessionRule(req.user, req.session, req.row);
     case "hosted.session":
@@ -104,25 +160,25 @@ export function authorize(repo: Repo, ctx: PolicyContext, req: AuthzRequest): De
       return req.reach.readable ? allow(rule) : deny(rule, missing, "not_found");
     }
     case "team.leave":
-      return req.team && repo.teams.isMember(req.team.id, req.user.id) ? allow("team.member") : deny("team.member", "not found", "not_found");
+      return req.team && (yield* ask("isMember", req.team.id, req.user.id)) ? allow("team.member") : deny("team.member", "not found", "not_found");
     case "team.read": {
       const { team, user } = req;
-      if (team && repo.teams.isMember(team.id, user.id)) return allow("team.member");
+      if (team && (yield* ask("isMember", team.id, user.id))) return allow("team.member");
       if (team && isAdmin(ctx, user.email)) return allow("admin.env");
       return deny("team.member", "not found", "not_found");
     }
     case "team.manage": {
       const { team, user } = req;
-      const member = !!team && repo.teams.isMember(team.id, user.id);
+      const member = !!team && (yield* ask("isMember", team.id, user.id));
       if (!team || (!member && !isAdmin(ctx, user.email))) return deny("team.member", "not found", "not_found");
-      if (member && repo.teams.isOwner(team.id, user.id)) return allow("team.owner");
+      if (member && (yield* ask("isOwner", team.id, user.id))) return allow("team.owner");
       if (isAdmin(ctx, user.email)) return allow("admin.env");
       return deny("team.owner", `only an owner of team "${team.name}" (or an admin) can add or remove members; \`grayboard team members ${team.name}\` lists its owners`);
     }
     case "msg.wake":
-      return wakeRule(repo, req.from_user, req.to_user);
+      return yield* wakeRule(req.from_user, req.to_user);
     case "delegate.to":
-      return delegateRule(repo, req.from_user, req.to_user);
+      return yield* delegateRule(req.from_user, req.to_user);
     case "alias.see":
       // The directory of people's names is open in the org (vision.md
       // principle 9); a team's names are its members' (and the team's own),
@@ -131,7 +187,7 @@ export function authorize(repo: Repo, ctx: PolicyContext, req: AuthzRequest): De
       // directory grant (as for msg.wake).
       if (req.scope.scope_kind === "person") return allow("alias.see_person");
       if (req.principal.kind === "team" && req.scope.scope_kind === "team" && req.principal.name === req.scope.scope_ref) return allow("alias.see_own_team");
-      return actIn(repo, req.principal, req.scope);
+      return yield* actIn(req.principal, req.scope);
     case "admin": {
       if (isAdmin(ctx, req.email)) return allow("admin.env");
       const admins = ctx.admins ?? [];
@@ -230,14 +286,14 @@ function isAdmin(ctx: PolicyContext, email: string): boolean {
 // one (#284 S9). Keyed by principal, not by email: a user acts in its own
 // person scope and in the teams it belongs to. Service scopes, and service
 // principals acting anywhere, wait for #270's grants.
-function actIn(repo: Repo, p: Principal, scope: ActScope): Decision {
+function* actIn(p: Principal, scope: ActScope): Rule<Decision> {
   const ref = scope.scope_ref;
   if (scope.scope_kind === "service" || p.kind === "service") return deny("scope.service", "service principals arrive with #270");
   if (p.kind !== "user") return deny("scope.user_only", `${p.name} is a ${p.kind}, not a user`);
   if (scope.scope_kind === "person") return ref === p.name ? allow("scope.own_person") : deny("scope.own_person", `${ref}'s scope isn't ${p.name}'s`);
-  const userId = repo.principals.findByName(p.name)?.user_id;
-  const team = repo.teams.findByName(ref);
-  return userId != null && team && repo.teams.isMember(team.id, userId)
+  const userId = (yield* ask("principalByName", p.name))?.user_id;
+  const team = yield* ask("teamByName", ref);
+  return userId != null && team && (yield* ask("isMember", team.id, userId))
     ? allow("scope.team_member")
     : deny("scope.team_member", `${p.name} isn't a member of team ${ref}`);
 }
@@ -260,10 +316,10 @@ function sessionRule(user: string, session: string, row: SessionFacts | undefine
 // wake. A user's own agents wake each other; across users, only members of a
 // shared 'collaborative' or 'delegating' team do (delegating implies it, #256). No admin exemption: admin is a server role,
 // not a messaging grant. One indexed lookup per decision (principle 11).
-function wakeRule(repo: Repo, fromUser: string, toUser: string): Decision {
+function* wakeRule(fromUser: string, toUser: string): Rule<Decision> {
   if (fromUser === toUser) return allow("wake.same_user");
-  const a = repo.users.findByEmail(fromUser), b = repo.users.findByEmail(toUser);
-  if (a && b && repo.teams.shareCollaborative(a.id, b.id)) return allow("wake.team_policy");
+  const a = yield* ask("userByEmail", fromUser), b = yield* ask("userByEmail", toUser);
+  if (a && b && (yield* ask("shareCollaborative", a.id, b.id))) return allow("wake.team_policy");
   return deny("wake.cross_user", `${fromUser} shares no collaborative team with ${toUser}; delivered as mail that doesn't wake their agent`);
 }
 
@@ -271,10 +327,10 @@ function wakeRule(repo: Repo, fromUser: string, toUser: string): Decision {
 // name (#256). A user's own launchers take it; across users, only members of
 // a shared 'delegating' team. The grant is the team's, set by its owner; an
 // owner-approved grant per launcher is #874. No admin exemption, as for wakes.
-function delegateRule(repo: Repo, fromUser: string, toUser: string): Decision {
+function* delegateRule(fromUser: string, toUser: string): Rule<Decision> {
   if (fromUser === toUser) return allow("delegate.same_user");
-  const a = repo.users.findByEmail(fromUser), b = repo.users.findByEmail(toUser);
-  if (a && b && repo.teams.shareDelegating(a.id, b.id)) return allow("delegate.team_policy");
+  const a = yield* ask("userByEmail", fromUser), b = yield* ask("userByEmail", toUser);
+  if (a && b && (yield* ask("shareDelegating", a.id, b.id))) return allow("delegate.team_policy");
   return deny("delegate.cross_user", `${fromUser} shares no team whose policy is delegating with ${toUser}`);
 }
 
@@ -284,26 +340,26 @@ function delegateRule(repo: Repo, fromUser: string, toUser: string): Decision {
 // (#284 S12), the analogue of sharing a team. Board mentions and thread
 // replies go through this too (access.ts), so a post can't reach a phone a
 // DM can't.
-function humanRule(repo: Repo, reach: HumanReach, from: string, to: string): { allow: boolean; rule: string } {
+function* humanRule(reach: HumanReach, from: string, to: string): Rule<{ allow: boolean; rule: string }> {
   const t = addressParts(to);
   if (t?.kind !== "alias" || t.name !== HUMAN_NAME) return { allow: true, rule: "human.not_human" };
   if (reach === "all") return { allow: true, rule: "human.reach_all" };
-  const f = repo.resolver.principalOf(from);
-  const them = t.scopeKind === "person" ? repo.users.findByEmail(t.scope) : undefined;
+  const f = yield* ask("principalOf", from);
+  const them = t.scopeKind === "person" ? yield* ask("userByEmail", t.scope) : undefined;
   if (!f || !them) return { allow: false, rule: "human.teammates" };
   if (f.kind === "team") {
-    const team = repo.teams.findByName(f.name);
-    return { allow: !!team && repo.teams.isMember(team.id, them.id), rule: "human.team_alias" };
+    const team = yield* ask("teamByName", f.name);
+    return { allow: !!team && (yield* ask("isMember", team.id, them.id)), rule: "human.team_alias" };
   }
   if (f.kind !== "user") return { allow: false, rule: "human.teammates" };
   if (f.name === them.email) return { allow: true, rule: "human.self" };
-  const me = repo.users.findByEmail(f.name);
+  const me = yield* ask("userByEmail", f.name);
   if (!me) return { allow: false, rule: "human.teammates" };
-  const theirs = new Set(repo.teams.listForUser(them.id).map((x) => x.id));
-  return { allow: repo.teams.listForUser(me.id).some((x) => theirs.has(x.id)), rule: "human.teammates" };
+  const theirs = new Set((yield* ask("teamsOf", them.id)).map((x) => x.id));
+  return { allow: (yield* ask("teamsOf", me.id)).some((x) => theirs.has(x.id)), rule: "human.teammates" };
 }
 
-// The pre-seam entry points, as authorize() answers them, for the unit tests
+// The pre-seam entry points, as authorizeNow() answers them, for the unit tests
 // that exercise each rule directly (can_send.test.ts, access.test.ts). Nothing
 // outside this module and tests calls them.
 export type SendContext = { db: Repo; now: number; humanReach: HumanReach };
@@ -313,18 +369,18 @@ export type SendDecision = { allow: true } | { allow: false; code: "forbidden" |
 const plain = (d: Decision): SendDecision => (d.allow ? { allow: true } : { allow: false, code: d.code, reason: d.reason });
 
 export function canSend(from: string, target: SendTarget, ctx: SendContext): SendDecision {
-  return plain(authorize(ctx.db, { humanReach: ctx.humanReach }, { verb: "msg.send", from, to: target.address }));
+  return plain(authorizeNow(ctx.db, { humanReach: ctx.humanReach }, { verb: "msg.send", from, to: target.address }));
 }
 
 export function reachesHuman(repo: Repo, reach: HumanReach, from: string, to: string): boolean {
-  return authorize(repo, { humanReach: reach }, { verb: "human.reach", from, to }).allow;
+  return authorizeNow(repo, { humanReach: reach }, { verb: "human.reach", from, to }).allow;
 }
 
 export function canAdmin(email: string, admins: readonly string[]): SendDecision {
-  return plain(authorize(undefined as unknown as Repo, { admins }, { verb: "admin", email }));
+  return plain(decidePure({ admins }, { verb: "admin", email }));
 }
 
 export function mayActIn(repo: Repo, p: Principal, scope: ActScope): string | null {
-  const d = authorize(repo, {}, { verb: "scope.act", principal: p, scope });
+  const d = authorizeNow(repo, {}, { verb: "scope.act", principal: p, scope });
   return d.allow ? null : d.reason;
 }

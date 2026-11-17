@@ -6,9 +6,9 @@ import { writeAudit } from "./audit.ts";
 import { participant, queuedGuardTx, queuedTx, type Repo } from "./db.ts";
 import type { Read } from "./store/tx.ts";
 import { addressSet } from "../core/bindings.ts";
-import { authorize, recordDecision, type Actor, type AuthzRequest } from "./policy.ts";
+import { decidePure, recordDecision, type Actor, type PureRequest } from "./policy.ts";
 
-// The read request for attachment `idText`, judged by authorize(): `handle` may read it on a post on a board it can see,
+// The read request for attachment `idText`, judged by policy.ts decidePure(): `handle` may read it on a post on a board it can see,
 // on a direct message it sent or received, or its own unsent upload. A
 // session's files are its whole address set's (#284 S8): `principal` names
 // the caller, whose session holding `handle` (or held by it) joins the set;
@@ -21,7 +21,7 @@ function readRequest(repo: Repo, r: Read, handle: string, idText: string, princi
   const row = Number.isInteger(id) && id > 0 ? getAttachment(db, id) : undefined;
   const addresses = addressSet(db, handle, principal);
   const dmVisible = (messageId: number) => participant(repo.messages.getById(r, messageId), addresses);
-  const req: AuthzRequest = { verb: "attachment.read", identity: handle, attachment: idText.slice(0, 32), reach: row && attachmentReach(db, handle, row, dmVisible, { addresses, principal: user }) };
+  const req: PureRequest = { verb: "attachment.read", identity: handle, attachment: idText.slice(0, 32), reach: row && attachmentReach(db, handle, row, dmVisible, { addresses, principal: user }) };
   return { row, req };
 }
 
@@ -31,8 +31,8 @@ function readRequest(repo: Repo, r: Read, handle: string, idText: string, princi
 // inside it. `writeAudit` joins an open transaction and queues otherwise, so neither row needs deferring.
 export function requestAttachment(repo: Repo, r: Read, handle: string, idText: string, principal: string | null, actor: Actor & { user: string }, detail: Record<string, unknown> = {}): { row: AttachmentRow } | { refused: string } {
   const { row, req } = readRequest(repo, r, handle, idText, principal, actor.user);
-  const d = authorize(repo, {}, req);
-  // An allow has a row: authorize() refuses an attachment that doesn't exist.
+  const d = decidePure({}, req);
+  // An allow has a row: the rule refuses an attachment that doesn't exist.
   if (d.allow) return { row: row! };
   writeAudit(repo, r, "attachment.download_refused", actor.user, `attachment:${req.attachment}`, { identity: handle, ...detail });
   recordDecision(repo, r, actor, req, d, detail);

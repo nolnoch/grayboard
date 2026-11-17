@@ -15,7 +15,7 @@ import { GRAYBOARD_DELIVERY_META, GRAYBOARD_EFFORT_META, GRAYBOARD_LAUNCHER_META
 import type { HostedEnd, HostedLost, HostedSession, LostReader } from "./hosted-types.ts";
 import { writeAudit, type AuditAction } from "./audit.ts";
 import { hostedFailure } from "./hosted-diagnostics.ts";
-import { authorize, recordDecision, type AuthzRequest } from "./policy.ts";
+import { decidePure, recordDecision, type PureRequest } from "./policy.ts";
 import { countRefusal } from "./metrics.ts";
 import type { Read, Tx } from "./store/tx.ts";
 
@@ -273,8 +273,8 @@ export function createHostedSessions(application: Application, options: { now?: 
   // `authz.decision` row, handed to `later` (the throw rolls back a row written inside). `from`: the requesting
   // session, when it isn't the row itself.
   function ownRow(p: OAuthPrincipal, row: HostedSession, later: (write: RefusalRow) => void, from = row.session_id) {
-    const req: AuthzRequest = { verb: "hosted.session", session: row.session_id, user: p.authed.user_id, client: p.clientId, row: { user: row.user_id, client: row.client_id } };
-    const d = authorize(repo, {}, req);
+    const req: PureRequest = { verb: "hosted.session", session: row.session_id, user: p.authed.user_id, client: p.clientId, row: { user: row.user_id, client: row.client_id } };
+    const d = decidePure({}, req);
     if (d.allow) return;
     later(w => recordDecision(repo, w, { user: p.authed.user_email, session: from }, req, d));
     throw new ApplicationError(d.code, d.reason);

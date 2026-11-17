@@ -6,7 +6,7 @@
 // next delivery (principle 11). The sender is told (`wakes: false`).
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import type { DeliveryEvent } from "../../src/server/application.ts";
-import { authorize } from "../../src/server/policy.ts";
+import { authorizeNow } from "../../src/server/policy.ts";
 import { accessAudits } from "../support/audit.ts";
 import { board, direct } from "../support/events.ts";
 import { seed } from "../support/seed.ts";
@@ -41,7 +41,7 @@ async function team(): Promise<void> {
 
 test("the msg.wake rule: same user, a shared collaborative team, else denied; admin is no exemption", async () => {
   const repo = srv.app.repo;
-  const wake = (from: string, to: string, admins: string[] = []) => authorize(repo, { admins }, { verb: "msg.wake", from_user: from, to_user: to });
+  const wake = (from: string, to: string, admins: string[] = []) => authorizeNow(repo, { admins }, { verb: "msg.wake", from_user: from, to_user: to });
   expect(wake(A, A)).toMatchObject({ allow: true, rule: "wake.same_user" });
   expect(wake(B, A)).toMatchObject({ allow: false, rule: "wake.cross_user" });
   expect(wake(B, A, [B])).toMatchObject({ allow: false, rule: "wake.cross_user" });
@@ -61,7 +61,7 @@ test("the msg.wake rule: same user, a shared collaborative team, else denied; ad
 // delegate.to rule is the narrower one: only 'delegating' grants it.
 test("a delegating team grants wakes and delegate.to; collaborative grants wakes only", async () => {
   const repo = srv.app.repo;
-  const rule = (verb: "msg.wake" | "delegate.to", from: string, to: string) => authorize(repo, { admins: [B] }, { verb, from_user: from, to_user: to });
+  const rule = (verb: "msg.wake" | "delegate.to", from: string, to: string) => authorizeNow(repo, { admins: [B] }, { verb, from_user: from, to_user: to });
   expect(rule("delegate.to", A, A)).toMatchObject({ allow: true, rule: "delegate.same_user" });
   await team();
   expect((await policy(alice, "eng", "collaborative")).status).toBe(200);
