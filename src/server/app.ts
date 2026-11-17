@@ -16,6 +16,7 @@ import type { Config } from "./config.ts";
 import { SlackBridge } from "./slack.ts";
 import { serveMetrics, startLagSampler, type Gauges } from "./metrics.ts";
 import { testPauseAsync } from "../shared/testpause.ts";
+import { settleAll } from "./settle.ts";
 
 export type StartOptions = ApplicationOptions & {
   hostname?: string;
@@ -84,8 +85,8 @@ export function startServer(config: Config, opts: StartOptions = {}) {
   const attachments = createMcpAttachments(repo, oauth, uploads, { trustedOrigin: new URL(config.publicUrl).origin, sessions: mcp.sessions });
   // The startup writes, each through the write queue in the order queued (#807 P3 A4): the dev-session revocation,
   // OAuth's built-in client cutovers, and hosted's downtime credit and first sweep. The listener serves nothing until
-  // all have committed; a failure rejects it, and every request then fails, so the caller (main.ts) exits on it.
-  const ready: Promise<void> = Promise.all([devRevoked, oauth.ready, mcp.sessions.ready]).then(() => testPauseAsync("server:ready"));
+  // all have settled; a failure then rejects it, and every request fails, so the caller (main.ts) exits on it.
+  const ready: Promise<void> = settleAll([devRevoked, oauth.ready, mcp.sessions.ready]).then(() => testPauseAsync("server:ready"));
   let started = false;
   ready.then(() => { started = true; }, () => {});
 

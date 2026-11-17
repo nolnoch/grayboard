@@ -21,8 +21,9 @@ export function seed<T>(on: Pick<Repo, "write"> | Database, fn: (tx: Tx) => T): 
 }
 
 // seed() for a write a synchronous hook makes (a test's stand-in for a production function, called outside any queued
-// body), which can't await: the Repo's post, which runs fn now on an idle queue. It throws when the post didn't run
-// now (another body holds the queue), rather than letting the write land after the hook has returned.
+// body), which can't await: the Repo's post, which runs fn now on an idle queue. When another body holds the queue,
+// post has already queued fn, which commits later, after the hook has returned; the throw doesn't stop that write, it
+// makes the test fail visibly instead of passing on a write that landed out of order.
 export function seedSync(on: Pick<Repo, "post">, fn: (tx: Tx) => void): void {
   if (!on.post(fn, undefined, "seedSync")) throw new Error("seedSync: the write queue is held, so the write didn't run now");
 }

@@ -13,6 +13,7 @@ import { RateLimiter, retrySecs, type RateLimit } from "./rate_limit.ts";
 import { hostedFailure } from "./hosted-diagnostics.ts";
 import { isTrustedOrigin } from "./origin.ts";
 import { SITE_LIMIT_FACTOR } from "./auth_gate.ts";
+import { settleAll } from "./settle.ts";
 
 // `sourceKey` is the `_meta` key that maps this client's hosted session source, or null
 // (unmapped: reads only). A pure function of the client ID and the startup config.
@@ -126,13 +127,17 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
   const now = options.now ?? Date.now;
   // Before any request (the server's `ready` waits for it, #807 P3 A4), and only once the config parsed: a grant an
   // operator client issued under a now-built-in ID (before #429) would otherwise act as a built-in's.
-  const ready = repo.write(tx => repo.oauth.revokePreBuiltinGrants(tx, BUILTIN_CLIENT_IDS, now())).then(revoked => {
-    if (revoked) console.error(`[grayboard] revoked ${revoked} OAuth grant(s) issued under a built-in client ID (${BUILTIN_CLIENT_IDS.join(", ")}) before this server had built-in clients; those clients sign in again`);
+  // Both writes are queued here, in order, so the built-in cutover commits before the CLI's and both before
+  // anything a request queues later.
+  const ready = settleAll([
+    repo.write(tx => repo.oauth.revokePreBuiltinGrants(tx, BUILTIN_CLIENT_IDS, now())).then(revoked => {
+      if (revoked) console.error(`[grayboard] revoked ${revoked} OAuth grant(s) issued under a built-in client ID (${BUILTIN_CLIENT_IDS.join(", ")}) before this server had built-in clients; those clients sign in again`);
+    }),
     // The same once for grayboard-cli (#928 D8), under its own key: the cutover above already ran on most databases.
-    return repo.write(tx => repo.oauth.revokePreBuiltinGrants(tx, [CLI_CLIENT_ID], now(), "builtin_clients_cli"));
-  }).then(revokedCli => {
-    if (revokedCli) console.error(`[grayboard] revoked ${revokedCli} OAuth grant(s) issued under ${CLI_CLIENT_ID} before this server reserved it for CLI sign-in`);
-  });
+    repo.write(tx => repo.oauth.revokePreBuiltinGrants(tx, [CLI_CLIENT_ID], now(), "builtin_clients_cli")).then(revokedCli => {
+      if (revokedCli) console.error(`[grayboard] revoked ${revokedCli} OAuth grant(s) issued under ${CLI_CLIENT_ID} before this server reserved it for CLI sign-in`);
+    }),
+  ]);
   const cimd = createCimdResolver({ ...options.cimd, now });
   // Only listed metadata documents are clients (F-16): any HTTPS URL could otherwise publish
   // redirects that authorize errors follow, and a name the consent page shows.

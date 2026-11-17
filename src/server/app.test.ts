@@ -274,9 +274,6 @@ test("an explicit observerCap start option overrides the configured watch cap (#
   expect(startLimits({ helloLimit: { burst: 3, perSec: 1 }, hostedRequestLimit: { burst: 7, perSec: 2 }, hostedCaps }, { observerCap: 5 })).toMatchObject({ observerCap: 5 });
 });
 
-// F-04: a dev sign-in token must not outlive dev auth. A restart without it
-// revokes every dev token, and turning dev auth back on doesn't revive them;
-// a token from the real sign-in survives.
 // #807 P3 A4: the startup writes are queued, and the listener serves nothing until they've committed: a request that
 // arrives first waits for `ready`. The pause holds `ready` open after the writes, so the request is in flight while it is.
 test("a request that arrives before the startup writes commit waits for them", async () => {
@@ -306,6 +303,35 @@ test("a request that arrives before the startup writes commit waits for them", a
   }
 });
 
+// A startup write that fails rejects `ready`; `stop` still resolves (it waits for the writes to settle, not to
+// succeed), and a request then gets the bare 500 rather than a served answer. The trigger fails hosted's downtime
+// credit, which writes the heartbeat row on every start.
+test("a startup write that fails rejects ready, and the server stops and serves nothing", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "gb-ready-fail-"));
+  const config = restartConfig(dir);
+  const log = spyOn(console, "error").mockImplementation(() => {});
+  let app: ReturnType<typeof startServer> | undefined;
+  try {
+    app = startServer(config, { hostname, background: false }); await app.ready;
+    await app.stop(); app = undefined;
+    const db = new Database(config.dbPath);
+    db.run("CREATE TRIGGER fail_state_insert BEFORE INSERT ON server_state BEGIN SELECT RAISE(ABORT, 'startup write refused'); END");
+    db.run("CREATE TRIGGER fail_state_update BEFORE UPDATE ON server_state BEGIN SELECT RAISE(ABORT, 'startup write refused'); END");
+    db.close();
+
+    app = startServer(config, { hostname, background: false });
+    expect(await app.ready.then(() => "resolved", (e: Error) => e.message)).toContain("startup write refused");
+    expect((await fetch(`http://${hostname}:${app.server.port}/healthz`)).status).toBe(500);
+    await app.stop(); app = undefined;
+  } finally {
+    log.mockRestore();
+    await app?.stop().catch(() => {}); rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// F-04: a dev sign-in token must not outlive dev auth. A restart without it
+// revokes every dev token, and turning dev auth back on doesn't revive them;
+// a token from the real sign-in survives.
 test("a server started without dev auth revokes dev sign-in tokens for good", async () => {
   const dir = mkdtempSync(join(tmpdir(), "gb-dev-revoke-"));
   const config = restartConfig(dir);
