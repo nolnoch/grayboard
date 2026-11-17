@@ -1116,8 +1116,6 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     // Whether the session's ownership declared a launcher (#473, #520): what its instruction text follows, since the
     // stored flag, not the current request's `_meta`, decides whether it receives delegation requests.
     hostedLauncher(id: string): Promise<boolean> { return repo.hosted.launcher(repo.read, id); },
-    // The same, synchronously: SQLite only, for the MCP layer's instruction text until A7h2 (#807 P3).
-    hostedLauncherNow(id: string): boolean { return repo.hosted.launcherNow(repo.read, id); },
     hostedPlace(tx: Tx, id: string, place: string | null) { setPlace(repo.coreOn(tx), id, place); },
     // Trusted in-process bridge capability; never expose this through client arguments.
     attachHuman,

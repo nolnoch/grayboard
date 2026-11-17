@@ -51,15 +51,22 @@ const ids = z.array(id);
 const text = (value: unknown): CallToolResult => ({ content: [{ type: "text", text: typeof value === "string" ? value : JSON.stringify(value, null, 2) }] });
 const LEGACY_GET_PRIME = ": keepalive\n\n";
 // `declared`: the native request's declared delivery (#429), for text only.
-type Context = { request: Request; principal: OAuthPrincipal; sessionContext: SessionContext; declared?: DeclaredDelivery; stamp?: { ownership: number; generation: number }; verdict?: Verdict; role: HostedRole; session: ApplicationSession; info: IdentityInfo; finish(): void };
+// `instruction`: what the bound text reads from the ownership (its launcher flag and lease), read by `select` for a
+// context makeServer may give the bound text (#807 P3 A7h2).
+type Context = { request: Request; principal: OAuthPrincipal; sessionContext: SessionContext; declared?: DeclaredDelivery; stamp?: { ownership: number; generation: number }; verdict?: Verdict; role: HostedRole; session: ApplicationSession; info: IdentityInfo; instruction?: { launcher: boolean; leased: boolean }; finish(): void };
 type Binding = { user: number; email: string; grant: string; role: HostedRole; identity: string };
 // A legacy session whose access token expired with its grant still active sleeps
 // (#476): its admission is released, its sid stays, and the binding's next
 // authenticated request re-admits it. `dormant` holds the separate dormant bound.
 // `controls`: the tail of this protocol session's subscribe/unsubscribe chain; each runs after the previous settles (#431).
 type Legacy = { ref: string; meta?: unknown; server: McpServer; transport: WebStandardStreamableHTTPServerTransport; binding: Binding; principal: OAuthPrincipal; release(): void; subscriptions: Map<string, string | null>; stream?: Live; posts: number; lastUsed: number; stopped: boolean; controls: Promise<unknown>; dormant?: { since: number; release(): void } };
-type Checked = { row: HostedSession | undefined; root?: HostedSession };
-type Live = { context: Context; rows: Set<string>; uris: Map<string, string | null>; watches: string[]; stream?: OwnedStream; handler?: McpHttpHandler; legacy?: Legacy; stopped: boolean; hint(uri: string): void; stop(): void };
+// `seq`: the hosted notice number when the read began; a notice since naming one of its rows makes it stale (#807 P3
+// A7h2, `moved`).
+type Checked = { row: HostedSession | undefined; root?: HostedSession; seq: number };
+type Bound = { row: HostedSession | undefined; root?: HostedSession };
+// `bound`: the binding's row and root as the last read or commit notice left them, which a notice judges (#807 P3
+// A7h2). `rechecking`: the context a re-read of them is in flight for.
+type Live = { context: Context; rows: Set<string>; bound: Bound; rechecking?: Context; uris: Map<string, string | null>; watches: string[]; stream?: OwnedStream; handler?: McpHttpHandler; legacy?: Legacy; stopped: boolean; hint(uri: string): void; stop(): void };
 
 export function createHostedMcp(application: Application, oauth: Pick<ReturnType<typeof createOAuthServer>, "authenticate" | "isAuthorized" | "peekAuthorized" | "isGrantActive" | "issuer" | "resource">, opts: { trustedOrigin: string; now?: () => number; limits?: McpLimits; caps?: HostedCaps; idleSeconds?: number; streamRecheckMs?: number }) {
   const now = opts.now ?? Date.now;
@@ -183,31 +190,37 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
   async function authorize(context: Context, signal?: AbortSignal, withRow = true): Promise<Checked | void> {
     await authCheck(context, signal);
     if (!withRow) return;
-    return rowCheck(context);
+    const checked = await rowCheck(context);
+    if (cancelled(context, signal)) throw new ApplicationError("unauthenticated", "request cancelled");
+    return checked;
   }
-  // authorize's hosted-row part, synchronous: the timer's phase B reuses it after its own auth check.
-  function rowCheck(context: Context): Checked {
-    if (!("id" in context.sessionContext)) return { row: undefined };
-    const row = hosted.row(context.sessionContext.id);
-    const root = row && hosted.rootOf(row);
-    if (!root || root.lease_deadline === null || root.lease_deadline > now()) return { row, root };
+  // authorize's hosted-row part, also a live's recheck (#807 P3 A7h2). The row and root are two pool reads: a commit
+  // between them leaves a mixed pair, which `bindingLive` refuses unless the root still names the row's ownership,
+  // and a notice for either since `seq` makes a live re-read them (`adopt`). The lease deadline is checked against
+  // the root as read, the newer of the two.
+  async function rowCheck(context: Context): Promise<Checked> {
+    const start = seq;
+    if (!("id" in context.sessionContext)) return { row: undefined, seq: start };
+    const row = await hosted.readRow(context.sessionContext.id);
+    const root = row && await hosted.readRoot(row);
+    if (!root || root.lease_deadline === null || root.lease_deadline > now()) return { row, root, seq: start };
     // The settle's body is async (#807 P3 A6e2) and nothing waits for it: the request answers no row, failing
     // closed. It goes through the write queue, not post: authorize also runs from the queue's holder (a board
     // commit's afterCommit hint), where an async post throws; a write queues behind the holder. The settle judges
     // the root when it runs, which may find a body it waited behind renewed the lease.
     void application.repo.write(tx => hosted.settle(tx, root.session_id)).catch(e => hostedFailure("hosted.settle", e));
-    return { row: undefined };
+    return { row: undefined, seq: start };
   }
   // authorize's checks that read no hosted row: the request, the token and grant, the session and its user. The
   // request is checked again after the awaits: a close or cancel that landed meanwhile refuses (#807 P3 A7d).
+  const cancelled = (context: Context, signal?: AbortSignal) => closed || context.request.signal.aborted || !!signal?.aborted;
   async function authCheck(context: Context, signal?: AbortSignal) {
-    const cancelled = () => closed || context.request.signal.aborted || !!signal?.aborted;
-    if (cancelled()) throw new ApplicationError("unauthenticated", "request cancelled");
+    if (cancelled(context, signal)) throw new ApplicationError("unauthenticated", "request cancelled");
     await application.repo.authRead(async () => {
       if (!await oauth.isAuthorized(context.principal)) throw new ApplicationError("unauthenticated", "unauthenticated");
       await application.revalidateSession(context.session, true);
     });
-    if (cancelled()) throw new ApplicationError("unauthenticated", "request cancelled");
+    if (cancelled(context, signal)) throw new ApplicationError("unauthenticated", "request cancelled");
   }
   // authCheck from the auth cache alone, for the timer's phase A: true or a throw as authCheck, or undefined on a
   // cache miss, which phase B checks in full.
@@ -279,6 +292,13 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     if (exchange) { exchange.principal = principal.authed.user_id; exchange.identity = context.session.identityName; exchange.session = context.session.sessionId; }
     try {
       if (closed || request.signal.aborted) throw new Error("MCP request is closed");
+      // The bound text's facts, for a context makeServer would give it (boundInstruction): read here, since the
+      // server's instructions are built synchronously. The selection read the root moments ago (#907).
+      if (role !== "subscriber" && !context.session.via && !context.session.readOnly && "id" in routing) {
+        const row = context.verdict ? undefined : await hosted.readRow(routing.id);
+        const root = context.verdict?.root ?? (row && await hosted.readRoot(row));
+        context.instruction = { launcher: await application.hostedLauncher(routing.id), leased: root?.lease_deadline != null };
+      }
       if (!await oauth.isAuthorized(principal)) {
         const refusal = await oauth.authenticate(request, roleScopes(role));
         if (refusal instanceof Response) refuse(refusal);
@@ -293,25 +313,25 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     return { user: context.principal.authed.user_id, email: context.principal.authed.user_email, grant: context.principal.grantId, role: context.role, identity: context.session.identityFull };
   }
   function matches(a: Binding, b: Binding) { return a.user === b.user && a.email === b.email && a.grant === b.grant && a.role === b.role; }
-  function bindingLive(context: Context, checked?: { row: HostedSession | undefined }) {
+  // Judged from rows already read (a Checked, or a live's `bound`): the pair must be the row and the root it names,
+  // under one ownership (the readRoot check), so a pair a commit split is refused.
+  function bindingLive(context: Context, bound: Bound) {
     if (!("id" in context.sessionContext)) return false;
-    const row = checked ? checked.row : hosted.row(context.sessionContext.id);
-    if (!row) return false;
-    const root = hosted.rootOf(row);
+    const { row, root } = bound;
+    if (!row || !root || root.session_id !== (row.root_session_id ?? row.session_id) || root.ownership_id !== row.ownership_id) return false;
     return hosted.named(root) && root.ownership_id === context.stamp?.ownership && root.bind_gen === context.stamp.generation;
   }
-  // The rows a live's binding reads: its own and its root's, fixed at creation (#399). A commit names the one
-  // row it changed, so only the lives reading it are checked; null checks them all.
-  function bindingRows(context: Context): Set<string> {
+  // The rows a live's binding reads: its own and its root's (from `row`, its own as its creator read it), fixed at
+  // creation (#399). A commit names the one row it changed, so only the lives reading it are checked.
+  function bindingRows(context: Context, row: HostedSession | undefined): Set<string> {
     if (!("id" in context.sessionContext)) return new Set();
-    const row = hosted.row(context.sessionContext.id);
     return new Set([context.sessionContext.id, ...(row?.root_session_id ? [row.root_session_id] : [])]);
   }
   // The stream timer re-reads a context's hosted rows only when they could have changed (#899): a commit notice
   // naming one (`changedAt`, every context, idle lives too), a null notice (`allAt`), a moved auth generation (which
   // another connection's commit also moves), a lease deadline passing, or `recheckMs` since its last full check.
   // `seq` numbers the notices; a stamp keeps the one current when its check began.
-  let seq = 0, allAt = 0, prunedAt = now();
+  let seq = 0, allAt = 0, prunedAt = now(), prunedThrough = 0;
   const changedAt = new Map<string, number>();
   type Stamp = { gen: string; seq: number; at: number; recheckAt: number; rows: string[]; row: HostedSession | undefined };
   const stamps = new WeakMap<Context, Stamp>();
@@ -331,16 +351,68 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     for (const id of s.rows) if ((changedAt.get(id) ?? 0) > s.seq) return undefined;
     return s;
   }
-  const unlistenHosted = hosted.listen(changed => {
+  // A notice for a row since `since`, or one for every row (null), or one the prune may have dropped: a read begun
+  // at `since` may be older than the commit.
+  function moved(rows: Iterable<string>, since: number) {
+    if (allAt > since || prunedThrough > since) return true;
+    for (const id of rows) if ((changedAt.get(id) ?? 0) > since) return true;
+    return false;
+  }
+  // Every commit to a hosted row notifies, so a read no notice for its rows followed is the committed state: the live
+  // keeps it. One a notice raced is read again, as is a re-read a notice raced in turn.
+  function adopt(live: Live, checked: Checked) {
+    if (live.stopped) return;
+    if (moved(live.rows, checked.seq)) return recheck(live);
+    live.bound = { row: checked.row, root: checked.root };
+  }
+  function recheck(live: Live) {
+    const context = live.context;
+    if (live.rechecking === context) return;
+    live.rechecking = context;
+    track(rowCheck(context).then(checked => {
+      if (live.rechecking === context) live.rechecking = undefined;
+      if (live.stopped || live.context !== context) return;
+      adopt(live, checked);
+      judge(live);
+    }, e => {
+      if (live.rechecking === context) live.rechecking = undefined;
+      if (live.stopped || live.context !== context) return;
+      if (!(e instanceof ApplicationError)) hostedFailure("mcp.binding", e);
+      live.stop();
+    }));
+  }
+  function judge(live: Live) {
+    if (live.stopped) return;
+    try { if (!idle(live) && !bindingLive(live.context, live.bound)) live.stop(); }
+    catch (e) { hostedFailure("mcp.binding", e); live.stop(); }
+  }
+  // A row from a commit (null: gone) into a live's bound: its own, its root's, or both for a root.
+  function note(live: Live, id: string, row: HostedSession | undefined) {
+    const own = "id" in live.context.sessionContext ? live.context.sessionContext.id : undefined;
+    const rootId = [...live.rows].find(r => r !== own) ?? own;
+    if (id === own) live.bound.row = row;
+    if (id === rootId) live.bound.root = row;
+  }
+  // A notice carrying its row (#807 P3 A7h2) updates the lives reading that row and judges them in the commit's
+  // flush, as before; the lives with no row are judged on every notice. A notice without one (null, or a commit whose
+  // facts read failed) leaves the lives to the full pass it requested: `watchRows` reads their rows on its Tx and
+  // judges them before the queue's next body. Until then a live a revoke unbound may take a hint, whose own
+  // authorize reads the rows and refuses.
+  const unlistenHosted = hosted.listen((changed, row) => {
     seq++;
     if (changed === null) allAt = seq; else changedAt.set(changed, seq);
     // A snapshot: stop() unindexes as it goes.
-    const affected = changed === null ? [...lives] : [...(byRow.get(changed) ?? []), ...rowless];
-    for (const live of affected) {
-      if (live.stopped) continue;
-      try { if (!idle(live) && !bindingLive(live.context)) live.stop(); }
-      catch (e) { hostedFailure("mcp.binding", e); live.stop(); }
-    }
+    const affected = [...rowless];
+    if (changed !== null && row !== undefined) for (const live of byRow.get(changed) ?? []) { note(live, changed, row ?? undefined); affected.push(live); }
+    for (const live of affected) judge(live);
+  });
+  const unwatchHosted = hosted.watchRows({
+    ids: () => byRow.keys(),
+    apply(rows) {
+      const affected = new Set<Live>();
+      for (const [id, row] of rows) for (const live of byRow.get(id) ?? []) { note(live, id, row); affected.add(live); }
+      for (const live of affected) judge(live);
+    },
   });
   // `checked`: authorize's result for this context, awaited by the caller with no await since (#853).
   function watchable(context: Context, uri: string, checked: Checked): string | null {
@@ -365,7 +437,9 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
   // One authorize for the live's every uri: watchable and describe reuse its row (#853). The uris are read after
   // the awaits, as they stand then (#807 P3 A7d).
   async function valid(live: Live): Promise<Checked> {
-    return validChecked(live, await authorize(live.context));
+    const checked = validChecked(live, await authorize(live.context));
+    adopt(live, checked);
+    return checked;
   }
   function validChecked(live: Live, checked: Checked): Checked {
     for (const [uri, cap] of live.uris) if (watchable(live.context, uri, checked) !== cap) throw new ApplicationError("not_found", "resource not found");
@@ -376,7 +450,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
   // since. Undefined on an auth cache miss, which phase B checks in full.
   function validStamped(live: Live, s: Stamp, peek: AuthPeek): true | undefined {
     if (!authPeekCheck(live.context, peek)) return undefined;
-    for (const [uri, cap] of live.uris) if (capability(live.context, uri, { row: s.row }) !== cap) throw new ApplicationError("not_found", "resource not found");
+    for (const [uri, cap] of live.uris) if (capability(live.context, uri, { row: s.row, seq: s.seq }) !== cap) throw new ApplicationError("not_found", "resource not found");
     return true;
   }
   function addWatch(live: Live, uri: string) {
@@ -395,6 +469,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
   // resources keeps its own credentials. Hosted admission isn't charged again: the POST paid it.
   // A refusal, or a GET closed meanwhile, is `unauthenticated`; anything else is a fault.
   async function attach(live: Live, via: Request) {
+    const start = seq;
     const request = new Request(via.url, { method: "GET", headers: via.headers, signal: live.context.request.signal });
     const exchange: Exchange = { ...exchanges.getStore()!, request, refusal: undefined, context: undefined, failure: undefined, logged: false };
     let next: Context;
@@ -407,13 +482,16 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     if (live.stopped || !idle(live)) { next.finish(); return; }
     const previous = live.context;
     unindexRows(live);
-    live.context = next; live.rows = bindingRows(next);
+    live.context = next; live.rows = bindingRows(next, next.verdict?.row);
     indexRows(live);
+    // The selection's rows, read after `start`.
+    adopt(live, { row: next.verdict?.row, root: next.verdict?.root, seq: start });
     if (live.stream) streamContexts.set(live.stream, next);
     previous.finish();
   }
-  function makeLive(context: Context, uris: Map<string, string | null>, handler?: McpHttpHandler, legacy?: Legacy): Live {
-    const live: Live = { context, rows: bindingRows(context), uris, watches: [], handler, legacy, stopped: false,
+  // `checked`: the authorize its caller judged the uris with.
+  function makeLive(context: Context, checked: Checked, uris: Map<string, string | null>, handler?: McpHttpHandler, legacy?: Legacy): Live {
+    const live: Live = { context, rows: bindingRows(context, checked.row), bound: { row: undefined }, uris, watches: [], handler, legacy, stopped: false,
       // A hint arrives from a commit's afterCommit, inside the queue's holder: nothing waits for its check, and a
       // live stopped, or a uri dropped, while the check awaited gets no notification (#807 P3 A7d).
       hint(uri) {
@@ -449,6 +527,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     };
     lives.add(live);
     indexInbox(live); indexRows(live);
+    adopt(live, checked);
     try { for (const uri of uris.keys()) addWatch(live, uri); }
     catch (error) { live.stop(); throw error; }
     return live;
@@ -470,11 +549,8 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
   }
   // The bound text follows the ownership: its launcher flag, and (with no declaration) its lease (#531).
   function boundInstruction(context: Context): string {
-    if (!("id" in context.sessionContext)) return hostedBoundInstruction(context.info, context.declared);
-    // The exchange's selection read the root moments ago (#907).
-    const row = context.verdict ? undefined : hosted.row(context.sessionContext.id);
-    const root = context.verdict?.root ?? (row && hosted.rootOf(row));
-    return hostedBoundInstruction(context.info, context.declared, application.hostedLauncherNow(context.sessionContext.id), root?.lease_deadline != null);
+    if (!("id" in context.sessionContext) || !context.instruction) return hostedBoundInstruction(context.info, context.declared);
+    return hostedBoundInstruction(context.info, context.declared, context.instruction.launcher, context.instruction.leased);
   }
   function makeServer(context: Context, legacy?: Legacy) {
     const { role, info } = context;
@@ -690,6 +766,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
       // longer has.
       if (closed || live.stopped || live.context !== context) return;
       stamp(context, gen, t, start, checked);
+      adopt(live, checked);
     } catch (e) {
       if (closed || live.stopped || live.context !== context) return;
       stamps.delete(context); unexpected(e); streamClosed(context, e); live.stop();
@@ -784,6 +861,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
       for (const context of streamContexts.values()) oldest = Math.min(oldest, stamps.get(context)?.seq ?? oldest);
       for (const start of checking.values()) oldest = Math.min(oldest, start);
       for (const [id, n] of changedAt) if (n <= oldest) changedAt.delete(id);
+      prunedThrough = oldest;
     }
     return phaseB;
   }, 1000);
@@ -883,7 +961,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
                 const checked = await authorize(context);
                 const authorized = new Map(uris.map(uri => [uri, watchable(context, uri, checked)]));
                 ownHandler = createMcpHandler(modernFactory, { legacy: "reject", keepAliveMs: 5000, bus: isolatedBus(), onerror: error => report(error) });
-                live = makeLive(context, authorized, ownHandler);
+                live = makeLive(context, checked, authorized, ownHandler);
                 response = await ownHandler.fetch(req, { parsedBody: body.parsedBody });
               } else {
                 exchange.context = await select(req);
@@ -949,7 +1027,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
                   if (watchable(context, uri, checked) !== cap) throw new ApplicationError("not_found", "resource not found");
                   uris.set(uri, cap);
                 }
-                live = makeLive(context, uris, undefined, legacy);
+                live = makeLive(context, checked, uris, undefined, legacy);
                 if (idle(live)) context.session.listed = false;
                 legacy.stream = live;
               }
@@ -994,7 +1072,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
       // A failed drain or lease detach mustn't skip the final heartbeat or leave
       // the hosted timer running against a closed database (#423).
       try { await Promise.all([...forwarding].map(stream => stream.stop())); }
-      finally { try { unlistenHosted(); resources.close(); delivery.close(); } finally { await hosted.close(); } }
+      finally { try { unlistenHosted(); unwatchHosted(); resources.close(); delivery.close(); } finally { await hosted.close(); } }
       await modern.close();
       await Promise.allSettled([...bodyReads]);
       while (closing.size) await Promise.all([...closing]);

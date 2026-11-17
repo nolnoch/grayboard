@@ -244,6 +244,22 @@ test("disable immediately closes held ownership and invalidates capability", asy
   expect(() => delivery.describe(bob, context(bob), lease.capability, row)).toThrow();
 });
 
+test("#807 P3 A7h2: a disable's full pass finishes the lease after its read; meanwhile a pull's own row read refuses it", async () => {
+  const lease = await delivery.open(bob, context(bob));
+  let active = -1, refused: unknown;
+  await hostedPause("hosted:reconcile:read", async () => {
+    await seed(store.repo, tx => store.repo.users.setDisabled(tx, bob.authed.user_id, true));
+    await until(() => delivery.activeLeaseCount === 0);
+  }, async () => {
+    // The user change named no row: the lease waits for the pass, held at its read.
+    active = delivery.activeLeaseCount;
+    try { delivery.describe(bob, context(bob), lease.capability, await checked(context(bob))); } catch (e) { refused = e; }
+  });
+  expect(active).toBe(1);
+  expect(refused).toHaveProperty("code");
+  expect(delivery.activeLeaseCount).toBe(0);
+});
+
 test("board receipt is issued and scoped, not an arbitrary high-water cursor", async () => {
   await seed(store.repo, () => {
     createBoard(store.db, "alice@example.com/be", "#e2e", "test delivery");
@@ -291,7 +307,7 @@ test("per-user delivery capacity refuses without attaching another grant or drop
   await hosted.bind(bob, contender, { name: "contender", create: true });
   await expect(delivery.open({ ...bob, grantId: "G2" }, contender)).rejects.toHaveProperty("code", "bad_request");
   expect(delivery.activeLeaseCount).toBe(32);
-  expect(hosted.row("id" in contender ? contender.id : "")?.grant_id).toBe(bob.grantId);
+  expect((await hosted.readRow("id" in contender ? contender.id : ""))?.grant_id).toBe(bob.grantId);
   expect(delivery.describe(bob, context(bob), first.capability, await checked(context(bob))).capability).toBe(first.capability);
 });
 

@@ -331,10 +331,6 @@ export function createHostedSessions(application: Application, options: { now?: 
   async function rootOf(r: Read, row: HostedSession): Promise<HostedSession> {
     return rootCheck(row, row.root_session_id ? await store.get(r, row.root_session_id) : row);
   }
-  // rootOf, synchronously: SQLite only, for the MCP layer's synchronous row checks until A7h2 (#807 P3).
-  function rootOfNow(r: Read, row: HostedSession): HostedSession {
-    return rootCheck(row, row.root_session_id ? store.getNow(r, row.root_session_id) : row);
-  }
   function rootCheck(row: HostedSession, root: HostedSession | undefined): HostedSession {
     if (!root || root.ownership_id !== row.ownership_id) throw new ApplicationError("unbound", "unbound; its root's ownership changed, so the root must register this child again (session_register)");
     return root;
@@ -775,9 +771,10 @@ export function createHostedSessions(application: Application, options: { now?: 
     now,
     leaseTtl,
     gate,
-    // Synchronous, SQLite only: the MCP layer's row checks until A7h2 (#807 P3).
-    row(id: string) { return store.getNow(repo.read, id); },
-    rootOf: (row: HostedSession) => rootOfNow(repo.read, row),
+    // A row and its root on the pool, for the MCP layer's row checks (#807 P3 A7h2): two reads, so a commit can land
+    // between them; the caller judges the pair (mcp.ts `bindingLive`) and rechecks one a notice raced.
+    readRow: (id: string) => store.get(repo.read, id),
+    readRoot: (row: HostedSession) => rootOf(repo.read, row),
     rootOnly,
     named,
     audit,

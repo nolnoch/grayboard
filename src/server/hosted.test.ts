@@ -757,11 +757,11 @@ test("a second grant write does not attach; successful owning call does", async 
   await hosted.bind(principal, root, { name: "fe", create: true });
   const second = { ...principal, grantId: "G2" };
   await hosted.run(second, root, "peer_status", () => true);
-  expect(hosted.row("id" in root ? root.id : "")?.grant_id).toBe("G1");
+  expect((await hosted.readRow("id" in root ? root.id : ""))?.grant_id).toBe("G1");
   await expect(hosted.bind(second, root, { name: "missing" })).rejects.toHaveProperty("code", "identity_unknown");
-  expect(hosted.row("id" in root ? root.id : "")?.grant_id).toBe("G1");
+  expect((await hosted.readRow("id" in root ? root.id : ""))?.grant_id).toBe("G1");
   await hosted.register(second, root, "child");
-  expect(hosted.row("id" in root ? root.id : "")?.grant_id).toBe("G2");
+  expect((await hosted.readRow("id" in root ? root.id : ""))?.grant_id).toBe("G2");
 });
 
 test("durable lease deadline expires once without a contender", async () => {

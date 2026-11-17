@@ -2204,7 +2204,6 @@ function makeHostedStore(db: Database): HostedStoreOf {
     write: (fn, committed) => queued(db, fn, committed),
     subscribe: () => () => {},
     get: async (r, id) => hostedRow(sqliteOf(r), id),
-    getNow: (r, id) => hostedRow(sqliteOf(r), id),
     owned: async (r, id) => sqliteOf(r).query<{ n: number }, [string, string]>(
       "SELECT 1 AS n WHERE EXISTS (SELECT 1 FROM hosted_ownerships WHERE session_id = ?1) OR EXISTS (SELECT 1 FROM hosted_sessions WHERE session_id = ?2)",
     ).get(id, id) !== null,
@@ -2249,7 +2248,6 @@ function makeHostedStore(db: Database): HostedStoreOf {
     restateWritesAs: async (tx, id, writesAs) => { sqliteOf(tx).query("UPDATE ids SET writes_as = ? WHERE id = ? AND writes_as IS NULL").run(writesAs, id); },
     declareLauncher: async (tx, id) => sqliteOf(tx).query("UPDATE ids SET launcher = 1 WHERE id = ? AND launcher IS NOT 1").run(id).changes > 0,
     launcher: async (r, id) => launcherOf(sqliteOf(r), id),
-    launcherNow: (r, id) => launcherOf(sqliteOf(r), id),
     holds: async (r) => sqliteOf(r).query<{ id: string; address: string }, []>(`SELECT id, address FROM alias_holds ${HOLD_ORDER}`).all(),
   };
   return store;

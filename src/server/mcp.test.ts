@@ -1531,6 +1531,19 @@ test("#899: a write no notice or generation sees reaches a stamped listen at the
   await f.listen.close();
 });
 
+// #807 P3 A7h2: a notice that carries no row (here the full reconcile's null) leaves the lives to the full pass, which
+// reads their rows on its Tx and judges them in its apply: no stream tick needed, and none before the read.
+test("#807 P3 A7h2: a null notice's full pass stops a live whose binding moved, after the pass's read", async () => {
+  const f = await stampedListen();
+  // Raw SQL: the commit sends no notice, so only the pass below can see it.
+  await seed(store.repo, async tx => store.db.run("UPDATE hosted_sessions SET bind_gen = bind_gen + 1 WHERE session_id = ?", [(await aliceRoot(tx)).session_id]));
+  let during = -1;
+  await held("hosted:reconcile:read", () => hosted.sessions.reconcile(), async () => { during = hosted.activeListens; });
+  expect(during).toBe(1);
+  expect(hosted.activeListens).toBe(0);
+  await f.listen.close();
+});
+
 test("#899: another connection's commit reaches a stamped listen within a tick", async () => {
   const { Database } = await import("bun:sqlite");
   // Reopen the fixture on a file, so a second connection can commit to it.
