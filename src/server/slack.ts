@@ -210,15 +210,15 @@ export class SlackBridge implements SlackLinker {
     // with the user's own email may redeem it (#805 F-05).
     const email = await this.slackEmail(slackUser);
     if (email === "unavailable") {
-      await repo.write(() => writeAudit(repo, repo.read, "slack.link_refused", user.email, slackUser, { reason: "slack_unavailable" }));
+      await repo.write(tx => writeAudit(repo, tx, "slack.link_refused", user.email, slackUser, { reason: "slack_unavailable" }));
       return this.say(channel, ts, "grayboard couldn't reach Slack to check this account's email, and the code is used up. Run `grayboard slack link` for a new one and try again.");
     }
     if (email === null) {
-      await repo.write(() => writeAudit(repo, repo.read, "slack.link_refused", user.email, slackUser, { reason: "no_email" }));
+      await repo.write(tx => writeAudit(repo, tx, "slack.link_refused", user.email, slackUser, { reason: "no_email" }));
       return this.say(channel, ts, "grayboard can't read your Slack account's email, so it can't check this link. Ask the server's admin to add the users:read and users:read.email scopes to the Slack app and reinstall it.");
     }
     if (email !== user.email) {
-      await repo.write(() => writeAudit(repo, repo.read, "slack.link_refused", user.email, slackUser, { reason: "email_mismatch" }));
+      await repo.write(tx => writeAudit(repo, tx, "slack.link_refused", user.email, slackUser, { reason: "email_mismatch" }));
       return this.say(channel, ts, `This Slack account's email isn't \`${user.email}\`; link from that account. The code is used up.`);
     }
 
@@ -469,12 +469,12 @@ export class SlackBridge implements SlackLinker {
       retryMs: this.o.retryMs,
       label: (h) => (h.startsWith(prefix) ? h.slice(prefix.length) : h),
       attachmentLimits: repo.attachmentLimits,
-      onFileSent: (f) => void repo.post(() =>
-        writeAudit(repo, repo.read, "attachment.sent_to_slack", link.email, `attachment:${f.attachment}`, {
+      onFileSent: (f) => void repo.post(tx =>
+        writeAudit(repo, tx, "attachment.sent_to_slack", link.email, `attachment:${f.attachment}`, {
           identity: handle, channel: link.dm_channel, thread_ts: f.thread_ts, slack_file: f.slack_file, sha256: f.sha256,
         }), undefined, "Slack file audit"),
-      onFileRefused: (f) => void repo.post(() =>
-        writeAudit(repo, repo.read, "attachment.slack_refused", link.email, f.attachment === null ? null : `attachment:${f.attachment}`, {
+      onFileRefused: (f) => void repo.post(tx =>
+        writeAudit(repo, tx, "attachment.slack_refused", link.email, f.attachment === null ? null : `attachment:${f.attachment}`, {
           identity: handle, channel: link.dm_channel, filename: f.name, reason: f.why, ...(f.sha256 ? { sha256: f.sha256 } : {}),
         }), undefined, "Slack file audit"),
     });
