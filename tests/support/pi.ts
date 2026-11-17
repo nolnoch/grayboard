@@ -21,7 +21,7 @@ import { issueOAuth } from "../helpers/oauth.ts";
 import { seed } from "./seed.ts";
 import { cleanEnv, localEnv } from "./env.ts";
 import { onChannelDm, messageText, promptText, startFakeModel, type ChatRequest, type FakeModel, type Reply, type Rule } from "./fake_model.ts";
-import { browse, hostedServer, seedGrant, type HostedServer } from "./hosted_oauth.ts";
+import { browse, hostedServer, seedGrant, tokenRequests, type HostedServer } from "./hosted_oauth.ts";
 import { localSession, stopSession } from "./mcp.ts";
 import { CLI, ROOT } from "./paths.ts";
 import { runCli } from "./cli.ts";
@@ -1561,18 +1561,21 @@ export function piHostedRefreshLogoutScenario(dir: string): Promise<void> {
     const refreshTokens = () => srv.app.db.query<{ n: number; spent: number }, [string]>(
       "SELECT count(*) AS n, count(spent_at) AS spent FROM oauth_tokens WHERE grant_id = ? AND kind = 'refresh'").get(seeded.grantId)!;
     expect(refreshTokens()).toEqual({ n: 1, spent: 0 });
+    const tokens = tokenRequests(srv);
 
     const a = start(), b = start();
     const [sa, sb] = await Promise.all([a.command({ type: "get_state" }), b.command({ type: "get_state" })]);
     expect(sa.sessionId).not.toBe(sb.sessionId);
-    // Both reached the server on the one rotation.
+    // Both reached the server on one refresh request, and so one rotation.
     await until(() => piRow(srv, sa.sessionId) && piRow(srv, sb.sessionId), 15_000, "both sessions on the server");
     expect(refreshTokens()).toEqual({ n: 2, spent: 1 });
+    expect(tokens()).toEqual(["refresh_token"]);
 
     await a.command({ type: "prompt", message: "bind a" });
     await b.command({ type: "prompt", message: "bind b" });
     await until(() => piRow(srv, sa.sessionId)?.name === "pi-a" && piRow(srv, sb.sessionId)?.name === "pi-b" && srv.app.mcp.activeLeases === 2, 30_000, "both leased");
     expect(refreshTokens()).toEqual({ n: 2, spent: 1 });
+    expect(tokens()).toEqual(["refresh_token"]);
     await Promise.all([idle(a), idle(b)]);
 
     // Logout in a: the grant is revoked, so the server drops both leases,
