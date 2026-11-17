@@ -21,11 +21,11 @@ import type { SendResult } from "../shared/protocol.ts";
 import type { Store, ThreadRow } from "./store.ts";
 import { SlackError, SlackUnavailable, type SlackWeb } from "./web.ts";
 
-/** The thread map and outbox: store.ts locally, the server's tables and acks in server mode. */
 // The thread map and progress may answer with a promise (a server's async store, #807 P3 A5); the relay awaits each.
 // The outbox stays synchronous: `notify` stores an item before anything else can fail, and a server's is memory.
 type MaybeAsync<F> = F extends (...args: infer A) => infer R ? (...args: A) => R | Promise<R> : never;
 type Stored = "thread" | "byTs" | "addThread" | "advance" | "progress" | "setProgress" | "done";
+/** The thread map and outbox: store.ts locally, the server's tables and acks in server mode. */
 export type RelayStore = Pick<Store, "enqueue" | "pending"> & { [K in Stored]: MaybeAsync<Store[K]> };
 
 export type ChannelParams = { content: string; meta: Record<string, string> };

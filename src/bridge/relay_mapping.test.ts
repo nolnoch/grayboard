@@ -19,7 +19,8 @@ function delegate(s: Store): RelayStore {
   };
 }
 
-// wrap: the RelayStore the relay gets (default the Store itself); hold: bus calls wait for it.
+// wrap: the RelayStore the relay gets (default the Store itself); hold: bus calls wait for it; called: resolved
+// when a bus call is entered (an inbound new thread's mapping is in flight by then).
 function fixture(kind: "dm" | "board" = "dm", opts: { wrap?: (s: Store) => RelayStore; hold?: Promise<void> } = {}) {
   const store = new Store(":memory:");
   store.addThread({ thread_ts: "be.0", kind: "dm", board: null, root_id: 1, peer: "be", last_id: 1 });
@@ -31,6 +32,7 @@ function fixture(kind: "dm" | "board" = "dm", opts: { wrap?: (s: Store) => Relay
   const later = deferred<Response>();
   const laterEntered = deferred<void>();
   const looked = deferred<void>();
+  const called = deferred<void>();
   const byTs = store.byTs.bind(store);
   store.byTs = (ts) => {
     const row = byTs(ts);
@@ -42,6 +44,7 @@ function fixture(kind: "dm" | "board" = "dm", opts: { wrap?: (s: Store) => Relay
   const bus: Bus = {
     call: async (name, args) => {
       calls.push([name, args]);
+      called.resolve();
       await opts.hold;
       return { ok: true, value: { message_id: next, post_id: next++, delivered_now: true, board: "ops" } };
     },
@@ -78,7 +81,7 @@ function fixture(kind: "dm" | "board" = "dm", opts: { wrap?: (s: Store) => Relay
   });
   const release = () => answer.resolve(Response.json({ ok: true, ts: "fe.0" }));
   const releaseLater = () => later.resolve(Response.json({ ok: true, ts: "later.0" }));
-  return { store, relay, calls, posts, logs, looked, answer, start, reply, release, releaseLater, laterEntered };
+  return { store, relay, calls, posts, logs, looked, called, answer, start, reply, release, releaseLater, laterEntered };
 }
 
 for (const kind of ["dm", "board"] as const) {
@@ -238,6 +241,7 @@ test("mapping: a new thread mapped during an async outbox lookup still threads t
   });
   try {
     const started = f.relay.onEvent({ type: "event_callback", event: { type: "message", channel: "G1", user: "U1", text: "@fe hi", ts: "new.0" } });
+    await f.called.promise;
     f.store.enqueue({ content: "answer", meta: { from: "fe", message_id: "10" } });
     const drain = f.relay.drain();
     await read.promise;
@@ -249,6 +253,33 @@ test("mapping: a new thread mapped during an async outbox lookup still threads t
     expect(f.posts.find(p => p.markdown_text === "**fe** answer")).toMatchObject({ thread_ts: "new.0" });
   } finally {
     hold.resolve();
+    gate.resolve();
+    f.release();
+    f.relay.stop();
+    f.store.close();
+  }
+});
+
+// The relay's writes may await too. A new thread's mapping (addThread) that resolves later must still be stored
+// before the publish counts as finished: a reply waiting on that publish reads again after it and must find the row.
+test("mapping: a publish's async thread write lands before a waiting reply reads again (#807)", async () => {
+  const gate = deferred<void>(), writing = deferred<void>();
+  const f = fixture("dm", { wrap: s => ({ ...delegate(s), addThread: async row => { writing.resolve(); await gate.promise; s.addThread(row); } }) });
+  try {
+    const { drain } = await f.start();
+    const reply = f.reply();
+    await f.looked.promise;
+    f.release();
+    await writing.promise;
+    // Every pending microtask runs before this (no timer, no I/O in the fakes): a publish counted finished before
+    // its write lands lets the reply read again now, and find nothing.
+    await new Promise(r => setImmediate(r));
+    gate.resolve();
+    await drain;
+    await reply;
+    expect(f.calls).toEqual([["dm_send", { to: "fe", body: "to fe", parent_id: 2 }]]);
+    expect(f.posts.map(p => p.markdown_text)).not.toContainEqual(expect.stringContaining("isn't connected"));
+  } finally {
     gate.resolve();
     f.release();
     f.relay.stop();
