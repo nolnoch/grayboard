@@ -11,6 +11,7 @@ import { canonicalJson, WRITE_DEDUP_WINDOW_MS } from "../shared/dedup.ts";
 import type { CoreDb } from "../core/boards.ts";
 import { scratchDbPath } from "../../tests/support/scratch_db.ts";
 import { seed } from "../../tests/support/seed.ts";
+import type { Tx } from "./store/tx.ts";
 
 describe("canonicalJson", () => {
   test("sorts keys at every depth and emits no whitespace", () => {
@@ -72,13 +73,13 @@ describe("dedupWrite", () => {
     tool: "dm_send", session: "s1", sender: SENDER, actor: "a@example.com", transport: "bridge",
     args: { to: "b@example.com/fe", body: "hi" }, resend: false, ...over,
   });
-  const send = (body = "hi") => () => {
-    const m = repo.messages.insert(SENDER, "user", "b@example.com/fe", body, null);
+  const send = (body = "hi") => (tx: Tx) => {
+    const m = repo.messages.insert(tx, SENDER, "user", "b@example.com/fe", body, null);
     return { payload: { message_id: m.id, delivered_now: false }, ref: { kind: "message" as const, id: m.id } };
   };
   // A tool call's dedup, inside a queued body as the application's handlers run it.
-  const dedup = <W extends Written>(now: number, c: DedupCall, write: () => Sync<W>) =>
-    seed(repo, tx => dedupWrite(repo, tx, now, c, write) as Sync<DedupOutcome<W>>) as Promise<DedupOutcome<W>>;
+  const dedup = <W extends Written>(now: number, c: DedupCall, write: (tx: Tx) => Sync<W>) =>
+    seed(repo, tx => dedupWrite(repo, tx, now, c, () => write(tx)) as Sync<DedupOutcome<W>>) as Promise<DedupOutcome<W>>;
   const count = (sql: string) => (db.prepare(sql).get() as { n: number }).n;
   const audits = (action: string) => db.prepare("SELECT target, actor, detail FROM access_log WHERE action = ?").all(action) as { target: string; actor: string; detail: string }[];
 
@@ -107,8 +108,8 @@ describe("dedupWrite", () => {
   });
 
   test("a write that throws leaves no receipt, so the retry writes", async () => {
-    await expect(dedup(1_000, call(), () => {
-      send()();
+    await expect(dedup(1_000, call(), tx => {
+      send()(tx);
       throw new Error("bound attachment refused");
     })).rejects.toThrow("bound attachment refused");
     expect(count("SELECT COUNT(*) AS n FROM write_receipts")).toBe(0);
@@ -132,7 +133,7 @@ describe("dedupWrite", () => {
   test("a receipt whose row is gone is a miss, and is replaced", async () => {
     const first = await dedup(1_000, call(), send());
     if (!("fresh" in first)) throw new Error("expected a fresh write");
-    expect(await seed(repo, () => repo.messages.retract(SENDER, first.fresh.ref.id, { actor: "a@example.com", session: "s1" }))).toBe(true);
+    expect(await seed(repo, tx => repo.messages.retract(tx, SENDER, first.fresh.ref.id, { actor: "a@example.com", session: "s1" }))).toBe(true);
     // The Repo's retract writes its own audit row (#306), whoever calls it.
     const [retracted] = audits("message.retracted");
     expect(retracted).toMatchObject({ target: `message:${first.fresh.ref.id}`, actor: "a@example.com" });
@@ -190,8 +191,8 @@ describe("dedupWrite", () => {
     expect("replay" in r && r.replay.note).toBe(`already posted to #e2e at ${new Date(1_000).toISOString()} as post 7; this repeat was not posted. To send it again on purpose, call with resend: true.`);
 
     const d = call({ tool: "delegate", args: { to: null, persona: "p", task: "t" } });
-    const deleg = () => {
-      const w = send("delegation")();
+    const deleg = (tx: Tx) => {
+      const w = send("delegation")(tx);
       return { ...w, payload: { ...w.payload, to: "a@example.com/lx" } };
     };
     await dedup(1_000, d, deleg);

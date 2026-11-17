@@ -159,7 +159,7 @@ test("reads repeat without admission; receipt and dm_ack remain distinct", async
 test("only an issued contiguous direct prefix advances MAX cursor, ignoring global gaps", async () => {
   const lease = await delivery.open(bob, context(bob));
   await send("first");
-  await seed(store.repo, () => store.repo.messages.insert("alice@example.com/be", "user", "alice@example.com/be", "gap", null, false));
+  await seed(store.repo, tx => store.repo.messages.insert(tx, "alice@example.com/be", "user", "alice@example.com/be", "gap", null, false));
   await send("second");
   const items = await delivery.pending(bob, context(bob), lease.capability);
   await expect(delivery.receipt(bob, context(bob), lease.capability, [items[1]!.id])).rejects.toHaveProperty("code", "not_found");

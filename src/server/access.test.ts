@@ -147,7 +147,7 @@ describe("resolveMention", () => {
 
   test("@id: resolves a live ID; an ended one refuses a strict post and is unresolved otherwise", async () => {
     expect(access.resolveMention(WADE_ID, AUTHOR, OPEN, true)).toBe(WADE_ID);
-    await seed(repo, () => endSession(db, repo.mail, WADE_ID, { why: "test", now: 5 }));
+    await seed(repo, tx => endSession(db, repo.mailOn(tx), WADE_ID, { why: "test", now: 5 }));
     expect(() => access.resolveMention(WADE_ID, AUTHOR, OPEN, true)).toThrow(/^id_ended:/);
     expect(access.resolveMention(WADE_ID, AUTHOR, OPEN, false)).toBeNull();
     expect(access.resolveMention(idAddress("f".repeat(64)), AUTHOR, OPEN, false)).toBeNull();

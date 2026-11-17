@@ -66,7 +66,7 @@ test("an existing pre-OAuth database opens additively without losing old data", 
     const user = old.repo.users.upsertByEmail(tx, "you@example.com", "You");
     const session = old.repo.sessions.create(tx, user.id, "old-session-hash", "old client");
     old.repo.aliases.create(tx, { scope_kind: "person", scope_ref: user.email, name: "fe" }, user.email);
-    old.repo.messages.insert("you@example.com/fe", "user", "peer@example.com/be", "preserved", null);
+    old.repo.messages.insert(tx, "you@example.com/fe", "user", "peer@example.com/be", "preserved", null);
     for (const table of ["oauth_tokens", "oauth_grants", "oauth_codes", "oauth_browsers", "oauth_requests"]) old.db.exec(`DROP TABLE ${table}`);
     return { user, session };
   });
@@ -266,9 +266,9 @@ describe("Repo", () => {
   });
 
   test("messages: insert and thread", async () => {
-    const { root, reply } = await seed(repo, () => {
-      const root  = repo.messages.insert("a@example.com/fe", "user", "b@example.com/be", "hello", null);
-      return { root, reply: repo.messages.insert("b@example.com/be", "user", "a@example.com/fe", "hi", root.id) };
+    const { root, reply } = await seed(repo, tx => {
+      const root  = repo.messages.insert(tx, "a@example.com/fe", "user", "b@example.com/be", "hello", null);
+      return { root, reply: repo.messages.insert(tx, "b@example.com/be", "user", "a@example.com/fe", "hi", root.id) };
     });
     const thread = repo.messages.thread(root.id);
     expect(thread).toHaveLength(2);
@@ -286,9 +286,9 @@ describe("Repo", () => {
   });
 
   test("unreadSince returns only messages after cursor", async () => {
-    const [m1, m2] = await seed(repo, () => [
-      repo.messages.insert("a@example.com/fe", "user", "b@example.com/be", "msg1", null),
-      repo.messages.insert("a@example.com/fe", "user", "b@example.com/be", "msg2", null),
+    const [m1, m2] = await seed(repo, tx => [
+      repo.messages.insert(tx, "a@example.com/fe", "user", "b@example.com/be", "msg1", null),
+      repo.messages.insert(tx, "a@example.com/fe", "user", "b@example.com/be", "msg2", null),
     ]);
     const unread = repo.messages.unreadSince([{ type: "direct", ref: "b@example.com/be", since: m1.id }]);
     expect(unread).toHaveLength(1);
@@ -298,12 +298,12 @@ describe("Repo", () => {
   // #284 S8: a session reads as every address it has, its ID and its alias.
   test("history, undeliveredFrom, receivedUnacked and sentPending take an address set", async () => {
     const [id, alias, peer, other] = ["id:s1", "a@example.com/fe", "b@example.com/be", "c@example.com/qa"];
-    const { toId, fromAlias, toAlias, fromId } = await seed(repo, () => {
-      const toId = repo.messages.insert(peer, "user", id, "to the id", null);
-      const fromAlias = repo.messages.insert(alias, "user", peer, "from the alias", null, true);
-      const toAlias = repo.messages.insert(peer, "user", alias, "to the alias", null);
-      const fromId = repo.messages.insert(id, "user", other, "from the id", null, true);
-      repo.messages.insert(peer, "user", other, "not ours", null);
+    const { toId, fromAlias, toAlias, fromId } = await seed(repo, tx => {
+      const toId = repo.messages.insert(tx, peer, "user", id, "to the id", null);
+      const fromAlias = repo.messages.insert(tx, alias, "user", peer, "from the alias", null, true);
+      const toAlias = repo.messages.insert(tx, peer, "user", alias, "to the alias", null);
+      const fromId = repo.messages.insert(tx, id, "user", other, "from the id", null, true);
+      repo.messages.insert(tx, peer, "user", other, "not ours", null);
       return { toId, fromAlias, toAlias, fromId };
     });
     const set = [id, alias];
@@ -321,11 +321,11 @@ describe("Repo", () => {
     expect(ids(repo.messages.receivedUnacked(set, 0))).toEqual([toId.id, toAlias.id]);
     expect(ids(repo.messages.sentPending(set, 0))).toEqual([fromAlias.id, fromId.id]);
     // An ack counts for the address the row names, not any address of the set.
-    await seed(repo, () => repo.messages.ack(alias, toId.id));
+    await seed(repo, tx => repo.messages.ack(tx, alias, toId.id));
     expect(ids(repo.messages.receivedUnacked(set, 0))).toEqual([toId.id, toAlias.id]);
-    await seed(repo, () => {
-      repo.messages.ack(id, toId.id);
-      repo.messages.ack(id, fromId.id);
+    await seed(repo, tx => {
+      repo.messages.ack(tx, id, toId.id);
+      repo.messages.ack(tx, id, fromId.id);
     });
     expect(ids(repo.messages.receivedUnacked(set, 0))).toEqual([toAlias.id]);
     expect(ids(repo.messages.sentPending(set, 0))).toEqual([fromAlias.id]);
@@ -335,25 +335,25 @@ describe("Repo", () => {
   test("mail: unread is the ID's unread direct mail from others; bounce and dropReader", async () => {
     const [id, peer] = ["id:s1", "b@example.com/be"];
     const { read, unread } = await seed(repo, tx => {
-      const read = repo.messages.insert(peer, "user", id, "read", null);
-      const unread = repo.messages.insert(peer, "user", id, "unread", null);
-      repo.messages.insert(id, "user", id, "to itself", null);
-      repo.messages.insert(peer, "team", id, "a team stream of the same name", null);
-      repo.messages.insert(peer, "user", "a@example.com/fe", "to someone else", null);
+      const read = repo.messages.insert(tx, peer, "user", id, "read", null);
+      const unread = repo.messages.insert(tx, peer, "user", id, "unread", null);
+      repo.messages.insert(tx, id, "user", id, "to itself", null);
+      repo.messages.insert(tx, peer, "team", id, "a team stream of the same name", null);
+      repo.messages.insert(tx, peer, "user", "a@example.com/fe", "to someone else", null);
       repo.cursors.advance(tx, id, "direct", id, read.id);
       return { read, unread };
     });
-    expect(repo.mail.unread(id)).toEqual([{ id: unread.id, sender: peer }]);
+    expect(await seed(repo, tx => repo.mailOn(tx).unread(id))).toEqual([{ id: unread.id, sender: peer }]);
 
-    await seed(repo, () => repo.mail.bounce(id, peer, unread.id, "returned", 1234));
+    await seed(repo, tx => repo.mailOn(tx).bounce(id, peer, unread.id, "returned", 1234));
     const [bounce] = repo.messages.history([peer]).filter((m) => m.kind === "bounce");
     expect(bounce).toMatchObject({ sender: id, recipient_type: "user", recipient: peer, body: "returned", parent_id: unread.id, created_at: 1234, pending: 0, kind: "bounce" });
     expect(repo.messages.getById(unread.id)?.kind).toBeNull();
 
-    await seed(repo, () => {
-      repo.messages.ack(id, unread.id);
-      repo.messages.ack(peer, bounce!.id);
-      repo.mail.dropReader(id);
+    await seed(repo, tx => {
+      repo.messages.ack(tx, id, unread.id);
+      repo.messages.ack(tx, peer, bounce!.id);
+      repo.mailOn(tx).dropReader(id);
     });
     expect(repo.cursors.directFor(repo.read, id)).toBe(0);
     expect(repo.messages.receivedUnacked([id], 0).map((m) => m.id)).toEqual([read.id, unread.id]);
@@ -572,7 +572,7 @@ test("undeliveredFrom looks each read point up by its key, never a mailbox_curso
     repo.aliases.create(tx, person("a@example.com", "fe"), "a@example.com");
     repo.users.upsertByEmail(tx, "b@example.com", null);
     repo.aliases.create(tx, person("b@example.com", "be"), "b@example.com");
-    repo.messages.insert("a@example.com/fe", "user", "b@example.com/be", "hello", null);
+    repo.messages.insert(tx, "a@example.com/fe", "user", "b@example.com/be", "hello", null);
     repo.cursors.advance(tx, "b@example.com/be", "direct", "b@example.com/be", 1);
   });
   const plan = db.prepare("EXPLAIN QUERY PLAN " + UNDELIVERED_FROM_SQL)
@@ -604,7 +604,7 @@ test("queuedTo and retract look the read point up by its key, never a mailbox_cu
     repo.aliases.create(tx, person("a@example.com", "fe"), "a@example.com");
     repo.users.upsertByEmail(tx, "b@example.com", null);
     repo.aliases.create(tx, person("b@example.com", "be"), "b@example.com");
-    repo.messages.insert("a@example.com/fe", "user", "b@example.com/be", "hello", null);
+    repo.messages.insert(tx, "a@example.com/fe", "user", "b@example.com/be", "hello", null);
     repo.cursors.advance(tx, "b@example.com/be", "direct", "b@example.com/be", 1);
   });
   const detail = (sql: string, ...args: (string | number)[]) =>
@@ -895,4 +895,45 @@ test("#807 P1c-13: the aliases store runs on the handle it's given", async () =>
   })).rejects.toThrow("rolled back");
   expect(a.find(repo.read, "a@example.com/qa")).toBeUndefined();
   expect(a.find(repo.read, "a@example.com/fe")?.name).toBe("fe");
+});
+
+// #807 P1c-14a: the messages store's writes and the mail port run on the Tx they're given.
+test("#807 P1c-14a: the messages writes and the mail port run on the Tx they're given", async () => {
+  const { repo } = openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
+  const [id, peer] = ["id:s1", "b@example.com/be"];
+  const { kept, first, second } = await seed(repo, tx => {
+    const first = repo.messages.insert(tx, peer, "user", id, "first", null);
+    const second = repo.messages.insert(tx, peer, "user", id, "second", null);
+    repo.cursors.advance(tx, id, "direct", id, first.id);
+    return { kept: tx, first, second };
+  });
+  const settled = /used after its transaction settled/;
+  const m = repo.messages;
+  expect(() => m.insert(kept, peer, "user", id, "late", null)).toThrow(settled);
+  expect(() => m.ack(kept, id, first.id)).toThrow(settled);
+  expect(() => m.markDelivered(kept, first.id, 1)).toThrow(settled);
+  expect(() => m.retract(kept, peer, second.id, { actor: null, session: null })).toThrow(settled);
+  expect(() => m.prune(kept, Date.now() + 1)).toThrow(settled);
+  expect(() => repo.mailOn(kept)).toThrow(settled);
+  const port = await seed(repo, tx => repo.mailOn(tx));
+  expect(() => port.unread(id)).toThrow(settled);
+  expect(() => port.bounce(peer, id, first.id, "late", 1)).toThrow(settled);
+  expect(() => port.dropReader(id)).toThrow(settled);
+  expect(() => m.ack({} as Tx, id, first.id)).toThrow("not a SQLite store handle");
+  // Every write rolls back with its body. On SQLite the resolved connection is the ambient one, so only the kept-Tx
+  // refusals above tell them apart; this half discriminates on Postgres.
+  await expect(seed(repo, tx => {
+    m.insert(tx, peer, "user", id, "rolled back", null);
+    m.ack(tx, id, first.id);
+    m.markDelivered(tx, first.id, 1234);
+    expect(m.retract(tx, peer, second.id, { actor: null, session: null })).toBe(true);
+    repo.mailOn(tx).dropReader(id);
+    throw new Error("rolled back");
+  })).rejects.toThrow("rolled back");
+  expect(m.history([id]).map(x => x.body)).toEqual(["second", "first"]);
+  expect(m.receivedUnacked([id], 0).map(x => x.id)).toEqual([first.id, second.id]);
+  expect(m.getById(first.id)?.delivered_at).toBeNull();
+  expect(repo.cursors.directFor(repo.read, id)).toBe(first.id);
+  await expect(seed(repo, tx => { m.prune(tx, Date.now() + 1); throw new Error("rolled back"); })).rejects.toThrow("rolled back");
+  expect(m.history([id])).toHaveLength(2);
 });

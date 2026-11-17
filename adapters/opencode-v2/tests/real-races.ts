@@ -39,7 +39,7 @@ export async function realRace(f: {
   if (scenario === "outage") {
     const owner = () => app.db.prepare("SELECT ownership_id FROM hosted_sessions WHERE source_session_id = ?").get(root) as { ownership_id: number } | null;
     const old = owner()!.ownership_id; f.outage(true);
-    const message = await app.repo.write(() => app.repo.messages.insert("you@example.com/sim", "user", "you@example.com/race", "Real network outage recovery", null, false)); app.application.wake(["you@example.com/race"]);
+    const message = await app.repo.write(tx => app.repo.messages.insert(tx, "you@example.com/sim", "user", "you@example.com/race", "Real network outage recovery", null, false)); app.application.wake(["you@example.com/race"]);
     await Bun.sleep(31_000); app.mcp.sessions.sweep();
     assert.equal(owner(), null); assert.equal(app.repo.cursors.directFor(app.repo.read, "you@example.com/race"), 0); assert.equal(g.inputs.length, 0);
     f.outage(false);
@@ -52,7 +52,7 @@ export async function realRace(f: {
   const entered = new Promise<void>(r => { g.entered = r; });
   g.released = new Promise<void>(r => { release = r; }); g.holding = true;
   const beforeCursor = app.repo.cursors.directFor(app.repo.read, "you@example.com/race"), beforeReceipts = f.receipts();
-  const message = await app.repo.write(() => app.repo.messages.insert("you@example.com/sim", "user", "you@example.com/race", "IMMUTABLE REAL " + scenario, null, false));
+  const message = await app.repo.write(tx => app.repo.messages.insert(tx, "you@example.com/sim", "user", "you@example.com/race", "IMMUTABLE REAL " + scenario, null, false));
   app.application.wake(["you@example.com/race"]);
   try {
     await Promise.race([entered, Bun.sleep(15_000).then(() => { throw new Error("No real issued batch"); })]);

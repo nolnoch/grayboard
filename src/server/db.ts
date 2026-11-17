@@ -293,7 +293,7 @@ export interface Repo {
     // (#523), else null. senderUser: the writer's signed-in user (security
     // audit F-10), kept out of reads like sender_id.
     insert(
-      sender: string, recipientType: "user" | "team", recipient: string, body: string, parentId: number | null, pending?: boolean,
+      tx: Tx, sender: string, recipientType: "user" | "team", recipient: string, body: string, parentId: number | null, pending?: boolean,
       files?: MessageFiles, senderId?: string | null, via?: string | null, senderUser?: string | null,
     ): MessageRow;
     // The writer's signed-in user of each message and post that has one
@@ -320,20 +320,21 @@ export interface Repo {
     receivedUnacked(readers: string[], since: number): MessageRow[];
     // Direct messages from any of senders since `since` sent pending and not acked by their sender, oldest first.
     sentPending(senders: string[], since: number): MessageRow[];
-    ack(reader: string, id: number): void;
+    ack(tx: Tx, reader: string, id: number): void;
     // A launcher's delegation requests since `since` it hasn't taken (#252, countOpenDelegations).
     openDelegations(launcher: string, since: number): number;
     // Stamps delivered_at on a direct message handed to its recipient's harness; the first stamp stands.
-    markDelivered(id: number, at: number): void;
+    markDelivered(tx: Tx, id: number, at: number): void;
     // Deletes a direct message from sender that's past the recipient's cursor
     // and has no reply. False if any of that doesn't hold. Audited as
     // message.retracted in the delete's transaction (#306), as local's
     // retractMessage is, so every caller writes the row a repeat is answered from.
-    retract(sender: string, id: number, by: { actor: string | null; session: string | null }): boolean;
-    prune(olderThanMs: number): void;
+    retract(tx: Tx, sender: string, id: number, by: { actor: string | null; session: string | null }): boolean;
+    prune(tx: Tx, olderThanMs: number): void;
   };
-  // An ended session's mail, as core endSession reaches it (#284 decision 4).
-  mail: MailPort;
+  // An ended session's mail, as core endSession reaches it (#284 decision 4), on the body's `Tx` (#807 P1c-14):
+  // core's MailPort names no handle, so the port is bound to the connection the `Tx` resolves to.
+  mailOn(tx: Tx): MailPort;
   // Read points (#284), keyed by the reading address: how far it has
   // received a stream (its direct messages, stream_ref = the address itself).
   cursors: {
@@ -1217,7 +1218,8 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
     },
 
     messages: {
-      insert(sender, recipientType, recipient, body, parentId, pending = false, files, senderId = null, via = null, senderUser = null) {
+      insert(tx, sender, recipientType, recipient, body, parentId, pending = false, files, senderId = null, via = null, senderUser = null) {
+        const db = sqliteOf(tx);
         return db.transaction(() => {
           const row = db.query<MessageRow, [string, string | null, string, string, string, number | null, number, number, string | null, string | null]>(
             `INSERT INTO messages (sender, sender_id, recipient_type, recipient, body, parent_id, created_at, pending, via, sender_user)
@@ -1333,13 +1335,14 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       openDelegations(launcher, since) {
         return countOpenDelegations(db, "access_log", launcher, since);
       },
-      ack(reader, id) {
-        db.run("INSERT OR IGNORE INTO dm_acks (reader, message_id, acked_at) VALUES (?, ?, ?)", [reader, id, clock()]);
+      ack(tx, reader, id) {
+        sqliteOf(tx).run("INSERT OR IGNORE INTO dm_acks (reader, message_id, acked_at) VALUES (?, ?, ?)", [reader, id, clock()]);
       },
-      markDelivered(id, at) {
-        db.run("UPDATE messages SET delivered_at = ? WHERE id = ? AND delivered_at IS NULL", [at, id]);
+      markDelivered(tx, id, at) {
+        sqliteOf(tx).run("UPDATE messages SET delivered_at = ? WHERE id = ? AND delivered_at IS NULL", [at, id]);
       },
-      retract(sender, id, by) {
+      retract(tx, sender, id, by) {
+        const db = sqliteOf(tx);
         return db.transaction(() => {
           const retractable = db.query<{ recipient: string }, [number, string]>(
             RETRACTABLE_SQL,
@@ -1352,7 +1355,8 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
           return true;
         })();
       },
-      prune(olderThanMs) {
+      prune(tx, olderThanMs) {
+        const db = sqliteOf(tx);
         // Replies outlive pruned parents as roots; parent_id is a foreign key.
         db.transaction(() => {
           db.run(
@@ -1369,7 +1373,15 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       },
     },
 
-    mail: mailPort(db),
+    // Each method resolves the handle when called, so a port kept past its body is refused, as a kept Tx is.
+    mailOn: (tx) => {
+      sqliteOf(tx);
+      return {
+        unread: (id) => mailPort(sqliteOf(tx)).unread(id),
+        bounce: (from, to, parentId, body, now) => mailPort(sqliteOf(tx)).bounce(from, to, parentId, body, now),
+        dropReader: (id) => mailPort(sqliteOf(tx)).dropReader(id),
+      };
+    },
 
     cursors: {
       get(r, address, streamType, streamRef) {
