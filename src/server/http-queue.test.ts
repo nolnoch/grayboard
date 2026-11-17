@@ -14,6 +14,7 @@ import { DEFAULT_AUTH_FAIL_LIMIT, DEFAULT_HELLO_LIMIT } from "./rate_limit.ts";
 import { DEFAULT_TRUSTED_PROXIES } from "./client_addr.ts";
 import { until } from "../../tests/support/until.ts";
 import { seed } from "../../tests/support/seed.ts";
+import { registerId } from "../core/boards.ts";
 
 const cleanups: (() => unknown)[] = [];
 afterEach(async () => { for (const c of cleanups.splice(0).reverse()) await c(); });
@@ -133,6 +134,9 @@ test("#807 P1c-15c-1: claim, identity and team routes reach core on their body's
     await call("team add", you, "POST", "/api/teams/core/add", { email: "bob@example.com" });
     await call("identity create", you, "POST", "/api/identities", { name: "agent" }, 201);
     await call("claim call", you, "POST", "/api/claims/call", { as: "agent", tool: "claim_take", args: { key: "k" } });
+    // A session-ID `as` reaches ownAddress's ID branch, which reads the `ids` row on the claim call's Tx.
+    await seed(repo, tx => { registerId(repo.coreOn(tx), { id: "id:0000000000001", principal: "you@example.com", launcher: false }); });
+    await call("claim call as id", you, "POST", "/api/claims/call", { as: "id:0000000000001", tool: "claim_take", args: { key: "j" } });
     await call("claim list", you, "GET", "/api/claims");
     await call("identity delete", you, "DELETE", "/api/identities/agent");
     await seed(repo, tx => { repo.aliases.create(tx, { scope_kind: "team", scope_ref: "core", name: "bot" }, "you@example.com"); });
@@ -140,7 +144,7 @@ test("#807 P1c-15c-1: claim, identity and team routes reach core on their body's
     await call("team remove", you, "POST", "/api/teams/core/remove", { email: "bob@example.com" });
     await call("team add again", you, "POST", "/api/teams/core/add", { email: "bob@example.com" });
     await call("team leave", bob, "POST", "/api/teams/core/leave");
-    const inBody = ["team create", "team add", "identity create", "claim call", "identity delete", "team delete-alias", "team remove", "team leave"];
+    const inBody = ["team create", "team add", "identity create", "claim call", "claim call as id", "identity delete", "team delete-alias", "team remove", "team leave"];
     // Each in-body route reached core at least once, so the last check isn't vacuous for it.
     expect(inBody.filter(r => !checks.some(c => c.route === r && c.handle === "tx"))).toEqual([]);
     expect(checks.some(c => c.route === "claim list" && c.handle === "pool")).toBe(true);
