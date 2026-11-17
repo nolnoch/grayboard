@@ -201,7 +201,7 @@ test("the same client without sessionSource, and a non-OpenCode CIMD client, get
   await stop();
   start([operator(BROKER, false)]);
   // The bound root keeps its name; its client's requests are unmapped from now on.
-  expect(app.repo.hosted.all(app.repo.read).filter(r => app.application.hostedHolds(r.session_id).some(a => a.endsWith("/owner"))).map(r => r.client_id)).toEqual([BROKER]);
+  expect(app.repo.hosted.all(app.repo.read).filter(r => app.application.hostedHolds(app.application.repo.read, r.session_id).some(a => a.endsWith("/owner"))).map(r => r.client_id)).toEqual([BROKER]);
   const tokens = { kept, fresh: await grant(BROKER), cimd: await grant(CIMD_CLIENT) };
   for (const [label, token] of Object.entries(tokens)) {
     const meta: [string, string][] = [[GRAYBOARD_SESSION_META, "owner"], [OPENCODE_SESSION_META, "owner"]];

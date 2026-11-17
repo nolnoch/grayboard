@@ -76,7 +76,7 @@ export function createResources(application: Application, options: ResourceOptio
     if (!watches.has(watch.id)) return false;
     // Background faults close the watch without failing a committed mutation.
     try {
-      if (authorized(watch.session) && application.canReceiveBoard(watch.session, watch.board)) return true;
+      if (authorized(watch.session) && application.canReceiveBoard(application.repo.read, watch.session, watch.board)) return true;
     } catch (e) { hostedFailure("resources.authorize", e); }
     finishQuietly(watch);
     return false;

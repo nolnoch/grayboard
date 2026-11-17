@@ -285,6 +285,43 @@ test("#807 P1c-15b: core helpers inside hosted bodies run on that body's Tx, out
   } finally { spy.mockRestore(); }
 });
 
+// #807 P1c-15b-2: the rest of application.ts leaves `db`. A refusal's deferred row is written on the `Tx` of the body
+// that flushes it; bind's place, unbind, a request's facts and a receipt's board check run on their body's `Tx`.
+test("#807 P1c-15b-2: refusal rows, place, unbind, facts and board checks run on a body's Tx", async () => {
+  const generic: OAuthPrincipal = { ...principal, clientId: "grayboard-pi", sourceKey: GRAYBOARD_SESSION_META };
+  const ctx = (raw: string, extra: Record<string, unknown> = {}) => sessionContext(generic, { [GRAYBOARD_SESSION_META]: raw, ...extra });
+  const checks: { inTxn: boolean; handle: "pool" | "tx" }[] = [];
+  const original = database.repo.coreOn.bind(database.repo);
+  const spy = spyOn(database.repo, "coreOn").mockImplementation(((h: Parameters<typeof original>[0]) => {
+    checks.push({ inTxn: database.db.inTransaction, handle: h === database.repo.read ? "pool" : "tx" });
+    return original(h);
+  }) as never);
+  const holder = ctx("p15b2-holder"), other = ctx("p15b2-other");
+  const refused = () => database.db.prepare("SELECT name FROM binding_events WHERE session_id = ? AND event = 'refused'").all((other as { id: string }).id);
+  try {
+    await hosted.bind(generic, holder, { name: "p15b2", create: true, where: "repo on main" });
+    expect(database.db.prepare("SELECT place FROM ids WHERE id = ?").get((holder as { id: string }).id)).toEqual({ place: "repo on main" });
+    await delivery.open(generic, holder);
+    await hosted.bind(generic, other, { name: "p15b2-other", create: true });
+    const before = checks.length;
+    await expect(hosted.bind(generic, other, { name: "p15b2" })).rejects.toHaveProperty("code", "alias_held");
+    expect(refused()).toEqual([{ name: "you@example.com/p15b2" }]);
+    // The refused bind's row is written by flushQueued's own body, on its Tx.
+    expect(checks.slice(before).filter(c => c.inTxn && c.handle === "tx").length).toBeGreaterThan(0);
+    await hosted.whoami(generic, ctx("p15b2-other", { [GRAYBOARD_MODEL_META]: "claude-opus-5-5" }));
+    expect(database.db.prepare("SELECT model FROM ids WHERE id = ?").get((other as { id: string }).id)).toEqual({ model: "claude-opus-5-5" });
+    await hosted.run(generic, holder, "board_create", (session, tx) => application.call(tx, session, "board_create", { name: "p15b2", purpose: "tests" }));
+    await hosted.run(generic, holder, "board_subscribe", (session, tx) => application.call(tx, session, "board_subscribe", { board: "p15b2", mode: "push" }));
+    await hosted.run(generic, other, "board_post", (session, tx) => application.call(tx, session, "board_post", { board: "p15b2", body: "x" }));
+    const lease = await delivery.open(generic, holder);
+    const items = await delivery.pending(generic, holder, lease.capability);
+    expect(items.some(i => i.event.kind === "board")).toBe(true);
+    await delivery.receipt(generic, holder, lease.capability, items.map(i => i.id));
+    expect(await hosted.unbind(generic, other, { name: "p15b2-other" })).toMatchObject({ structuredContent: { name: null } });
+    expect(checks.filter(c => c.inTxn !== (c.handle === "tx"))).toEqual([]);
+  } finally { spy.mockRestore(); }
+});
+
 test("one reconciliation invalidates listeners once, not once per root", async () => {
   for (let i = 0; i < 4; i++) await hosted.bind(principal, context(`root-${i}`), { name: `peer-${i}`, create: true });
   const invalidations: (string | null)[] = [];
@@ -745,8 +782,8 @@ test("bind publishes its new hold before the after-commit pause and the first ho
   await sender.connect();
   await paused("hosted:bind:after-commit", () => hosted.bind(principal, context("root"), { name: "be", create: true }), async () => {
     await sender.send("you@example.com/fe", "not for be");
-    expect(application.aliasHolderId("you@example.com/fe")).not.toBeNull();
-    expect(application.aliasHolderId("you@example.com/be")).toBe(application.aliasHolderId("you@example.com/fe"));
+    expect(application.aliasHolderId(application.repo.read, "you@example.com/fe")).not.toBeNull();
+    expect(application.aliasHolderId(application.repo.read, "you@example.com/be")).toBe(application.aliasHolderId(application.repo.read, "you@example.com/fe"));
   });
   const lease = await delivery.open(principal, context("root"));
   expect(await delivery.pending(principal, context("root"), lease.capability)).toHaveLength(1);

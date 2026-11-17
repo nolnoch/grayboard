@@ -21,6 +21,7 @@ import {
   type HistoryMessage,
   type IdentityInfo,
   type InboxResult,
+  type RefusalRow,
   type SendResult,
   type UnbindResult,
 } from "../../src/server/application.ts";
@@ -105,7 +106,7 @@ export class AppSession {
   // collector is set and cleared inside the body, which holds the write queue, so overlapping calls on one session
   // can't leave it pointing at another call's. fn may be async (an application operation, #807 P1c-3).
   private async write<T>(session: ApplicationSession, fn: (tx: Tx) => T | Promise<T>): Promise<Awaited<T>> {
-    const rows: Array<() => void> = [];
+    const rows: RefusalRow[] = [];
     try {
       return await this.repo.write(async tx => {
         rows.length = 0;
@@ -120,11 +121,11 @@ export class AppSession {
 
   // A refusal's rows in a body of their own, each in its own savepoint, as hosted's flushQueued writes them: one that
   // fails is logged and the rest still land, so the caller's ApplicationError is what it rethrows.
-  private async flushRefusal(rows: Array<() => void>): Promise<void> {
+  private async flushRefusal(rows: RefusalRow[]): Promise<void> {
     if (!rows.length) return;
-    await seed(this.repo, () => {
+    await seed(this.repo, tx => {
       for (const w of rows) {
-        try { this.repo.atomic(w); } catch (failure) { console.error("[app_session] refusal row failed:", failure); }
+        try { this.repo.atomic(() => w(tx)); } catch (failure) { console.error("[app_session] refusal row failed:", failure); }
       }
     }).catch(failure => console.error("[app_session] refusal rows failed:", failure));
   }
@@ -178,11 +179,11 @@ export class AppSession {
     const id = idAddress(this.key);
     let info: IdentityInfo;
     // A refusal's rows, written after its rollback, as hosted registration hands them to `later` (#807 P1b-4f).
-    const rows: Array<() => void> = [], later = (w: () => void) => { rows.push(w); };
+    const rows: RefusalRow[] = [], later = (w: RefusalRow) => { rows.push(w); };
     try {
       ({ session: this.session, info } = await seed(this.repo, tx => {
         const writesAs = toolsOnly && this.identity !== null
-          ? this.application.hostedWritesAs(tx, this.authed, id, this.identity, true, (address, detail) => later(() => this.application.hostedRefused(id, address, detail)), later)
+          ? this.application.hostedWritesAs(tx, this.authed, id, this.identity, true, (address, detail) => later(w => this.application.hostedRefused(w, id, address, detail)), later)
           : null;
         this.application.hostedRegister(tx, this.authed, id, this.opts.harness ?? "test", writesAs, why => later(() => this.application.hostedCollided(this.authed, id, why)));
         if (this.opts.launcher && writesAs === null) this.application.hostedDeclareLauncher(tx, this.authed, id, { ownership: 0, client_id: "test" });
@@ -214,7 +215,7 @@ export class AppSession {
 
   async unbind(alias: string): Promise<UnbindResult> {
     const session = this.live();
-    return this.write(session, () => this.application.unbind(session, alias));
+    return this.write(session, tx => this.application.unbind(tx, session, alias));
   }
 
   async send(
