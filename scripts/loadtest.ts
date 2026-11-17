@@ -380,8 +380,11 @@ async function main() {
       // Per window only at a size where 80% isn't inside the schedule's own noise; the pool below covers small runs.
       if (!w.churning && target >= 100 && w.ops < 0.8 * target) failures.push(`t=${w.t.toFixed(0)}s: ${w.ops} ops; want ≥ 80% of ${target.toFixed(0)}`);
     }
+    // The pool holds 80% once it's past the schedule's noise, as the per-window gate does; a smaller pool (a seconds-long
+    // run, #1027) only proves the fleet didn't stall: each op waits 0.5-1.5 periods, so 24 expected can come in at 19.
     const opsWindows = steady.filter(w => !w.churning), opsPool = opsWindows.reduce((a, w) => a + w.ops, 0);
-    if (opsWindows.length && opsPool < 0.8 * target * opsWindows.length) failures.push(`${opsPool} ops over ${opsWindows.length} steady windows; want ≥ 80% of ${(target * opsWindows.length).toFixed(0)}`);
+    const poolTarget = target * opsWindows.length, poolShare = poolTarget >= 100 ? 0.8 : 0.5;
+    if (opsWindows.length && opsPool < poolShare * poolTarget) failures.push(`${opsPool} ops over ${opsWindows.length} steady windows; want ≥ ${100 * poolShare}% of ${poolTarget.toFixed(0)}`);
     // Per tool over the steady period: a rare tool's tail can hide in the per-window total.
     const toolSteady: Record<string, { count: number; fast: number }> = {};
     for (const w of steady) for (const [t, x] of Object.entries(w.tools)) { const a = toolSteady[t] ??= { count: 0, fast: 0 }; a.count += x.count; a.fast += x.fast; }
