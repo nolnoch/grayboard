@@ -5,7 +5,7 @@
 // grace, the probe and supersede of a hello, a hello's token checks, the
 // logout close and `end` went with it. Moved from ws.test.ts; tool, board and
 // DM semantics are in hosted_tools.test.ts, routes in http_routes.test.ts.
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -202,6 +202,22 @@ test("revoking or disabling a user closes their open connections; a disable the 
   await seed(srv.app.repo, async tx => srv.app.repo.users.setDisabled(tx, (await srv.app.repo.users.findByEmail(tx, B))!.id, true));
   await srv.app.revalidate();
   await late.next(closed);
+  await a.call("board_list");
+
+  // #807 P3 A7u2: one user's failed read is logged and skips that user only; the tick still resolves and closes the
+  // other disabled user's session (the timer voids it: a rejection would be unhandled).
+  await api(root, "POST", "/api/admin/enable-user", { email: B });
+  const later = await srv.connected(await login(B), "be4");
+  const repo = srv.app.repo;
+  const aId = (await repo.users.findByEmail(repo.read, A))!.id, bId = (await repo.users.findByEmail(repo.read, B))!.id;
+  await seed(repo, tx => repo.users.setDisabled(tx, bId, true));
+  const isDisabled = repo.users.isDisabled;
+  repo.users.isDisabled = (r, id) => id === aId ? Promise.reject(new Error("read failed")) : isDisabled.call(repo.users, r, id);
+  const logs: string[] = [];
+  const logged = spyOn(console, "error").mockImplementation((m: unknown) => { logs.push(String(m)); });
+  try { await srv.app.revalidate(); } finally { repo.users.isDisabled = isDisabled; logged.mockRestore(); }
+  expect(logs.some(m => m.includes("revalidate: user read failed"))).toBe(true);
+  await later.next(closed);
   await a.call("board_list");
 });
 

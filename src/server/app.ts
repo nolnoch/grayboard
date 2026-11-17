@@ -169,7 +169,9 @@ export function startServer(config: Config, opts: StartOptions = {}) {
   if (opts.background !== false) {
     timers.push(setInterval(sweepLimits, 30_000), setInterval(() => {
       // A throw here would surface as an unhandled error every 30 s with no context; log it and let the next tick retry.
-      try { void revalidate(); } catch (e) { console.error(`[grayboard] revalidate failed: ${(e as Error).stack ?? e}`); }
+      // Async since #807 P3 A7u2: a rejection is logged the same way, never left unhandled (Bun exits on one).
+      const failed = (e: unknown) => console.error(`[grayboard] revalidate failed: ${(e as Error).stack ?? e}`);
+      try { revalidate().catch(failed); } catch (e) { failed(e); }
     }, 30_000));
     stopRetention = startRetentionJobs(repo, config, opts.retentionFirstDelayMs !== undefined ? { firstDelayMs: opts.retentionFirstDelayMs } : undefined, application.boardsChanged);
   }

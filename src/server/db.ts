@@ -99,8 +99,14 @@ const ALIAS_COLS = `id, address, scope_kind, scope_ref, name, created_at`;
 // A synchronous callback's result: a promise is refused at compile time, so
 // nothing can await between a transaction's reads and its writes.
 export type Sync<T> = T extends PromiseLike<unknown> ? never : T;
-// Repo.authPeek's answer: the auth cache's live-token hits under one generation (#807 P3 A7d).
-export type AuthPeek = { generation: string; access(tokenHash: string, resource: string, now: number): OAuthAccess | undefined };
+// Repo.authPeek's answer: the auth cache's live-token and user hits under one generation (#807 P3 A7d, A7u2).
+// `user`: the user cache's entry under that generation (#807 P3 A7u2): the row, null when known absent, undefined on a
+// miss.
+export type AuthPeek = {
+  generation: string;
+  access(tokenHash: string, resource: string, now: number): OAuthAccess | undefined;
+  user(userId: number): User | null | undefined;
+};
 
 // A top-level write transaction, through db's write queue. `committed` runs after the commit and before the queue's
 // next body (D4: in-memory state a transaction reads changes only inside one or right after its commit, never in
@@ -231,15 +237,15 @@ export interface Repo {
   post<T>(fn: (tx: Tx) => T | Promise<T>, committed?: (value: T) => unknown, what?: string): boolean;
   // The store's read handle outside any transaction (#807 P1c): reads committed state. The task holding an open
   // transaction can't use it (sqliteOf refuses, #807 P3 A7e2): it passes its body's Tx. A Postgres Read is a pool
-  // handle and must never resolve to a transaction's connection. Ambient `db` reads (policyNow, the users reads) aren't
-  // guarded.
+  // handle and must never resolve to a transaction's connection. Ambient `db` reads (policyNow) aren't guarded.
   read: Read;
   // Runs fn, which writes none of the generation's tables, with the auth cache's generation read once for its whole
   // body (#881): one authorization's token and user reads share it, across its awaits (#807 P3 A7c). Inside the
   // caller's own transaction, nested, or with no generation to read, it's plain fn().
   authRead<T>(fn: () => T | Promise<T>): Promise<T>;
-  // The auth cache's hits, synchronously, for the stream timer's phase A (#807 P3 A7d): a live access token by hash
-  // as the cache holds it under the current generation, else undefined (a miss: the caller reads in full, async).
+  // The auth cache's hits, synchronously, for the stream timer's phase A (#807 P3 A7d): a live access token by hash,
+  // and a user by id (#807 P3 A7u2), as the caches hold them under the current generation, else undefined (a miss:
+  // the caller reads in full, async).
   // Only live tokens are cached, so a miss is never a refusal. Undefined itself when there's no generation to key on
   // (inside the caller's own transaction, or a failed generation read).
   authPeek(): AuthPeek | undefined;
@@ -264,11 +270,13 @@ export interface Repo {
     // Forgets a user's IdP issuer and subject, so the next sign-in with the email, from any IdP, links its account.
     clearSubject(tx: Tx, userId: number): Promise<void>;
     findByEmail(r: Read, email: string): Promise<User | undefined>;
-    findById(userId: number): User | undefined;
-    // findById(id)?.disabled_at != null, cached on authGeneration (#853).
-    isDisabled(userId: number): boolean;
-    // The user's email while it exists and isn't disabled, cached on authGeneration (#853).
-    activeEmail(userId: number): string | undefined;
+    // Uncached: a fresh read on the caller's handle.
+    findById(r: Read, userId: number): Promise<User | undefined>;
+    // findById(r, id)?.disabled_at != null, cached on authGeneration (#853); inside the caller's own transaction it
+    // reads on its Tx, uncached.
+    isDisabled(r: Read, userId: number): Promise<boolean>;
+    // The user's email while it exists and isn't disabled, cached as isDisabled is.
+    activeEmail(r: Read, userId: number): Promise<string | undefined>;
     setDisabled(tx: Tx, userId: number, disabled: boolean): Promise<void>;
   };
   sessions: {
@@ -290,8 +298,9 @@ export interface Repo {
   // Policy's reads (and resolveMention's alias reads), synchronously on the SQLite connection (#807 P3 A7e1): the
   // loader authorizeNow drives, and the core Access seam's, until #807 B makes them async. Inside the caller's own
   // transaction they read its writes. principalOf is principals.of. teamsOf serves helloOkFields, which the
-  // synchronous hostedSession reaches. SQLite only: a Postgres Repo won't have it. policy.test.ts ratchets its callers.
-  policyNow: PolicyReadsSync & AccessReadsSync & { teamsOf(userId: number): Team[] };
+  // synchronous hostedSession reaches; userById the hosted service's synchronous rebuild (#807 P3 A7u2, until A7g).
+  // SQLite only: a Postgres Repo won't have it. policy.test.ts ratchets its callers.
+  policyNow: PolicyReadsSync & AccessReadsSync & { teamsOf(userId: number): Team[]; userById(userId: number): User | undefined };
   // Names in scopes, keyed by address. The writes return promises (#807 P3 A6d); the reads stay synchronous until
   // async Access (A7): `listForScope` and `seen` feed the synchronous session builder, and `countForScope` (only async bodies call it) moves with them so the group's reads go async together.
   aliases: {
@@ -1008,11 +1017,11 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
     return n === undefined ? undefined : `${n}:${dataVersion.get()!.data_version}`;
   };
   const authGeneration = () => ownsTx(db) ? undefined : pinned() ?? readGeneration();
-  const userById = (userId: number) => db.query<User, [number]>("SELECT * FROM users WHERE id = ?").get(userId) ?? undefined;
+  const userById = (c: Database, userId: number) => c.query<User, [number]>("SELECT * FROM users WHERE id = ?").get(userId) ?? undefined;
   // Caches of what the auth tables say, keyed on authGeneration: a live access token only (an unknown or dead one is
   // re-read every time); a user row, or its absence, as read (#853). They sit here, under the store's own methods, so
   // a test that replaces one of those methods replaces the cache behind it, except authPeek's: it reads the access
-  // cache directly, so a stubbed findActiveAccess changes only what a miss later fills.
+  // and user caches directly, so a stubbed findActiveAccess, isDisabled or activeEmail changes only what a miss later fills.
   // A lookup hits only when its generation is the cache's. A miss reads, then fills only if the generation is still
   // its own once the read is done (#807 P3 A7b): a lookup pinned before a commit neither fills nor clears the cache a
   // newer one keyed, so bodies with different pins don't thrash it, and generations need no order.
@@ -1026,12 +1035,19 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
   };
   let userGeneration: string | undefined;
   const users = new Map<number, User | null>();
-  const cachedUser = (userId: number): User | undefined => {
+  const heldUser = (g: string, userId: number) => g === userGeneration ? users.get(userId) : undefined;
+  // The read may await (#807 P3 A7u2; pause auth:user:read): a commit meanwhile (a disable) moves the generation, so
+  // the fill check stores nothing and the next lookup reads again. The answer stands, linearized before that commit.
+  // Inside the caller's own transaction (generation undefined) it reads on the caller's Tx, uncached. The handle is
+  // resolved first, so a kept Tx is refused on a hit too.
+  const cachedUser = async (r: Read, userId: number): Promise<User | undefined> => {
+    const c = sqliteOf(r);
     const g = authGeneration();
-    if (g === undefined) return userById(userId);
-    const hit = g === userGeneration ? users.get(userId) : undefined;
+    if (g === undefined) return userById(c, userId);
+    const hit = heldUser(g, userId);
     if (hit !== undefined) return hit ?? undefined;
-    const u = userById(userId) ?? null;
+    const u = userById(c, userId) ?? null;
+    await testPauseAsync("auth:user:read");
     const kept = fills(g, userGeneration, () => users.clear());
     if (kept === g) { userGeneration = g; users.set(userId, u); }
     return u ?? undefined;
@@ -1120,7 +1136,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       try { g = authGeneration(); } catch (error) { console.error("[grayboard] auth generation read failed:", error); return undefined; }
       if (g === undefined) return undefined;
       const generation = g;
-      return { generation, access: (h, resource, now) => heldAccess(generation, `${resource}\n${h}`, now) };
+      return { generation, access: (h, resource, now) => heldAccess(generation, `${resource}\n${h}`, now), user: (userId) => heldUser(generation, userId) };
     },
     authGeneration,
     commitGeneration: () => ownsTx(db) ? undefined : readGeneration(),
@@ -1175,12 +1191,12 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
         sqliteOf(tx).run("UPDATE users SET idp_issuer = NULL, idp_subject = NULL WHERE id = ?", [userId]);
       },
       async findByEmail(r, email) { return userByEmail(sqliteOf(r), email); },
-      findById: userById,
-      isDisabled(userId) {
-        return cachedUser(userId)?.disabled_at != null;
+      async findById(r, userId) { return userById(sqliteOf(r), userId); },
+      async isDisabled(r, userId) {
+        return (await cachedUser(r, userId))?.disabled_at != null;
       },
-      activeEmail(userId) {
-        const u = cachedUser(userId);
+      async activeEmail(r, userId) {
+        const u = await cachedUser(r, userId);
         return u && u.disabled_at === null ? u.email : undefined;
       },
       async setDisabled(tx, userId, disabled) {
@@ -1254,6 +1270,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       shareDelegating: (userA, userB) => shareDelegating(db, userA, userB),
       userByEmail: email => userByEmail(db, email),
       teamsOf: userId => teamsOf(db, userId),
+      userById: userId => userById(db, userId),
       alias: address => aliasAt(db, address),
       aliasesNamed: name => aliasesNamed(db, name),
     },

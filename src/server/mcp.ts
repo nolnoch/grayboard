@@ -617,7 +617,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     auditedStreams.add(context);
     try {
       const reason = context.principal.accessExpiry <= now() ? "access_expired" : error instanceof ApplicationError ? error.code : "failed";
-      hosted.audit(application.repo.read, context.sessionContext.id, "hosted.stream_closed", { reason, role: context.role, ...(context.stamp ? { ownership: context.stamp.ownership } : {}) }, context.principal);
+      hosted.auditAs(application.repo.read, context.sessionContext.id, "hosted.stream_closed", { reason, role: context.role, ...(context.stamp ? { ownership: context.stamp.ownership } : {}) }, context.principal);
     } catch (e) { hostedFailure("mcp.stream", e); }
   }
   // Legacy lifecycle transitions are audited with a per-session random ref, never the sid (#476).
