@@ -39,7 +39,7 @@ test("#807: retention while another body holds the write queue waits, then prune
     return inserted;
   });
   const holder = hold(db);
-  const ran = runRetention(repo, db, { messageRetentionDays: 1, auditRetentionDays: 1 } as Config);
+  const ran = runRetention(repo, { messageRetentionDays: 1, auditRetentionDays: 1 } as Config);
   await ticks();
   expect(repo.messages.getById(repo.read, m.id)).toBeDefined();
   holder.release();

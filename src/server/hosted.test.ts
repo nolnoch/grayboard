@@ -36,7 +36,7 @@ const context = (raw: string) => sessionContext(principal, { [OPENCODE_SESSION_M
 beforeEach(async () => {
   blobDir = mkdtempSync(join(tmpdir(), "gb-hosted-"));
   database = openDatabase(scratchDbPath(), { blobDir });
-  application = createApplication(database.repo, database.db);
+  application = createApplication(database.repo);
   const user = await seed(database.repo, tx => database.repo.users.upsertByEmail(tx, "you@example.com", null));
   principal = { authed: { user_id: user.id, user_email: user.email, session_id: 0 }, clientId: OPENCODE_CLIENT, sourceKey: OPENCODE_SESSION_META, grantId: "G1", accessHash: "test", accessExpiry: Number.MAX_SAFE_INTEGER, scopes: ["tools", "delivery"] };
   now = Date.now(); authorized = true;
@@ -858,7 +858,7 @@ test("a refused writes_as declaration through the hosted gate keeps its refused 
 });
 
 test("a rate-limited hosted bind keeps its bind.rate_limited row after the transaction rolls back, and the streak's end is written once (#467)", async () => {
-  const limited = createApplication(database.repo, database.db, { helloLimit: { burst: 1, perSec: 0.01 }, now: () => now });
+  const limited = createApplication(database.repo, { helloLimit: { burst: 1, perSec: 0.01 }, now: () => now });
   const service = createHostedSessions(limited, { now: () => now, isAuthorized: () => true });
   const rows = (action: string) => (database.db.query("SELECT count(*) AS n FROM access_log WHERE action = ?").get(action) as { n: number }).n;
   try {
@@ -1579,7 +1579,7 @@ test("a released child's ID ends with the release's reason, not at the next star
   expect(idEnd(hostedId("root"))).toBeNull();
   // Nothing is left for the startup sweep to label a WSS leftover.
   hosted.close(); application.stopExpiry();
-  application = createApplication(database.repo, database.db);
+  application = createApplication(database.repo);
   hosted = createHostedSessions(application, { now: () => now, isAuthorized: () => authorized });
   expect(childAudits("id.ended").filter(a => a.why === "wss_removed")).toEqual([]);
 });

@@ -36,7 +36,7 @@ const file = (text: string) => ({ filename: "a.txt", type: "text/plain", data: n
 test("#807: an upload stored while another body holds the write queue waits, then commits", async () => {
   const { db, repo } = setup();
   const holder = hold(db);
-  const stored = storeUpload(repo, db, "you@example.com", "be", file("hello"));
+  const stored = storeUpload(repo, "you@example.com", "be", file("hello"));
   await ticks();
   expect(rows(db)).toEqual([]);
   holder.release();
@@ -47,9 +47,9 @@ test("#807: an upload stored while another body holds the write queue waits, the
 
 test("#807: an upload released while another body holds the write queue waits, then deletes it", async () => {
   const { db, repo } = setup();
-  const row = await storeUpload(repo, db, "you@example.com", "be", file("hello"));
+  const row = await storeUpload(repo, "you@example.com", "be", file("hello"));
   const holder = hold(db);
-  const released = releaseStored(repo, db, "you@example.com", "be", row.id);
+  const released = releaseStored(repo, "you@example.com", "be", row.id);
   await ticks();
   expect(rows(db)).toEqual([row.id]);
   holder.release();

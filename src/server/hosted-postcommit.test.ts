@@ -40,7 +40,7 @@ beforeEach(async () => {
   const issued = await issueOAuth(database.repo, `${origin}/mcp`, "you@example.com", ["grayboard:tools", "grayboard:delivery"], Date.now(), OPENCODE_CLIENT);
   token = issued.token;
   oauth = createOAuthServer(database.repo, { dbPath: path, blobDir: join(dir, "blobs"), httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl: origin, messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES });
-  application = createApplication(database.repo, database.db);
+  application = createApplication(database.repo);
   mcp = createHostedMcp(application, oauth, { trustedOrigin: origin });
   const authenticated = oauth.authenticate(new Request(`${origin}/mcp`, { headers: { Authorization: `Bearer ${token}` } }), ["grayboard:tools"]);
   if (authenticated instanceof Response) throw new Error("fixture authentication");

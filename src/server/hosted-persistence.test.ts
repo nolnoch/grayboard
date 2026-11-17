@@ -25,7 +25,7 @@ const resource = "https://grayboard.example/mcp";
 const context = (p: OAuthPrincipal, raw = "root") => sessionContext(p, { [OPENCODE_SESSION_META]: raw });
 function open() {
   database = openDatabase(join(dir, "bus.db"), { blobDir: join(dir, "blobs") });
-  application = createApplication(database.repo, database.db);
+  application = createApplication(database.repo);
   const isAuthorized = (p: OAuthPrincipal, r: Read = database.repo.read) => database.repo.oauth.isGrantActive(r, p.grantId, now);
   hosted = createHostedSessions(application, { now: () => now, isAuthorized });
   delivery = createDelivery(hosted, { isAuthorized });

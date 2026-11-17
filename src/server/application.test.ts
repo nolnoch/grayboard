@@ -31,7 +31,7 @@ const isDirect = (e: { kind: string }) => e.kind === "direct";
 beforeEach(async () => {
   blobDir = mkdtempSync(join(tmpdir(), "gb-application-"));
   store = openDatabase(scratchDbPath(), { blobDir });
-  application = createApplication(store.repo, store.db);
+  application = createApplication(store.repo);
   const user = (tx: Tx, email: string): AuthedUser => {
     const u = store.repo.users.upsertByEmail(tx, email, null);
     // A session needs a live sign-in (#351).
@@ -197,7 +197,7 @@ test("tools-only calls neither own nor drain deliveries nor reset the owner's st
 
 test("bind budget is per user and spent before an alias is created or a hold taken", async () => {
   application.stopExpiry();
-  application = createApplication(store.repo, store.db, { helloLimit: { burst: 1, perSec: 0.01 } });
+  application = createApplication(store.repo, { helloLimit: { burst: 1, perSec: 0.01 } });
   const a = await connect(alice, "be");
   await expect(a.bind("refused")).rejects.toMatchObject({ code: "rate_limited", extra: { retry_after_ms: expect.any(Number) } });
   expect(store.repo.aliases.listForScope(store.repo.read, "person", alice.user_email).map(x => x.name)).toEqual(["be"]);

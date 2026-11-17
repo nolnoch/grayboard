@@ -8,7 +8,7 @@ import type { OAuthPrincipal } from "../../src/server/oauth.ts";
 const [path, blobs, raw] = process.argv.slice(2);
 const input = JSON.parse(raw!) as { principal: OAuthPrincipal; operation: "bind" | "register" | "end" | "revoke" | "sweep" | "receipt"; now: number; name?: string; rawSession?: string; child?: string; refreshHash?: string; sweepAt?: number };
 const { db, repo } = openDatabase(path!, { blobDir: blobs! });
-const application = createApplication(repo, db);
+const application = createApplication(repo);
 let now = input.now;
 const hosted = createHostedSessions(application, { now: () => now, isAuthorized: (p, r = repo.read) => repo.oauth.isGrantActive(r, p.grantId, now) });
 const context = sessionContext(input.principal, { [OPENCODE_SESSION_META]: input.rawSession ?? "root" });

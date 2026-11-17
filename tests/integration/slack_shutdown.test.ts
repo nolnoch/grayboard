@@ -48,7 +48,7 @@ for (const mode of ["stop", "receipt-failure", "stop-during-receipt"]) test(`hos
     const before = srv.app.db.prepare("SELECT * FROM slack_progress").all();
     const mapped = srv.app.db.prepare("SELECT * FROM slack_threads").all();
     expect(mapped).toHaveLength(1);
-    restarted = new SlackBridge({ repo: srv.app.repo, db: srv.app.db, application: srv.app.application, appToken: "xapp-1-test", botToken: "xoxb-test", apiUrl: slack.api });
+    restarted = new SlackBridge({ repo: srv.app.repo, application: srv.app.application, appToken: "xapp-1-test", botToken: "xoxb-test", apiUrl: slack.api });
     await restarted.start();
     const next = [...(restarted as any).linked.values()][0] as any;
     await next.relay.settled();
