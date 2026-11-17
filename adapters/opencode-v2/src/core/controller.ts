@@ -47,7 +47,7 @@ export type CallOutcome = { status: "completed"; output: unknown } | { status: "
 // recovery whose delivery expires again before it opens never starts over.
 // `binding` counts the root's own native binds and unbinds between beforeCall
 // and afterCall: the recovery never resumes under one, whose completion sets the holds.
-type Root<E extends Enrollment> = { e: E; approval: E; epoch: number; paused: boolean; status: Status; admitted: Set<string>; abort?: AbortController; task?: Promise<void>; lease?: Lease; awaiting?: object; recovery?: { attempt: number; spent: number }; binding?: number };
+type Root<E extends Enrollment> = { e: E; approval: E; epoch: number; paused: boolean; status: Status; admitted: Set<string>; abort?: AbortController; task?: Promise<void>; lease?: Lease; awaiting?: object; recovery?: { attempt: number; spent: number }; binding?: number; released?: number };
 // Time left in `grace`: its own budget less what it spent, and never past the protected lease's deadline.
 function graceLeft(grace: Grace): number {
   const lease = grace.lease?.();
@@ -109,6 +109,9 @@ const display = (address: string) => shortOf(address.slice(0, address.lastIndexO
 export class Controller<E extends Enrollment = Enrollment> {
   readonly routes = new SessionRoutes();
   private readonly lookups = new Map<string, SessionPath>();
+  // A descendant's registration under its enrolled root (#567): shared while in flight, and once done kept only
+  // while the root keeps its epoch and its lease's server ownership (whose end deletes child rows server-side).
+  private readonly registered = new Map<string, { r: Root<E>; epoch: number; ownership?: number; settled: boolean; done: Promise<void> }>();
   readonly Transport: typeof Wire;
   protected roots = new Map<string, Root<E>>();
   private watches = new Map<string, { dispose(): Promise<void> }>();
@@ -168,8 +171,8 @@ export class Controller<E extends Enrollment = Enrollment> {
   }
   // The watch's and a guard's drift alike; hosts key on DRIFTED (pi's describe, a root's sink).
   private credentialChanged() { this.drift(`${DRIFTED}; ${this.hint}`); }
-  private async path(sessionID: string) {
-    const path = await this.port.ancestry(sessionID);
+  private async path(sessionID: string) { return this.route(await this.port.ancestry(sessionID)); }
+  private route(path: SessionPath) {
     this.routes.remember({ sessionID: path.root, root: path.root, via: [] });
     for (const [index, id] of path.via.entries()) this.routes.remember({ sessionID: id, root: path.root, via: path.via.slice(index + 1) });
     this.routes.remember(path);
@@ -197,17 +200,61 @@ export class Controller<E extends Enrollment = Enrollment> {
   // before a native wire names it, which unregistered would start an ownership
   // of its own (#535). One that ended while registering may have sent its end
   // before this registration landed, so it ends the row it made. A refusal is
-  // the root's `child_register` failure unless `report` is false: an
-  // instructions fetch reports its own, without degrading the root.
-  async enlist(path: SessionPath, report = true): Promise<void> {
-    const r = this.roots.get(path.root);
+  // the root's `child_register` failure unless this is an instructions `fetch`,
+  // which reports its own, without degrading the root. Under an enrolled root,
+  // calls and fetches share a registration in flight; a done one serves while
+  // the root keeps its epoch (a stop, pause or re-enroll moves it) and the
+  // server ownership its lease names: any end of that ownership (a release, a
+  // lapsed lease the run loop reopens, an idle sweep) deletes child rows (#567).
+  async enlist(path: SessionPath, fetch = false): Promise<void> {
+    const r = this.roots.get(path.root), live = !!r && !r.paused, releases = r?.released ?? 0, epoch = r?.epoch;
     const e = r?.e ?? await this.port.credential.capture(path.root);
     const call: Temporary = (sessionID, c) => this.temporary(e, c, sessionID);
-    await register(call, { root: path.root, via: path.via, child: path.sessionID })
-      .catch(error => { if (report) this.failure("child_register", error, r); throw error; });
+    const shared = () => {
+      const known = r && this.registered.get(path.sessionID);
+      return known && known.r === r && known.epoch === r.epoch && (!known.settled || known.ownership !== undefined && known.ownership === r.lease?.ownership) ? known.done : undefined;
+    };
+    const start = () => {
+      const started = register(call, { root: path.root, via: path.via, child: path.sessionID });
+      if (r) {
+        const entry = { r, epoch: r.epoch, ...(r.lease ? { ownership: r.lease.ownership } : {}), settled: false, done: started };
+        this.registered.set(path.sessionID, entry);
+        if (this.registered.size > LOOKUPS) this.registered.delete(this.registered.keys().next().value!);
+        started.then(() => { entry.settled = true; }, () => {});
+      }
+      started.catch(() => { if (this.registered.get(path.sessionID)?.done === started) this.registered.delete(path.sessionID); });
+      return started;
+    };
+    // A joined registration that fails may have failed on an older request's deadline (one held at the bind
+    // gate, its 10s spent before this call began): this call then registers once on its own, as it would have
+    // unshared, joining instead any newer one a peer started first (#567). Only while nothing it registers
+    // under has moved since it began: a root stopped, paused, re-enrolled or ended, or a child ended, would
+    // have the retry start an ownership nothing then ends, so the joined failure stands.
+    const unmoved = () => !this.stopped && !this.routes.isEnded(path.sessionID) && !this.routes.isEnded(path.root)
+      && this.roots.get(path.root) === r && !!r && !r.paused && r.epoch === epoch;
+    let done = shared(), joined = !!done;
+    for (;;) {
+      done ??= start();
+      const error = await done.then(() => undefined, (error: unknown) => ({ error }));
+      if (!error) break;
+      if (joined && unmoved()) { joined = false; done = shared(); continue; }
+      if (!fetch) this.failure("child_register", error.error, r);
+      throw error.error;
+    }
     if (this.routes.isEnded(path.sessionID) || this.routes.isEnded(path.root)) {
       await end(call, { child: path.sessionID }).catch(error => this.failure("child_end", error, r));
       throw new AncestryError("Grayboard session ended during registration");
+    }
+    // A fetch whose root released its ownership while it registered: the release may have landed first, and
+    // the registration then started the root's key a new ownership. A root still paused ends it again, with
+    // the child's row; one a re-enroll replaced, or a resume restarted, owns its key, so its rows stand (#567).
+    if (fetch && live && (this.roots.get(path.root) !== r || (r!.released ?? 0) !== releases)) {
+      if (this.registered.get(path.sessionID)?.done === done) this.registered.delete(path.sessionID);
+      if (this.roots.get(path.root) === r && r!.paused) {
+        await end(call, { child: path.sessionID }).catch(error => this.failure("child_end", error, r));
+        await end(call, { child: path.root }).catch(error => this.failure("session_end", error, r));
+      }
+      throw new AncestryError("Grayboard root paused during registration");
     }
     this.routes.remember(path);
   }
@@ -614,7 +661,7 @@ export class Controller<E extends Enrollment = Enrollment> {
   }
   private async stop(r: Root<E>) { r.epoch++; r.abort?.abort(); await r.task; r.task = undefined; r.abort = undefined; }
   private async release(r: Root<E>) {
-    const lease = r.lease; r.lease = undefined;
+    const lease = r.lease; r.lease = undefined; r.released = (r.released ?? 0) + 1;
     await this.temporary(r.e, async wire => {
       if (lease) { wire.capability = lease.capability; await wire.call("delivery_release").catch(error => this.failure("delivery_release", error, r)); }
       await wire.call("session_end");
@@ -879,6 +926,9 @@ export class Controller<E extends Enrollment = Enrollment> {
   // After a native call: a bind or unbind result restarts delivery under the new
   // hold set; an `unbound` result from any tool rebinds the remembered holds.
   async afterCall(event: { sessionID: string; tool: string; result: CallOutcome }): Promise<void> {
+    // A descendant's call the server answered unbound found no child row (one evicted, or its root's ownership
+    // ended unseen): its next call registers again (#567).
+    if (!this.roots.has(event.sessionID) && event.result.status === "completed" && (event.result.output as { unbound?: unknown } | undefined)?.unbound === true) this.registered.delete(event.sessionID);
     return this.serial(async () => {
       const r = this.roots.get(event.sessionID);
       const own = event.tool === "bind" || event.tool === "unbind";
@@ -921,9 +971,11 @@ export class Controller<E extends Enrollment = Enrollment> {
     });
   }
   // A new top-level root binds the configured name; receiving still needs approval where the host keeps one.
+  // `session.created` resolved its ancestry a moment ago (`childRoot`): that lookup serves (#567).
   async configuredBind(sessionID: string) {
     if (this.stopped || !this.configured) return;
-    const path = await this.path(sessionID);
+    const known = this.lookups.get(sessionID);
+    const path = known ? this.route(known) : await this.path(sessionID);
     if (path.root !== sessionID) return;
     try {
       const e = await this.port.credential.capture(sessionID);
@@ -935,7 +987,7 @@ export class Controller<E extends Enrollment = Enrollment> {
   // ownership; a descendant ends its registration without ending its root.
   async ended(sessionID: string) {
     if (this.stopped) return;
-    this.lookups.delete(sessionID);
+    this.lookups.delete(sessionID); this.registered.delete(sessionID);
     const path = this.routes.end(sessionID);
     if (!path) return;
     const r = this.roots.get(path.root);

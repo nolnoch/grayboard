@@ -36541,9 +36541,15 @@ import { createHash as createHash6 } from "crypto";
 // adapters/hosted-core/src/sessions.ts
 class AncestryError extends Error {
 }
+var ENDED_LIMIT = 4096;
+
 class SessionRoutes {
+  limit;
   paths = new Map;
   ended = new Set;
+  constructor(limit = ENDED_LIMIT) {
+    this.limit = limit;
+  }
   remember(path) {
     if (this.ended.has(path.sessionID) || this.ended.has(path.root))
       throw new AncestryError("Grayboard session ended during ancestry lookup");
@@ -36563,6 +36569,8 @@ class SessionRoutes {
     if (this.ended.has(sessionID))
       return;
     this.ended.add(sessionID);
+    if (this.ended.size > this.limit)
+      this.ended.delete(this.ended.values().next().value);
     const path = this.paths.get(sessionID);
     this.paths.delete(sessionID);
     return path ? { ...path, via: [...path.via] } : undefined;
@@ -36627,6 +36635,7 @@ class Controller {
   port;
   routes = new SessionRoutes;
   lookups = new Map;
+  registered = new Map;
   Transport;
   roots = new Map;
   watches = new Map;
@@ -36694,7 +36703,9 @@ class Controller {
     this.drift(`${DRIFTED}; ${this.hint}`);
   }
   async path(sessionID) {
-    const path = await this.port.ancestry(sessionID);
+    return this.route(await this.port.ancestry(sessionID));
+  }
+  route(path) {
     this.routes.remember({ sessionID: path.root, root: path.root, via: [] });
     for (const [index, id] of path.via.entries())
       this.routes.remember({ sessionID: id, root: path.root, via: path.via.slice(index + 1) });
@@ -36720,18 +36731,61 @@ class Controller {
     const r = this.roots.get(path.root);
     return path.root !== sessionID && r && !r.paused ? path : undefined;
   }
-  async enlist(path, report = true) {
-    const r = this.roots.get(path.root);
+  async enlist(path, fetch2 = false) {
+    const r = this.roots.get(path.root), live = !!r && !r.paused, releases = r?.released ?? 0, epoch = r?.epoch;
     const e = r?.e ?? await this.port.credential.capture(path.root);
     const call = (sessionID, c) => this.temporary(e, c, sessionID);
-    await register2(call, { root: path.root, via: path.via, child: path.sessionID }).catch((error) => {
-      if (report)
-        this.failure("child_register", error, r);
-      throw error;
-    });
+    const shared = () => {
+      const known = r && this.registered.get(path.sessionID);
+      return known && known.r === r && known.epoch === r.epoch && (!known.settled || known.ownership !== undefined && known.ownership === r.lease?.ownership) ? known.done : undefined;
+    };
+    const start = () => {
+      const started = register2(call, { root: path.root, via: path.via, child: path.sessionID });
+      if (r) {
+        const entry = { r, epoch: r.epoch, ...r.lease ? { ownership: r.lease.ownership } : {}, settled: false, done: started };
+        this.registered.set(path.sessionID, entry);
+        if (this.registered.size > LOOKUPS)
+          this.registered.delete(this.registered.keys().next().value);
+        started.then(() => {
+          entry.settled = true;
+        }, () => {});
+      }
+      started.catch(() => {
+        if (this.registered.get(path.sessionID)?.done === started)
+          this.registered.delete(path.sessionID);
+      });
+      return started;
+    };
+    const unmoved = () => !this.stopped && !this.routes.isEnded(path.sessionID) && !this.routes.isEnded(path.root) && this.roots.get(path.root) === r && !!r && !r.paused && r.epoch === epoch;
+    let done = shared(), joined = !!done;
+    for (;; ) {
+      done ??= start();
+      const error = await done.then(() => {
+        return;
+      }, (error) => ({ error }));
+      if (!error)
+        break;
+      if (joined && unmoved()) {
+        joined = false;
+        done = shared();
+        continue;
+      }
+      if (!fetch2)
+        this.failure("child_register", error.error, r);
+      throw error.error;
+    }
     if (this.routes.isEnded(path.sessionID) || this.routes.isEnded(path.root)) {
       await end(call, { child: path.sessionID }).catch((error) => this.failure("child_end", error, r));
       throw new AncestryError("Grayboard session ended during registration");
+    }
+    if (fetch2 && live && (this.roots.get(path.root) !== r || (r.released ?? 0) !== releases)) {
+      if (this.registered.get(path.sessionID)?.done === done)
+        this.registered.delete(path.sessionID);
+      if (this.roots.get(path.root) === r && r.paused) {
+        await end(call, { child: path.sessionID }).catch((error) => this.failure("child_end", error, r));
+        await end(call, { child: path.root }).catch((error) => this.failure("session_end", error, r));
+      }
+      throw new AncestryError("Grayboard root paused during registration");
     }
     this.routes.remember(path);
   }
@@ -37215,6 +37269,7 @@ class Controller {
   async release(r) {
     const lease = r.lease;
     r.lease = undefined;
+    r.released = (r.released ?? 0) + 1;
     await this.temporary(r.e, async (wire) => {
       if (lease) {
         wire.capability = lease.capability;
@@ -37498,6 +37553,8 @@ class Controller {
       });
   }
   async afterCall(event) {
+    if (!this.roots.has(event.sessionID) && event.result.status === "completed" && event.result.output?.unbound === true)
+      this.registered.delete(event.sessionID);
     return this.serial(async () => {
       const r = this.roots.get(event.sessionID);
       const own = event.tool === "bind" || event.tool === "unbind";
@@ -37550,7 +37607,8 @@ class Controller {
   async configuredBind(sessionID) {
     if (this.stopped || !this.configured)
       return;
-    const path = await this.path(sessionID);
+    const known = this.lookups.get(sessionID);
+    const path = known ? this.route(known) : await this.path(sessionID);
     if (path.root !== sessionID)
       return;
     try {
@@ -37565,6 +37623,7 @@ class Controller {
     if (this.stopped)
       return;
     this.lookups.delete(sessionID);
+    this.registered.delete(sessionID);
     const path = this.routes.end(sessionID);
     if (!path)
       return;
