@@ -169,8 +169,15 @@ function queuedNow<T>(db: Database, fn: (tx: Tx) => T, committed?: (value: T) =>
 // transaction when the caller holds the queue outside one, or through the idle queue; when another body holds the
 // queue it waits behind it, and its failure is logged as `what` failed. True when it ran now (its error thrown,
 // `committed` run after the open transaction's commit or at once), false when it waits.
-function posted<T>(db: Database, fn: (tx: Tx) => T, committed: ((value: T) => unknown) | undefined, what: string): boolean {
+function posted<T>(db: Database, fn: (tx: Tx) => T, given: ((value: T) => unknown) | undefined, what: string): boolean {
   const queue = queueFor(db);
+  // No caller awaits a post, so a promise its committed returns is caught here, on every branch, and logged as `what`
+  // (#1051); returning nothing, the waited branch's own catch doesn't log it twice. A synchronous throw is unchanged.
+  const committed = given && ((value: T) => {
+    const r = given(value);
+    if (r !== null && (typeof r === "object" || typeof r === "function") && typeof (r as PromiseLike<unknown>).then === "function")
+      Promise.resolve(r).catch(error => console.error(`[grayboard] ${what} failed:`, error));
+  });
   if (queue.mine && db.inTransaction) {
     const value = withTx(db, fn)();
     if (committed) afterCommit(db, () => { committed(value); });
