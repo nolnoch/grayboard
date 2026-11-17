@@ -41,7 +41,6 @@ import { detached } from "./request_context.ts";
 import { onAliasCreated } from "./teams.ts";
 import { principalCanSee } from "./access.ts";
 import { PROMISE_DAYS, STALE_UNDELIVERED_MS, alreadyRetracted, historyLimit, inboxDays, promised, queuedNote, retractRefusal, showMessage, unanswered, undeliveredInstruction, type InboxItem, type PromiseItem } from "../shared/inbox.ts";
-import { afterCommit } from "../core/sqlite.ts";
 import type { Pending } from "../shared/notifications.ts";
 
 // Every code an operation refuses with is a wire code (src/shared/protocol.ts).
@@ -211,7 +210,7 @@ type Hub = {
   delegateOpenCap: number;
   aliasScopeCap: number;
   now: () => number;
-  // `on`: when its effect runs (`onCommit(handle)`, or core's own transaction for a core-driven callback).
+  // `on`: when its effect runs (`onCommit(handle)`: after that handle's commit, or now for `repo.read`).
   boardChanged: (on: Commit, board: string) => void;
 };
 
@@ -505,13 +504,12 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
   function boardsChanged(on: Commit, boards: string[]) {
     for (const board of new Set(boards)) hub.boardChanged(on, board);
   }
-  // Core's claim expiry runs in core's own queued transaction, which can't name a server Tx (D1): its effects stay on
-  // the connection's afterCommit until P3 forks claims into the server.
-  const coreCommit: Commit = (effect) => afterCommit(db, effect);
+  // Core's claim expiry calls back after its sweep's write has committed, outside any body: its effects run now.
+  const expiryCommit = onCommit(repo.read);
   // Announces claims that lapse on their boards.
   // Armed from requests, it fires for every holder: detached, so its rows
   // don't carry the arming request's address (security audit F-19).
-  const expiryTimer = claimExpiryTimer(db, handles => wake(hub, coreCommit, handles), boards => boardsChanged(coreCommit, boards), queuedTx(repo));
+  const expiryTimer = claimExpiryTimer(db, handles => wake(hub, expiryCommit, handles), boards => boardsChanged(expiryCommit, boards), queuedTx(repo));
   const expiry = { arm: () => detached(() => expiryTimer.arm()), stop: () => expiryTimer.stop() };
   // The session leaves the hub's registry: superseded, revoked or closed.
   function detach(session: ApplicationSession): void {
