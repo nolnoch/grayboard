@@ -435,9 +435,10 @@ export const GrayboardPlugin: Plugin = async ({ client, directory }) => {
       if (diff.length) report(`grayboard: the running grayboard serves different tools than \`grayboard tools\` listed at load: ${diff.join(", ")}`);
       if (local && recipient) await associate(recipient, childSelection);
     });
-    // A call that awaits ready gets the failure; this only keeps an unawaited
-    // rejection from surfacing when no call is waiting.
-    ready.catch(() => {});
+    // A handshake that fails without the process exiting (an error reply, an
+    // invalid acknowledgement) restarts it as an exit does (#1142). fail()
+    // ignores its own rejections and a child that's no longer current.
+    ready.catch((e: Error) => { if (!closed) fail(`grayboard process failed to initialize: ${e.message}`); });
     const deadline = setTimeout(() => fail(`grayboard process didn't initialize within ${INIT_DEADLINE_MS / 1000} s`), INIT_DEADLINE_MS);
     ready.then(() => clearTimeout(deadline), () => clearTimeout(deadline));
     return { proc, ready, call, associate, stop };

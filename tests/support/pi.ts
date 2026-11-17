@@ -23,7 +23,7 @@ import { cleanEnv, localEnv } from "./env.ts";
 import { onChannelDm, messageText, promptText, startFakeModel, type ChatRequest, type Reply, type Rule } from "./fake_model.ts";
 import { browse, seedGrant, type HostedServer } from "./hosted_oauth.ts";
 import { localSession, stopSession } from "./mcp.ts";
-import { CLI, ROOT } from "./paths.ts";
+import { CLI, REFUSING_MCP, ROOT } from "./paths.ts";
 import { runCli } from "./cli.ts";
 import { mintSessionKey } from "../../src/core/bindings.ts";
 import { adapterChildren, grayboardChildren, grayboardChildPids, grayboardDescendants, processDescendants, sigkill, STOP_READING } from "./procs.ts";
@@ -392,26 +392,33 @@ export function piLocalRestartScenario(dir: string): Promise<void> {
   });
 }
 
-// A grayboard process that never answers initialize is killed at the
-// deadline and restarted as an exit is (#559); after the last restart a
-// tool call fails with the deadline's reason instead of hanging.
-export function piLocalInitDeadlineScenario(dir: string): Promise<void> {
+// A grayboard process that never answers initialize ("deadline") is killed
+// at the deadline (#559), and one that answers it with an error ("refused")
+// at once (#1142); either restarts as an exit does, and after the last
+// restart a tool call fails with the reason instead of hanging.
+export function piLocalInitFailScenario(dir: string, how: "deadline" | "refused"): Promise<void> {
   return named(PI_HARNESS, async () => {
     const procs: ChildProcess[] = [];
     const model = startFakeModel([scripted("who", [{ tool: "mcp__grayboard__whoami", args: {} }])]);
     try {
-      // Every child, restarts included, blocks before it answers initialize.
-      mkdirSync(join(dir, "pause"), { recursive: true });
-      const env = { BUS_TEST_PAUSE: "mcp:before-connect", BUS_TEST_PAUSE_FILE: join(dir, "pause", "go"), BUS_TEST_INIT_DEADLINE_MS: "1000" };
-      const pi = startPi(dir, model.port, procs, { identity: null, env });
+      let opts: PiOpts;
+      if (how === "deadline") {
+        // Every child, restarts included, blocks before it answers initialize.
+        mkdirSync(join(dir, "pause"), { recursive: true });
+        opts = { identity: null, env: { BUS_TEST_PAUSE: "mcp:before-connect", BUS_TEST_PAUSE_FILE: join(dir, "pause", "go"), BUS_TEST_INIT_DEADLINE_MS: "1000" } };
+      } else {
+        opts = { identity: null, entry: { command: process.execPath, args: [REFUSING_MCP, process.execPath, CLI, "mcp", "--mode", "local"] } };
+      }
+      const reason = how === "deadline" ? "grayboard process didn't initialize within 1 s" : "grayboard process failed to initialize: grayboard: refused for test";
+      const pi = startPi(dir, model.port, procs, opts);
       await pi.command({ type: "get_state" }, 60_000);
       const notice = await until(() => pi.notices().find((n) => n.includes("after 3 restarts; restart pi to reconnect")), 60_000, "restart exhaustion notice");
-      expect(notice).toContain("grayboard process didn't initialize within 1 s");
-      expect(pi.notices().filter((n) => n.includes("didn't initialize within 1 s; restarting it"))).toHaveLength(3);
+      expect(notice).toContain(reason);
+      expect(pi.notices().filter((n) => n.includes(`${reason}; restarting it`))).toHaveLength(3);
       await pi.command({ type: "prompt", message: "who" });
       const failed = await toolResult(pi, "whoami");
       expect(failed.isError).toBe(true);
-      expect(resultText(failed)).toContain("grayboard process didn't initialize within 1 s");
+      expect(resultText(failed)).toContain(reason);
       await until(() => grayboardChildPids(pi.pid).length === 0, 5_000, "no grayboard process left");
       await idle(pi);
       expect(model.unhandled).toEqual([]);

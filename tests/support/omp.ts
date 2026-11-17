@@ -22,7 +22,7 @@ import { factsOf, hostedRow, leased, PEER, Pi, pingPong, requestTools, resultTex
 import { localSession, stopSession, type Session } from "./mcp.ts";
 import { accessAudits } from "./audit.ts";
 import { grayboardChildPids, grayboardDescendants, processDescendants, sigkill, STOP_READING } from "./procs.ts";
-import { CLI, ROOT } from "./paths.ts";
+import { CLI, REFUSING_MCP, ROOT } from "./paths.ts";
 import { until } from "./until.ts";
 import { hostedCarryScenario, hostedRefreshLogoutScenario, loginNotice, named, withHosted, type HostedHarness } from "./hosted_harness.ts";
 
@@ -816,27 +816,35 @@ export function ompLocalCarryScenario(dir: string): Promise<void> {
   });
 }
 
-// A grayboard process that never answers initialize is killed at the
-// deadline and restarted as an exit is (#559); after the last restart a
-// tool call fails with the deadline's reason instead of hanging.
-export function ompLocalInitDeadlineScenario(dir: string): Promise<void> {
+// A grayboard process that never answers initialize ("deadline") is killed
+// at the deadline (#559), and one that answers it with an error ("refused")
+// at once (#1142); either restarts as an exit does, and after the last
+// restart a tool call fails with the reason instead of hanging.
+export function ompLocalInitFailScenario(dir: string, how: "deadline" | "refused"): Promise<void> {
   return named(OMP_HARNESS, async () => {
     const procs: ChildProcess[] = [];
     const model = startFakeModel([scripted("who", [{ tool: `${PREFIX}whoami`, args: {} }])]);
     try {
-      installLocal(dir, model.port);
-      // Every child, restarts included, blocks before it answers initialize.
-      mkdirSync(join(dir, "pause"), { recursive: true });
-      const omp = startLocalOmp(dir, dir, procs, null, { BUS_TEST_PAUSE: "mcp:before-connect", BUS_TEST_PAUSE_FILE: join(dir, "pause", "go"), BUS_TEST_INIT_DEADLINE_MS: "1000" });
+      let env: Record<string, string> = {};
+      if (how === "deadline") {
+        installLocal(dir, model.port);
+        // Every child, restarts included, blocks before it answers initialize.
+        mkdirSync(join(dir, "pause"), { recursive: true });
+        env = { BUS_TEST_PAUSE: "mcp:before-connect", BUS_TEST_PAUSE_FILE: join(dir, "pause", "go"), BUS_TEST_INIT_DEADLINE_MS: "1000" };
+      } else {
+        installLocal(dir, model.port, [process.execPath, REFUSING_MCP]);
+      }
+      const reason = how === "deadline" ? "grayboard process didn't initialize within 1 s" : "grayboard process failed to initialize: grayboard: refused for test";
+      const omp = startLocalOmp(dir, dir, procs, null, env);
       await omp.command({ type: "get_state" }, 60_000);
       const notice = await until(() => omp.notices().find((n) => n.includes("after 3 restarts; restart omp to reconnect")), 60_000, "restart exhaustion notice");
-      expect(notice).toContain("grayboard process didn't initialize within 1 s");
+      expect(notice).toContain(reason);
       await omp.command({ type: "prompt", message: "who" });
       await idle(omp);
-      expect(resultText(await toolResultNamed(omp, `${PREFIX}whoami`))).toContain("grayboard process didn't initialize within 1 s");
+      expect(resultText(await toolResultNamed(omp, `${PREFIX}whoami`))).toContain(reason);
       await until(() => grayboardChildPids(omp.pid).length === 0, 5_000, "no grayboard process left");
       // With no process left, the turn's hooks fail as after an exit's give-up, with the same reason.
-      expect(new Set(omp.events.filter((e) => e.type === "extension_error").map((e) => e.error))).toEqual(new Set(["grayboard process didn't initialize within 1 s"]));
+      expect(new Set(omp.events.filter((e) => e.type === "extension_error").map((e) => e.error))).toEqual(new Set([reason]));
       expect(model.unhandled).toEqual([]);
       await omp.quit();
     } finally {
