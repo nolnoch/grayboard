@@ -188,8 +188,12 @@ for (const h of HARNESSES) test(`refresh-adapters installs the current mode's ${
   mkdirSync(join(f.paths.local, ".."), { recursive: true });
   writeFileSync(f.paths.local, "// stale");
   writeFileSync(f.paths.mcp, JSON.stringify({ mcpServers: { grayboard: localEntry } }));
-  expect(f.run("refresh-adapters")).toContain(`Refreshed ${f.paths.hosted}`);
+  const migrated = f.run("refresh-adapters");
+  expect(migrated).toContain(`Refreshed ${f.paths.hosted}`);
+  expect(migrated).toContain(`Run /grayboard login in ${h} to sign it in.`);
   expectHosted(f);
+  // A refresh on the same server keeps the sign-in, so it asks for none.
+  expect(f.run("refresh-adapters")).not.toContain("/grayboard login");
 
   // Back in local mode the entry the local adapter reads is recreated.
   rmSync(join(f.root, "credentials"));

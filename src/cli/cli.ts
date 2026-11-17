@@ -102,13 +102,15 @@ const OMP = piFamily("omp", OMP_DIR, { source: adapterBundle("omp", "local"), bu
 /** The hosted MCP endpoint of a server URL, as the server names its OAuth resource. */
 const hostedMcpUrl = (server: string) => new URL(server.replace(/\/+$/, "") + "/mcp").href;
 
-type FamilyInstall = { adapter: string; notes: string[] };
+type FamilyInstall = { adapter: string; notes: string[]; signIn: boolean };
 /**
  * Install the harness's adapter for the mode: `server` set → the hosted
  * extension; else the local adapter, with `entry` as the entry's command (or
  * the existing entry kept in its local shape). Leaving a hosted install's
  * server (local mode, or another server) signs the harness out of it first,
- * revoking its grant. Returns the adapter's path and what else changed.
+ * revoking its grant. Returns the adapter's path, what else changed, and
+ * whether the harness now needs /grayboard login (a hosted install whose
+ * server changed: new, or migrated from local or another server).
  * Throws, before any file changes, on a server URL the hosted extension would
  * refuse or an unparseable mcp.json or config.json; throws after the entry
  * check if the sign-out does (its grant store's lock), leaving the install
@@ -136,7 +138,7 @@ async function installPiFamily(h: PiFamily, server: string | undefined, entry?: 
     rmSync(h.local, { force: true });
     writeJsonFile(h.hostedConfig, { url } satisfies HostedConfig);
     notes.push(`Wrote ${h.hostedConfig}`);
-    return { adapter: h.hosted, notes };
+    return { adapter: h.hosted, notes, signIn: old !== url };
   }
   // The local adapter reads its command from the entry, so one that's missing
   // (a server-mode install removed it, or the user did) is recreated with
@@ -151,7 +153,7 @@ async function installPiFamily(h: PiFamily, server: string | undefined, entry?: 
     rmSync(h.hostedConfig, { force: true });
     notes.push(`Removed ${h.hostedConfig}`);
   }
-  return { adapter: h.local, notes };
+  return { adapter: h.local, notes, signIn: false };
 }
 
 /**
@@ -945,6 +947,7 @@ program
         const r = await installPiFamily(h, server);
         console.log(`Refreshed ${r.adapter}`);
         for (const note of r.notes) console.log(note);
+        if (r.signIn) console.log(`Run /grayboard login in ${h.name} to sign it in.`);
       } catch (e) { adapterFailed(e); }
     }
     for (const w of undeliveredEntries()) console.log(`[grayboard] ${w}`);
