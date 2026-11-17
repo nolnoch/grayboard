@@ -22,7 +22,7 @@ import { basename, join } from "node:path";
 import { pinMarketplace } from "../../scripts/pin_claude_plugin.ts";
 import { CLAUDE_PLUGIN } from "../../src/shared/claude_channels.ts";
 import { CLAUDE_CODE_VERSION, type ClaudeHome, claudeCli, claudeCodeBin, claudeHome, claudeTty, descendants, transcript } from "../support/claude_code.ts";
-import { onChannelDm, onUserText, startFakeAnthropic, toolResults } from "../support/fake_anthropic.ts";
+import { onChannelDm, onUserText, startFakeAnthropic, toolResults, userTexts } from "../support/fake_anthropic.ts";
 import { browse, hostedServer, seedGrant } from "../support/hosted_oauth.ts";
 import { direct } from "../support/events.ts";
 import { ROOT } from "../support/paths.ts";
@@ -160,9 +160,11 @@ test(`Claude Code ${CLAUDE_CODE_VERSION}: the root reports its model and effort 
 
     await t.submit("FACTS-1");
     await until(() => toolResults(model, "toolu_FACTS_1").length > 0, 60_000, `the bind (plugin from ${from})`);
-    // The model Claude Code started on, as its first request named it.
-    const started = model.requests[0]!.body.model;
-    expect(facts()).toEqual([{ model: started, effort: expect.any(String) }]);
+    // The model and effort Claude Code started on, as the main turn's request
+    // named them (not requests[0]: a build may send a side request first).
+    const turn = model.requests.find((r) => r.body.tools?.some((x) => x.name === TOOL("bind")) && userTexts(r.body).some((x) => x.includes("FACTS-1")))!.body;
+    expect(turn.output_config?.effort).toEqual(expect.any(String));
+    expect(facts()).toEqual([{ model: turn.model, effort: turn.output_config!.effort! }]);
 
     await slash("/effort high", "Set effort level to high");
     await slash("/model claude-sonnet-5-5", "Set model to", "Switch model?");
@@ -170,11 +172,18 @@ test(`Claude Code ${CLAUDE_CODE_VERSION}: the root reports its model and effort 
     await until(() => toolResults(model, "toolu_FACTS_2").length > 0, 60_000, "the whoami after the switch");
     expect(facts()).toEqual([{ model: "claude-sonnet-5-5", effort: "high" }]);
 
-    // /clear: the plugin's root continues, and SessionStart(clear) reports the model it continues on.
+    // /clear: the plugin's root continues on the facts it had. SessionStart(clear)
+    // carries no model (2.1.316), so the hook keeps both files rather than
+    // dropping them; a drop would leave the server's row unchanged, so the
+    // files are what tell it.
+    const agents = join(h.config, "plugins/data/grayboard-grayboard/claude-agents");
     const changedBefore = changes();
     await t.submit("/clear");
     await t.submit("FACTS-3");
     await until(() => toolResults(model, "toolu_FACTS_3").length > 0, 60_000, "the whoami after /clear");
+    const kept = readdirSync(agents).filter((pid) => existsSync(join(agents, pid, "start")));
+    expect(kept).toHaveLength(1);
+    expect(readFileSync(join(agents, kept[0]!, "model"), "utf8")).toBe("claude-sonnet-5-5");
     expect(facts()).toEqual([{ model: "claude-sonnet-5-5", effort: "high" }]);
     // Every root grayboard call carries the effort, so repeated calls never clear and restore it (#558).
     expect(changes()).toEqual(changedBefore);
