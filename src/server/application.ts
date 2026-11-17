@@ -609,11 +609,11 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     if (session.readOnly && !allowUnbound) fail("unbound", UNBOUND_ERROR);
   }
   // `h`: the handle the caller holds; inside a body its `Tx`, so a disabled user's terminate writes its rows there.
-  // The user read awaits (#807 P3 A7u1; async from A7u2): a close, detach or terminate that lands meanwhile changes
-  // the session outside the write queue, so it's checked again after, and the caller goes on with no await between.
+  // The user read awaits (#807 P3 A7u1, A7u2): a close, detach or terminate that lands meanwhile changes the session
+  // outside the write queue, so it's checked again after, and the caller goes on with no await between.
   async function valid(session: ApplicationSession, allowUnbound = false, h: Read = repo.read): Promise<void> {
     stillOpen(session);
-    const disabled = repo.users.isDisabled(session.authed.user_id);
+    const disabled = await repo.users.isDisabled(h, session.authed.user_id);
     await testPauseAsync("valid:user:read");
     stillOpen(session);
     if (disabled) {
@@ -783,7 +783,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
   async function attachHuman(authed: AuthedUser, sink: DeliverySink, current?: (tx: Tx) => string | null): Promise<{ session: ApplicationSession; ok: HelloResult }> {
     const addr = `${authed.user_email}/${HUMAN_NAME}`;
     return repo.write(async tx => {
-      if (repo.users.findById(authed.user_id)?.disabled_at != null) fail("unauthenticated", "session is closed");
+      if ((await repo.users.findById(tx, authed.user_id))?.disabled_at != null) fail("unauthenticated", "session is closed");
       const stale = current?.(tx);
       if (stale) fail("unauthenticated", stale);
       if (!(await repo.aliases.find(tx, addr))) {
@@ -1249,13 +1249,12 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     // reset, an operator edit), and an alias its session's principal may no
     // longer act as (S9's backstop to accessChanged).
     // Its promise settles once the alias recheck is written (a failure there is logged, not rejected).
-    revalidate(): Promise<void> {
+    // The users reads await (#807 P3 A7u2): disconnectUser walks the sessions as they stand after them.
+    async revalidate(): Promise<void> {
       for (const observer of [...observers]) observerLive(observer);
-      const users = new Set<number>();
-      for (const s of hub.sessions) {
-        if (!s.human && repo.users.findById(s.authed.user_id)?.disabled_at != null) users.add(s.authed.user_id);
-      }
-      for (const id of users) application.disconnectUser(id);
+      const ids = [...new Set([...hub.sessions].filter(s => !s.human).map(s => s.authed.user_id))];
+      const disabled = await Promise.all(ids.map(id => repo.users.isDisabled(repo.read, id)));
+      for (const [i, id] of ids.entries()) if (disabled[i]) application.disconnectUser(id);
       return recheckAliases(null, null);
     },
     sweepHellos: () => { hub.helloLimiter.sweep(); hostedRequestLimiter.sweep(); hostedSubscriberLimiter.sweep(); hub.delegateLimiter.sweep(); },

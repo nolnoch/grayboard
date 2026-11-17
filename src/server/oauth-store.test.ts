@@ -467,7 +467,7 @@ describe("OAuth domain store", () => {
     expect(await first.repo.oauth.isGrantActive(first.repo.read, input.grantId, start)).toBe(true);
     await expect(seed(first.repo, tx => first.repo.sessions.revokeAllForUser(tx, userId))).rejects.toThrow("storage failure");
     await expect(w1(tx => first.repo.users.setDisabled(tx, userId, true))).rejects.toThrow("storage failure");
-    expect(first.repo.users.findById(userId)?.disabled_at).toBeNull();
+    expect((await first.repo.users.findById(first.repo.read, userId))?.disabled_at).toBeNull();
   });
   // #807 P2-1 (D3): each single-use spend is one conditional statement. SQLite's single writer can't interleave two
   // redeemers, so a trigger lands the other redeemer's spend between this one's read and its spend; the Postgres

@@ -253,10 +253,11 @@ export function createHostedSessions(application: Application, options: { now?: 
     return { call: <T>(fn: () => Promise<T>) => enter(false, fn), bind: <T>(fn: () => Promise<T>) => enter(true, fn) };
   };
   // The row is read only for an audit with no principal to name the actor and client (#907).
-  // `h`: the caller's body `Tx`, which the row read and the audit row both use (writeAudit).
-  const audit = (h: Read, id: string, action: AuditAction, detail: Record<string, unknown>, principal?: OAuthPrincipal) => {
+  // `h`: the caller's body `Tx`, which the row and user reads and the audit row all use (writeAudit). The user read
+  // awaits (#807 P3 A7u2); no caller reads in-memory state after it.
+  const audit = async (h: Read, id: string, action: AuditAction, detail: Record<string, unknown>, principal?: OAuthPrincipal) => {
     const row = principal ? undefined : store.get(h, id);
-    const actor = principal?.authed.user_email ?? (row && repo.users.findById(row.user_id)?.email) ?? null;
+    const actor = principal?.authed.user_email ?? (row && (await repo.users.findById(h, row.user_id))?.email) ?? null;
     writeAudit(repo, h, action, actor, id, { ...detail, client_id: principal?.clientId ?? row?.client_id ?? null });
   };
   // `r`: the body's Tx when the check runs inside one, so it sees the body's own revokes (#998); else the pool.
@@ -347,7 +348,7 @@ export function createHostedSessions(application: Application, options: { now?: 
     const root = rootOf(tx, row), t = now();
     await admit(tx, p.authed.user_id, [root.session_id, row.session_id], root.session_id);
     await store.unpark(tx, row.session_id, root.grant_id, t);
-    audit(tx, root.session_id, "hosted.child_unparked", { child: row.session_id, ownership: row.ownership_id, parked_ms: t - row.parked_at! }, p);
+    await audit(tx, root.session_id, "hosted.child_unparked", { child: row.session_id, ownership: row.ownership_id, parked_ms: t - row.parked_at! }, p);
     return { ...row, parked_at: null, grant_id: root.grant_id, last_seen_at: t };
   }
   // Whether the root holds a name or writes as one; a root with neither reads and nothing else.
@@ -367,7 +368,8 @@ export function createHostedSessions(application: Application, options: { now?: 
         application.close(holder.session);
         holders.delete(changed);
       }
-      const user = row && held.length && !holders.has(changed) ? repo.users.findById(row.user_id) : undefined;
+      // policyNow's sync user read (#807 P3 A7u2): rebuild runs from an afterCommit observer; A7g moves it.
+      const user = row && held.length && !holders.has(changed) ? repo.policyNow.userById(row.user_id) : undefined;
       if (row && user) holders.set(changed, { row, session: application.hostedSession(repo.read, { user_id: user.id, user_email: user.email, session_id: 0 }, changed, held, null, row, quietSink).session });
       return;
     }
@@ -382,7 +384,7 @@ export function createHostedSessions(application: Application, options: { now?: 
       }
     }
     for (const row of rows) if (!holders.has(row.session_id)) {
-      const user = repo.users.findById(row.user_id);
+      const user = repo.policyNow.userById(row.user_id);
       if (!user) continue;
       const { session } = application.hostedSession(repo.read, { user_id: user.id, user_email: user.email, session_id: 0 }, row.session_id, held.get(row.session_id)!, null, row, quietSink);
       holders.set(row.session_id, { row, session });
@@ -419,7 +421,7 @@ export function createHostedSessions(application: Application, options: { now?: 
   }
   async function park(tx: Tx, row: HostedSession, parkedUnder: Set<string>) {
     await store.park(tx, row.session_id, now());
-    audit(tx, row.root_session_id!, "hosted.child_parked", { child: row.session_id, ownership: row.ownership_id, idle_ms: now() - row.last_seen_at });
+    await audit(tx, row.root_session_id!, "hosted.child_parked", { child: row.session_id, ownership: row.ownership_id, idle_ms: now() - row.last_seen_at });
     parkedUnder.add(row.root_session_id!);
   }
   // Past the parked ceiling, the oldest parked children are released (#584): one returning starts as a root.
@@ -445,7 +447,7 @@ export function createHostedSessions(application: Application, options: { now?: 
     let ended = false;
     if (root && !root.root_session_id) {
       const t = now();
-      if (root.user_id !== authed && repo.users.isDisabled(root.user_id)) { await store.end(tx, root.session_id, "disabled", t); ended = true; }
+      if (root.user_id !== authed && await repo.users.isDisabled(tx, root.user_id)) { await store.end(tx, root.session_id, "disabled", t); ended = true; }
       else if (root.lease_deadline !== null && root.lease_deadline <= t) { await store.end(tx, root.session_id, "expired", t, root.lease_deadline); ended = true; }
       else if (root.lease_deadline === null && idleAt(root) && !application.hostedHolds(tx, root.session_id).length) { await store.end(tx, root.session_id, "idle", t); ended = true; }
     }
@@ -476,15 +478,17 @@ export function createHostedSessions(application: Application, options: { now?: 
       const t = now(), alive = store.aliveAt(tx), downtime = alive === undefined ? null : t - alive;
       let credited = 0;
       if (alive !== undefined && downtime !== null && downtime > LIVE_STALENESS_MS) {
+        // Disabled users' roots, by the sweep's query: no users read per row (#807 P3 A7u2).
+        const disabled = new Set(store.disabled(tx).map(r => r.session_id));
         for (const row of store.all(tx)) {
-          if (row.root_session_id || repo.users.findById(row.user_id)?.disabled_at != null) continue;
+          if (row.root_session_id || disabled.has(row.session_id)) continue;
           let credit: { field: "lease_deadline" | "last_seen_at"; before: number; after: number } | undefined;
           if (row.lease_deadline !== null) {
             if (row.lease_deadline > alive) credit = { field: "lease_deadline", before: row.lease_deadline, after: Math.min(row.lease_deadline + downtime, t + leaseTtl) };
           } else if (row.last_seen_at > alive - idle) credit = { field: "last_seen_at", before: row.last_seen_at, after: Math.min(row.last_seen_at + downtime, t) };
           if (!credit || credit.after <= credit.before) continue;
           await store.update(tx, { ...row, [credit.field]: credit.after });
-          audit(tx, row.session_id, "hosted.lease_restart_credit", { ownership: row.ownership_id, field: credit.field, downtime_ms: downtime, before: credit.before, after: credit.after });
+          await audit(tx, row.session_id, "hosted.lease_restart_credit", { ownership: row.ownership_id, field: credit.field, downtime_ms: downtime, before: credit.before, after: credit.after });
           credited++;
         }
       }
@@ -625,9 +629,9 @@ export function createHostedSessions(application: Application, options: { now?: 
     testPause("hosted:attach:in-txn");
     await authorized(p, tx);
     for (const child of store.ofOwnership(tx, fresh.ownership_id)) await store.update(tx, { ...child, grant_id: p.grantId });
-    audit(tx, row.session_id, "hosted.grant_attached", { from: fresh.grant_id, to: p.grantId, ownership: fresh.ownership_id });
+    await audit(tx, row.session_id, "hosted.grant_attached", { from: fresh.grant_id, to: p.grantId, ownership: fresh.ownership_id });
     // The lease is tied to the grant (delivery.ts), so a reattach closes one only if it was open.
-    if (fresh.lease_deadline !== null) audit(tx, row.session_id, "hosted.lease_closed", { reason: "reattached" });
+    if (fresh.lease_deadline !== null) await audit(tx, row.session_id, "hosted.lease_closed", { reason: "reattached" });
     return { ...fresh, grant_id: p.grantId };
   }
   // `held`: the root's holds, when the caller read them for this row with no await since (#902).
@@ -656,7 +660,7 @@ export function createHostedSessions(application: Application, options: { now?: 
     return store.write(async tx => {
       if (reader === "controller") return store.reportLost(tx, row.session_id, now());
       const taken = await store.tellLost(tx, row.session_id, now());
-      if (taken.length) audit(tx, row.session_id, "hosted.alias_lost_notified", { aliases: taken.map(l => l.alias), ownership: row.ownership_id }, p);
+      if (taken.length) await audit(tx, row.session_id, "hosted.alias_lost_notified", { aliases: taken.map(l => l.alias), ownership: row.ownership_id }, p);
       return taken;
     });
   }
@@ -687,7 +691,7 @@ export function createHostedSessions(application: Application, options: { now?: 
     async seeLost(tx: Tx, p: OAuthPrincipal, row: HostedSession): Promise<void> {
       if (!store.lost(tx, row.session_id, "controller").length) return;
       const seen = await store.seeLost(tx, row.session_id, now());
-      if (seen.length) audit(tx, row.session_id, "hosted.alias_lost_seen", { aliases: seen.map(l => l.alias), ownership: row.ownership_id }, p);
+      if (seen.length) await audit(tx, row.session_id, "hosted.alias_lost_seen", { aliases: seen.map(l => l.alias), ownership: row.ownership_id }, p);
     },
     reconcile,
     sweep,
@@ -724,7 +728,7 @@ export function createHostedSessions(application: Application, options: { now?: 
           return await store.write<T>(async tx => {
             await fence(tx, p, row, root);
             const value = await fn(selected.session, tx);
-            if (!writeReads.has(tool)) audit(tx, row!.session_id, "hosted.write", { tool, session: row!.session_id, root: root!.session_id, grant: p.grantId, held: selected.session.holds, writes_as: root!.writes_as }, p);
+            if (!writeReads.has(tool)) await audit(tx, row!.session_id, "hosted.write", { tool, session: row!.session_id, root: root!.session_id, grant: p.grantId, held: selected.session.holds, writes_as: root!.writes_as }, p);
             return value;
           });
         } catch (error) {
@@ -822,7 +826,7 @@ export function createHostedSessions(application: Application, options: { now?: 
           // `where` restates the place even when the name was already held (a re-bind), as on the other surfaces.
           if (added || args.where !== undefined) await store.update(tx, { ...row, bind_gen: row.bind_gen + (added ? 1 : 0), place: args.where ?? row.place });
           if (args.where !== undefined) application.hostedPlace(tx, row.session_id, args.where);
-          if (added && row.lease_deadline !== null) audit(tx, row.session_id, "hosted.lease_closed", { reason: "rebound" });
+          if (added && row.lease_deadline !== null) await audit(tx, row.session_id, "hosted.lease_closed", { reason: "rebound" });
           // A lost hold bound again is no longer lost: neither reader is told it, and the Controller keeps it (#453).
           if (added) await store.forgetLost(tx, row.session_id, ok.alias);
           return { ok, added: ok.held.length !== before.length, first: before.length === 0, ownership: row.ownership_id };
@@ -856,7 +860,7 @@ export function createHostedSessions(application: Application, options: { now?: 
           if (ok.released) {
             // Its last hold gone, the root is unbound but owning: no lease, so the sweep doesn't expire it.
             await store.update(tx, { ...row, bind_gen: row.bind_gen + 1, lease_deadline: ok.held.length ? row.lease_deadline : null });
-            if (row.lease_deadline !== null) audit(tx, row.session_id, "hosted.lease_closed", { reason: "unbound" });
+            if (row.lease_deadline !== null) await audit(tx, row.session_id, "hosted.lease_closed", { reason: "unbound" });
           }
           return { ok, before, ownership: row.ownership_id, suggested: row.suggested };
         } finally { application.close(selected.session, tx); }
@@ -916,7 +920,7 @@ export function createHostedSessions(application: Application, options: { now?: 
           await application.hostedRoot(tx, childId, root.session_id);
           await store.insert(tx, { session_id: childId, ownership_id: attached.ownership_id, user_id: p.authed.user_id, client_id: p.clientId, grant_id: p.grantId,
             source_session_id: child, writes_as: null, bind_gen: 0, root_session_id: root.session_id, place: null, lease_deadline: null, created_at: now(), last_seen_at: now(), suggested: null, parked_at: null });
-          audit(tx, root.session_id, "hosted.child_registered", { child: childId, ownership: root.ownership_id, source_session_id: child, via });
+          await audit(tx, root.session_id, "hosted.child_registered", { child: childId, ownership: root.ownership_id, source_session_id: child, via });
           return { message: "registered", child: childId, root: root.session_id };
         }); } catch (e) { await later.flushQueued(); throw e; }
       };

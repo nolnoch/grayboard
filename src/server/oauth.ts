@@ -331,7 +331,7 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
     if (!b || !sessionHash) fail();
     const bound = await repo.oauth.bindRequestSession(tx, r.requestHash, r.browserHash, sessionHash!, now());
     if (bound.status !== "ok") fail();
-    const user = repo.users.findById(b!.userId)!;
+    const user = (await repo.users.findById(tx, b!.userId))!;
     // Looked up again after the store's awaits: the flow may have ended meanwhile, and a gone one refuses as getFlow does.
     const found = flows.get(r.requestHash);
     if (!found || found.expiresAt <= now()) fail();
@@ -502,15 +502,17 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
       const sessionHash = hashToken(c.session!);
       const code = random();
       // The browser session is read in the decision's transaction, so it can't lapse between them.
-      const { b, result } = await repo.write(async tx => {
+      // The deciding user's email is read there too, for the audit row after it (#807 P3 A7u2).
+      const { email, result } = await repo.write(async tx => {
         const t = now();
         const b = await repo.oauth.findBrowserSession(tx, sessionHash, t);
         if (!b) fail();
-        return { b: b!, result: await repo.oauth.decideRequest(tx, { requestHash: r.requestHash, browserHash: r.browserHash, sessionHash, csrfHash: hashToken(required(p, "csrf")),
+        const email = (await repo.users.findById(tx, b!.userId))?.email ?? null;
+        return { email, result: await repo.oauth.decideRequest(tx, { requestHash: r.requestHash, browserHash: r.browserHash, sessionHash, csrfHash: hashToken(required(p, "csrf")),
           approve: decision === "approve", code: { ...r, codeHash: hashToken(code), userId: b!.userId, createdAt: t, expiresAt: t + OAUTH_TTL.code } }, t) };
       });
       if (result.status !== "ok") fail();
-      writeAudit(repo, repo.read, decision === "approve" ? "oauth.consent_approved" : "oauth.consent_denied", repo.users.findById(b!.userId)?.email ?? null, null, { client_id: r.clientId });
+      writeAudit(repo, repo.read, decision === "approve" ? "oauth.consent_approved" : "oauth.consent_denied", email, null, { client_id: r.clientId });
       flows.delete(r.requestHash);
       return returnToClient(r, f, decision === "approve" ? { code } : { error: "access_denied" });
     }
@@ -620,11 +622,11 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
   // authGeneration (#853), so the hot path skips the token-grant-user join, and share one read of it (#881).
   // `r`: the Tx of the body the check runs in (hosted's in-body checks, #998), read uncached; else the pool.
   function activeAccess(accessHash: string, r: Read = repo.read): Promise<{ access: OAuthAccess; email: string } | undefined> {
-    return repo.authRead(async () => withEmail(await repo.oauth.findActiveAccess(r, accessHash, resource, [], now())));
+    return repo.authRead(async () => withEmail(r, await repo.oauth.findActiveAccess(r, accessHash, resource, [], now())));
   }
-  function withEmail(access: OAuthAccess | undefined): { access: OAuthAccess; email: string } | undefined {
+  async function withEmail(r: Read, access: OAuthAccess | undefined): Promise<{ access: OAuthAccess; email: string } | undefined> {
     if (!access) return undefined;
-    const email = repo.users.activeEmail(access.userId);
+    const email = await repo.users.activeEmail(r, access.userId);
     return email === undefined ? undefined : { access, email };
   }
   // A bearer header's token hash, or the refusal; the access lookup is the caller's.
@@ -674,13 +676,15 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
       const a = (await activeAccess(principal.accessHash, r))?.access;
       return !closed && authorizedBy(principal, a);
     },
-    // isAuthorized from the auth cache alone (Repo.authPeek, #807 P3 A7d): undefined on a miss, which the caller
-    // checks in full with isAuthorized.
+    // isAuthorized from the auth cache alone (Repo.authPeek, #807 P3 A7d): undefined on a miss of the token or (#807
+    // P3 A7u2) its user, which the caller checks in full with isAuthorized. It reads nothing.
     peekAuthorized(principal: OAuthPrincipal, peek: AuthPeek): boolean | undefined {
       if (closed || principal.accessExpiry <= now()) return false;
       const a = peek.access(principal.accessHash, resource, now());
       if (!a) return undefined;
-      return repo.users.activeEmail(a.userId) !== undefined && authorizedBy(principal, a);
+      const u = peek.user(a.userId);
+      if (u === undefined) return undefined;
+      return u !== null && u.disabled_at === null && authorizedBy(principal, a);
     },
     close() { closed = true; cimd.close(); clearInterval(timer); flows.clear(); upstream.clear(); },
   };
