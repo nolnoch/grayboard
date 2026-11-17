@@ -79,4 +79,14 @@ export interface HostedStore {
   // heartbeat on this schema. A restart credits leases with the downtime (#423).
   aliveAt(r: Read): number | undefined;
   heartbeat(tx: Tx, now: number): void;
+  // The hosted facts on a session's `ids` row (#807 P1c-15a): a child's root (#523), an ended ID live again (#475 item 7a),
+  // a tools-only root's writes_as (A4) and its ownership's launcher flag (#473, #520). `declareLauncher`: whether it turned
+  // the flag on.
+  setRoot(tx: Tx, id: string, root: string | null): void;
+  reopenId(tx: Tx, id: string): void;
+  restateWritesAs(tx: Tx, id: string, writesAs: string): void;
+  declareLauncher(tx: Tx, id: string): boolean;
+  launcher(r: Read, id: string): boolean;
+  // Every session's holds, oldest first: the hosted sweep's and reconcile's.
+  holds(r: Read): { id: string; address: string }[];
 }

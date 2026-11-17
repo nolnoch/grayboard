@@ -306,7 +306,7 @@ export class SlackBridge implements SlackLinker {
         // address (security audit F-19).
         if (m.kind === "direct") detached(() => relay.notify(dmNotification(m.message)));
         else if (m.item.kind === "digest") {
-          try { repo.post(() => application.receiptBoards(session, [refOf(m.item)]), undefined, "Slack digest receipt"); } catch {}
+          try { repo.post(tx => application.receiptBoards(tx, session, [refOf(m.item)]), undefined, "Slack digest receipt"); } catch {}
         }
         else detached(() => relay.notify(boardNotification(m.item)));
       },
@@ -348,7 +348,7 @@ export class SlackBridge implements SlackLinker {
           // A message Slack refused (msg_too_long) is given up, never posted: its cursor moves but it isn't stamped
           // delivered (#470). Read in the body, after the progress writes queued before it.
           const posted = (repo.slack.progress(tx, link.user_id, r) as { posted?: boolean } | undefined)?.posted === true;
-          if (m.board && m.post_id) application.receiptBoards(session, [{ kind: "push", post_id: Number(m.post_id) }]);
+          if (m.board && m.post_id) application.receiptBoards(tx, session, [{ kind: "push", post_id: Number(m.post_id) }]);
           else if (m.message_id) application.receiptDirect(tx, session, [Number(m.message_id)], { handed: posted });
           repo.slack.clearProgress(tx, link.user_id, r);
         }, () => { outbox.delete(id); }, "Slack receipt");

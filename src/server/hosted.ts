@@ -290,9 +290,9 @@ export function createHostedSessions(application: Application, options: { now?: 
       row = { session_id: context.id, ownership_id: store.start(tx, context.id, p.authed.user_id, p.clientId, t, context.suggested), user_id: p.authed.user_id,
         client_id: p.clientId, grant_id: p.grantId, source_session_id: context.raw, writes_as: writesAs, bind_gen: 0,
         root_session_id: null, place: null, lease_deadline: null, created_at: t, last_seen_at: t, suggested: context.suggested ?? null, parked_at: null };
-      application.hostedRegister(p.authed, row.session_id, harnessFor(p.clientId), writesAs, why => later(() => application.hostedCollided(p.authed, context.id, why)), context.facts);
+      application.hostedRegister(tx, p.authed, row.session_id, harnessFor(p.clientId), writesAs, why => later(() => application.hostedCollided(p.authed, context.id, why)), context.facts);
       // An ID that was a child (its source row ended) starts as a root: an address again (#523).
-      application.hostedRoot(row.session_id, null);
+      application.hostedRoot(tx, row.session_id, null);
       store.insert(tx, row);
     } else if (row && !row.root_session_id) {
       // A tools-only root writes as one alias for its life, and a request that disagrees with
@@ -305,7 +305,7 @@ export function createHostedSessions(application: Application, options: { now?: 
     // Any request of a root's ownership may turn its launcher flag on (#520): OpenCode's native client starts the
     // ownership without the plugin's `_meta`, so the declaration arrives on a later subscriber request. A child's
     // and a tools-only root's are ignored; only the ownership's end clears it.
-    if (row && declare && context.launcher && !row.root_session_id && row.writes_as === null) application.hostedDeclareLauncher(p.authed, row.session_id, { ownership: row.ownership_id, client_id: p.clientId });
+    if (row && declare && context.launcher && !row.root_session_id && row.writes_as === null) application.hostedDeclareLauncher(tx, p.authed, row.session_id, { ownership: row.ownership_id, client_id: p.clientId });
     return row;
   }
   function rootOf(r: Read, row: HostedSession): HostedSession {
@@ -893,8 +893,8 @@ export function createHostedSessions(application: Application, options: { now?: 
             return { message: "already registered" };
           }
           if (existing) store.end(tx, existing.session_id, "closed", now());
-          application.hostedRegister(p.authed, childId, harnessFor(p.clientId));
-          application.hostedRoot(childId, root.session_id);
+          application.hostedRegister(tx, p.authed, childId, harnessFor(p.clientId));
+          application.hostedRoot(tx, childId, root.session_id);
           store.insert(tx, { session_id: childId, ownership_id: attached.ownership_id, user_id: p.authed.user_id, client_id: p.clientId, grant_id: p.grantId,
             source_session_id: child, writes_as: null, bind_gen: 0, root_session_id: root.session_id, place: null, lease_deadline: null, created_at: now(), last_seen_at: now(), suggested: null, parked_at: null });
           audit(root.session_id, "hosted.child_registered", { child: childId, ownership: root.ownership_id, source_session_id: child, via });

@@ -87,3 +87,13 @@ export function sqliteOf(r: Read): Database {
   if (r instanceof SqliteTx) r.assertLive();
   return r.db;
 }
+
+// An effect after the caller's commit: a `Tx`'s `afterCommit` (a settled one throws), or now for a `Read` (outside any body, nothing
+// is pending). Lets a function reached both inside a body and outside one schedule its effect on the handle it holds.
+export function afterCommitOf(h: Read, effect: () => void | Promise<void>): void {
+  if (h instanceof SqliteTx) { h.afterCommit(effect); return; }
+  if (!(h instanceof SqliteRead)) throw new Error("not a SQLite store handle");
+  // As core's afterCommit outside a transaction: run synchronously, an error or rejection logged.
+  try { void Promise.resolve(effect()).catch((error) => console.error("postcommit effect failed", error)); }
+  catch (error) { console.error("postcommit effect failed", error); }
+}

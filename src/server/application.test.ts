@@ -292,7 +292,7 @@ test("unbound hosted reads never use the human address and still list and read b
   store.repo.resolver.principalOf = (address: string) => { asked.push(address); return principalOf(address); };
   // One with no ids row (a foreign or pre-context ID), and one registered as hosted does at create.
   const unregistered = application.hostedSession(store.repo.read, alice, "id:0000000000000", [], null, null, delivery()).session;
-  await seed(store.repo, () => application.hostedRegister(alice, "id:1111111111111", "opencode"));
+  await seed(store.repo, tx => application.hostedRegister(tx, alice, "id:1111111111111", "opencode"));
   const registered = application.hostedSession(store.repo.read, alice, "id:1111111111111", [], null, null, delivery()).session;
   for (const session of [unregistered, registered]) {
     expect((await application.boardCatalog(store.repo.read, session)).boards.map(b => b.name)).toContain("e2e");
@@ -345,7 +345,7 @@ test("unbound hosted sessions cannot use named operations or persist synthetic h
     () => application.thread(store.repo.read, session, 1),
     () => application.inbox(store.repo.read, session),
     () => seed(store.repo, tx => application.receiptDirect(tx, session, [1])),
-    () => application.receiptBoards(session, []),
+    () => seed(store.repo, tx => application.receiptBoards(tx, session, [])),
     () => seed(store.repo, tx => application.acknowledgeDm(tx, session, 1)),
     () => seed(store.repo, tx => application.retract(tx, session, 1)),
     () => seed(store.repo, tx => application.call(tx, session, "board_create", { name: "e2e", purpose: "no" })),
