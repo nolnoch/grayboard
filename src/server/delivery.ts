@@ -164,9 +164,12 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
           const lease = get(p, context, capability, fresh, false, tx), deadline = now() + ttl;
           if (!fresh || fresh.root_session_id) stale(p, context, capability);
           await store.update(tx, { ...fresh, lease_deadline: deadline, last_seen_at: now() });
+          // The lease was read before the update's await (#807 P3 A6e2): one finished meanwhile is refused here, which
+          // rolls the new deadline back, and stays finished.
+          if (leases.get(capability) !== lease) stale(p, context, capability);
           return { lease, deadline };
         }, ({ lease, deadline }) => {
-          // The lease was read before the update's await (#807 P3 A6e2): one finished meanwhile stays finished.
+          // Nothing awaits between the body's check and here; kept as the in-memory side's own guard.
           if (leases.get(capability) !== lease) stale(p, context, capability);
           lease.expiresAt = deadline;
           if (hooks) lease.hooks = hooks;
