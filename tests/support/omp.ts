@@ -58,20 +58,21 @@ function ompDbReady(dir: string): boolean {
 // take JSON (YAML's superset). tools.xdev off exposes the grayboard tools
 // top-level, as the scripts call them, instead of behind omp's xd:// devices;
 // either way omp runs the extension's registered tool. `settings` adds to
-// config.yml.
-function installHosted(dir: string, srv: HostedServer, modelPort: number, settings: Record<string, unknown>): void {
+// config.yml; `reasoning` lets the fake model take a thinking level.
+function installHosted(dir: string, srv: HostedServer, modelPort: number, settings: Record<string, unknown>, reasoning = false): void {
   const agentDir = agentDirOf(dir), bin = join(dir, "bin");
   for (const d of [join(agentDir, "extensions"), stateDirOf(dir), bin, join(dir, "home")]) mkdirSync(d, { recursive: true });
   writeFileSync(join(agentDir, "extensions", "grayboard.js"), BUNDLE);
   writeFileSync(join(stateDirOf(dir), "config.json"), JSON.stringify({ url: srv.resource }));
-  writeConfig(agentDir, modelPort, settings);
+  writeConfig(agentDir, modelPort, settings, reasoning);
   for (const opener of ["open", "xdg-open"]) writeFileSync(join(bin, opener), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
 }
 
 // The fake model as omp's only provider, and config.yml with `settings`.
-function writeConfig(agentDir: string, modelPort: number, settings: Record<string, unknown>): void {
+// A reasoning model changes omp's requests, so only a scenario that sets a thinking level asks for one.
+function writeConfig(agentDir: string, modelPort: number, settings: Record<string, unknown>, reasoning = false): void {
   writeFileSync(join(agentDir, "models.yml"), JSON.stringify({
-    providers: { fake: { baseUrl: `http://localhost:${modelPort}/v1`, api: "openai-completions", apiKey: "x", models: [{ id: "fake-1" }] } },
+    providers: { fake: { baseUrl: `http://localhost:${modelPort}/v1`, api: "openai-completions", apiKey: "x", models: [{ id: "fake-1", ...(reasoning ? { reasoning: true } : {}) }] } },
   }));
   writeFileSync(join(agentDir, "config.yml"), JSON.stringify({ tools: { xdev: false }, ...settings }));
 }
@@ -130,7 +131,7 @@ async function named(run: () => Promise<void>): Promise<void> {
   }
 }
 
-function withHosted(dir: string, rules: Rule[], run: (h: Hosted) => Promise<void>, settings: Record<string, unknown> = {}): Promise<void> {
+function withHosted(dir: string, rules: Rule[], run: (h: Hosted) => Promise<void>, settings: Record<string, unknown> = {}, reasoning = false): Promise<void> {
   return named(async () => {
     const procs: ChildProcess[] = [];
     const srv = hostedServer();
@@ -138,7 +139,7 @@ function withHosted(dir: string, rules: Rule[], run: (h: Hosted) => Promise<void
     let peer: Peer | undefined;
     try {
       peer = await hostedPeer(srv, dir);
-      installHosted(dir, srv, model.port, settings);
+      installHosted(dir, srv, model.port, settings, reasoning);
       await run({ srv, model, peer, start: (o) => startHostedOmp(dir, procs, o) });
       expect(model.unhandled).toEqual([]);
       expect(peer.reports).toEqual([]);
@@ -192,6 +193,7 @@ export function ompHostedScenario(dir: string): Promise<void> {
   return withHosted(dir, [
     scripted("bind", [{ tool: `${PREFIX}bind`, args: { name: "omp-task", create: true } }]),
     scripted("send report", [{ tool: `${PREFIX}dm_send`, args: { to: PEER, body: "report attached", attachments: [join(dir, "report.txt")] } }]),
+    scripted("whoami", [{ tool: `${PREFIX}whoami`, args: {} }]),
   ], async ({ srv, model, peer, start }) => {
     writeFileSync(join(dir, "report.txt"), report);
     const omp = start();
@@ -222,6 +224,15 @@ export function ompHostedScenario(dir: string): Promise<void> {
     // Its requests report omp's model and thinking level; `inherit` is none (#364).
     const { thinkingLevel } = await omp.command({ type: "get_state" }, 30_000);
     expect(factsOf(srv, OMP_CLIENT, sessionId)).toEqual({ model: "fake/fake-1", effort: thinkingLevel && thinkingLevel !== "inherit" ? thinkingLevel : null });
+    await idle(omp);
+    // A level, then `inherit`: the next call clears the server's effort (#563 item 1).
+    for (const [level, effort] of [["high", "high"], ["inherit", null]] as const) {
+      await omp.command({ type: "set_thinking_level", level });
+      expect((await omp.command({ type: "get_state" })).thinkingLevel ?? null).toBe(effort);
+      await omp.command({ type: "prompt", message: "whoami" });
+      await until(() => factsOf(srv, OMP_CLIENT, sessionId)?.effort === effort, 15_000, `the server's effort ${effort}`);
+      await idle(omp);
+    }
     const first = model.requests[0]!.body;
     expect(requestTools(first).filter((n) => n.startsWith(PREFIX)).sort()).toEqual(GRAYBOARD_TOOLS);
     expect(systemText(first)).toContain("no bus name yet");
@@ -272,7 +283,7 @@ export function ompHostedScenario(dir: string): Promise<void> {
     // Quitting releases the lease and ends the session.
     await omp.quit();
     await until(() => srv.app.mcp.activeLeases === 0 && !ompRow(srv, sessionId), 10_000, "released on quit");
-  });
+  }, {}, true);
 }
 
 // A task run with two subagents, each held open (a bash gate) after its
@@ -994,7 +1005,8 @@ export function ompHostedCarryScenario(dir: string): Promise<void> {
     expect(ompRow(srv, first.sessionId)).toBeUndefined();
     expect(ownershipEnded(srv, firstOwnership)).toBe(true);
     expect(ompRow(srv, forked.sessionId)!.ownership_id).not.toBe(firstOwnership);
-    expectInstructed(model, await pingPong(srv, peer, "omp-carry"), "omp-carry");
+    const p2 = await pingPong(srv, peer, "omp-carry");
+    expectInstructed(model, p2, "omp-carry");
     await idle(omp);
 
     // /new carries it on.
@@ -1020,8 +1032,10 @@ export function ompHostedCarryScenario(dir: string): Promise<void> {
     expect(grayboardDescendants(omp.pid)).toEqual([]);
     expect(omp.events.filter((e) => e.type === "extension_error")).toEqual([]);
     // Each session's file records its deliveries: the first holds the DMs it
-    // received before the fork and after the resume, /new's the one it did.
+    // received before the fork and after the resume, /new's the one it did;
+    // the fork's holds its own and the first's records it copied (#504).
     await expectDeliveryRecords(first.sessionFile, first.sessionId, [p1, p4], "omp-carry");
+    await expectDeliveryRecords(forked.sessionFile, forked.sessionId, [p2], "omp-carry", { root: first.sessionId, pings: [p1] });
     await expectDeliveryRecords(fresh.sessionFile, fresh.sessionId, [p3], "omp-carry");
     await omp.quit();
     await until(() => srv.app.mcp.activeLeases === 0 && !ompRow(srv, first.sessionId), 10_000, "released on quit");

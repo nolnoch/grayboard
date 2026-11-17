@@ -226,6 +226,12 @@ describe("facts (#545)", () => {
     // A root call on a model without effort says it has none (#558): null, which the wire sends as a clear.
     hook("pre-tool-use", { tool_use_id: id(3) }, true);
     expect(facts()).toEqual({ model: "claude-haiku-4-5", effort: null });
+    // A null level, or a null effort, is none as well (#563 item 4).
+    for (const effort of [{ level: null }, null]) {
+      hook("pre-tool-use", { tool_use_id: id(5), effort: { level: "high" } }, true);
+      hook("pre-tool-use", { tool_use_id: id(6), effort }, true);
+      expect(facts()).toEqual({ model: "claude-haiku-4-5", effort: null });
+    }
     // A switch makes it unknown again (left out, so the server keeps its value), not none.
     hook("model-switch", { from_model: "claude-haiku-4-5", to_model: "claude-opus-5-5" }, true);
     expect(facts()).toEqual({ model: "claude-opus-5-5" });

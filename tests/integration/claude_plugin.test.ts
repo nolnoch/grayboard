@@ -24,7 +24,6 @@ import { CancelledNotificationSchema, ElicitationCompleteNotificationSchema, Eli
 import { Controller } from "../../adapters/hosted-core/src/controller.ts";
 import { Diagnostics } from "../../adapters/hosted-core/src/diagnostics.ts";
 import { tryAcquire } from "../../adapters/hosted-core/src/lock.ts";
-import { Login } from "../../adapters/hosted-core/src/login.ts";
 import { ToolProxy } from "../../adapters/hosted-core/src/proxy.ts";
 import { deliveryPath } from "../../adapters/hosted-core/src/storage.ts";
 import { hostedSessionId } from "../../src/server/hosted.ts";
@@ -32,7 +31,7 @@ import { hasCalled, putSignIn, sessionDir, SIGN_IN } from "../../src/shared/clau
 import { GRAYBOARD_SESSION_META } from "../../src/shared/session_meta.ts";
 import { CLIENT_ID, createPlugin, LOGIN_ELSEWHERE, SOURCE } from "../../plugins/claude-code/src/plugin.ts";
 import { issueOAuth } from "../helpers/oauth.ts";
-import { browse, hostedServer, seedGrant, type HostedServer } from "../support/hosted_oauth.ts";
+import { browse, hostedServer, seedGrant, storeLogin, type HostedServer } from "../support/hosted_oauth.ts";
 import { accessAudits } from "../support/audit.ts";
 import { closeSessions, mcpSession, stopSession, type ClientShape, type Session } from "../support/mcp.ts";
 import { until } from "../support/until.ts";
@@ -376,6 +375,9 @@ test("the root reports the model and effort its hooks wrote (#545); a subagent's
   expect(facts(rootId)).toEqual({ model: "claude-sonnet-5-5", effort: "max" });
   expect(root.stderr().split("the server gets no model for this session").length - 1).toBe(1);
   expect(root.stderr()).not.toContain("couldn't read session");
+  // A root call on a model without effort: the hook's none goes through this process to the server as a clear (#563 item 3).
+  expect((await modelCall(root, "whoami", {})).error).toBe(false);
+  expect(facts(rootId)).toEqual({ model: "claude-sonnet-5-5", effort: null });
 }, 40_000);
 
 test("an explicit BUS_IDENTITY binds at start (#443), created if new, with delivery; one the naming rule refuses is said in the first tool result", async () => {
@@ -703,7 +705,7 @@ test("two signed-out processes share one flow: the waiter shows the holder's lin
 
 test("a refused link file of another session's sign-in is said in the log only, never in a tool result (#592)", async () => {
   // This plugin's store, as another session's sign-in holds it with a link of another origin.
-  const store = new Login({ resource: srv.resource, clientId: CLIENT_ID, stateDir: data, harness: "Claude Code", loginAction: "x", present: () => {}, notify: () => {}, diagnostic: () => {} });
+  const store = storeLogin(srv, data, CLIENT_ID, "Claude Code", "x");
   mkdirSync(dirname(store.path), { recursive: true, mode: 0o700 });
   writeFileSync(`${store.path}.login.url`, JSON.stringify({ url: "https://elsewhere.example/oauth/authorize?state=x", at: Date.now() }));
   const held = tryAcquire(`${store.path}.login.lock`)!;
@@ -792,7 +794,7 @@ test("a link a killed predecessor left in this Claude Code process's dir is remo
 
 const count = (text: string, part: string) => text.split(part).length - 1;
 // Another process's logout of this data dir's grant store.
-const logoutElsewhere = () => new Login({ resource: srv.resource, clientId: CLIENT_ID, stateDir: data, harness: "test", loginAction: "log in", present: () => {}, notify: () => {}, diagnostic: () => {} }).logout();
+const logoutElsewhere = () => storeLogin(srv, data, CLIENT_ID).logout();
 
 test("a lease release that fails at shutdown is said once on stderr: the server down, then EOF", async () => {
   await seedGrant(srv, data, CLIENT_ID, EMAIL);
