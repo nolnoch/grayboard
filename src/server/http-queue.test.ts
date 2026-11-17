@@ -91,16 +91,16 @@ for (const [route, action] of [["revoke-session", "auth.session_revoked"], ["dis
     const bobToken = await login("bob@example.com");
     // The change lands, then the audit row after it fails: the transaction rolls back.
     const write = repo.audit.write.bind(repo.audit);
-    const audit = spyOn(repo.audit, "write").mockImplementation(row => {
+    const audit = spyOn(repo.audit, "write").mockImplementation((tx, row) => {
       if (row.action === action) throw new Error("disk full");
-      write(row);
+      write(tx, row);
     });
     await expect(call(`/api/admin/${route}`, { email: "bob@example.com" }, root)).rejects.toThrow("disk full");
     audit.mockRestore();
     expect(disconnected).toEqual([]);
     const bob = repo.users.findByEmail("bob@example.com")!;
     // Rolled back: no audit row, bob still enabled and signed in.
-    expect(repo.audit.last(action, "bob@example.com")).toBeUndefined();
+    expect(repo.audit.last(repo.read, action, "bob@example.com")).toBeUndefined();
     expect(bob.disabled_at).toBeNull();
     expect((await handleHttp(new Request("http://localhost/api/whoami", { headers: { Authorization: `Bearer ${bobToken}` } }),
       repo, config, touches, () => {}, undefined, hooks, "127.0.0.1")).status).toBe(200);

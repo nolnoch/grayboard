@@ -111,8 +111,8 @@ describe("retention pruning", () => {
   });
 
   test("pruneAudit does not throw", async () => {
-    await seed(repo, () => repo.audit.write({ at: Date.now() - 1000, actor: "system", action: "auth.login", target: null, detail: null }));
-    await expect(seed(repo, () => pruneAudit(repo, Date.now()))).resolves.toBeUndefined();
+    await seed(repo, (tx) => repo.audit.write(tx, { at: Date.now() - 1000, actor: "system", action: "auth.login", target: null, detail: null }));
+    await expect(seed(repo, (tx) => pruneAudit(repo, tx, Date.now()))).resolves.toBeUndefined();
   });
 });
 

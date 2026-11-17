@@ -140,7 +140,7 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
   // bogus-post flood, or token posts during a listed document's outage, can't write one each.
   type Row = readonly [action: AuditAction, detail?: Record<string, unknown>];
   const resolveClient = async (id: string, defer?: (row: Row) => void) => {
-    const row = (r: Row) => { if (defer) defer(r); else writeAudit(repo, r[0], null, null, r[1]); };
+    const row = (r: Row) => { if (defer) defer(r); else writeAudit(repo, repo.read, r[0], null, null, r[1]); };
     const manual = clients.get(id);
     if (manual) return manual;
     if (!cimdClients.has(id)) { row(["oauth.cimd_refused", { reason: "not_allowed" }]); return undefined; }
@@ -176,12 +176,12 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
   const limiter = (limit: RateLimit, scope: string, maxKeys: number) => new RateLimiter(limit, {
     start: (key, ctx, retryAfterMs) => {
       console.error(`[grayboard] OAuth ${scope} rate limit reached`);
-      writeAudit(repo, "oauth.rate_limited", null, key, { scope, ...ctx, retry_after_ms: retryAfterMs });
+      writeAudit(repo, repo.read, "oauth.rate_limited", null, key, { scope, ...ctx, retry_after_ms: retryAfterMs });
     },
-    end: (key, refused) => writeAudit(repo, "oauth.rate_limit_ended", null, key, { scope, refused }),
+    end: (key, refused) => writeAudit(repo, repo.read, "oauth.rate_limit_ended", null, key, { scope, refused }),
     full: (tracked, uncharged) => {
       console.error(`[grayboard] OAuth ${scope} rate limiter at key cap`);
-      writeAudit(repo, "oauth.rate_limit_full", null, null, { scope, tracked, uncharged });
+      writeAudit(repo, repo.read, "oauth.rate_limit_full", null, null, { scope, tracked, uncharged });
     },
   }, now, maxKeys);
   const globalLimit = limiter(config.oauthGlobalLimit ?? { burst: 600, perSec: 10 }, "global", 1);
@@ -303,7 +303,7 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
       return redirect(await provider.authorizeUrl({ redirectUri: endpoint(callbackPath(provider)), state: upstreamState, nonce, challenge: challenge(verifier) }));
     } catch (e) {
       hostedFailure("oauth.upstream", e);
-      writeAudit(repo, "oauth.upstream_failed", null, null, { client_id: f.client.clientId, provider: provider.id });
+      writeAudit(repo, repo.read, "oauth.upstream_failed", null, null, { client_id: f.client.clientId, provider: provider.id });
       upstream.delete(f.upstream.stateHash);
       flows.delete(hashToken(id));
       return authorizationResponse(redirectUri, f.state, { error: "temporarily_unavailable" });
@@ -383,7 +383,7 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
         selected = scopes(optional(p, "scope"));
         if (!selected.every(s => client.scopes.includes(s))) fail("invalid_scope");
       } catch (e) {
-        if (e instanceof OAuthError) { writeAudit(repo, "oauth.authorize_refused", null, null, { code: e.error }); return authorizationResponse(redirectUri, state, { error: e.error }); }
+        if (e instanceof OAuthError) { writeAudit(repo, repo.read, "oauth.authorize_refused", null, null, { code: e.error }); return authorizationResponse(redirectUri, state, { error: e.error }); }
         throw e;
       }
       sweep();
@@ -410,7 +410,7 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
         response = chooser(id);
       }
       response.headers.append("Set-Cookie", cookie("binding", binding, OAUTH_TTL.browser / 1000));
-      writeAudit(repo, "oauth.authorize", null, null, { client_id: client.clientId });
+      writeAudit(repo, repo.read, "oauth.authorize", null, null, { client_id: client.clientId });
       return response;
     }
     if (path === "/oauth/upstream" && req.method === "GET") {
@@ -441,22 +441,22 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
       // From here the request is bound: a refusal goes back to the client (RFC 6749 §4.1.2.1), so `grayboard login` and
       // any other client can report it, with a fixed description per reason. The audit rows are as before.
       const refuse = (description?: string) => { flows.delete(r.requestHash); return returnToClient(r, f, description ? { error: "access_denied", error_description: errorDescription(description) } : { error: "access_denied" }); };
-      if (p.has("error")) { writeAudit(repo, "oauth.upstream_denied", null, null, { client_id: r.clientId, provider: provider.id }); return refuse(); }
+      if (p.has("error")) { writeAudit(repo, repo.read, "oauth.upstream_denied", null, null, { client_id: r.clientId, provider: provider.id }); return refuse(); }
       let identity: UpstreamIdentity;
       try { identity = await provider.exchange({ code: required(p, "code"), verifier: upstreamFlow.verifier, nonce: upstreamFlow.nonce, redirectUri: endpoint(callbackPath(provider)) }); }
       catch (e) {
         // The provider checked the email's domain (D1, D5); its refusal is audited as such.
-        if (e instanceof DomainRefused) { writeAudit(repo, "oauth.domain_refused", null, null, { client_id: r.clientId, provider: provider.id }); return refuse(REFUSED.domain); }
+        if (e instanceof DomainRefused) { writeAudit(repo, repo.read, "oauth.domain_refused", null, null, { client_id: r.clientId, provider: provider.id }); return refuse(REFUSED.domain); }
         // The log keeps the error's class, which names the failed stage for the OIDC provider (OidcDiscoveryError…).
-        hostedFailure("oauth.exchange", e); writeAudit(repo, "oauth.upstream_failed", null, null, { client_id: r.clientId, provider: provider.id }); return refuse(REFUSED.provider);
+        hostedFailure("oauth.exchange", e); writeAudit(repo, repo.read, "oauth.upstream_failed", null, null, { client_id: r.clientId, provider: provider.id }); return refuse(REFUSED.provider);
       }
       if (f.expiresAt <= now() || closed) fail();
-      if (!isValidEmail(identity!.email)) { writeAudit(repo, "oauth.domain_refused", null, null, { client_id: r.clientId, provider: provider.id }); return refuse(REFUSED.provider); }
+      if (!isValidEmail(identity!.email)) { writeAudit(repo, repo.read, "oauth.domain_refused", null, null, { client_id: r.clientId, provider: provider.id }); return refuse(REFUSED.provider); }
       const signedIn = await repo.write(tx => idpSignIn(repo, tx, provider, identity!, { client_id: r.clientId }, providers));
       // idpSignIn's text names only the person's email(s), the provider labels and the admin's unlink-idp remedy.
       if ("refused" in signedIn) return refuse(signedIn.refused);
       const { user } = signedIn;
-      if (user.disabled_at !== null) { writeAudit(repo, "oauth.user_refused", user.email, null, { client_id: r.clientId }); return refuse(REFUSED.disabled); }
+      if (user.disabled_at !== null) { writeAudit(repo, repo.read, "oauth.user_refused", user.email, null, { client_id: r.clientId }); return refuse(REFUSED.disabled); }
       const session = random();
       const created = await repo.write(tx => {
         const t = now();
@@ -468,7 +468,7 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
       if (created.status !== "ok") fail("temporarily_unavailable", 503);
       const response = redirect(endpoint("/oauth/consent") + "?request=" + id);
       response.headers.append("Set-Cookie", cookie("session", session, OAUTH_TTL.browser / 1000));
-      writeAudit(repo, "oauth.upstream_authenticated", user.email, null, { client_id: r.clientId, provider: provider.id });
+      writeAudit(repo, repo.read, "oauth.upstream_authenticated", user.email, null, { client_id: r.clientId, provider: provider.id });
       return response;
     }
     if (path === "/oauth/consent" && req.method === "GET") {
@@ -495,7 +495,7 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
           approve: decision === "approve", code: { ...r, codeHash: hashToken(code), userId: b!.userId, createdAt: t, expiresAt: t + OAUTH_TTL.code } }, t) };
       });
       if (result.status !== "ok") fail();
-      writeAudit(repo, decision === "approve" ? "oauth.consent_approved" : "oauth.consent_denied", repo.users.findById(b!.userId)?.email ?? null, null, { client_id: r.clientId });
+      writeAudit(repo, repo.read, decision === "approve" ? "oauth.consent_approved" : "oauth.consent_denied", repo.users.findById(b!.userId)?.email ?? null, null, { client_id: r.clientId });
       flows.delete(r.requestHash);
       return returnToClient(r, f, decision === "approve" ? { code } : { error: "access_denied" });
     }
@@ -522,7 +522,7 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
           const p = recognized(submitted, ["token", "token_type_hint"]);
           const token = hashToken(required(p, "token"));
           await repo.write(tx => repo.oauth.revokeToken(tx, token, client.clientId, now()));
-          writeAudit(repo, "oauth.revoke_requested", null, null, { client_id: client.clientId });
+          writeAudit(repo, repo.read, "oauth.revoke_requested", null, null, { client_id: client.clientId });
           return new Response(null, { status: 200, headers });
         }
         const p = recognized(submitted, ["grant_type", "client_id", "code", "code_verifier", "redirect_uri", "resource", "scope", "refresh_token"]);
@@ -583,7 +583,7 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
         if (refused || deferred.length) {
           // One decision per refusal, after every await, for all its rows; the CIMD rows go with it. Only a refusal or
           // an outage answers here without a row; any other error (the shutdown 503) keeps fetch's own row.
-          if (refusalRows.take("global", { path: routeName(path) }).ok) for (const [action, detail] of deferred) writeAudit(repo, action, null, null, detail);
+          if (refusalRows.take("global", { path: routeName(path) }).ok) for (const [action, detail] of deferred) writeAudit(repo, repo.read, action, null, null, detail);
           else if (refused) return refusal(e as OAuthError);
           else if (e instanceof CimdUnavailable) return cimdUnavailable();
         }
@@ -618,9 +618,9 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
       try { return await route(req, context); }
       catch (e) {
         if (e instanceof CimdUnavailable) return cimdUnavailable();
-        if (e instanceof OAuthError) { writeAudit(repo, "oauth.request_refused", null, null, { code: e.error, status: e.status }); return refusal(e); }
+        if (e instanceof OAuthError) { writeAudit(repo, repo.read, "oauth.request_refused", null, null, { code: e.error, status: e.status }); return refusal(e); }
         hostedFailure("oauth.request", e);
-        writeAudit(repo, "oauth.request_failed", null, null, { category: "unexpected" });
+        writeAudit(repo, repo.read, "oauth.request_failed", null, null, { category: "unexpected" });
         return json({ error: "server_error" }, 500);
       }
     },

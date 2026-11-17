@@ -80,6 +80,10 @@ export function sqliteTx(db: Database, nests = true): Tx & { close(): void } {
   return new SqliteTx(db, nests) as unknown as Tx & { close(): void };
 }
 
+// Whether a handle is a transaction's: a function reached both inside a body and outside one writes on a `Tx` and
+// posts its own write for a `Read` (writeAudit). A settled `Tx` still answers true; writing on it throws (D4).
+export function isTx(h: Read): h is Tx { return h instanceof SqliteTx; }
+
 // The connection a SQLite store function runs its statements on: refuses a closed `Tx`, and a handle from another
 // store.
 export function sqliteOf(r: Read): Database {

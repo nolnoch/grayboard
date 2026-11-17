@@ -381,11 +381,11 @@ export interface Repo {
     advance(tx: Tx, address: string, streamType: "direct" | "team", streamRef: string, messageId: number): void;
   };
   audit: {
-    write(row: AccessLogRow): void;
+    write(tx: Tx, row: AccessLogRow): void;
     // The most recent row for this action+target, for dedup windows and
     // "has this happened recently" checks. Undefined when none exists.
-    last(action: string, target: string): AccessLogRow | undefined;
-    prune(olderThanMs: number): void;
+    last(r: Read, action: string, target: string): AccessLogRow | undefined;
+    prune(tx: Tx, olderThanMs: number): void;
   };
   slack: {
     links(r: Read): SlackLink[];
@@ -1490,20 +1490,14 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
     },
 
     audit: {
-      write(row) {
-        insertAudit(db, row.at, row.actor, row.action, row.target, row.detail);
+      write(tx, row) {
+        insertAudit(sqliteOf(tx), row.at, row.actor, row.action, row.target, row.detail);
       },
-      last(action, target) {
-        return (
-          db
-            .query<AccessLogRow, [string, string]>(
-              ACCESS_LOG_LAST_SQL,
-            )
-            .get(action, target) ?? undefined
-        );
+      last(r, action, target) {
+        return sqliteOf(r).query<AccessLogRow, [string, string]>(ACCESS_LOG_LAST_SQL).get(action, target) ?? undefined;
       },
-      prune(olderThanMs) {
-        db.run("DELETE FROM access_log WHERE at < ?", [olderThanMs]);
+      prune(tx, olderThanMs) {
+        sqliteOf(tx).run("DELETE FROM access_log WHERE at < ?", [olderThanMs]);
       },
     },
 

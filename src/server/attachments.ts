@@ -34,8 +34,8 @@ export function requestAttachment(repo: Repo, r: Read, handle: string, idText: s
   const d = authorize(repo, {}, req);
   // An allow has a row: authorize() refuses an attachment that doesn't exist.
   if (d.allow) return { row: row! };
-  writeAudit(repo, "attachment.download_refused", actor.user, `attachment:${req.attachment}`, { identity: handle, ...detail });
-  recordDecision(repo, actor, req, d, detail);
+  writeAudit(repo, r, "attachment.download_refused", actor.user, `attachment:${req.attachment}`, { identity: handle, ...detail });
+  recordDecision(repo, r, actor, req, d, detail);
   return { refused: d.reason };
 }
 
@@ -66,7 +66,7 @@ export async function storeUpload(
     // released, rather than keeping bytes no `attachment.uploaded` row records.
     await repo.write(w => {
       guard?.(w);
-      writeAudit(repo, "attachment.uploaded", email, `attachment:${row.id}`, {
+      writeAudit(repo, w, "attachment.uploaded", email, `attachment:${row.id}`, {
         identity: handle, filename: row.filename, type: row.type, size: row.size, sha256: row.sha256, ...detail,
       });
     });
@@ -91,7 +91,7 @@ export async function releaseStored(
   const inBody = queuedGuardTx(repo, guard);
   const row = await releaseUpload(repo.coreOn(repo.read), repo.blobs, id, { addresses: [handle], principal: email }, inBody.guard, inBody.tx);
   if (row) {
-    writeAudit(repo, "attachment.released", email, `attachment:${row.id}`, {
+    writeAudit(repo, repo.read, "attachment.released", email, `attachment:${row.id}`, {
       identity: handle, filename: row.filename, size: row.size, sha256: row.sha256, ...detail,
     });
   }

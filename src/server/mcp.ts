@@ -73,7 +73,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     const scope = used[kind] >= limit.global ? "global" : count >= limit.perUser ? "user" : undefined;
     if (scope) {
       countRefusal(`mcp_${kind}`);
-      writeAudit(application.repo, "hosted.capacity_refused", principal.authed.user_email, null, { kind, scope, client_id: principal.clientId, ...detail });
+      writeAudit(application.repo, application.repo.read, "hosted.capacity_refused", principal.authed.user_email, null, { kind, scope, client_id: principal.clientId, ...detail });
       return undefined;
     }
     used[kind]++; counts.set(user, count + 1);
@@ -567,14 +567,14 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     auditedStreams.add(context);
     try {
       const reason = context.principal.accessExpiry <= now() ? "access_expired" : error instanceof ApplicationError ? error.code : "failed";
-      hosted.audit(context.sessionContext.id, "hosted.stream_closed", { reason, role: context.role, ...(context.stamp ? { ownership: context.stamp.ownership } : {}) }, context.principal);
+      hosted.audit(application.repo.read, context.sessionContext.id, "hosted.stream_closed", { reason, role: context.role, ...(context.stamp ? { ownership: context.stamp.ownership } : {}) }, context.principal);
     } catch (e) { hostedFailure("mcp.stream", e); }
   }
   // Legacy lifecycle transitions are audited with a per-session random ref, never the sid (#476).
   function legacyAudit(legacy: Legacy, action: "hosted.legacy_dormant" | "hosted.legacy_rehydrated" | "hosted.legacy_dropped", detail: Record<string, unknown>) {
     try {
       const context = sessionContext(legacy.principal, legacy.meta);
-      writeAudit(application.repo, action, legacy.principal.authed.user_email, "id" in context ? context.id : null, { ...detail, ref: legacy.ref, grant: legacy.principal.grantId, client_id: legacy.principal.clientId });
+      writeAudit(application.repo, application.repo.read, action, legacy.principal.authed.user_email, "id" in context ? context.id : null, { ...detail, ref: legacy.ref, grant: legacy.principal.grantId, client_id: legacy.principal.clientId });
     } catch (e) { hostedFailure("mcp.legacy", e); }
   }
   function sleep(legacy: Legacy) {

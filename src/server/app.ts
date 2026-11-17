@@ -46,7 +46,7 @@ export function startServer(config: Config, opts: StartOptions = {}) {
   // server started without dev auth revokes them, so a re-enable doesn't revive them.
   if (!config.devAuth) {
     const revoked = repo.writeNow(tx => repo.sessions.revokeDev(tx));
-    if (revoked > 0) writeAudit(repo, "auth.dev_sessions_revoked", null, null, { count: revoked });
+    if (revoked > 0) writeAudit(repo, repo.read, "auth.dev_sessions_revoked", null, null, { count: revoked });
   }
   const application = createApplication(repo, { humanReach, slackRunning: () => slack?.running ?? false, ...startLimits(config, opts) });
   const { revalidate, disconnectUser, accessChanged, stopExpiry, wake } = application;
