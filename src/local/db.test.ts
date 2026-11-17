@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { LOCAL_SENT_PENDING_SQL, LOCAL_UNDELIVERED_FROM_SQL, QUEUED_FOR_SQL, localHistorySql } from "./binding.ts";
+import { DM_GAP_SQL } from "./mailbox.ts";
 import { openLocalDb } from "./open.ts";
 import { AUDIT_LOG_LAST_SQL } from "../core/audit.ts";
 
@@ -59,6 +60,15 @@ test("candidate queue counts search messages by recipient, never scan it", () =>
   db.prepare(`INSERT INTO messages (sender, recipient, body, created_at) VALUES ('be', 'fe', 'a', 1), ('be', 'fe', 'b', 2), ('fe', 'fe', 'self', 3), ('fe', 'sim', 'c', 4)`).run();
   db.prepare(`INSERT INTO cursors (reader, last_seen_id) VALUES ('fe', 1)`).run();
   expect(db.prepare(QUEUED_FOR_SQL).all(JSON.stringify(["fe", "be"]))).toEqual([{ name: "fe", n: 1 }, { name: "be", n: 0 }]);
+});
+
+// #1192: every DM push looks for an undelivered DM under it, by an index
+// range on the reader's DMs; a SCAN of messages would cost every push.
+test("the DM gap check searches the reader's DMs by index range, never a scan", () => {
+  const db = openLocalDb(join(mkdtempSync(join(tmpdir(), "gb-local-")), "bus.db")).db;
+  const detail = (db.prepare("EXPLAIN QUERY PLAN " + DM_GAP_SQL).all("fe", 10) as { detail: string }[]).map((p) => p.detail).join(" ");
+  expect(detail).toContain("SEARCH m USING INDEX idx_messages_recipient_id (recipient=? AND id>? AND id<?)");
+  expect(detail).not.toContain("SCAN m");
 });
 
 // #295: lastCoreAudit searches audit_log by (action, target) and reads it newest first, with no scan or sort.

@@ -203,9 +203,18 @@ export async function transactionRace(f: TransactionRace) {
           } else {
             revoker.proc.stdin.end();
             await bounded(revoker.wait("test pause hit: hosted:revoke:in-txn"), 10_000, "Revoke held in its transaction");
-            const mark = f.calls.length;
+            // The revoke holds the database's write lock in its own process, so the server's pause slot is free. The
+            // bind's first write is its admission's gate (settle and rowFor), whose BEGIN IMMEDIATE then waits in
+            // SQLite's busy handler (5 s, on the server's one thread) for that lock: tracing the gate's last point
+            // before it proves the server reached the write, not merely that the plugin sent the call (#1169). The hit
+            // names no request, so the marks are taken before arming and, at the hit, the bind must be the only request
+            // the plugin sent since: any other could have reached the gate first and left the bind unread behind it.
+            const mark = f.calls.length, marked = f.methods.length, waiting = await server.trace("hosted:gate:checked");
             binding = f.invoke(root, "bind", { name: "final", create: true });
             await until(() => f.calls.slice(mark).some(c => c.name === "bind" && c.session === root), 20_000, "The G2 owning call is sent while the revoke is held");
+            await waiting.hit();
+            assert.deepEqual(f.calls.slice(mark).map(c => [c.name, c.session]), [["bind", root]], "The bind is the only call sent since arming");
+            assert.deepEqual(f.methods.slice(marked), [{ method: "tools/call", subscriber: false }], "The bind's is the only request sent since arming, so the gate traced is its");
             await Bun.write(releaseFile, "release");
           }
           assert.equal(await bounded(revoker.proc.exited, 20_000, "Revoker exits"), 0); await revoker.done;

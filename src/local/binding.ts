@@ -787,7 +787,7 @@ export const LOCAL_UNDELIVERED_FROM_SQL = `SELECT m.recipient, COUNT(*) AS n, MI
 export const QUEUED_FOR_SQL = `SELECT j.value AS name,
     (SELECT COUNT(*) FROM messages m
       WHERE m.recipient = j.value AND m.sender != j.value
-        AND m.id > COALESCE((SELECT last_seen_id FROM cursors WHERE reader = j.value), 0)) AS n
+        AND m.id > COALESCE((SELECT last_seen_id FROM cursors WHERE reader = j.value), 0) AND m.delivered_at IS NULL) AS n
   FROM json_each(?1) j`;
 
 /**
