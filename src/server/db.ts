@@ -5,7 +5,7 @@ import { queueFor } from "./store/queue.ts";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 
-import { ALIAS_SESSION_SQL, HOLD_ORDER, setAccess } from "../core/boards.ts";
+import { ALIAS_SESSION_SQL, HOLD_ORDER, setAccess, type CoreDb } from "../core/boards.ts";
 import { dropHold, logBinding } from "../core/bindings.ts";
 import type { AuditAction } from "./audit.ts";
 import { bindAttachments, dropAttachments, withAttachments, type BlobStore, type Uploader } from "../core/attachments.ts";
@@ -338,6 +338,9 @@ export interface Repo {
   // An ended session's mail, as core endSession reaches it (#284 decision 4), on the body's `Tx` (#807 P1c-14):
   // core's MailPort names no handle, so the port is bound to the connection the `Tx` resolves to.
   mailOn(tx: Tx): MailPort;
+  // The connection a handle resolves to, for core helpers that take a `db` (#807 P1c-15b; D1 keeps core's signatures until
+  // P3 forks it): a body's `Tx` inside one, `repo.read` outside. Resolved at the call, so a settled `Tx` is refused there.
+  coreOn(h: Read): CoreDb;
   // Read points (#284), keyed by the reading address: how far it has
   // received a stream (its direct messages, stream_ref = the address itself).
   cursors: {
@@ -1394,6 +1397,8 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
         })();
       },
     },
+
+    coreOn: (h) => sqliteOf(h),
 
     // Each method resolves the handle when called, so a port kept past its body is refused, as a kept Tx is.
     mailOn: (tx) => {

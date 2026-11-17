@@ -253,6 +253,38 @@ test("#807 P1c-14b: a delivery receipt's messages reads run on its body's Tx", a
   } finally { restore(); }
 });
 
+// #807 P1c-15b: every core helper application.ts reaches goes through `repo.coreOn(handle)`: a body's `Tx` inside one,
+// the pool outside. Logged per call with whether a transaction is open, so an in-body call on the pool (or the reverse) shows.
+test("#807 P1c-15b: core helpers inside hosted bodies run on that body's Tx, outside on the pool", async () => {
+  const checks: { inTxn: boolean; handle: "pool" | "tx" }[] = [];
+  const original = database.repo.coreOn.bind(database.repo);
+  const spy = spyOn(database.repo, "coreOn").mockImplementation(((h: Parameters<typeof original>[0]) => {
+    checks.push({ inTxn: database.db.inTransaction, handle: h === database.repo.read ? "pool" : "tx" });
+    return original(h);
+  }) as never);
+  const a = context("p15-a"), b = context("p15-b");
+  try {
+    await hosted.bind(principal, a, { name: "p15a", create: true });
+    await hosted.bind(principal, b, { name: "p15b", create: true });
+    const bound = checks.length;
+    expect(checks.filter(c => c.inTxn && c.handle === "tx").length).toBeGreaterThan(0);
+    await hosted.run(principal, a, "dm_send", (session, tx) => application.send(tx, session, "p15b", "question", { pending: true }));
+    await hosted.run(principal, a, "board_create", (session, tx) => application.call(tx, session, "board_create", { name: "p15", purpose: "tests" }));
+    await hosted.run(principal, b, "board_subscribe", (session, tx) => application.call(tx, session, "board_subscribe", { board: "p15", mode: "push" }));
+    await hosted.run(principal, a, "board_post", (session, tx) => application.call(tx, session, "board_post", { board: "p15", body: "x" }));
+    await hosted.run(principal, b, "board_read", (session, tx) => application.call(tx, session, "board_read", { board: "p15" }));
+    await hosted.run(principal, b, "dm_inbox", (session, tx) => application.inbox(tx, session));
+    const lease = await delivery.open(principal, b);
+    const items = await delivery.pending(principal, b, lease.capability);
+    expect(items.length).toBeGreaterThan(0);
+    await delivery.receipt(principal, b, lease.capability, items.map(i => i.id));
+    await hosted.whoami(principal, a);
+    expect(checks.length).toBeGreaterThan(bound);
+    expect(checks.some(c => !c.inTxn && c.handle === "pool")).toBe(true);
+    expect(checks.filter(c => c.inTxn !== (c.handle === "tx"))).toEqual([]);
+  } finally { spy.mockRestore(); }
+});
+
 test("one reconciliation invalidates listeners once, not once per root", async () => {
   for (let i = 0; i < 4; i++) await hosted.bind(principal, context(`root-${i}`), { name: `peer-${i}`, create: true });
   const invalidations: (string | null)[] = [];
