@@ -5,7 +5,6 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { idAddress } from "../core/bindings.ts";
-import { endSession } from "../core/session_end.ts";
 import { registerId, type Board, type CoreDb } from "../core/boards.ts";
 import { serverAccess } from "./access.ts";
 import { mayActIn } from "./policy.ts";
@@ -147,7 +146,7 @@ describe("resolveMention", () => {
 
   test("@id: resolves a live ID; an ended one refuses a strict post and is unresolved otherwise", async () => {
     expect(access.resolveMention(WADE_ID, AUTHOR, OPEN, true)).toBe(WADE_ID);
-    await seed(repo, tx => endSession(db, repo.mailOn(tx), WADE_ID, { why: "test", now: 5 }));
+    await seed(repo, tx => repo.sessionEnd.end(tx, WADE_ID, { why: "test", now: 5 }));
     expect(() => access.resolveMention(WADE_ID, AUTHOR, OPEN, true)).toThrow(/^id_ended:/);
     expect(access.resolveMention(WADE_ID, AUTHOR, OPEN, false)).toBeNull();
     expect(access.resolveMention(idAddress("f".repeat(64)), AUTHOR, OPEN, false)).toBeNull();

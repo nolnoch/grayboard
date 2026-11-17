@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Glob } from "bun";
-import { ACCESS_LOG_LAST_SQL, openDatabase, PrincipalTaken, QUEUED_TO_SQL, RETRACTABLE_SQL, SENT_PENDING_SQL, UNDELIVERED_FROM_SQL, type Repo } from "./db.ts";
+import { ACCESS_LOG_LAST_SQL, mailPort, openDatabase, PrincipalTaken, QUEUED_TO_SQL, RETRACTABLE_SQL, SENT_PENDING_SQL, UNDELIVERED_FROM_SQL, type Repo } from "./db.ts";
 import type { Tx } from "./store/tx.ts";
 import { scratchDbPath } from "../../tests/support/scratch_db.ts";
 import { holdAlias } from "../core/bindings.ts";
@@ -333,7 +333,7 @@ describe("Repo", () => {
     expect(ids((await repo.messages.sentPending(repo.read, set, 0)))).toEqual([fromAlias.id]);
   });
 
-  // #284 S5: the MailPort core endSession runs on the server.
+  // #284 S5: the MailPort core endSession runs on the server (repo.sessionEnd.end's, #807 P3 B4a).
   test("mail: unread is the ID's unread direct mail from others; bounce and dropReader", async () => {
     const [id, peer] = ["id:s1", "b@example.com/be"];
     const { read, unread } = await seed(repo, async tx => {
@@ -345,9 +345,9 @@ describe("Repo", () => {
       await repo.cursors.advance(tx, id, "direct", id, read.id);
       return { read, unread };
     });
-    expect(await seed(repo, tx => repo.mailOn(tx).unread(id))).toEqual([{ id: unread.id, sender: peer }]);
+    expect(await seed(repo, tx => mailPort(repo.coreOn(tx)).unread(id))).toEqual([{ id: unread.id, sender: peer }]);
 
-    await seed(repo, tx => repo.mailOn(tx).bounce(id, peer, unread.id, "returned", 1234));
+    await seed(repo, tx => mailPort(repo.coreOn(tx)).bounce(id, peer, unread.id, "returned", 1234));
     const [bounce] = (await repo.messages.history(repo.read, [peer])).filter((m) => m.kind === "bounce");
     expect(bounce).toMatchObject({ sender: id, recipient_type: "user", recipient: peer, body: "returned", parent_id: unread.id, created_at: 1234, pending: 0, kind: "bounce" });
     expect((await repo.messages.getById(repo.read, unread.id))?.kind).toBeNull();
@@ -355,7 +355,7 @@ describe("Repo", () => {
     await seed(repo, async tx => {
       await repo.messages.ack(tx, id, unread.id);
       await repo.messages.ack(tx, peer, bounce!.id);
-      repo.mailOn(tx).dropReader(id);
+      mailPort(repo.coreOn(tx)).dropReader(id);
     });
     expect(await repo.cursors.directFor(repo.read, id)).toBe(0);
     expect((await repo.messages.receivedUnacked(repo.read, [id], 0)).map((m) => m.id)).toEqual([read.id, unread.id]);
@@ -937,8 +937,9 @@ test("#807 P1c-13: the aliases store runs on the handle it's given", async () =>
   expect((await a.find(repo.read, "a@example.com/fe"))?.name).toBe("fe");
 });
 
-// #807 P1c-14a: the messages store's writes and the mail port run on the Tx they're given.
-test("#807 P1c-14a: the messages writes and the mail port run on the Tx they're given", async () => {
+// #807 P1c-14a: the messages store's writes run on the Tx they're given (the mail port's moved into repo.sessionEnd.end,
+// whose handle test is P3 B4a's).
+test("#807 P1c-14a: the messages writes run on the Tx they're given", async () => {
   const { repo } = openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
   const [id, peer] = ["id:s1", "b@example.com/be"];
   const { kept, first, second } = await seed(repo, async tx => {
@@ -954,11 +955,6 @@ test("#807 P1c-14a: the messages writes and the mail port run on the Tx they're 
   await expect(m.markDelivered(kept, first.id, 1)).rejects.toThrow(settled);
   await expect(m.retract(kept, peer, second.id, { actor: null, session: null })).rejects.toThrow(settled);
   await expect(m.prune(kept, Date.now() + 1)).rejects.toThrow(settled);
-  expect(() => repo.mailOn(kept)).toThrow(settled);
-  const port = await seed(repo, tx => repo.mailOn(tx));
-  expect(() => port.unread(id)).toThrow(settled);
-  expect(() => port.bounce(peer, id, first.id, "late", 1)).toThrow(settled);
-  expect(() => port.dropReader(id)).toThrow(settled);
   await expect(m.ack({} as Tx, id, first.id)).rejects.toThrow("not a SQLite store handle");
   // Every write rolls back with its body. On SQLite the resolved connection is the ambient one, so only the kept-Tx
   // refusals above tell them apart; this half discriminates on Postgres.
@@ -967,7 +963,6 @@ test("#807 P1c-14a: the messages writes and the mail port run on the Tx they're 
     await m.ack(tx, id, first.id);
     await m.markDelivered(tx, first.id, 1234);
     expect(await m.retract(tx, peer, second.id, { actor: null, session: null })).toBe(true);
-    repo.mailOn(tx).dropReader(id);
     throw new Error("rolled back");
   })).rejects.toThrow("rolled back");
   expect((await m.history(repo.read, [id])).map(x => x.body)).toEqual(["second", "first"]);
@@ -1111,4 +1106,36 @@ test("#807 P3 B1c: bindings.take refuses another ID's hold and another user's wr
   // The same ID's re-take restamps its own hold.
   expect(await take(be, s1, 400)).toEqual({ bound_at: 400 });
   expect(holds()).toEqual([{ address: be, id: s1, bound_at: 400 }, { address: ops, id: s2, bound_at: 100 }, { address: qa, id: s1, bound_at: 301 }]);
+});
+
+// #807 P3 B4a: repo.sessionEnd runs on the handle it's given: a kept Tx and a non-store handle are refused, and an end
+// rolls back with its body (its bounce, cursor drop and ended_at with it).
+test("#807 P3 B4a: sessionEnd runs on the Tx it's given and rolls back with its body", async () => {
+  const { repo } = openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
+  const [id, peer] = ["id:0000000000001", "b@example.com/be"];
+  const { kept, unread } = await seed(repo, async tx => {
+    registerId(repo.coreOn(tx), { id, principal: "a@example.com", launcher: false });
+    const read = await repo.messages.insert(tx, peer, "user", id, "read", null);
+    const unread = await repo.messages.insert(tx, peer, "user", id, "unread", null);
+    await repo.cursors.advance(tx, id, "direct", id, read.id);
+    return { kept: tx, unread };
+  });
+  const settled = /used after its transaction settled/;
+  const e = repo.sessionEnd;
+  await expect(e.end(kept, id, { why: "t", now: 1 })).rejects.toThrow(settled);
+  await expect(e.refusal(kept, id)).rejects.toThrow(settled);
+  await expect(e.pruneEnded(kept, 1, 1)).rejects.toThrow(settled);
+  await expect(e.refusal({} as Tx, id)).rejects.toThrow("not a SQLite store handle");
+  await expect(seed(repo, async tx => {
+    expect((await e.end(tx, id, { why: "t", now: 5 })).ended).toBe(true);
+    expect((await e.refusal(tx, id))?.code).toBe("id_ended");
+    throw new Error("rolled back");
+  })).rejects.toThrow("rolled back");
+  expect(await seed(repo, tx => e.refusal(tx, id))).toBeNull();
+  expect((await repo.messages.history(repo.read, [peer])).filter(m => m.kind === "bounce")).toEqual([]);
+  expect(await repo.cursors.directFor(repo.read, id)).toBeGreaterThan(0);
+  // Committed, the end bounces the unread message and the ID refuses delivery.
+  expect((await seed(repo, tx => e.end(tx, id, { why: "t", now: 5 }))).ended).toBe(true);
+  expect((await repo.messages.history(repo.read, [peer])).filter(m => m.kind === "bounce").map(m => m.parent_id)).toEqual([unread.id]);
+  expect((await seed(repo, tx => e.refusal(tx, id)))?.code).toBe("id_ended");
 });

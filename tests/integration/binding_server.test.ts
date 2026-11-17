@@ -10,7 +10,6 @@ import { runCli } from "../support/cli.ts";
 import { cleanEnv } from "../support/env.ts";
 import { closeSessions } from "../support/mcp.ts";
 import { idAddress } from "../../src/core/bindings.ts";
-import { endSession } from "../../src/core/session_end.ts";
 import { refusal } from "../support/app_session.ts";
 import type { AppSession, AppSessionOptions } from "../support/app_session.ts";
 import { board, direct } from "../support/events.ts";
@@ -62,7 +61,7 @@ const connect = (identity: string | null, { token, ...opts }: AppSessionOptions 
 // (#282: no grace, no clean-exit frame), so tests that need an ended session end it.
 async function endIt(s: AppSession): Promise<void> {
   s.close();
-  await seed(srv.app.repo, tx => endSession(srv.app.db, srv.app.repo.mailOn(tx), s.id, { why: "exit", now: Date.now() }));
+  await seed(srv.app.repo, tx => srv.app.repo.sessionEnd.end(tx, s.id, { why: "exit", now: Date.now() }));
 }
 // The server restarts on the same database, a new in-process TestServer.
 async function restarted(): Promise<void> {

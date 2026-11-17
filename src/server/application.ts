@@ -33,7 +33,7 @@ import { addressParts, aliasScope, type AliasScope, type ParsedAddress } from ".
 import { CoreError } from "../core/errors.ts";
 import { countRefusal } from "./metrics.ts";
 import type { Principal } from "../core/resolver.ts";
-import { assertDeliverableId, coreRefusalCode, endSession, Undeliverable } from "../core/session_end.ts";
+import { coreRefusalCode, Undeliverable } from "../core/session_end.ts";
 import { callBoardTool, claimsInstruction, isBoardTool, type ToolContext, type BoardPostResult } from "../core/tools.ts";
 import { attachmentIds, type Uploader } from "../core/attachments.ts";
 import type { AttachmentLimits } from "../shared/attachments.ts";
@@ -687,7 +687,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
         // The end's bounces are read in its savepoint, so they're pushed at the commit (#807 P3 A7i), before any
         // newer message to their senders can commit; a failed read rolls back this end alone.
         ended = await tx.savepoint(async sp => {
-          const end = endSession(repo.coreOn(sp), repo.mailOn(sp), id, { why, now: at, audit: serverAuditSink(repo, sp) });
+          const end = await repo.sessionEnd.end(sp, id, { why, now: at, audit: serverAuditSink(repo, sp) });
           return { ...end, bounces: end.ended ? await repo.messages.bouncesFrom(sp, id, at) : [] };
         });
       } catch (e) {
@@ -1575,7 +1575,10 @@ async function writeSend(hub: Hub, tx: Tx, session: ApplicationSession, p: Prepa
   const { repo, registry } = hub;
   let msg: MessageRow;
   try {
-    if (addressParts(p.to)?.kind === "id") assertDeliverableId(repo.coreOn(tx), p.to);
+    if (addressParts(p.to)?.kind === "id") {
+      const why = await repo.sessionEnd.refusal(tx, p.to);
+      if (why) throw why;
+    }
     msg = await repo.messages.insert(tx, p.from, "user", p.to, p.body, p.parentId, p.pending, { ids: p.ids, uploader: uploaderOf(session) }, session.writerId ?? null, session.via ?? null, session.authed.user_email);
   } catch (e) {
     if (e instanceof CoreError) throw coreRefusal(e);

@@ -6,7 +6,7 @@ import { mkdirSync } from "node:fs";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { dirname } from "node:path";
 
-import { ALIAS_SESSION_SQL, HOLD_ORDER, lastSeen, registerId, setAccess, setAliasMeta, setIdFacts, setPlace, touchAlias, touchId, type AliasMetaSet, type CoreDb, type IdFacts, type IdSessionFacts, type ReusedId } from "../core/boards.ts";
+import { ALIAS_SESSION_SQL, HOLD_ORDER, lastSeen, pruneEndedIds, registerId, setAccess, setAliasMeta, setIdFacts, setPlace, touchAlias, touchId, type AliasMetaSet, type CoreDb, type IdFacts, type IdSessionFacts, type ReusedId } from "../core/boards.ts";
 import { listClaims, sweepChanges, type Claim, type ClaimChanges } from "../core/claims.ts";
 import { addressSet, aliasUser, aliasUses, dropHold, holderOf, holdsOf, idRow, idStatuses, logBinding, unendedIds, type AliasUse, type BindingEvent, type IdRow } from "../core/bindings.ts";
 import type { AuditAction } from "./audit.ts";
@@ -16,7 +16,7 @@ import { HUMAN_NAME } from "../shared/addressing.ts";
 import type { Principal } from "../core/resolver.ts";
 import { initCoreSchema } from "../core/schema.ts";
 import { countOpenDelegations } from "../core/delegation.ts";
-import { endSession, type MailPort } from "../core/session_end.ts";
+import { endSession, undeliverableId, type EndedSession, type MailPort, type Undeliverable } from "../core/session_end.ts";
 import type { AuditSink } from "../core/audit.ts";
 import { afterCommit, type Boundary, onCommit, openBoundary, openReader, openSqlite, ownsTx, ownWriter, reclaimFreePages, routeReads } from "../core/sqlite.ts";
 import type { WriteTx } from "../core/write_tx.ts";
@@ -369,6 +369,18 @@ export interface Repo {
     // Deletes the claims lapsed at now and announces them (core sweepChanges).
     sweep(tx: Tx, now: number): Promise<ClaimChanges>;
   };
+  // A session's end and its ID's deliverability (#807 P3 B4a), on the caller's handle.
+  sessionEnd: {
+    // Ends `id` and its children in the caller's transaction (core endSession over the server's mail, #284 decision 4):
+    // holds and claims released, unread mail bounced, cursors and acks dropped. One method: its claim releases post
+    // through core under the synchronous Access seam until B5b.
+    end(tx: Tx, id: string, opts: { why: string; now: number; audit?: AuditSink }): Promise<EndedSession>;
+    // Why `id` can't receive a send or @mention (core undeliverableId), or null. On the send's Tx: on Postgres it is
+    // the send side of an end's race (D3).
+    refusal(tx: Tx, id: string): Promise<Undeliverable | null>;
+    // Deletes the ended ids rows ended before `olderThanMs`, leaving keyed tombstones (core pruneEndedIds); returns how many.
+    pruneEnded(tx: Tx, olderThanMs: number, now: number): Promise<number>;
+  };
   // The writes return promises (#807 P3 A6g), and so do the reads, on the caller's handle (A7e3).
   teams: {
     // Inserts the team's principal in the same transaction; rejects with
@@ -451,9 +463,6 @@ export interface Repo {
     retract(tx: Tx, sender: string, id: number, by: { actor: string | null; session: string | null }): Promise<boolean>;
     prune(tx: Tx, olderThanMs: number): Promise<void>;
   };
-  // An ended session's mail, as core endSession reaches it (#284 decision 4), on the body's `Tx` (#807 P1c-14):
-  // core's MailPort names no handle, so the port is bound to the connection the `Tx` resolves to.
-  mailOn(tx: Tx): MailPort;
   // The connection a handle resolves to, for core helpers that take a `db` (#807 P1c-15b; D1 keeps core's signatures until
   // P3 forks it): a body's `Tx` inside one, `repo.read` outside. Resolved at the call, so a settled `Tx` is refused there.
   coreOn(h: Read): CoreDb;
@@ -1478,6 +1487,12 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       sweep: async (tx, now) => sweepChanges(sqliteOf(tx), now),
     },
 
+    sessionEnd: {
+      end: async (tx, id, opts) => { const w = sqliteOf(tx); return endSession(w, mailPort(w), id, opts); },
+      refusal: async (tx, id) => undeliverableId(sqliteOf(tx), id),
+      pruneEnded: async (tx, olderThanMs, now) => pruneEndedIds(sqliteOf(tx), olderThanMs, now),
+    },
+
     teams: {
       async create(tx, name, createdBy) {
         const db = sqliteOf(tx);
@@ -1718,16 +1733,6 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
 
     coreOn: (h) => sqliteOf(h),
     close: () => { db.close(); },
-
-    // Each method resolves the handle when called, so a port kept past its body is refused, as a kept Tx is.
-    mailOn: (tx) => {
-      sqliteOf(tx);
-      return {
-        unread: (id) => mailPort(sqliteOf(tx)).unread(id),
-        bounce: (from, to, parentId, body, now) => mailPort(sqliteOf(tx)).bounce(from, to, parentId, body, now),
-        dropReader: (id) => mailPort(sqliteOf(tx)).dropReader(id),
-      };
-    },
 
     cursors: {
       async get(r, address, streamType, streamRef) {
@@ -2282,8 +2287,9 @@ function oauthOps(db: Database, hosted: HostedStoreOf): OAuthOps {
   };
 }
 
-// The server's mail as core's session end reads it (a MailPort): the repo's, and the hosted store's child ends (#475).
-function mailPort(db: Database): MailPort {
+// The server's mail as core's session end reads it (a MailPort): repo.sessionEnd.end's, and the hosted store's child
+// ends (#475). Exported for its test.
+export function mailPort(db: Database): MailPort {
   return {
     unread(id) {
       return db.query<{ id: number; sender: string }, [string]>(

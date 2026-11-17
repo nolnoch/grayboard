@@ -2,7 +2,7 @@ import type { Repo } from "./db.ts";
 import { sweepStoredBlobs } from "./attachments.ts";
 import type { Tx } from "./store/tx.ts";
 import type { Config } from "./config.ts";
-import { pruneEndedIds, prunePosts } from "../core/boards.ts";
+import { prunePosts } from "../core/boards.ts";
 import { UNBOUND_TTL_MS } from "../shared/attachments.ts";
 import { WRITE_DEDUP_WINDOW_MS } from "../shared/dedup.ts";
 import { logReclaimed, RECLAIM_PAGES_PER_RUN } from "../core/sqlite.ts";
@@ -50,7 +50,7 @@ export async function runRetention(repo: Repo, config: Config, now = Date.now(),
     });
     // Ended sessions' rows share it too (#328): a keyed one leaves a
     // tombstone, so its key coming back is audited as reused.
-    await repo.write(tx => pruneEndedIds(repo.coreOn(tx), now - config.messageRetentionDays * 86_400_000, now));
+    await repo.write(tx => repo.sessionEnd.pruneEnded(tx, now - config.messageRetentionDays * 86_400_000, now));
     await repo.write((tx) => pruneAudit(repo, tx, now - config.auditRetentionDays * 86_400_000));
     await repo.write(tx => repo.attachments.pruneUnbound(tx, now - UNBOUND_TTL_MS));
     await repo.write(tx => repo.writeReceipts.prune(tx, now - WRITE_DEDUP_WINDOW_MS));

@@ -92,13 +92,12 @@ test("a session whose end fails is audited and retried at the next revalidate; t
   expect((await srv.api(alice, "POST", "/api/teams/eng/add", { email: "bob@example.com" })).status).toBe(200);
   const bad = await srv.connected(bob, "eng/deploy", { push: false });
   const good = await srv.connected(bob, "eng/ops", { push: false });
-  const repo = srv.app.repo, mailOn = repo.mailOn.bind(repo);
-  repo.mailOn = (tx) => {
-    const port = mailOn(tx);
-    return { ...port, unread: (id) => {
-      if (id === bad.id) throw new Error("disk on fire");
-      return port.unread(id);
-    } };
+  // bad's end runs whole, then fails: the savepoint must roll back everything it wrote.
+  const repo = srv.app.repo, end = repo.sessionEnd.end;
+  repo.sessionEnd.end = async (tx, id, opts) => {
+    const out = await end(tx, id, opts);
+    if (id === bad.id) throw new Error("disk on fire");
+    return out;
   };
 
   expect((await srv.api(alice, "POST", "/api/teams/eng/remove", { email: "bob@example.com" })).status).toBe(200);
@@ -109,7 +108,7 @@ test("a session whose end fails is audited and retried at the next revalidate; t
   expect(failed.map((r) => ({ actor: r.actor, ...JSON.parse(r.detail) }))).toEqual([{ actor: null, why: "revoked", error: "Error: disk on fire" }]);
 
   // The session still writes as an alias it may not: the next revalidate ends it.
-  repo.mailOn = mailOn;
+  repo.sessionEnd.end = end;
   await srv.app.revalidate();
   expect(row(bad.id)!.ended_at).toBe(clock);
   expect(ended(bad.id)).toEqual([expect.objectContaining({ why: "revoked" })]);
