@@ -9,6 +9,7 @@ import { DM_ACK_TOOL, DM_INBOX_TOOL, DM_RETRACT_TOOL, MAX_INBOX_DAYS, ackResult,
 import { HUMAN_NAME, isValidIdentityName } from "../shared/addressing.ts";
 import { ATTACHMENT_LIMITS_CAPABILITY } from "../shared/attachments.ts";
 import { GRAYBOARD_ALIAS_LOST_META } from "../shared/session_meta.ts";
+import { testPauseAsync } from "../shared/testpause.ts";
 import { ApplicationError, type Application, type ApplicationSession, type IdentityInfo } from "./application.ts";
 import type { createOAuthServer, OAuthPrincipal } from "./oauth.ts";
 import { setRequestClient } from "./request_context.ts";
@@ -662,6 +663,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
         // A failed generation read stamps nothing: the check still runs, and the next tick checks in full again.
         let gen: string | undefined;
         try { gen = application.repo.authGeneration(); } catch { gen = undefined; }
+        await testPauseAsync("mcp:stream:check");
         return { gen, start, checked: rest(await authorize(context)) };
       });
     } finally { checking.delete(context); }

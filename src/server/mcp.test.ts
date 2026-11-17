@@ -4,7 +4,7 @@ import { DEFAULT_TRUSTED_PROXIES } from "./client_addr.ts";
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
 import { McpServer, WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/server";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ApplicationError, createApplication } from "./application.ts";
@@ -1514,6 +1514,91 @@ test("#899: another connection's commit reaches a stamped listen within a tick",
   await f.tick();
   await untilHosted(() => hosted.activeListens === 0);
   await f.listen.close();
+});
+
+// #807 P3 A7d: phase B's full check holds at `mcp:stream:check` (after its generation read, before authorize) while
+// `during` runs, after a tick that overlaps it. Resolves once the held tick's phase B is done.
+async function heldCheck(tickStream: () => Promise<void>, during: () => Promise<void>) {
+  const dir = mkdtempSync(join(tmpdir(), "gb-mcp-pause-")), file = join(dir, "release");
+  let hits = 0, reached!: () => void;
+  const hit = new Promise<void>(resolve => { reached = resolve; });
+  const log = spyOn(console, "error").mockImplementation((message: unknown) => {
+    if (message === "[grayboard] test pause hit: mcp:stream:check") { hits++; reached(); }
+  });
+  process.env.BUS_TEST_PAUSE = "mcp:stream:check"; process.env.BUS_TEST_PAUSE_FILE = file;
+  try {
+    const held = tickStream();
+    await hit;
+    await tickStream(); // overlaps the held check, which it skips
+    await during();
+    writeFileSync(file, "release");
+    await held;
+    expect(hits).toBe(1);
+    return { failures: () => log.mock.calls.filter(args => String(args[0]).includes("mcp.stream")) };
+  } finally {
+    writeFileSync(file, "release");
+    delete process.env.BUS_TEST_PAUSE; delete process.env.BUS_TEST_PAUSE_FILE;
+    log.mockRestore(); rmSync(dir, { recursive: true, force: true });
+  }
+}
+const streamClosedReasons = () => store.db.query<{ detail: string }, []>("SELECT detail FROM access_log WHERE action = 'hosted.stream_closed'").all().map(row => JSON.parse(row.detail).reason);
+const revokeAccess = (access: string, at: number) => seed(store.repo, tx => store.repo.oauth.revokeToken(tx, hashToken(access), OPENCODE_CLIENT, at));
+
+test("#807 P3 A7d: a revoke during a held phase-B check stales its stamp: the next tick closes the listen once", async () => {
+  const f = await stampedListen(10_000);
+  f.time.now += 10_000; // past the recheck backstop: the next tick checks in full
+  const { failures } = await heldCheck(f.tickStream, () => revokeAccess(token, f.time.now));
+  // The check read under the generation before the revoke: its answer stands, linearized before the revoke, and its
+  // stamp keeps that generation, so the next tick checks in full and closes the listen.
+  expect(hosted.activeListens).toBe(1);
+  await f.tickStream();
+  expect(hosted.activeListens).toBe(0);
+  expect(streamClosedReasons()).toEqual(["unauthenticated"]);
+  expect(failures()).toEqual([]);
+  await f.listen.close();
+});
+
+test("#807 P3 A7d: a held phase-B check whose live stopped meanwhile acts on nothing", async () => {
+  const f = await stampedListen(10_000);
+  f.time.now += 10_000;
+  const { failures } = await heldCheck(f.tickStream, async () => {
+    // A binding change stops the live, unaudited; the revoke then refuses the released check.
+    await seed(store.repo, tx => { const r = aliceRoot(); return store.repo.hosted.update(tx, { ...r, bind_gen: r.bind_gen + 1 }); });
+    expect(hosted.activeListens).toBe(0);
+    await revokeAccess(token, f.time.now);
+  });
+  expect(streamClosedReasons()).toEqual([]);
+  expect(failures()).toEqual([]);
+  await f.listen.close();
+});
+
+test("#807 P3 A7d: a held phase-B check of an idle legacy GET that an attach re-selects leaves the GET open", async () => {
+  const { time, tickStream } = await clocked(undefined, 10_000);
+  const grant = await issueOAuth(store.repo, oauth.resource, "alice@example.com", ["grayboard:tools"], time.now, OPENCODE_CLIENT);
+  const auth = new Headers({ Authorization: `Bearer ${grant.token}` });
+  token = grant.token;
+  const legacy = await connect("2025-11-25", undefined, auth);
+  expect((await legacy.callTool({ name: "board_create", arguments: { name: "attach", purpose: "A7d" } })).isError).not.toBe(true);
+  await untilHosted(() => hosted.activeGetStreams === 1);
+  await tickStream();
+  // The GET's own token is revoked once its client sends a refreshed one. The revoke moves the generation, so the
+  // next tick checks the GET in full, under the old token.
+  const { access } = await rotateOAuth(store.repo, grant, grant.refreshToken, time.now);
+  auth.set("Authorization", `Bearer ${access}`);
+  // A POST under the refreshed token re-authorizes the legacy session; the idle GET keeps its old context.
+  expect((await legacy.callTool({ name: "board_list", arguments: {} })).isError).not.toBe(true);
+  await revokeAccess(grant.token, time.now);
+  const { failures } = await heldCheck(tickStream, async () => {
+    // The subscribing POST re-selects the idle GET's context under the refreshed token.
+    expect(await legacy.subscribeResource({ uri: "grayboard://boards/attach" })).toEqual({});
+  });
+  // The released check, refused under the old token, is about a context the GET no longer has.
+  expect(hosted.activeGetStreams).toBe(1);
+  expect(streamClosedReasons()).toEqual([]);
+  expect(failures()).toEqual([]);
+  await tickStream();
+  expect(hosted.activeGetStreams).toBe(1);
+  await legacy.close();
 });
 
 test("#899: a quiet tick reads no hosted row or alias hold for a stamped listen or legacy GET", async () => {
