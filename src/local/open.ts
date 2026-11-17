@@ -13,6 +13,7 @@ import { openSqlite } from "../core/sqlite.ts";
 import { conversationSnapshot, liveSessions, type Ended, type SessionRow } from "./binding.ts";
 import { ATTACHMENT_BYTES_SQL } from "./blobs.ts";
 import { privateDbFiles, privateDir } from "./perms.ts";
+import { lowercaseLegacyHandles } from "./handle_case.ts";
 
 export function localDbPath(env: Record<string, string | undefined> = process.env): string {
   return refuseForbiddenBus(env.BUS_DB_PATH ?? `${homedir()}/.claude-bus/bus.db`);
@@ -158,5 +159,6 @@ function initLocalSchema(db: Database): void {
     INSERT OR IGNORE INTO aliases (address, scope_kind, scope_ref, name, human, queue_off, created_at, last_seen)
     SELECT name, 'person', NULL, name, human, queue_off, first_seen, last_seen FROM handles WHERE name NOT LIKE '~%';
   `);
+  lowercaseLegacyHandles(db);
   ensureBoard(db, ANNOUNCE_BOARD, "Your user's announcements to every live session. Only a human starts posts here; reply in the thread to acknowledge.", null, "grayboard");
 }
