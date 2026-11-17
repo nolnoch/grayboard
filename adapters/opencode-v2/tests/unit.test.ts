@@ -283,3 +283,9 @@ test("JSON admission caps serialized code units before escaping and envelope ove
   expect(JSON.parse(text.split("\n")[2]!)).toEqual(event);
   expect(() => render({ ...items[0]!, event: { body: event.body + "x" } }, identity)).toThrow("Inbox item exceeds admission limit");
 });
+
+// tests/until.ts is a copy of tests/support/until.ts that the host scripts can carry into scratch directories (#571).
+test("the package's until helper matches the repo's", () => {
+  const body = (path: string) => readFileSync(new URL(path, import.meta.url), "utf8").split("\n").filter(line => !line.startsWith("//")).join("\n");
+  expect(body("./until.ts")).toBe(body("../../../tests/support/until.ts"));
+});

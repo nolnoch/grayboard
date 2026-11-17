@@ -8,7 +8,7 @@ mkdir -p "$root/source/adapters/opencode-v2/tests"
 cp -R ../../src "$root/source/"
 cp ../../package.json "$root/source/package.json"
 cp -R src "$root/source/adapters/opencode-v2/"
-cp tests/host.ts tests/real-races.ts tests/real-reload.ts tests/real-transactions.ts tests/real-server.ts tests/server-db.ts tests/reload-state.ts tests/causal.ts tests/subscriber-work.ts tests/failed-continuation.ts tests/effect-host.ts tests/effect-instrument.ts tests/cimd-fixture.ts "$root/source/adapters/opencode-v2/tests/"
+cp tests/host.ts tests/until.ts tests/real-races.ts tests/real-reload.ts tests/real-transactions.ts tests/real-server.ts tests/server-db.ts tests/reload-state.ts tests/causal.ts tests/subscriber-work.ts tests/failed-continuation.ts tests/effect-host.ts tests/effect-instrument.ts tests/cimd-fixture.ts "$root/source/adapters/opencode-v2/tests/"
 # The transaction races' process helpers (real-server.ts, real-transactions.ts), their second writer, and the
 # stubbed upstream identity provider host.ts and real-server.ts start the server with (its imports are under src/).
 mkdir -p "$root/source/tests/support"

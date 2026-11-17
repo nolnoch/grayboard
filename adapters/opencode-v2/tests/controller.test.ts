@@ -12,7 +12,8 @@ import { Approval, METADATA, enrollmentHash, type OpenCodeEnrollment as Enrollme
 import { AccessExpired, type Item } from "../src/core/model.js";
 import { SIGN_IN } from "../src/binding.js";
 class NativeAccessExpired extends AccessExpired { constructor() { super("OpenCode", SIGN_IN); } }
-import { fixture, until } from "./native-fixture.js";
+import { fixture } from "./native-fixture.js";
+import { until } from "./until.ts";
 import { FailedContinuation } from "./failed-continuation.js";
 import { observeRuns } from "./subscriber-work.js";
 import { barrier, bounded } from "./reload-state.js";
@@ -134,17 +135,17 @@ test("diagnostics retain each root across unrelated activity and restart without
     r.bind("R", "be"); r.bind("B", "fe");
     r.batches.set("R", [{ id: "direct:1", actionable: true, event: {}, ownership: 1, bind_gen: 1, address: "you@example.com/be" }]);
     r.admission(async () => { throw new Error("secret-token\n at bearer-token.ts:1"); });
-    await r.controller.enroll("R"); await until(() => r.controller.status().state === "paused");
+    await r.controller.enroll("R"); await until(() => r.controller.status().state === "paused", 1000);
     r.admission(async () => {});
     const reply = await r.controller.enroll("B");
     expect(reply.message).toContain("fe");
-    await until(() => r.controller.status().roots.find(root => root.sessionID === "B")?.state === "active");
+    await until(() => r.controller.status().roots.find(root => root.sessionID === "B")?.state === "active", 1000);
     expect(r.controller.status().roots.find(root => root.sessionID === "R")?.message).toContain("direct:1");
     expect(r.controller.status().state).toBe("paused");
     await r.controller.close();
     expect(JSON.stringify(r.storage.get("diagnostics:v1"))).not.toContain("secret-token");
     restarted = r.restart(); const start = r.calls.length; await restarted.restore();
-    await until(() => restarted!.status().roots.find(root => root.sessionID === "B")?.state === "active");
+    await until(() => restarted!.status().roots.find(root => root.sessionID === "B")?.state === "active", 1000);
     expect(restarted.status().roots.find(root => root.sessionID === "R")?.state).toBe("paused");
     expect(r.calls.slice(start).some(call => call.name === "delivery_open" && call.sessionID === "R")).toBe(false);
     expect(r.storage.get("paused:R")).toBe(false);
@@ -156,14 +157,14 @@ test("an ended root stays listed but never speaks for the live roots", async () 
   try {
     r.bind("R", "be"); r.bind("B", "fe");
     await r.controller.enroll("R"); await r.controller.enroll("B");
-    await until(() => r.controller.status().roots.filter(root => root.state === "active").length === 2);
+    await until(() => r.controller.status().roots.filter(root => root.state === "active").length === 2, 1000);
     r.nodes.delete("B"); await r.controller.observe("session.deleted", { sessionID: "B" });
     expect(r.controller.status().roots.find(root => root.sessionID === "B")).toMatchObject({ state: "paused", operation: "session_end" });
     expect(r.controller.status()).toMatchObject({ state: "active", sessionID: "R" });
     expect(r.controller.status().message).toContain("be");
     await r.controller.close();
     restarted = r.restart(); await restarted.restore();
-    await until(() => restarted!.status().state === "active");
+    await until(() => restarted!.status().state === "active", 1000);
     expect(restarted.status().sessionID).toBe("R");
   } finally { await restarted?.close(); await r.controller.close(); }
 });
@@ -197,7 +198,7 @@ test.each([false, true])("expiry failed-continuation barrier joins actual subscr
     const checked = forbidden ? assert.rejects(completion, /deep-equal/) : completion;
     model.release(); await bounded(Promise.resolve(checked), 1000, "Counted model work drains before absence check");
     gate.release();
-    await until(() => waits.length === 5);
+    await until(() => waits.length === 5, 1000);
     expect(waits).toEqual([500, 1000, 2000, 4000, 8000]); expect(retired).toBe(false);
     expect((r.nodes.get("R")!.metadata[METADATA] as { enabled: boolean }).enabled).toBe(true);
     expect(r.calls.filter(c => c.name === "delivery_receipt")).toHaveLength(1); expect(r.batches.get("R")).toHaveLength(1);
@@ -215,7 +216,7 @@ test.each([false, true])("terminal retry pause survives diagnostic emission fail
     r.bind("R", "be");
     r.batches.set("R", [{ id: "direct:1", actionable: true, event: {}, ownership: 1, bind_gen: 1, address: "you@example.com/be" }]);
     r.admission(async () => { throw new Error("synthetic-private-error"); });
-    await controller.enroll("R"); await until(() => exhausted); await controller.close();
+    await controller.enroll("R"); await until(() => exhausted, 1000); await controller.close();
     expect(r.admissions).toHaveLength(8);
     const terminal = (r.storage.get("diagnostics:v1") as { state: string; code?: string; operation: string; failure?: { operation: string } }[]).find(record => record.code === "retry_exhausted")!;
     expect(terminal.state).toBe("paused"); expect(terminal.operation).toBe("subscriber");
@@ -229,7 +230,7 @@ test.each([false, true])("terminal retry pause survives diagnostic emission fail
     expect(restored.status().roots.find(root => root.sessionID === "R")?.state).toBe("paused");
     expect(r.calls.filter(call => call.name === "delivery_open")).toHaveLength(opens);
     expect(r.admissions).toHaveLength(8); expect(r.calls.filter(call => call.name === "delivery_receipt")).toEqual([]);
-    await restored.enroll("R"); await until(() => r.calls.some(call => call.name === "delivery_receipt"));
+    await restored.enroll("R"); await until(() => r.calls.some(call => call.name === "delivery_receipt"), 1000);
     expect(r.admissions).toHaveLength(9);
   } finally { await restored?.close(); await controller.close(); await r.controller.close(); }
 });
@@ -251,7 +252,7 @@ test("remembered-name bookkeeping cannot grant approval after a concurrent revoc
     expect((r.nodes.get("R")!.metadata[METADATA] as { enabled: boolean }).enabled).toBe(false);
     expect(r.calls.filter(c => c.name === "delivery_open")).toEqual([]);
     Object.defineProperty(r.ctx.storage, "set", { configurable: true, value: original });
-    await r.controller.enroll("R"); await until(() => r.controller.status().roots.some(root => root.sessionID === "R" && root.state === "active"));
+    await r.controller.enroll("R"); await until(() => r.controller.status().roots.some(root => root.sessionID === "R" && root.state === "active"), 1000);
     expect((r.nodes.get("R")!.metadata[METADATA] as { enabled: boolean }).enabled).toBe(true);
   } finally { Object.defineProperty(r.ctx.storage, "set", { configurable: true, value: original }); await r.controller.close(); }
 });
@@ -263,7 +264,7 @@ test("diagnostic read failure does not block independently authorized roots", as
     const original = r.ctx.storage.get;
     Object.defineProperty(r.ctx.storage, "get", { value: async (key: string) => { if (key === "diagnostics:v1") throw new Error("secret storage failure"); return original(key); } });
     restarted = r.restart(); await restarted.restore();
-    await until(() => restarted!.status().roots.some(root => root.sessionID === "R" && root.state === "active"));
+    await until(() => restarted!.status().roots.some(root => root.sessionID === "R" && root.state === "active"), 1000);
     expect(JSON.stringify(restarted.status())).not.toContain("secret storage failure");
   } finally { await restarted?.close(); await r.controller.close(); }
 });
@@ -271,7 +272,7 @@ test("diagnostic read failure does not block independently authorized roots", as
 test("before bind immediately reports rebinding without waiting for an after hook", async () => {
   const r = runtime();
   try {
-    r.bind("R", "be"); await r.controller.enroll("R"); await until(() => r.controller.status().state === "active");
+    r.bind("R", "be"); await r.controller.enroll("R"); await until(() => r.controller.status().state === "active", 1000);
     await r.before("R", "grayboard_bind");
     expect(r.controller.status().roots.find(root => root.sessionID === "R")?.state).toBe("rebinding");
     await r.before("B", "grayboard_bind");
@@ -294,7 +295,7 @@ test.each(["edited", "prepare"])("restore isolates a %s root without releasing a
     }
     const start = r.calls.length;
     await restored.restore();
-    await until(() => r.calls.slice(start).some(c => c.name === "delivery_open" && c.sessionID === "B"));
+    await until(() => r.calls.slice(start).some(c => c.name === "delivery_open" && c.sessionID === "B"), 1000);
     expect(r.calls.slice(start).some(c => ["session_end", "delivery_release"].includes(c.name))).toBe(false);
     expect(r.calls.slice(start).some(c => c.name === "delivery_open" && c.sessionID === "R")).toBe(false);
     expect(r.storage.get("paused:R")).toBe(false);
@@ -376,7 +377,7 @@ test.each(["connect", "whoami", "bind"].flatMap(boundary => ["approval", "genera
       if (change === "endpoint") r.f.config.url = "https://other.example.com/mcp";
     });
     await r.controller.enroll("R");
-    await until(() => r.controller.status().roots.find(root => root.sessionID === "R")?.state === "paused");
+    await until(() => r.controller.status().roots.find(root => root.sessionID === "R")?.state === "paused", 1000);
     await r.controller.close();
     expect(changed).toBe(true);
     const release = r.calls.findIndex(call => call.name === "delivery_release"); expect(release).toBeGreaterThan(-1);
@@ -399,7 +400,7 @@ test("capacity recovery rebinds without creation and receipts the reissued item 
       r.batches.set("R", [{ id: "direct:1", actionable: true, event: {}, ownership: row.ownership, bind_gen: row.generation, name: "be" }]);
     });
     await r.controller.enroll("R");
-    await until(() => r.calls.some(c => c.name === "delivery_receipt"));
+    await until(() => r.calls.some(c => c.name === "delivery_receipt"), 1000);
     expect(r.rows.get("R")?.ownership).toBe(2);
     expect(r.calls.filter(c => c.name === "delivery_release")).toHaveLength(1);
     expect(r.calls.filter(c => c.name === "bind").map(c => c.args)).toEqual([{ name: "you@example.com/be", create: false, where: "/worktree" }]);
@@ -415,7 +416,7 @@ test.each(["receipt_capacity", "bad_request"])("only typed %s controls bounded c
     r.bind("R", "be");
     r.readFailure(() => { throw new SubscriberError(code); });
     await r.controller.enroll("R");
-    await until(() => r.controller.status().state === "paused");
+    await until(() => r.controller.status().state === "paused", 1000);
     expect(r.calls.filter(c => c.name === "delivery_open")).toHaveLength(8);
     const releases = r.calls.filter(c => c.name === "delivery_release");
     expect(releases).toHaveLength(code === "receipt_capacity" ? 8 : 0);
@@ -436,7 +437,7 @@ test("a poison item exhausts eight attempts despite successful same-lease opens,
     r.batches.set("R", [1, 2].map(id => ({ id: `direct:${id}`, actionable: true, event: {}, ownership: 1, bind_gen: 1, address: "you@example.com/be" })));
     r.admission(async () => { throw new Error("synthetic refused"); });
     await r.controller.enroll("R");
-    await until(() => r.controller.status().state === "paused");
+    await until(() => r.controller.status().state === "paused", 1000);
     expect(r.admissions).toHaveLength(8);
     expect(new Set(r.admissions.map(a => a.id)).size).toBe(1);
     expect(r.calls.filter(c => c.name === "delivery_open")).toHaveLength(8);
@@ -454,7 +455,7 @@ test("a successful receipt alone resets progress budget for the next item", asyn
     let tries = 0;
     r.admission(async () => { if (++tries !== 8) throw new Error("synthetic refused"); });
     await r.controller.enroll("R");
-    await until(() => r.controller.status().state === "paused");
+    await until(() => r.controller.status().state === "paused", 1000);
     expect(r.admissions).toHaveLength(16);
     expect(r.calls.filter(c => c.name === "delivery_receipt").map(c => c.args.ids)).toEqual([["direct:1"]]);
     expect(r.batches.get("R")?.map(i => i.id)).toEqual(["direct:2"]);
@@ -468,7 +469,7 @@ test("repeated successful opens reset lease recovery but cannot erase one item's
     r.batches.set("R", [{ id: "direct:1", actionable: true, event: {}, ownership: 1, bind_gen: 1, address: "you@example.com/be" }]);
     r.admission(async () => { throw new LeaseUnavailable(); });
     await r.controller.enroll("R");
-    await until(() => r.controller.status().state === "paused");
+    await until(() => r.controller.status().state === "paused", 1000);
     expect(r.admissions).toHaveLength(8);
     expect(r.calls.filter(c => c.name === "delivery_open")).toHaveLength(9);
     expect(r.calls.filter(c => c.name === "delivery_receipt")).toHaveLength(0);
@@ -481,7 +482,7 @@ test("a lease lost outside any item pauses after bounded recoveries despite succ
     r.bind("R", "be");
     r.readFailure(() => { throw new LeaseUnavailable(); });
     await r.controller.enroll("R");
-    await until(() => r.controller.status().state === "paused");
+    await until(() => r.controller.status().state === "paused", 1000);
     expect(r.calls.filter(c => c.name === "delivery_open")).toHaveLength(4);
   } finally { await r.controller.close(); }
 });
@@ -497,7 +498,7 @@ async function outage(waited?: (elapsed: number, ms: number) => void | Promise<v
   r.subscriptions(() => ++listens === 1 ? first.promise : undefined);
   r.bind("R", "be");
   await controller.enroll("R");
-  await until(() => controller.status().state === "active" && listens === 1);
+  await until(() => controller.status().state === "active" && listens === 1, 1000);
   return { r, controller, waits, codes, states, stop: () => first.resolve() };
 }
 // #661: past the grace, the wait for the refresh backs off to 30 s for an hour of waits.
@@ -517,7 +518,7 @@ test("server outages and subscription closures never spend the failure budget, a
       return undefined;
     });
     o.stop();
-    await until(() => o.r.calls.some(c => c.name === "delivery_receipt"));
+    await until(() => o.r.calls.some(c => c.name === "delivery_receipt"), 1000);
     // Closures back off too: only a healthy lease (renew or receipt) resets it.
     expect(o.waits).toEqual([500, 1000, 2000, 4000, 8000, 8000, 8000, 8000, 8000, 8000, 8000, ...Array(10).fill(8000)]);
     expect(o.codes).toContain("server_unreachable");
@@ -535,7 +536,7 @@ test("a native token that expires during an outage keeps retrying; outside one i
     o.r.observe(async operation => { if (operation === "connect" && failures.length) throw failures.shift()!; });
     o.r.subscriptions(() => { o.r.batches.set("R", [item]); return undefined; });
     o.stop();
-    await until(() => o.r.calls.some(c => c.name === "delivery_receipt"));
+    await until(() => o.r.calls.some(c => c.name === "delivery_receipt"), 1000);
     expect(o.waits).toEqual([500, 1000, 2000, 4000]);
     expect(o.codes).toContain("native_access_expired");
     expect(o.controller.status().state).toBe("active");
@@ -548,7 +549,7 @@ test("a native token that expires during an outage keeps retrying; outside one i
     p.observe(async operation => { if (operation === "connect" && ++connects >= 3) throw new NativeAccessExpired(); });
     p.bind("R", "be");
     await p.controller.enroll("R");
-    await until(() => p.controller.status().roots.find(root => root.sessionID === "R")?.message.startsWith(STILL_EXPIRED) === true);
+    await until(() => p.controller.status().roots.find(root => root.sessionID === "R")?.message.startsWith(STILL_EXPIRED) === true, 1000);
     // The failure's backoff, then the rotation grace: 20 polls of 500 ms (#472).
     expect(waits.slice(0, 21)).toEqual([500, ...Array(20).fill(500)]);
     // The stored token reads valid, so each recovery attempt's prepare connects, finds it expired and keeps the
@@ -571,7 +572,7 @@ test("a native token that expires during an outage asks OpenCode to refresh once
     o.r.observe(async operation => { if (operation === "connect" && down) { down = false; o.r.f.expire(); throw new ServerUnreachable(new Error("down")); } });
     o.r.subscriptions(() => { o.r.batches.set("R", [item]); return undefined; });
     o.stop();
-    await until(() => o.r.calls.some(c => c.name === "delivery_receipt"));
+    await until(() => o.r.calls.some(c => c.name === "delivery_receipt"), 1000);
     expect(reloadsAtRotate).toBe(1);
     expect(o.r.f.reloads).toBe(1);
     expect(o.codes).toContain("native_access_expired");
@@ -587,7 +588,7 @@ test("a native account change found by the outage retry's refresh keeps the drif
     o.r.f.afterResolve(() => { if (armed) { armed = false; o.r.f.select("credential-two"); } });
     o.r.observe(async operation => { if (operation === "connect" && down) { down = false; o.r.f.expire(); armed = true; throw new ServerUnreachable(new Error("down")); } });
     o.stop();
-    await until(() => o.controller.status().roots.find(root => root.sessionID === "R")?.state === "paused");
+    await until(() => o.controller.status().roots.find(root => root.sessionID === "R")?.state === "paused", 1000);
     await o.controller.close();
     expect(o.controller.status().roots.find(root => root.sessionID === "R")).toMatchObject({ state: "paused", message: expect.stringContaining("enroll again") });
   } finally { await o.controller.close(); await o.r.controller.close(); }
@@ -599,7 +600,7 @@ test("a closed subscription is not an outage: native expiry on every reconnect, 
     // The SDK wraps errors thrown during connect (EraNegotiationFailed {cause}).
     o.r.observe(async operation => { if (operation === "connect") { connects++; throw new Error("era negotiation failed", { cause: new NativeAccessExpired() }); } });
     o.stop();
-    await until(() => o.controller.status().roots.find(root => root.sessionID === "R")?.message.startsWith(STILL_EXPIRED) === true);
+    await until(() => o.controller.status().roots.find(root => root.sessionID === "R")?.message.startsWith(STILL_EXPIRED) === true, 1000);
     expect(connects).toBe(21 + RECOVERY.length);
     expect(o.waits).toEqual([...Array(21).fill(500), ...RECOVERY]);
     expect(o.codes).toContain("subscription_closed");
@@ -617,7 +618,7 @@ for (const lands of [600, 1500]) test(`OpenCode's refresh landing ${lands} ms af
     o.r.f.expire();
     o.r.subscriptions(() => { o.r.batches.set("R", [item]); return undefined; });
     o.stop();
-    await until(() => o.r.calls.some(c => c.name === "delivery_receipt"));
+    await until(() => o.r.calls.some(c => c.name === "delivery_receipt"), 1000);
     // The close's own backoff, then 500 ms rotation polls; a spent failure would back off 1000 ms.
     expect(o.waits).toEqual(lands === 600 ? [500, 500] : [500, 500, 500]);
     expect(o.codes).toContain("native_access_expired");
@@ -634,7 +635,7 @@ test("a native refresh that never lands within the rotation grace pauses, asks O
   try {
     o.r.f.expire();
     o.stop();
-    await until(() => o.controller.status().roots.find(root => root.sessionID === "R")?.message.startsWith(STILL_EXPIRED) === true);
+    await until(() => o.controller.status().roots.find(root => root.sessionID === "R")?.message.startsWith(STILL_EXPIRED) === true, 1000);
     expect(o.waits).toEqual([...Array(21).fill(500), ...RECOVERY]);
     // Once per stored expiry, though every attempt asks.
     expect(o.r.f.reloads).toBe(1);
@@ -652,7 +653,7 @@ test("a native call refused before dispatch never holds the reconnect (#661)", a
     await expect(o.controller.before({ sessionID: "G", tool: "grayboard_dm_send", id: "refused" })).rejects.toThrow("child_bound");
     o.r.f.expire();
     o.stop();
-    await until(() => o.r.f.reloads === 1);
+    await until(() => o.r.f.reloads === 1, 1000);
     expect(o.waits.slice(0, 22)).toEqual([...Array(21).fill(500), 1000]);
   } finally { await o.controller.close(); await o.r.controller.close(); }
 });
@@ -682,7 +683,7 @@ test("a native call released by a reconnect waits for its tool to be listed agai
     reload.resolve();
     await other;
     expect(binding.calls.has("other")).toBe(false);
-    await until(() => empty >= 3);
+    await until(() => empty >= 3, 1000);
     expect(settled).toBe(false);
     listed = true;
     await expect(native).rejects.toThrow("child_bound");
@@ -700,7 +701,7 @@ test("a refresh that lands while the server is down resumes on restore's outage 
     o.r.observe(async operation => { if (operation === "connect" && down) { down = false; refused++; throw new ServerUnreachable(Object.assign(new Error("refused"), { code: "ECONNREFUSED" })); } });
     o.r.f.expire();
     o.stop();
-    await until(() => refused === 1 && o.controller.status().roots.find(root => root.sessionID === "R")?.state === "active");
+    await until(() => refused === 1 && o.controller.status().roots.find(root => root.sessionID === "R")?.state === "active", 1000);
     // The grace, one recovery wait, then restore's outage backoff: never the recovery's again.
     expect(o.waits).toEqual([...Array(21).fill(500), 1000, 500]);
     expect(during).toMatchObject({ state: "retrying", operation: "recover", code: "server_unreachable" });
@@ -726,7 +727,7 @@ test("a native call in flight holds the reconnect until its after hook; the refr
     (o.r.ctx.mcp as { reload: () => Promise<void> }).reload = async () => { await reload(); o.r.f.rotate("fake-access-two"); };
     o.r.f.expire();
     o.stop();
-    await until(() => recovering >= 3 && controller.status().roots.find(root => root.sessionID === "R")?.state === "active");
+    await until(() => recovering >= 3 && controller.status().roots.find(root => root.sessionID === "R")?.state === "active", 1000);
     expect(reloadsWhileHeld).toBe(0);
     expect(o.r.f.reloads).toBe(1);
     expect(o.waits).toEqual([...Array(21).fill(500), 1000, 2000, 4000, 8000]);
@@ -748,10 +749,10 @@ test.each([false, true])("a native access expiry pause doesn't survive a restart
     // Restore walks saved roots in storage-key order (#660): the expired root
     // is B, so it is restored first and the grace's first poll samples it.
     r.bind("B", "be"); r.bind("R", "fe");
-    await r.controller.enroll("B"); await until(() => r.controller.status().state === "active" && listens === 1);
-    await r.controller.enroll("R"); await until(() => r.controller.status().roots.filter(root => root.state === "active").length === 2);
+    await r.controller.enroll("B"); await until(() => r.controller.status().state === "active" && listens === 1, 1000);
+    await r.controller.enroll("R"); await until(() => r.controller.status().roots.filter(root => root.state === "active").length === 2, 1000);
     r.f.expire(); first.resolve();
-    await until(() => r.controller.status().roots.find(root => root.sessionID === "B")?.state === "paused");
+    await until(() => r.controller.status().roots.find(root => root.sessionID === "B")?.state === "paused", 1000);
     expect(r.controller.status().roots.find(root => root.sessionID === "B")?.code).toBe("native_access_expired");
     await r.controller.close();
     if (legacy) {
@@ -766,7 +767,7 @@ test.each([false, true])("a native access expiry pause doesn't survive a restart
     });
     const start = r.calls.length;
     await restarted.restore();
-    await until(() => restarted!.status().roots.filter(root => root.state === "active").length === 2);
+    await until(() => restarted!.status().roots.filter(root => root.state === "active").length === 2, 1000);
     expect(polls).toBe(3);
     // The grace is visible: the old paused record gives way to a retrying one before the check.
     expect(during).toMatchObject({ state: "retrying", operation: "restore", code: "native_access_expired" });
@@ -781,7 +782,7 @@ async function restoredDuringOutage(refused: number, waited?: (restarted: Contro
   const r = runtime({}, async () => {});
   r.bind("B", "be");
   await r.controller.enroll("B");
-  await until(() => r.controller.status().state === "active");
+  await until(() => r.controller.status().state === "active", 1000);
   await r.controller.close();
   r.observe(async operation => { if (operation === "connect" && refused > 0) { refused--; throw new ServerUnreachable(Object.assign(new Error("refused"), { code: "ECONNREFUSED" })); } });
   const waits: number[] = [], states: string[] = [];
@@ -798,7 +799,7 @@ test("a restore during a server outage retries on the outage backoff, never paus
   const o = await restoredDuringOutage(4);
   try {
     expect(o.restarted.status().roots.find(root => root.sessionID === "B")).toMatchObject({ operation: "restore", code: "server_unreachable" });
-    await until(() => o.restarted.status().roots.find(root => root.sessionID === "B")?.state === "active");
+    await until(() => o.restarted.status().roots.find(root => root.sessionID === "B")?.state === "active", 1000);
     expect(o.restarted.status().roots.find(root => root.sessionID === "B")).toMatchObject({ state: "active", ownership: 1 });
     expect(o.waits).toEqual([500, 1000, 2000, 4000]);
     expect(o.states).toEqual(Array(4).fill("retrying"));
@@ -813,7 +814,7 @@ test("a token that expires during a restore's outage retry waits for the host's 
     else { seen = restarted.status().roots.find(root => root.sessionID === "B"); reloads = r.f.reloads; r.f.rotate("fake-access-two"); }
   });
   try {
-    await until(() => o.restarted.status().roots.find(root => root.sessionID === "B")?.state === "active");
+    await until(() => o.restarted.status().roots.find(root => root.sessionID === "B")?.state === "active", 1000);
     expect(seen).toMatchObject({ state: "retrying", operation: "restore", code: "native_access_expired" });
     // The retry asked OpenCode to refresh before its next wait (#916).
     expect(reloads).toBe(1);
@@ -830,7 +831,7 @@ test("a native account change found by a restore's outage-retry refresh keeps th
     r.f.afterResolve(() => { if (armed) { armed = false; r.f.select("credential-two"); } });
   });
   try {
-    await until(() => o.restarted.status().roots.find(root => root.sessionID === "B")?.state === "paused");
+    await until(() => o.restarted.status().roots.find(root => root.sessionID === "B")?.state === "paused", 1000);
     await o.restarted.close();
     expect(o.restarted.status().roots.find(root => root.sessionID === "B")).toMatchObject({ state: "paused", message: expect.stringContaining("enroll again") });
   } finally { await o.restarted.close(); await o.r.controller.close(); }
@@ -839,7 +840,7 @@ test("a shutdown during a restore's outage retry ends it: nothing opens once the
   let shut = false;
   const o = await restoredDuringOutage(1, async restarted => { if (!shut) { shut = true; await restarted.shutdown("B", "detach"); } });
   try {
-    await until(() => shut);
+    await until(() => shut, 1000);
     // close waits out the control queue, so the retry's last check has run.
     await o.restarted.close();
     expect(o.calls().some(c => c.name === "delivery_open")).toBe(false);
@@ -854,9 +855,9 @@ test.each(["account", "revoked"])("a genuine refusal at restart keeps a native a
     const first = Promise.withResolvers<void>();
     r.subscriptions(() => first.promise);
     r.bind("R", "be");
-    await r.controller.enroll("R"); await until(() => r.controller.status().state === "active");
+    await r.controller.enroll("R"); await until(() => r.controller.status().state === "active", 1000);
     r.f.expire(); first.resolve();
-    await until(() => r.controller.status().state === "paused");
+    await until(() => r.controller.status().state === "paused", 1000);
     await r.controller.close();
     r.f.rotate("fake-access-two");
     if (refusal === "account") r.f.select("other"); else r.f.status("needs_auth");
@@ -891,7 +892,7 @@ test("approval without name does not bind, lease, admit or receipt; native compl
     expect((await r.controller.enroll("R")).state).toBe("unbound");
     expect(r.calls.map(c => c.name)).toEqual(["whoami"]);
     await r.before("R", "grayboard_bind"); r.bind("R", "be"); await r.after("R", "be");
-    await until(() => r.controller.status().state === "active");
+    await until(() => r.controller.status().state === "active", 1000);
     expect(r.calls.filter(c => c.name === "delivery_open")).toHaveLength(1);
     expect(r.admissions).toHaveLength(0);
   } finally { await r.controller.close(); }
@@ -903,7 +904,7 @@ test("two approved roots on shared native config keep independent names, leases 
     r.batches.set("R", [{ id: "direct:1", actionable: true, event: {}, ownership: 1, bind_gen: 1, address: "you@example.com/be" }]);
     r.batches.set("B", [{ id: "direct:2", actionable: false, event: {}, ownership: 2, bind_gen: 1, name: "fe" }]);
     await r.controller.enroll("R"); await r.controller.enroll("B");
-    await until(() => r.calls.filter(c => c.name === "delivery_receipt").length === 2);
+    await until(() => r.calls.filter(c => c.name === "delivery_receipt").length === 2, 1000);
     expect(r.admissions.map(a => [a.sessionID, a.resume])).toEqual([["R", true], ["B", false]]);
     expect(r.calls.filter(c => c.name === "delivery_open").map(c => c.sessionID)).toEqual(["R", "B"]);
   } finally { await r.controller.close(); }
@@ -913,7 +914,7 @@ test("before awaits G registration directly under R via C, rejects missing ances
   try {
     r.holdRegistration(() => new Promise(resolve => { done = resolve; }));
     let allowed = false; const pending = r.before("G").then(() => { allowed = true; });
-    await until(() => !!done); expect(allowed).toBe(false);
+    await until(() => !!done, 1000); expect(allowed).toBe(false);
     expect(r.calls.at(-1)).toEqual({ sessionID: "R", name: "session_register", args: { child: "G", via: ["C"] } });
     done(); await pending; expect(allowed).toBe(true);
     r.nodes.delete("C"); await expect(r.before("G")).rejects.toThrow("missing C");
@@ -937,10 +938,10 @@ test("retained routes close children independently, child-first and root-first l
 test("FOUR native rebinds preserve approval and reopen exactly once each without release", async () => {
   const r = runtime();
   try {
-    r.bind("R", "be"); await r.controller.enroll("R"); await until(() => r.controller.status().state === "active");
+    r.bind("R", "be"); await r.controller.enroll("R"); await until(() => r.controller.status().state === "active", 1000);
     for (let i = 1; i <= 4; i++) {
       await r.before("R", "grayboard_bind"); r.bind("R", `name-${i}`); await r.after("R", `name-${i}`);
-      await until(() => r.calls.filter(c => c.name === "delivery_open").length === i + 1);
+      await until(() => r.calls.filter(c => c.name === "delivery_open").length === i + 1, 1000);
     }
     expect(r.calls.filter(c => c.name === "delivery_release")).toHaveLength(0);
     expect(r.rows.get("R")?.ownership).toBe(1);
@@ -950,16 +951,16 @@ test.each(["completion", "enroll", "pause", "session.archived", "session.deleted
   const r = runtime();
   try {
     r.bind("R", "initial"); await r.controller.enroll("R");
-    await until(() => r.calls.filter(c => c.name === "delivery_open").length === 1);
+    await until(() => r.calls.filter(c => c.name === "delivery_open").length === 1, 1000);
     await Promise.all([r.before("R", "grayboard_bind"), r.before("R", "grayboard_bind")]);
     r.bind("R", "first"); await r.after("R", "first");
-    await until(() => r.calls.filter(c => c.name === "delivery_open").length === 2);
-    if (transition === "enroll") { await r.controller.enroll("R"); await until(() => r.calls.filter(c => c.name === "delivery_open").length === 3); }
+    await until(() => r.calls.filter(c => c.name === "delivery_open").length === 2, 1000);
+    if (transition === "enroll") { await r.controller.enroll("R"); await until(() => r.calls.filter(c => c.name === "delivery_open").length === 3, 1000); }
     else if (transition === "pause") await r.controller.pause();
     else if (transition.startsWith("session.")) await r.controller.observe(transition, { sessionID: "R" });
     r.bind("R", "final"); await r.after("R", "final");
     if (transition === "completion" || transition === "enroll") {
-      await until(() => r.controller.status().state === "active" && r.controller.status().message.includes("final"));
+      await until(() => r.controller.status().state === "active" && r.controller.status().message.includes("final"), 1000);
       expect(r.calls.filter(c => c.name === "delivery_open")).toHaveLength(transition === "enroll" ? 4 : 3);
       expect(r.calls.filter(c => c.name === "delivery_release")).toHaveLength(0);
       expect(r.rows.get("R")?.ownership).toBe(1);
@@ -972,9 +973,9 @@ test.each(["completion", "enroll", "pause", "session.archived", "session.deleted
 test("pause ends ownership, resume rebinds remembered name create:false; held name refuses once", async () => {
   const r = runtime();
   try {
-    r.bind("R", "be"); await r.controller.enroll("R"); await until(() => r.controller.status().state === "active");
+    r.bind("R", "be"); await r.controller.enroll("R"); await until(() => r.controller.status().state === "active", 1000);
     await r.controller.pause(); expect(r.rows.has("R")).toBe(false);
-    await r.controller.enroll("R"); await until(() => r.controller.status().state === "active");
+    await r.controller.enroll("R"); await until(() => r.controller.status().state === "active", 1000);
     expect(r.calls.find(c => c.name === "bind")?.args).toMatchObject({ name: "you@example.com/be", create: false });
     await r.controller.pause(); r.refuse(); await r.controller.enroll("R"); await Bun.sleep(20);
     expect(r.controller.status().message).toContain("approval saved");
@@ -993,7 +994,7 @@ test("restart skips ended roots, restores another root, and resumes a paused dur
     await r.controller.pause(); await r.controller.close();
     restarted = r.restart(); await restarted.restore();
     expect(restarted.status().state).toBe("paused");
-    await restarted.enroll("B"); await until(() => restarted!.status().roots.find(root => root.sessionID === "B")?.state === "active");
+    await restarted.enroll("B"); await until(() => restarted!.status().roots.find(root => root.sessionID === "B")?.state === "active", 1000);
     expect(restarted.status().roots.find(root => root.sessionID === ended)?.state).toBe("paused");
     expect(r.calls.filter(c => c.name === "bind").at(-1)?.args).toMatchObject({ name: "you@example.com/fe", create: false });
   } finally { await restarted?.close(); await r.controller.close(); }
@@ -1011,7 +1012,7 @@ test("saving an approval prunes the saved roots that restore dropped", async () 
     r.nodes.delete("R");
     restarted = r.restart(); await restarted.restore();
     expect(savedRoots(r.storage)).toEqual(["B", "R"]);
-    await restarted.enroll("B"); await until(() => restarted!.status().roots.find(root => root.sessionID === "B")?.state === "active");
+    await restarted.enroll("B"); await until(() => restarted!.status().roots.find(root => root.sessionID === "B")?.state === "active", 1000);
     expect(savedRoots(r.storage)).toEqual(["B"]);
   } finally { await restarted?.close(); await r.controller.close(); }
 });
@@ -1035,12 +1036,12 @@ test("a save drops only saved roots still ended, keeps edited and foreign ones, 
     r.nodes.set("R", back);
     const remove = r.ctx.storage.remove; let failed = 0;
     r.ctx.storage.remove = async key => { failed++; throw new Error(`remove ${key}`); };
-    await restarted.enroll("B"); await until(() => restarted!.status().roots.find(root => root.sessionID === "B")?.state === "active");
+    await restarted.enroll("B"); await until(() => restarted!.status().roots.find(root => root.sessionID === "B")?.state === "active", 1000);
     expect(failed).toBe(1); expect(r.storage.get("paused:B")).toBe(false);
     expect(savedRoots(r.storage)).toEqual(["B", "E", "O", "R", "X"]);
     r.ctx.storage.remove = remove;
     await restarted.close(); restarted = r.restart(); await restarted.restore();
-    await restarted.enroll("B"); await until(() => restarted!.status().roots.find(root => root.sessionID === "B")?.state === "active");
+    await restarted.enroll("B"); await until(() => restarted!.status().roots.find(root => root.sessionID === "B")?.state === "active", 1000);
     expect(savedRoots(r.storage)).toEqual(["B", "E", "O", "R"]);
   } finally { await restarted?.close(); await r.controller.close(); }
 });
@@ -1059,7 +1060,7 @@ test("one location's saves never drop another location's saved root (#660)", asy
     await r.controller.close(); await other.close();
     // R comes back from its saved approval, not only from its diagnostic record.
     restarted = r.restart(); await restarted.restore();
-    await until(() => restarted!.status().roots.find(root => root.sessionID === "B")?.state === "active");
+    await until(() => restarted!.status().roots.find(root => root.sessionID === "B")?.state === "active", 1000);
     expect(restarted.status().roots.find(root => root.sessionID === "R")).toMatchObject({ state: "paused", message: "Saved approval paused; explicitly enroll again" });
   } finally { await restarted?.close(); await other.close(); await r.controller.close(); }
 });
@@ -1074,7 +1075,7 @@ test("restore migrates the pre-#660 root index without re-enrollment", async () 
     await r.controller.close();
     r.storage.set("rootSessionIDs", ["R"]);
     restarted = r.restart(); await restarted.restore();
-    await until(() => ["R", "B"].every(id => restarted!.status().roots.find(root => root.sessionID === id)?.state === "active"));
+    await until(() => ["R", "B"].every(id => restarted!.status().roots.find(root => root.sessionID === id)?.state === "active"), 1000);
     expect(r.storage.has("rootSessionIDs")).toBe(false);
     expect(savedRoots(r.storage)).toEqual(["B", "R"]);
   } finally { await restarted?.close(); await r.controller.close(); }
@@ -1083,10 +1084,10 @@ test("ordinary native unbound result rebinds the durable name once with create:f
   const r = runtime();
   try {
     r.bind("R", "be"); await r.controller.enroll("R");
-    await until(() => r.controller.status().state === "active");
+    await until(() => r.controller.status().state === "active", 1000);
     r.rows.delete("R");
     await r.controller.after({ sessionID: "R", tool: "grayboard_whoami", id: "call", status: "completed", result: { output: { unbound: true, name: null, ownership: null } } });
-    await until(() => r.calls.filter(c => c.name === "delivery_open").length === 2);
+    await until(() => r.calls.filter(c => c.name === "delivery_open").length === 2, 1000);
     expect(r.calls.filter(c => c.name === "bind").map(c => c.args)).toEqual([{ name: "you@example.com/be", create: false, where: "/worktree" }]);
     await r.before("G");
     expect(r.calls.at(-1)?.args).toEqual({ child: "G", via: ["C"] });
@@ -1097,7 +1098,7 @@ test("pause during awaited admission suppresses receipt without pretending host 
   try {
     r.bind("R", "be"); r.batches.set("R", [{ id: "direct:1", actionable: true, event: {}, ownership: 1, bind_gen: 1, address: "you@example.com/be" }]);
     r.admission(() => new Promise(resolve => { unblock = resolve; }));
-    await r.controller.enroll("R"); await until(() => !!unblock);
+    await r.controller.enroll("R"); await until(() => !!unblock, 1000);
     const pausing = r.controller.pause(); await Bun.sleep(5); unblock(); await pausing;
     expect(r.admissions).toHaveLength(1);
     expect(r.calls.filter(c => c.name === "delivery_receipt")).toHaveLength(0);
@@ -1109,14 +1110,14 @@ test.each(["session.archived", "session.deleted", "credential.switched", "rebind
   try {
     r.bind("R", "be"); r.batches.set("R", [{ id: "direct:1", actionable: true, event: {}, ownership: 1, bind_gen: 1, address: "you@example.com/be" }]);
     r.admission(() => new Promise(resolve => { unblock = resolve; }));
-    await r.controller.enroll("R"); await until(() => !!unblock);
+    await r.controller.enroll("R"); await until(() => !!unblock, 1000);
     let ending: Promise<unknown> | undefined;
     if (mode === "credential.switched") ending = r.controller.observe(mode, { integrationID: "native-integration" });
     else if (mode === "rebind") ending = r.before("R", "grayboard_bind");
     else if (mode === "expiry") r.rows.delete("R");
     else { r.nodes.delete("R"); ending = r.controller.observe(mode, { sessionID: "R" }); }
     await Bun.sleep(5); unblock(); await ending;
-    if (mode === "expiry") await until(() => r.controller.status().state === "retrying");
+    if (mode === "expiry") await until(() => r.controller.status().state === "retrying", 1000);
     await Bun.sleep(10);
     expect(r.admissions.map(a => a.sessionID)).toEqual(["R"]);
     // An expired lease's receipt goes out and the server refuses it (#845: no renew precedes it); a guard
@@ -1130,7 +1131,7 @@ test("configuration away-and-back during host admission remains latched and send
   try {
     r.bind("R", "be"); r.batches.set("R", [{ id: "direct:1", actionable: true, event: {}, ownership: 1, bind_gen: 1, address: "you@example.com/be" }]);
     r.admission(() => new Promise(resolve => { unblock = resolve; }));
-    await r.controller.enroll("R"); await until(() => !!unblock);
+    await r.controller.enroll("R"); await until(() => !!unblock, 1000);
     r.f.config.url = "https://other.example.com/mcp"; r.f.reload();
     r.f.config.url = "https://grayboard.example.com/mcp"; r.f.reload();
     unblock(); await Bun.sleep(20);
@@ -1230,15 +1231,15 @@ test("startup creation is not remembered as permission to create on resume or re
   let restarted: Controller | undefined;
   try {
     await r.controller.observe("session.created", { sessionID: "R" });
-    await r.controller.enroll("R"); await until(() => r.controller.status().state === "active");
+    await r.controller.enroll("R"); await until(() => r.controller.status().state === "active", 1000);
     await r.controller.pause(); await r.controller.enroll("R");
-    await until(() => r.controller.status().state === "active");
+    await until(() => r.controller.status().state === "active", 1000);
     r.rows.delete("R");
     await r.controller.after({ sessionID: "R", tool: "grayboard_whoami", id: "call", status: "completed", result: { output: { unbound: true } } });
-    await until(() => r.controller.status().state === "active");
+    await until(() => r.controller.status().state === "active", 1000);
     await r.controller.close(); r.rows.delete("R");
     restarted = r.restart(); await restarted.restore();
-    await until(() => restarted!.status().state === "active");
+    await until(() => restarted!.status().state === "active", 1000);
     expect(r.calls.filter(c => c.name === "bind").map(c => c.args.create)).toEqual([true, false, false, false]);
   } finally { await restarted?.close(); await r.controller.close(); }
 });
@@ -1263,7 +1264,7 @@ test("issued stamp mismatch never admits or receipts", async () => {
   const r = runtime();
   try {
     r.bind("R", "be"); r.batches.set("R", [{ id: "direct:1", actionable: true, event: {}, ownership: 99, bind_gen: 1, address: "you@example.com/be" }]);
-    await r.controller.enroll("R"); await until(() => r.controller.status().state === "paused");
+    await r.controller.enroll("R"); await until(() => r.controller.status().state === "paused", 1000);
     expect(r.admissions).toHaveLength(0); expect(r.calls.filter(c => c.name === "delivery_receipt")).toHaveLength(0);
   } finally { await r.controller.close(); }
 });
@@ -1274,7 +1275,7 @@ test("lost receipt reopens and receipts without admitting the item again", async
   try {
     r.bind("R", "be"); r.rejectReceipt();
     r.batches.set("R", [{ id: "direct:1", actionable: false, event: {}, ownership: 1, bind_gen: 1, address: "you@example.com/be" }]);
-    await r.controller.enroll("R"); await until(() => r.calls.filter(c => c.name === "delivery_receipt").length === 2);
+    await r.controller.enroll("R"); await until(() => r.calls.filter(c => c.name === "delivery_receipt").length === 2, 1000);
     expect(r.admissions.map(a => a.sessionID)).toEqual(["R"]);
     expect(r.calls.filter(c => c.name === "delivery_receipt").map(c => c.args.ids)).toEqual([["direct:1"], ["direct:1"]]);
     expect(r.batches.get("R")).toEqual([]);

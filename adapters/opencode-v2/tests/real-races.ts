@@ -10,6 +10,7 @@ import type { startServer } from "../../../src/server/app.ts";
 import { OPENCODE_CLIENT } from "../../../src/server/oauth-config.ts";
 import { sessionContext } from "../../../src/server/hosted.ts";
 import { audits, hostedRow } from "./server-db.ts";
+import { until } from "./until.ts";
 
 type Input = NativeInput;
 export type AdmissionGate = {
@@ -17,10 +18,6 @@ export type AdmissionGate = {
   accepted: NativeAdmission[];
   models: string[]; entered(): void; released: Promise<void>;
 };
-async function until(read: () => boolean | Promise<boolean>, label: string) {
-  for (let n = 0; n < 240; n++) { if (await read()) return; await Bun.sleep(50); }
-  throw new Error("Real race wait expired: " + label);
-}
 export async function realRace(f: {
   scenario: string; gate: AdmissionGate; host: FixtureHost;
   ctx: Context; app: ReturnType<typeof startServer>; location: { directory: string };
@@ -35,7 +32,7 @@ export async function realRace(f: {
     await host.session.switchModel({ sessionID: s.id, model: { providerID: "fixture", id: "fixture" } }); return s.id;
   };
   const root = await create("Real race root"), other = await create("Untouched root"), child = await create("Untouched child", root);
-  await f.enroll(root, "race"); await until(() => app.mcp.activeLeases === 1, "approved lease");
+  await f.enroll(root, "race"); await until(() => app.mcp.activeLeases === 1, 12_000, "approved lease");
   if (scenario === "outage") {
     const owner = () => app.db.prepare("SELECT ownership_id FROM hosted_sessions WHERE source_session_id = ?").get(root) as { ownership_id: number } | null;
     const old = owner()!.ownership_id; f.outage(true);
@@ -43,7 +40,7 @@ export async function realRace(f: {
     await Bun.sleep(31_000); await app.mcp.sessions.sweep();
     assert.equal(owner(), null); assert.equal(await app.repo.cursors.directFor(app.repo.read, "you@example.com/race"), 0); assert.equal(g.inputs.length, 0);
     f.outage(false);
-    await until(async () => (await app.repo.cursors.directFor(app.repo.read, "you@example.com/race")) === message.id, "automatic rightful ownership after actual expired outage");
+    await until(async () => (await app.repo.cursors.directFor(app.repo.read, "you@example.com/race")) === message.id, 12_000, "automatic rightful ownership after actual expired outage");
     assert.notEqual(owner()!.ownership_id, old); assert.equal(g.inputs.length, 1); assert.equal(g.inputs[0]!.sessionID, root);
     await host.session.wait({ sessionID: root }); assert(g.models.includes(root)); assert(!g.models.includes(other)); assert(!g.models.includes(child));
     console.log("REAL_NETWORK_OUTAGE_RECOVERY_OK", { oldOwnership: old, recoveredOwnership: owner()!.ownership_id, cursor: message.id }); return;
@@ -101,7 +98,7 @@ export async function realRace(f: {
       }
       default: throw new Error("Unknown real race " + scenario);
     }
-    if (["account", "account-away-back", "config", "away-back"].includes(scenario)) await until(async () => (await f.status()).state === "paused", "observed drift before releasing original write");
+    if (["account", "account-away-back", "config", "away-back"].includes(scenario)) await until(async () => (await f.status()).state === "paused", 12_000, "observed drift before releasing original write");
     g.holding = false; release(); await transition;
     if (scenario === "expiry") await bounded(f.expiryContinuation.failed.promise, 12_000, "Real forwarding returned and its failed post-admission transport completion is held before retry");
     else await bounded(retiredSubscriber, 12_000, "Original issued subscriber generation must finish, including its post-admission continuation");
@@ -111,7 +108,7 @@ export async function realRace(f: {
     if (scenario === "enrollment") assert(g.inputs.every(i => i.id === original.id), "Only the original message is admitted again, never a distinct one"); else assert.equal(g.inputs.length, 1, "No subsequent admission after original subscriber completion");
     if (scenario === "enrollment") {
       // The replayed item is acknowledged once by the new lease; the original lease never receipts.
-      await until(async () => (await app.repo.cursors.directFor(app.repo.read, "you@example.com/race")) === message.id, "replayed original acknowledged under the new lease");
+      await until(async () => (await app.repo.cursors.directFor(app.repo.read, "you@example.com/race")) === message.id, 12_000, "replayed original acknowledged under the new lease");
       assert.equal(f.receipts(), beforeReceipts + 1, "Exactly one receipt, from the replay");
     } else {
       // A server-side end the client can't see (a rebind, a revoke) surfaces at the receipt, which the server refuses (#845).
@@ -138,7 +135,7 @@ export async function realRace(f: {
       // hosted.stale_capability, naming the session and never the capability (#226 §7, #383).
       const session = hostedRow(app.db, root)!.session_id;
       const rebound = audits(app.db, "hosted.lease_closed").find(r => r.target === session && r.detail.reason === "rebound"); assert(rebound, "The out-of-band rebind closed the old lease");
-      await until(() => audits(app.db, "hosted.stale_capability").length > 0, "late old-capability call audited");
+      await until(() => audits(app.db, "hosted.stale_capability").length > 0, 12_000, "late old-capability call audited");
       for (const r of audits(app.db, "hosted.stale_capability")) assert.deepEqual(r, { id: r.id, actor: "you@example.com", target: session, detail: { client_id: OPENCODE_CLIENT } });
       assert(audits(app.db, "hosted.stale_capability")[0]!.id > rebound.id, "Refused only after the rebind closed the lease");
     }
