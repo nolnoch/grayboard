@@ -31,7 +31,7 @@ The server gets its own async core on Postgres under `src/server/store/`. `src/c
 ### D2. Transactions are explicit values
 
 - `type Read` is a statement handle (the pool, or a transaction); `type Tx extends Read` adds `afterCommit(fn)` and `savepoint(fn)`. Every store function that writes takes a `Tx`; one that only reads takes a `Read`. No module holds an ambient pool it can query behind a caller's transaction: a stray pool query inside a transaction runs outside it, and at pool exhaustion it deadlocks against the transaction holding the last connection.
-- `atomic(fn)` opens a transaction and passes the `Tx`. A nested `atomic` inside one is a type error; nesting goes through `tx.savepoint`.
+- `write(fn)` opens a transaction through the write queue and passes the `Tx`. Inside one, `write` refuses; nesting goes through `tx.savepoint`, whose body writes on the savepoint's own Tx (`Repo.atomic` is gone, #807 P3 A1).
 - `afterCommit` callbacks live on the `Tx` and run in registration order after `COMMIT` resolves, never on rollback, and the synchronous part of each runs before the write queue (D4) is released. So the next queued transaction sees every in-memory effect of the last, as it does today when effects flush before anything else runs. This replaces the `db.transaction` monkey-patch.
 - `Access` (the authorization seam) becomes async and takes the caller's `Read`, so a policy read inside a transaction sees that transaction. This lands with the core's server-side ports (P3): until then the server still calls the synchronous `src/core/`, whose statements call `Access` synchronously.
 
