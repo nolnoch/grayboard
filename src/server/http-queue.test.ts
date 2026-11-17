@@ -15,6 +15,7 @@ import { DEFAULT_TRUSTED_PROXIES } from "./client_addr.ts";
 import { until } from "../../tests/support/until.ts";
 import { seed } from "../../tests/support/seed.ts";
 import { registerId } from "../core/boards.ts";
+import { runRetention } from "./retention.ts";
 
 const cleanups: (() => unknown)[] = [];
 afterEach(async () => { for (const c of cleanups.splice(0).reverse()) await c(); });
@@ -148,6 +149,40 @@ test("#807 P1c-15c-1: claim, identity and team routes reach core on their body's
     // Each in-body route reached core at least once, so the last check isn't vacuous for it.
     expect(inBody.filter(r => !checks.some(c => c.route === r && c.handle === "tx"))).toEqual([]);
     expect(checks.some(c => c.route === "claim list" && c.handle === "pool")).toBe(true);
+    expect(checks.filter(c => c.inTxn !== (c.handle === "tx"))).toEqual([]);
+  } finally { spy.mockRestore(); }
+});
+
+// #807 P1c-15c-2: the attachment routes and retention reach core's helpers through `repo.coreOn(handle)`: a write
+// body's `Tx` inside it (core's store and release transactions through `queuedTx`, the guarded download's recheck,
+// retention's prunes), the pool outside (the download's first access check, the blob sweep).
+test("#807 P1c-15c-2: attachment routes and retention reach core on their body's Tx, the pool outside one", async () => {
+  const srv = new TestServer();
+  cleanups.push(() => srv.stop());
+  const { repo, db } = srv.app;
+  const you = await srv.login("you@example.com");
+  expect((await srv.api(you, "POST", "/api/identities", { name: "agent" })).status).toBe(201);
+  const checks: { route: string; inTxn: boolean; handle: "pool" | "tx" }[] = [];
+  let route = "";
+  const original = repo.coreOn.bind(repo);
+  const spy = spyOn(repo, "coreOn").mockImplementation(((h: Parameters<typeof original>[0]) => {
+    checks.push({ route, inTxn: db.inTransaction, handle: h === repo.read ? "pool" : "tx" });
+    return original(h);
+  }) as never);
+  try {
+    route = "upload";
+    const up = await srv.uploadAs(you, "agent", "a.txt", "hello");
+    expect(up.status).toBe(201);
+    route = "download";
+    // A guard makes the download recheck access inside its write body, on that body's Tx.
+    expect((await srv.downloadAs(you, "agent", up.body.id as number, () => {})).status).toBe(200);
+    route = "release";
+    expect((await srv.releaseAs(you, "agent", up.body.id as number)).status).toBe(200);
+    route = "retention";
+    await runRetention(repo, { ...srv.config, messageRetentionDays: 1, auditRetentionDays: 1 }, Date.now() + 30 * 86_400_000);
+    const want = { upload: ["tx"], download: ["pool", "tx"], release: ["pool", "tx"], retention: ["pool", "tx"] } as Record<string, string[]>;
+    // Each route reached core on each handle it should, so the last check isn't vacuous for it.
+    expect(Object.entries(want).flatMap(([r, hs]) => hs.filter(h => !checks.some(c => c.route === r && c.handle === h)).map(h => `${r}:${h}`))).toEqual([]);
     expect(checks.filter(c => c.inTxn !== (c.handle === "tx"))).toEqual([]);
   } finally { spy.mockRestore(); }
 });

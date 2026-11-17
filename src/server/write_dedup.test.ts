@@ -175,7 +175,7 @@ describe("dedupWrite", () => {
     const now = Date.now();
     await dedup(now - WRITE_DEDUP_WINDOW_MS - 1, call({ session: "gone" }), send());
     await dedup(now, call(), send("kept"));
-    await runRetention(repo, db, { messageRetentionDays: 30, auditRetentionDays: 90 } as Config, now);
+    await runRetention(repo, { messageRetentionDays: 30, auditRetentionDays: 90 } as Config, now);
     expect(db.prepare("SELECT session FROM write_receipts").all()).toEqual([{ session: "s1" }]);
   });
 

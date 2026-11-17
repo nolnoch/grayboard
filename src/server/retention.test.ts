@@ -70,12 +70,12 @@ describe("retention pruning", () => {
       db.run("UPDATE messages SET created_at = 0 WHERE id = ?", [old.id]);
       return kept;
     });
-    await runRetention(r, db, config);
+    await runRetention(r, config);
     expect(db.query("SELECT message_id FROM attachments").all()).toEqual([{ message_id: kept.id }]);
     expect(r.messages.thread(r.read, kept.id)[0].attachments).toHaveLength(1);
     expect(db.query("SELECT COUNT(*) AS n FROM attachment_blobs").get()).toEqual({ n: 1 });
     expect(readdirSync(blobDir).filter((d) => d !== "tmp")).toHaveLength(1);
-    await runRetention(r, db, config, Date.now() + 2 * 86_400_000);
+    await runRetention(r, config, Date.now() + 2 * 86_400_000);
     expect(db.query("SELECT COUNT(*) AS n FROM attachment_blobs").get()).toEqual({ n: 0 });
     expect(readdirSync(join(blobDir, readdirSync(blobDir).find((d) => d !== "tmp")!))).toEqual([]);
   });
@@ -98,14 +98,14 @@ describe("retention pruning", () => {
       if (seen.length === 1) throw new Error("sync hint failure");
       return Promise.reject(new Error("async hint failure"));
     };
-    await runRetention(r, db, config, Date.now(), callback);
-    await runRetention(r, db, config, Date.now(), callback);
+    await runRetention(r, config, Date.now(), callback);
+    await runRetention(r, config, Date.now(), callback);
     expect(seen).toEqual([["e2e"]]);
     await seed(r, () => {
       post(db, "a@example.com/be", "e2e", "old again");
       db.run("UPDATE posts SET created_at = 0");
     });
-    await runRetention(r, db, config, Date.now(), callback);
+    await runRetention(r, config, Date.now(), callback);
     expect(seen).toEqual([["e2e"], ["e2e"]]);
     expect(snapshots).toEqual([[], []]);
   });
@@ -156,7 +156,7 @@ describe("reclaiming free pages", () => {
     const lines: string[] = [];
     const real = console.error;
     console.error = (...a: unknown[]) => { lines.push(a.map(String).join(" ")); };
-    try { await runRetention(repo, db, { messageRetentionDays: 90, auditRetentionDays: 90 } as Config); } finally { console.error = real; }
+    try { await runRetention(repo, { messageRetentionDays: 90, auditRetentionDays: 90 } as Config); } finally { console.error = real; }
     expect(freeCount(db)).toBe(0);
     expect(lines).toContain(`[grayboard] retention: reclaimed ${before} free database pages (0 left)`);
     db.close();

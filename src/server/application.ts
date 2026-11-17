@@ -408,7 +408,7 @@ function sessionActor(session: ApplicationSession, address?: string): Actor {
   return { user: session.authed.user_email, address, session: session.sessionId || undefined };
 }
 
-export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptions = {}) {
+export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
   const now = opts.now ?? Date.now;
   // A bind spends the hello bucket inside its caller's transaction (hosted's `owning`, #467): while it does, this
   // is the session's `afterRollback`, and a streak's audit row, written there where a commit keeps it, is handed
@@ -509,7 +509,8 @@ export function createApplication(repo: Repo, db: CoreDb, opts: ApplicationOptio
   // Announces claims that lapse on their boards.
   // Armed from requests, it fires for every holder: detached, so its rows
   // don't carry the arming request's address (security audit F-19).
-  const expiryTimer = claimExpiryTimer(db, handles => wake(hub, expiryCommit, handles), boards => boardsChanged(expiryCommit, boards), queuedTx(repo));
+  // The sweep writes on its queued body's connection; `arm` runs after commits and outside bodies, on the pool.
+  const expiryTimer = claimExpiryTimer(repo.coreOn(repo.read), handles => wake(hub, expiryCommit, handles), boards => boardsChanged(expiryCommit, boards), queuedTx(repo));
   const expiry = { arm: () => detached(() => expiryTimer.arm()), stop: () => expiryTimer.stop() };
   // The session leaves the hub's registry: superseded, revoked or closed.
   function detach(session: ApplicationSession): void {

@@ -14,7 +14,7 @@ import { isLoopbackIp } from "./client_addr.ts";
 import { DEFAULT_LAG_GATE, lagSampler, lagVerdict, lagWindows, type LagGate, type LagSampler, type LagWindow } from "./metrics.ts";
 import { authorize, recordDecision, type AuthzRequest } from "./policy.ts";
 import { HUMAN_NAME, HUMAN_RESERVED, isValidEmail, isValidIdentityName } from "../shared/addressing.ts";
-import { forgetHandle, getBoard, type CoreDb } from "../core/boards.ts";
+import { forgetHandle, getBoard } from "../core/boards.ts";
 import { addressParts } from "../core/addresses.ts";
 import { BlobMissing, CoreError, TooLargeError } from "../core/errors.ts";
 import { transferTimeoutMs } from "../shared/http.ts";
@@ -305,7 +305,7 @@ function queryAs(url: URL, authed: AuthedUser, repo: Repo): string | Response {
 // runs the same checks on what arrives (checkFile, the size caps) plus the
 // user's quota of unsent bytes, and stores it unbound, for a dm_send or
 // board_post by that identity to carry.
-export async function attachmentUpload(req: Request, url: URL, authed: AuthedUser, repo: Repo, db: CoreDb, uploads: UploadGate, guard?: () => void, signal = req.signal): Promise<Response> {
+export async function attachmentUpload(req: Request, url: URL, authed: AuthedUser, repo: Repo, uploads: UploadGate, guard?: () => void, signal = req.signal): Promise<Response> {
   const handle = queryAs(url, authed, repo);
   if (handle instanceof Response) return handle;
   const rawName = url.searchParams.get("filename");
@@ -329,9 +329,9 @@ export async function attachmentUpload(req: Request, url: URL, authed: AuthedUse
     guard?.();
     if (guard && data.length !== Number(declared)) return refuse("bad_request", "the body is shorter than its Content-Length", 400);
     new SizeTally(repo.attachmentLimits, 1).add(label, data.length);
-    const row = await storeUpload(repo, db, authed.user_email, handle, checkFile(label, rawName, data), {}, guard);
+    const row = await storeUpload(repo, authed.user_email, handle, checkFile(label, rawName, data), {}, guard);
     try { guard?.(); } catch (error) {
-      await releaseStored(repo, db, authed.user_email, handle, row.id);
+      await releaseStored(repo, authed.user_email, handle, row.id);
       throw error;
     }
     return json({ id: row.id, filename: row.filename, type: row.type, size: row.size, sha256: row.sha256 }, 201);
@@ -352,10 +352,10 @@ export async function attachmentUpload(req: Request, url: URL, authed: AuthedUse
 
 // A download (`<id>?as=`), for the hosted byte route's GET: the file, for an identity that can
 // read the message or post carrying it. One it can't reads as missing.
-export async function attachmentDownload(idStr: string, url: URL, authed: AuthedUser, repo: Repo, db: CoreDb, guard?: () => void): Promise<Response> {
+export async function attachmentDownload(idStr: string, url: URL, authed: AuthedUser, repo: Repo, guard?: () => void): Promise<Response> {
   const handle = queryAs(url, authed, repo);
   if (handle instanceof Response) return handle;
-  const read = requestAttachment(repo, repo.read, db, handle, idStr, authed.user_email, { user: authed.user_email, address: handle });
+  const read = requestAttachment(repo, repo.read, handle, idStr, authed.user_email, { user: authed.user_email, address: handle });
   if ("refused" in read) return jsonErr("not_found", read.refused, 404);
   const { row } = read;
   // Audited once the bytes are in hand, so a failed read isn't logged as a download.
@@ -372,7 +372,7 @@ export async function attachmentDownload(idStr: string, url: URL, authed: Authed
   guard?.();
   if (guard) {
     // A refusal here is a decision too (#851); the transaction returns, so its rows commit.
-    const current = requestAttachment(repo, tx, db, handle, String(row.id), authed.user_email, { user: authed.user_email, address: handle });
+    const current = requestAttachment(repo, tx, handle, String(row.id), authed.user_email, { user: authed.user_email, address: handle });
     if ("refused" in current || current.row.sha256 !== row.sha256) return notFound();
   }
   writeAudit(repo, "attachment.downloaded", authed.user_email, `attachment:${row.id}`, { identity: handle, sha256: row.sha256 });
@@ -390,11 +390,11 @@ export async function attachmentDownload(idStr: string, url: URL, authed: Authed
 
 // A release (`<id>?as=`), for the hosted byte route's DELETE: drops an upload of that identity's
 // that no message or post carries, when the send it was for failed.
-export async function attachmentRelease(idStr: string, url: URL, authed: AuthedUser, repo: Repo, db: CoreDb, guard?: () => void): Promise<Response> {
+export async function attachmentRelease(idStr: string, url: URL, authed: AuthedUser, repo: Repo, guard?: () => void): Promise<Response> {
   const handle = queryAs(url, authed, repo);
   if (handle instanceof Response) return handle;
   guard?.();
-  const row = /^\d{1,15}$/.test(idStr) ? await releaseStored(repo, db, authed.user_email, handle, Number(idStr), {}, guard) : null;
+  const row = /^\d{1,15}$/.test(idStr) ? await releaseStored(repo, authed.user_email, handle, Number(idStr), {}, guard) : null;
   guard?.();
   if (!row) return jsonErr("not_found", `no unsent upload ${idStr.slice(0, 32)} of yours`, 404);
   return json({ ok: true });

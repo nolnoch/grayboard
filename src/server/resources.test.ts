@@ -47,7 +47,7 @@ async function call<T = unknown>(session: ApplicationSession, tool: string, args
 beforeEach(async () => {
   dir = mkdtempSync(join(tmpdir(), "gb-resources-"));
   store = openDatabase(scratchDbPath(), { blobDir: dir });
-  application = createApplication(store.repo, store.db);
+  application = createApplication(store.repo);
   revoked = new Set();
   resources = createResources(application, { isAuthorized: s => !revoked.has(s) });
   const user = async (email: string): Promise<AuthedUser> => {
@@ -365,11 +365,11 @@ test("retention hints only actual committed post deletions and snapshot reads le
   });
   const before = state();
   const config = { messageRetentionDays: 1, auditRetentionDays: 1 } as Config;
-  await runRetention(store.repo, store.db, config, Date.now(), application.boardsChanged);
+  await runRetention(store.repo, config, Date.now(), application.boardsChanged);
   expect(h.counts.changed).toBe(1);
   expect((await resources.read(store.repo.read, b, uri)).posts.map(p => p.body)).toEqual(["kept"]);
   expect(state()).toEqual(before);
-  await runRetention(store.repo, store.db, config, Date.now(), application.boardsChanged);
+  await runRetention(store.repo, config, Date.now(), application.boardsChanged);
   expect(h.counts.changed).toBe(1);
 });
 
@@ -531,7 +531,7 @@ test("per-session watch capacity counts only that session's watches and frees on
 test("configured watch caps admit past the defaults and refuse at the configured size", async () => {
   resources.close();
   application.stopExpiry();
-  application = createApplication(store.repo, store.db, { observerCap: 1100 });
+  application = createApplication(store.repo, { observerCap: 1100 });
   resources = createResources(application, { isAuthorized: () => true, caps: { global: 1100, perSession: 1100 } });
   const a = await select(alice);
   await call(a, "board_create", { name: "wide", purpose: "capacity" });

@@ -18,7 +18,7 @@ test("guarded upload cleanup errors propagate instead of returning the refusal",
   try {
     db.exec("CREATE TRIGGER fail_release BEFORE DELETE ON attachments BEGIN SELECT RAISE(ABORT, 'cleanup failed'); END");
     let checks = 0;
-    await expect(storeUpload(repo, db, "alice@example.com", "alice@example.com/be", checkFile("file report.txt", "report.txt", new TextEncoder().encode("file")), {}, () => { if (++checks > 1) throw refusal; })).rejects.toThrow("cleanup failed");
+    await expect(storeUpload(repo, "alice@example.com", "alice@example.com/be", checkFile("file report.txt", "report.txt", new TextEncoder().encode("file")), {}, () => { if (++checks > 1) throw refusal; })).rejects.toThrow("cleanup failed");
     expect((db.query("SELECT COUNT(*) AS n FROM attachments").get() as { n: number }).n).toBe(1);
   } finally { db.close(); rmSync(blobDir, { recursive: true, force: true }); }
 });

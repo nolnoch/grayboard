@@ -607,7 +607,7 @@ test("a bridge that fails at boot records its death for its linked users, via th
   // notify loop must run over the durable links, whose map is not empty.
   const { SlackBridge } = await import("../../src/server/slack.ts");
   const boot = new SlackBridge({
-    repo: srv.app.repo, db: srv.app.db, application: srv.app.application,
+    repo: srv.app.repo, application: srv.app.application,
     appToken: "xapp-1-t", botToken: "xoxb-t", apiUrl: "http://127.0.0.1:1/api/",
   });
   await boot.start().catch((e) => boot.stop({ fatal: true, detail: `not started: ${(e as Error).message}` }));
@@ -713,7 +713,7 @@ test("a second fatal within the dedup window records the death but doesn't re-no
   // the notice doesn't repeat.
   const { SlackBridge } = await import("../../src/server/slack.ts");
   const second = new SlackBridge({
-    repo: srv.app.repo, db: srv.app.db, application: srv.app.application,
+    repo: srv.app.repo, application: srv.app.application,
     appToken: "xapp-1-t", botToken: "xoxb-t", apiUrl: slack.api,
   });
   await second.start();

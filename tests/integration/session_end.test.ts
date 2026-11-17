@@ -132,10 +132,10 @@ test("retention prunes ended sessions, never a live one, and leaves no tombstone
   const db = srv.app.db;
   const tombstones = () => db.prepare(`SELECT id, ended_at, pruned_at FROM pruned_ids`).all();
   // Inside the window nothing goes.
-  await runRetention(srv.app.repo, db, srv.config, clock + 1);
+  await runRetention(srv.app.repo, srv.config, clock + 1);
   expect(row(first.id)).not.toBeNull();
   const later = clock + (srv.config.messageRetentionDays + 1) * 86_400_000;
-  await runRetention(srv.app.repo, db, srv.config, later);
+  await runRetention(srv.app.repo, srv.config, later);
   expect([row(first.id), row(second.id)]).toEqual([null, null]);
   // A live session is never pruned, however old.
   expect(row(live.id)).toEqual({ ended_at: null, held_aliases_json: null });

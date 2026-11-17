@@ -34,7 +34,7 @@ const clients: Client[] = [];
 beforeEach(async () => {
   blobDir = mkdtempSync(join(tmpdir(), "gb-mcp-"));
   store = openDatabase(scratchDbPath(), { blobDir });
-  application = createApplication(store.repo, store.db, { helloLimit: { burst: 10000, perSec: 10000 }, hostedRequestLimit: { burst: 10000, perSec: 10000 }, hostedSubscriberLimit: { burst: 10000, perSec: 10000 } });
+  application = createApplication(store.repo, { helloLimit: { burst: 10000, perSec: 10000 }, hostedRequestLimit: { burst: 10000, perSec: 10000 }, hostedSubscriberLimit: { burst: 10000, perSec: 10000 } });
   oauth = createOAuthServer(store.repo, { dbPath: scratchDbPath(), blobDir, httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl: "https://grayboard.example.com:443", messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES });
   hosted = createHostedMcp(application, oauth, { trustedOrigin: "https://grayboard.example.com:443" });
   const issued = await issuedOAuth(store.repo, oauth.resource);
@@ -1444,7 +1444,7 @@ test("#899: another connection's commit reaches a stamped listen within a tick",
   await hosted.close(); oauth.close(); application.stopExpiry(); store.db.close();
   const path = join(blobDir, "gb.db");
   store = openDatabase(path, { blobDir });
-  application = createApplication(store.repo, store.db, { helloLimit: { burst: 10000, perSec: 10000 }, hostedRequestLimit: { burst: 10000, perSec: 10000 }, hostedSubscriberLimit: { burst: 10000, perSec: 10000 } });
+  application = createApplication(store.repo, { helloLimit: { burst: 10000, perSec: 10000 }, hostedRequestLimit: { burst: 10000, perSec: 10000 }, hostedSubscriberLimit: { burst: 10000, perSec: 10000 } });
   oauth = createOAuthServer(store.repo, { dbPath: path, blobDir, httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl: "https://grayboard.example.com:443", messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES });
   hosted = createHostedMcp(application, oauth, { trustedOrigin: "https://grayboard.example.com:443" });
   const issued = await issuedOAuth(store.repo, oauth.resource);
