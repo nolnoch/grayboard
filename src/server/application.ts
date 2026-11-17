@@ -13,7 +13,7 @@ import { ALIAS_SCOPE_CAP, aliasCapRefusal } from "./alias_cap.ts";
 import { DELEGATE_LIMIT, DELEGATE_OPEN_CAP, addressUser, crossUserRefusal, delegateOkFields, delegateThrottled, neverConnected, resolveDelegation, type DelegateReach } from "../core/delegation.ts";
 import {
   MAX_CANDIDATES, MAX_HOLDS, actingAs, aliasHeldText, boardActor, childStateRefusal, closestNames, dropHold, holdAlias, holdsOf,
-  logBinding, orderCandidates, primaryOf, replyPeer, replyPeerError, replySender, replySenderError, tooManyHolds, unboundPeer, unendedIds, unknownNameError,
+  logBinding, orderCandidates, primaryOf, replyPeer, replyPeerError, replySender, replySenderError, tooManyHolds, unboundPeer, unknownNameError,
   type AliasUse, type Candidate,
 } from "../core/bindings.ts";
 import { participant, queuedTx, type MessageRow, type Repo } from "./db.ts";
@@ -705,8 +705,9 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
   // End each at start, as the grace sweep would have: holds and claims
   // released, mail bounced. A hosted ID is the hosted store's to end.
   // The startup leftovers' ends (#807 P3 A1): the server's `ready` waits for them.
-  // The pool's synchronous check first, so a start with no leftovers writes nothing; the ends' write reads them again.
-  const ready = !unendedIds(repo.coreOn(repo.read)).length ? Promise.resolve() : endIds(async (tx) => {
+  // The write is enqueued at construction, ahead of any other startup write, and reads the leftovers on its own Tx
+  // (#807 P3 B1b): a start with none commits an empty transaction.
+  const ready = endIds(async (tx) => {
     const ids: string[] = [];
     for (const id of await repo.bindings.unendedIds(tx)) if (!(await repo.hosted.owned(tx, id))) ids.push(id);
     return ids;
@@ -737,12 +738,19 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
         }
         if (reason) revoked.push({ ...u, reason });
       }
-      return revokeAliases(tx, revoked, by);
+      const out = await revokeAliases(tx, revoked, by);
+      // The resynced holders' holds as the transaction commits (#807 P3 B1b): a beforeCommit read sees what a
+      // caller's body writes after this returns, as the after-commit read it replaces did.
+      const holds = new Map<string, string[]>();
+      if (out.resync.length) tx.beforeCommit({}, async root => {
+        for (const [id, held] of await repo.bindings.holdsOfMany(root, out.resync)) holds.set(id, held);
+      });
+      return { ...out, holds };
     };
-    const committed = ({ resync, ends }: Awaited<ReturnType<typeof revokeAliases>>) => {
+    const committed = ({ resync, ends, holds }: Awaited<ReturnType<typeof body>>) => {
       // #475 7c: a live holder (the Slack bridge's, an application session) stops acting as it now: its
       // address set and registry entries follow the database, as a bind or unbind's do.
-      for (const id of resync) for (const s of hub.sessions) if (!s.human && s.sessionId === id) setHolds(hub, s, holdsOf(repo.coreOn(repo.read), id));
+      for (const id of resync) for (const s of hub.sessions) if (!s.human && s.sessionId === id) setHolds(hub, s, holds.get(id) ?? []);
       afterEnds(ends.woken, ends.bounced);
     };
     if (isTx(h)) return body(h).then(value => { h.afterCommit(() => committed(value)); });
@@ -971,7 +979,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     // `suggested`: the name the session's checkout suggested (#443), offered first while free.
     hostedCandidates(r: Read, authed: AuthedUser, suggested: string | null): Promise<Candidate[]> { return candidates(hub, r, authed, suggested); },
     // The aliases a hosted root holds, oldest first: alias_holds is their only truth (#451).
-    hostedHolds(r: Read, id: string): string[] { return holdsOf(repo.coreOn(r), id); },
+    hostedHolds(r: Read, id: string): Promise<string[]> { return repo.bindings.holdsOf(r, id); },
     // `writesAs`: a tools-only root's alias; it holds nothing and binds nothing.
     // Otherwise the session holds `holds`, reads as them and its
     // ID, and writes as the oldest; none held reads and nothing else (readOnly). `row`: the hosted root's

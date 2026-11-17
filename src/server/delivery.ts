@@ -143,7 +143,7 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
     async open(p: DeliveryPrincipal, context: SessionContext, hooks: DeliveryHooks = {}, openOptions: DeliveryOpenOptions = {}): Promise<DeliveryLease> {
       let previous: Lease | undefined;
       return hosted.owning(p, context, async (row, _defer, tx) => {
-        const holds = application.hostedHolds(tx, row.session_id);
+        const holds = await application.hostedHolds(tx, row.session_id);
         if (!holds.length) throw new ApplicationError("unbound", "unbound; bind a name before opening delivery");
         await hosted.seeLost(tx, p, row);
         const reuse = () => {

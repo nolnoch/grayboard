@@ -1009,6 +1009,25 @@ test("ending a tools-only hosted root frees its alias for other users and restor
   expect(aliasUser(database.db, "you@example.com/fe")).toBe(id);
 });
 
+// #807 P3 B1b: mcp.ts bindingLive judges whether a root holds a name from its stamp, read with its generation, so
+// every change to a hosted root's holds must move bind_gen (or end the row). Bind and unbind here; the revoke and the
+// contender's end are pinned by the tests below and above ("revoking one hosted hold", "a hosted contender").
+test("#807 P3 B1b: each hosted bind or unbind that changes a root's holds moves its generation; a no-op bind doesn't", async () => {
+  const gen = async () => (await database.repo.hosted.get(database.repo.read, (context("root") as { id: string }).id))!.bind_gen;
+  await hosted.bind(principal, context("root"), { name: "fe", create: true });
+  const g0 = await gen();
+  await hosted.bind(principal, context("root"), { name: "be", create: true });
+  const g1 = await gen();
+  expect(g1).toBeGreaterThan(g0);
+  await hosted.bind(principal, context("root"), { name: "be" });
+  expect(await gen()).toBe(g1);
+  await hosted.unbind(principal, context("root"), { name: "be" });
+  const g2 = await gen();
+  expect(g2).toBeGreaterThan(g1);
+  await hosted.unbind(principal, context("root"), { name: "fe" });
+  expect(await gen()).toBeGreaterThan(g2);
+});
+
 test("revoking one hosted hold releases only it, bumps the generation and closes the lease; the next whoami shows what is left (#451)", async () => {
   const team = await seed(database.repo, async (tx) => {
     const t = await database.repo.teams.create(tx, "ops", principal.authed.user_id);

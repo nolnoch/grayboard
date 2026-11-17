@@ -369,8 +369,9 @@ export function createHostedSessions(application: Application, options: { now?: 
     await audit(tx, root.session_id, "hosted.child_unparked", { child: row.session_id, ownership: row.ownership_id, parked_ms: t - row.parked_at! }, p);
     return { ...row, parked_at: null, grant_id: root.grant_id, last_seen_at: t };
   }
-  // Whether the root holds a name or writes as one; a root with neither reads and nothing else.
-  const named = (root: HostedSession, held = application.hostedHolds(repo.read, root.session_id)) => held.length > 0 || root.writes_as !== null;
+  // Whether the root holds a name or writes as one; a root with neither reads and nothing else. `held`: its holds, read
+  // by the caller (#807 P3 B1b).
+  const named = (root: HostedSession, held: string[]) => held.length > 0 || root.writes_as !== null;
   // A root that holds a name has a holder session, rebuilt when its ownership or generation changes. `changed`:
   // the one row a commit changed (#399), with `facts` read on its committing transaction just before COMMIT
   // (#807 P3 A7g1, readHolder); null (startup, the backstop timer, a grant or user change) checks every root, in a
@@ -401,7 +402,7 @@ export function createHostedSessions(application: Application, options: { now?: 
   // no build, so a renew reads only the row and its holds. `build` null: the row's user is gone.
   async function readHolder(tx: Tx, id: string): Promise<HolderFacts> {
     const row = await store.get(tx, id);
-    const held = row && !row.root_session_id && row.parked_at === null ? application.hostedHolds(tx, id) : [];
+    const held = row && !row.root_session_id && row.parked_at === null ? await application.hostedHolds(tx, id) : [];
     if (!row || !held.length || matches(row, holders.get(id))) return { row, held };
     const user = await repo.users.findById(tx, row.user_id);
     if (!user) return { row, held, build: null };
@@ -538,7 +539,7 @@ export function createHostedSessions(application: Application, options: { now?: 
       const t = now();
       if (root.user_id !== authed && await repo.users.isDisabled(tx, root.user_id)) { await store.end(tx, root.session_id, "disabled", t); ended = true; }
       else if (root.lease_deadline !== null && root.lease_deadline <= t) { await store.end(tx, root.session_id, "expired", t, root.lease_deadline); ended = true; }
-      else if (root.lease_deadline === null && idleAt(root) && !application.hostedHolds(tx, root.session_id).length) { await store.end(tx, root.session_id, "idle", t); ended = true; }
+      else if (root.lease_deadline === null && idleAt(root) && !(await application.hostedHolds(tx, root.session_id)).length) { await store.end(tx, root.session_id, "idle", t); ended = true; }
     }
     // A root's end may have ended this child with it.
     const child = !row.root_session_id ? undefined : ended ? await store.get(tx, row.session_id) : row;
@@ -725,11 +726,16 @@ export function createHostedSessions(application: Application, options: { now?: 
   }
   // `held`: the root's holds, when the caller read them for this row with no await since (#902).
   // `known`: row's root, when the caller just read it.
+  // The stamp keeps whether the root held a name (#807 P3 B1b), read after the root: mcp.ts's `bindingLive` judges it
+  // with the generation instead of reading the holds synchronously. Sound because every change to a hosted root's
+  // holds moves its bind_gen or ends its row, so a stamp whose generation still matches still has the holds it read;
+  // holds newer than the root read can only come with a newer generation, which refuses.
   async function snapshot(p: OAuthPrincipal, row?: HostedSession, held?: string[], known?: HostedSession) {
     const root = row ? known ?? await rootOf(repo.read, row) : undefined;
+    const holds = root ? held ?? await application.hostedHolds(repo.read, root.session_id) : [];
     // A child acts under its root's addresses, and its writes carry its own ID as `via` (#523).
     const childOf = row && root && row.session_id !== root.session_id ? root.session_id : null;
-    return { ...await application.hostedSession(repo.read, p.authed, row?.session_id ?? "no-context", root ? held ?? application.hostedHolds(repo.read, root.session_id) : [], root?.writes_as ?? null, root ?? null, quietSink, false, childOf), stamp: root ? { ownership: root.ownership_id, generation: root.bind_gen } : undefined };
+    return { ...await application.hostedSession(repo.read, p.authed, row?.session_id ?? "no-context", holds, root?.writes_as ?? null, root ?? null, quietSink, false, childOf), stamp: root ? { ownership: root.ownership_id, generation: root.bind_gen, holding: holds.length > 0 } : undefined };
   }
   // The rows are read after the token check's await. On the pool a commit can land between the two reads (#807 P3
   // A7h1); each is compared to what the caller selected, so a mixed read can only refuse.
@@ -755,8 +761,8 @@ export function createHostedSessions(application: Application, options: { now?: 
     });
   }
   // The agent's notice for lost holds, said as the plugin says its alias_lost frame.
-  function lostNotice(p: OAuthPrincipal, row: HostedSession, lost: HostedLost[]): string {
-    const short = shortOf(p.authed.user_email), primary = application.hostedHolds(repo.read, row.session_id)[0];
+  async function lostNotice(p: OAuthPrincipal, row: HostedSession, lost: HostedLost[]): Promise<string> {
+    const short = shortOf(p.authed.user_email), primary = (await application.hostedHolds(repo.read, row.session_id))[0];
     return aliasLostNotice(lost.map(l => ({ alias: short(l.alias), reason: l.reason })), primary === undefined ? null : short(primary), lost.some(l => l.primary), LOST_ALL);
   }
   const service = {
@@ -778,7 +784,6 @@ export function createHostedSessions(application: Application, options: { now?: 
     readRow: (id: string) => store.get(repo.read, id),
     readRoot: (row: HostedSession) => rootOf(repo.read, row),
     rootOnly,
-    named,
     audit,
     auditAs,
     // Inside delivery_open's transaction (#453): the lost holds root `row`'s Controller was reported, taken. Its
@@ -810,9 +815,9 @@ export function createHostedSessions(application: Application, options: { now?: 
     async run<T>(p: OAuthPrincipal, context: SessionContext, tool: string, fn: (session: ApplicationSession, tx: Tx) => T | Promise<T>, told?: (notice: string) => void, prior?: Verdict): Promise<T> {
       const body = async (row: HostedSession | undefined) => {
         const taken = told ? await takeLost(p, row, "agent") : [];
-        if (taken.length) told!(lostNotice(p, row!, taken));
+        if (taken.length) told!(await lostNotice(p, row!, taken));
         const root = row ? await rootOf(repo.read, row) : undefined;
-        const held = root ? application.hostedHolds(repo.read, root.session_id) : undefined;
+        const held = root ? await application.hostedHolds(repo.read, root.session_id) : [];
         if (!(root && named(root, held)) && !UNBOUND_READS.has(tool) && tool !== "whoami") {
           throw new ApplicationError("unbound", row?.root_session_id ? childUnbound(row.root_session_id) : "unbound; bind a name first, or have this session's root register it as a child (session_register)");
         }
@@ -837,8 +842,9 @@ export function createHostedSessions(application: Application, options: { now?: 
     async transfer<T>(p: OAuthPrincipal, context: SessionContext, fn: (session: ApplicationSession, guard: (r: Read) => Promise<void>) => Promise<T>): Promise<T> {
       return withGate(p, context, false, async row => {
         const root = row ? await rootOf(repo.read, row) : undefined;
-        if (!(root && named(root))) throw new ApplicationError("unbound", "attachments require a bound source session");
-        const selected = await snapshot(p, row);
+        const held = root ? await application.hostedHolds(repo.read, root.session_id) : [];
+        if (!(root && named(root, held))) throw new ApplicationError("unbound", "attachments require a bound source session");
+        const selected = await snapshot(p, row, held, root);
         const late = refusalRows();
         selected.session.afterRollback = late.defer;
         // fence only reads, so no transaction: on the pool a commit can land between its reads (#807 P3 A7h1), but each
@@ -889,8 +895,8 @@ export function createHostedSessions(application: Application, options: { now?: 
       return withGate(p, context, false, async row => {
         const root = row ? await rootOf(repo.read, row) : undefined;
         const taken = await takeLost(p, row, told ? "agent" : "controller"), lost = taken.map(({ alias, reason }) => ({ alias, reason }));
-        if (told && taken.length) told(lostNotice(p, row!, taken));
-        const held = root ? application.hostedHolds(repo.read, root.session_id) : [];
+        if (told && taken.length) told(await lostNotice(p, row!, taken));
+        const held = root ? await application.hostedHolds(repo.read, root.session_id) : [];
         // An await after `held` (#807 P3 A7g2; `root` was read before takeLost's): candidates are hints, so a bind
         // landing meanwhile only makes them a moment newer than `held`.
         const offered = !(root && named(root, held)) && !row?.root_session_id ? await application.hostedCandidates(repo.read, p.authed, root?.suggested ?? null) : undefined;
@@ -907,7 +913,7 @@ export function createHostedSessions(application: Application, options: { now?: 
       if (!normalized.ok) throw new ApplicationError("bad_request", normalized.error);
       const result = await service.owning(p, context, async (row, defer, tx) => {
         testPause("hosted:bind:in-txn");
-        const before = application.hostedHolds(tx, row.session_id);
+        const before = await application.hostedHolds(tx, row.session_id);
         // A hosted contender idle past the window, or whose lease lapsed, ends and frees the alias; a live one
         // refuses the bind (application.bindNow sees its hold).
         const address = await application.bindAddress(tx, p.authed, normalized.name);
@@ -952,7 +958,7 @@ export function createHostedSessions(application: Application, options: { now?: 
     // oldest remaining hold, and the last one leaves the root unbound but owning, its lease closed.
     async unbind(p: OAuthPrincipal, context: SessionContext, args: { name: string }, declared?: DeclaredDelivery) {
       const result = await service.owning(p, context, async (row, defer, tx) => {
-        const before = application.hostedHolds(tx, row.session_id);
+        const before = await application.hostedHolds(tx, row.session_id);
         const selected = await application.hostedSession(tx, p.authed, row.session_id, before, row.writes_as, row, quietSink);
         selected.session.afterRollback = defer;
         try {
@@ -1003,7 +1009,7 @@ export function createHostedSessions(application: Application, options: { now?: 
           if (before && root.ownership_id !== before.ownership_id) throw new ApplicationError("unbound", "session binding changed; select the current binding again");
           const existing = await store.get(tx, childId);
           if (existing) ownRow(p, existing, later.defer, root.session_id);
-          const childHolds = existing ? application.hostedHolds(tx, childId) : [];
+          const childHolds = existing ? await application.hostedHolds(tx, childId) : [];
           if (existing && (childHolds.length || existing.writes_as)) throw new ApplicationError("child_bound", `session ${childId} holds ${childHolds.length ? childHolds.map(h => `"${h}"`).join(", ") : `nothing, writing as "${existing.writes_as}",`} as its own root (bound ${new Date(existing.created_at).toISOString()}${existing.place ? `, in ${existing.place}` : ""}); end it with session_end from that session, or leave it as its own root.`);
           if (existing?.root_session_id && existing.root_session_id !== root.session_id) throw new ApplicationError("child_registered_elsewhere", `session ${childId} is registered under root ${existing.root_session_id}; a session has one root. session_end(${childId}) from ${existing.root_session_id} first.`);
           const descendants = await store.children(tx, childId);
