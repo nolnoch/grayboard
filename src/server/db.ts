@@ -289,10 +289,9 @@ export interface Repo {
   };
   // Policy's reads (and resolveMention's alias reads), synchronously on the SQLite connection (#807 P3 A7e1): the
   // loader authorizeNow drives, and the core Access seam's, until #807 B makes them async. Inside the caller's own
-  // transaction they read its writes. principalOf is principals.of. teamsOf and teamMembers serve the synchronous
-  // helpers that can't await yet (helloOkFields, onAliasCreated, the roster read beside its guard). SQLite only: a
-  // Postgres Repo won't have it. policy.test.ts ratchets its callers.
-  policyNow: PolicyReadsSync & AccessReadsSync & { teamsOf(userId: number): Team[]; teamMembers(teamId: number): TeamMember[] };
+  // transaction they read its writes. principalOf is principals.of. teamsOf serves helloOkFields, which the
+  // synchronous hostedSession reaches. SQLite only: a Postgres Repo won't have it. policy.test.ts ratchets its callers.
+  policyNow: PolicyReadsSync & AccessReadsSync & { teamsOf(userId: number): Team[] };
   // Names in scopes, keyed by address. The writes return promises (#807 P3 A6d); the reads stay synchronous until
   // async Access (A7): `listForScope` and `seen` feed the synchronous session builder, and `countForScope` (only async bodies call it) moves with them so the group's reads go async together.
   aliases: {
@@ -1255,7 +1254,6 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       shareDelegating: (userA, userB) => shareDelegating(db, userA, userB),
       userByEmail: email => userByEmail(db, email),
       teamsOf: userId => teamsOf(db, userId),
-      teamMembers: teamId => teamMembers(db, teamId),
       alias: address => aliasAt(db, address),
       aliasesNamed: name => aliasesNamed(db, name),
     },

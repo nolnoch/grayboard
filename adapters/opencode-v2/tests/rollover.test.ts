@@ -21,7 +21,7 @@ const ORIGIN = "https://grayboard.example.com", ROOT = `ses_${"a".repeat(64)}`;
 
 // #472: the server's own 1 s timer closes the subscriber stream when the
 // access token expires; OpenCode's refresh lands on the adapter's second
-// expiry poll, about 1.5 s after that close, as on prod.
+// expiry poll, about 1.0 s after that close (the close's 500 ms backoff, then one 500 ms poll), as on prod.
 test("a real access-expiry stream close with OpenCode's refresh landing after it keeps the ownership and push delivery (#472)", async () => {
   const dir = mkdtempSync(join(tmpdir(), "rollover-472-"));
   const app = startServer({ dbPath: join(dir, "bus.db"), blobDir: join(dir, "blobs"), httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl: ORIGIN, messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES }, { hostname: "127.0.0.1", background: false });
@@ -73,8 +73,9 @@ test("a real access-expiry stream close with OpenCode's refresh landing after it
     const all = audits(), closes = all.filter(a => a.action === "hosted.stream_closed");
     expect(closes.some(a => a.role === "subscriber" && a.ownership === ownership)).toBe(true);
     expect(closes.every(a => a.reason === "access_expired")).toBe(true);
-    expect(all.filter(a => a.action === "hosted.lease_closed")).toEqual([]);
-    // The reopen found the lease still live and attached it again: never closed, never reopened.
+    // The reopen found the lease still live and attached it again: never closed, never reopened. (A "no
+    // hosted.lease_closed" check could not fail here: the lease's 30 s TTL outlasts the rollover, so its sweep
+    // never runs in this window (#481). One open of the same ownership is the check that can.)
     expect(opened().map(a => [a.ownership, a.reopened])).toEqual([[ownership, false]]);
     // Push delivery still reaches the root.
     const { board, posted } = await app.repo.write(() => {

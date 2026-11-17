@@ -15,6 +15,7 @@ import { GRAYBOARD_SESSION_META, GRAYBOARD_WRITES_AS_META } from "../../src/shar
 import { issueOAuth } from "../helpers/oauth.ts";
 import { withMeta } from "../helpers/hosted.ts";
 import { seed } from "../support/seed.ts";
+import { hostedPause } from "../support/hosted-pause.ts";
 
 const A = "alice@example.com";
 const B = "bob@example.com";
@@ -72,6 +73,19 @@ describe("team management", () => {
       { actor: C, target: "team:eng", verb: "team.manage", allow: false, rule: "team.member" },
       { actor: C, target: "team:eng", verb: "team.read", allow: false, rule: "team.member" },
     ]);
+  });
+
+  // The roster is read before the guard decides (#807 P3 A7f1): a member removed between the two reads is refused,
+  // not handed the roster read while they were still in the team.
+  test("a member removed while their roster read waits reads not found, with a deny row", async () => {
+    const [a, b] = await Promise.all([srv.login(A), srv.login(B)]);
+    expect((await srv.api(a, "POST", "/api/teams", { name: "eng" })).status).toBe(201);
+    expect((await srv.api(a, "POST", "/api/teams/eng/add", { email: B })).status).toBe(200);
+    const res = await hostedPause("http:team-members:between",
+      () => srv.api(b, "GET", "/api/teams/eng/members"),
+      async () => { expect((await srv.api(a, "POST", "/api/teams/eng/remove", { email: B })).status).toBe(200); });
+    expect(res.status).toBe(404);
+    expect(rows().filter((r) => r.actor === B)).toEqual([{ actor: B, target: "team:eng", verb: "team.read", allow: false, rule: "team.member" }]);
   });
 
   test("a non-admin's admin route denies; an admin's allows; both name the route", async () => {
