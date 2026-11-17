@@ -152,7 +152,7 @@ for (const owning of ["bind", "open", "register"] as const) {
     expect(fresh.ownership_id).not.toBe(old.ownership_id);
     expect(fresh.grant_id).toBe(first.grantId);
     expect(application.hostedHolds(application.repo.read, fresh.session_id).map(short)).toEqual(change === "convert" ? [] : ["be"]);
-    expect(database.repo.aliases.find(database.repo.read, `${p.authed.user_email}/new`)).toBeUndefined();
+    expect(await database.repo.aliases.find(database.repo.read, `${p.authed.user_email}/new`)).toBeUndefined();
     expect(database.repo.hosted.all(database.repo.read).some(row => row.source_session_id === "new-child")).toBe(false);
     expect(delivery.activeLeaseCount).toBe(0);
   });

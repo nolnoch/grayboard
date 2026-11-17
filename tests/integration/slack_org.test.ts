@@ -599,7 +599,7 @@ test("#807: a rolled-back unlink leaves the link and its human online", async ()
     expect((await api(alice, "POST", "/api/slack/unlink")).status).not.toBe(200);
   } finally { spy.mockRestore(); }
   expect(srv.app.repo.slack.linkFor(srv.app.repo.read, userId)).toBeDefined();
-  expect(srv.app.repo.aliases.find(srv.app.repo.read, "alice@example.com/human")).toBeDefined();
+  expect(await srv.app.repo.aliases.find(srv.app.repo.read, "alice@example.com/human")).toBeDefined();
   const sent = await be.call<SendResult>("dm_send", { to: "human", body: "still linked?" });
   expect(sent.delivered_now).toBe(true);
   await until(() => slack.posts().find((p) => p.markdown_text?.includes("still linked?")));
@@ -616,7 +616,7 @@ test("#807: a rolled-back link leaves no link, no human identity and nothing att
     await until(() => spy.mock.calls.some((c) => c.map(String).join(" ").includes("audit refused")), 5000, "the link's failure was logged");
   } finally { spy.mockRestore(); }
   expect(srv.app.repo.slack.linkFor(srv.app.repo.read, userId)).toBeUndefined();
-  expect(srv.app.repo.aliases.find(srv.app.repo.read, "alice@example.com/human")).toBeUndefined();
+  expect(await srv.app.repo.aliases.find(srv.app.repo.read, "alice@example.com/human")).toBeUndefined();
   expect((await api(alice, "GET", "/api/whoami")).body.identities).not.toContain("human");
 });
 

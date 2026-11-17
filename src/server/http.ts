@@ -169,7 +169,7 @@ async function claimList(url: URL, authed: AuthedUser, repo: Repo): Promise<Resp
   const principal = { kind: "user" as const, name: authed.user_email };
   const sees = async (holder: string): Promise<boolean> => {
     // A deleted team name (#347) keeps its claims and stays inside the team that had it.
-    const a = repo.aliases.find(repo.read, holder);
+    const a = await repo.aliases.find(repo.read, holder);
     const p = a ? null : addressParts(holder);
     const scope = a ? { scope_kind: a.scope_kind, scope_ref: a.scope_ref } : p?.kind === "alias" && p.scopeKind === "principal" ? { scope_kind: "team" as const, scope_ref: p.scope } : null;
     return !scope || scope.scope_ref === null || (await authorize(repo, repo.read, {}, { verb: "alias.see", principal, scope: { scope_kind: scope.scope_kind, scope_ref: scope.scope_ref } })).allow;
@@ -213,7 +213,7 @@ async function ownAddress(r: Read, input: string | null | undefined, authed: Aut
     if (d.rule === "scope.ownerless" || d.rule === "scope.team_member") return forbidden(`you can't act as "${address}": no principal owns its scope`);
     return forbidden(`you can't act as "${address}": ${d.reason}`);
   }
-  if (!repo.aliases.find(r, address)) {
+  if (!(await repo.aliases.find(r, address))) {
     return jsonErr("unknown_identity", `no session has used "${address}"; check which handle this shell acts as with grayboard whoami, or pass --as`, 404);
   }
   // An alias in use by another user's session is exclusive (#284 S8, decided);
@@ -267,7 +267,7 @@ async function identityCreate(req: Request, authed: AuthedUser, repo: Repo, conf
   if (!isValidIdentityName(name)) return badRequest("invalid identity name");
   if (name === HUMAN_NAME) return badRequest(HUMAN_RESERVED);
   return repo.write(async tx => {
-    const existing = repo.aliases.find(tx, `${authed.user_email}/${name}`);
+    const existing = await repo.aliases.find(tx, `${authed.user_email}/${name}`);
     if (existing) return conflict(`identity "${name}" already exists`);
     const capped = aliasCapRefusal(repo, tx, { scope_kind: "person", scope_ref: authed.user_email }, config.aliasScopeCap ?? ALIAS_SCOPE_CAP);
     if (capped) return badRequest(capped);
@@ -282,7 +282,7 @@ function identityDelete(name: string, authed: AuthedUser, repo: Repo): Response 
   name = name.toLowerCase();
   if (name === HUMAN_NAME) return badRequest(`"${HUMAN_NAME}" goes away with your Slack link: grayboard slack unlink`);
   return repo.write(async tx => {
-    const existing = repo.aliases.find(tx, `${authed.user_email}/${name}`);
+    const existing = await repo.aliases.find(tx, `${authed.user_email}/${name}`);
     if (!existing) return notFound();
     // Its holds and writers would outlive it: a second session could then bind
     // the name while the first still acts as it.
@@ -589,7 +589,7 @@ async function teamDeleteAlias(teamName: string, req: Request, authed: AuthedUse
     const name = body.name.toLowerCase();
     if (name === HUMAN_NAME) return badRequest(`"${HUMAN_NAME}" is reserved in every scope; no team has one`);
     if (!isValidIdentityName(name)) return badRequest("invalid name");
-    const existing = repo.aliases.find(tx, `${managed.team.name}/${name}`);
+    const existing = await repo.aliases.find(tx, `${managed.team.name}/${name}`);
     if (!existing) return jsonErr("not_found", `team "${managed.team.name}" has no name "${name}"`, 404);
     const user = aliasUser(repo.coreOn(tx), existing.address);
     if (user) return jsonErr("alias_held", aliasHeldText(existing.address, `the session ${user}`, "end it, or have it unbind the name, first"), 409);

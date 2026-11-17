@@ -297,12 +297,12 @@ export interface Repo {
   aliases: {
     // createdBy: the principal that made it (the binder's user for a lazy create).
     create(tx: Tx, scope: { scope_kind: ScopeKind; scope_ref: string; name: string }, createdBy: string): Promise<Alias>;
-    find(r: Read, address: string): Alias | undefined;
+    find(r: Read, address: string): Promise<Alias | undefined>;
     listForScope(r: Read, kind: ScopeKind, ref: string): Alias[];
     // The scope's names less the Slack link's human, for the cap (#347).
     countForScope(r: Read, kind: ScopeKind, ref: string): number;
     // Every scope's alias of this name.
-    findAllByName(r: Read, name: string): Alias[];
+    findAllByName(r: Read, name: string): Promise<Alias[]>;
     // When each of these addresses was last used, and the cwd or place of the
     // session that holds or last held it (ALIAS_SESSION_SQL); unused ones are absent.
     seen(r: Read, addresses: string[]): Map<string, { last_seen: number; cwd: string | null; place: string | null }>;
@@ -1267,7 +1267,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
            VALUES (?, ?, ?, ?, ?, ?) RETURNING ${ALIAS_COLS}`,
         ).get(`${scope_ref}/${name}`, scope_kind, scope_ref, name, createdBy, clock())!;
       },
-      find: (r, address) => aliasAt(sqliteOf(r), address),
+      find: async (r, address) => aliasAt(sqliteOf(r), address),
       listForScope(r, kind, ref) {
         return sqliteOf(r).query<Alias, [string, string]>(
           `SELECT ${ALIAS_COLS} FROM aliases WHERE scope_ref = ? AND scope_kind = ? ORDER BY name`,
@@ -1278,7 +1278,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
           `SELECT COUNT(*) AS n FROM aliases WHERE scope_ref = ? AND scope_kind = ? AND name != ?`,
         ).get(ref, kind, HUMAN_NAME)!.n;
       },
-      findAllByName: (r, name) => aliasesNamed(sqliteOf(r), name),
+      findAllByName: async (r, name) => aliasesNamed(sqliteOf(r), name),
       seen(r, addresses) {
         const rows = sqliteOf(r).query<{ address: string; last_seen: number; cwd: string | null; place: string | null }, [string]>(
           `SELECT a.address, a.last_seen, i.cwd, i.place FROM aliases a LEFT JOIN ids i ON i.id = ${ALIAS_SESSION_SQL}

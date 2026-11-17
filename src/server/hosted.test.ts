@@ -872,7 +872,7 @@ test("a hosted root holds several names: bind adds, unbind releases one and prom
   expect(unbound).toMatchObject({ held: [], ownership: first.ownership });
   await expect(hosted.run(principal, context("root"), "dm_send", () => true)).rejects.toHaveProperty("code", "unbound");
   // The released names' mail still queues for their next holder.
-  expect(database.repo.aliases.find(database.repo.read, at("fe"))).toBeDefined();
+  expect(await database.repo.aliases.find(database.repo.read, at("fe"))).toBeDefined();
 });
 
 const at = (name: string) => `you@example.com/${name}`;

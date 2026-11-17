@@ -274,11 +274,11 @@ test("repo.read inside the caller's own transaction is refused; the body's Tx, o
     put(tx, "a");
     expect(() => rows(repo.read)).toThrow(refusal);
     expect(() => repo.coreOn(repo.read)).toThrow(refusal);
-    expect(() => repo.aliases.find(repo.read, "x@example.com/be")).toThrow(refusal);
+    await expect(repo.aliases.find(repo.read, "x@example.com/be")).rejects.toThrow(refusal);
     expect(rows(tx)).toEqual(["a"]);
     await tick();
     expect(() => rows(repo.read)).toThrow(refusal);
-    expect(() => repo.aliases.find(repo.read, "x@example.com/be")).toThrow(refusal);
+    await expect(repo.aliases.find(repo.read, "x@example.com/be")).rejects.toThrow(refusal);
   });
   // (c) Another task, while a body holding the transaction awaits: committed state, no throw.
   let release!: () => void;

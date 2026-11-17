@@ -416,7 +416,7 @@ async function bindTarget(hub: Hub, r: Read, authed: AuthedUser, input: string):
 // the user who named it. Callers are inside a transaction, whose Tx is `tx`.
 async function createLazily(hub: Hub, tx: Tx, authed: AuthedUser, { address, scope }: Exclude<Target, { error: string }>, session: string): Promise<void> {
   const { repo } = hub;
-  if (repo.aliases.find(tx, address)) return;
+  if ((await repo.aliases.find(tx, address))) return;
   await repo.aliases.create(tx, scope, authed.user_email);
   writeAudit(repo, tx, "alias.created", authed.user_email, address, { lazy: true, session });
   await onAliasCreated(repo, tx, authed.user_id, address);
@@ -771,11 +771,14 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
       if (repo.users.findById(authed.user_id)?.disabled_at != null) fail("unauthenticated", "session is closed");
       const stale = current?.(tx);
       if (stale) fail("unauthenticated", stale);
-      if (!repo.aliases.find(tx, addr)) {
+      if (!(await repo.aliases.find(tx, addr))) {
         await repo.aliases.create(tx, { scope_kind: "person", scope_ref: authed.user_email, name: HUMAN_NAME }, authed.user_email);
         writeAudit(repo, tx, "alias.created", authed.user_email, addr, { lazy: true, slack: true });
         await onAliasCreated(repo, tx, authed.user_id, addr);
       }
+      // Again after the awaits (#807 P3 A7f3 audit): a stop outside the write queue lands meanwhile; the throw rolls the create back.
+      const late = current?.(tx);
+      if (late) fail("unauthenticated", late);
       touchAlias(repo.coreOn(tx), addr);
       logBinding(repo.coreOn(tx), HUMAN_NAME, addr, "bound");
     }, () => {
@@ -845,7 +848,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     }
     // A typo would otherwise create a fresh alias, and the DMs queued for the
     // intended one would never arrive.
-    if (m.create === false && !repo.aliases.find(tx, address)) {
+    if (m.create === false && !(await repo.aliases.find(tx, address))) {
       const known = closestNames(scope.name, repo.aliases.listForScope(tx, scope.scope_kind, scope.scope_ref).map((a) => a.name).filter((n) => n !== HUMAN_NAME));
       const message = unknownNameError(scope.name, known);
       return refuse("identity_unknown", message, message, { known });
@@ -871,7 +874,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     }
     // A new name past its scope's cap (#347); checked here, not in the
     // transaction below, so the refused binding event stays.
-    const capped = repo.aliases.find(tx, address) ? null : aliasCapRefusal(repo, tx, target.scope, hub.aliasScopeCap);
+    const capped = (await repo.aliases.find(tx, address)) ? null : aliasCapRefusal(repo, tx, target.scope, hub.aliasScopeCap);
     if (capped) return refuse("bad_request", capped, capped);
 
     // No savepoint (#807 P3 A1): a throw here fails the bind, and every caller's transaction rolls back with it.
@@ -1035,7 +1038,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
         return fail("alias_held", aliasHeldText(target.address, why, "write as another name"));
       }
       if (create) {
-        const capped = repo.aliases.find(tx, target.address) ? null : aliasCapRefusal(repo, tx, target.scope, hub.aliasScopeCap);
+        const capped = (await repo.aliases.find(tx, target.address)) ? null : aliasCapRefusal(repo, tx, target.scope, hub.aliasScopeCap);
         if (capped) {
           note(target.address, capped);
           return fail("bad_request", capped);
@@ -1342,7 +1345,7 @@ async function resolvePeer(repo: Repo, r: Read, from: string, input: string, vie
   const fa = addressParts(from);
   const scope = fa?.kind === "alias" ? fa.scope : fa?.kind === "id" ? (await repo.principals.of(r, from))?.name ?? null : null;
   const own = scope ? addressParts(`${scope}/${p.name}`) : null;
-  if (own?.kind === "alias" && repo.aliases.find(r, own.address)) return own;
+  if (own?.kind === "alias" && (await repo.aliases.find(r, own.address))) return own;
   if (p.name === HUMAN_NAME) {
     // A bare "human" is always your own (addressing.ts HUMAN_NAME), never the
     // one alias anyone has with the name: another user's is reached by its
@@ -1353,7 +1356,7 @@ async function resolvePeer(repo: Repo, r: Read, from: string, input: string, vie
   // One decision per scope.
   const sees = new Map<string, boolean>();
   const all: string[] = [];
-  for (const a of repo.aliases.findAllByName(r, p.name)) {
+  for (const a of (await repo.aliases.findAllByName(r, p.name))) {
     if (vp === null) break;
     const key = JSON.stringify([a.scope_kind, a.scope_ref]);
     let ok = sees.get(key);
@@ -1369,7 +1372,7 @@ async function resolvePeer(repo: Repo, r: Read, from: string, input: string, vie
 // anyone outside the team its names read as missing (alias.see, #348), for mail too (#1014). Only a team's: a
 // service's agents take mail from anyone in the org (vision.md principle 9).
 async function teamAliasHidden(repo: Repo, r: Read, viewer: string, address: string): Promise<boolean> {
-  const a = repo.aliases.find(r, address);
+  const a = await repo.aliases.find(r, address);
   if (a?.scope_kind !== "team" || a.scope_ref === null) return false;
   const vp = await repo.principals.of(r, viewer);
   return vp === null || !(await authorize(repo, r, {}, { verb: "alias.see", principal: vp, scope: { scope_kind: "team", scope_ref: a.scope_ref } })).allow;
@@ -1425,7 +1428,7 @@ async function prepareSend(
     const parent = repo.messages.getById(r, parentId);
     return participant(parent, session.addresses) && replyPeer(parent, session.addresses) === address;
   };
-  if (to.kind === "alias" && (!repo.aliases.find(r, to.address) || ((await teamAliasHidden(repo, r, session.sessionId || from, to.address)) && !replyingTo(to.address)))) {
+  if (to.kind === "alias" && (!(await repo.aliases.find(r, to.address)) || ((await teamAliasHidden(repo, r, session.sessionId || from, to.address)) && !replyingTo(to.address)))) {
     fail("not_found", `identity "${to.address}" not found; peer_list shows exact handles`);
   }
   const req: AuthzRequest = { verb: "msg.send", from, to: to.address };
@@ -1471,8 +1474,10 @@ async function writeSend(hub: Hub, tx: Tx, session: ApplicationSession, p: Prepa
   await testPauseAsync("send:wake:decided");
   // Read after the await (#807 P3 A7f2, H-A): a wake note about a holder that closed meanwhile is dropped.
   const live = registry.get(p.to);
-  const wake = wakeUser(repo, tx, live, p.to) === decided.user ? decided.fields : {};
-  const payload: SendResult = live?.active
+  // Snapshot with `live`: wakeUser may await an alias read (#807 P3 A7f3), and the payload must describe one instant.
+  const liveActive = live?.active;
+  const wake = (await wakeUser(repo, tx, live, p.to)) === decided.user ? decided.fields : {};
+  const payload: SendResult = liveActive
     ? { message_id: msg.id, delivered_now: true, ...f, ...wake }
     : {
         message_id: msg.id,
@@ -1490,10 +1495,10 @@ async function writeSend(hub: Hub, tx: Tx, session: ApplicationSession, p: Prepa
 }
 
 // The user a wake is judged against: `live`'s, else a person alias's; undefined says nothing.
-function wakeUser(repo: Repo, r: Read, live: ApplicationSession | undefined, to: string): string | undefined {
+async function wakeUser(repo: Repo, r: Read, live: ApplicationSession | undefined, to: string): Promise<string | undefined> {
   if (live?.human || to.endsWith(`/${HUMAN_NAME}`)) return undefined;
   if (live) return live.authed.user_email;
-  const a = repo.aliases.find(r, to);
+  const a = await repo.aliases.find(r, to);
   return a?.scope_kind === "person" ? a.scope_ref ?? undefined : undefined;
 }
 
@@ -1506,7 +1511,7 @@ function wakeUser(repo: Repo, r: Read, live: ApplicationSession | undefined, to:
 // reads it; msg.send already decided reach). Each pull decides again
 // (pending()), so this reflects the grant at send time, not a promise.
 async function unwoken(repo: Repo, r: Read, session: ApplicationSession, live: ApplicationSession | undefined, to: string): Promise<{ user: string | undefined; fields: { wakes?: false; wake_note?: string } }> {
-  const toUser = wakeUser(repo, r, live, to);
+  const toUser = await wakeUser(repo, r, live, to);
   if (toUser === undefined) return { user: undefined, fields: {} };
   const decision = await authorize(repo, r, {}, { verb: "msg.wake", from_user: session.authed.user_email, to_user: toUser });
   if (decision.allow) return { user: toUser, fields: {} };

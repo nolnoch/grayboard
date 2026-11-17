@@ -113,7 +113,7 @@ try {
   assert.equal(app.mcp.activeLeases, 0);
   await rpc.enroll({ sessionID: session.id }, { location });
   assert.equal(app.mcp.activeLeases, 0, "Approval alone cannot bind or create a mailbox");
-  assert.equal(app.repo.aliases.find(app.repo.read, "you@example.com/be"), undefined);
+  assert.equal(await app.repo.aliases.find(app.repo.read, "you@example.com/be"), undefined);
   await rpc.enroll({ sessionID: session.id, name: "be", create: true }, { location });
   await wait(() => app.mcp.activeLeases, n => n === 1);
   await seed(app.db, () => {
