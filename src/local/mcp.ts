@@ -340,9 +340,13 @@ let restoredFrom: string | null = null;
 // The name record (#182 decision 14), written by the session that owns
 // delivery whenever its name changes. The Slack bridge's child keeps none:
 // its name is fixed, and a restart that can't have it must fail loudly. Nor
-// does a keyed session: its restart re-attaches, name and all.
+// does a keyed session: its restart re-attaches, name and all. Nor does a
+// process started as a subagent (BUS_PARENT_SESSION), even once it falls
+// back or a bind promotes it (#1078): a foreground child's harness pid is its
+// root's pi process, shared with the root and every sibling, so its record
+// would hand a sibling's names to the next subagent that falls back there.
 const RECORD_DIR = sockDir();
-const RECORDS = PUSH && !HUMAN && !KEYED;
+const RECORDS = PUSH && !HUMAN && !KEYED && PARENT_SESSION === undefined;
 // A failed write costs only the restore after a restart; the bind itself stands.
 const writeNames = () => {
   if (!RECORDS) return;

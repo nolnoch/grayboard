@@ -3,7 +3,8 @@
 // names change (every name it holds, oldest first; none while unbound). A
 // grayboard mcp restarted under the same harness process (`/mcp` reconnect, a
 // crash) finds it and takes the names back, so a session that bound names
-// mid-task doesn't come back unbound. A record whose harness has exited, or whose pid now belongs
+// mid-task doesn't come back unbound. A subagent process (BUS_PARENT_SESSION)
+// keeps none, even once promoted or fallen back, and restarts unbound (#1078). A record whose harness has exited, or whose pid now belongs
 // to another process, is stale: it's deleted, never honoured.
 //
 // The file is writable by any process running as the user, the same trust
