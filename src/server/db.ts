@@ -2068,7 +2068,7 @@ function makeHostedStore(db: Database): HostedStoreOf {
       "SELECT * FROM hosted_sessions WHERE user_id = ? AND +root_session_id IS NULL ORDER BY created_at, session_id").all(user),
     park: (tx, ...a) => on(tx).park(...a),
     unpark: (tx, ...a) => on(tx).unpark(...a),
-    start: (tx, ...a) => on(tx).start(...a),
+    start: async (tx, ...a) => on(tx).start(...a),
     insert: (tx, ...a) => on(tx).insert(...a),
     update: (tx, ...a) => on(tx).update(...a),
     touch: (tx, ...a) => on(tx).touch(...a),
@@ -2087,18 +2087,18 @@ function makeHostedStore(db: Database): HostedStoreOf {
       return taken;
     },
     end: (tx, ...a) => on(tx).end(...a),
-    lose: (tx, ...a) => on(tx).lose(...a),
+    lose: async (tx, ...a) => on(tx).lose(...a),
     lost: (r, session, reader) => hostedLostOf(sqliteOf(r))(session, `${LOST_READ[reader]} IS NULL`),
-    tellLost: (tx, ...a) => on(tx).tellLost(...a),
-    reportLost: (tx, ...a) => on(tx).reportLost(...a),
-    seeLost: (tx, ...a) => on(tx).seeLost(...a),
-    forgetLost: (tx, ...a) => on(tx).forgetLost(...a),
+    tellLost: async (tx, ...a) => on(tx).tellLost(...a),
+    reportLost: async (tx, ...a) => on(tx).reportLost(...a),
+    seeLost: async (tx, ...a) => on(tx).seeLost(...a),
+    forgetLost: async (tx, ...a) => on(tx).forgetLost(...a),
     aliveAt: (r) => sqliteOf(r).query<{ value: number }, []>("SELECT value FROM server_state WHERE key = 'alive_at'").get()?.value,
-    heartbeat: (tx, ...a) => on(tx).heartbeat(...a),
-    setRoot: (tx, id, root) => { sqliteOf(tx).query("UPDATE ids SET root_id = ? WHERE id = ? AND root_id IS NOT ?").run(root, id, root); },
-    reopenId: (tx, id) => { sqliteOf(tx).query("UPDATE ids SET ended_at = NULL, held_aliases_json = NULL WHERE id = ?").run(id); },
-    restateWritesAs: (tx, id, writesAs) => { sqliteOf(tx).query("UPDATE ids SET writes_as = ? WHERE id = ? AND writes_as IS NULL").run(writesAs, id); },
-    declareLauncher: (tx, id) => sqliteOf(tx).query("UPDATE ids SET launcher = 1 WHERE id = ? AND launcher IS NOT 1").run(id).changes > 0,
+    heartbeat: async (tx, ...a) => on(tx).heartbeat(...a),
+    setRoot: async (tx, id, root) => { sqliteOf(tx).query("UPDATE ids SET root_id = ? WHERE id = ? AND root_id IS NOT ?").run(root, id, root); },
+    reopenId: async (tx, id) => { sqliteOf(tx).query("UPDATE ids SET ended_at = NULL, held_aliases_json = NULL WHERE id = ?").run(id); },
+    restateWritesAs: async (tx, id, writesAs) => { sqliteOf(tx).query("UPDATE ids SET writes_as = ? WHERE id = ? AND writes_as IS NULL").run(writesAs, id); },
+    declareLauncher: async (tx, id) => sqliteOf(tx).query("UPDATE ids SET launcher = 1 WHERE id = ? AND launcher IS NOT 1").run(id).changes > 0,
     launcher: (r, id) => sqliteOf(r).query<{ launcher: number | null }, [string]>("SELECT launcher FROM ids WHERE id = ?").get(id)?.launcher === 1,
     holds: (r) => sqliteOf(r).query<{ id: string; address: string }, []>(`SELECT id, address FROM alias_holds ${HOLD_ORDER}`).all(),
   };
@@ -2114,7 +2114,8 @@ const hostedLostOf = (db: Database) => (session: string, where: string): HostedL
 
 type HostedWriteName = "park" | "unpark" | "start" | "insert" | "update" | "touch" | "childEnd" | "end" | "lose" | "tellLost" | "reportLost" | "seeLost" | "forgetLost" | "heartbeat";
 // The hosted store's writes without their handle, bound to one connection.
-type HostedWrites = { [K in HostedWriteName]: HostedStore[K] extends (tx: Tx, ...a: infer A) => infer R ? (...a: A) => R : never };
+// Synchronous: `endHostedWhere` runs them inside the users and OAuth stores' synchronous transactions (#807 P3 A6e1).
+type HostedWrites = { [K in HostedWriteName]: HostedStore[K] extends (tx: Tx, ...a: infer A) => infer R ? (...a: A) => Awaited<R> : never };
 function hostedWrites(db: Database, ended: { list: EndedChild[] }): HostedWrites {
   const get = (id: string) => hostedRow(db, id);
   const audit = (session: string, action: AuditAction, detail: Record<string, unknown>, now: number) => {

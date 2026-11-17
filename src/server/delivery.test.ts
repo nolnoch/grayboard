@@ -41,7 +41,7 @@ beforeEach(async () => {
   await sender.connect();
   await hosted.bind(bob, context(bob), { name: "fe", create: true });
 });
-afterEach(() => { delivery.close(); hosted.close(); application.stopExpiry(); store.db.close(); rmSync(dir, { recursive: true, force: true }); });
+afterEach(async () => { delivery.close(); await hosted.close(); application.stopExpiry(); store.db.close(); rmSync(dir, { recursive: true, force: true }); });
 const send = async (body = "hello", pending = false) => (await sender.send("bob@example.com/fe", body, { pending })).message_id;
 
 test("stale receipt audit survives rollback exactly once without committing any cursor", async () => {
@@ -198,7 +198,7 @@ test("renew is fenced and extends sticky deadline, reopening is idempotent", asy
 
 test("shutdown leaves ownership and deadline durable; reopen retains ownership", async () => {
   const lease = await delivery.open(bob, context(bob));
-  delivery.close(); hosted.close();
+  delivery.close(); await hosted.close();
   now += 10_000;
   hosted = createHostedSessions(application, { now: () => now, isAuthorized: () => authorized }); await hosted.ready;
   delivery = createDelivery(hosted, { isAuthorized: () => authorized });
