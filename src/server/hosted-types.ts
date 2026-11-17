@@ -26,7 +26,9 @@ export interface HostedStore {
   write<T, R = T>(fn: (tx: Tx) => Sync<T>, committed?: (value: T) => R): Promise<Awaited<R>>;
   // Told after each commit that changed a row (#399): its session ID, or null when any row may have (a grant or
   // user change). A touch (`touch`) tells nothing: nothing that observes rows reads `last_seen_at`.
-  subscribe(fn: (changed: string | null) => void): () => void;
+  // With `read`, a named row's notice carries `read`'s answer on the committing transaction, just before its COMMIT
+  // (#807 P3 A7g1); undefined when the read failed or the body was synchronous.
+  subscribe<F>(fn: (changed: string | null, facts?: F) => void, read?: (tx: Tx, id: string) => Promise<F>): () => void;
   get(r: Read, id: string): HostedSession | undefined;
   // Whether the session ID is a hosted session's: a root's ownership row
   // stays after it ends; a child's row only while it is registered.
