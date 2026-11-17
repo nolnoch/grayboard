@@ -1531,6 +1531,33 @@ test("#899: a write no notice or generation sees reaches a stamped listen at the
   await f.listen.close();
 });
 
+// #807 P3 A7h2: a notice that carries no row (here the full reconcile's null) leaves the lives to the full pass, which
+// reads their rows on its Tx and judges them in its apply: no stream tick needed, and none before the read.
+test("#807 P3 A7h2: a null notice's full pass stops a live whose binding moved, after the pass's read", async () => {
+  const f = await stampedListen(3_600_000, true);
+  // Raw SQL: the commit sends no notice, so only the pass below can see it.
+  await seed(store.repo, async tx => store.db.run("UPDATE hosted_sessions SET bind_gen = bind_gen + 1 WHERE session_id = ?", [(await aliceRoot(tx)).session_id]));
+  let during = -1;
+  await held("hosted:reconcile:read", () => hosted.sessions.reconcile(), async () => { during = hosted.activeListens; });
+  expect(during).toBe(1);
+  expect(hosted.activeListens).toBe(0);
+  await f.listen.close();
+});
+
+// #807 P3 A7h2 audit: the watcher rows are read before the rebuilds, and each rebuild in its own savepoint, so a rebuild
+// that throws still lets the pass's apply stop a live whose binding moved.
+test("#807 P3 A7h2: a full pass whose rebuild throws still stops a live whose binding moved", async () => {
+  const f = await stampedListen(3_600_000, true);
+  await seed(store.repo, async tx => store.db.run("UPDATE hosted_sessions SET bind_gen = bind_gen + 1 WHERE session_id = ?", [(await aliceRoot(tx)).session_id]));
+  const builds = spyOn(application, "hostedBuildFacts").mockRejectedValue(new Error("build failed"));
+  try {
+    await hosted.sessions.reconcile();
+    expect(builds).toHaveBeenCalled();
+  } finally { builds.mockRestore(); }
+  expect(hosted.activeListens).toBe(0);
+  await f.listen.close();
+});
+
 test("#899: another connection's commit reaches a stamped listen within a tick", async () => {
   const { Database } = await import("bun:sqlite");
   // Reopen the fixture on a file, so a second connection can commit to it.
@@ -1679,6 +1706,24 @@ test("#807 P3 A7d: of two legacy GETs whose checks await together, one takes the
   expect(hosted.activeWatches).toBe(1);
   for (const a of aborts) a.abort();
   for (const g of gets) await g.body?.cancel().catch(() => {});
+  await raw.delete();
+});
+
+// #807 P3 A7h2: a live keeps its creator's rows only when no notice for them came after the read began; a GET whose
+// root's binding moved while its check awaited re-reads them once it opens, and stops, with no stream tick.
+test("#807 P3 A7h2: a legacy GET whose binding moves while its check awaits re-reads its rows and stops", async () => {
+  const { time } = await clocked(undefined, undefined, true);
+  const access = (await issueOAuth(store.repo, oauth.resource, "alice@example.com", ["grayboard:tools"], time.now, OPENCODE_CLIENT)).token;
+  const raw = await rawLegacySession(access, meta);
+  expect((await raw.post("tools/call", { name: "board_create", arguments: { name: "moved", purpose: "A7h2" }, _meta: meta })).text).not.toContain("isError\":true");
+  expect((await raw.post("resources/subscribe", { uri: "grayboard://boards/moved", _meta: meta })).text).not.toContain("\"error\"");
+  const abort = new AbortController();
+  const { value: get } = await held("mcp:legacy:get-checked", () => raw.get(abort.signal), async () => {
+    await seed(store.repo, async tx => { const r = await aliceRoot(tx); return store.repo.hosted.update(tx, { ...r, bind_gen: r.bind_gen + 1 }); });
+  });
+  expect(get.status).toBe(200);
+  await untilHosted(() => hosted.activeGetStreams === 0);
+  abort.abort(); await get.body?.cancel().catch(() => {});
   await raw.delete();
 });
 

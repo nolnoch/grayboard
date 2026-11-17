@@ -462,7 +462,7 @@ test("child quota refusal leaves grant, lease and graph unchanged; ending a chil
   await expect(hosted.register(otherGrant, context("root"), "overflow")).rejects.toHaveProperty("code", "bad_request");
   expect(refusalCount("hosted_child")).toBe(counted + 1);
   expect((await database.repo.hosted.all(database.repo.read)).every(row => row.grant_id === "G1")).toBe(true);
-  expect(delivery.describe(principal, context("root"), lease.capability, { row: undefined }).capability).toBe(lease.capability);
+  expect(delivery.describe(principal, context("root"), lease.capability, { row: await database.repo.hosted.get(database.repo.read, hostedId("root")) }).capability).toBe(lease.capability);
   await hosted.end(principal, context("child-0"));
   await hosted.register(principal, context("root"), "overflow");
   expect(await database.repo.hosted.all(database.repo.read)).toHaveLength(1 + hosted.limits.children);
@@ -757,11 +757,11 @@ test("a second grant write does not attach; successful owning call does", async 
   await hosted.bind(principal, root, { name: "fe", create: true });
   const second = { ...principal, grantId: "G2" };
   await hosted.run(second, root, "peer_status", () => true);
-  expect(hosted.row("id" in root ? root.id : "")?.grant_id).toBe("G1");
+  expect((await hosted.readRow("id" in root ? root.id : ""))?.grant_id).toBe("G1");
   await expect(hosted.bind(second, root, { name: "missing" })).rejects.toHaveProperty("code", "identity_unknown");
-  expect(hosted.row("id" in root ? root.id : "")?.grant_id).toBe("G1");
+  expect((await hosted.readRow("id" in root ? root.id : ""))?.grant_id).toBe("G1");
   await hosted.register(second, root, "child");
-  expect(hosted.row("id" in root ? root.id : "")?.grant_id).toBe("G2");
+  expect((await hosted.readRow("id" in root ? root.id : ""))?.grant_id).toBe("G2");
 });
 
 test("durable lease deadline expires once without a contender", async () => {
@@ -1951,7 +1951,8 @@ test("#807 P3 A7d2b: delivery's pending refuses a lease finished while its token
     const call = service.pending(principal, context("lease-root"), lease.capability);
     await held.reached;
     await seed(database.repo, tx => database.repo.users.setDisabled(tx, principal.authed.user_id, true));
-    expect(service.activeLeaseCount).toBe(0);
+    // The disable's full pass finishes the lease (#807 P3 A7h2).
+    await until(() => service.activeLeaseCount === 0);
     held.release(true);
     await expect(call).rejects.toThrow("no live delivery lease");
     expect(database.db.query("SELECT count(*) AS n FROM access_log WHERE action = 'hosted.stale_capability'").get()).toEqual({ n: 1 });

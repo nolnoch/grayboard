@@ -244,7 +244,11 @@ export function createHostedSessions(application: Application, options: { now?: 
   // A named row's facts as its transaction commits (readHolder): its row and holds, and what a new holder's build
   // reads when the current holder doesn't match (null: the row's user is gone).
   type HolderFacts = { row?: HostedSession; held: string[]; build?: { authed: AuthedUser; facts: BuildFacts } | null };
-  const listeners = new Set<(changed: string | null) => void>();
+  // `row`: the changed row as its commit left it (null: gone), when the notice carries facts; undefined when it
+  // doesn't (null, or a named notice without facts), whose full pass hands the rows to `watchers` (#807 P3 A7h2).
+  const listeners = new Set<(changed: string | null, row?: HostedSession | null) => void>();
+  type RowWatcher = { ids(): Iterable<string>; apply(rows: Map<string, HostedSession | undefined>): void };
+  const watchers = new Set<RowWatcher>();
   let stopped = false;
   const gate = (id: string) => {
     const enter = async <T>(writer: boolean, fn: () => Promise<T>): Promise<T> => {
@@ -327,10 +331,6 @@ export function createHostedSessions(application: Application, options: { now?: 
   async function rootOf(r: Read, row: HostedSession): Promise<HostedSession> {
     return rootCheck(row, row.root_session_id ? await store.get(r, row.root_session_id) : row);
   }
-  // rootOf, synchronously: SQLite only, for the MCP layer's synchronous row checks until A7h2 (#807 P3).
-  function rootOfNow(r: Read, row: HostedSession): HostedSession {
-    return rootCheck(row, row.root_session_id ? store.getNow(r, row.root_session_id) : row);
-  }
   function rootCheck(row: HostedSession, root: HostedSession | undefined): HostedSession {
     if (!root || root.ownership_id !== row.ownership_id) throw new ApplicationError("unbound", "unbound; its root's ownership changed, so the root must register this child again (session_register)");
     return root;
@@ -385,7 +385,10 @@ export function createHostedSessions(application: Application, options: { now?: 
         if (facts) applyNamed(changed, facts);
         else full = requestFull(); // a synchronous body's commit, or a failed facts read
       }
-    } finally { for (const listener of listeners) listener(changed); }
+    } finally {
+      const row = changed !== null && facts ? facts.row ?? null : undefined;
+      for (const listener of listeners) listener(changed, row);
+    }
     return full ?? Promise.resolve();
   }
   const authedOf = (user: { id: number; email: string }): AuthedUser => ({ user_id: user.id, user_email: user.email, session_id: 0 });
@@ -435,21 +438,41 @@ export function createHostedSessions(application: Application, options: { now?: 
     return mine.promise;
   }
   async function readAll(tx: Tx) {
+    // The rows each watcher follows, parked ones too, read on this Tx (#807 P3 A7h2): `applyAll` hands them over
+    // before the queue's next body, so no commit lands between this read and the watcher's check. Read first, and
+    // each rebuild below in its own savepoint, so a rebuild that throws can't keep a revocation from its watchers.
+    const watched = new Map<RowWatcher, Map<string, HostedSession | undefined>>();
+    for (const w of watchers) {
+      const rows = new Map<string, HostedSession | undefined>();
+      for (const id of [...w.ids()]) rows.set(id, await store.get(tx, id));
+      watched.set(w, rows);
+    }
     const held = await application.holdsByOwner(tx);
     const rows = (await store.all(tx)).filter(r => !r.root_session_id && held.has(r.session_id));
     const builds = new Map<string, { authed: AuthedUser; facts: BuildFacts }>();
     for (const row of rows) {
       if (matches(row, holders.get(row.session_id))) continue;
-      const user = await repo.users.findById(tx, row.user_id);
-      if (!user) continue;
-      const authed = authedOf(user);
-      builds.set(row.session_id, { authed, facts: await application.hostedBuildFacts(tx, authed, row.session_id, { holds: held.get(row.session_id)!, writesAs: null, suggested: row.suggested, root: null }) });
+      try {
+        await tx.savepoint(async sp => {
+          const user = await repo.users.findById(sp, row.user_id);
+          if (!user) return;
+          const authed = authedOf(user);
+          builds.set(row.session_id, { authed, facts: await application.hostedBuildFacts(sp, authed, row.session_id, { holds: held.get(row.session_id)!, writesAs: null, suggested: row.suggested, root: null }) });
+        });
+      } catch (e) {
+        // Left unbuilt: its holder is closed, if it no longer matches, and rebuilt by a later pass.
+        hostedFailure("hosted.reconcile", e);
+      }
     }
     await testPauseAsync("hosted:reconcile:read");
-    return { held, rows, builds };
+    return { held, rows, builds, watched };
   }
-  function applyAll({ held, rows, builds }: Awaited<ReturnType<typeof readAll>>) {
+  function applyAll({ held, rows, builds, watched }: Awaited<ReturnType<typeof readAll>>) {
     if (stopped) return;
+    // Watchers first, as reconcile runs the listeners even when a rebuild throws.
+    for (const [w, seen] of watched) if (watchers.has(w)) {
+      try { w.apply(seen); } catch (e) { hostedFailure("hosted.reconcile", e); }
+    }
     const live = new Map(rows.map(r => [r.session_id, r]));
     for (const [id, holder] of holders) {
       const row = live.get(id);
@@ -758,9 +781,10 @@ export function createHostedSessions(application: Application, options: { now?: 
     now,
     leaseTtl,
     gate,
-    // Synchronous, SQLite only: the MCP layer's row checks until A7h2 (#807 P3).
-    row(id: string) { return store.getNow(repo.read, id); },
-    rootOf: (row: HostedSession) => rootOfNow(repo.read, row),
+    // A row and its root on the pool, for the MCP layer's row checks (#807 P3 A7h2): two reads, so a commit can land
+    // between them; the caller judges the pair (mcp.ts `bindingLive`) and rechecks one a notice raced.
+    readRow: (id: string) => store.get(repo.read, id),
+    readRoot: (row: HostedSession) => rootOf(repo.read, row),
     rootOnly,
     named,
     audit,
@@ -775,7 +799,9 @@ export function createHostedSessions(application: Application, options: { now?: 
     reconcile,
     sweep,
     settle,
-    listen(fn: (changed: string | null) => void) { listeners.add(fn); return () => { listeners.delete(fn); }; },
+    listen(fn: (changed: string | null, row?: HostedSession | null) => void) { listeners.add(fn); return () => { listeners.delete(fn); }; },
+    // The full pass reads `ids()` on its Tx and hands the rows to `apply` in its `committed` (#807 P3 A7h2).
+    watchRows(w: RowWatcher) { watchers.add(w); return () => { watchers.delete(w); }; },
     // Every MCP exchange's selection, before its tool runs: it doesn't wake a parked child (#566). The tool's own
     // gate does, except session_end's, so ending a parked child is never refused for capacity.
     // `verdict`: the rows it selected, for the same request's tool call (`run`'s `prior`, #907). `endTouch`: false
@@ -1038,7 +1064,7 @@ export function createHostedSessions(application: Application, options: { now?: 
       clearInterval(timer);
       unsubscribe();
       for (const { session } of holders.values()) application.close(session);
-      holders.clear(); listeners.clear();
+      holders.clear(); listeners.clear(); watchers.clear();
       // A clean stop records its exact time, so the next start credits leases
       // with the real downtime rather than up to a heartbeat interval more.
       // Returned, so the caller awaits its commit before it closes the database.

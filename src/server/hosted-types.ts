@@ -31,10 +31,6 @@ export interface HostedStore {
   subscribe<F>(fn: (changed: string | null, facts?: F) => void, read?: (tx: Tx, id: string) => Promise<F>): () => void;
   // The store's reads all return promises, on the caller's handle (#807 P3 A7h1).
   get(r: Read, id: string): Promise<HostedSession | undefined>;
-  // `get` and `launcher`, synchronously: SQLite only, for delivery's and the MCP layer's synchronous row checks and
-  // instruction text until A7h2 removes them.
-  getNow(r: Read, id: string): HostedSession | undefined;
-  launcherNow(r: Read, id: string): boolean;
   // Whether the session ID is a hosted session's: a root's ownership row
   // stays after it ends; a child's row only while it is registered.
   owned(r: Read, id: string): Promise<boolean>;
