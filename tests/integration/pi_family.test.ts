@@ -764,6 +764,8 @@ test("a pause the Controller's run loop reaches on its own is said at once and i
   ]).toContainEqual(a.notices[1]?.message ?? "");
   expect(a.notices[1]?.level).toBe("info");
   await until(async () => (await a.ext.status()).includes(`  sink-a (${EMAIL}/sinker, ${EMAIL}/switched): active,`), 5_000, "sink-a active as sinker, switched");
+  // Only paused and degraded states reach the UI on their own (root.ts sink): no second pause.
+  expect(a.notices).toHaveLength(2);
   const resumed = texts(await a.call("whoami"));
   expect(resumed).toHaveLength(1);
   expect(JSON.parse(resumed[0]!)).toMatchObject({ primary: `${EMAIL}/sinker`, held: [`${EMAIL}/sinker`, `${EMAIL}/switched`] });
