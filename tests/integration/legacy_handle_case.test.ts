@@ -78,7 +78,8 @@ test(`${FROM}'s Gray, then a v2 release's gray, then this tree started as Gray: 
   expect(busRows<{ detail: string }>(bus, `SELECT detail FROM audit_log WHERE action = 'alias.case_moved'`).map((r) => JSON.parse(r.detail))).toEqual([{ from: "Gray", merged: true }]);
 }, 60_000);
 
-// #1189: another process's open merging into a live `gray` wakes it.
+// #1189: another process's open merging into a live `gray` wakes it. Assumes a
+// case-sensitive filesystem (sock.Gray and sock.gray are distinct files), as on CI's Linux.
 test(`a ${FROM} DM to Gray while this tree's gray is live arrives at the next open`, async () => {
   const bus = mkdtempSync(join(tmpdir(), "grayboard-case-"));
   dirs.push(bus);

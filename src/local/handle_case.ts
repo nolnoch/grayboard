@@ -10,7 +10,8 @@
 // winning wherever a key holds one row per name (its cursor, its
 // subscription mode, its alias labels). A merge is refused only where it
 // would change who a name is: one of the two is a human and the other isn't,
-// the lowercase name is reserved (`human`), or it isn't a valid name at all.
+// an agent's name lowercases to the reserved `human`, or it isn't a valid name
+// at all.
 //
 // Data only (schema changes stay additive). It runs inside the open's schema
 // transaction, after the seed, on every open: a 1.x grayboard still running
