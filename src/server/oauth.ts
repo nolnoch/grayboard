@@ -390,10 +390,14 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
       if (flows.size >= 1000) fail("temporarily_unavailable", 429);
       const c = cookies(req);
       const binding = c.binding ?? random();
-      const id = random(), csrf = random(), t = now();
-      const request = await repo.write(tx => repo.oauth.createRequest(tx, { clientId: client.clientId, redirectUri, resource, scopes: selected, codeChallenge,
-        requestHash: hashToken(id), browserHash: hashToken(binding), csrfHash: hashToken(csrf), stateHash: hashToken(state),
-        consentSessionHash: null, createdAt: t, expiresAt: t + OAUTH_TTL.request }, t));
+      const id = random(), csrf = random();
+      // Each write body reads the clock itself (#971): a body that waited in the write queue judges and stamps at its write.
+      const { t, request } = await repo.write(tx => {
+        const t = now();
+        return { t, request: repo.oauth.createRequest(tx, { clientId: client.clientId, redirectUri, resource, scopes: selected, codeChallenge,
+          requestHash: hashToken(id), browserHash: hashToken(binding), csrfHash: hashToken(csrf), stateHash: hashToken(state),
+          consentSessionHash: null, createdAt: t, expiresAt: t + OAUTH_TTL.request }, t) };
+      });
       if (request.status !== "ok") fail("temporarily_unavailable", 429);
       const f: Flow = { client, state, csrf, expiresAt: t + OAUTH_TTL.request };
       flows.set(hashToken(id), f);
@@ -453,9 +457,12 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
       if ("refused" in signedIn) return refuse(signedIn.refused);
       const { user } = signedIn;
       if (user.disabled_at !== null) { writeAudit(repo, "oauth.user_refused", user.email, null, { client_id: r.clientId }); return refuse(REFUSED.disabled); }
-      const session = random(), t = now();
-      const created = await repo.write(tx => repo.oauth.createBrowserSession(tx, { sessionHash: hashToken(session), userId: user.id, createdAt: t, expiresAt: t + OAUTH_TTL.browser }, t,
-        c.session && hashToken(c.session)));
+      const session = random();
+      const created = await repo.write(tx => {
+        const t = now();
+        return repo.oauth.createBrowserSession(tx, { sessionHash: hashToken(session), userId: user.id, createdAt: t, expiresAt: t + OAUTH_TTL.browser }, t,
+          c.session && hashToken(c.session));
+      });
       if (created.status !== "ok") fail("temporarily_unavailable", 503);
       const response = redirect(endpoint("/oauth/consent") + "?request=" + id);
       response.headers.append("Set-Cookie", cookie("session", session, OAUTH_TTL.browser / 1000));
@@ -476,10 +483,11 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
       const decision = required(p, "decision");
       if (!["approve", "deny"].includes(decision) || !c.session) fail();
       const sessionHash = hashToken(c.session!);
-      const code = random(), t = now();
+      const code = random();
       // The browser session is read in the decision's transaction, so it can't lapse between them.
       const { b, result } = await repo.write(tx => {
-        const b = repo.oauth.findBrowserSession(tx, sessionHash, now());
+        const t = now();
+        const b = repo.oauth.findBrowserSession(tx, sessionHash, t);
         if (!b) fail();
         return { b: b!, result: repo.oauth.decideRequest(tx, { requestHash: r.requestHash, browserHash: r.browserHash, sessionHash, csrfHash: hashToken(required(p, "csrf")),
           approve: decision === "approve", code: { ...r, codeHash: hashToken(code), userId: b!.userId, createdAt: t, expiresAt: t + OAUTH_TTL.code } }, t) };
@@ -521,10 +529,9 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
         const allowed = grantType === "authorization_code" ? ["grant_type", "client_id", "code", "code_verifier", "redirect_uri", "resource", "scope"] : ["grant_type", "client_id", "refresh_token", "resource", "scope"];
         if ([...p].some(([k, v]) => v !== "" && !allowed.includes(k))) fail();
         if ((optional(p, "resource") ?? resource) !== resource) fail("invalid_grant");
-        const t = now();
         const access = random(), refresh = random();
-        let result;
-        const pair = (selected: string[]) => ({ clientId: client.clientId, resource, scopes: selected, accessHash: hashToken(access), refreshHash: hashToken(refresh),
+        let result, t: number;
+        const pair = (selected: string[], t: number) => ({ clientId: client.clientId, resource, scopes: selected, accessHash: hashToken(access), refreshHash: hashToken(refresh),
           accessExpiresAt: t + OAUTH_TTL.access, refreshExpiresAt: t + OAUTH_TTL.refresh });
         if (grantType === "authorization_code") {
           const verifier = required(p, "code_verifier");
@@ -535,30 +542,32 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
           // nothing; the redemption's own (a replay revokes the grant or session) commits and is checked after.
           // The stored code's scopes alone pick the redemption: a login code becomes a CLI session (#928 D8).
           const redeemed = await repo.write(tx => {
+            const t = now();
             const selected = repo.oauth.findCodeScopes(tx, codeHash, client.clientId, resource, redirectUri, t) ?? [];
             if (!selected.length) fail("invalid_grant");
             if (optional(p, "scope") !== null && JSON.stringify(scopes(optional(p, "scope"))) !== JSON.stringify(selected)) fail("invalid_scope");
             const authorization = { clientId: client.clientId, resource, scopes: selected, redirectUri, codeChallenge: challenge(verifier), codeHash };
-            if (selected.includes(LOGIN_SCOPE)) return { login: repo.oauth.redeemLoginCode(tx, { ...authorization, tokenHash: hashToken(sessionToken), label: userAgent(req) }, t) };
-            return { grant: repo.oauth.redeemCode(tx, { ...authorization, grantId: random(), grantExpiresAt: t + OAUTH_TTL.grant, tokens: pair(selected) }, t) };
+            if (selected.includes(LOGIN_SCOPE)) return { t, login: repo.oauth.redeemLoginCode(tx, { ...authorization, tokenHash: hashToken(sessionToken), label: userAgent(req) }, t) };
+            return { t, grant: repo.oauth.redeemCode(tx, { ...authorization, grantId: random(), grantExpiresAt: t + OAUTH_TTL.grant, tokens: pair(selected, t) }, t) };
           });
           if (redeemed.login) {
             if (redeemed.login.status !== "ok") { if (redeemed.login.status === "replay") hostedFailure("oauth.replay", undefined, "warning"); fail("invalid_grant"); }
             // The CLI's API token (verifySessionToken), not an OAuth access token: no expiry, no refresh.
             return json({ access_token: sessionToken, token_type: "Bearer", scope: LOGIN_SCOPE });
           }
-          result = redeemed.grant!;
+          result = redeemed.grant!; t = redeemed.t;
         } else {
           if (!client.allowRefresh) fail("invalid_grant");
           const refreshHash = hashToken(required(p, "refresh_token"));
           // As the code above: the grant is read in the rotation's transaction.
-          result = await repo.write(tx => {
+          ({ t, result } = await repo.write(tx => {
+            const t = now();
             const grant = repo.oauth.findRefreshGrant(tx, refreshHash, client.clientId, resource, t);
             if (!grant) fail("invalid_grant");
             const selected = scopes(optional(p, "scope"), grant!.scopes);
             if (!selected.every(s => grant!.scopes.includes(s))) fail("invalid_scope");
-            return repo.oauth.rotateRefresh(tx, { clientId: client.clientId, resource, scopes: selected, refreshHash, tokens: pair(selected) }, t);
-          });
+            return { t, result: repo.oauth.rotateRefresh(tx, { clientId: client.clientId, resource, scopes: selected, refreshHash, tokens: pair(selected, t) }, t) };
+          }));
         }
         if (result.status !== "ok") { if (result.status === "replay") hostedFailure("oauth.replay", undefined, "warning"); fail("invalid_grant"); }
         return json({ access_token: access, token_type: "Bearer", expires_in: Math.floor((result.value.tokens.accessExpiresAt - t) / 1000), scope: result.value.tokens.scopes.join(" "),

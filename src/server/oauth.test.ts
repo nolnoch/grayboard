@@ -8,6 +8,8 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDatabase } from "./db.ts";
+import { queueFor } from "./store/queue.ts";
+import { until } from "../../tests/support/until.ts";
 import { createOAuthServer, type OAuthPrincipal } from "./oauth.ts";
 import { hashToken, verifySessionToken } from "./auth.ts";
 import { OAUTH_TTL } from "./oauth-types.ts";
@@ -1525,4 +1527,24 @@ test("the grayboard-cli cutover revokes earlier grants and pending codes under i
   service = makeService();
   expect(service.isGrantActive(later.grantId)).toBe(true);
   expect(codes().sort()).toEqual([CLI_CLIENT_ID, "native"]);
+});
+
+// #971: a code or refresh token that expires while its redemption waits in the write queue is refused: the body judges
+// expiry against the clock it reads at its write, not one read before the wait.
+for (const grant of ["authorization_code", "refresh_token"] as const) test(`#971: ${grant === "authorization_code" ? "a code" : "a refresh token"} that expires while its redemption waits behind another write body is refused`, async () => {
+  const a = await issue();
+  const params = grant === "authorization_code" ? tokenParams(a)
+    : { client_id: "native", grant_type: "refresh_token", refresh_token: (await redeem(a)).refresh_token, resource: service.resource };
+  let release!: () => void;
+  const held = queueFor(storage.db).run(() => new Promise<void>(r => { release = r; }));
+  const write = storage.repo.write;
+  let entered = false;
+  storage.repo.write = ((...args: Parameters<typeof write>) => { entered = true; return write.apply(storage.repo, args); }) as typeof write;
+  try {
+    const response = post("/oauth/token", params);
+    await until(() => entered, 5000, "the token route reaches its write");
+    clock += grant === "authorization_code" ? OAUTH_TTL.code : OAUTH_TTL.refresh;
+    release(); await held;
+    expect((await response).status).toBe(400);
+  } finally { storage.repo.write = write; }
 });
