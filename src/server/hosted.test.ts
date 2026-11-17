@@ -2076,3 +2076,23 @@ test("#807 P3 A7g1: full reconciles requested before the queued one starts share
     expect(all).toHaveBeenCalledTimes(1);
   } finally { all.mockRestore(); }
 });
+
+test("#807 P3 A7g1: a full reconcile requested once the queued one has started runs a pass of its own", async () => {
+  const all = spyOn(database.repo.hosted, "all");
+  try {
+    let again!: Promise<void>, first!: Promise<void>;
+    await paused("hosted:reconcile:read", () => (first = hosted.reconcile()), async () => { again = hosted.reconcile(); expect(again).not.toBe(first); });
+    await again;
+    expect(all).toHaveBeenCalledTimes(2);
+  } finally { all.mockRestore(); }
+});
+
+test("#807 P3 A7g1 audit: a full reconcile whose write is refused before its body starts doesn't stick", async () => {
+  const write = spyOn(database.repo.hosted, "write").mockImplementationOnce(() => Promise.reject(new Error("BEGIN failed")));
+  const all = spyOn(database.repo.hosted, "all");
+  try {
+    await expect(hosted.reconcile()).rejects.toThrow("BEGIN failed");
+    await hosted.reconcile();
+    expect(all).toHaveBeenCalledTimes(1);
+  } finally { write.mockRestore(); all.mockRestore(); }
+});

@@ -1012,9 +1012,10 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
             catch (error) { console.error("hosted facts read failed", error); }
           }
           // After this transaction's notices (registered before the hook ran): the facts served their flush.
-          root.afterCommit(() => { for (const each of ids) o.facts.delete(each); });
+          try { root.afterCommit(() => { for (const each of ids) o.facts.delete(each); }); }
+          catch (error) { console.error("hosted facts clear failed", error); }
         });
-      } catch { /* a synchronous body's Tx refuses the hook: its notices carry no facts */ }
+      } catch { o.pending.delete(id); /* a synchronous body's Tx refuses the hook: its notices carry no facts */ }
     }
   };
   // An async op's notice waits for it to fulfil (#807 P3 A6c): one that rejects changed nothing, as a sync throw didn't.
