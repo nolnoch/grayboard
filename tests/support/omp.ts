@@ -781,8 +781,9 @@ export function ompLocalRestartAbortScenario(dir: string): Promise<void> {
       await until(() => omp.events.some((e) => e.type === "tool_execution_end" && e.toolName === `${PREFIX}bind`), 2_000, "the bind ended at its abort");
       expect(Date.now() - aborted).toBeLessThan(2_000);
       await idle(omp, 2_000);
-      // The backoff runs out and the process is back. A negative assertion:
-      // a bind still waiting would run once the process is ready.
+      // The backoff runs out and the process is back. A regression guard: the
+      // aborted bind never runs (the old adapter only ended it late, at the
+      // backoff's end; its send already refused an aborted call).
       await until(() => grayboardChildPids(omp.pid).length === 1, 15_000, "the restarted grayboard process");
       await Bun.sleep(2_000);
       expect(localRows<{ id: string }>(dir, "SELECT id FROM alias_holds WHERE address = 'omp-late'")).toEqual([]);
