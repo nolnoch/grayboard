@@ -18,8 +18,8 @@ export function issueOAuth(repo: Repo, resource: string, email = "alice@example.
 }
 export type IssuedOAuth = Awaited<ReturnType<typeof issueOAuth>>;
 
-function issueNow(repo: Repo, tx: Tx, resource: string, email: string, scopes: string[], now: number, clientId: string) {
-  const user = repo.users.upsertByEmail(tx, email, null);
+async function issueNow(repo: Repo, tx: Tx, resource: string, email: string, scopes: string[], now: number, clientId: string) {
+  const user = await repo.users.upsertByEmail(tx, email, null);
   const binding = { clientId, resource, scopes: [...scopes].sort(), redirectUri: "http://127.0.0.1/callback", codeChallenge: random() };
   const request = { ...binding, requestHash: hashToken(random()), browserHash: hashToken(random()), csrfHash: hashToken(random()), stateHash: hashToken(random()), consentSessionHash: null, createdAt: now, expiresAt: now + OAUTH_TTL.request };
   const sessionHash = hashToken(random());

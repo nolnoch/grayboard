@@ -63,7 +63,7 @@ test("an existing pre-OAuth database opens additively without losing old data", 
   const opts = { blobDir: join(dir, "blobs") };
   const old = openDatabase(path, opts);
   const { user, session } = await seed(old.repo, async tx => {
-    const user = old.repo.users.upsertByEmail(tx, "you@example.com", "You");
+    const user = await old.repo.users.upsertByEmail(tx, "you@example.com", "You");
     const session = await old.repo.sessions.create(tx, user.id, "old-session-hash", "old client");
     old.repo.aliases.create(tx, { scope_kind: "person", scope_ref: user.email, name: "fe" }, user.email);
     old.repo.messages.insert(tx, "you@example.com/fe", "user", "peer@example.com/be", "preserved", null);
@@ -95,8 +95,8 @@ test("opening a database from before ids.root_id backfills each live hosted chil
   const old = openDatabase(path, opts);
   const now = Date.now();
   const [root, child, gone] = ["id:r000000000000", "id:c000000000000", "id:g000000000000"];
-  await seed(old.repo, tx => {
-    const user = old.repo.users.upsertByEmail(tx, "you@example.com", null);
+  await seed(old.repo, async tx => {
+    const user = await old.repo.users.upsertByEmail(tx, "you@example.com", null);
     for (const id of [root, child, gone]) old.db.prepare(`INSERT INTO ids (id, principal, started_at, last_seen) VALUES (?, ?, ?, ?)`).run(id, user.email, now, now);
     const ownership = old.db.prepare(`INSERT INTO hosted_ownerships (session_id, user_id, client_id, started_at) VALUES (?, ?, ?, ?) RETURNING id`).get(root, user.id, "grayboard-pi", now) as { id: number };
     const row = old.db.prepare(`INSERT INTO hosted_sessions (session_id, ownership_id, user_id, client_id, grant_id, source_session_id, root_session_id, created_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`);
@@ -128,8 +128,8 @@ test("opening a database clears launcher marks no live hosted root holds, auditi
   const old = openDatabase(path, opts);
   const now = Date.now();
   const [root, child, wss, ended, plain] = ["id:r000000000000", "id:c000000000000", "id:w000000000000", "id:e000000000000", "id:p000000000000"];
-  const user = await seed(old.repo, tx => {
-    const user = old.repo.users.upsertByEmail(tx, "you@example.com", null);
+  const user = await seed(old.repo, async tx => {
+    const user = await old.repo.users.upsertByEmail(tx, "you@example.com", null);
     for (const id of [root, child, wss, ended, plain]) old.db.prepare(`INSERT INTO ids (id, principal, started_at, last_seen, launcher) VALUES (?, ?, ?, ?, ?)`).run(id, user.email, now, now, id === plain ? 0 : 1);
     const own = old.db.prepare(`INSERT INTO hosted_ownerships (session_id, user_id, client_id, started_at, ended_at) VALUES (?, ?, ?, ?, ?) RETURNING id`);
     const live = own.get(root, user.id, "grayboard-pi", now, null) as { id: number };
@@ -193,8 +193,8 @@ describe("Repo", () => {
   });
 
   test("sessions: create, findByTokenHash, revoke", async () => {
-    const s = await seed(repo, tx => {
-      const u = repo.users.upsertByEmail(tx, "wade@example.com", null);
+    const s = await seed(repo, async tx => {
+      const u = await repo.users.upsertByEmail(tx, "wade@example.com", null);
       return repo.sessions.create(tx, u.id, "hash123", "test");
     });
     const found = await repo.sessions.findByTokenHash(repo.read, "hash123");
@@ -207,8 +207,8 @@ describe("Repo", () => {
   });
 
   test("aliases: create, list, remove", async () => {
-    const fe = await seed(repo, tx => {
-      repo.users.upsertByEmail(tx, "you@example.com", null);
+    const fe = await seed(repo, async tx => {
+      await repo.users.upsertByEmail(tx, "you@example.com", null);
       const fe = repo.aliases.create(tx, person("you@example.com", "fe"), "you@example.com");
       repo.aliases.create(tx, person("you@example.com", "be"), "you@example.com");
       return fe;
@@ -226,8 +226,8 @@ describe("Repo", () => {
 
   // #284 S9: aliases are keyed by address in any scope.
   test("aliases: a team scope's alias is its own address, listed under its scope", async () => {
-    const team = await seed(repo, tx => {
-      const u = repo.users.upsertByEmail(tx, "you@example.com", null);
+    const team = await seed(repo, async tx => {
+      const u = await repo.users.upsertByEmail(tx, "you@example.com", null);
       repo.teams.create(tx, "eng", u.id);
       repo.aliases.create(tx, person("you@example.com", "be"), "you@example.com");
       return repo.aliases.create(tx, { scope_kind: "team", scope_ref: "eng", name: "be" }, "you@example.com");
@@ -242,8 +242,8 @@ describe("Repo", () => {
   });
 
   test("principals: findByName reads users and teams", async () => {
-    const { u, eng } = await seed(repo, tx => {
-      const u = repo.users.upsertByEmail(tx, "you@example.com", null);
+    const { u, eng } = await seed(repo, async tx => {
+      const u = await repo.users.upsertByEmail(tx, "you@example.com", null);
       return { u, eng: repo.teams.create(tx, "eng", u.id) };
     });
     expect(repo.principals.findByName("you@example.com")).toMatchObject({ kind: "user", user_id: u.id, team_id: null });
@@ -252,9 +252,9 @@ describe("Repo", () => {
   });
 
   test("teams: create, join, leave, list members", async () => {
-    const { u2, t } = await seed(repo, tx => {
-      const u1 = repo.users.upsertByEmail(tx, "a@example.com", null);
-      const u2 = repo.users.upsertByEmail(tx, "b@example.com", null);
+    const { u2, t } = await seed(repo, async tx => {
+      const u1 = await repo.users.upsertByEmail(tx, "a@example.com", null);
+      const u2 = await repo.users.upsertByEmail(tx, "b@example.com", null);
       const t  = repo.teams.create(tx, "eng", u1.id);
       repo.teams.addMember(tx, t.id, u1.id);
       repo.teams.addMember(tx, t.id, u2.id);
@@ -371,9 +371,9 @@ describe("Repo", () => {
 // #284 decision 5: users, teams and service principals share one namespace.
 test("principals: a sign-in and a team create insert one; a team can't take another principal's name", async () => {
   const { db, repo } = openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
-  const { u, eng } = await seed(repo, tx => {
-    const u = repo.users.upsertByEmail(tx, "a@example.com", null);
-    repo.users.upsertByEmail(tx, "a@example.com", "A");
+  const { u, eng } = await seed(repo, async tx => {
+    const u = await repo.users.upsertByEmail(tx, "a@example.com", null);
+    await repo.users.upsertByEmail(tx, "a@example.com", "A");
     const eng = repo.teams.create(tx, "eng", u.id);
     // Service principals arrive with #270; the namespace guard is here now.
     db.prepare(`INSERT INTO principals (kind, name, created_at) VALUES ('service', 'ingest', 0)`).run();
@@ -588,9 +588,9 @@ test("schema: what a rolled-back binary writes (a subject, no issuer; its old in
 test("undeliveredFrom looks each read point up by its key, never a mailbox_cursors scan", async () => {
   const { db, repo } = openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
   await seed(repo, async tx => {
-    repo.users.upsertByEmail(tx, "a@example.com", null);
+    await repo.users.upsertByEmail(tx, "a@example.com", null);
     repo.aliases.create(tx, person("a@example.com", "fe"), "a@example.com");
-    repo.users.upsertByEmail(tx, "b@example.com", null);
+    await repo.users.upsertByEmail(tx, "b@example.com", null);
     repo.aliases.create(tx, person("b@example.com", "be"), "b@example.com");
     repo.messages.insert(tx, "a@example.com/fe", "user", "b@example.com/be", "hello", null);
     await repo.cursors.advance(tx, "b@example.com/be", "direct", "b@example.com/be", 1);
@@ -620,9 +620,9 @@ test("undeliveredFrom and sentPending search messages by sender, never by recipi
 test("queuedTo and retract look the read point up by its key, never a mailbox_cursors scan", async () => {
   const { db, repo } = openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
   await seed(repo, async tx => {
-    repo.users.upsertByEmail(tx, "a@example.com", null);
+    await repo.users.upsertByEmail(tx, "a@example.com", null);
     repo.aliases.create(tx, person("a@example.com", "fe"), "a@example.com");
-    repo.users.upsertByEmail(tx, "b@example.com", null);
+    await repo.users.upsertByEmail(tx, "b@example.com", null);
     repo.aliases.create(tx, person("b@example.com", "be"), "b@example.com");
     repo.messages.insert(tx, "a@example.com/fe", "user", "b@example.com/be", "hello", null);
     await repo.cursors.advance(tx, "b@example.com/be", "direct", "b@example.com/be", 1);
@@ -684,7 +684,7 @@ test("#807 P1c-5: cursors and writeReceipts run on the handle they're given", as
 test("#807 P1c-6: sessions run on the handle they're given", async () => {
   const { repo } = openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
   const { kept, s, u } = await seed(repo, async tx => {
-    const u = repo.users.upsertByEmail(tx, "a@example.com", null);
+    const u = await repo.users.upsertByEmail(tx, "a@example.com", null);
     const s = await repo.sessions.create(tx, u.id, "hash-a", "test");
     await repo.sessions.touch(tx, s.id, 7);
     return { kept: tx, s, u };
@@ -710,13 +710,13 @@ test("#807 P1c-6: sessions run on the handle they're given", async () => {
 // #807 P1c-7: the users store's writes run on the handle they're given, as P1c-6's sessions do.
 test("#807 P1c-7: user writes run on the handle they're given", async () => {
   const { repo } = openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
-  const { kept, u } = await seed(repo, tx => ({ kept: tx, u: repo.users.upsertByEmail(tx, "a@example.com", null) }));
+  const { kept, u } = await seed(repo, async tx => ({ kept: tx, u: await repo.users.upsertByEmail(tx, "a@example.com", null) }));
   const settled = /used after its transaction settled/;
-  expect(() => repo.users.upsertByEmail(kept, "b@example.com", null)).toThrow(settled);
-  expect(() => repo.users.signIn(kept, GOOGLE_ISSUER, "s-1", "c@example.com", null)).toThrow(settled);
-  expect(() => repo.users.clearSubject(kept, u.id)).toThrow(settled);
-  expect(() => repo.users.setDisabled(kept, u.id, true)).toThrow(settled);
-  expect(() => repo.users.setDisabled({} as Tx, u.id, true)).toThrow("not a SQLite store handle");
+  await expect(repo.users.upsertByEmail(kept, "b@example.com", null)).rejects.toThrow(settled);
+  await expect(repo.users.signIn(kept, GOOGLE_ISSUER, "s-1", "c@example.com", null)).rejects.toThrow(settled);
+  await expect(repo.users.clearSubject(kept, u.id)).rejects.toThrow(settled);
+  await expect(repo.users.setDisabled(kept, u.id, true)).rejects.toThrow(settled);
+  await expect(repo.users.setDisabled({} as Tx, u.id, true)).rejects.toThrow("not a SQLite store handle");
   expect(repo.users.findByEmail("b@example.com")).toBeUndefined();
   expect(repo.users.findByEmail("c@example.com")).toBeUndefined();
   expect(repo.users.findById(u.id)?.disabled_at).toBeNull();
@@ -764,41 +764,41 @@ test("#807 P1c-8: the OAuth store runs on the handle it's given", async () => {
 test("#807 P1c-9: the Slack store runs on the handle it's given", async () => {
   const { repo } = openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
   const t = { thread_ts: "1.1", kind: "dm" as const, board: null, root_id: 1, peer: null, last_id: 1 };
-  const { kept, u } = await seed(repo, tx => {
-    const u = repo.users.upsertByEmail(tx, "a@example.com", null);
-    repo.slack.link(tx, u.id, "U1", "D1");
-    repo.slack.addThread(tx, u.id, t);
-    repo.slack.setProgress(tx, u.id, "dm:1", { posted: true });
+  const { kept, u } = await seed(repo, async tx => {
+    const u = await repo.users.upsertByEmail(tx, "a@example.com", null);
+    await repo.slack.link(tx, u.id, "U1", "D1");
+    await repo.slack.addThread(tx, u.id, t);
+    await repo.slack.setProgress(tx, u.id, "dm:1", { posted: true });
     return { kept: tx, u };
   });
   const settled = /used after its transaction settled/;
   const s = repo.slack;
-  expect(() => s.link(kept, u.id, "U2", "D2")).toThrow(settled);
-  expect(() => s.unlink(kept, u.id)).toThrow(settled);
-  expect(() => s.addThread(kept, u.id, { ...t, thread_ts: "2.2" })).toThrow(settled);
-  expect(() => s.advanceThread(kept, u.id, "1.1", 9)).toThrow(settled);
-  expect(() => s.setProgress(kept, u.id, "dm:1", { posted: false })).toThrow(settled);
-  expect(() => s.clearProgress(kept, u.id, "dm:1")).toThrow(settled);
-  expect(() => s.links(kept)).toThrow(settled);
+  await expect(s.link(kept, u.id, "U2", "D2")).rejects.toThrow(settled);
+  await expect(s.unlink(kept, u.id)).rejects.toThrow(settled);
+  await expect(s.addThread(kept, u.id, { ...t, thread_ts: "2.2" })).rejects.toThrow(settled);
+  await expect(s.advanceThread(kept, u.id, "1.1", 9)).rejects.toThrow(settled);
+  await expect(s.setProgress(kept, u.id, "dm:1", { posted: false })).rejects.toThrow(settled);
+  await expect(s.clearProgress(kept, u.id, "dm:1")).rejects.toThrow(settled);
+  await expect(s.links(kept)).rejects.toThrow(settled);
   expect(() => s.linkFor(kept, u.id)).toThrow(settled);
-  expect(() => s.linkBySlackUser(kept, "U1")).toThrow(settled);
-  expect(() => s.thread(kept, u.id, "dm", null, 1)).toThrow(settled);
-  expect(() => s.threadByTs(kept, u.id, "1.1")).toThrow(settled);
-  expect(() => s.progress(kept, u.id, "dm:1")).toThrow(settled);
+  await expect(s.linkBySlackUser(kept, "U1")).rejects.toThrow(settled);
+  await expect(s.thread(kept, u.id, "dm", null, 1)).rejects.toThrow(settled);
+  await expect(s.threadByTs(kept, u.id, "1.1")).rejects.toThrow(settled);
+  await expect(s.progress(kept, u.id, "dm:1")).rejects.toThrow(settled);
   expect(() => s.linkFor({} as Tx, u.id)).toThrow("not a SQLite store handle");
-  expect(s.links(repo.read)).toMatchObject([{ user_id: u.id, slack_user: "U1", dm_channel: "D1" }]);
-  expect(s.linkBySlackUser(repo.read, "U2")).toBeUndefined();
-  expect(s.threadByTs(repo.read, u.id, "1.1")?.last_id).toBe(1);
-  expect(s.thread(repo.read, u.id, "dm", null, 1)?.thread_ts).toBe("1.1");
-  expect(s.threadByTs(repo.read, u.id, "2.2")).toBeUndefined();
-  expect(s.progress(repo.read, u.id, "dm:1")).toEqual({ posted: true });
+  expect(await s.links(repo.read)).toMatchObject([{ user_id: u.id, slack_user: "U1", dm_channel: "D1" }]);
+  expect(await s.linkBySlackUser(repo.read, "U2")).toBeUndefined();
+  expect((await s.threadByTs(repo.read, u.id, "1.1"))?.last_id).toBe(1);
+  expect((await s.thread(repo.read, u.id, "dm", null, 1))?.thread_ts).toBe("1.1");
+  expect(await s.threadByTs(repo.read, u.id, "2.2")).toBeUndefined();
+  expect(await s.progress(repo.read, u.id, "dm:1")).toEqual({ posted: true });
 });
 
 // #807 P1c-10: the teams store's writes run on the handle they're given, as P1c-7's users writes do.
 test("#807 P1c-10: team writes run on the handle they're given", async () => {
   const { repo } = openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
-  const { kept, t, a, b } = await seed(repo, tx => {
-    const a = repo.users.upsertByEmail(tx, "a@example.com", null), b = repo.users.upsertByEmail(tx, "b@example.com", null);
+  const { kept, t, a, b } = await seed(repo, async tx => {
+    const a = await repo.users.upsertByEmail(tx, "a@example.com", null), b = await repo.users.upsertByEmail(tx, "b@example.com", null);
     const t = repo.teams.create(tx, "ops", a.id);
     repo.teams.addMember(tx, t.id, a.id, "owner");
     return { kept: tx, t, a, b };
@@ -819,8 +819,8 @@ test("#807 P1c-10: team writes run on the handle they're given", async () => {
 // resolves the handle before it reads any argument, so a kept Tx is refused whatever the rest of the call says.
 test("#807 P1c-11: hosted writes run on the handle they're given", async () => {
   const { repo } = openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
-  const { kept, row } = await seed(repo, tx => {
-    const u = repo.users.upsertByEmail(tx, "a@example.com", null);
+  const { kept, row } = await seed(repo, async tx => {
+    const u = await repo.users.upsertByEmail(tx, "a@example.com", null);
     const ownership = repo.hosted.start(tx, "root-1", u.id, "test", 1);
     const row = { session_id: "root-1", ownership_id: ownership, user_id: u.id, client_id: "test", grant_id: "g", source_session_id: "root-1",
       writes_as: null, bind_gen: 0, root_session_id: null, place: null, lease_deadline: null, created_at: 1, last_seen_at: 1, suggested: null, parked_at: null };
@@ -855,8 +855,8 @@ test("#807 P1c-11: hosted writes run on the handle they're given", async () => {
 // #807 P1c-12: the hosted store's reads run on the handle they're given, as P1c-6's sessions reads do.
 test("#807 P1c-12: hosted reads run on the handle they're given", async () => {
   const { repo } = openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
-  const { kept, u } = await seed(repo, tx => {
-    const u = repo.users.upsertByEmail(tx, "a@example.com", null);
+  const { kept, u } = await seed(repo, async tx => {
+    const u = await repo.users.upsertByEmail(tx, "a@example.com", null);
     const ownership = repo.hosted.start(tx, "root-1", u.id, "test", 1);
     repo.hosted.insert(tx, { session_id: "root-1", ownership_id: ownership, user_id: u.id, client_id: "test", grant_id: "g", source_session_id: "root-1",
       writes_as: null, bind_gen: 0, root_session_id: null, place: null, lease_deadline: 5, created_at: 1, last_seen_at: 1, suggested: null, parked_at: null });
@@ -889,8 +889,8 @@ test("#807 P1c-12: hosted reads run on the handle they're given", async () => {
 // #807 P1c-13: the aliases store runs on the handle it's given, as P1c-6's sessions do.
 test("#807 P1c-13: the aliases store runs on the handle it's given", async () => {
   const { repo } = openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
-  const { kept } = await seed(repo, tx => {
-    repo.users.upsertByEmail(tx, "a@example.com", null);
+  const { kept } = await seed(repo, async tx => {
+    await repo.users.upsertByEmail(tx, "a@example.com", null);
     repo.aliases.create(tx, person("a@example.com", "fe"), "a@example.com");
     // Read inside the body that wrote it, on its Tx.
     expect(repo.aliases.find(tx, "a@example.com/fe")?.name).toBe("fe");
@@ -965,8 +965,8 @@ test("#807 P1c-14b: the messages reads and aliases.seen run on the handle they'r
   const { repo, db } = openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
   const [id, peer] = ["id:s1", "b@example.com/be"];
   const m = repo.messages;
-  const { kept, root, reply } = await seed(repo, tx => {
-    repo.users.upsertByEmail(tx, "b@example.com", null);
+  const { kept, root, reply } = await seed(repo, async tx => {
+    await repo.users.upsertByEmail(tx, "b@example.com", null);
     repo.aliases.create(tx, person("b@example.com", "be"), "b@example.com");
     const root = m.insert(tx, peer, "user", id, "root", null, true);
     const reply = m.insert(tx, id, "user", peer, "reply", root.id);

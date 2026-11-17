@@ -57,11 +57,11 @@ export type SignInProvider = Pick<IdentityProvider, "id" | "label" | "issuer">;
 // signing in what an admin can do and reaches the OAuth client as its error_description; `detail` joins each audit row, and `known`
 // names the provider holding an email another issuer holds. Callers run it
 // inside repo.write, passing its Tx.
-export function idpSignIn(
+export async function idpSignIn(
   repo: Repo, tx: Tx, provider: SignInProvider, identity: Omit<UpstreamIdentity, "issuer">,
   detail: Record<string, unknown> = {}, known: readonly SignInProvider[] = [provider],
-): { user: User } | { refused: string } {
-  const r = repo.users.signIn(tx, provider.issuer, identity.subject, identity.email, identity.displayName);
+): Promise<{ user: User } | { refused: string }> {
+  const r = await repo.users.signIn(tx, provider.issuer, identity.subject, identity.email, identity.displayName);
   const audited = { provider: provider.id, issuer: provider.issuer, ...detail };
   const fix = (email: string) => `an admin runs grayboard admin unlink-idp --email ${email}`;
   if (r.status === "issuer_mismatch") {

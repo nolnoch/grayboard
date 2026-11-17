@@ -28,10 +28,10 @@ let access: ReturnType<typeof serverAccess>;
 
 beforeEach(async () => {
   ({ repo, db } = openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) }));
-  await seed(repo, tx => {
-    const wade = repo.users.upsertByEmail(tx, "wade@example.com", null);
-    const bob = repo.users.upsertByEmail(tx, "bob@example.com", null);
-    const eve = repo.users.upsertByEmail(tx, "eve@example.com", null);
+  await seed(repo, async tx => {
+    const wade = await repo.users.upsertByEmail(tx, "wade@example.com", null);
+    const bob = await repo.users.upsertByEmail(tx, "bob@example.com", null);
+    const eve = await repo.users.upsertByEmail(tx, "eve@example.com", null);
     const eng = repo.teams.create(tx, "eng", wade.id);
     repo.teams.addMember(tx, eng.id, wade.id);
     repo.teams.addMember(tx, eng.id, bob.id);

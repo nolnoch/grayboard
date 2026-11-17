@@ -26,15 +26,18 @@ describe("OAuth domain store", () => {
   let code: OAuthCode;
   const sessionHash = h("browser-session");
   // The store's writes run in each connection's write queue, as a request's do.
-  const w1 = <T>(fn: (tx: Tx) => Sync<T>) => seed(first.repo, fn);
+  // w1 takes an async body too: the users writes answer with a promise (#807 P3 A6b).
+  function w1<T>(fn: (tx: Tx) => Promise<T>): Promise<Awaited<T>>;
+  function w1<T>(fn: (tx: Tx) => Sync<T>): Promise<Awaited<T>>;
+  function w1<T>(fn: (tx: Tx) => T): Promise<Awaited<T>> { return seed(first.repo, fn as (tx: Tx) => Promise<T>); }
   const w2 = <T>(fn: (tx: Tx) => Sync<T>) => seed(second.repo, fn);
   beforeEach(async () => {
     dir = mkdtempSync(join(tmpdir(), "grayboard-oauth-"));
     const opts = { blobDir: join(dir, "blobs") };
     first = openDatabase(join(dir, "db.sqlite"), opts);
     second = openDatabase(join(dir, "db.sqlite"), opts);
-    await w1(tx => {
-      userId = first.repo.users.upsertByEmail(tx, "you@example.com", null).id;
+    await w1(async tx => {
+      userId = (await first.repo.users.upsertByEmail(tx, "you@example.com", null)).id;
       expect(first.repo.oauth.createBrowserSession(tx, { sessionHash, userId, createdAt: start, expiresAt: start + OAUTH_TTL.browser }, start).status).toBe("ok");
     });
     request = { ...binding, requestHash: h("request"), browserHash: h("browser"), csrfHash: h("csrf"), stateHash: h("state"), consentSessionHash: null, createdAt: start, expiresAt: start + OAUTH_TTL.request };
