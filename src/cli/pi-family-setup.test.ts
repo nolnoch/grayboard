@@ -6,7 +6,7 @@
 // changes nothing for pi, and leaving a hosted install's server signs the
 // harness out of it, revoking its grant.
 import { afterEach, expect, test } from "bun:test";
-import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Login } from "../../adapters/hosted-core/src/login.ts";
@@ -220,6 +220,44 @@ test("refresh-adapters migrates an omp local install's enabled entry to the disa
   expect(JSON.parse(readFileSync(f.paths.mcp, "utf8")).mcpServers.other).toEqual({ command: "x" });
   // A second refresh changes nothing.
   expect(f.run("refresh-adapters")).not.toContain("Disabled the grayboard entry");
+}, 60_000);
+
+// #439: an mcp.json holding JSON null has nothing to keep, so setup writes
+// the entry into it; one holding an array or a scalar would be lost, so setup
+// refuses and leaves it alone.
+test("setup writes into an mcp.json holding JSON null and refuses one holding an array", () => {
+  const f = fixture();
+  mkdirSync(f.dir, { recursive: true });
+  writeFileSync(f.paths.mcp, "null");
+  f.run("setup", "--local", "-y");
+  expectLocal(f);
+
+  writeFileSync(f.paths.mcp, "[1]");
+  const r = f.exec(["setup", "--local", "-y"]);
+  expect(r.exitCode).not.toBe(0);
+  expect(r.stderr).toContain(`Can't parse ${f.paths.mcp}: it holds a JSON array, not an object`);
+  expect(readFileSync(f.paths.mcp, "utf8")).toBe("[1]");
+}, 60_000);
+
+// #439: the rewrite is a temp file renamed over the config, so it must land
+// at a symlink's target (the link stays), keep the file's mode, and leave no
+// temp file behind.
+test("setup rewrites a symlinked mcp.json at its target, keeping the link and the mode", () => {
+  const f = fixture();
+  const dotfiles = join(f.root, "dotfiles");
+  mkdirSync(dotfiles);
+  mkdirSync(f.dir, { recursive: true });
+  const target = join(dotfiles, "mcp.json");
+  writeFileSync(target, JSON.stringify({ mcpServers: { other: { command: "x" } } }));
+  chmodSync(target, 0o600);
+  symlinkSync(target, f.paths.mcp);
+  f.run("setup", "--local", "-y");
+  expect(lstatSync(f.paths.mcp).isSymbolicLink()).toBe(true);
+  expectLocal(f);
+  expect(JSON.parse(readFileSync(target, "utf8")).mcpServers.other).toEqual({ command: "x" });
+  expect(lstatSync(target).mode & 0o777).toBe(0o600);
+  expect(readdirSync(dotfiles)).toEqual(["mcp.json"]);
+  expect(readdirSync(f.dir).filter(n => n.endsWith(".tmp"))).toEqual([]);
 }, 60_000);
 
 test("setup upgrades an existing raw local omp adapter in place to the bundle", () => {

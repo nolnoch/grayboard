@@ -1,7 +1,8 @@
 // The grayboard CLI. Loaded by main.ts (the entry) for every command but a
 // hook, so a hook doesn't pay for this module's imports (#551).
 import { Command } from "commander";
-import { writeFileSync, mkdirSync, readFileSync, existsSync, chmodSync, rmSync, lstatSync, readSync } from "node:fs";
+import { writeFileSync, mkdirSync, readFileSync, existsSync, chmodSync, rmSync, lstatSync, readSync, realpathSync, statSync, openSync, fchmodSync, writeSync, fsyncSync, closeSync, renameSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join, basename, dirname, resolve } from "node:path";
 import { loginThroughServer } from "./oauth_flow.ts";
@@ -124,8 +125,7 @@ async function installPiFamily(h: PiFamily, server: string | undefined, entry?: 
   }
   // The entry next: an unparseable mcp.json throws before any file changes.
   const existing = readConfig<Record<string, Record<string, Entry> | undefined>>(h.config.path, {})[h.config.section]?.grayboard;
-  // `?.`: the file may hold JSON null.
-  const old = readConfig<{ url?: unknown }>(h.hostedConfig, {})?.url;
+  const old = readConfig<{ url?: unknown }>(h.hostedConfig, {}).url;
   if (typeof old === "string" && old !== url) {
     const note = await signOutPiFamily(h, old);
     if (note) notes.push(note);
@@ -182,17 +182,45 @@ function writeAdapter(path: string, source: string): void {
   writeFileSync(path, source);
 }
 
-/** A harness's JSON config, or `empty` when the file doesn't exist. Throws when it can't be parsed. */
+/**
+ * A harness's JSON config, or `empty` when the file doesn't exist or holds
+ * JSON null (nothing to keep). Throws when it can't be parsed, or holds an
+ * array or a scalar, which a rewrite would lose.
+ */
 function readConfig<T extends object>(path: string, empty: T): T {
   if (!existsSync(path)) return empty;
-  try { return JSON.parse(readFileSync(path, "utf8")); } catch (e) {
+  let value: unknown;
+  try { value = JSON.parse(readFileSync(path, "utf8")); } catch (e) {
     throw new Error(`Can't parse ${path}: ${(e as Error).message}`);
   }
+  if (value === null) return empty;
+  if (typeof value !== "object" || Array.isArray(value)) throw new Error(`Can't parse ${path}: it holds a JSON ${Array.isArray(value) ? "array" : typeof value}, not an object`);
+  return value as T;
 }
 
+/**
+ * Replace a harness's JSON config atomically (#439): a temp file beside it,
+ * synced, then renamed over it, so a crash leaves the old file or the new
+ * one, never a truncated one. A symlinked config is written at its target,
+ * keeping the link, and an existing file keeps its mode.
+ */
 function writeConfig(path: string, cfg: object): void {
-  mkdirSync(dirname(path), { recursive: true });
-  writeFileSync(path, JSON.stringify(cfg, null, 2) + "\n");
+  let target = path;
+  let mode: number | undefined;
+  try { target = realpathSync(path); mode = statSync(target).mode & 0o7777; } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
+  }
+  mkdirSync(dirname(target), { recursive: true });
+  const temp = `${target}.grayboard-${process.pid}-${randomUUID()}.tmp`;
+  const fd = openSync(temp, "wx", mode ?? 0o666);
+  try {
+    try {
+      if (mode !== undefined) fchmodSync(fd, mode); // the umask may have narrowed it
+      writeSync(fd, JSON.stringify(cfg, null, 2) + "\n");
+      fsyncSync(fd);
+    } finally { closeSync(fd); }
+    renameSync(temp, target);
+  } catch (e) { rmSync(temp, { force: true }); throw e; }
 }
 
 /** Write `entry` (or reshape the existing one by `c.local`) as the harness's grayboard entry; true when the file changed. */
