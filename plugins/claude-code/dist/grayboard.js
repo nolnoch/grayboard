@@ -38626,11 +38626,14 @@ function createPlugin(o) {
     const dir = join8(sessionDir(config.dataDir, o.claude.pid), "ended");
     try {
       mkdirSync3(dir, { recursive: true, mode: 448 });
-      endWatch = watch(dir, () => drainEnded());
-      endWatch.on("error", (error) => {
-        say(`stopped watching subagent ends: ${message(error)}; they end at the next subagent call, or with this session`);
-        endWatch?.close();
+      const watcher = watch(dir, () => drainEnded());
+      watcher.on("error", (error) => {
+        say(`stopped watching subagent ends: ${message(error)}; they end at the next subagent call, which watches again`);
+        watcher.close();
+        if (endWatch === watcher)
+          endWatch = undefined;
       });
+      endWatch = watcher;
     } catch (error) {
       say(`couldn't watch subagent ends: ${message(error)}; they end at the next subagent call, or with this session`);
     }

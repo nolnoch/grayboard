@@ -330,7 +330,7 @@ export function createPlugin(o: PluginOptions): Plugin {
   // Watched once the first child call shows the session's record dir exists,
   // or from startup when an earlier process noted a child's call (#555),
   // and drained by every child call too, so a missed or coalesced watch event
-  // (or a failed watch) delays an end by one call at most.
+  // (or a failed watch, retried at that call) delays an end by one call at most.
   let endWatch: FSWatcher | undefined;
   const drainEnded = () => {
     if ("error" in config || closed) return;
@@ -348,8 +348,14 @@ export function createPlugin(o: PluginOptions): Plugin {
     const dir = join(sessionDir(config.dataDir, o.claude.pid), "ended");
     try {
       mkdirSync(dir, { recursive: true, mode: 0o700 });
-      endWatch = watch(dir, () => drainEnded());
-      endWatch.on("error", error => { say(`stopped watching subagent ends: ${message(error)}; they end at the next subagent call, or with this session`); endWatch?.close(); });
+      const watcher = watch(dir, () => drainEnded());
+      // A failed watch is dropped, so the next subagent call watches again (#555 item 10).
+      watcher.on("error", error => {
+        say(`stopped watching subagent ends: ${message(error)}; they end at the next subagent call, which watches again`);
+        watcher.close();
+        if (endWatch === watcher) endWatch = undefined;
+      });
+      endWatch = watcher;
     } catch (error) { say(`couldn't watch subagent ends: ${message(error)}; they end at the next subagent call, or with this session`); }
     drainEnded();
   };
