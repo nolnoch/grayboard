@@ -557,15 +557,18 @@ try {
       await app.repo.aliases.create(tx, { scope_kind: "person", scope_ref: "you@example.com", name: "spare" }, "you@example.com");
       await app.repo.messages.insert(tx, "you@example.com/sim", "user", "you@example.com/spare", "Fixture queued for spare", null, false);
     });
-    await host.mcp.connect({ server: "grayboard", location }); await wait(() => ctx.tool.list(), ts => ts.some(t => t.id === "grayboard_bind"), "native tools after reconnect");
+    // connect resolves after the reconnect's initialize, which reads the server's new instructions.
+    // The alias and its queued DM stay: a later step asserting an unenrolled root's text sees "spare" listed.
+    await host.mcp.connect({ server: "grayboard", location });
     const changed = "The following MCP server instructions have changed. Each entry replaces the previously listed server with the same name:";
     const prior = modelRequests.length;
     await invoke(plain.id, "whoami", {});
-    const notices = (await host.session.context({ sessionID: plain.id }) as unknown as { type: string; text?: string; metadata?: { notice?: string } }[])
-      .filter(m => m.type === "system" && m.metadata?.notice === "instructions");
-    assert.equal(notices.length, 1, "OpenCode persisted one instructions-changed system message");
+    const context = await host.session.context({ sessionID: plain.id }) as unknown as { type: string; text?: string; metadata?: { notice?: string } }[];
+    const notices = context.filter(m => m.type === "system" && m.metadata?.notice === "instructions");
+    assert.equal(notices.length, 1, `OpenCode persisted one instructions-changed system message; the context's system messages: ${JSON.stringify(context.filter(m => m.type === "system"))}`);
     const stored = notices[0]!.text ?? "";
-    assert(stored.startsWith(changed) && stored.includes(unbound) && stored.includes("spare (1 queued DM"), "The persisted message carries OpenCode's changed session-less text");
+    assert(stored.startsWith(changed), `The persisted message starts with OpenCode's changed header: ${JSON.stringify(stored)}`);
+    assert(stored.includes(unbound) && stored.includes("spare (1 queued DM"), `The persisted message carries the changed session-less text: ${JSON.stringify(stored)}`);
     const request = modelRequests.slice(prior).findLast(r => r.sessionID === plain.id && r.body.includes(changed));
     assert(request, "The root's next model request carries the persisted message");
     const update = (JSON.parse(request.body).messages as { role: string; content: string | { text?: string }[] }[]).filter(m => JSON.stringify(m.content).includes(changed));
@@ -574,8 +577,8 @@ try {
     assert.equal(update[0]!.role, "user", "OpenAI-compatible chat has no mid-conversation system role: the update is a wrapped user turn");
     assert(updateText.includes("<system-update>\n" + changed), "OpenCode lowered the role-system message as a <system-update>");
     // Only the context hook's role-"system" pass rewrites a message's entry; the lowering escapes the frame.
-    assert(updateText.includes(`&lt;server name="grayboard"&gt;\n${codeMode ? "    Use tools from this server through `execute` under `tools[\"grayboard\"]`.\n" : ""}    ${boundAs("plain")}`), "The persisted message's grayboard entry carries the root's current text");
-    assert(!updateText.includes(unbound) && !updateText.includes("spare ("), "and not the session-less unbound text");
+    assert(updateText.includes(`&lt;server name="grayboard"&gt;\n${codeMode ? "    Use tools from this server through `execute` under `tools[\"grayboard\"]`.\n" : ""}    ${boundAs("plain")}`), `The persisted message's grayboard entry carries the root's current text: ${JSON.stringify(updateText)}`);
+    assert(!updateText.includes(unbound) && !updateText.includes("spare ("), `and not the session-less unbound text: ${JSON.stringify(updateText)}`);
     text = said(plain.id, changed);
     assert(text.includes(boundAs("plain")) && !text.includes(unbound) && !text.includes("spare ("), "Nothing in the request carries the session-less text");
     console.log("REAL_INSTRUCTIONS_PERSISTED_OK", { role: update[0]!.role, stored: stored.split("\n").slice(0, 3) });
