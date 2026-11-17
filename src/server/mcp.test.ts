@@ -575,7 +575,8 @@ test("actual access revocation between factory and dispatch prevents mutation", 
   const revokeOnFirst = (principal: OAuthPrincipal) => {
     if (++checks === 1) revoking = seed(store.repo, tx => store.repo.oauth.revokeToken(tx, principal.accessHash, principal.clientId, Date.now()));
   };
-  // Selection checks through the async form, dispatch through the synchronous one (#807 P3 A7c): either may be first.
+  // Selection and dispatch both check through the async form (#807 P3 A7d2b); the synchronous patch stays for the
+  // resources callback until A7d2c. Either check may be first.
   oauth.isAuthorized = async principal => { const valid = await original(principal); revokeOnFirst(principal); return valid; };
   oauth.isAuthorizedNow = principal => { const valid = originalNow(principal); revokeOnFirst(principal); return valid; };
   try {

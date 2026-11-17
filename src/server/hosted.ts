@@ -539,16 +539,19 @@ export function createHostedSessions(application: Application, options: { now?: 
         const later = refusalRows();
         // Checked outside the transaction, where the auth cache serves it (#853); an idle queue runs the body below
         // inside write(). The check awaits (#807 P3 A7d2), so a body holding the queue meanwhile can commit a disable or
-        // revoke and release it before write() is called: `g`, the generation the check read under, compared in the
+        // revoke and release it before write() is called: `g`, the generation read just before the check, compared in the
         // same synchronous run as write(), says whether anything that moves it committed since. A body that waited
         // behind another, or ran after such a commit, checks again in the transaction (uncached), so settle's
         // premise holds either way. Equal generations prove nothing committed between them only where a commit moves
         // the generation synchronously (SQLite's counter); a store without one returns undefined, and every body
-        // checks again. withGate never runs inside an authRead body, whose pin would answer both reads alike.
-        const g = await repo.authRead(async () => { await authorized(p); return repo.authGeneration(); });
+        // checks again (Repo.commitGeneration). `g` is read before the check, so a commit during the check's awaits
+        // moves the generation past it and makes the body stale.
+        let g: string | undefined;
+        try { g = repo.commitGeneration(); } catch { g = undefined; }
+        await repo.authRead(() => authorized(p));
         await testPauseAsync("hosted:gate:checked");
         let waited = false, stale = true;
-        try { stale = g === undefined || repo.authGeneration() !== g; } catch { stale = true; }
+        try { stale = g === undefined || repo.commitGeneration() !== g; } catch { stale = true; }
         // One queued body: settle commits whether or not rowFor refuses (rowFor's savepoint rolls back alone, and its
         // refusal rows are written after it, in the same commit), and nothing runs between them, so `settled` is
         // current when rowFor reads it.

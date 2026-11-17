@@ -254,6 +254,12 @@ export interface Repo {
   // mean no committed write to oauth_tokens, oauth_grants or users from this connection, and no commit at all from
   // another, came between them (#899).
   authGeneration(): string | undefined;
+  // The generation read now, never authRead's pin, where every commit to oauth_tokens, oauth_grants or users moves it
+  // before the committing body releases the write queue (SQLite: the commit hook and data_version); undefined inside
+  // the caller's own transaction, after a failed counter read, and on a store whose generation can lag a commit (an
+  // outside writer's notice still in flight). The hosted gate reads equal values as "no auth commit between them"
+  // (#807 P3 A7d2b), which only this contract makes sound; authGeneration's equality (#899) promises less.
+  commitGeneration(): string | undefined;
   oauth: OAuthStore;
   hosted: HostedStore;
   users: {
@@ -1097,6 +1103,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       return { generation, access: (h, resource, now) => heldAccess(generation, `${resource}\n${h}`, now) };
     },
     authGeneration,
+    commitGeneration: () => ownsTx(db) ? undefined : readGeneration(),
 
     oauth: { ...oauth, findActiveAccess, redeemCode: change(oauth.redeemCode), rotateRefresh: change(oauth.rotateRefresh), revokeToken: change(oauth.revokeToken) },
     hosted: { ...hostedStore, insert: marks(hosted.insert, (_tx, row) => row.session_id), update: marks(hosted.update, (_tx, row) => row.session_id),
