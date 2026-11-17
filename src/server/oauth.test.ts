@@ -94,6 +94,7 @@ for (const kind of ["multiline", "getter", "proxy"] as const) test(`OAuth limite
     return interval(fn, ms, ...args);
   }) as typeof setInterval);
   try { service = makeService(); } finally { timers.mockRestore(); }
+  await storage.repo.write(() => {}); // startup's async revocation writes hold the queue; the tick below runs once they're done
   const request = new Request(base + "/oauth/unknown");
   const key = "PRIVATE-ADDRESS";
   expect((await service.fetch(request, { key }))!.status).toBe(405);
@@ -108,6 +109,7 @@ for (const kind of ["multiline", "getter", "proxy"] as const) test(`OAuth limite
     expect(callbacks.at(-1)!).not.toThrow();
     expect(reads).toBe(0);
     expect(log.mock.calls).toEqual([[`[grayboard] {"operation":"rate_limit.end","category":"failure","level":"error","class":"${kind === "proxy" ? "non-error" : "Error"}"}`]]);
+    await storage.repo.write(() => {}); // the tick's async cleanup holds the queue; the retry runs once it's done
     storage.repo.audit.write = write;
     callbacks.at(-1)!(); callbacks.at(-1)!();
     const ended = storage.db.query<{ detail: string }, []>("SELECT detail FROM access_log WHERE action='oauth.rate_limit_ended'").all();
@@ -207,6 +209,22 @@ test("CIMD consent heads with the client host, quotes the self-declared name esc
   expect(page.headers.get("Content-Security-Policy")).toBe("default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'self' http://127.0.0.1:34567");
   expect((await decide(browser, consent, "approve", "null")).status).toBe(403);
   expect((await decide(browser, consent)).status).toBe(303);
+});
+
+test("a consent page whose flow ends while its store reads await refuses (#807 P3 A6c)", async () => {
+  service.close();
+  const interval = spyOn(globalThis, "setInterval");
+  service = makeService();
+  const tick = interval.mock.calls[0]![0] as () => void;
+  interval.mockRestore();
+  const browser = new Browser();
+  const consent = await loginConsent(browser, authorization().url);
+  const bind = storage.repo.oauth.bindRequestSession;
+  // The flow lapses and the sweep drops it between the binding's read and consent's use of the flow.
+  storage.repo.oauth.bindRequestSession = async (...a) => { const out = await bind(...a); clock += OAUTH_TTL.request; tick(); return out; };
+  try {
+    expect((await browser.request(base + "/oauth/consent?request=" + consent.request)).status).toBe(400);
+  } finally { storage.repo.oauth.bindRequestSession = bind; }
 });
 
 test("only listed metadata documents are clients: no fetch, audit, no redirect; de-listing ends refresh (F-16)", async () => {
@@ -463,12 +481,14 @@ test("OAuth sweep and upstream diagnostics never inspect exception strings, stac
   service = makeService();
   const tick = interval.mock.calls[0]![0] as () => void;
   interval.mockRestore();
+  await storage.repo.write(() => {}); // as above: the tick runs on an idle queue, as it does 60s after startup
   const cleanup = storage.repo.oauth.cleanup;
   const forged = new Error("Bearer PRIVATE\n    at f (/private/refresh-token.ts:1:1)", { cause: "AUTHORIZATION-CODE" });
   const log = spyOn(console, "error").mockImplementation(() => {});
-  storage.repo.oauth.cleanup = () => { throw forged; };
+  storage.repo.oauth.cleanup = async () => { throw forged; };
   try {
     tick();
+    await until(() => log.mock.calls.length > 0, 5000, "the sweep's cleanup failure is logged");
     expect(log.mock.calls.flat()).toEqual(['[grayboard] {"operation":"oauth.sweep","category":"failure","level":"error","class":"Error"}']);
   } finally { storage.repo.oauth.cleanup = cleanup; }
   try {

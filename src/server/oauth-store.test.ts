@@ -82,7 +82,9 @@ describe("OAuth domain store", () => {
     for (const change of [{ clientId: "foreign" }, { resource: "wrong" }, { scopes: ["grayboard:delivery"] }, { redirectUri: "https://evil.example/cb" }, { codeChallenge: "B".repeat(43) }, { codeHash: h("wrong") }, { grantExpiresAt: start + OAUTH_TTL.grant + 1 }, { tokens: { ...input.tokens, scopes: ["grayboard:delivery"] } }, { tokens: { ...input.tokens, accessHash: "raw-secret" } }, { tokens: { ...input.tokens, refreshExpiresAt: start + OAUTH_TTL.refresh + 1 } }]) {
       expect((await w1(tx => first.repo.oauth.redeemCode(tx, { ...input, ...change }, start))).status).not.toBe("ok");
     }
-    const results = await Promise.all([w1(tx => first.repo.oauth.redeemCode(tx, input, start)), w2(tx => second.repo.oauth.redeemCode(tx, { ...input, grantId: "grant_2222222222222222", tokens: pair() }, start))]);
+    // Sequential, not Promise.all: an async body holds BEGIN IMMEDIATE across awaits, and two in-process
+    // connections would block the one JS thread on busy_timeout. The overlapping case is the two-process test.
+    const results = [await w1(tx => first.repo.oauth.redeemCode(tx, input, start)), await w2(tx => second.repo.oauth.redeemCode(tx, { ...input, grantId: "grant_2222222222222222", tokens: pair() }, start))];
     expect(results.map(r => r.status).sort()).toEqual(["ok", "replay"]);
     expect(first.repo.oauth.findActiveAccess(first.repo.read, input.tokens.accessHash, binding.resource, binding.scopes, start)).toBeUndefined();
     expect(first.repo.oauth.isGrantActive(first.repo.read, input.grantId, start)).toBe(false);
@@ -168,7 +170,9 @@ describe("OAuth domain store", () => {
   test("refresh race winner is revoked by strict replay from the other connection", async () => {
     const input = await issue();
     const a = pair(start + 1), b = pair(start + 1);
-    const results = await Promise.all([w1(tx => first.repo.oauth.rotateRefresh(tx, { ...binding, refreshHash: input.tokens.refreshHash, tokens: a }, start + 1)), w2(tx => second.repo.oauth.rotateRefresh(tx, { ...binding, refreshHash: input.tokens.refreshHash, tokens: b }, start + 1))]);
+    // Sequential, not Promise.all: an async body holds BEGIN IMMEDIATE across awaits, and two in-process
+    // connections would block the one JS thread on busy_timeout. The overlapping case is the two-process test.
+    const results = [await w1(tx => first.repo.oauth.rotateRefresh(tx, { ...binding, refreshHash: input.tokens.refreshHash, tokens: a }, start + 1)), await w2(tx => second.repo.oauth.rotateRefresh(tx, { ...binding, refreshHash: input.tokens.refreshHash, tokens: b }, start + 1))];
     expect(results.map(r => r.status).sort()).toEqual(["ok", "replay"]);
     expect(first.repo.oauth.isGrantActive(first.repo.read, input.grantId, start + 1)).toBe(false);
   });

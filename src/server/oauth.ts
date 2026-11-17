@@ -213,7 +213,9 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
     const t = now();
     for (const [h, f] of flows) if (f.expiresAt <= t) { flows.delete(h); if (f.upstream) upstream.delete(f.upstream.stateHash); }
     globalLimit.sweep(); addressLimit.sweep(); tokenAddressLimit.sweep(); siteLimit.sweep(); tokenSiteLimit.sweep(); refusalRows.sweep();
-    repo.post(tx => repo.oauth.cleanup(tx, t), undefined, "oauth cleanup");
+    // The store's cleanup is async (#807 P3 A6c), so its failure arrives as a rejection: caught here, as the timer
+    // catches a synchronous one, so neither reaches a log that prints the error itself.
+    repo.write(tx => repo.oauth.cleanup(tx, t)).catch(e => hostedFailure("oauth.sweep", e));
   };
   // A failed housekeeping transaction is retried next tick, never treated as credential failure.
   const timer = setInterval(() => { try { sweep(); } catch (e) { hostedFailure("oauth.sweep", e); } }, 60_000);
@@ -330,7 +332,10 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
     const bound = await repo.oauth.bindRequestSession(tx, r.requestHash, r.browserHash, sessionHash!, now());
     if (bound.status !== "ok") fail();
     const user = repo.users.findById(b!.userId)!;
-    const f = flows.get(r.requestHash)!;
+    // Looked up again after the store's awaits: the flow may have ended meanwhile, and a gone one refuses as getFlow does.
+    const found = flows.get(r.requestHash);
+    if (!found || found.expiresAt <= now()) fail();
+    const f = found!;
     const client = f.client;
     // A metadata-document client is known by its host; the name in its document is its own claim.
     const host = clients.has(client.clientId) ? undefined : new URL(client.clientId).host;
