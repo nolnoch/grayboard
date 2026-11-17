@@ -40,6 +40,8 @@ export function claimsModern(body: unknown): boolean {
   return isPlainObject(meta) && PROTOCOL_VERSION_META_KEY in meta;
 }
 
+// Subscriber calls that end a session: their selection admits no unknown ID (#1097).
+const ENDING_CALLS = new Set<unknown>(["session_end", "delivery_release"]);
 export const MCP_PROTOCOL_VERSIONS = ["2026-07-28", "2025-11-25", "2025-06-18"];
 type CallToolResult = z.infer<typeof CallToolResultSchema>;
 const id = z.number().int().positive();
@@ -137,7 +139,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
   } });
   const hosted = createHostedSessions(application, { now, caps: caps.sessions, ...(opts.idleSeconds ? { idleSeconds: opts.idleSeconds } : {}), isAuthorized: (principal, r) => oauth.isAuthorized(principal, r) });
   const delivery = createDelivery(hosted, { isAuthorized: (principal, r) => oauth.isAuthorized(principal, r), now, caps: caps.leases });
-  type Exchange = { request: Request; address: string; protocol: string; principal?: number; identity?: string; session?: string; tool?: string; logged?: boolean; failure?: ApplicationError; meta?: unknown; id?: string | number | null; method?: unknown; refusal?: Response; context?: Context; legacy?: Legacy };
+  type Exchange = { request: Request; address: string; protocol: string; principal?: number; identity?: string; session?: string; tool?: string; logged?: boolean; failure?: ApplicationError; meta?: unknown; id?: string | number | null; method?: unknown; call?: unknown; refusal?: Response; context?: Context; legacy?: Legacy };
   const exchanges = new AsyncLocalStorage<Exchange>();
   const refusalLogs = new RateLimiter({ burst: 1, perSec: 0.1 }, { start() {}, end() {} }, now, 4096);
   const report = (error: unknown, source: FailureSource = "hosted-sdk", exchange = exchanges.getStore()) => {
@@ -216,8 +218,10 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     let selected: Awaited<ReturnType<typeof hosted.snapshot>>;
     try {
       if (admit) application.admitHosted(principal.authed, "id" in routing ? routing.id : null, role);
-      // A native tool call's end is touched by its tool's gate, which also reuses this selection's verdict (#907).
-      selected = await hosted.snapshot(principal, routing, !(role === "native" && exchanges.getStore()?.method === "tools/call"));
+      // A native tool call's end is touched by its tool's gate, which also reuses this selection's verdict (#907). A
+      // subscriber's ending call admits no unknown ID (#1097): ending must never start a session.
+      const exchange = exchanges.getStore();
+      selected = await hosted.snapshot(principal, routing, !(role === "native" && exchange?.method === "tools/call"), !(role === "subscriber" && ENDING_CALLS.has(exchange?.call)));
     } catch (error) {
       const exchange = exchanges.getStore();
       if (exchange && error instanceof ApplicationError && error.code === "rate_limited" && typeof error.extra.retry_after_ms === "number" && Number.isFinite(error.extra.retry_after_ms) && error.extra.retry_after_ms > 0) {
@@ -739,8 +743,8 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
         const body = post ? await readBody(original) : { request: original, parsedBody: undefined };
         if (body instanceof Response) { releasePost(); return body; }
         const req = body.request;
-        const parsed = body.parsedBody as { id?: string | number | null; method?: unknown; params?: { _meta?: unknown } } | undefined;
-        return await exchanges.run({ ...boundary, request: req, meta: parsed?.params?._meta, id: parsed?.id, method: parsed?.method }, async () => {
+        const parsed = body.parsedBody as { id?: string | number | null; method?: unknown; params?: { _meta?: unknown; name?: unknown } } | undefined;
+        return await exchanges.run({ ...boundary, request: req, meta: parsed?.params?._meta, id: parsed?.id, method: parsed?.method, call: parsed?.method === "tools/call" ? parsed.params?.name : undefined }, async () => {
           const exchange = exchanges.getStore()!;
           let live: Live | undefined;
           let ownHandler: McpHttpHandler | undefined;
