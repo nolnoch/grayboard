@@ -575,6 +575,7 @@ test("actual access revocation between factory and dispatch prevents mutation", 
   const revokeOnFirst = (principal: OAuthPrincipal) => {
     if (++checks === 1) revoking = seed(store.repo, tx => store.repo.oauth.revokeToken(tx, principal.accessHash, principal.clientId, Date.now()));
   };
+  // Selection and dispatch both check through the async form (#807 P3 A7d2b): either may be first.
   oauth.isAuthorized = async principal => { const valid = await original(principal); revokeOnFirst(principal); return valid; };
   try {
     await expect(client.callTool({ name: "board_create", arguments: { name: "blocked", purpose: "must not mutate" } })).rejects.toThrow("invalid_token");

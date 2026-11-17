@@ -56,3 +56,23 @@ for (const end of ["disable", "revoke"] as const) test(`a ${end} committed betwe
   expect(hostedRowCount(store.db)).toBe(0);
   expect(admits()).toBe(before);
 });
+
+// The gate reads its generation before the check, not after it: a disable that commits while the check awaits
+// (after the check's reads) moves the generation past `g`, so the body checks again and refuses (#1150 audit F1).
+test("a disable committed during the gate's check refuses, and admits no row", async () => {
+  let calls = 0;
+  const raced = createHostedSessions(application, { now: () => now, isAuthorized: async (p, r) => {
+    const valid = await oauth.isAuthorized(p, r);
+    // Call 1 is the entry check, call 2 the gate's check outside the transaction.
+    if (++calls === 2) await store.repo.write(tx => store.repo.users.setDisabled(tx, issued.authed.user_id, true));
+    return valid;
+  } });
+  await raced.ready;
+  try {
+    const before = admits();
+    await expect(raced.whoami(principal, sessionContext(principal, { [OPENCODE_SESSION_META]: "gate-during" }))).rejects.toThrow("unauthenticated");
+    expect(calls).toBeGreaterThanOrEqual(3);
+    expect(hostedRowCount(store.db)).toBe(0);
+    expect(admits()).toBe(before);
+  } finally { await raced.close(); }
+});
