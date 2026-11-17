@@ -408,7 +408,10 @@ export const GrayboardPlugin: Plugin = async ({ client, directory }) => {
         return;
       }
       const nextEpoch = ++epoch;
-      const result = AssociationSchema.parse(await call("grayboard/session", { owner, epoch: nextEpoch, session }));
+      const parsed = AssociationSchema.safeParse(await call("grayboard/session", { owner, epoch: nextEpoch, session }));
+      // A fixed message: it reaches a toast, and zod's is a multi-line dump.
+      if (!parsed.success) throw new Error("grayboard: invalid root association response");
+      const result = parsed.data;
       if (!current()) return;
       if (gone || closed || child?.proc !== proc) throw new Error("grayboard: stale root association response");
       if (result.session !== session || result.epoch !== nextEpoch) throw new Error("grayboard: mismatched root association response");
