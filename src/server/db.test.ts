@@ -915,8 +915,13 @@ test("#807 P1c-14a: the messages writes and the mail port run on the Tx they're 
   expect(() => m.retract(kept, peer, second.id, { actor: null, session: null })).toThrow(settled);
   expect(() => m.prune(kept, Date.now() + 1)).toThrow(settled);
   expect(() => repo.mailOn(kept)).toThrow(settled);
+  const port = await seed(repo, tx => repo.mailOn(tx));
+  expect(() => port.unread(id)).toThrow(settled);
+  expect(() => port.bounce(peer, id, first.id, "late", 1)).toThrow(settled);
+  expect(() => port.dropReader(id)).toThrow(settled);
   expect(() => m.ack({} as Tx, id, first.id)).toThrow("not a SQLite store handle");
-  // Every write rolls back with its body.
+  // Every write rolls back with its body. On SQLite the resolved connection is the ambient one, so only the kept-Tx
+  // refusals above tell them apart; this half discriminates on Postgres.
   await expect(seed(repo, tx => {
     m.insert(tx, peer, "user", id, "rolled back", null);
     m.ack(tx, id, first.id);
