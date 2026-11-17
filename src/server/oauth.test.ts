@@ -510,6 +510,10 @@ test("OAuth event trail records decisions, grant, strict replay warnings and rev
     for (const action of ["request_refused", "authorize", "upstream_authenticated", "consent_denied", "consent_approved", "grant_issued", "code_replay_revoked", "refreshed", "refresh_replay_revoked", "revoked", "revoke_requested"]) expect(actions).toContain("oauth." + action);
     // #928 D9: the upstream rows name their provider.
     expect(rows.filter(r => r.action === "oauth.upstream_authenticated").map(r => [r.actor, JSON.parse(r.detail)])).toContainEqual(["you@example.com", { client_id: "native", provider: "google" }]);
+    // #807 P3 A7u2: the consent rows name the signed-in user, read async before the decision's write.
+    const consents = rows.filter(r => /^oauth\.consent_(approved|denied)$/.test(r.action)).map(r => r.actor);
+    expect(consents.length).toBeGreaterThan(1);
+    expect(new Set(consents)).toEqual(new Set(["you@example.com"]));
     for (const row of rows.filter(r => /grant_issued|replay_revoked|refreshed|^oauth.revoked$/.test(r.action))) {
       expect(row.actor).toBe("you@example.com");
       expect(JSON.parse(row.detail).client_id).toBe("native");

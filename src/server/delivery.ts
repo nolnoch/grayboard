@@ -92,7 +92,7 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
   }
   function refused(p: DeliveryPrincipal, context: SessionContext, error: unknown): never {
     const id = "id" in context ? context.id : "no-context";
-    if (error instanceof StaleCapability) hosted.audit(pool, id, "hosted.stale_capability", {}, p);
+    if (error instanceof StaleCapability) hosted.auditAs(pool, id, "hosted.stale_capability", {}, p);
     throw error;
   }
   // The lease for `capability`, without the token check: only for a caller that checked p's token this turn, with no
@@ -137,7 +137,7 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
         if (leases.size - replaced >= caps.global || (perUser.get(p.authed.user_id) ?? 0) - replaced >= caps.perUser) { countRefusal("delivery_lease"); throw new ApplicationError("bad_request", "delivery lease capacity reached"); }
         const expiresAt = now() + ttl;
         await store.update(tx, { ...row, lease_deadline: expiresAt, last_seen_at: now() });
-        hosted.audit(tx, row.session_id, "hosted.lease_opened", { ownership: row.ownership_id, bind_gen: row.bind_gen, grant: p.grantId, reopened: row.lease_deadline !== null, ...(openOptions.context === false ? { context: false } : {}) });
+        await hosted.audit(tx, row.session_id, "hosted.lease_opened", { ownership: row.ownership_id, bind_gen: row.bind_gen, grant: p.grantId, reopened: row.lease_deadline !== null, ...(openOptions.context === false ? { context: false } : {}) });
         return { row, expiresAt };
       }, result => {
         if ("capability" in result) return opened(result, false, hooks);
@@ -273,7 +273,7 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
     close() {
       stopped = true; unlisten();
       // The capability is dropped, but the lease row stays; a restart credits it with the downtime (#423).
-      for (const lease of [...leases.values()]) { hosted.audit(pool, lease.sessionId, "hosted.lease_detached", { reason: "shutdown" }, lease.principal); finish(lease); }
+      for (const lease of [...leases.values()]) { hosted.auditAs(pool, lease.sessionId, "hosted.lease_detached", { reason: "shutdown" }, lease.principal); finish(lease); }
     },
   };
   return service;

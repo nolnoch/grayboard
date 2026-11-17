@@ -257,9 +257,16 @@ export function createHostedSessions(application: Application, options: { now?: 
   // awaits (#807 P3 A7u2); no caller reads in-memory state after it.
   // A named function: hosted.test.ts finds its frame in a stack (an async arrow shows as <anonymous>).
   async function audit(h: Read, id: string, action: AuditAction, detail: Record<string, unknown>, principal?: OAuthPrincipal) {
-    const row = principal ? undefined : store.get(h, id);
-    const actor = principal?.authed.user_email ?? (row && (await repo.users.findById(h, row.user_id))?.email) ?? null;
-    writeAudit(repo, h, action, actor, id, { ...detail, client_id: principal?.clientId ?? row?.client_id ?? null });
+    if (principal) return auditAs(h, id, action, detail, principal);
+    const row = store.get(h, id);
+    const actor = (row && (await repo.users.findById(h, row.user_id))?.email) ?? null;
+    await testPauseAsync("hosted:audit:user");
+    writeAudit(repo, h, action, actor, id, { ...detail, client_id: row?.client_id ?? null });
+  }
+  // An audit whose principal names the actor and client: it reads nothing, so it stays synchronous, for callers
+  // that can't await or must throw synchronously (#807 P3 A7u2).
+  function auditAs(h: Read, id: string, action: AuditAction, detail: Record<string, unknown>, principal: OAuthPrincipal) {
+    writeAudit(repo, h, action, principal.authed.user_email, id, { ...detail, client_id: principal.clientId });
   }
   // `r`: the body's Tx when the check runs inside one, so it sees the body's own revokes (#998); else the pool.
   // A close while the read awaited refuses too (#807 P3 A7d2).
@@ -687,6 +694,7 @@ export function createHostedSessions(application: Application, options: { now?: 
     rootOnly,
     named,
     audit,
+    auditAs,
     // Inside delivery_open's transaction (#453): the lost holds root `row`'s Controller was reported, taken. Its
     // run loop opens only after the same iteration's whoami and the durable drop, so these are applied.
     async seeLost(tx: Tx, p: OAuthPrincipal, row: HostedSession): Promise<void> {

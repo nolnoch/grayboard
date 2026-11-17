@@ -1248,12 +1248,16 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     // Catches a user disabled with no server route to say so (a database
     // reset, an operator edit), and an alias its session's principal may no
     // longer act as (S9's backstop to accessChanged).
-    // Its promise settles once the alias recheck is written (a failure there is logged, not rejected).
-    // The users reads await (#807 P3 A7u2): disconnectUser walks the sessions as they stand after them.
+    // Its promise settles once the alias recheck is written (a failure there, or a user's read, is logged, not
+    // rejected). The users reads await, on the auth cache (#807 P3 A7u2): disconnectUser walks the sessions as they
+    // stand after them; one user's failed read skips that user only, and the next tick retries it.
     async revalidate(): Promise<void> {
       for (const observer of [...observers]) observerLive(observer);
       const ids = [...new Set([...hub.sessions].filter(s => !s.human).map(s => s.authed.user_id))];
-      const disabled = await Promise.all(ids.map(id => repo.users.isDisabled(repo.read, id)));
+      const disabled = await Promise.all(ids.map(id => repo.users.isDisabled(repo.read, id).catch(error => {
+        console.error("[grayboard] revalidate: user read failed:", error);
+        return false;
+      })));
       for (const [i, id] of ids.entries()) if (disabled[i]) application.disconnectUser(id);
       return recheckAliases(null, null);
     },

@@ -99,7 +99,7 @@ const ALIAS_COLS = `id, address, scope_kind, scope_ref, name, created_at`;
 // A synchronous callback's result: a promise is refused at compile time, so
 // nothing can await between a transaction's reads and its writes.
 export type Sync<T> = T extends PromiseLike<unknown> ? never : T;
-// Repo.authPeek's answer: the auth cache's live-token hits under one generation (#807 P3 A7d).
+// Repo.authPeek's answer: the auth cache's live-token and user hits under one generation (#807 P3 A7d, A7u2).
 // `user`: the user cache's entry under that generation (#807 P3 A7u2): the row, null when known absent, undefined on a
 // miss.
 export type AuthPeek = {
@@ -243,8 +243,9 @@ export interface Repo {
   // body (#881): one authorization's token and user reads share it, across its awaits (#807 P3 A7c). Inside the
   // caller's own transaction, nested, or with no generation to read, it's plain fn().
   authRead<T>(fn: () => T | Promise<T>): Promise<T>;
-  // The auth cache's hits, synchronously, for the stream timer's phase A (#807 P3 A7d): a live access token by hash
-  // as the cache holds it under the current generation, else undefined (a miss: the caller reads in full, async).
+  // The auth cache's hits, synchronously, for the stream timer's phase A (#807 P3 A7d): a live access token by hash,
+  // and a user by id (#807 P3 A7u2), as the caches hold them under the current generation, else undefined (a miss:
+  // the caller reads in full, async).
   // Only live tokens are cached, so a miss is never a refusal. Undefined itself when there's no generation to key on
   // (inside the caller's own transaction, or a failed generation read).
   authPeek(): AuthPeek | undefined;
@@ -1020,7 +1021,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
   // Caches of what the auth tables say, keyed on authGeneration: a live access token only (an unknown or dead one is
   // re-read every time); a user row, or its absence, as read (#853). They sit here, under the store's own methods, so
   // a test that replaces one of those methods replaces the cache behind it, except authPeek's: it reads the access
-  // cache directly, so a stubbed findActiveAccess changes only what a miss later fills.
+  // and user caches directly, so a stubbed findActiveAccess, isDisabled or activeEmail changes only what a miss later fills.
   // A lookup hits only when its generation is the cache's. A miss reads, then fills only if the generation is still
   // its own once the read is done (#807 P3 A7b): a lookup pinned before a commit neither fills nor clears the cache a
   // newer one keyed, so bodies with different pins don't thrash it, and generations need no order.
