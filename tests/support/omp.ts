@@ -816,6 +816,36 @@ export function ompLocalCarryScenario(dir: string): Promise<void> {
   });
 }
 
+// A grayboard process that never answers initialize is killed at the
+// deadline and restarted as an exit is (#559); after the last restart a
+// tool call fails with the deadline's reason instead of hanging.
+export function ompLocalInitDeadlineScenario(dir: string): Promise<void> {
+  return named(OMP_HARNESS, async () => {
+    const procs: ChildProcess[] = [];
+    const model = startFakeModel([scripted("who", [{ tool: `${PREFIX}whoami`, args: {} }])]);
+    try {
+      installLocal(dir, model.port);
+      // Every child, restarts included, blocks before it answers initialize.
+      mkdirSync(join(dir, "pause"), { recursive: true });
+      const omp = startLocalOmp(dir, dir, procs, null, { BUS_TEST_PAUSE: "mcp:before-connect", BUS_TEST_PAUSE_FILE: join(dir, "pause", "go"), BUS_TEST_INIT_DEADLINE_MS: "1000" });
+      await omp.command({ type: "get_state" }, 60_000);
+      const notice = await until(() => omp.notices().find((n) => n.includes("after 3 restarts; restart omp to reconnect")), 60_000, "restart exhaustion notice");
+      expect(notice).toContain("grayboard process didn't initialize within 1 s");
+      await omp.command({ type: "prompt", message: "who" });
+      await idle(omp);
+      expect(resultText(await toolResultNamed(omp, `${PREFIX}whoami`))).toContain("grayboard process didn't initialize within 1 s");
+      await until(() => grayboardChildPids(omp.pid).length === 0, 5_000, "no grayboard process left");
+      // With no process left, the turn's hooks fail as after an exit's give-up, with the same reason.
+      expect(new Set(omp.events.filter((e) => e.type === "extension_error").map((e) => e.error))).toEqual(new Set(["grayboard process didn't initialize within 1 s"]));
+      expect(model.unhandled).toEqual([]);
+      await omp.quit();
+    } finally {
+      await stopAll(procs);
+      model.stop();
+    }
+  });
+}
+
 // A tool call waiting out a restart's backoff ends at its abort (#559), as
 // pi's does, rather than holding the turn until the grayboard process is
 // back, and it never runs there: the bind it carried takes no name.
