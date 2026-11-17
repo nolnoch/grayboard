@@ -558,6 +558,26 @@ test("a native token that expires during an outage keeps retrying; outside one i
     expect(p.controller.status().roots.find(root => root.sessionID === "R")?.code).toBe("native_access_expired");
   } finally { await p.controller.close(); }
 });
+// #916: an access token that expires while the server is down gets no 401 to make OpenCode refresh it; once the
+// server answers with the expiry, the run loop asks the host (`credential.refresh`), as the #661 recovery does.
+test("a native token that expires during an outage asks OpenCode to refresh once the server answers the expiry (#916)", async () => {
+  let reloadsAtRotate = -1;
+  const o = await outage(elapsed => {
+    // OpenCode stores its refresh once the reconnect lands; the cap keeps a regression from looping forever.
+    if (reloadsAtRotate < 0 && (o.r.f.reloads > 0 || elapsed > 30_000)) { reloadsAtRotate = o.r.f.reloads; o.r.f.rotate("fake-access-two"); }
+  });
+  try {
+    let down = true;
+    o.r.observe(async operation => { if (operation === "connect" && down) { down = false; o.r.f.expire(); throw new ServerUnreachable(new Error("down")); } });
+    o.r.subscriptions(() => { o.r.batches.set("R", [item]); return undefined; });
+    o.stop();
+    await until(() => o.r.calls.some(c => c.name === "delivery_receipt"));
+    expect(reloadsAtRotate).toBe(1);
+    expect(o.r.f.reloads).toBe(1);
+    expect(o.codes).toContain("native_access_expired");
+    expect(o.controller.status().state).toBe("active");
+  } finally { await o.controller.close(); await o.r.controller.close(); }
+});
 test("a closed subscription is not an outage: native expiry on every reconnect, even wrapped by the SDK, pauses once the rotation grace runs out", async () => {
   const o = await outage();
   try {
@@ -740,14 +760,16 @@ test("a restore during a server outage retries on the outage backoff, never paus
   } finally { await o.restarted.close(); await o.r.controller.close(); }
 });
 test("a token that expires during a restore's outage retry waits for the host's refresh, never pausing (#424 6)", async () => {
-  let seen: unknown, waited = 0;
+  let seen: unknown, waited = 0, reloads = -1;
   const o = await restoredDuringOutage(1, async (restarted, r) => {
     if (++waited === 1) r.f.expire();
-    else { seen = restarted.status().roots.find(root => root.sessionID === "B"); r.f.rotate("fake-access-two"); }
+    else { seen = restarted.status().roots.find(root => root.sessionID === "B"); reloads = r.f.reloads; r.f.rotate("fake-access-two"); }
   });
   try {
     await until(() => o.restarted.status().roots.find(root => root.sessionID === "B")?.state === "active");
     expect(seen).toMatchObject({ state: "retrying", operation: "restore", code: "native_access_expired" });
+    // The retry asked OpenCode to refresh before its next wait (#916).
+    expect(reloads).toBe(1);
     expect(o.waits).toEqual([500, 1000]);
     expect(o.restarted.status().roots.find(root => root.sessionID === "B")).toMatchObject({ state: "active", ownership: 1 });
     expect(o.calls().filter(c => c.name === "delivery_open").map(c => c.sessionID)).toEqual(["B"]);
