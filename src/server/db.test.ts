@@ -733,6 +733,9 @@ test("#807 P1c-8: the OAuth store runs on the handle it's given", async () => {
   const settled = /used after its transaction settled/;
   const x = {} as never;
   const o = repo.oauth;
+  // A refused change notifies no hosted observer: the notice waits for the async op to fulfil (#807 P3 A6c).
+  let notices = 0;
+  const unsubscribe = repo.hosted.subscribe(() => { notices++; });
   await expect(o.createRequest(kept, x, 1)).rejects.toThrow(settled);
   await expect(o.bindRequestSession(kept, "r", "b", "s", 1)).rejects.toThrow(settled);
   await expect(o.createBrowserSession(kept, x, 1)).rejects.toThrow(settled);
@@ -751,6 +754,10 @@ test("#807 P1c-8: the OAuth store runs on the handle it's given", async () => {
   expect(() => o.findActiveAccess(kept, "h", "r", [], 1)).toThrow(settled);
   expect(() => o.isGrantActive(kept, "g", 1)).toThrow(settled);
   await expect(o.revokeToken({} as Tx, "t", "c", 1)).rejects.toThrow("not a SQLite store handle");
+  expect(notices).toBe(0);
+  await seed(repo, tx => o.revokeToken(tx, "t", "c", 1));
+  expect(notices).toBe(1);
+  unsubscribe();
   expect(o.isGrantActive(repo.read, "g", 1)).toBe(false);
   // A warm access cache still resolves the handle first.
   const issued = await issueOAuth(repo, "https://grayboard.example.com/mcp");

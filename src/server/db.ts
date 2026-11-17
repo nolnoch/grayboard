@@ -923,16 +923,14 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
   // the change. `null`: any row may have changed (a grant or a user), so observers check every one.
   const observers = new Set<(changed: string | null) => void>();
   const changed = (id: string | null) => afterCommit(db, () => { for (const fn of observers) { try { fn(id); } catch (error) { console.error("hosted invalidation failed", error); } } });
-  const change = <A extends unknown[], R>(fn: (...args: A) => R) => (...args: A): R => {
-    const value = fn(...args);
-    changed(null);
-    return value;
+  // An async op's notice waits for it to fulfil (#807 P3 A6c): one that rejects changed nothing, as a sync throw didn't.
+  const then = <R>(value: R, notify: () => void): R => {
+    if (!isThenable(value)) { notify(); return value; }
+    return Promise.resolve(value).then(v => { notify(); return v; }) as R;
   };
-  const marks = <A extends unknown[], R>(fn: (...args: A) => R, id: (...args: A) => string) => (...args: A): R => {
-    const value = fn(...args);
-    changed(id(...args));
-    return value;
-  };
+  const change = <A extends unknown[], R>(fn: (...args: A) => R) => (...args: A): R => then(fn(...args), () => changed(null));
+  const marks = <A extends unknown[], R>(fn: (...args: A) => R, id: (...args: A) => string) => (...args: A): R =>
+    then(fn(...args), () => changed(id(...args)));
   const hosted = makeHostedStore(db);
   const { writesOn: _writesOn, ...hostedStore } = hosted;
   const oauth = makeOAuthStore(hosted);

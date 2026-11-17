@@ -29,8 +29,8 @@ export type OAuthTokenPair = OAuthBinding & {
 export type OAuthFailure = { status: "invalid" | "not_found" | "replay" | "capacity" };
 export type OAuthResult<T> = { status: "ok"; value: T } | OAuthFailure;
 // Writes take the body's `Tx`, reads a `Read` (#807 D2): the caller's `Tx` inside a write body, `repo.read` outside one.
-// Async but for the two auth hot-path reads (#807 P3 A6c): findActiveAccess and isGrantActive sit under authRead's
-// cache (#853) and move with it (A6f).
+// Async but for the two auth hot-path reads (#807 P3 A6c), which go async with `Access` (A7): findActiveAccess sits
+// under authRead's cache (#853), and isGrantActive's callers (hosted MCP's live-session rechecks, src/server/mcp.ts) are sync.
 export interface OAuthStore {
   createRequest(tx: Tx, input: OAuthRequest, now: number): Promise<OAuthResult<OAuthRequest>>;
   findRequest(r: Read, requestHash: string, browserHash: string, now: number): Promise<OAuthRequest | undefined>;
