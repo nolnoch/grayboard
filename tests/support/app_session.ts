@@ -162,7 +162,8 @@ export class AppSession {
   private live(): ApplicationSession {
     if (!this.session) throw new Error(`${this.label}: not connected`);
     try {
-      this.application.revalidateSession(this.session, true);
+      // The operation's own `valid` reads the user; this checks only that the session is open (#807 P3 A7u1).
+      this.application.revalidateNow(this.session, true);
     } catch (e) {
       this.drop(`refused: ${(e as Error).message}`);
       throw e;
@@ -268,7 +269,7 @@ export class AppSession {
 
   async boardAck(refs: PendingRef[]): Promise<void> {
     const session = this.live();
-    await this.write(session, tx => { this.application.receiptBoards(tx, session, refs); });
+    await this.write(session, tx => this.application.receiptBoards(tx, session, refs));
   }
 
   async dmAck(id: number): Promise<void> {

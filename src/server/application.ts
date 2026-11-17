@@ -538,7 +538,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
   function observerLive(observer: Observer): boolean {
     if (!observers.has(observer)) return false;
     try {
-      valid(observer.session);
+      validNow(observer.session);
       if (observer.session.addresses.some((a) => canSeeBoard(repo.coreOn(repo.read), a, observer.board))) return true;
     } catch {}
     removeObserver(observer);
@@ -590,8 +590,8 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     close(session, h);
     session.sink.closed(error);
   }
-  // `h`: the handle the caller holds; inside a body its `Tx`, so a disabled user's terminate writes its rows there.
-  function valid(session: ApplicationSession, allowUnbound = false, h: Read = repo.read) {
+  // The session open and current; a closed one is refused with why.
+  function stillOpen(session: ApplicationSession) {
     if (!session.active || !hub.sessions.has(session)) {
       // A superseded bridge connection is told so, a revoked tools-only
       // one why it may not write as its alias (S9); any other closed session
@@ -601,7 +601,22 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
       if (why?.code === "forbidden") throw why;
       fail("unauthenticated", "session is closed");
     }
-    if (repo.users.isDisabled(session.authed.user_id)) {
+  }
+  // `valid`'s checks that read nothing (#807 P3 A7u1), for a sync caller downstream of a token check that refused a
+  // disabled user with no await since, or of one that rechecks (the board observers' `changed` hook).
+  function validNow(session: ApplicationSession, allowUnbound = false) {
+    stillOpen(session);
+    if (session.readOnly && !allowUnbound) fail("unbound", UNBOUND_ERROR);
+  }
+  // `h`: the handle the caller holds; inside a body its `Tx`, so a disabled user's terminate writes its rows there.
+  // The user read awaits (#807 P3 A7u1; async from A7u2): a close, detach or terminate that lands meanwhile changes
+  // the session outside the write queue, so it's checked again after, and the caller goes on with no await between.
+  async function valid(session: ApplicationSession, allowUnbound = false, h: Read = repo.read): Promise<void> {
+    stillOpen(session);
+    const disabled = repo.users.isDisabled(session.authed.user_id);
+    await testPauseAsync("valid:user:read");
+    stillOpen(session);
+    if (disabled) {
       terminate(session, new ApplicationError("unauthenticated", "an admin signed this user out"), h);
       fail("unauthenticated", "an admin signed this user out");
     }
@@ -802,7 +817,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
   // transaction the refusal's throw rolls back, and the row is written after it.
   // `tx`: the body the bind runs in; its alias reads and lazy create run on it.
   async function bindNow(tx: Tx, session: ApplicationSession, m: Omit<BindRequest, "type" | "req_id">): Promise<BindResult> {
-    valid(session, true, tx);
+    await valid(session, true, tx);
     const { authed } = session;
     if (session.human) fail("bad_request", `the Slack bridge's connection is its user's "${HUMAN_NAME}"; it binds nothing`);
     if (session.toolsOnly) fail("bad_request", "a tools-only connection writes as its writes_as; it binds nothing");
@@ -823,7 +838,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     }
     // The session may have been terminated (a disable's revalidate) while the decision awaited (#807 P3 A7f2, H-B); a
     // refused target's rows are written first, as every deny's is.
-    valid(session, true, tx);
+    await valid(session, true, tx);
     const { address, scope } = target;
     const refuse = (code: ErrorCode, message: string, detail: string, extra: ApplicationError["extra"] = {}): never => {
       rowAfterRollback(session, tx, w => logBinding(repo.coreOn(w), id, address, "refused", detail));
@@ -881,7 +896,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     await createLazily(hub, tx, authed, target, id);
     await testPauseAsync("bind:alias:created");
     // Again after the create's await: no hold for a session terminated meanwhile.
-    valid(session, true, tx);
+    await valid(session, true, tx);
     holdAlias(repo.coreOn(tx), address, id, now());
     logBinding(repo.coreOn(tx), id, address, "bound", null);
     if (meta) setAliasMeta(repo.coreOn(tx), address, meta, id, audit, authed.user_email);
@@ -899,8 +914,8 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
   // leaves this session (setHolds), so that holder is pushed it. An alias
   // the session doesn't hold answers ok with released: false.
   // `tx`: the body the unbind runs in.
-  function unbind(tx: Tx, session: ApplicationSession, alias: string): UnbindResult {
-    valid(session, true, tx);
+  async function unbind(tx: Tx, session: ApplicationSession, alias: string): Promise<UnbindResult> {
+    await valid(session, true, tx);
     if (session.human) fail("bad_request", `the Slack bridge's connection is its user's "${HUMAN_NAME}"; it unbinds nothing`);
     if (session.toolsOnly) fail("bad_request", "a tools-only connection writes as its writes_as; it unbinds nothing");
     const id = session.sessionId;
@@ -1075,11 +1090,12 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     unbind,
     close,
     revalidateSession: valid,
+    revalidateNow: validNow,
     // Everything owed to a push session, after its hello's answer: direct
     // messages and board items for `addresses` (every address by default; a
     // bind's alias after its answer).
     async replay(session: ApplicationSession, addresses?: string[]) {
-      valid(session, true);
+      await valid(session, true);
       if (session.readOnly || !session.push) return;
       // Called after the hello's or bind's commit, outside any body, so the drain runs now; awaited, so the replay
       // answers once it's delivered (#807 P3 A6a). A failure is logged, as a commit effect's is.
@@ -1087,7 +1103,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
         await drainDirect(hub, session, addresses ?? session.addresses);
         // Closed while the drain awaited (an unlink, a revoke): nothing more is owed.
         if (!session.active) return;
-        valid(session, true);
+        await valid(session, true);
         drainBoards(session, hub, true);
       } catch (error) { console.error("postcommit effect failed", error); }
     },
@@ -1098,29 +1114,29 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
       body: string,
       options: { parent_id?: number; pending?: boolean; attachment_ids?: number[]; resend?: boolean; as?: string } = {},
     ) {
-      valid(session, false, tx);
+      await valid(session, false, tx);
       return handleSend(hub, tx, session, recipient, body, options.parent_id ?? null, options.pending === true, options.attachment_ids, options.resend === true, options.as);
     },
     async delegate(tx: Tx, session: ApplicationSession, request: Omit<DelegateRequest, "type" | "req_id">) {
-      valid(session, false, tx);
+      await valid(session, false, tx);
       return handleDelegate(hub, tx, session, request);
     },
     async history(r: Read, session: ApplicationSession, options: { peer?: string; limit?: number; before_id?: number } = {}) {
-      valid(session, false, r);
+      await valid(session, false, r);
       return handleHistory(hub, r, session, options.peer, options.limit, options.before_id);
     },
     async thread(r: Read, session: ApplicationSession, id: number) {
-      valid(session, false, r);
+      await valid(session, false, r);
       return handleThread(r, session, id, repo);
     },
     async inbox(r: Read, session: ApplicationSession, days?: number) {
-      valid(session, false, r);
+      await valid(session, false, r);
       childState(session, "dm_inbox");
       return handleInbox(hub, r, session, days);
     },
     // Reads retain durable cursors; pendingFor still cleans inaccessible outbox rows.
     async pending(r: Read, session: ApplicationSession, limit = 100): Promise<DeliveryEvent[]> {
-      valid(session, false, r);
+      await valid(session, false, r);
       if (!Number.isInteger(limit) || limit < 1 || limit > 100) fail("bad_request", "invalid pending limit");
       const streams = await Promise.all(session.addresses.map(async (a) => ({ type: "direct" as const, ref: a, since: await repo.cursors.get(r, a, "direct", a) })));
       const messages = repo.messages.unreadSince(r, streams).slice(0, limit);
@@ -1143,11 +1159,11 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
       ];
     },
     async boardCatalog(r: Read, session: ApplicationSession, after?: string) {
-      valid(session, true, r);
+      await valid(session, true, r);
       return boardCatalog(repo.coreOn(r), session.readOnly ? seer(repo, session) : session.primary, after);
     },
     async boardSnapshot(r: Read, session: ApplicationSession, board: string, options: SnapshotOptions = {}) {
-      valid(session, true, r);
+      await valid(session, true, r);
       // A resource read is a read like board_read, and carries its marks (#825).
       const snap = snapshot(repo.coreOn(r), reader(r, session, board), board, options);
       const marks = await writerMarks(repo, r, session, [], snap.posts.map((p) => p.id));
@@ -1158,7 +1174,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     // Keys in the observer indexes: a board or session with no observers left has none (#831).
     get observerIndexKeys() { return { boards: observersByBoard.size, sessions: observersBySession.size }; },
     observeBoard(session: ApplicationSession, boardInput: string, hooks: BoardObserver): () => void {
-      valid(session);
+      validNow(session);
       const board = normalizeBoard(boardInput);
       // Snapshot performs the same concealed access check as content reads.
       snapshot(repo.coreOn(repo.read), reader(repo.read, session, board), board, { limit: 1 });
@@ -1168,21 +1184,21 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
       return () => removeObserver(observer);
     },
     canReceiveBoard(r: Read, session: ApplicationSession, board: string) {
-      valid(session, false, r);
+      validNow(session);
       const core = repo.coreOn(r);
       return session.addresses.some((a) => canSeeBoard(core, a, board));
     },
     // handed: false is a give-up (Slack refused the message): the cursor
     // moves so it isn't retried, but nothing reached the harness to stamp.
     async receiptDirect(tx: Tx, session: ApplicationSession, ids: number[], opts: { handed: boolean } = { handed: true }) {
-      valid(session, false, tx);
+      await valid(session, false, tx);
       await handleAck(tx, session, ids, repo, opts.handed ? now() : null);
     },
     // A ref carries no handle: the item was sent for one of this session's
     // addresses, and acknowledging is a no-op on one with no such row, so
     // each address acks it.
-    receiptBoards(tx: Tx, session: ApplicationSession, refs: PendingRef[]) {
-      valid(session, false, tx);
+    async receiptBoards(tx: Tx, session: ApplicationSession, refs: PendingRef[]) {
+      await valid(session, false, tx);
       for (const r of refs) {
         for (const a of session.addresses) acknowledge(repo.coreOn(tx), a, r);
         tx.afterCommit(() => { session.inflight.delete(pendingKey(r)); });
@@ -1191,7 +1207,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     // Acked as the address the row names (S8): receivedUnacked and
     // sentPending match a.reader = m.recipient, or m.sender.
     async acknowledgeDm(tx: Tx, session: ApplicationSession, id: number) {
-      valid(session, false, tx);
+      await valid(session, false, tx);
       childState(session, "dm_ack");
       const m = repo.messages.getById(tx, id), mine = session.addresses;
       const reader = !m || m.recipient_type !== "user" ? null
@@ -1202,11 +1218,11 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
       await repo.messages.ack(tx, reader, m.id);
     },
     async retract(tx: Tx, session: ApplicationSession, id: number) {
-      valid(session, false, tx);
+      await valid(session, false, tx);
       return await handleRetract(hub, tx, session, id);
     },
     async call(tx: Tx, session: ApplicationSession, tool: string, args: Record<string, unknown>, publish?: (result: unknown) => void) {
-      valid(session, UNBOUND_READS.has(tool), tx);
+      await valid(session, UNBOUND_READS.has(tool), tx);
       // Armed on a refusal too: a call can commit work (an expiring claim) before it throws (#385 item 15f).
       try { return await handleCall(hub, tx, session, tool, args, publish); }
       finally { tx.afterCommit(() => expiry.arm()); }
