@@ -322,15 +322,15 @@ export async function attachmentUpload(req: Request, url: URL, authed: AuthedUse
   try {
     // A declared length over the cap is refused before the body is read.
     new SizeTally(repo.attachmentLimits, 1).add(label, Number(declared));
-    guard?.(repo.read);
+    await guard?.(repo.read);
     release = await uploads.reserve(authed.user_email, Number(declared), signal);
-    guard?.(repo.read);
+    await guard?.(repo.read);
     const data = await readUploadBody(req, Number(declared), transferTimeoutMs(Number(declared)), guard ? signal : undefined);
-    guard?.(repo.read);
+    await guard?.(repo.read);
     if (guard && data.length !== Number(declared)) return refuse("bad_request", "the body is shorter than its Content-Length", 400);
     new SizeTally(repo.attachmentLimits, 1).add(label, data.length);
     const row = await storeUpload(repo, authed.user_email, handle, checkFile(label, rawName, data), {}, guard);
-    try { guard?.(repo.read); } catch (error) {
+    try { await guard?.(repo.read); } catch (error) {
       await releaseStored(repo, authed.user_email, handle, row.id);
       throw error;
     }
@@ -368,8 +368,8 @@ export async function attachmentDownload(idStr: string, url: URL, authed: Authed
     if (e instanceof BlobMissing) return jsonErr("not_found", `attachment ${row.id}'s bytes are gone`, 404);
     throw e;
   }
-  return repo.write(tx => {
-  guard?.(tx);
+  return repo.write(async tx => {
+  await guard?.(tx);
   if (guard) {
     // A refusal here is a decision too (#851); the transaction returns, so its rows commit.
     const current = requestAttachment(repo, tx, handle, String(row.id), authed.user_email, { user: authed.user_email, address: handle });
@@ -393,9 +393,9 @@ export async function attachmentDownload(idStr: string, url: URL, authed: Authed
 export async function attachmentRelease(idStr: string, url: URL, authed: AuthedUser, repo: Repo, guard?: Guard): Promise<Response> {
   const handle = queryAs(url, authed, repo);
   if (handle instanceof Response) return handle;
-  guard?.(repo.read);
+  await guard?.(repo.read);
   const row = /^\d{1,15}$/.test(idStr) ? await releaseStored(repo, authed.user_email, handle, Number(idStr), {}, guard) : null;
-  guard?.(repo.read);
+  await guard?.(repo.read);
   if (!row) return jsonErr("not_found", `no unsent upload ${idStr.slice(0, 32)} of yours`, 404);
   return json({ ok: true });
 }

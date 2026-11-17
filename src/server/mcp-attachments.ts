@@ -7,6 +7,7 @@ import type { createOAuthServer } from "./oauth.ts";
 import type { UploadGate } from "./uploads.ts";
 import { permitsOrigin } from "./origin.ts";
 import { countRefusal } from "./metrics.ts";
+import { testPauseAsync } from "../shared/testpause.ts";
 
 class Refusal extends Error {
   constructor(readonly response: Response) { super("attachment request refused"); }
@@ -18,7 +19,7 @@ const privateResponse = (response: Response) => {
   return response;
 };
 
-export function createMcpAttachments(repo: Repo, oauth: Pick<ReturnType<typeof createOAuthServer>, "authenticate" | "authenticateNow" | "resource">, uploads: UploadGate, opts: { trustedOrigin: string; sessions: HostedSessions }) {
+export function createMcpAttachments(repo: Repo, oauth: Pick<ReturnType<typeof createOAuthServer>, "authenticate" | "resource">, uploads: UploadGate, opts: { trustedOrigin: string; sessions: HostedSessions }) {
   const origin = new URL(opts.trustedOrigin).origin;
   const paths = new Set(["/mcp/attachments", `${new URL(oauth.resource).pathname}/attachments`]);
   const pending = new Set<Promise<Response>>();
@@ -61,21 +62,27 @@ export function createMcpAttachments(repo: Repo, oauth: Pick<ReturnType<typeof c
         // The HTTP routes act as `as` (#284): the hosted session's name.
         selected.searchParams.delete("identity");
         selected.searchParams.set("as", session.identityFull);
-        // Every read on `r`, the handle of the context it runs in: the pool here, a body's own Tx inside one (#1053).
-        // Synchronous: it runs inside transaction bodies, which are synchronous until #807 P3 A7d2.
-        const guard = (r: Read) => {
+        const live = () => {
           if (closed || signal.aborted) throw new Refusal(error(closed ? "unavailable" : "cancelled", closed ? "server closing" : "request cancelled", closed ? 503 : 499));
-          const current = oauth.authenticateNow(req, ["grayboard:tools"], r);
+        };
+        // Every read on `r`, the handle of the context it runs in: the pool here, a body's own Tx inside one (#1053).
+        // The binding and alias reads follow the token read's await, so they see `r` as of the token check, and a
+        // close or abort while it awaited refuses (#807 P3 A7d2a).
+        const guard = async (r: Read) => {
+          live();
+          const current = await oauth.authenticate(req, ["grayboard:tools"], r);
+          await testPauseAsync("attachments:guard:checked");
+          live();
           if (current instanceof Response) throw new Refusal(current);
           bindingGuard(r);
           if (!repo.aliases.find(r, session.identityFull)) throw new Refusal(error("not_found", "identity not found", 404));
         };
-        guard(repo.read);
+        await guard(repo.read);
         const response = req.method === "POST" ? await attachmentUpload(req, selected, principal.authed, repo, uploads, guard, signal)
           : req.method === "GET" ? await attachmentDownload(id!, selected, principal.authed, repo, guard)
           : await attachmentRelease(id!, selected, principal.authed, repo, guard);
         if (req.method === "POST" && req.body && !req.body.locked) await req.body.cancel();
-        guard(repo.read);
+        await guard(repo.read);
         return response;
       });
     } catch (cause) {

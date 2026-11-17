@@ -1,7 +1,7 @@
 import { DEFAULT_HELLO_LIMIT, DEFAULT_AUTH_FAIL_LIMIT } from "./rate_limit.ts";
 import { DEFAULT_TRUSTED_PROXIES } from "./client_addr.ts";
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDatabase } from "./db.ts";
@@ -465,3 +465,80 @@ test("#1053: the guard's reads inside a transaction body use that body's handle,
   for (const what of ["aliases.find", "hosted.get", "findActiveAccess"]) expect(inBody.some(c => c.what === what)).toBe(true);
   expect(inBody.filter(c => c.pool)).toEqual([]);
 });
+
+// #807 P3 A7d2a: `start`'s request holds at the guard's `attachments:guard:checked` point (its token read done) on its
+// `hit`th guard call, then `during` runs, then the pause releases. Resolves with the response.
+async function heldGuard(hit: number, start: () => Promise<Response>, during: () => Promise<void> | void) {
+  const point = "attachments:guard:checked";
+  const pause = mkdtempSync(join(tmpdir(), "gb-guard-pause-")), file = join(pause, "release");
+  let seen = 0;
+  const reached = Promise.withResolvers<void>();
+  // The spy runs inside the pause's own log line, before it first looks for the file: every hit but the `hit`th
+  // finds the file and passes at once, and the `hit`th finds none and holds until `during` is done.
+  const log = spyOn(console, "error").mockImplementation((message: unknown) => {
+    if (message !== `[grayboard] test pause hit: ${point}`) return;
+    if (++seen === hit) { rmSync(file, { force: true }); reached.resolve(); } else writeFileSync(file, "");
+  });
+  process.env.BUS_TEST_PAUSE = point; process.env.BUS_TEST_PAUSE_FILE = file;
+  const deadline = setTimeout(() => reached.reject(new Error(`guard pause hit ${seen} of ${hit} times in 5 s`)), 5_000);
+  try {
+    const response = start();
+    response.catch(() => {});
+    await reached.promise;
+    await during();
+    writeFileSync(file, "release");
+    const value = await response;
+    expect(seen).toBeGreaterThanOrEqual(hit);
+    return value;
+  } finally {
+    clearTimeout(deadline);
+    writeFileSync(file, "release");
+    delete process.env.BUS_TEST_PAUSE; delete process.env.BUS_TEST_PAUSE_FILE;
+    log.mockRestore(); rmSync(pause, { recursive: true, force: true });
+  }
+}
+// Whether an `attachments` row was ever inserted (AUTOINCREMENT keeps the sequence after the row is deleted).
+const everStored = () => store.db.query("SELECT 1 FROM sqlite_sequence WHERE name = 'attachments'").get() !== null;
+
+// A token the pool still reads as live but every transaction body reads as revoked: what a body sees when a revoke
+// commits after the route's last pool check (the guard's own binding fence would refuse one seen at the pool).
+const revokedInBodies = () => stubAuthRead(store.repo, "findActiveAccess", active => ((r, ...rest) => r === store.repo.read ? active(r, ...rest) : undefined) as typeof active);
+
+test("#807 P3 A7d2a: the store body awaits the guard on its Tx and refuses before core inserts", async () => {
+  const restore = revokedInBodies();
+  try { expect((await send()).status).toBe(401); } finally { restore(); }
+  // Refused before core's insert, not inserted and then released by the audit body's check.
+  expect(everStored()).toBe(false);
+  expect(store.db.query("SELECT COUNT(*) AS n FROM attachment_blobs").get()).toEqual({ n: 0 });
+});
+
+test("#807 P3 A7d2a: the download's recheck body awaits the guard on its Tx", async () => {
+  const id = await uploaded();
+  const restore = revokedInBodies();
+  try { expect((await send(request("GET", `/hosted/mcp/attachments/${id}?identity=be`))).status).toBe(401); } finally { restore(); }
+  expect(store.db.query("SELECT COUNT(*) AS n FROM access_log WHERE action = 'attachment.downloaded'").get()).toEqual({ n: 0 });
+});
+
+test("#807 P3 A7d2a: the release body awaits the guard on its Tx", async () => {
+  const id = await uploaded();
+  const restore = revokedInBodies();
+  try { expect((await send(request("DELETE", `/hosted/mcp/attachments/${id}?identity=be`))).status).toBe(401); } finally { restore(); }
+  expect(count()).toBe(1);
+});
+
+// The guard calls of one upload, in order: the router's (1), the route's before its quota wait (2), before its body
+// read (3) and after it (4), the store body's (5), the audit body's (6), the route's after the store (7) and the
+// router's after the route (8).
+for (const [stop, status] of [["abort", 499], ["close", 503]] as const) {
+  test(`#807 P3 A7d2a: a request ${stop === "abort" ? "aborted" : "closed"} while the store body's guard reads is refused there`, async () => {
+    const aborts = new AbortController();
+    let closing: Promise<void> | undefined;
+    const response = await heldGuard(5, () => send(request("POST", undefined, bytes, issued.token, { signal: aborts.signal })), () => {
+      if (stop === "abort") aborts.abort();
+      else closing = router.close();
+    });
+    await closing;
+    expect(response.status).toBe(status);
+    expect(everStored()).toBe(false);
+  });
+}
