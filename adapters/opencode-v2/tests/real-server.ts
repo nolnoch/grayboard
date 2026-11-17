@@ -24,7 +24,7 @@ export interface RealServer {
   // Arms `point` already released: its hit line traces when a path reaches it, without holding it.
   trace(point: string): Promise<Pick<HeldPause, "hit">>;
   // Abandons any held pause and stops the server (SIGKILL after 5 s). Its output streams into this
-  // process's log as it arrives, prefixed `REAL_SERVER |`.
+  // process's log as it arrives, prefixed `REAL_SERVER out |` or `REAL_SERVER err |`.
   stop(): Promise<void>;
 }
 

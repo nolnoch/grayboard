@@ -459,7 +459,7 @@ test("setup prefetches a subagent's text when it's created, its context hook rew
   const fetched: string[] = [];
   const cleanup = await setup(ctx, () => {}, () => {}, async id => { fetched.push(id); return id === "C" ? "child text" : bound; });
   try {
-    await until(() => fetched.includes("C"));
+    await until(() => fetched.includes("C"), 1000);
     const system = [{ type: "text", text: "agent" }, { type: "text", text: render(unbound) }];
     await hook!({ sessionID: "C", system, messages: [] });
     expect(system[1]!.text).toBe(render("child text"));
@@ -469,7 +469,7 @@ test("setup prefetches a subagent's text when it's created, its context hook rew
     expect(fetched).toEqual(["C"]);
     // A deleted subagent's text goes; a session reusing the ID would fetch afresh.
     remove();
-    await until(() => forgot.mock.calls.some(([id]) => id === "C"));
+    await until(() => forgot.mock.calls.some(([id]) => id === "C"), 1000);
     await hook!({ sessionID: "C", system: [{ type: "text", text: render(unbound) }], messages: [] });
     expect(fetched).toEqual(["C", "C"]);
   } finally {
