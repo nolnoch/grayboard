@@ -834,7 +834,7 @@ export function ompLocalInitDeadlineScenario(dir: string): Promise<void> {
       await omp.command({ type: "prompt", message: "who" });
       await idle(omp);
       expect(resultText(await toolResultNamed(omp, `${PREFIX}whoami`))).toContain("grayboard process didn't initialize within 1 s");
-      expect(grayboardChildPids(omp.pid)).toEqual([]);
+      await until(() => grayboardChildPids(omp.pid).length === 0, 5_000, "no grayboard process left");
       // With no process left, the turn's hooks fail as after an exit's give-up, with the same reason.
       expect(new Set(omp.events.filter((e) => e.type === "extension_error").map((e) => e.error))).toEqual(new Set(["grayboard process didn't initialize within 1 s"]));
       expect(model.unhandled).toEqual([]);

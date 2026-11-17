@@ -52,6 +52,12 @@ const AssociationSchema = z.object({ id: z.string(), session: z.string(), epoch:
 // the lifecycle stays here rather than importing a runtime helper.
 const RESTART_DELAYS_MS = [0, 1_000, 5_000];
 const STABLE_MS = 60_000;
+// How long a new child gets to answer initialize and finish its session
+// handshake before it is killed and restarted as an exit is (#559): a wedged
+// child would otherwise hold every waiting call and the first turn. Under
+// STABLE_MS, so a child that never initializes uses up its restarts.
+// BUS_TEST_INIT_DEADLINE_MS shortens it for tests.
+const INIT_DEADLINE_MS = Number(process.env.BUS_TEST_INIT_DEADLINE_MS) > 0 ? Number(process.env.BUS_TEST_INIT_DEADLINE_MS) : 30_000;
 
 function esc(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;");
@@ -432,6 +438,8 @@ export const GrayboardPlugin: Plugin = async ({ client, directory }) => {
     // A call that awaits ready gets the failure; this only keeps an unawaited
     // rejection from surfacing when no call is waiting.
     ready.catch(() => {});
+    const deadline = setTimeout(() => fail(`grayboard process didn't initialize within ${INIT_DEADLINE_MS / 1000} s`), INIT_DEADLINE_MS);
+    ready.then(() => clearTimeout(deadline), () => clearTimeout(deadline));
     return { proc, ready, call, associate, stop };
   };
 

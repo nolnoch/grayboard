@@ -64,10 +64,10 @@ const RESTART_DELAYS_MS = [0, 1_000, 5_000];
 const STABLE_MS = 60_000;
 // How long a new child gets to answer initialize and finish its session
 // handshake before it is killed and restarted as an exit is (#559): a wedged
-// child would otherwise hold every waiting call and the session's switch.
+// child would otherwise hold every waiting call and the first turn.
 // Under STABLE_MS, so a child that never initializes uses up its restarts.
 // BUS_TEST_INIT_DEADLINE_MS shortens it for tests.
-const INIT_DEADLINE_MS = Number(process.env.BUS_TEST_INIT_DEADLINE_MS) || 30_000;
+const INIT_DEADLINE_MS = Number(process.env.BUS_TEST_INIT_DEADLINE_MS) > 0 ? Number(process.env.BUS_TEST_INIT_DEADLINE_MS) : 30_000;
 // How long a killed child gets to exit before SIGKILL, as in the omp adapter.
 const EXIT_WAIT_MS = 1_500;
 // How long a child gets to end its session after its stdin closes at

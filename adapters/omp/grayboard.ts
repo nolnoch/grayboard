@@ -61,7 +61,7 @@ const STABLE_MS = 60_000;
 // child would otherwise hold every waiting call and the session's switch.
 // Under STABLE_MS, so a child that never initializes uses up its restarts.
 // BUS_TEST_INIT_DEADLINE_MS shortens it for tests.
-const INIT_DEADLINE_MS = Number(process.env.BUS_TEST_INIT_DEADLINE_MS) || 30_000;
+const INIT_DEADLINE_MS = Number(process.env.BUS_TEST_INIT_DEADLINE_MS) > 0 ? Number(process.env.BUS_TEST_INIT_DEADLINE_MS) : 30_000;
 
 // A tool call's wait for the grayboard process (a transition, a restart's
 // backoff, initialization) ends at the call's abort, as pi's does (#559): a

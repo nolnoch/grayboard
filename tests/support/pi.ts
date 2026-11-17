@@ -412,7 +412,7 @@ export function piLocalInitDeadlineScenario(dir: string): Promise<void> {
       const failed = await toolResult(pi, "whoami");
       expect(failed.isError).toBe(true);
       expect(resultText(failed)).toContain("grayboard process didn't initialize within 1 s");
-      expect(grayboardChildPids(pi.pid)).toEqual([]);
+      await until(() => grayboardChildPids(pi.pid).length === 0, 5_000, "no grayboard process left");
       await idle(pi);
       expect(model.unhandled).toEqual([]);
       await pi.quit();
