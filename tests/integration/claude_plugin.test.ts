@@ -376,6 +376,9 @@ test("the root reports the model and effort its hooks wrote (#545); a subagent's
   expect(facts(rootId)).toEqual({ model: "claude-sonnet-5-5", effort: "max" });
   expect(root.stderr().split("the server gets no model for this session").length - 1).toBe(1);
   expect(root.stderr()).not.toContain("couldn't read session");
+  // A root call on a model without effort: the hook's none goes through this process to the server as a clear (#563 item 3).
+  expect((await modelCall(root, "whoami", {})).error).toBe(false);
+  expect(facts(rootId)).toEqual({ model: "claude-sonnet-5-5", effort: null });
 }, 40_000);
 
 test("an explicit BUS_IDENTITY binds at start (#443), created if new, with delivery; one the naming rule refuses is said in the first tool result", async () => {
