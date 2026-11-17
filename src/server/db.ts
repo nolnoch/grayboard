@@ -15,7 +15,7 @@ import { addressParts, type ScopeKind } from "../core/addresses.ts";
 import { HUMAN_NAME } from "../shared/addressing.ts";
 import type { Principal } from "../core/resolver.ts";
 import { initCoreSchema } from "../core/schema.ts";
-import { countOpenDelegations } from "../core/delegation.ts";
+import { addressUser, countOpenDelegations, everConnected, isLauncher, launchers, type DelegationFacts } from "../core/delegation.ts";
 import { endSession, undeliverableId, type EndedSession, type MailPort, type Undeliverable } from "../core/session_end.ts";
 import type { AuditSink } from "../core/audit.ts";
 import { afterCommit, type Boundary, onCommit, openBoundary, openReader, openSqlite, ownsTx, ownWriter, reclaimFreePages, routeReads } from "../core/sqlite.ts";
@@ -381,6 +381,16 @@ export interface Repo {
     // Deletes the ended ids rows ended before `olderThanMs`, leaving keyed tombstones (core pruneEndedIds); returns how many.
     pruneEnded(tx: Tx, olderThanMs: number, now: number): Promise<number>;
   };
+  // What a delegate decides on (#807 P3 B4b), on the caller's handle: read first, then core's synchronous decision
+  // (resolveDelegationWith) runs over it.
+  delegation: {
+    // The user behind an address (core addressUser): an ID's principal, an alias's holder's or last holder's;
+    // undefined with no session behind it.
+    addressUser(r: Read, address: string): Promise<string | null | undefined>;
+    // Everything the decision can ask for this call: with `to`, that target's; without, every launcher's user and
+    // open count (requests since `since` it hasn't taken, #252). A fact not read throws when asked.
+    facts(r: Read, q: { to?: string; since: number }): Promise<ReadDelegationFacts>;
+  };
   // The writes return promises (#807 P3 A6g), and so do the reads, on the caller's handle (A7e3).
   teams: {
     // Inserts the team's principal in the same transaction; rejects with
@@ -412,8 +422,7 @@ export interface Repo {
     // Whether two users share any team: the human-reach rule's teammates, in one statement (A7e3).
     shareAny(r: Read, userA: number, userB: number): Promise<boolean>;
   };
-  // Every read and write returns a promise (#807 P3 A6d2, A7i) but openDelegations: core's synchronous resolveDelegation
-  // calls it per candidate, so it is core's port until P3 forks core.
+  // Every read and write returns a promise (#807 P3 A6d2, A7i).
   messages: {
     // files: unbound uploads (ids) of their uploader (the sending session's
     // address set, #284 PR 4 S5, and its user, #367), bound in the insert's
@@ -452,8 +461,6 @@ export interface Repo {
     // Direct messages from any of senders since `since` sent pending and not acked by their sender, oldest first.
     sentPending(r: Read, senders: string[], since: number): Promise<MessageRow[]>;
     ack(tx: Tx, reader: string, id: number): Promise<void>;
-    // A launcher's delegation requests since `since` it hasn't taken (#252, countOpenDelegations).
-    openDelegations(r: Read, launcher: string, since: number): number;
     // Stamps delivered_at on a direct message handed to its recipient's harness; the first stamp stands.
     markDelivered(tx: Tx, id: number, at: number): Promise<void>;
     // Deletes a direct message from sender that's past the recipient's cursor
@@ -1487,6 +1494,20 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       sweep: async (tx, now) => sweepChanges(sqliteOf(tx), now),
     },
 
+    delegation: {
+      addressUser: async (r, address) => addressUser(sqliteOf(r), address),
+      async facts(r, q) {
+        const c = sqliteOf(r);
+        const open = (h: string) => countOpenDelegations(c, "access_log", h, q.since);
+        if (q.to !== undefined) {
+          const to = q.to;
+          return delegationFacts({ to: { everConnected: everConnected(c, to), isLauncher: isLauncher(c, to) }, users: new Map([[to, addressUser(c, to)]]), open: new Map([[to, open(to)]]) });
+        }
+        const list = launchers(c);
+        return delegationFacts({ launchers: list, users: new Map(list.map(h => [h, addressUser(c, h)])), open: new Map(list.map(h => [h, open(h)])) });
+      },
+    },
+
     sessionEnd: {
       end: async (tx, id, opts) => { const w = sqliteOf(tx); return endSession(w, mailPort(w), id, opts); },
       refusal: async (tx, id) => undeliverableId(sqliteOf(tx), id),
@@ -1688,10 +1709,6 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
         return att(c, c.query<MessageRow, [string, number]>(
           SENT_PENDING_SQL,
         ).all(JSON.stringify(senders), since));
-      },
-      openDelegations(r, launcher, since) {
-        const c = sqliteOf(r);
-        return countOpenDelegations(c, "access_log", launcher, since);
       },
       async ack(tx, reader, id) {
         sqliteOf(tx).run("INSERT OR IGNORE INTO dm_acks (reader, message_id, acked_at) VALUES (?, ?, ?)", [reader, id, clock()]);
@@ -2284,6 +2301,32 @@ function oauthOps(db: Database, hosted: HostedStoreOf): OAuthOps {
         db.run("DELETE FROM oauth_grants WHERE expires_at <= ?", [now]);
       }).immediate();
     },
+  };
+}
+
+// A delegate's facts, read first (repo.delegation.facts): the decision's reads, and each candidate's open count.
+export interface ReadDelegationFacts extends DelegationFacts {
+  open(handle: string): number;
+}
+
+// Maps over what was read; a question about anything else throws, so a decision that asks for a fact the read left
+// out fails loudly instead of reading as false or zero. The human fallback's reads are local mode's only.
+function delegationFacts(read: {
+  launchers?: string[];
+  to?: { everConnected: boolean; isLauncher: boolean };
+  users: Map<string, string | null | undefined>;
+  open: Map<string, number>;
+}): ReadDelegationFacts {
+  const missing = (what: string): never => { throw new Error(`delegation facts: ${what} was not read`); };
+  const from = <T>(m: Map<string, T>, what: string) => (h: string): T => m.has(h) ? m.get(h) as T : missing(`${what} of "${h}"`);
+  return {
+    launchers: () => read.launchers ?? missing("the launcher list"),
+    userOf: from(read.users, "the user"),
+    everConnected: () => read.to?.everConnected ?? missing("whether the target connected"),
+    isLauncher: () => read.to?.isLauncher ?? missing("whether the target is a launcher"),
+    open: from(read.open, "the open count"),
+    humanHandles: () => missing("the human handles"),
+    lastSeen: () => missing("a last-seen"),
   };
 }
 

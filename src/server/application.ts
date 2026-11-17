@@ -10,7 +10,7 @@ import { DEFAULT_HELLO_LIMIT, DEFAULT_HOSTED_REQUEST_LIMIT, DEFAULT_HOSTED_SUBSC
 import { dedupWrite, type DedupOutcome, type DedupTool, type Written } from "./write_dedup.ts";
 import { testPause, testPauseAsync } from "../shared/testpause.ts";
 import { ALIAS_SCOPE_CAP, aliasCapRefusal } from "./alias_cap.ts";
-import { DELEGATE_LIMIT, DELEGATE_OPEN_CAP, addressUser, crossUserRefusal, delegateOkFields, delegateThrottled, neverConnected, resolveDelegation, type DelegateReach } from "../core/delegation.ts";
+import { DELEGATE_LIMIT, DELEGATE_OPEN_CAP, crossUserRefusal, delegateOkFields, delegateThrottled, neverConnected, resolveDelegationWith, type DelegateReach } from "../core/delegation.ts";
 import {
   MAX_CANDIDATES, MAX_HOLDS, actingAs, aliasHeldText, boardActor, childStateRefusal, closestNames,
   orderCandidates, primaryOf, replyPeer, replyPeerError, replySender, replySenderError, tooManyHolds, unboundPeer, unknownNameError,
@@ -1712,7 +1712,7 @@ async function handleDelegate(hub: Hub, tx: Tx, session: ApplicationSession, m: 
   const online = (h: string) => hub.registry.get(h)?.active === true;
   // The human fallback's reachability is the server's own knowledge: the
   // bridge is running and this user is linked (#191).
-  // The link is read on `h` before core's synchronous resolveDelegation runs (#807 P3 A7i): `h` is the dedup
+  // The link is read on `h` before core's synchronous decision runs (#807 P3 A7i): `h` is the dedup
   // savepoint's Tx where the call runs inside it (the caller's refuses statements while it's open). Whether the bridge
   // runs is in memory, read when core asks.
   const humanReachable = async (h: Tx) => { const linked = !!(await repo.slack.linkFor(h, authed.user_id)); return () => hub.slackRunning() && linked; };
@@ -1722,7 +1722,6 @@ async function handleDelegate(hub: Hub, tx: Tx, session: ApplicationSession, m: 
   let out: DedupOutcome<Written<DelegateResult> & { msg: MessageRow }>;
   // A launcher's open requests: the same window dm_inbox lists by default (#252).
   const since = hub.now() - inboxDays(undefined) * 86_400_000;
-  const open = (h: Tx) => (to: string) => repo.messages.openDelegations(h, to, since);
   // The limiter's streak rows and the policy denies' decision rows from this
   // call: written inside the dedup transaction they'd roll back with it, so
   // they're written after it. A refusal's decision rows go to the session's
@@ -1739,7 +1738,7 @@ async function handleDelegate(hub: Hub, tx: Tx, session: ApplicationSession, m: 
   // refuse it by name; a replay's recheck refuses it, since the stored
   // request's grant can't be judged against a holder that isn't there
   // (security audit of #878).
-  // Decided before core asks (#807 P3 A7f2): core's resolveDelegation is synchronous and calls `reach` only for the
+  // Decided before core asks (#807 P3 A7f2): core's decision is synchronous and calls `reach` only for the
   // explicit `to`, which is resolved before it runs. The deny row is returned, not written, so it's emitted only when
   // core asks (after its own field checks), as before.
   type Reach = { result: DelegateReach; row?: SyncRow };
@@ -1753,7 +1752,7 @@ async function handleDelegate(hub: Hub, tx: Tx, session: ApplicationSession, m: 
     // none), so a human-fallback delegation is rechecked rather than refused as unheld (#1030). A fresh call naming a
     // human keeps reading as own, and routing refuses it as no launcher.
     const t = recheck ? addressParts(to) : null;
-    const owner = t?.kind === "alias" && t.name === HUMAN_NAME && t.scopeKind === "person" ? t.scope : addressUser(repo.coreOn(h), to);
+    const owner = t?.kind === "alias" && t.name === HUMAN_NAME && t.scopeKind === "person" ? t.scope : await repo.delegation.addressUser(h, to);
     if (owner === undefined && recheck) return { result: { refused: `no session holds "${to}" now, so the first delegation's grant can't be rechecked; call again to delegate afresh (#256)` } };
     if (owner === undefined || owner === authed.user_email) return { result: { ok: "own" } };
     if (owner === null) return { result: { refused: crossUserRefusal(to) } };
@@ -1778,7 +1777,10 @@ async function handleDelegate(hub: Hub, tx: Tx, session: ApplicationSession, m: 
         if (pre === undefined || t !== to) throw new Error(`delegate: reach for an address not decided first ("${t}")`);
         return emit(sp, pre);
       };
-      const d = resolveDelegation(repo.coreOn(sp), session.primary, authed.user_email, { ...m, to }, online, await humanReachable(sp), (h) => session.addresses.includes(h), open(sp), hub.delegateOpenCap, reach);
+      // What core's synchronous decision asks of the store, read first on the savepoint (#807 P3 B4b): the named
+      // target's facts, or every launcher's user and open count.
+      const facts = await repo.delegation.facts(sp, { to, since });
+      const d = resolveDelegationWith(facts, session.primary, authed.user_email, { ...m, to }, online, await humanReachable(sp), (h) => session.addresses.includes(h), facts.open, hub.delegateOpenCap, reach);
       picked = d.to;
       const w = await writeSend(hub, sp, session, await prepareSend(hub, sp, session, session.primary, d.to, d.body, null, true, undefined));
       const payload: DelegateResult = { ...w.payload, ...delegateOkFields(d, w.payload) };

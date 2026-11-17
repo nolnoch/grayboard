@@ -316,30 +316,43 @@ test("server: a delegate reads aliases on its body's Tx (#807 P1c-13)", async ()
   expect(checks.filter((c) => !c.inTxn || c.handle !== "tx")).toEqual([]);
 }, 30_000);
 
-// #807 P1c-14b: a delegate's open-request count (the launcher's backlog), and every other messages read in its body,
-// run on the request's Tx, not the pool.
-test("server: a delegate reads messages on its body's Tx (#807 P1c-14b)", async () => {
+// #807 P1c-14b, P3 B4b: a delegate's facts (the launchers, their users and open-request counts), the target's user, and
+// every messages read in its body run on the request's Tx, not the pool; core's decision reads nothing itself.
+test("server: a delegate reads its facts and messages on its body's Tx (#807 P1c-14b, P3 B4b)", async () => {
   const srv = serve();
   const repo = srv.app.repo;
   const checks: { op: string; inTxn: boolean; handle: "pool" | "tx" }[] = [];
-  const spies = (["openDelegations", "undeliveredFrom", "getById"] as const).map((name) => {
-    const original = repo.messages[name].bind(repo.messages) as (...a: unknown[]) => unknown;
-    return spyOn(repo.messages, name).mockImplementation(((r: unknown, ...rest: unknown[]) => {
-      if (new Error().stack?.includes("handleDelegate")) checks.push({ op: name, inTxn: srv.app.db.inTransaction, handle: r === repo.read ? "pool" : "tx" });
+  let route = "";
+  const spy = <S extends object>(store: S, names: readonly (keyof S & string)[]) => names.map((name) => {
+    const original = (store[name] as (...a: unknown[]) => unknown).bind(store);
+    return spyOn(store, name as never).mockImplementation(((r: unknown, ...rest: unknown[]) => {
+      if (route) checks.push({ op: `${route}:${name}`, inTxn: srv.app.db.inTransaction, handle: r === repo.read ? "pool" : "tx" });
       return original(r, ...rest);
     }) as never);
   });
+  const spies = [...spy(repo.messages, ["undeliveredFrom", "getById"] as const), ...spy(repo.delegation, ["addressUser", "facts"] as const)];
+  const coreOn = spyOn(repo, "coreOn");
   try {
     const alice = await srv.login("alice@example.com");
     expect((await srv.api(alice, "POST", "/api/teams", { name: "eng" })).status).toBe(201);
     await launcher(srv, alice, "eng/builder");
     const sim = await srv.connected(alice, "eng/sim");
+    coreOn.mockClear();
+    route = "explicit";
     await sim.delegate({ persona: "p", task: "t", to: "builder" });
+    route = "auto";
+    await sim.delegate({ persona: "p", task: "t2" });
+    route = "";
+    // The decision and the reach read through repo.delegation only.
+    expect(coreOn.mock.calls.length).toBe(0);
   } finally {
-    for (const spy of spies) spy.mockRestore();
+    for (const s of spies) s.mockRestore();
+    coreOn.mockRestore();
     await srv.stop();
   }
-  expect(checks.map((c) => c.op)).toContain("openDelegations");
+  const ops = checks.map((c) => c.op);
+  expect(ops).toEqual(expect.arrayContaining(["explicit:addressUser", "explicit:facts", "auto:facts"]));
+  expect(ops).not.toContain("auto:addressUser");
   expect(checks.filter((c) => !c.inTxn || c.handle !== "tx")).toEqual([]);
 }, 30_000);
 
