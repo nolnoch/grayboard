@@ -2376,8 +2376,10 @@ function hostedWrites(db: Database, ended: { list: EndedChild[] }): HostedWrites
     insertAudit(db, now, actor, action, target, detail ? JSON.stringify(detail) : null);
   const endChild = (child: string, why: string, now: number) => {
     const end = endSession(db, mail, child, { why, now, audit: coreAudit(now) });
+    if (!end.ended) return;
+    const bounces = db.query<MessageRow, [string, number]>(`SELECT ${MSG_COLS} FROM messages WHERE sender = ? AND kind = 'bounce' AND created_at >= ? ORDER BY id`).all(child, now);
     // Queued at commit, so a rolled-back release wakes nobody and bounces nothing.
-    if (end.ended) afterCommit(db, () => { ended.list.push({ id: child, at: now, wake: end.wake }); });
+    afterCommit(db, () => { ended.list.push({ id: child, at: now, wake: end.wake, bounces }); });
   };
   const lostOf = hostedLostOf(db);
   // Marks `where`'s rows' `column` and deletes the rows both readers took.

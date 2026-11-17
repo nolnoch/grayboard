@@ -10,7 +10,8 @@
 // winning wherever a key holds one row per name (its cursor, its
 // subscription mode, its alias labels). A merge is refused only where it
 // would change who a name is: one of the two is a human and the other isn't,
-// the lowercase name is reserved (`human`), or it isn't a valid name at all.
+// an agent's name lowercases to the reserved `human`, or it isn't a valid name
+// at all.
 //
 // Data only (schema changes stay additive). It runs inside the open's schema
 // transaction, after the seed, on every open: a 1.x grayboard still running
@@ -39,6 +40,16 @@ const COLUMNS: readonly (readonly [table: string, column: string, keyed: boolean
 
 export type CaseNotice = (line: string) => void;
 
+// The names a committed move gave rows, per connection, for the opener to
+// wake: a live session bound to `gray` while another process's open merges
+// `Gray` into it is told only by a wakeup (#1189).
+const wakes = new WeakMap<Database, string[]>();
+export function takeCaseWakes(db: Database): string[] {
+  const names = wakes.get(db) ?? [];
+  wakes.delete(db);
+  return names;
+}
+
 // The alias row is the human flag's authority (core/boards.ts); handles.human
 // is 1.x's copy, which declaring a human since never updates.
 const isHuman = (db: Database, name: string): boolean =>
@@ -65,7 +76,8 @@ export function lowercaseLegacyHandles(db: Database, notice: CaseNotice = (l) =>
       continue;
     }
     const to = n.name;
-    if (to === HUMAN_NAME) {
+    // Local mode lets a human handle be named `human`; an agent can't be.
+    if (to === HUMAN_NAME && !isHuman(db, from)) {
       collision(db, from, to, `"${HUMAN_NAME}" is reserved`, notice);
       continue;
     }
@@ -97,8 +109,15 @@ export function lowercaseLegacyHandles(db: Database, notice: CaseNotice = (l) =>
         if (keyed) db.prepare(`DELETE FROM ${t} WHERE ${c} = ?`).run(from);
       }
       if (merged) db.prepare(`UPDATE cursors SET last_seen_id = ? WHERE reader = ?`).run(lowest, to);
+      // A 1.x process still running as `from` writes it again, and every open
+      // merges the new rows: one notice per name, a row per move.
+      const again = !!db.prepare(
+        `SELECT 1 FROM audit_log WHERE action = 'alias.case_moved' AND target = ? AND json_extract(detail, '$.from') = ? LIMIT 1`,
+      ).get(to, from);
       writeCoreAudit(db, "alias.case_moved", "grayboard", to, { from, merged });
       db.exec("RELEASE handle_case");
+      afterCommit(db, () => { wakes.set(db, [...(wakes.get(db) ?? []), to]); });
+      if (again) continue;
     } catch (e) {
       db.exec("ROLLBACK TO handle_case");
       db.exec("RELEASE handle_case");

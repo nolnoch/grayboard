@@ -439,23 +439,31 @@ export function createHostedSessions(application: Application, options: { now?: 
     return mine.promise;
   }
   async function readAll(tx: Tx) {
-    const held = await application.holdsByOwner(tx);
-    const rows = (await store.all(tx)).filter(r => !r.root_session_id && held.has(r.session_id));
-    const builds = new Map<string, { authed: AuthedUser; facts: BuildFacts }>();
-    for (const row of rows) {
-      if (matches(row, holders.get(row.session_id))) continue;
-      const user = await repo.users.findById(tx, row.user_id);
-      if (!user) continue;
-      const authed = authedOf(user);
-      builds.set(row.session_id, { authed, facts: await application.hostedBuildFacts(tx, authed, row.session_id, { holds: held.get(row.session_id)!, writesAs: null, suggested: row.suggested, root: null }) });
-    }
     // The rows each watcher follows, parked ones too, read on this Tx (#807 P3 A7h2): `applyAll` hands them over
-    // before the queue's next body, so no commit lands between this read and the watcher's check.
+    // before the queue's next body, so no commit lands between this read and the watcher's check. Read first, and
+    // each rebuild below in its own savepoint, so a rebuild that throws can't keep a revocation from its watchers.
     const watched = new Map<RowWatcher, Map<string, HostedSession | undefined>>();
     for (const w of watchers) {
       const rows = new Map<string, HostedSession | undefined>();
       for (const id of [...w.ids()]) rows.set(id, await store.get(tx, id));
       watched.set(w, rows);
+    }
+    const held = await application.holdsByOwner(tx);
+    const rows = (await store.all(tx)).filter(r => !r.root_session_id && held.has(r.session_id));
+    const builds = new Map<string, { authed: AuthedUser; facts: BuildFacts }>();
+    for (const row of rows) {
+      if (matches(row, holders.get(row.session_id))) continue;
+      try {
+        await tx.savepoint(async sp => {
+          const user = await repo.users.findById(sp, row.user_id);
+          if (!user) return;
+          const authed = authedOf(user);
+          builds.set(row.session_id, { authed, facts: await application.hostedBuildFacts(sp, authed, row.session_id, { holds: held.get(row.session_id)!, writesAs: null, suggested: row.suggested, root: null }) });
+        });
+      } catch (e) {
+        // Left unbuilt: its holder is closed, if it no longer matches, and rebuilt by a later pass.
+        hostedFailure("hosted.reconcile", e);
+      }
     }
     await testPauseAsync("hosted:reconcile:read");
     return { held, rows, builds, watched };
