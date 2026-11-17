@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { refusalCount } from "./metrics.ts";
+import { until } from "../../tests/support/until.ts";
 import { AppSession } from "../../tests/support/app_session.ts";
 import { hostedRowCount } from "../../tests/support/hosted_rows.ts";
 import { hostedPause } from "../../tests/support/hosted-pause.ts";
@@ -8,7 +9,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createApplication } from "./application.ts";
 import { createDelivery, type DeliveryPrincipal } from "./delivery.ts";
-import { createHostedSessions, sessionContext } from "./hosted.ts";
+import { createHostedSessions, sessionContext, type SessionContext } from "./hosted.ts";
 import { OPENCODE_CLIENT, OPENCODE_SESSION_META } from "./oauth-config.ts";
 import { openDatabase } from "./db.ts";
 import { createBoard, post, subscribe } from "../core/boards.ts";
@@ -26,6 +27,8 @@ let dir: string;
 let now: number;
 let authorized: boolean;
 const context = (p: DeliveryPrincipal, raw = "root") => sessionContext(p, { [OPENCODE_SESSION_META]: raw });
+// The caller's row for describe, as a request's authorize reads it (#807 P3 A7h2: describe reads none of its own).
+const checked = async (c: SessionContext) => ({ row: "id" in c ? await store.repo.hosted.get(store.repo.read, c.id) : undefined });
 beforeEach(async () => {
   dir = mkdtempSync(join(tmpdir(), "gb-delivery-"));
   store = openDatabase(scratchDbPath(), { blobDir: dir });
@@ -117,7 +120,7 @@ test("successful reuse fences older creator cancellation; canceled reuse does no
   delivery.accept(reuse);
   await delivery.cancel(creator);
   expect(delivery.activeLeaseCount).toBe(1);
-  expect(delivery.describe(bob, context(bob), reuse.capability, { row: undefined }).capability).toBe(creator.capability);
+  expect(delivery.describe(bob, context(bob), reuse.capability, await checked(context(bob))).capability).toBe(creator.capability);
   await delivery.release(bob, context(bob), reuse.capability);
   await hosted.bind(bob, context(bob), { name: "fe" });
   const next = await delivery.open(bob, context(bob));
@@ -134,12 +137,12 @@ test("old attempt cancellation cannot end a replacement generation or ownership"
   await hosted.bind(bob, context(bob), { name: "new", create: true });
   const current = await delivery.open(bob, context(bob)); delivery.accept(current);
   await delivery.cancel(old);
-  expect(delivery.describe(bob, context(bob), current.capability, { row: undefined }).bind_gen).toBeGreaterThan(old.bind_gen);
+  expect(delivery.describe(bob, context(bob), current.capability, await checked(context(bob))).bind_gen).toBeGreaterThan(old.bind_gen);
   await delivery.release(bob, context(bob), current.capability);
   await hosted.bind(bob, context(bob), { name: "new" });
   const replacement = await delivery.open(bob, context(bob)); delivery.accept(replacement);
   await delivery.cancel(current);
-  expect(delivery.describe(bob, context(bob), replacement.capability, { row: undefined }).ownership).not.toBe(current.ownership);
+  expect(delivery.describe(bob, context(bob), replacement.capability, await checked(context(bob))).ownership).not.toBe(current.ownership);
 });
 
 test("reads repeat without admission; receipt and dm_ack remain distinct", async () => {
@@ -235,8 +238,10 @@ test("disable immediately closes held ownership and invalidates capability", asy
   const lease = await delivery.open(bob, context(bob));
   await seed(store.repo, tx => store.repo.users.setDisabled(tx, bob.authed.user_id, true));
   expect(hostedRowCount(store.db)).toBe(0);
-  expect(delivery.activeLeaseCount).toBe(0);
-  expect(() => delivery.describe(bob, context(bob), lease.capability, { row: undefined })).toThrow();
+  // A user change names no row: the full pass it requests reads the lease's row and finishes it (#807 P3 A7h2).
+  await until(() => delivery.activeLeaseCount === 0);
+  const row = await checked(context(bob));
+  expect(() => delivery.describe(bob, context(bob), lease.capability, row)).toThrow();
 });
 
 test("board receipt is issued and scoped, not an arbitrary high-water cursor", async () => {
@@ -257,7 +262,7 @@ test("failed rebind preserves lease and original grant attachment", async () => 
   const lease = await delivery.open(bob, context(bob));
   const second = { ...bob, grantId: "G2" };
   await expect(hosted.bind(second, context(bob), { name: "missing" })).rejects.toHaveProperty("code", "identity_unknown");
-  expect(delivery.describe(bob, context(bob), lease.capability, { row: undefined }).capability).toBe(lease.capability);
+  expect(delivery.describe(bob, context(bob), lease.capability, await checked(context(bob))).capability).toBe(lease.capability);
 });
 
 test("receipt storage failure rolls back direct admission and keeps the issued batch retryable", async () => {
@@ -269,7 +274,7 @@ test("receipt storage failure rolls back direct admission and keeps the issued b
   try {
     await expect(delivery.receipt(bob, context(bob), lease.capability, batch.map(item => item.id))).rejects.toThrow("injected receipt rollback");
     expect(await store.repo.cursors.directFor(store.repo.read, "bob@example.com/fe")).toBe(0);
-    expect(delivery.describe(bob, context(bob), lease.capability, { row: undefined }).capability).toBe(lease.capability);
+    expect(delivery.describe(bob, context(bob), lease.capability, await checked(context(bob))).capability).toBe(lease.capability);
   } finally { application.receiptBoards = original; }
   await delivery.receipt(bob, context(bob), lease.capability, batch.map(item => item.id));
   expect(await delivery.pending(bob, context(bob), lease.capability)).toEqual([]);
@@ -287,7 +292,7 @@ test("per-user delivery capacity refuses without attaching another grant or drop
   await expect(delivery.open({ ...bob, grantId: "G2" }, contender)).rejects.toHaveProperty("code", "bad_request");
   expect(delivery.activeLeaseCount).toBe(32);
   expect(hosted.row("id" in contender ? contender.id : "")?.grant_id).toBe(bob.grantId);
-  expect(delivery.describe(bob, context(bob), first.capability, { row: undefined }).capability).toBe(first.capability);
+  expect(delivery.describe(bob, context(bob), first.capability, await checked(context(bob))).capability).toBe(first.capability);
 });
 
 test("the per-user lease count frees a slot on release and never double-counts a reopen (#805)", async () => {
@@ -422,7 +427,7 @@ test("renew completes while a transfer holds the reader gate past the original d
     now += 20_000;
     await hosted.sweep();
     expect(delivery.activeLeaseCount).toBe(1);
-    expect(delivery.describe(bob, context(bob), lease.capability, { row: undefined }).ownership).toBe(lease.ownership);
+    expect(delivery.describe(bob, context(bob), lease.capability, await checked(context(bob))).ownership).toBe(lease.ownership);
   } finally { release(); }
   await transfer;
 });

@@ -244,7 +244,11 @@ export function createHostedSessions(application: Application, options: { now?: 
   // A named row's facts as its transaction commits (readHolder): its row and holds, and what a new holder's build
   // reads when the current holder doesn't match (null: the row's user is gone).
   type HolderFacts = { row?: HostedSession; held: string[]; build?: { authed: AuthedUser; facts: BuildFacts } | null };
-  const listeners = new Set<(changed: string | null) => void>();
+  // `row`: the changed row as its commit left it (null: gone), when the notice carries facts; undefined when it
+  // doesn't (null, or a named notice without facts), whose full pass hands the rows to `watchers` (#807 P3 A7h2).
+  const listeners = new Set<(changed: string | null, row?: HostedSession | null) => void>();
+  type RowWatcher = { ids(): Iterable<string>; apply(rows: Map<string, HostedSession | undefined>): void };
+  const watchers = new Set<RowWatcher>();
   let stopped = false;
   const gate = (id: string) => {
     const enter = async <T>(writer: boolean, fn: () => Promise<T>): Promise<T> => {
@@ -385,7 +389,10 @@ export function createHostedSessions(application: Application, options: { now?: 
         if (facts) applyNamed(changed, facts);
         else full = requestFull(); // a synchronous body's commit, or a failed facts read
       }
-    } finally { for (const listener of listeners) listener(changed); }
+    } finally {
+      const row = changed !== null && facts ? facts.row ?? null : undefined;
+      for (const listener of listeners) listener(changed, row);
+    }
     return full ?? Promise.resolve();
   }
   const authedOf = (user: { id: number; email: string }): AuthedUser => ({ user_id: user.id, user_email: user.email, session_id: 0 });
@@ -443,11 +450,23 @@ export function createHostedSessions(application: Application, options: { now?: 
       const authed = authedOf(user);
       builds.set(row.session_id, { authed, facts: await application.hostedBuildFacts(tx, authed, row.session_id, { holds: held.get(row.session_id)!, writesAs: null, suggested: row.suggested, root: null }) });
     }
+    // The rows each watcher follows, parked ones too, read on this Tx (#807 P3 A7h2): `applyAll` hands them over
+    // before the queue's next body, so no commit lands between this read and the watcher's check.
+    const watched = new Map<RowWatcher, Map<string, HostedSession | undefined>>();
+    for (const w of watchers) {
+      const rows = new Map<string, HostedSession | undefined>();
+      for (const id of [...w.ids()]) rows.set(id, await store.get(tx, id));
+      watched.set(w, rows);
+    }
     await testPauseAsync("hosted:reconcile:read");
-    return { held, rows, builds };
+    return { held, rows, builds, watched };
   }
-  function applyAll({ held, rows, builds }: Awaited<ReturnType<typeof readAll>>) {
+  function applyAll({ held, rows, builds, watched }: Awaited<ReturnType<typeof readAll>>) {
     if (stopped) return;
+    // Watchers first, as reconcile runs the listeners even when a rebuild throws.
+    for (const [w, seen] of watched) if (watchers.has(w)) {
+      try { w.apply(seen); } catch (e) { hostedFailure("hosted.reconcile", e); }
+    }
     const live = new Map(rows.map(r => [r.session_id, r]));
     for (const [id, holder] of holders) {
       const row = live.get(id);
@@ -773,7 +792,9 @@ export function createHostedSessions(application: Application, options: { now?: 
     reconcile,
     sweep,
     settle,
-    listen(fn: (changed: string | null) => void) { listeners.add(fn); return () => { listeners.delete(fn); }; },
+    listen(fn: (changed: string | null, row?: HostedSession | null) => void) { listeners.add(fn); return () => { listeners.delete(fn); }; },
+    // The full pass reads `ids()` on its Tx and hands the rows to `apply` in its `committed` (#807 P3 A7h2).
+    watchRows(w: RowWatcher) { watchers.add(w); return () => { watchers.delete(w); }; },
     // Every MCP exchange's selection, before its tool runs: it doesn't wake a parked child (#566). The tool's own
     // gate does, except session_end's, so ending a parked child is never refused for capacity.
     // `verdict`: the rows it selected, for the same request's tool call (`run`'s `prior`, #907). `endTouch`: false
@@ -1036,7 +1057,7 @@ export function createHostedSessions(application: Application, options: { now?: 
       clearInterval(timer);
       unsubscribe();
       for (const { session } of holders.values()) application.close(session);
-      holders.clear(); listeners.clear();
+      holders.clear(); listeners.clear(); watchers.clear();
       // A clean stop records its exact time, so the next start credits leases
       // with the real downtime rather than up to a heartbeat interval more.
       // Returned, so the caller awaits its commit before it closes the database.
