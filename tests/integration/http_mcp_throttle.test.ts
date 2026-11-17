@@ -20,9 +20,9 @@ test("hosted traffic at 5 requests/s cannot starve same-user binds; exhaustion i
     const other = await srv.login("bob@example.com");
     const hostedToken = (await issueOAuth(srv.app.repo, srv.app.oauth.resource, "alice@example.com", ["grayboard:tools"], Date.now(), OPENCODE_CLIENT)).token;
     const otherHostedToken = (await issueOAuth(srv.app.repo, srv.app.oauth.resource, "bob@example.com")).token;
-    await seed(srv.app.repo, tx => {
-      srv.app.repo.aliases.create(tx, { scope_kind: "person", scope_ref: "alice@example.com", name: "be" }, "alice@example.com");
-      srv.app.repo.aliases.create(tx, { scope_kind: "person", scope_ref: "bob@example.com", name: "be" }, "bob@example.com");
+    await seed(srv.app.repo, async tx => {
+      await srv.app.repo.aliases.create(tx, { scope_kind: "person", scope_ref: "alice@example.com", name: "be" }, "alice@example.com");
+      await srv.app.repo.aliases.create(tx, { scope_kind: "person", scope_ref: "bob@example.com", name: "be" }, "bob@example.com");
     });
     await client.connect(new StreamableHTTPClientTransport(new URL(`${srv.base}/mcp`), {
       requestInit: { headers: { Authorization: `Bearer ${hostedToken}` } },

@@ -36,9 +36,9 @@ async function legacyLogin(email = "alice@example.com") {
   const res = await fetch(`${base}/api/auth/dev-login`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email }) });
   const token = (await res.json() as { session_token: string }).session_token;
   const user = app.repo.users.findByEmail(email)!;
-  await seed(app.repo, tx => {
+  await seed(app.repo, async tx => {
     for (const name of ["be", "allowed"]) {
-      if (!app.repo.aliases.find(tx, `${user.email}/${name}`)) app.repo.aliases.create(tx, { scope_kind: "person", scope_ref: user.email, name: name }, user.email);
+      if (!app.repo.aliases.find(tx, `${user.email}/${name}`)) await app.repo.aliases.create(tx, { scope_kind: "person", scope_ref: user.email, name: name }, user.email);
     }
   });
   return token;

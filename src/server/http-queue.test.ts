@@ -140,7 +140,7 @@ test("#807 P1c-15c-1: claim, identity and team routes reach core on their body's
     await call("claim call as id", you, "POST", "/api/claims/call", { as: "id:0000000000001", tool: "claim_take", args: { key: "j" } });
     await call("claim list", you, "GET", "/api/claims");
     await call("identity delete", you, "DELETE", "/api/identities/agent");
-    await seed(repo, tx => { repo.aliases.create(tx, { scope_kind: "team", scope_ref: "core", name: "bot" }, "you@example.com"); });
+    await seed(repo, tx => repo.aliases.create(tx, { scope_kind: "team", scope_ref: "core", name: "bot" }, "you@example.com"));
     await call("team delete-alias", you, "POST", "/api/teams/core/delete-alias", { name: "bot" });
     await call("team remove", you, "POST", "/api/teams/core/remove", { email: "bob@example.com" });
     await call("team add again", you, "POST", "/api/teams/core/add", { email: "bob@example.com" });
