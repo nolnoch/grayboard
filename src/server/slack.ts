@@ -236,7 +236,7 @@ export class SlackBridge implements SlackLinker {
       const moved = previous && previous.slack_user !== slackUser ? previous : undefined;
       if (moved) writeAudit(repo, tx, "slack.relinked", user.email, slackUser, { from: moved.slack_user });
       const handle = `${user.email}/${HUMAN_NAME}`;
-      if (!repo.aliases.find(tx, handle)) {
+      if (!(await repo.aliases.find(tx, handle))) {
         // Start from now: drop what queued for an earlier link's alias.
         forgetHandle(repo.coreOn(tx), handle);
         await repo.aliases.create(tx, { scope_kind: "person", scope_ref: user.email, name: HUMAN_NAME }, user.email);

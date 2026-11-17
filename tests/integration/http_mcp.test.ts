@@ -39,7 +39,7 @@ async function legacyLogin(email = "alice@example.com") {
   const user = (await app.repo.users.findByEmail(app.repo.read, email))!;
   await seed(app.repo, async tx => {
     for (const name of ["be", "allowed"]) {
-      if (!app.repo.aliases.find(tx, `${user.email}/${name}`)) await app.repo.aliases.create(tx, { scope_kind: "person", scope_ref: user.email, name: name }, user.email);
+      if (!(await app.repo.aliases.find(tx, `${user.email}/${name}`))) await app.repo.aliases.create(tx, { scope_kind: "person", scope_ref: user.email, name: name }, user.email);
     }
   });
   return token;
@@ -105,7 +105,7 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: HTTP delegation u
 for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: configured Origin gates discovery and tools before identity creation`, async () => {
   const token = await login();
   await expect(connect(token, "refused", version, "https://foreign.example.com")).rejects.toThrow();
-  expect(app.repo.aliases.find(app.repo.read, "alice@example.com/refused")).toBeUndefined();
+  expect(await app.repo.aliases.find(app.repo.read, "alice@example.com/refused")).toBeUndefined();
   let origin = trustedOrigin;
   let identity = "allowed";
   const client = new Client({ name: "origin-test", version: "1" }, {
@@ -135,7 +135,7 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: configured Origin
       });
       expect(res.status).toBe(403);
     }
-    expect(app.repo.aliases.find(app.repo.read, `alice@example.com/${identity}`)).toBeUndefined();
+    expect(await app.repo.aliases.find(app.repo.read, `alice@example.com/${identity}`)).toBeUndefined();
     expect(app.mcp.activeContexts).toBe(app.mcp.activeGetStreams);
   }
   origin = trustedOrigin;
@@ -162,7 +162,7 @@ test("all HTTP methods authenticate; identity headers never bind an uncontextual
     expect((await client.callTool({ name: "board_create", arguments: { name: "blocked", purpose: "no context" } })).isError).toBe(true);
     expect((await client.callTool({ name: "bind", arguments: { name: "be", create: true } })).isError).toBe(true);
   }
-  expect(app.repo.aliases.find(app.repo.read, "alice@example.com/human")).toBeUndefined();
+  expect(await app.repo.aliases.find(app.repo.read, "alice@example.com/human")).toBeUndefined();
   expect(app.mcp.activeContexts).toBe(app.mcp.activeGetStreams);
 });
 
@@ -262,7 +262,7 @@ test("OAuth challenges and actual scope precede identity validation on every met
       expect(response.headers.get("WWW-Authenticate")).toBe(`Bearer resource_metadata="${app.oauth.resourceMetadata}", scope="${status === 401 ? "grayboard:delivery grayboard:tools" : "grayboard:tools"}", error="${error}"`);
     }
   }
-  expect(app.repo.aliases.find(app.repo.read, "alice@example.com/unselected")).toBeUndefined();
+  expect(await app.repo.aliases.find(app.repo.read, "alice@example.com/unselected")).toBeUndefined();
   expect(app.mcp.activeContexts).toBe(app.mcp.activeGetStreams);
 });
 
@@ -363,7 +363,7 @@ for (const version of MCP_PROTOCOL_VERSIONS) for (const failure of ["expiry", "r
       await response.arrayBuffer();
     }
     expect(checks).toBe(2);
-    expect(app.repo.aliases.find(app.repo.read, `${issued.authed.user_email}/unselected`)).toBeUndefined();
+    expect(await app.repo.aliases.find(app.repo.read, `${issued.authed.user_email}/unselected`)).toBeUndefined();
     expect(app.db.query("SELECT name FROM boards WHERE name = 'blocked'").get()).toBeNull();
     expect(app.mcp.activeContexts).toBe(app.mcp.activeGetStreams);
   } finally { app.oauth.authenticate = original; }
@@ -378,7 +378,7 @@ test("production MCP storage errors are generic 500s, not invalid-token guesses"
     expect(response.headers.has("WWW-Authenticate")).toBe(false);
     expect(await response.json()).toEqual({ code: "internal", message: "internal error" });
   } finally { restoreFindActiveAccess(); }
-  expect(app.repo.aliases.find(app.repo.read, "alice@example.com/unselected")).toBeUndefined();
+  expect(await app.repo.aliases.find(app.repo.read, "alice@example.com/unselected")).toBeUndefined();
   expect(app.mcp.activeContexts).toBe(app.mcp.activeGetStreams);
 });
 

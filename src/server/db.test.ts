@@ -233,12 +233,12 @@ describe("Repo", () => {
       return await repo.aliases.create(tx, { scope_kind: "team", scope_ref: "eng", name: "be" }, "you@example.com");
     });
     expect(team).toMatchObject({ address: "eng/be", scope_kind: "team", scope_ref: "eng", name: "be" });
-    expect(repo.aliases.find(repo.read, "eng/be")?.id).toBe(team.id);
-    expect(repo.aliases.find(repo.read, "eng/fe")).toBeUndefined();
+    expect((await repo.aliases.find(repo.read, "eng/be"))?.id).toBe(team.id);
+    expect(await repo.aliases.find(repo.read, "eng/fe")).toBeUndefined();
     expect(repo.aliases.listForScope(repo.read, "team", "eng").map((a) => a.address)).toEqual(["eng/be"]);
     expect(repo.aliases.listForScope(repo.read, "person", "you@example.com").map((a) => a.address)).toEqual(["you@example.com/be"]);
     expect(repo.aliases.listForScope(repo.read, "person", "eng")).toEqual([]);
-    expect(repo.aliases.findAllByName(repo.read, "be").map((a) => a.address)).toEqual(["eng/be", "you@example.com/be"]);
+    expect((await repo.aliases.findAllByName(repo.read, "be")).map((a) => a.address)).toEqual(["eng/be", "you@example.com/be"]);
   });
 
   test("principals: findByName reads users and teams", async () => {
@@ -901,30 +901,30 @@ test("#807 P1c-13: the aliases store runs on the handle it's given", async () =>
     await repo.users.upsertByEmail(tx, "a@example.com", null);
     await repo.aliases.create(tx, person("a@example.com", "fe"), "a@example.com");
     // Read inside the body that wrote it, on its Tx.
-    expect(repo.aliases.find(tx, "a@example.com/fe")?.name).toBe("fe");
+    expect((await repo.aliases.find(tx, "a@example.com/fe"))?.name).toBe("fe");
     return { kept: tx };
   });
   const settled = /used after its transaction settled/;
   const a = repo.aliases;
   expect(() => a.create(kept, person("a@example.com", "be"), "a@example.com")).toThrow(settled);
   expect(() => a.remove(kept, "a@example.com/fe")).toThrow(settled);
-  expect(() => a.find(kept, "a@example.com/fe")).toThrow(settled);
+  await expect(a.find(kept, "a@example.com/fe")).rejects.toThrow(settled);
   expect(() => a.listForScope(kept, "person", "a@example.com")).toThrow(settled);
   expect(() => a.countForScope(kept, "person", "a@example.com")).toThrow(settled);
-  expect(() => a.findAllByName(kept, "fe")).toThrow(settled);
-  expect(() => a.find({} as Tx, "a@example.com/fe")).toThrow("not a SQLite store handle");
-  expect(a.find(repo.read, "a@example.com/be")).toBeUndefined();
+  await expect(a.findAllByName(kept, "fe")).rejects.toThrow(settled);
+  await expect(a.find({} as Tx, "a@example.com/fe")).rejects.toThrow("not a SQLite store handle");
+  expect(await a.find(repo.read, "a@example.com/be")).toBeUndefined();
   expect(a.listForScope(repo.read, "person", "a@example.com").map(x => x.name)).toEqual(["fe"]);
   expect(a.countForScope(repo.read, "person", "a@example.com")).toBe(1);
-  expect(a.findAllByName(repo.read, "fe").map(x => x.address)).toEqual(["a@example.com/fe"]);
+  expect((await a.findAllByName(repo.read, "fe")).map(x => x.address)).toEqual(["a@example.com/fe"]);
   // A create rolls back with its body, and a remove's read points with it.
   await expect(seed(repo, tx => {
     a.create(tx, person("a@example.com", "qa"), "a@example.com");
     a.remove(tx, "a@example.com/fe");
     throw new Error("rolled back");
   })).rejects.toThrow("rolled back");
-  expect(a.find(repo.read, "a@example.com/qa")).toBeUndefined();
-  expect(a.find(repo.read, "a@example.com/fe")?.name).toBe("fe");
+  expect(await a.find(repo.read, "a@example.com/qa")).toBeUndefined();
+  expect((await a.find(repo.read, "a@example.com/fe"))?.name).toBe("fe");
 });
 
 // #807 P1c-14a: the messages store's writes and the mail port run on the Tx they're given.

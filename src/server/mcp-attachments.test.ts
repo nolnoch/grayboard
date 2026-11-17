@@ -94,7 +94,7 @@ test("precise routing, canonical challenge, strict query and existing identity o
     expect((await send(request("POST", `/mcp/attachments?${query}`))).status).toBe(query.includes("access_token") ? 401 : query.startsWith("identity=human&") || query.startsWith("identity=alice%40") ? 403 : 400);
   }
   expect((await send(request("POST", "/mcp/attachments?identity=missing&filename=x.txt"))).status).toBe(403);
-  expect(store.repo.aliases.find(store.repo.read, `${issued.authed.user_email}/missing`)).toBeUndefined();
+  expect(await store.repo.aliases.find(store.repo.read, `${issued.authed.user_email}/missing`)).toBeUndefined();
   for (const id of ["0", "-1", "1e2", "01", "9007199254740992", "%31"]) expect((await send(request("GET", `/mcp/attachments/${id}?identity=be`))).status).toBe(400);
   expect(count()).toBe(0);
 });
@@ -474,9 +474,9 @@ test("#1053: the guard's reads inside a transaction body use that body's handle,
 });
 
 // #807 P3 A7d2a: `start`'s request holds at the guard's `attachments:guard:checked` point (its token read done) on its
-// `hit`th guard call, then `during` runs, then the pause releases. Resolves with the response.
-async function heldGuard(hit: number, start: () => Promise<Response>, during: () => Promise<void> | void) {
-  const point = "attachments:guard:checked";
+// `hit`th guard call, then `during` runs, then the pause releases. Resolves with the response. `point` picks another
+// pause in the guard (A7f3: `attachments:guard:alias-read`, after its alias read).
+async function heldGuard(hit: number, start: () => Promise<Response>, during: () => Promise<void> | void, point = "attachments:guard:checked") {
   const pause = mkdtempSync(join(tmpdir(), "gb-guard-pause-")), file = join(pause, "release");
   let seen = 0;
   const reached = Promise.withResolvers<void>();
@@ -546,6 +546,21 @@ for (const [stop, status] of [["abort", 499], ["close", 503]] as const) {
       if (stop === "abort") aborts.abort();
       else closing = router.close();
     });
+    await closing;
+    expect(response.status).toBe(status);
+    expect(everStored()).toBe(false);
+  });
+}
+
+// #807 P3 A7f3: the guard's alias read awaits, so a stop during it refuses there, before the store body inserts.
+for (const [stop, status] of [["abort", 499], ["close", 503]] as const) {
+  test(`#807 P3 A7f3: a request ${stop === "abort" ? "aborted" : "closed"} while the store body's guard reads its alias is refused there`, async () => {
+    const aborts = new AbortController();
+    let closing: Promise<void> | undefined;
+    const response = await heldGuard(5, () => send(request("POST", undefined, bytes, issued.token, { signal: aborts.signal })), () => {
+      if (stop === "abort") aborts.abort();
+      else closing = router.close();
+    }, "attachments:guard:alias-read");
     await closing;
     expect(response.status).toBe(status);
     expect(everStored()).toBe(false);
