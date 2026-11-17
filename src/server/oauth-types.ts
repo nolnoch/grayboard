@@ -30,7 +30,7 @@ export type OAuthFailure = { status: "invalid" | "not_found" | "replay" | "capac
 export type OAuthResult<T> = { status: "ok"; value: T } | OAuthFailure;
 // Writes take the body's `Tx`, reads a `Read` (#807 D2): the caller's `Tx` inside a write body, `repo.read` outside one.
 // Every method is async (#807 P3 A7c). The SQLite Repo also keeps synchronous forms of the two auth hot-path reads
-// (`Repo.authNow`) for the hosted MCP callers that are still synchronous until A7d.
+// (`Repo.authNow`) for the hosted MCP callers that are still synchronous until A7d2.
 export interface OAuthStore {
   createRequest(tx: Tx, input: OAuthRequest, now: number): Promise<OAuthResult<OAuthRequest>>;
   findRequest(r: Read, requestHash: string, browserHash: string, now: number): Promise<OAuthRequest | undefined>;

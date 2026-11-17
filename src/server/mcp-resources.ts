@@ -99,16 +99,16 @@ export function registerHostedResources(server: McpServer, context: {
   role: HostedRole;
   current(ctx?: ServerContext): { principal: OAuthPrincipal; sessionContext: SessionContext; session: ApplicationSession; request: Request };
   issuer: string; resource: string; resources: Resources; delivery: Delivery; hosted: HostedSessions;
-  authorize(): { row: HostedSession | undefined };
+  authorize(): Promise<{ row: HostedSession | undefined }>;
   leaseHooks?: () => { changed(): void; closed(): void; bind(capability: string): void };
 }) {
   const { role, resources, delivery, hosted } = context;
-  const authorize = (signal?: AbortSignal) => {
+  const authorize = async (signal?: AbortSignal) => {
     if (signal?.aborted) throw new ApplicationError("unauthenticated", "request cancelled");
     return context.authorize();
   };
-  // `checked`: the authorization its caller made with no await since (#881), so it isn't made twice.
-  const leaseCapability = (signal: AbortSignal, checked = authorize(signal)) => {
+  // `checked`: the authorization its caller awaited with no await since (#881), so it isn't made twice.
+  const leaseCapability = (checked: { row: HostedSession | undefined }) => {
     const { principal, sessionContext, session, request } = context.current();
     const capability = request.headers.get("X-Grayboard-Lease");
     if (!capability || !/^[A-Za-z0-9_-]{43}$/.test(capability) ||
@@ -121,7 +121,7 @@ export function registerHostedResources(server: McpServer, context: {
     const params = request.params ?? {};
     const { principal, sessionContext } = context.current(ctx);
     try {
-      authorize(ctx.mcpReq.signal);
+      await authorize(ctx.mcpReq.signal);
       if (role === "subscriber") {
         if (params.cursor !== undefined) throw new ApplicationError("bad_request", "invalid catalog cursor");
         return { resources: [metadata(inboxUri, "inbox")] };
@@ -135,7 +135,7 @@ export function registerHostedResources(server: McpServer, context: {
   });
   server.server.setRequestHandler("resources/templates/list", async (request, ctx) => {
     try {
-      authorize(ctx.mcpReq.signal);
+      await authorize(ctx.mcpReq.signal);
       if (request.params?.cursor !== undefined) throw new ApplicationError("bad_request", "invalid catalog cursor");
       return { resourceTemplates: [] };
     } catch (error) { throw resourceError(error); }
@@ -143,10 +143,10 @@ export function registerHostedResources(server: McpServer, context: {
   server.server.setRequestHandler("resources/read", async ({ params }, ctx) => {
     const { principal, sessionContext, session } = context.current(ctx);
     try {
-      const checked = authorize(ctx.mcpReq.signal);
+      const checked = await authorize(ctx.mcpReq.signal);
       if (role === "subscriber") {
         if (params.uri !== inboxUri) throw new ApplicationError("not_found", "resource not found");
-        return json(params.uri, { items: await delivery.pending(principal, sessionContext, leaseCapability(ctx.mcpReq.signal, checked), 100) });
+        return json(params.uri, { items: await delivery.pending(principal, sessionContext, leaseCapability(checked), 100) });
       }
       const read = boardRead(params.uri);
       return json(params.uri, await hosted.run(principal, sessionContext, "board_read", (session, tx) => resources.read(tx, session, read.uri, read.options)));
@@ -157,11 +157,12 @@ export function registerHostedResources(server: McpServer, context: {
     }
   });
   if (role !== "subscriber") return;
-  // `call` runs synchronously up to its first await, so it may use `checked` there (#881).
+  // `call` runs synchronously up to its first await, so it may use `checked` there (#881): `checked` was awaited
+  // just before it.
   const run = async (ctx: ServerContext, call: (checked: { row: HostedSession | undefined }) => unknown | Promise<unknown>) => {
     try {
       context.current(ctx);
-      const value = await call(authorize(ctx.mcpReq.signal));
+      const value = await call(await authorize(ctx.mcpReq.signal));
       return { content: [{ type: "text" as const, text: JSON.stringify(value ?? { ok: true }) }] };
     } catch (error) {
       return toolError(error);
@@ -172,13 +173,13 @@ export function registerHostedResources(server: McpServer, context: {
     description: "Add a name to this root's holds; never enrolls it for host admission.",
     inputSchema: HOSTED_BIND_INPUT,
   }, async (args, ctx) => {
-    try { context.current(ctx); authorize(ctx.mcpReq.signal); return await hosted.bind(context.current().principal, context.current().sessionContext, args); }
+    try { context.current(ctx); await authorize(ctx.mcpReq.signal); return await hosted.bind(context.current().principal, context.current().sessionContext, args); }
     catch (error) { return toolError(error); }
   });
   server.registerTool("unbind", {
     description: "Release one of this root's holds.", inputSchema: HOSTED_UNBIND_INPUT,
   }, async (args, ctx) => {
-    try { context.current(ctx); authorize(ctx.mcpReq.signal); return await hosted.unbind(context.current().principal, context.current().sessionContext, args); }
+    try { context.current(ctx); await authorize(ctx.mcpReq.signal); return await hosted.unbind(context.current().principal, context.current().sessionContext, args); }
     catch (error) { return toolError(error); }
   });
   server.registerTool("session_register", {
@@ -197,7 +198,7 @@ export function registerHostedResources(server: McpServer, context: {
     const hooks = context.leaseHooks?.();
     const lease = await delivery.open(principal, sessionContext, hooks, args.context === undefined ? {} : { context: args.context });
     hooks?.bind(lease.capability);
-    try { authorize(ctx.mcpReq.signal); delivery.accept(lease); return lease; }
+    try { await authorize(ctx.mcpReq.signal); delivery.accept(lease); return lease; }
     catch (error) {
       try { await delivery.cancel(lease); } catch {}
       throw error;
@@ -205,12 +206,12 @@ export function registerHostedResources(server: McpServer, context: {
   }));
   server.registerTool("delivery_renew", {
     description: "Renew this identity's delivery lease supplied in X-Grayboard-Lease.", inputSchema: EMPTY_INPUT,
-  }, (_args, ctx) => run(ctx, checked => delivery.renew(context.current().principal, context.current().sessionContext, leaseCapability(ctx.mcpReq.signal, checked))));
+  }, (_args, ctx) => run(ctx, checked => delivery.renew(context.current().principal, context.current().sessionContext, leaseCapability(checked))));
   server.registerTool("delivery_receipt", {
     description: "Receipt issued delivery IDs only after durable host admission; not a DM handling acknowledgment.",
     inputSchema: RECEIPT_INPUT,
-  }, (args, ctx) => run(ctx, checked => delivery.receipt(context.current().principal, context.current().sessionContext, leaseCapability(ctx.mcpReq.signal, checked), args.ids)));
+  }, (args, ctx) => run(ctx, checked => delivery.receipt(context.current().principal, context.current().sessionContext, leaseCapability(checked), args.ids)));
   server.registerTool("delivery_release", {
     description: "Release this identity's delivery lease supplied in X-Grayboard-Lease.", inputSchema: EMPTY_INPUT,
-  }, (_args, ctx) => run(ctx, checked => delivery.release(context.current().principal, context.current().sessionContext, leaseCapability(ctx.mcpReq.signal, checked))));
+  }, (_args, ctx) => run(ctx, checked => delivery.release(context.current().principal, context.current().sessionContext, leaseCapability(checked))));
 }
