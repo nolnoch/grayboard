@@ -424,3 +424,18 @@ for (const h of HARNESSES) test(`setup and refresh-adapters warn when ${h}'s gra
   expect(fixed.stderr + fixed.stdout).not.toContain(warning);
   expect(f.entry()).toEqual(localEntry);
 }, 60_000);
+
+// From source, a macro runs when its module loads: only adapter_texts.ts, which
+// setup and refresh-adapters load on demand, may import one, so `mcp`,
+// `--version` and every other command never run `bun build` (#438).
+test("only adapter_texts.ts imports the adapter macros among the CLI's modules, and nothing imports it statically", () => {
+  const modules = readdirSync(import.meta.dir).filter(f => f.endsWith(".ts") && !f.endsWith(".test.ts"));
+  const source = (f: string) => readFileSync(join(import.meta.dir, f), "utf8");
+  // The transpiler refuses main.ts's shebang line.
+  const imports = new Map(modules.map(f => [f, new Bun.Transpiler({ loader: "ts" }).scanImports(source(f).replace(/^#!.*\n/, ""))]));
+  // scanImports doesn't report import attributes: a macro import names adapters.ts with `type: "macro"`.
+  expect(modules.filter(f => /from\s+["']\.\/adapters\.ts["']\s+with\s*\{\s*type:\s*["']macro["']/.test(source(f)))).toEqual(["adapter_texts.ts"]);
+  const statically = [...imports].filter(([, list]) => list.some(i => i.path === "./adapter_texts.ts" && i.kind !== "dynamic-import")).map(([f]) => f);
+  expect(statically).toEqual([]);
+  expect(imports.get("cli.ts")!.some(i => i.path === "./adapter_texts.ts" && i.kind === "dynamic-import")).toBe(true);
+});

@@ -569,10 +569,13 @@ test("a runner child with no parent session works as an unregistered session, wa
   await root("loner-next", "loner", {}, false);
 });
 
-test("a config.json URL the extension would refuse leaves it loading: start warns, and every tool call and status name the fix", async () => {
+test("a missing config.json, or a URL the extension would refuse, leaves it loading: start warns, and every tool call and status name the fix", async () => {
   const rule = `${join(stateDir, "config.json")} names a server URL that isn't canonical HTTPS (or HTTP loopback) without credentials, query or fragment; run \`grayboard setup --server <url>\` with one that is`;
-  for (const url of ["http://10.0.0.5:8080/mcp", "https://grayboard.example/mcp?team=1"]) {
-    writeFileSync(join(stateDir, "config.json"), JSON.stringify({ url }));
+  const unset = "grayboard is not set up for a server; run `grayboard setup --server <url>`";
+  const cases: [string | undefined, string][] = [["http://10.0.0.5:8080/mcp", rule], ["https://grayboard.example/mcp?team=1", rule], [undefined, unset]];
+  for (const [url, rule] of cases) {
+    if (url) writeFileSync(join(stateDir, "config.json"), JSON.stringify({ url }));
+    else rmSync(join(stateDir, "config.json"), { force: true });
     const i = instance();
     await i.ext.start({ id: `noncanonical-${instances.length}`, reason: "startup" });
     expect(i.notices).toEqual([{ level: "warning", message: `grayboard: ${rule}` }]);
@@ -740,7 +743,7 @@ test("a child's system-prompt instructions are its registered session's, even fe
   expect((await child.call("whoami")).isError).toBeUndefined();
 });
 
-test("a pause the Controller's run loop reaches on its own is said at once and in the next tool result", async () => {
+test("a pause the Controller's run loop reaches on its own is said at once and in the next tool result, and /grayboard resume restarts it", async () => {
   const a = await root("sink-a", "sinker");
   // The same session bound to another name outside this extension: the run
   // loop won't deliver under a binding it didn't make.
@@ -751,6 +754,15 @@ test("a pause the Controller's run loop reaches on its own is said at once and i
   await until(() => a.notices.length > 0, 10_000, "a notice");
   expect(a.notices).toEqual([{ level: "warning", message: paused }]);
   expect(texts(await a.call("whoami"))[0]).toBe(paused);
+  // /grayboard resume restarts the paused root: it runs again under its own name.
+  await a.ext.command("resume");
+  // It says "approved" before the command returns; whether delivery's later "active" also
+  // reaches the UI as a notice is timing-dependent, so status is the proof it's running again.
+  expect(a.notices.slice(1, 2)).toEqual([{ level: "info", message: "grayboard: approved: Bound sinker, switched; opening delivery" }]);
+  await until(async () => (await a.ext.status()).includes(`  sink-a (${EMAIL}/sinker, ${EMAIL}/switched): active,`), 5_000, "sink-a active as sinker, switched");
+  const resumed = texts(await a.call("whoami"));
+  expect(resumed).toHaveLength(1);
+  expect(JSON.parse(resumed[0]!)).toMatchObject({ primary: `${EMAIL}/sinker`, held: [`${EMAIL}/sinker`, `${EMAIL}/switched`] });
 });
 
 test("with the server down, /grayboard logout signs out but warns that its revoke is queued, and a failed /grayboard login names login, not resume", async () => {
