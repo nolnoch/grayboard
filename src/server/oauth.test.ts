@@ -25,6 +25,7 @@ import { GOOGLE_ISSUER } from "./idp_google.ts";
 import { DomainRefused } from "./idp.ts";
 import { REFUSED } from "./oauth.ts";
 import { exportJWK, generateKeyPair, SignJWT, type JWK, type KeyLike } from "jose";
+import { stubAuthRead } from "../../tests/support/auth_stub.ts";
 
 const random = () => randomBytes(32).toString("base64url");
 // One signing key for every test that mocks Google's JWKS: the default provider's key set (idp_google.ts) is
@@ -62,7 +63,7 @@ beforeEach(() => {
     const handled = await service.fetch(req);
     if (handled) return handled;
     if (new URL(req.url).pathname !== "/mcp") return new Response(null, { status: 404 });
-    const principal = service.authenticate(req);
+    const principal = await service.authenticate(req);
     if (principal instanceof Response) return principal;
     return mcp.fetch(req);
   } });
@@ -71,12 +72,12 @@ beforeEach(() => {
     devAuth: true, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES, messageRetentionDays: 90, auditRetentionDays: 90, oauthClients: registrations,
     oauthCimdClients: [OPENCODE_CLIENT, "https://client.example/metadata.json", "https://client.example/client.json"] };
   service = makeService();
-  mcp = createMcpHandler(({ requestInfo }) => {
-    const principal = service.authenticate(requestInfo!);
+  mcp = createMcpHandler(async ({ requestInfo }) => {
+    const principal = await service.authenticate(requestInfo!);
     if (principal instanceof Response) throw new Error("unauthenticated");
     const s = new McpServer({ name: "oauth-fixture", version: "1" });
-    s.registerTool("whoami", { description: "Fixture live OAuth principal" }, () => {
-      if (!service.isAuthorized(principal)) throw new Error("unauthenticated");
+    s.registerTool("whoami", { description: "Fixture live OAuth principal" }, async () => {
+      if (!await service.isAuthorized(principal)) throw new Error("unauthenticated");
       return { content: [{ type: "text", text: principal.authed.user_email }] };
     });
     return s;
@@ -138,42 +139,41 @@ test("CIMD automatic registration uses one native grant and omitted resource sta
   const exchanged = await post("/oauth/token", params); expect(exchanged.status).toBe(200);
   const tokens = await exchanged.json() as Tokens;
   expect(tokens.scope).toBe("grayboard:delivery grayboard:tools");
-  const original = principal(tokens, ["grayboard:delivery", "grayboard:tools"]);
+  const original = await principal(tokens, ["grayboard:delivery", "grayboard:tools"]);
   expect(original.clientId).toBe(clientId);
   const refresh = { grant_type: "refresh_token", client_id: clientId, refresh_token: tokens.refresh_token };
   expect((await post("/oauth/token", { ...refresh, resource: base + "/wrong" })).status).toBe(400);
   const renewed = await post("/oauth/token", refresh); expect(renewed.status).toBe(200);
   const next = await renewed.json() as Tokens;
-  expect(principal(next).grantId).toBe(original.grantId);
+  expect((await principal(next)).grantId).toBe(original.grantId);
   expect(reads).toBe(1);
   expect((await post("/oauth/revoke", { client_id: clientId, token: next.refresh_token })).status).toBe(200);
-  expect(service.authenticate(new Request(base + "/mcp", { headers: { Authorization: `Bearer ${next.access_token}` } }))).toBeInstanceOf(Response);
+  expect(await service.authenticate(new Request(base + "/mcp", { headers: { Authorization: `Bearer ${next.access_token}` } }))).toBeInstanceOf(Response);
 });
 
 test("internal grant liveness survives individual access revocation but never authorizes that access", async () => {
   const grant = await issueOAuth(storage.repo, service.resource, "you@example.com", ["grayboard:delivery", "grayboard:tools"], clock);
   const request = new Request(service.resource, { headers: { Authorization: `Bearer ${grant.token}` } });
-  const principal = service.authenticate(request);
+  const principal = await service.authenticate(request);
   if (principal instanceof Response) throw new Error("expected fixture principal");
-  expect(service.isGrantActive(grant.grantId)).toBe(true);
+  expect(await service.isGrantActive(grant.grantId)).toBe(true);
   await seed(storage.repo, tx => storage.repo.oauth.revokeToken(tx, grant.tokens.accessHash, grant.binding.clientId, clock));
-  expect(service.isGrantActive(grant.grantId)).toBe(true);
-  expect(service.isAuthorized(principal)).toBe(false);
-  expect(service.authenticate(request)).toBeInstanceOf(Response);
-  expect(service.isGrantActive("unknown")).toBe(false);
-  const active = storage.repo.oauth.isGrantActive;
-  storage.repo.oauth.isGrantActive = () => { throw new Error("storage unavailable"); };
-  try { expect(() => service.isGrantActive(grant.grantId)).toThrow("storage unavailable"); }
-  finally { storage.repo.oauth.isGrantActive = active; }
+  expect(await service.isGrantActive(grant.grantId)).toBe(true);
+  expect(await service.isAuthorized(principal)).toBe(false);
+  expect(await service.authenticate(request)).toBeInstanceOf(Response);
+  expect(await service.isGrantActive("unknown")).toBe(false);
+  const restoreIsGrantActive = stubAuthRead(storage.repo, "isGrantActive", active => () => { throw new Error("storage unavailable"); });
+  try { await expect(service.isGrantActive(grant.grantId)).rejects.toThrow("storage unavailable"); }
+  finally { restoreIsGrantActive(); }
   await seed(storage.repo, tx => storage.repo.users.setDisabled(tx, grant.authed.user_id, true));
-  expect(service.isGrantActive(grant.grantId)).toBe(false);
+  expect(await service.isGrantActive(grant.grantId)).toBe(false);
   await seed(storage.repo, tx => storage.repo.users.setDisabled(tx, grant.authed.user_id, false));
-  expect(service.isGrantActive(grant.grantId)).toBe(false);
+  expect(await service.isGrantActive(grant.grantId)).toBe(false);
   const next = await issueOAuth(storage.repo, service.resource, "you@example.com", ["grayboard:delivery"], clock);
   clock += OAUTH_TTL.grant;
-  expect(service.isGrantActive(next.grantId)).toBe(false);
+  expect(await service.isGrantActive(next.grantId)).toBe(false);
   service.close();
-  expect(service.isGrantActive(grant.grantId)).toBe(false);
+  expect(await service.isGrantActive(grant.grantId)).toBe(false);
 });
 
 test("CIMD refuses every issuer-origin redirect before creating a phishing flow", async () => {
@@ -294,13 +294,13 @@ test("each built-in client completes code and refresh on a random loopback port 
     expect(issued.consent.content).toContain("Local callback: only approve if you started this client.");
     const tokens = await redeem(issued);
     expect(tokens.scope).toBe("grayboard:delivery grayboard:tools");
-    const granted = principal(tokens, ["grayboard:delivery", "grayboard:tools"]);
+    const granted = await principal(tokens, ["grayboard:delivery", "grayboard:tools"]);
     expect([granted.clientId, granted.sourceKey]).toEqual([clientId, GRAYBOARD_SESSION_META]);
     const renewed = await post("/oauth/token", { grant_type: "refresh_token", client_id: clientId, refresh_token: tokens.refresh_token });
     expect(renewed.status).toBe(200);
     const next = await renewed.json() as Tokens;
     expect(next.refresh_token).not.toBe(tokens.refresh_token);
-    expect(principal(next)).toMatchObject({ grantId: granted.grantId, clientId, sourceKey: GRAYBOARD_SESSION_META });
+    expect(await principal(next)).toMatchObject({ grantId: granted.grantId, clientId, sourceKey: GRAYBOARD_SESSION_META });
     grants.add(granted.grantId);
   }
   expect(grants.size).toBe(BUILTIN_CLIENT_IDS.length * 2);
@@ -339,9 +339,9 @@ test("the first start with built-in clients revokes the grants and codes an oper
   const scope = "grayboard:delivery grayboard:tools";
   // A database from before #429: an operator client named grayboard-pi left a grant and an
   // unredeemed code, and no cutover is recorded.
-  const old = await redeem(await issue("grayboard-pi", scope)), oldPrincipal = principal(old);
+  const old = await redeem(await issue("grayboard-pi", scope)), oldPrincipal = await principal(old);
   const pending = await issue("grayboard-pi", scope);
-  const unrelated = principal(await redeem(await issue()));
+  const unrelated = await principal(await redeem(await issue()));
   await seed(storage.repo, () => storage.db.run("DELETE FROM server_state WHERE key = 'builtin_clients'"));
   const audit = () => storage.db.query<{ actor: string; target: string; detail: string }, []>("SELECT actor, target, detail FROM access_log WHERE action = 'oauth.builtin_client_grant_revoked'").all();
   const log = spyOn(console, "error").mockImplementation(() => {});
@@ -350,19 +350,19 @@ test("the first start with built-in clients revokes the grants and codes an oper
     service.close();
     // A refused config changes nothing: the cutover runs only once the clients parse.
     expect(() => createOAuthServer(storage.repo, { ...config, oauthClients: [{ ...registrations[0]!, clientId: "grayboard-pi" }] })).toThrow("reserved for a built-in client");
-    expect([storage.repo.oauth.isGrantActive(storage.repo.read, oldPrincipal.grantId, clock), audit().length]).toEqual([true, 0]);
+    expect([await storage.repo.oauth.isGrantActive(storage.repo.read, oldPrincipal.grantId, clock), audit().length]).toEqual([true, 0]);
     service = makeService(); await service.ready;
     expect(revokedLines().map(([line]) => line)).toEqual([expect.stringContaining("revoked 1 OAuth grant(s)")]);
     expect(audit()).toEqual([{ actor: "you@example.com", target: oldPrincipal.grantId, detail: JSON.stringify({ client_id: "grayboard-pi" }) }]);
-    expect(service.isAuthorized(oldPrincipal)).toBe(false);
+    expect(await service.isAuthorized(oldPrincipal)).toBe(false);
     expect((await post("/oauth/token", { grant_type: "refresh_token", client_id: "grayboard-pi", refresh_token: old.refresh_token })).status).toBe(400);
     expect((await post("/oauth/token", tokenParams(pending))).status).toBe(400);
-    expect(service.isAuthorized(unrelated)).toBe(true);
+    expect(await service.isAuthorized(unrelated)).toBe(true);
     // From then on a grant under a built-in ID is the built-in's: later starts keep it.
     const fresh = await redeem(await issue("grayboard-omp", scope));
     for (let i = 0; i < 2; i++) { service.close(); service = makeService(); await service.ready; }
     expect([revokedLines().length, audit().length]).toEqual([1, 1]);
-    expect(service.isAuthorized(principal(fresh))).toBe(true);
+    expect(await service.isAuthorized(await principal(fresh))).toBe(true);
     expect((await post("/oauth/token", { grant_type: "refresh_token", client_id: "grayboard-omp", refresh_token: fresh.refresh_token })).status).toBe(200);
   } finally { log.mockRestore(); }
 });
@@ -389,18 +389,18 @@ test("CIMD outage during refresh or revocation returns retryable 503 without bur
   } });
   const issued = await issue(clientId);
   const tokens = await redeem(issued);
-  const grant = principal(tokens).grantId;
+  const grant = (await principal(tokens)).grantId;
   clock += 300_001; outage = true;
   for (const [path, params] of [["/oauth/token", {grant_type:"refresh_token",refresh_token:tokens.refresh_token}], ["/oauth/revoke", {token:tokens.refresh_token}]] as const) {
     const result = await post(path, {client_id:clientId,...params});
     expect(result.status).toBe(503);
     expect(await result.json()).toEqual({error:"temporarily_unavailable"});
-    expect(service.isGrantActive(grant)).toBe(true);
+    expect(await service.isGrantActive(grant)).toBe(true);
   }
   clock += 30_001; outage = false;
   const refreshed = await post("/oauth/token", {client_id:clientId,grant_type:"refresh_token",refresh_token:tokens.refresh_token});
   expect(refreshed.status).toBe(200);
-  expect(principal(await refreshed.json() as Tokens).grantId).toBe(grant);
+  expect((await principal(await refreshed.json() as Tokens)).grantId).toBe(grant);
 });
 
 function authorization(clientId = "native", verifier = random(), redirectUri = "http://127.0.0.1:34567/callback", scope = "grayboard:tools") {
@@ -458,8 +458,8 @@ type Tokens = { access_token: string; refresh_token: string; scope: string; expi
 async function redeem(a: Awaited<ReturnType<typeof issue>>) {
   const r = await post("/oauth/token", tokenParams(a)); expect(r.status).toBe(200); return await r.json() as Tokens;
 }
-function principal(tokens: Tokens, required?: string[]) {
-  const p = service.authenticate(new Request(base + "/mcp", { headers: { Authorization: `Bearer ${tokens.access_token}` } }), required);
+async function principal(tokens: Tokens, required?: string[]) {
+  const p = await service.authenticate(new Request(base + "/mcp", { headers: { Authorization: `Bearer ${tokens.access_token}` } }), required);
   expect(p).not.toBeInstanceOf(Response); return p as OAuthPrincipal;
 }
 
@@ -731,7 +731,7 @@ test("real HTTP metadata uses configured canonical issuer including prefix/defau
   expect(metadata).toMatchObject({ issuer: "https://grayboard.example.com:443/hosted", authorization_endpoint: "https://grayboard.example.com:443/hosted/oauth/authorize", authorization_response_iss_parameter_supported: true, token_endpoint_auth_methods_supported: ["none", "client_secret_basic"] });
   expect(metadata.registration_endpoint).toBeUndefined(); expect(metadata.jwks_uri).toBeUndefined();
   expect((await fetch(base + "/.well-known/openid-configuration")).status).toBe(404);
-  const auth = service.authenticate(new Request(base + "/mcp"), ["grayboard:delivery"]) as Response;
+  const auth = (await service.authenticate(new Request(base + "/mcp"), ["grayboard:delivery"])) as Response;
   expect(auth.status).toBe(401); expect(auth.headers.get("WWW-Authenticate")).toContain('scope="grayboard:delivery grayboard:tools"');
   expect(auth.headers.get("WWW-Authenticate")).not.toContain("offline_access");
   const dev = createOAuthServer(storage.repo, { ...config, publicUrl: "http://127.0.0.1:80/hosted" });
@@ -747,47 +747,47 @@ test("explicit consent and code survive service/database restart; distinct grant
   const oldCookies = [...browser.jar];
   service.close(); storage.db.close();
   storage = openDatabase(config.dbPath, { blobDir: config.blobDir }); service = makeService();
-  const tokens = await redeem(a); const p = principal(tokens);
+  const tokens = await redeem(a); const p = await principal(tokens);
   expect(p.authed.session_id).toBe(0); expect(tokens.expires_in).toBe(3600); expect(tokens.token_type).toBe("Bearer");
   const b = await issue("subscriber", "grayboard:delivery", browser);
   expect([...browser.jar]).toEqual(oldCookies); // persisted browser login, but fresh explicit consent
   expect(exchanges).toBe(1);
-  const t2 = await redeem(b); const p2 = principal(t2, ["grayboard:delivery"]);
+  const t2 = await redeem(b); const p2 = await principal(t2, ["grayboard:delivery"]);
   expect(p.grantId).not.toBe(p2.grantId); expect(p.authed.user_id).toBe(p2.authed.user_id);
-  const wrongScope = service.authenticate(new Request(base + "/mcp", { headers: { Authorization: `Bearer ${t2.access_token}` } })) as Response;
+  const wrongScope = (await service.authenticate(new Request(base + "/mcp", { headers: { Authorization: `Bearer ${t2.access_token}` } }))) as Response;
   expect(wrongScope.status).toBe(403); expect(wrongScope.headers.get("WWW-Authenticate")).toContain("insufficient_scope");
   expect((await post("/oauth/revoke", { client_id: "subscriber", token: tokens.access_token })).status).toBe(200);
-  expect(service.isAuthorized(p)).toBe(true);
+  expect(await service.isAuthorized(p)).toBe(true);
   expect((await post("/oauth/revoke", { client_id: "native", token: tokens.access_token })).status).toBe(200);
-  expect(service.isAuthorized(p)).toBe(false); expect(service.isAuthorized(p2)).toBe(true);
+  expect(await service.isAuthorized(p)).toBe(false); expect(await service.isAuthorized(p2)).toBe(true);
   const refreshed = await post("/oauth/token", { client_id: "native", grant_type: "refresh_token", refresh_token: tokens.refresh_token, resource: service.resource });
   expect(refreshed.status).toBe(200);
-  const t3 = await refreshed.json() as Tokens; expect(principal(t3).grantId).toBe(p.grantId);
+  const t3 = await refreshed.json() as Tokens; expect((await principal(t3)).grantId).toBe(p.grantId);
   expect((await post("/oauth/revoke", { client_id: "native", token: t3.refresh_token })).status).toBe(200);
-  expect(service.isAuthorized(principal(t2, ["grayboard:delivery"]))).toBe(true);
+  expect(await service.isAuthorized(await principal(t2, ["grayboard:delivery"]))).toBe(true);
 });
 
 test("all code bindings checked before consume/replay, downscoping refresh retains original permission, strict replay kills winner", async () => {
   const a = await issue("subscriber", "grayboard:delivery grayboard:tools");
   const invalidBindings: Record<string, string>[] = [{ client_id: "native" }, { code_verifier: random() }, { resource: base + "/elsewhere" }, { redirect_uri: "http://127.0.0.1:34568/callback" }, { scope: "grayboard:tools" }, { scope: "offline_access" }, { code: random() }];
   for (const patch of invalidBindings) expect((await post("/oauth/token", { ...tokenParams(a), ...patch })).status).toBe(400);
-  const tokens = await redeem(a), original = principal(tokens);
+  const tokens = await redeem(a), original = await principal(tokens);
   expect((await post("/oauth/token", { ...tokenParams(a), code_verifier: random() })).status).toBe(400);
-  expect(service.isAuthorized(original)).toBe(true);
+  expect(await service.isAuthorized(original)).toBe(true);
   const refresh = { client_id: "subscriber", grant_type: "refresh_token", refresh_token: tokens.refresh_token, resource: service.resource };
   expect((await post("/oauth/token", { ...refresh, scope: "offline_access" })).status).toBe(400);
   const r = await post("/oauth/token", { ...refresh, scope: "grayboard:tools" }); expect(r.status).toBe(200);
-  const narrow = await r.json() as Tokens; expect(narrow.scope).toBe("grayboard:tools"); expect(principal(narrow).grantId).toBe(original.grantId);
-  expect((service.authenticate(new Request(base + "/mcp", { headers: { Authorization: `Bearer ${narrow.access_token}` } }), ["grayboard:delivery"]) as Response).status).toBe(403);
+  const narrow = await r.json() as Tokens; expect(narrow.scope).toBe("grayboard:tools"); expect((await principal(narrow)).grantId).toBe(original.grantId);
+  expect(((await service.authenticate(new Request(base + "/mcp", { headers: { Authorization: `Bearer ${narrow.access_token}` } }), ["grayboard:delivery"])) as Response).status).toBe(403);
   const r2 = await post("/oauth/token", { ...refresh, refresh_token: narrow.refresh_token }); expect(r2.status).toBe(200);
   const full = await r2.json() as Tokens; expect(full.scope).toBe("grayboard:delivery grayboard:tools");
   expect((await post("/oauth/token", { ...refresh, client_id: "native" })).status).toBe(400);
-  expect(service.isAuthorized(principal(full))).toBe(true);
+  expect(await service.isAuthorized(await principal(full))).toBe(true);
   expect((await post("/oauth/token", refresh)).status).toBe(400);
-  expect(service.isAuthorized(original)).toBe(false);
-  expect((service.authenticate(new Request(base + "/mcp", { headers: { Authorization: `Bearer ${full.access_token}` } })) as Response).status).toBe(401);
-  const b = await issue(); const t = await redeem(b); const pb = principal(t);
-  expect((await post("/oauth/token", tokenParams(b))).status).toBe(400); expect(service.isAuthorized(pb)).toBe(false);
+  expect(await service.isAuthorized(original)).toBe(false);
+  expect(((await service.authenticate(new Request(base + "/mcp", { headers: { Authorization: `Bearer ${full.access_token}` } }))) as Response).status).toBe(401);
+  const b = await issue(); const t = await redeem(b); const pb = await principal(t);
+  expect((await post("/oauth/token", tokenParams(b))).status).toBe(400); expect(await service.isAuthorized(pb)).toBe(false);
 });
 
 test("confidential Basic form decoding, mandatory PKCE, no mixed/post/query secrets", async () => {
@@ -865,7 +865,7 @@ test("trusted authorization errors redirect with state/issuer; untrusted or ambi
   expect((await post("/oauth/token?client_secret=raw", tokenParams(code))).status).toBe(400);
   expect((await fetch(base + "/oauth/token", { method: "POST", body: "x".repeat(17000), headers: { "Content-Type": "application/x-www-form-urlencoded" } })).status).toBe(400);
   const tokens = await redeem(code);
-  for (const method of ["GET", "POST", "DELETE"]) expect((service.authenticate(new Request(base + "/mcp?access_token=" + tokens.access_token, { method, headers: { Authorization: `Bearer ${tokens.access_token}` } })) as Response).status).toBe(401);
+  for (const method of ["GET", "POST", "DELETE"]) expect(((await service.authenticate(new Request(base + "/mcp?access_token=" + tokens.access_token, { method, headers: { Authorization: `Bearer ${tokens.access_token}` } }))) as Response).status).toBe(401);
 });
 
 test("authorization database failure remains local server_error, not a redirect error", async () => {
@@ -908,9 +908,9 @@ test("bounded OAuth extensions are ignored, empty optional scope is omitted, and
   const narrowed = await narrow.json() as Tokens;
   const restored = await post("/oauth/token", { ...refresh, refresh_token: narrowed.refresh_token, scope: "" }); expect(restored.status).toBe(200);
   const full = await restored.json() as Tokens; expect(full.scope).toBe("grayboard:delivery grayboard:tools");
-  const p = principal(full);
+  const p = await principal(full);
   expect((await post("/oauth/revoke?url_extension=ignored&empty=", { client_id: "subscriber", token: full.refresh_token, token_type_hint: "", extension: "ignored", client_secret: "" })).status).toBe(200);
-  expect(service.isAuthorized(p)).toBe(false);
+  expect(await service.isAuthorized(p)).toBe(false);
   expect((await post("/oauth/revoke", { client_id: "subscriber", token: random(), extension: "ignored" })).status).toBe(200);
 });
 
@@ -977,21 +977,21 @@ test("fixed registered loopback ports allow another authorization port but code 
   for (const redirectUri of ["http://127.0.0.1:45678/callback", "http://[::1]:45678/callback", "http://127.0.0.1:80/callback", "http://[::1]:80/callback"]) {
     const a = await issue("native", "grayboard:tools", undefined, redirectUri);
     for (const wrong of [redirectUri.replace(/:\d+\//, ":8080/"), redirectUri.replace(/:\d+\//, ":45679/")]) expect((await post("/oauth/token", { ...tokenParams(a), redirect_uri: wrong })).status).toBe(400);
-    const tokens = await redeem(a); expect(principal(tokens).clientId).toBe("native");
+    const tokens = await redeem(a); expect((await principal(tokens)).clientId).toBe("native");
   }
 });
 
 test("live disable/admin revoke, expiry, and database failures are not credential errors or false success", async () => {
-  const a = await issue(), tokens = await redeem(a), p = principal(tokens);
+  const a = await issue(), tokens = await redeem(a), p = await principal(tokens);
   clock += OAUTH_TTL.access;
-  expect(service.isAuthorized(p)).toBe(false);
+  expect(await service.isAuthorized(p)).toBe(false);
   const refreshed = await post("/oauth/token", { client_id: "native", grant_type: "refresh_token", refresh_token: tokens.refresh_token, resource: service.resource });
-  const next = await refreshed.json() as Tokens; const np = principal(next);
+  const next = await refreshed.json() as Tokens; const np = await principal(next);
   await seed(storage.repo, tx => storage.repo.users.setDisabled(tx, np.authed.user_id, true));
   await seed(storage.repo, tx => storage.repo.users.setDisabled(tx, np.authed.user_id, false));
-  expect(service.isAuthorized(np)).toBe(false);
-  const b = await issue(), t2 = await redeem(b), p2 = principal(t2);
-  await seed(storage.repo, tx => storage.repo.sessions.revokeAllForUser(tx, p2.authed.user_id)); expect(service.isAuthorized(p2)).toBe(false);
+  expect(await service.isAuthorized(np)).toBe(false);
+  const b = await issue(), t2 = await redeem(b), p2 = await principal(t2);
+  await seed(storage.repo, tx => storage.repo.sessions.revokeAllForUser(tx, p2.authed.user_id)); expect(await service.isAuthorized(p2)).toBe(false);
   const c = await issue(), t3 = await redeem(c);
   storage.db.exec("CREATE TRIGGER reject_revoke BEFORE UPDATE ON oauth_grants BEGIN SELECT RAISE(ABORT, 'injected'); END");
   const failed = await post("/oauth/revoke", { client_id: "native", token: t3.refresh_token });
@@ -1004,7 +1004,7 @@ test("live disable/admin revoke, expiry, and database failures are not credentia
 });
 
 test("hash-only browser/code/token persistence and HTTP expiry clamps use actual absolute grant deadline", async () => {
-  const a = await issue(), tokens = await redeem(a), p = principal(tokens);
+  const a = await issue(), tokens = await redeem(a), p = await principal(tokens);
   const persisted = () => JSON.stringify(["oauth_requests", "oauth_browsers", "oauth_codes", "oauth_grants", "oauth_tokens"].map(table => storage.db.query(`SELECT * FROM ${table}`).all()));
   const records = persisted();
   for (const raw of [a.code, a.state, a.verifier, a.consent.csrf, ...a.browser.jar.values(), tokens.access_token, tokens.refresh_token]) expect(records).not.toContain(raw);
@@ -1017,10 +1017,10 @@ test("hash-only browser/code/token persistence and HTTP expiry clamps use actual
   clock = Number(storage.db.query<{ expires_at: number }, [string]>("SELECT expires_at FROM oauth_grants WHERE id = ?").get(p.grantId)!.expires_at) - 1000;
   const r = await post("/oauth/token", { client_id: "native", grant_type: "refresh_token", refresh_token: current.refresh_token, resource: service.resource });
   expect(r.status).toBe(200); current = await r.json() as Tokens; expect(current.expires_in).toBe(1);
-  const last = principal(current); clock += 1000; expect(service.isAuthorized(last)).toBe(false);
+  const last = await principal(current); clock += 1000; expect(await service.isAuthorized(last)).toBe(false);
   expect((await post("/oauth/token", { client_id: "native", grant_type: "refresh_token", refresh_token: current.refresh_token, resource: service.resource })).status).toBe(400);
-  const b = await issue(), t = await redeem(b), pb = principal(t); clock += OAUTH_TTL.code;
-  expect((await post("/oauth/token", tokenParams(b))).status).toBe(400); expect(service.isAuthorized(pb)).toBe(false);
+  const b = await issue(), t = await redeem(b), pb = await principal(t); clock += OAUTH_TTL.code;
+  expect((await post("/oauth/token", tokenParams(b))).status).toBe(400); expect(await service.isAuthorized(pb)).toBe(false);
 });
 
 test("HTTP concurrent code/refresh consumes have one winner and committed strict replay revocation", async () => {
@@ -1028,13 +1028,13 @@ test("HTTP concurrent code/refresh consumes have one winner and committed strict
   const codes = await Promise.all([post("/oauth/token", tokenParams(a)), post("/oauth/token", tokenParams(a))]);
   expect(codes.map(r => r.status).sort()).toEqual([200, 400]);
   const winner = await codes.find(r => r.status === 200)!.json() as Tokens;
-  expect((service.authenticate(new Request(base + "/mcp", { headers: { Authorization: `Bearer ${winner.access_token}` } })) as Response).status).toBe(401);
+  expect(((await service.authenticate(new Request(base + "/mcp", { headers: { Authorization: `Bearer ${winner.access_token}` } }))) as Response).status).toBe(401);
   const b = await issue(), tokens = await redeem(b);
   const p = { grant_type: "refresh_token", client_id: "native", refresh_token: tokens.refresh_token, resource: service.resource };
   const refreshes = await Promise.all([post("/oauth/token", p), post("/oauth/token", p)]);
   expect(refreshes.map(r => r.status).sort()).toEqual([200, 400]);
   const refreshed = await refreshes.find(r => r.status === 200)!.json() as Tokens;
-  expect((service.authenticate(new Request(base + "/mcp", { headers: { Authorization: `Bearer ${refreshed.access_token}` } })) as Response).status).toBe(401);
+  expect(((await service.authenticate(new Request(base + "/mcp", { headers: { Authorization: `Bearer ${refreshed.access_token}` } }))) as Response).status).toBe(401);
 });
 
 test("OAuth global rate bounds distinct callers and audits once per refusal streak", async () => {
@@ -1265,7 +1265,7 @@ test("URL-only SDK enrollment honors native challenge and obtains one tools+deli
   const browser = new Browser(), consent = await loginConsent(browser, provider.authorization!.href);
   const approved = await decide(browser, consent), callback = new URL(approved.headers.get("location")!);
   expect(await auth(provider, { serverUrl: service.resource, authorizationCode: callback.searchParams.get("code")!, iss: callback.searchParams.get("iss")! })).toBe("AUTHORIZED");
-  expect(principal(provider.saved as Tokens, ["grayboard:tools", "grayboard:delivery"]).scopes).toEqual(["grayboard:delivery", "grayboard:tools"]);
+  expect((await principal(provider.saved as Tokens, ["grayboard:tools", "grayboard:delivery"])).scopes).toEqual(["grayboard:delivery", "grayboard:tools"]);
   expect(storage.db.query<{ count: number }, []>("SELECT count(*) AS count FROM oauth_grants").get()?.count).toBe(1);
 });
 
@@ -1301,7 +1301,7 @@ test("official SDK binds one canonical default-port resource while preserving ex
   expect(wrongResource.status).toBe(400);
   await expect(auth(provider, { serverUrl: service.resource, fetchFn, authorizationCode: returned.searchParams.get("code")!, iss: new URL(publicUrl).href })).rejects.toThrow();
   expect(await auth(provider, { serverUrl: service.resource, fetchFn, authorizationCode: returned.searchParams.get("code")!, iss: publicUrl })).toBe("AUTHORIZED");
-  expect(provider.saved!.issuer).toBe(publicUrl); expect(principal(provider.saved as Tokens).clientId).toBe("subscriber");
+  expect(provider.saved!.issuer).toBe(publicUrl); expect((await principal(provider.saved as Tokens)).clientId).toBe("subscriber");
 });
 
 for (const version of ["2026-07-28", "2025-11-25"]) test(`${version} official SDK preregistered PRM/discovery/S256/iss/code/refresh and real MCP fixture`, async () => {
@@ -1330,26 +1330,26 @@ test("#853: a cached authorization ends with the write that ends it, from this c
   const { Database } = await import("bun:sqlite");
   const mint = async (email: string) => {
     const { token } = await issueOAuth(storage.repo, service.resource, email, ["grayboard:tools"], clock, "native");
-    const p = service.authenticate(new Request(base + "/mcp", { headers: { Authorization: `Bearer ${token}` } }));
+    const p = await service.authenticate(new Request(base + "/mcp", { headers: { Authorization: `Bearer ${token}` } }));
     if (p instanceof Response) throw new Error(`authenticate refused: ${p.status}`);
     return Object.assign(p, { bearer: new Request(base + "/mcp", { headers: { Authorization: `Bearer ${token}` } }) });
   };
-  const refused = (r: Request) => { const a = service.authenticate(r.clone()); return a instanceof Response && a.status === 401; };
+  const refused = async (r: Request) => { const a = await service.authenticate(r.clone()); return a instanceof Response && a.status === 401; };
   // The cache sits under repo.oauth.findActiveAccess, so count the join's SQL rather than the method.
   const query = spyOn(Database.prototype, "query");
   try {
     const joins = () => query.mock.calls.filter(([sql]) => String(sql).includes("FROM oauth_tokens t")).length;
     const p = await mint("cached@example.com");
     query.mockClear();
-    for (let i = 0; i < 10; i++) expect(service.isAuthorized(p)).toBe(true);
+    for (let i = 0; i < 10; i++) expect(await service.isAuthorized(p)).toBe(true);
     expect(joins()).toBe(0); // warm: no token join while nothing has changed
     // A write inside a transaction that rolls back: false within it, true again after.
     await expect(seed(storage.repo, async tx => {
       await storage.repo.sessions.revokeAllForUser(tx, p.authed.user_id);
-      expect(service.isAuthorized(p)).toBe(false);
+      expect(await service.isAuthorized(p)).toBe(false);
       throw new Error("roll back");
     })).rejects.toThrow("roll back");
-    expect(service.isAuthorized(p)).toBe(true);
+    expect(await service.isAuthorized(p)).toBe(true);
     expect(joins()).toBeGreaterThan(0); // the read inside the transaction bypassed the cache, so the spy sees the join
     // Each committed way the access ends, against a warm entry.
     const ends: [string, (p: OAuthPrincipal) => unknown][] = [
@@ -1360,18 +1360,18 @@ test("#853: a cached authorization ends with the write that ends it, from this c
     ];
     for (const [i, [what, end]] of ends.entries()) {
       const q = await mint(`end${i}@example.com`);
-      expect(service.isAuthorized(q)).toBe(true);
+      expect(await service.isAuthorized(q)).toBe(true);
       await end(q);
-      expect(service.isAuthorized(q), what).toBe(false);
-      expect(refused(q.bearer), what).toBe(true); // the bearer's own warm entry, not just the principal check
+      expect(await service.isAuthorized(q), what).toBe(false);
+      expect(await refused(q.bearer), what).toBe(true); // the bearer's own warm entry, not just the principal check
     }
     // Expiry needs no write: the entry's own deadline ends it.
     const e = await mint("expiry@example.com");
-    expect(service.isAuthorized(e)).toBe(true);
-    expect(refused(e.bearer)).toBe(false);
+    expect(await service.isAuthorized(e)).toBe(true);
+    expect(await refused(e.bearer)).toBe(false);
     clock = e.accessExpiry;
-    expect(service.isAuthorized(e)).toBe(false);
-    expect(refused(e.bearer)).toBe(true); // isAuthorized checks the principal's expiry first; authenticate reaches the entry's
+    expect(await service.isAuthorized(e)).toBe(false);
+    expect(await refused(e.bearer)).toBe(true); // isAuthorized checks the principal's expiry first; authenticate reaches the entry's
   } finally { query.mockRestore(); }
 });
 
@@ -1392,14 +1392,14 @@ test("#881: one authorization reads the auth generation once, and a write betwee
   storage = saved;
   try {
     const { token } = await issueOAuth(counted.repo, counting.resource, "generation@example.com", ["grayboard:tools"], clock, "native");
-    const p = counting.authenticate(new Request(base + "/mcp", { headers: { Authorization: `Bearer ${token}` } }));
+    const p = await counting.authenticate(new Request(base + "/mcp", { headers: { Authorization: `Bearer ${token}` } }));
     if (p instanceof Response) throw new Error(`authenticate refused: ${p.status}`);
-    expect(counting.isAuthorized(p)).toBe(true);
+    expect(await counting.isAuthorized(p)).toBe(true);
     reads = 0;
-    expect(counting.isAuthorized(p)).toBe(true);
+    expect(await counting.isAuthorized(p)).toBe(true);
     expect(reads).toBe(1); // the token read and the user read share it; before #881, two
     await seed(counted.repo, tx => counted.repo.users.setDisabled(tx, p.authed.user_id, true));
-    expect(counting.isAuthorized(p)).toBe(false);
+    expect(await counting.isAuthorized(p)).toBe(false);
   } finally { counting.close(); counted.db.close(); }
 });
 
@@ -1480,7 +1480,7 @@ test("a login code redeems once for a CLI session token: no refresh, no expiry, 
   expect(authed).toMatchObject({ user_email: "you@example.com" });
   expect(await storage.repo.sessions.findById(storage.repo.read, authed!.session_id)).toMatchObject({ label: "grayboard-test", revoked_at: null });
   // Not an OAuth access token.
-  expect(service.authenticate(new Request(base + "/mcp", { headers: { Authorization: `Bearer ${token}` } }))).toBeInstanceOf(Response);
+  expect(await service.authenticate(new Request(base + "/mcp", { headers: { Authorization: `Bearer ${token}` } }))).toBeInstanceOf(Response);
   expect(storage.db.query("SELECT COUNT(*) AS n FROM oauth_grants").get()).toEqual({ n: 0 });
   expect(accessAudits(storage.db, "oauth.session_issued")).toEqual([expect.objectContaining({ actor: "you@example.com", detail: { client_id: CLI_CLIENT_ID, token_session: authed!.session_id } })]);
   // The client has no refresh, and the code's other parameters are bound.
@@ -1558,8 +1558,8 @@ test("the grayboard-cli cutover revokes earlier grants and pending codes under i
   const log = spyOn(console, "error").mockImplementation(() => {});
   let logged: string;
   try { service = makeService(); await service.ready; logged = log.mock.calls.flat().join("\n"); } finally { log.mockRestore(); }
-  expect(service.isGrantActive(old.grantId)).toBe(false);
-  expect(service.isGrantActive(other.grantId)).toBe(true);
+  expect(await service.isGrantActive(old.grantId)).toBe(false);
+  expect(await service.isGrantActive(other.grantId)).toBe(true);
   const codes = () => storage.db.query<{ client: string }, []>("SELECT json_extract(data, '$.clientId') AS client FROM oauth_codes WHERE grant_id IS NULL").all().map(r => r.client);
   expect(codes()).toEqual(["native"]);
   expect(accessAudits(storage.db, "oauth.builtin_client_grant_revoked").map(r => r.detail)).toEqual([{ client_id: CLI_CLIENT_ID }]);
@@ -1569,7 +1569,7 @@ test("the grayboard-cli cutover revokes earlier grants and pending codes under i
   const later = await issueOAuth(storage.repo, service.resource, "op@example.com", ["grayboard:tools"], clock, CLI_CLIENT_ID);
   await pending(CLI_CLIENT_ID);
   service = makeService(); await service.ready;
-  expect(service.isGrantActive(later.grantId)).toBe(true);
+  expect(await service.isGrantActive(later.grantId)).toBe(true);
   expect(codes().sort()).toEqual([CLI_CLIENT_ID, "native"]);
 });
 

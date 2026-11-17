@@ -38,7 +38,7 @@ test("another task's generation stays the committed one while a holder's uncommi
   // Outside the holder's transaction: the committed generation, and the committed (enabled) user.
   expect(repo.authGeneration()).toBe(before);
   expect(repo.users.activeEmail(user.id)).toBe("a@example.com");
-  expect(repo.authRead(() => repo.authGeneration())).toBe(before);
+  expect(await repo.authRead(() => repo.authGeneration())).toBe(before);
   h.release();
   await h.done;
   expect(repo.authGeneration()).not.toBe(before);
@@ -77,7 +77,7 @@ test("a failed counter read leaves the generation undefined, never stale, until 
   const h = hold(repo, () => {});
   await h.wrote;
   expect(repo.authGeneration()).toBeUndefined();
-  expect(repo.authRead(() => repo.authGeneration())).toBeUndefined();
+  expect(await repo.authRead(() => repo.authGeneration())).toBeUndefined();
   h.release();
   await h.done;
   await repo.write(tx => { sqliteOf(tx).run("CREATE TEMP TABLE auth_generation(n INTEGER NOT NULL); INSERT INTO auth_generation(n) VALUES (7)"); });
@@ -124,10 +124,10 @@ test("work an authRead body starts reads afresh once the body is done: a disable
   const g0 = repo.authGeneration();
   const later = gate();
   // Boxed: authRead's body is synchronous until A7c; the continuation it starts runs after it, with its store.
-  const after = repo.authRead(() => {
+  const after = (await repo.authRead(() => {
     expect(repo.users.activeEmail(user.id)).toBe("p@example.com"); // fills the user cache at g0
     return { seen: later.p.then(() => ({ g: repo.authGeneration(), email: repo.users.activeEmail(user.id) })) };
-  }).seen;
+  })).seen;
   await repo.write(tx => repo.users.setDisabled(tx, user.id, true));
   later.open();
   const seen = await after;
@@ -143,10 +143,10 @@ test("work an authRead body starts reads afresh once the body is done: a revoked
   const later = gate();
   const resource = "https://bus.example.com/mcp";
   const issued = await issueAccess(repo, user.id, resource, t);
-  const after = repo.authRead(() => {
+  const after = (await repo.authRead(() => {
     expect(repo.oauth.findActiveAccess(repo.read, issued, resource, [], t)).toBeDefined(); // fills the access cache
     return { seen: later.p.then(() => repo.oauth.findActiveAccess(repo.read, issued, resource, [], t)) };
-  }).seen;
+  })).seen;
   await repo.write(tx => repo.users.setDisabled(tx, user.id, true));
   later.open();
   expect(await after).toBeUndefined();

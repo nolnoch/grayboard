@@ -83,7 +83,7 @@ export async function realRace(f: {
         const integrationID = (await ctx.mcp.list()).data.find(c => c.name === "grayboard")!.integrationID!;
         const connection = await ctx.integration.connection.active(integrationID); assert(connection);
         const grant = await ctx.integration.connection.resolve(connection); assert(grant?.type === "oauth");
-        const principal = app.oauth.authenticate(new Request("https://grayboard.example.com/hosted/mcp", { headers: { Authorization: "Bearer " + grant.access } })); assert(!(principal instanceof Response));
+        const principal = await app.oauth.authenticate(new Request("https://grayboard.example.com/hosted/mcp", { headers: { Authorization: "Bearer " + grant.access } })); assert(!(principal instanceof Response));
         await app.mcp.sessions.bind(principal, sessionContext(principal, { "ai.opencode/sessionID": root }), { name: "replacement", create: true });
         break;
       }

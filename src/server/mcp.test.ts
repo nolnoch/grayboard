@@ -18,6 +18,7 @@ import { OAUTH_TTL } from "./oauth-types.ts";
 import { sessionContext } from "./hosted.ts";
 import { OPENCODE_CLIENT } from "./oauth-config.ts";
 import { DEFAULT_MCP_LIMITS, type McpLimits } from "./config.ts";
+import { stubAuthRead } from "../../tests/support/auth_stub.ts";
 import { scratchDbPath } from "../../tests/support/scratch_db.ts";
 import { seed, seedSync } from "../../tests/support/seed.ts";
 const meta = { "ai.opencode/sessionID": "test-root" };
@@ -40,7 +41,7 @@ beforeEach(async () => {
   const issued = await issuedOAuth(store.repo, oauth.resource);
   token = issued.token;
   user = issued.authed;
-  const principal = oauth.authenticate(new Request("http://localhost/mcp", { headers: { Authorization: `Bearer ${token}` } }));
+  const principal = await oauth.authenticate(new Request("http://localhost/mcp", { headers: { Authorization: `Bearer ${token}` } }));
   if (principal instanceof Response) throw new Error("fixture authorization failed");
   await hosted.sessions.bind(principal, sessionContext(principal, meta), { name: "be", create: true, where: "tools" });
 });
@@ -488,12 +489,12 @@ for (const version of ["2026-07-28", "2025-11-25", "2025-06-18"]) for (const sta
   let response: Response | undefined;
   const client = await connect(version, async (r, request) => { if (request.method === "POST") response = r; });
   const credential = status === 401 ? "invalid" : (await issuedOAuth(store.repo, oauth.resource, "alice@example.com", ["grayboard:delivery"])).token;
-  const refusal = oauth.authenticate(new Request("http://localhost/mcp", { headers: { Authorization: `Bearer ${credential}` } }));
+  const refusal = await oauth.authenticate(new Request("http://localhost/mcp", { headers: { Authorization: `Bearer ${credential}` } }));
   if (!(refusal instanceof Response)) throw new Error("expected fixture OAuth refusal");
   expect(refusal.status).toBe(status);
   const original = oauth.authenticate;
   let checks = 0;
-  oauth.authenticate = (...args) => ++checks === 2 ? refusal : original(...args);
+  oauth.authenticate = async (...args) => ++checks === 2 ? refusal : original(...args);
   try {
     await client.callTool({ name: "board_create", arguments: { name: "blocked", purpose: "must not mutate" } }).catch(() => undefined);
     expect(response).toBe(refusal);
@@ -585,13 +586,12 @@ for (const version of ["2026-07-28", "2025-11-25", "2025-06-18"]) test(`${versio
   const client = await connect(version);
   // A legacy client opens its GET stream in the background; its authorization must not take the stage's throw.
   if (version !== "2026-07-28") await untilHosted(() => hosted.activeGetStreams === 1);
-  const original = store.repo.oauth.findActiveAccess;
   for (const stage of [2, 3, 4]) {
     let checks = 0;
-    store.repo.oauth.findActiveAccess = (...args) => {
+    const restoreAccess = stubAuthRead(store.repo, "findActiveAccess", original => (...args) => {
       if (++checks === stage) throw new Error("SELECT secret FROM /private/oauth.sqlite");
       return original(...args);
-    };
+    });
     try {
       let result: unknown;
       try { result = await client.callTool({ name: "board_create", arguments: { name: "blocked", purpose: "must not mutate" } }); }
@@ -602,7 +602,7 @@ for (const version of ["2026-07-28", "2025-11-25", "2025-06-18"]) test(`${versio
       expect(checks).toBe(stage);
       expect(store.db.query("SELECT name FROM boards WHERE name = 'blocked'").get()).toBeNull();
       expect(hosted.activeContexts).toBe(hosted.activeGetStreams);
-    } finally { store.repo.oauth.findActiveAccess = original; }
+    } finally { restoreAccess(); }
   }
 });
 
@@ -659,11 +659,10 @@ for (const failure of ["storage", "revoke"] as const) test(`legacy timer contain
   finally { timers.mockRestore(); }
   await connect("2025-11-25");
   const healthy = await otherClient("2025-11-25");
-  const find = store.repo.oauth.findActiveAccess;
   let reads = 0;
   const hostile = new Proxy({}, { get() { reads++; throw new Error("Bearer PRIVATE"); } });
   if (failure === "revoke") await seed(store.repo, tx => store.repo.oauth.revokeToken(tx, hashToken(token), OPENCODE_CLIENT, Date.now()));
-  store.repo.oauth.findActiveAccess = (...args) => { if (failure === "storage" && args[1] === hashToken(token)) throw hostile; return find(...args); };
+  const restoreAccess = stubAuthRead(store.repo, "findActiveAccess", find => (...args) => { if (failure === "storage" && args[1] === hashToken(token)) throw hostile; return find(...args); });
   const log = spyOn(console, "error").mockImplementation(() => {});
   const serverFault = spyOn(McpServer.prototype, "close").mockImplementation(() => { throw hostile; });
   const transportFault = spyOn(WebStandardStreamableHTTPServerTransport.prototype, "close").mockImplementation(async () => { throw hostile; });
@@ -676,14 +675,14 @@ for (const failure of ["storage", "revoke"] as const) test(`legacy timer contain
     serverFault.mockRestore(); transportFault.mockRestore();
     expect(callbacks.at(-1)!).not.toThrow();
     await healthy.listResources();
-    store.repo.oauth.findActiveAccess = find;
+    restoreAccess();
     if (failure === "revoke") token = (await issuedOAuth(store.repo, oauth.resource)).token;
     await connect("2025-11-25");
     expect(hosted.activeLegacySessions).toBe(2);
     await expect(connect("2025-11-25")).rejects.toThrow();
     expect(hosted.activeLegacySessions).toBe(2);
   } finally {
-    store.repo.oauth.findActiveAccess = find; serverFault.mockRestore(); transportFault.mockRestore(); log.mockRestore();
+    restoreAccess(); serverFault.mockRestore(); transportFault.mockRestore(); log.mockRestore();
   }
 });
 
@@ -860,7 +859,7 @@ const rawLegacy = (method: string, sid: string, access: string) => hosted.fetch(
 test("a legacy session idle past access expiry sleeps without admission and resumes on the same sid after refresh", async () => {
   const f = await dormantFixture();
   const logged = spyOn(console, "error");
-  const hostedId = sessionContext(oauth.authenticate(new Request("http://localhost/mcp", { headers: { Authorization: `Bearer ${f.grant.token}` } })) as OAuthPrincipal, meta);
+  const hostedId = sessionContext((await oauth.authenticate(new Request("http://localhost/mcp", { headers: { Authorization: `Bearer ${f.grant.token}` } }))) as OAuthPrincipal, meta);
   f.time.now += OAUTH_TTL.access + 1;
   await f.refresh();
   f.tick();
@@ -1103,13 +1102,12 @@ for (const version of ["2025-11-25", "2025-06-18"]) for (const kind of ["databas
   const { access, status } = await rotateOAuth(store.repo, grant, grant.refreshToken);
   expect(status).toBe("ok");
   headers.set("Authorization", `Bearer ${access}`);
-  const original = store.repo.oauth.findActiveAccess;
   const fault = kind === "internal" ? new ApplicationError("internal", "SELECT secret FROM private_storage") : new Error("SELECT secret FROM private_storage");
   let oldChecks = 0;
-  store.repo.oauth.findActiveAccess = (...args) => {
+  const restoreAccess = stubAuthRead(store.repo, "findActiveAccess", original => (...args) => {
     if (args[1] === grant.tokens.accessHash) { oldChecks++; throw fault; }
     return original(...args);
-  };
+  });
   try {
     const failure = await client.subscribeResource({ uri }).catch(error => error);
     expect(failure).toMatchObject({ code: -32603 });
@@ -1119,7 +1117,7 @@ for (const version of ["2025-11-25", "2025-06-18"]) for (const kind of ["databas
     expect(hosted.activeWatches).toBe(1);
     expect(hosted.activeGetStreams).toBe(1);
     expect(gets).toHaveLength(1);
-  } finally { store.repo.oauth.findActiveAccess = original; }
+  } finally { restoreAccess(); }
   expect((await client.callTool({ name: "board_post", arguments: { board: "rollback", body: "unregistered" } })).isError).not.toBe(true);
   expect(hints).toEqual([]);
   expect(await client.subscribeResource({ uri })).toEqual({});
@@ -1172,14 +1170,13 @@ test("a refusal attaching an idle legacy GET ends that GET; the subscription sta
 });
 
 test("authentication storage errors return a redacted HTTP 500 before identity selection", async () => {
-  const original = store.repo.oauth.findActiveAccess;
-  store.repo.oauth.findActiveAccess = () => { throw new Error("SELECT secret FROM /private/oauth.sqlite"); };
+  const restoreAccess = stubAuthRead(store.repo, "findActiveAccess", () => () => { throw new Error("SELECT secret FROM /private/oauth.sqlite"); });
   try {
     const response = await hosted.fetch(new Request("http://localhost/mcp", { headers: { Authorization: `Bearer ${token}` } }));
     expect(response.status).toBe(500);
     expect(await response.json()).toEqual({ code: "internal", message: "internal error" });
     expect(store.repo.aliases.find(store.repo.read, `${user.user_email}/unselected`)).toBeUndefined();
-  } finally { store.repo.oauth.findActiveAccess = original; }
+  } finally { restoreAccess(); }
   expect(hosted.activeContexts).toBe(hosted.activeGetStreams);
 });
 
@@ -1490,7 +1487,7 @@ test("#899: another connection's commit reaches a stamped listen within a tick",
   hosted = createHostedMcp(application, oauth, { trustedOrigin: "https://grayboard.example.com:443" });
   const issued = await issuedOAuth(store.repo, oauth.resource);
   user = issued.authed;
-  const principal = oauth.authenticate(new Request("http://localhost/mcp", { headers: { Authorization: `Bearer ${issued.token}` } }));
+  const principal = await oauth.authenticate(new Request("http://localhost/mcp", { headers: { Authorization: `Bearer ${issued.token}` } }));
   if (principal instanceof Response) throw new Error("fixture authorization failed");
   await hosted.sessions.bind(principal, sessionContext(principal, meta), { name: "be", create: true, where: "tools" });
   const f = await stampedListen();

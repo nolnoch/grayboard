@@ -98,7 +98,7 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: selective child e
   const root = await connect(version, grant.token, "capacity-root");
   await bind(root, "be");
   const first = await value(root, "session_register", { child: "first" });
-  const principal = app.oauth.authenticate(new Request(`${base}/mcp`, { headers: { Authorization: `Bearer ${grant.token}` } }));
+  const principal = await app.oauth.authenticate(new Request(`${base}/mcp`, { headers: { Authorization: `Bearer ${grant.token}` } }));
   if (principal instanceof Response) throw new Error("fixture authorization failed");
   const context = sessionContext(principal, { "ai.opencode/sessionID": "capacity-root" });
   for (let i = 1; i < 128; i++) await app.mcp.sessions.register(principal, context, `child-${i}`);
@@ -119,7 +119,7 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: idle children are
   const grant = await issue();
   const root = await connect(version, grant.token, "busy-root");
   await bind(root, "be");
-  const principal = app.oauth.authenticate(new Request(`${base}/mcp`, { headers: { Authorization: `Bearer ${grant.token}` } }));
+  const principal = await app.oauth.authenticate(new Request(`${base}/mcp`, { headers: { Authorization: `Bearer ${grant.token}` } }));
   if (principal instanceof Response) throw new Error("fixture authorization failed");
   const context = sessionContext(principal, { "ai.opencode/sessionID": "busy-root" });
   for (let i = 0; i < MAX_CHILDREN; i++) await app.mcp.sessions.register(principal, context, `sub-${i}`);
@@ -140,7 +140,7 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: a parked child's 
   const grant = await issue();
   const root = await connect(version, grant.token, "full-root");
   await bind(root, "be");
-  const principal = app.oauth.authenticate(new Request(`${base}/mcp`, { headers: { Authorization: `Bearer ${grant.token}` } }));
+  const principal = await app.oauth.authenticate(new Request(`${base}/mcp`, { headers: { Authorization: `Bearer ${grant.token}` } }));
   if (principal instanceof Response) throw new Error("fixture authorization failed");
   const context = sessionContext(principal, { "ai.opencode/sessionID": "full-root" });
   const { child } = await value(root, "session_register", { child: "sleeper" });
@@ -172,7 +172,7 @@ test("ending calls under an unknown ID write nothing; session_end reports ended:
   expect(hostedRowCount(app.db)).toBe(0);
   expect(audits()).toEqual([...before, "hosted.stale_capability"]);
   expect(await value(stranger, "session_end")).toEqual({ ended: false });
-  const principal = app.oauth.authenticate(new Request(`${base}/mcp`, { headers: { Authorization: `Bearer ${grant.token}` } }));
+  const principal = await app.oauth.authenticate(new Request(`${base}/mcp`, { headers: { Authorization: `Bearer ${grant.token}` } }));
   if (principal instanceof Response) throw new Error("fixture authorization failed");
   const unseen = sessionContext(principal, { "ai.opencode/sessionID": "never-seen" });
   expect(await app.mcp.sessions.end(principal, unseen)).toEqual({ ended: false });

@@ -17,6 +17,7 @@ let application: ReturnType<typeof createApplication>;
 let hosted: ReturnType<typeof createHostedSessions>;
 import { issueOAuth, type IssuedOAuth } from "../../tests/helpers/oauth.ts";
 import { getAttachment, bindAttachments } from "../core/attachments.ts";
+import { stubAuthRead } from "../../tests/support/auth_stub.ts";
 import { scratchDbPath } from "../../tests/support/scratch_db.ts";
 import { seed } from "../../tests/support/seed.ts";
 
@@ -50,8 +51,8 @@ beforeEach(async () => {
   await seed(store.repo, tx => store.repo.aliases.create(tx, { scope_kind: "person", scope_ref: issued.authed.user_email, name: "be" }, issued.authed.user_email));
   gate = new UploadGate(1024, 1024);
   application = createApplication(store.repo);
-  hosted = createHostedSessions(application, { now: () => now, isAuthorized: (p, r) => oauth.isAuthorized(p, r) }); await hosted.ready;
-  const principal = oauth.authenticate(new Request(resource, { headers: { Authorization: `Bearer ${issued.token}` } }), ["grayboard:tools"]);
+  hosted = createHostedSessions(application, { now: () => now, isAuthorized: (p, r) => oauth.isAuthorizedNow(p, r) }); await hosted.ready;
+  const principal = await oauth.authenticate(new Request(resource, { headers: { Authorization: `Bearer ${issued.token}` } }), ["grayboard:tools"]);
   if (principal instanceof Response) throw new Error("fixture auth failed");
   await hosted.bind(principal, sessionContext(principal, { [OPENCODE_SESSION_META]: "attachment-root" }), { name: "be" });
   router = createMcpAttachments(store.repo, oauth, gate, { trustedOrigin: origin, sessions: hosted });
@@ -91,14 +92,14 @@ test("precise routing, canonical challenge, strict query and existing identity o
   expect(count()).toBe(0);
 });
 
-function principal() {
-  const p = oauth.authenticate(new Request(resource, { headers: { Authorization: `Bearer ${issued.token}` } }));
+async function principal() {
+  const p = await oauth.authenticate(new Request(resource, { headers: { Authorization: `Bearer ${issued.token}` } }));
   if (p instanceof Response) throw new Error("fixture unauthorized");
   return p;
 }
 
-function external(operation: "bind" | "end", rawSession: string) {
-  const p = principal();
+async function external(operation: "bind" | "end", rawSession: string) {
+  const p = await principal();
   const result = Bun.spawnSync([process.execPath, "tests/support/hosted-operation.ts", join(dir, "bus.db"), dir, JSON.stringify({ now, operation, principal: p, rawSession, name: "fe" })], { stdin: Buffer.from(""), env: { ...process.env, BUS_TEST_PAUSE: "", BUS_TEST_PAUSE_FILE: "" } });
   expect(result.exitCode).toBe(0);
   expect(JSON.parse(result.stdout.toString().trim().split("\n").at(-1)!).ok).toBe(true);
@@ -120,7 +121,7 @@ test("all private attachment methods require mapped bound context, not a name ov
 });
 
 test("registered child attachments resolve the root; query name is only an assertion", async () => {
-  const p = principal(), root = sessionContext(p, { [OPENCODE_SESSION_META]: "attachment-root" });
+  const p = await principal(), root = sessionContext(p, { [OPENCODE_SESSION_META]: "attachment-root" });
   await hosted.register(p, root, "attachment-child");
   const upload = request("POST", "/mcp/attachments?filename=child.txt"); upload.headers.set("X-Grayboard-Session", "attachment-child");
   const response = await send(upload); expect(response.status).toBe(201);
@@ -136,8 +137,8 @@ test("registered child attachments resolve the root; query name is only an asser
 test("#807 P1c-14b: a download's message read runs on the pool, its recheck on the body's Tx", async () => {
   const id = await uploaded();
   await seed(store.repo, tx => store.repo.aliases.create(tx, { scope_kind: "person", scope_ref: issued.authed.user_email, name: "fe" }, issued.authed.user_email));
-  const root = sessionContext(principal(), { [OPENCODE_SESSION_META]: "attachment-root" });
-  await hosted.run(principal(), root, "dm_send", (session, tx) => application.send(tx, session, "fe", "the file", { attachment_ids: [id] }));
+  const root = sessionContext(await principal(), { [OPENCODE_SESSION_META]: "attachment-root" });
+  await hosted.run(await principal(), root, "dm_send", (session, tx) => application.send(tx, session, "fe", "the file", { attachment_ids: [id] }));
   const checks: { inTxn: boolean; handle: "pool" | "tx" }[] = [];
   const original = store.repo.messages.getById.bind(store.repo.messages);
   const spy = spyOn(store.repo.messages, "getById").mockImplementation((r, messageId) => {
@@ -153,7 +154,7 @@ test("#807 P1c-14b: a download's message read runs on the pool, its recheck on t
 // A registration's `via` names the ancestry for routing only: it never maps the intermediate. (The OpenCode
 // host suites can't show this since #535: there every subagent of an enrolled root registers on its own.)
 test("via ancestry is not registration or attachment mapping authority", async () => {
-  const p = principal(), root = sessionContext(p, { [OPENCODE_SESSION_META]: "attachment-root" });
+  const p = await principal(), root = sessionContext(p, { [OPENCODE_SESSION_META]: "attachment-root" });
   await hosted.register(p, root, "attachment-grandchild", ["attachment-mid"]);
   expect(store.db.query("SELECT 1 FROM hosted_sessions WHERE source_session_id = ?").get("attachment-mid")).toBeNull();
   const upload = request("POST", "/mcp/attachments?filename=mid.txt"); upload.headers.set("X-Grayboard-Session", "attachment-mid");
@@ -163,7 +164,7 @@ test("via ancestry is not registration or attachment mapping authority", async (
 });
 
 for (const boundary of ["body", "store", "download"] as const) for (const operation of ["bind", "end"] as const) test(`external ${operation} during attachment ${boundary} fences root and child snapshots`, async () => {
-  const p = principal();
+  const p = await principal();
   await hosted.register(p, sessionContext(p, { [OPENCODE_SESSION_META]: "attachment-root" }), "attachment-child");
   const entered = deferred(), resume = deferred();
   let id: number | undefined, req: Request;
@@ -182,7 +183,7 @@ for (const boundary of ["body", "store", "download"] as const) for (const operat
   req.headers.set("X-Grayboard-Session", "attachment-child");
   const pending = send(req);
   await entered.promise;
-  external(operation, operation === "bind" ? "attachment-root" : "attachment-child");
+  await external(operation, operation === "bind" ? "attachment-root" : "attachment-child");
   resume.resolve();
   const response = await pending;
   expect(response.status).toBe(403);
@@ -342,7 +343,7 @@ test("unexpected storage and authorization faults remain redacted 500", async ()
   expect(response.status).toBe(500);
   expect(await response.text()).not.toContain("secret disk path");
   expect(count()).toBe(0);
-  store.repo.oauth.findActiveAccess = () => { throw new Error("private SQL"); };
+  stubAuthRead(store.repo, "findActiveAccess", () => () => { throw new Error("private SQL"); });
   expect((await send()).status).toBe(500);
 });
 
@@ -449,16 +450,16 @@ test("#1053: the guard's reads inside a transaction body use that body's handle,
     if (queue.mine) inBody.push({ what, pool: args[0] === store.repo.read });
     return (fn as (...a: unknown[]) => unknown).apply(this, args);
   };
-  const find = store.repo.aliases.find, get = store.repo.hosted.get, active = store.repo.oauth.findActiveAccess;
+  const find = store.repo.aliases.find, get = store.repo.hosted.get;
   store.repo.aliases.find = record("aliases.find", find) as typeof find;
   store.repo.hosted.get = record("hosted.get", get) as typeof get;
-  store.repo.oauth.findActiveAccess = record("findActiveAccess", active) as typeof active;
+  const restoreAccess = stubAuthRead(store.repo, "findActiveAccess", active => record("findActiveAccess", active) as typeof active);
   try {
     const id = await uploaded();
     expect((await send(request("GET", `/hosted/mcp/attachments/${id}?identity=be`))).status).toBe(200);
     expect((await send(request("DELETE", `/hosted/mcp/attachments/${id}?identity=be`))).status).toBe(200);
   } finally {
-    store.repo.aliases.find = find; store.repo.hosted.get = get; store.repo.oauth.findActiveAccess = active;
+    store.repo.aliases.find = find; store.repo.hosted.get = get; restoreAccess();
   }
   // Each of the three reads ran in a body (store, audit, download recheck, release), and none of them on the pool.
   for (const what of ["aliases.find", "hosted.get", "findActiveAccess"]) expect(inBody.some(c => c.what === what)).toBe(true);
