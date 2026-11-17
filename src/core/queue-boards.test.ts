@@ -232,7 +232,7 @@ test("a reply by a different lane does not release the holder's claim", () => {
 
 test("a resolved @mention is direct addressing and bypasses the rotation", () => {
   const r = post(db, "be", "work", "@sim take this one");
-  const rows = db.prepare(`SELECT handle, reason FROM outbox WHERE post_id = ?`).all(r.post.id) as { handle: string }[];
+  const rows = db.prepare(`SELECT handle, reason FROM outbox WHERE post_id = ?`).all(r.post.id) as { handle: string; reason: string }[];
   expect(rows).toEqual([{ handle: "sim", reason: "mention" }]);
 });
 
