@@ -738,7 +738,7 @@ export type PostOpts = {
 // (never-woken first, then by handle). A lane was last woken at its latest
 // queue take on the board (a delivery or redelivery, #221: an old post's
 // redelivery counts when it was handed over, not when it was written), or at
-// the newest board post in its outbox (a mention), whichever is later. A lane is a push subscriber who isn't
+// the newest board post in its outbox (a mention or a thread reply), whichever is later. A lane is a push subscriber who isn't
 // one of the poster's addresses (its address set: a session's own lane never
 // takes its own post, whichever alias it posted as), hasn't opted out (peer_status queue:"off"), and isn't a
 // read-only viewer. A session's lane is its primary, the oldest alias it
@@ -768,7 +768,7 @@ export function queueLanes(
          GROUP BY l.lane
          ORDER BY NULLIF(MAX(
              COALESCE((SELECT MAX(e.at) FROM claim_events e
-                       WHERE e.board = ?1 AND e.handle = l.lane AND e.event = 'take' AND e.key LIKE 'queue:%'), 0),
+                       WHERE e.board = ?1 AND e.handle = l.lane AND e.event = 'take' AND e.key GLOB 'queue:*'), 0),
              COALESCE((SELECT MAX(p2.created_at) FROM outbox o2 JOIN posts p2 ON p2.id = o2.post_id
                        WHERE o2.handle = l.lane AND p2.board = ?1), 0)), 0) ASC NULLS FIRST, l.lane ASC`,
       )
