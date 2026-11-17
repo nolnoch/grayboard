@@ -6,13 +6,19 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { version } from "../../package.json" with { type: "json" };
 import { piAgentDir } from "../../src/shared/pi.ts";
 import type { Level } from "../hosted-core/src/client.ts";
-import { COMMAND, createGrayboard, factReader, toolArgs, toolResult } from "./extension.ts";
+import { COMMAND, createGrayboard, factReader, toolArgs, toolResult, type Marker } from "./extension.ts";
 import { modelName } from "./omp-instructions.ts";
 
 // pi's MCP naming (createMcpToolName), so --tools, --exclude-tools and the
 // MCP call renderer treat these as they treat any MCP server's tools.
 const SERVER = "grayboard";
 const PREFIX = `mcp__${SERVER}__`;
+
+// pi-subagents' detached runner sets PI_SUBAGENT_CHILD=1 and passes the
+// top-level parent's session id (src/runs/background/subagent-runner.js).
+export const piMarker = (env: Record<string, string | undefined> = process.env): Marker => env.PI_SUBAGENT_CHILD === "1"
+  ? { child: true, ...(env.PI_SUBAGENT_PARENT_SESSION ? { root: env.PI_SUBAGENT_PARENT_SESSION } : {}) }
+  : { child: false };
 
 export default function grayboard(pi: ExtensionAPI) {
   let ctx: ExtensionContext | undefined;
@@ -22,11 +28,7 @@ export default function grayboard(pi: ExtensionAPI) {
     clientId: "grayboard-pi",
     version,
     agentDir: piAgentDir(),
-    // pi-subagents' detached runner sets PI_SUBAGENT_CHILD=1 and passes the
-    // top-level parent's session id (src/runs/background/subagent-runner.js).
-    marker: () => process.env.PI_SUBAGENT_CHILD === "1"
-      ? { child: true, ...(process.env.PI_SUBAGENT_PARENT_SESSION ? { root: process.env.PI_SUBAGENT_PARENT_SESSION } : {}) }
-      : { child: false },
+    marker: () => piMarker(),
     register: (tools, call) => {
       for (const tool of tools) {
         pi.registerTool({

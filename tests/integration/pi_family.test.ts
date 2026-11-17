@@ -22,6 +22,7 @@ import type { CallToolResult } from "@modelcontextprotocol/client";
 import type { SessionFacts } from "../../adapters/hosted-core/src/port.ts";
 import { createGrayboard, factReader, LOGIN_ACTION, type DeliveryEntry, type Grayboard, type Marker, type SessionInfo } from "../../adapters/pi-family/extension.ts";
 import { rootOf, type Agent } from "../../adapters/pi-family/omp-ancestry.ts";
+import { piMarker } from "../../adapters/pi-family/entry-pi.ts";
 import type { Level } from "../../adapters/hosted-core/src/client.ts";
 import type { SignInState } from "../../adapters/hosted-core/src/offer.ts";
 import { Controller } from "../../adapters/hosted-core/src/controller.ts";
@@ -1180,4 +1181,15 @@ test("factReader reads each fact on its own: a throwing effort keeps the model, 
   expect(read("s2", { model: () => { throw new Error("no model"); }, effort: () => null })).toEqual({ effort: null });
   expect(warned).toHaveLength(2);
   expect(read("s1", { model: () => null, effort: () => "high" })).toEqual({ model: null, effort: "high" });
+});
+
+// pi's entry reads its marker from pi-subagents' runner env (#438 item 20):
+// the names, a child with no parent session (unattributed), and a root.
+test("pi's marker: PI_SUBAGENT_CHILD=1 is a child of PI_SUBAGENT_PARENT_SESSION; anything else is a root", () => {
+  expect(piMarker({ PI_SUBAGENT_CHILD: "1", PI_SUBAGENT_PARENT_SESSION: "parent-1" })).toEqual({ child: true, root: "parent-1" });
+  expect(piMarker({ PI_SUBAGENT_CHILD: "1" })).toEqual({ child: true });
+  expect(piMarker({ PI_SUBAGENT_CHILD: "1", PI_SUBAGENT_PARENT_SESSION: "" })).toEqual({ child: true });
+  expect(piMarker({ PI_SUBAGENT_PARENT_SESSION: "parent-1" })).toEqual({ child: false });
+  expect(piMarker({ PI_SUBAGENT_CHILD: "0", PI_SUBAGENT_PARENT_SESSION: "parent-1" })).toEqual({ child: false });
+  expect(piMarker({})).toEqual({ child: false });
 });
