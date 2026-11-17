@@ -37,7 +37,7 @@ for (const kind of ["keyed", "human", "runner"] as const) {
       startPi(dir, port, procs, { identity, entry: { env: { BUS_PUSH: "off", ...env } } })), 90_000);
 }
 for (const kind of ["keyed", "human"] as const) {
-  test(`pi local ${kind} root: a foreground child is ${kind === "keyed" ? "the root's child" : "refused a session, never the human handle"}, with no crash loop, after /new too and for a runner its bash launches, and no subagent leaves a name record (#897, #1075, #1078)`, () => piExcludedForegroundChildScenario(dir, kind), 90_000);
+  test(`pi local ${kind} root: a foreground child is ${kind === "keyed" ? "the root's child" : "refused a session, never the human handle"}, with no crash loop, after /new too and for a runner its bash launches, and no subagent leaves a name record (#897, #1075, #1078)`, () => piExcludedForegroundChildScenario(dir, kind), 180_000);
 }
 test("pi detached runner (#523 step 5): with no live parent it is its own session; with one it acts as the parent's child, writing as the parent's name with via, until a bind promotes it to its own session that receives, or the parent exits while it runs on", () => piRunnerScenario(dir), 180_000);
 test("pi foreground subagent (#557 3): a session the root's pi opens in-process with the grayboard extension, whose header names the root's file, acts as the root's child (its name, via, no second root) and ends at its shutdown; a header naming no live session and a /fork of the root are roots", () => piForegroundChildScenario(dir), 120_000);

@@ -284,7 +284,8 @@ export default function grayboard(pi: ExtensionAPI) {
         send({ id, method, params });
       });
     // Fail the calls in flight, then take the names back from the name
-    // record through a new child under the same pi process.
+    // record through a new child under the same pi process (a subagent's
+    // child keeps no record and comes back unbound, #1078).
     const fail = (reason: string) => {
       if (gone) return;
       gone = new Error(reason);

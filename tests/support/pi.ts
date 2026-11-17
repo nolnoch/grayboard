@@ -846,6 +846,7 @@ export function piExcludedForegroundChildScenario(dir: string, kind: "keyed" | "
   const prefix = "mcp__grayboard__";
   const whoami: Reply = { tool: prefix + "whoami", args: {} };
   const node = Bun.which("node");
+  const runnerPid = join(dir, "runner.pid");
   let current = "";
   return named(async () => {
     const procs: ChildProcess[] = [];
@@ -856,7 +857,7 @@ export function piExcludedForegroundChildScenario(dir: string, kind: "keyed" | "
       scripted("child two", [whoami]),
       (req) => scripted("launch runner", [{
         tool: "bash",
-        args: { command: `exec env PI_SUBAGENT_CHILD=1 PI_SUBAGENT_PARENT_SESSION='${current}' '${node}' '${PI_CLI}' -p --offline --provider fake --model fake-1 --no-session 'runner'` },
+        args: { command: `echo $$ > '${runnerPid}'; exec env PI_SUBAGENT_CHILD=1 PI_SUBAGENT_PARENT_SESSION='${current}' '${node}' '${PI_CLI}' -p --offline --provider fake --model fake-1 --no-session 'runner'` },
       }])(req),
       scripted("runner", kind === "keyed" ? [whoami, { tool: prefix + "bind", args: { name: "pi-runner", create: true } }] : [whoami]),
       scripted("who", [whoami]),
@@ -956,6 +957,9 @@ export function piExcludedForegroundChildScenario(dir: string, kind: "keyed" | "
       expect(pi.events.filter((e) => e.type === "extension_error")).toEqual([]);
       await pi.quit();
     } finally {
+      // A runner left running by a failure: its whole process group (pi's bash spawns it detached).
+      const pid = existsSync(runnerPid) ? Number(readFileSync(runnerPid, "utf8")) : 0;
+      if (pid > 0) try { process.kill(pid, 0); process.kill(-pid, "SIGKILL"); } catch {}
       await stopAll(procs);
       model.stop();
       db?.close();
