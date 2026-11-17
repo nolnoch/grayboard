@@ -1501,7 +1501,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
         const open = (h: string) => countOpenDelegations(c, "access_log", h, q.since);
         if (q.to !== undefined) {
           const to = q.to;
-          return delegationFacts({ to: { everConnected: everConnected(c, to), isLauncher: isLauncher(c, to) }, users: new Map([[to, addressUser(c, to)]]), open: new Map([[to, open(to)]]) });
+          return delegationFacts({ to: { address: to, everConnected: everConnected(c, to), isLauncher: isLauncher(c, to) }, users: new Map([[to, addressUser(c, to)]]), open: new Map([[to, open(to)]]) });
         }
         const list = launchers(c);
         return delegationFacts({ launchers: list, users: new Map(list.map(h => [h, addressUser(c, h)])), open: new Map(list.map(h => [h, open(h)])) });
@@ -2313,7 +2313,7 @@ export interface ReadDelegationFacts extends DelegationFacts {
 // out fails loudly instead of reading as false or zero. The human fallback's reads are local mode's only.
 function delegationFacts(read: {
   launchers?: string[];
-  to?: { everConnected: boolean; isLauncher: boolean };
+  to?: { address: string; everConnected: boolean; isLauncher: boolean };
   users: Map<string, string | null | undefined>;
   open: Map<string, number>;
 }): ReadDelegationFacts {
@@ -2322,8 +2322,8 @@ function delegationFacts(read: {
   return {
     launchers: () => read.launchers ?? missing("the launcher list"),
     userOf: from(read.users, "the user"),
-    everConnected: () => read.to?.everConnected ?? missing("whether the target connected"),
-    isLauncher: () => read.to?.isLauncher ?? missing("whether the target is a launcher"),
+    everConnected: (h) => read.to?.address === h ? read.to.everConnected : missing(`whether "${h}" connected`),
+    isLauncher: (h) => read.to?.address === h ? read.to.isLauncher : missing(`whether "${h}" is a launcher`),
     open: from(read.open, "the open count"),
     humanHandles: () => missing("the human handles"),
     lastSeen: () => missing("a last-seen"),

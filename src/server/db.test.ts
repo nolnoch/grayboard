@@ -1185,4 +1185,7 @@ test("#807 P3 B4b: repo.delegation runs on the handle it's given; its facts answ
   expect((await d.facts(r, { to: "b@example.com/none", since: 0 })).everConnected("b@example.com/none")).toBe(false);
   expect(() => named.launchers()).toThrow(/the launcher list was not read/);
   expect(() => named.open(be)).toThrow(/was not read/);
+  // The target's facts answer for that address only.
+  expect(() => named.everConnected(be)).toThrow(/whether "b@example.com\/be" connected was not read/);
+  expect(() => named.isLauncher(be)).toThrow(/whether "b@example.com\/be" is a launcher was not read/);
 });
