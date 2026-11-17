@@ -996,8 +996,8 @@ test("#1062: queued progress reads back as saved, and the receipt drops it", asy
     expect(store.progress(again)).toEqual({ posted: true, error: null });
     holder.release();
     await holder.done;
-    // The receipt's commit cleared the row and dropped the overlay with it.
-    await until(() => store.progress(again) === undefined, 5000, "the receipt dropped the queued progress");
+    // The progress write's commit dropped the overlay; the receipt's cleared the row.
+    await until(() => store.progress(again) === undefined, 5000, "the queued progress committed and was cleared");
     expect(committed()).toBeUndefined();
   } finally { holder.release(); }
 });
@@ -1005,7 +1005,7 @@ test("#1062: queued progress reads back as saved, and the receipt drops it", asy
 // End to end: a drain that fails after Slack took the post leaves the item in the outbox, and the next drain reads its
 // queued { posted: true } rather than posting it again.
 test("#1062: a redelivery while the item's progress waits in the write queue doesn't post it twice", async () => {
-  const { relay, store } = await linkedAlice();
+  const { userId, relay, store } = await linkedAlice();
   const be = await hosted("alice@example.com", "be");
   const { done } = store;
   let failed = false;
@@ -1018,9 +1018,12 @@ test("#1062: a redelivery while the item's progress waits in the write queue doe
   slack.onPost = (body) => { if (!holder && String(body.markdown_text).includes("redelivery fixture")) holder = holdQueue(); };
   const count = () => slack.posts().filter((p) => p.markdown_text?.includes("redelivery fixture")).length;
   try {
-    await be.call<SendResult>("dm_send", { to: "human", body: "redelivery fixture" });
+    const sent = await be.call<SendResult>("dm_send", { to: "human", body: "redelivery fixture" });
     await until(() => failed, 5000, "the first drain reached the receipt");
     expect(store.pending()).toHaveLength(1);
+    // The redelivery must read the queued progress, not a committed row.
+    expect(holder).toBeDefined();
+    expect(srv.app.repo.slack.progress(srv.app.repo.read, userId, `dm:${sent.message_id}`)).toBeUndefined();
     // A drain() while the failed one is still unwinding would only set its again flag.
     await until(() => !(relay as unknown as { draining: boolean }).draining, 5000, "the failed drain ended");
     await relay.drain();
@@ -1031,9 +1034,10 @@ test("#1062: a redelivery while the item's progress waits in the write queue doe
 
 // A progress write that failed leaves its overlay entry (the relay did what it records); the receipt's commit drops it.
 test("#1062: the receipt drops the overlay of a progress write that failed", async () => {
-  const { store } = await linkedAlice();
+  const { userId, store } = await linkedAlice();
   srv.app.db.run(`CREATE TRIGGER fail_progress BEFORE INSERT ON slack_progress BEGIN SELECT RAISE(ABORT, 'progress refused'); END`);
   const meta = { board: "e2e", post_id: "990002", from: "alice@example.com/be" };
+  const errors = spyOn(console, "error");
   const holder = holdQueue();
   try {
     const id = store.enqueue({ content: "failed progress fixture", meta });
@@ -1041,7 +1045,10 @@ test("#1062: the receipt drops the overlay of a progress write that failed", asy
     store.done(id, null);
     holder.release();
     await holder.done;
+    // The progress write failed, so only the receipt's commit can drop its overlay.
     const again = store.enqueue({ content: "failed progress fixture", meta });
+    await until(() => errors.mock.calls.some((c) => String(c[0]).includes("Slack progress failed")), 5000, "the progress write failed");
+    expect(srv.app.repo.slack.progress(srv.app.repo.read, userId, "post:990002")).toBeUndefined();
     await until(() => store.progress(again) === undefined, 5000, "the receipt dropped the failed write's overlay");
-  } finally { holder.release(); }
+  } finally { holder.release(); errors.mockRestore(); }
 });
