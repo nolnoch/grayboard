@@ -189,6 +189,28 @@ export function claim(
   }).immediate();
 }
 
+// A queue post's claim ended without an ack: offer the post to the next lane
+// that hasn't held it. With none left, the post stays readable on its board
+// unclaimed, and a reply in its thread, as the lane that held it last, tells
+// the poster and the claim's watchers (#220). Lanes are counted, not named: a
+// reader may not see a team's alias (#871). Like a holder that lost access,
+// one that can't post there now ends it quietly.
+function requeue(db: Database, c: ClaimRow, now: number): ClaimChanges {
+  const cc = watchersCc(db, c.key, true);
+  const r = redeliverQueuePost(db, c.key, c.holder, now);
+  if (!r) return { wake: [], boards: [] };
+  if ("lane" in r) return { wake: [r.lane], boards: [] };
+  const lanes = r.held === 1 ? "its one lane" : `all ${r.held} lanes`;
+  const text = `[unclaimed] ${c.key}: ${lanes} passed on it, and no other lane is left; it stays here unclaimed${cc}`;
+  try {
+    const res = post(db, c.holder, r.board, text, r.postId, { author_user: holderUser(db, c), allowArchived: true });
+    return { wake: res.wake, boards: [res.post.board] };
+  } catch (e) {
+    if (e instanceof CoreError) return { wake: [], boards: [] };
+    throw e;
+  }
+}
+
 // When one of `addresses` released `key`, if nothing has happened to the key
 // since: its release is the key's latest event, or on a queue: key the one
 // its own redelivery directly followed. Otherwise undefined.
@@ -231,9 +253,7 @@ export function release(
       // A declined queue post goes to the next lane with the original post;
       // the decline post would itself rotate as a new work item, so it isn't
       // announced either (#192 review).
-      watchersCc(db, key, true);
-      const lane = redeliverQueuePost(db, key, cur.holder, Date.now());
-      return { wake: lane ? [lane] : [], boards: [] };
+      return requeue(db, cur, Date.now());
     }
     const cc = watchersCc(db, key, true);
     // If the holder lost access to the board since claiming, release quietly;
@@ -313,9 +333,9 @@ function sweepChanges(db: Database, now: number): ClaimChanges {
       // A queue post's claim lapsed: re-offer the original post to the next
       // lane instead of announcing - an expiry post on a queue board would
       // itself rotate as a new work item (#192 review).
-      watchersCc(db, c.key, true);
-      const lane = redeliverQueuePost(db, c.key, c.holder, now);
-      if (lane) wake.add(lane);
+      const changed = requeue(db, c, now);
+      for (const h of changed.wake) wake.add(h);
+      for (const board of changed.boards) boards.add(board);
       continue;
     }
     const cc = watchersCc(db, c.key, true);

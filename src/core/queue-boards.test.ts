@@ -17,7 +17,7 @@ import {
   touchAlias,
 } from "./boards.ts";
 import { holdAlias } from "./bindings.ts";
-import { claim, release, sweepExpired, listClaims } from "./claims.ts";
+import { claim, release, sweepExpired, listClaims, watch } from "./claims.ts";
 import { initCoreSchema } from "./schema.ts";
 
 let db: Database;
@@ -96,14 +96,39 @@ test("a declined queue post redelivers the original post to the next lane", () =
   expect(claimEvents(claimKey(r.post.id)).map((e) => e.event)).toEqual(["take", "release", "take"]);
 });
 
-test("a redelivered post resets a lane's earlier delivery, so the re-offer reaches it", () => {
+// #220: each lane gets one turn at a post, so two lanes can't pass it back
+// and forth forever; with every lane passed, its thread says so.
+test("a lane that held a post isn't offered it again; with none left, a reply in its thread says it's unclaimed", () => {
   const r = post(db, "be", "work", "work item"); // fe claims
+  const key = claimKey(r.post.id);
   acknowledge(db, "fe", { kind: "push", post_id: r.post.id });
-  sweepExpired(db, Date.now() + 31 * 60_000); // sim declines too
-  release(db, "sim", claimKey(r.post.id), "pass");
-  // Only two lanes: the post comes back to fe, whose first delivery is reset.
-  const pend = pendingFor(db, "fe", { all: true });
-  expect(pend.some((i) => i.kind === "push" && i.post.id === r.post.id)).toBe(true);
+  sweepExpired(db, Date.now() + 31 * 60_000); // fe lapses; sim takes it
+  const passed = release(db, "sim", key, "pass");
+  // Both lanes held it: nobody holds it now, and fe isn't pushed it again.
+  expect(listClaims(db).some((c) => c.key === key)).toBe(false);
+  // In write order: the sweep ran at a later clock than the release.
+  expect(db.prepare(`SELECT event FROM claim_events WHERE key = ? ORDER BY id`).all(key)).toEqual(
+    ["take", "expire", "take", "release"].map((event) => ({ event })),
+  );
+  expect(pendingFor(db, "fe", { all: true }).some((i) => i.kind === "push" && i.post.id === r.post.id)).toBe(false);
+  // The last holder's reply in the thread tells the poster; lanes are counted, not named.
+  const replies = db.prepare(`SELECT author, body FROM posts WHERE parent_id = ?`).all(r.post.id);
+  expect(replies).toEqual([{ author: "sim", body: `[unclaimed] ${key}: all 2 lanes passed on it, and no other lane is left; it stays here unclaimed` }]);
+  expect(passed.wake).toEqual(["be"]);
+  // The decline's repeat (#254) still answers from state.
+  expect(release(db, "sim", key, "pass").releasedAt).toEqual(expect.any(Number));
+});
+
+test("a lapse on a one-lane queue says the post is unclaimed, and cc's the claim's watchers", () => {
+  db.prepare(`DELETE FROM subscriptions WHERE handle = 'sim'`).run();
+  const r = post(db, "be", "work", "work item"); // fe, the only lane, claims
+  const key = claimKey(r.post.id);
+  watch(db, "sim", key);
+  const swept = sweepExpired(db, Date.now() + 31 * 60_000);
+  const replies = db.prepare(`SELECT author, body FROM posts WHERE parent_id = ?`).all(r.post.id);
+  expect(replies).toEqual([{ author: "fe", body: `[unclaimed] ${key}: its one lane passed on it, and no other lane is left; it stays here unclaimed cc @sim` }]);
+  expect(swept.wake.sort()).toEqual(["be", "sim"]);
+  expect(listClaims(db).some((c) => c.key === key)).toBe(false);
 });
 
 test("a reply by the claim holder acks and releases the claim", () => {
@@ -333,6 +358,10 @@ test("a pre-kind database opens with the broadcast default", () => {
 });
 
 test("a repeated decline (its answer lost, #254) succeeds without a second release or redelivery", () => {
+  for (const h of ["yak", "zed"]) {
+    ensureAlias(db, h, "test");
+    subscribe(db, h, "work", "push");
+  }
   const r = post(db, "be", "work", "work item"); // fe claims it
   release(db, "fe", claimKey(r.post.id), "not my lane"); // redelivered: sim holds it
   const outbox = () => db.prepare(`SELECT handle, delivered_at, wake FROM outbox WHERE post_id = ? ORDER BY handle`).all(r.post.id);
@@ -343,9 +372,9 @@ test("a repeated decline (its answer lost, #254) succeeds without a second relea
   expect(outbox()).toEqual(before.outbox);
   expect(listClaims(db).find((c) => c.key === claimKey(r.post.id))?.holder).toBe("sim");
   // Once sim has acted on the key, fe's decline is history, and sim's is the latest.
-  release(db, "sim", claimKey(r.post.id), "pass"); // redelivered: fe holds it
+  release(db, "sim", claimKey(r.post.id), "pass"); // redelivered: yak holds it
   expect(release(db, "sim", claimKey(r.post.id), "pass").releasedAt).toEqual(expect.any(Number));
   // A TTL takeover isn't a release: the lapsed lane's call is refused as before.
-  sweepExpired(db, Date.now() + 31 * 60_000); // fe lapses; sim takes it
-  expect(() => release(db, "fe", claimKey(r.post.id))).toThrow(/held by sim/);
+  sweepExpired(db, Date.now() + 31 * 60_000); // yak lapses; zed takes it
+  expect(() => release(db, "yak", claimKey(r.post.id))).toThrow(/held by zed/);
 });
