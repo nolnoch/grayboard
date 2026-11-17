@@ -756,7 +756,10 @@ test("a pause the Controller's run loop reaches on its own is said at once and i
   expect(texts(await a.call("whoami"))[0]).toBe(paused);
   // /grayboard resume restarts the paused root: it runs again under its own name.
   await a.ext.command("resume");
-  expect(a.notices.at(-1)).toEqual({ level: "info", message: "grayboard: approved: Bound sinker, switched; opening delivery" });
+  // It says "approved" before the command returns; whether delivery's later "active" also
+  // reaches the UI as a notice is timing-dependent, so status is the proof it's running again.
+  expect(a.notices.slice(1, 2)).toEqual([{ level: "info", message: "grayboard: approved: Bound sinker, switched; opening delivery" }]);
+  await until(async () => (await a.ext.status()).includes(`  sink-a (${EMAIL}/sinker, ${EMAIL}/switched): active,`), 5_000, "sink-a active as sinker, switched");
   const resumed = texts(await a.call("whoami"));
   expect(resumed).toHaveLength(1);
   expect(JSON.parse(resumed[0]!)).toMatchObject({ primary: `${EMAIL}/sinker`, held: [`${EMAIL}/sinker`, `${EMAIL}/switched`] });
