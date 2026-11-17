@@ -352,7 +352,7 @@ export interface Repo {
     // Whether two users share any team: the human-reach rule's teammates, in one statement (A7e3).
     shareAny(r: Read, userA: number, userB: number): Promise<boolean>;
   };
-  // The writes return promises (#807 P3 A6d2); the reads stay synchronous until A7, as the alias reads do.
+  // The writes return promises (#807 P3 A6d2); the reads stay synchronous until A7.
   messages: {
     // files: unbound uploads (ids) of their uploader (the sending session's
     // address set, #284 PR 4 S5, and its user, #367), bound in the insert's
@@ -1012,9 +1012,10 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
             catch (error) { console.error("hosted facts read failed", error); }
           }
           // After this transaction's notices (registered before the hook ran): the facts served their flush.
-          root.afterCommit(() => { for (const each of ids) o.facts.delete(each); });
+          try { root.afterCommit(() => { for (const each of ids) o.facts.delete(each); }); }
+          catch (error) { console.error("hosted facts clear failed", error); }
         });
-      } catch { /* a synchronous body's Tx refuses the hook: its notices carry no facts */ }
+      } catch { o.pending.delete(id); /* a synchronous body's Tx refuses the hook: its notices carry no facts */ }
     }
   };
   // An async op's notice waits for it to fulfil (#807 P3 A6c): one that rejects changed nothing, as a sync throw didn't.
