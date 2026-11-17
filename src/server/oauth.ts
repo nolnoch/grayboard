@@ -2,7 +2,7 @@ import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { hashToken, mintToken, type AuthedUser } from "./auth.ts";
 import { callbackPath, defaultProviders, DomainRefused, idpSignIn, type IdentityProvider, type UpstreamIdentity } from "./idp.ts";
 import { checkIdpConfig, type Config } from "./config.ts";
-import type { Repo } from "./db.ts";
+import type { AuthPeek, Repo } from "./db.ts";
 import type { Read, Tx } from "./store/tx.ts";
 import { BUILTIN_CLIENT_IDS, BUILTIN_CLIENTS, CLI_CLIENT, CLI_CLIENT_ID, LOGIN_SCOPE, matchesRedirect, oauthPublicUrl, OAUTH_SCOPES, OPENCODE_CLIENT, parseOAuthClients, sourceKeyFor, type OAuthClient } from "./oauth-config.ts";
 import { OAUTH_TTL, type OAuthRequest, type OAuthAccess } from "./oauth-types.ts";
@@ -622,7 +622,7 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
   function activeAccess(accessHash: string, r: Read = repo.read): Promise<{ access: OAuthAccess; email: string } | undefined> {
     return repo.authRead(async () => withEmail(await repo.oauth.findActiveAccess(r, accessHash, resource, [], now())));
   }
-  // The synchronous form, for the hosted MCP callers that stay synchronous until #807 P3 A7d (Repo.authNow).
+  // The synchronous form, for the hosted MCP callers that stay synchronous until #807 P3 A7d2 (Repo.authNow).
   function activeAccessNow(accessHash: string, r: Read = repo.read): { access: OAuthAccess; email: string } | undefined {
     return repo.authNow.read(() => withEmail(repo.authNow.findActiveAccess(r, accessHash, resource, [], now())));
   }
@@ -672,18 +672,25 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
       if (closed) return bearerError(401, "invalid_token", requiredScopes);
       return principalOf(access, accessHash, requiredScopes);
     },
-    // authenticate's synchronous form, until #807 P3 A7d (activeAccessNow).
+    // authenticate's synchronous form, until #807 P3 A7d2 (activeAccessNow).
     authenticateNow(req: Request, requiredScopes: string[] = ["grayboard:tools"], r?: Read): OAuthPrincipal | Response {
       const accessHash = bearer(req, requiredScopes);
       if (accessHash instanceof Response) return accessHash;
       return principalOf(activeAccessNow(accessHash, r), accessHash, requiredScopes);
     },
     async isGrantActive(grantId: string): Promise<boolean> { return !closed && await repo.oauth.isGrantActive(repo.read, grantId, now()) && !closed; },
-    isGrantActiveNow(grantId: string): boolean { return !closed && repo.authNow.isGrantActive(repo.read, grantId, now()); },
     async isAuthorized(principal: OAuthPrincipal, r?: Read): Promise<boolean> {
       if (closed || principal.accessExpiry <= now()) return false;
       const a = (await activeAccess(principal.accessHash, r))?.access;
       return !closed && authorizedBy(principal, a);
+    },
+    // isAuthorized from the auth cache alone (Repo.authPeek, #807 P3 A7d): undefined on a miss, which the caller
+    // checks in full with isAuthorized.
+    peekAuthorized(principal: OAuthPrincipal, peek: AuthPeek): boolean | undefined {
+      if (closed || principal.accessExpiry <= now()) return false;
+      const a = peek.access(principal.accessHash, resource, now());
+      if (!a) return undefined;
+      return repo.users.activeEmail(a.userId) !== undefined && authorizedBy(principal, a);
     },
     isAuthorizedNow(principal: OAuthPrincipal, r?: Read): boolean {
       if (closed || principal.accessExpiry <= now()) return false;

@@ -99,6 +99,8 @@ const ALIAS_COLS = `id, address, scope_kind, scope_ref, name, created_at`;
 // A synchronous callback's result: a promise is refused at compile time, so
 // nothing can await between a transaction's reads and its writes.
 export type Sync<T> = T extends PromiseLike<unknown> ? never : T;
+// Repo.authPeek's answer: the auth cache's live-token hits under one generation (#807 P3 A7d).
+export type AuthPeek = { generation: string; access(tokenHash: string, resource: string, now: number): OAuthAccess | undefined };
 
 // A top-level write transaction, through db's write queue. `committed` runs after the commit and before the queue's
 // next body (D4: in-memory state a transaction reads changes only inside one or right after its commit, never in
@@ -226,13 +228,18 @@ export interface Repo {
   // caller's own transaction, nested, or with no generation to read, it's plain fn().
   authRead<T>(fn: () => T | Promise<T>): Promise<T>;
   // authRead for a synchronous body, and the two auth hot-path reads in synchronous form, for the hosted MCP callers
-  // that stay synchronous until #807 P3 A7d (its authorization check, the stream timer, the attachment guard, and the
-  // resources, hosted-session and delivery authorization callbacks). They share the async forms' caches. SQLite only: a store with async statements has no such forms.
+  // that stay synchronous until #807 P3 A7d2 (the attachment guard, and the resources, hosted-session and delivery
+  // authorization callbacks). They share the async forms' caches. SQLite only: a store with async statements has no such forms.
   authNow: {
     read<T>(fn: () => Sync<T>): T;
     findActiveAccess(r: Read, tokenHash: string, resource: string, requiredScopes: string[], now: number): OAuthAccess | undefined;
     isGrantActive(r: Read, grantId: string, now: number): boolean;
   };
+  // The auth cache's hits, synchronously, for the stream timer's phase A (#807 P3 A7d): a live access token by hash
+  // as the cache holds it under the current generation, else undefined (a miss: the caller reads in full, async).
+  // Only live tokens are cached, so a miss is never a refusal. Undefined itself when there's no generation to key on
+  // (inside the caller's own transaction, or a failed generation read).
+  authPeek(): AuthPeek | undefined;
   // The auth cache's generation: authRead's pinned one inside its body (and in work the body starts: the pin follows
   // the async task, #807 P3 A7b), else read now; undefined inside the caller's
   // own transaction. Another task's open transaction doesn't move it: it reflects commits only (#996). Equal values
@@ -987,7 +994,8 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
   const userById = (userId: number) => db.query<User, [number]>("SELECT * FROM users WHERE id = ?").get(userId) ?? undefined;
   // Caches of what the auth tables say, keyed on authGeneration: a live access token only (an unknown or dead one is
   // re-read every time); a user row, or its absence, as read (#853). They sit here, under the store's own methods, so
-  // a test that replaces one of those methods replaces the cache too.
+  // a test that replaces one of those methods replaces the cache behind it, except authPeek's: it reads the access
+  // cache directly, so a stubbed findActiveAccess changes only what a miss later fills.
   // A lookup hits only when its generation is the cache's. A miss reads, then fills only if the generation is still
   // its own once the read is done (#807 P3 A7b): a lookup pinned before a commit neither fills nor clears the cache a
   // newer one keyed, so bodies with different pins don't thrash it, and generations need no order.
@@ -1072,6 +1080,13 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       },
       findActiveAccess: findActiveAccessNow,
       isGrantActive: oauthNow.isGrantActive,
+    },
+    authPeek() {
+      let g: string | undefined;
+      try { g = authGeneration(); } catch (error) { console.error("[grayboard] auth generation read failed:", error); return undefined; }
+      if (g === undefined) return undefined;
+      const generation = g;
+      return { generation, access: (h, resource, now) => heldAccess(generation, `${resource}\n${h}`, now) };
     },
     authGeneration,
 

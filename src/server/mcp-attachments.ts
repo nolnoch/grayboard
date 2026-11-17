@@ -62,7 +62,7 @@ export function createMcpAttachments(repo: Repo, oauth: Pick<ReturnType<typeof c
         selected.searchParams.delete("identity");
         selected.searchParams.set("as", session.identityFull);
         // Every read on `r`, the handle of the context it runs in: the pool here, a body's own Tx inside one (#1053).
-        // Synchronous: it runs inside transaction bodies, which are synchronous until #807 P3 A7d.
+        // Synchronous: it runs inside transaction bodies, which are synchronous until #807 P3 A7d2.
         const guard = (r: Read) => {
           if (closed || signal.aborted) throw new Refusal(error(closed ? "unavailable" : "cancelled", closed ? "server closing" : "request cancelled", closed ? 503 : 499));
           const current = oauth.authenticateNow(req, ["grayboard:tools"], r);

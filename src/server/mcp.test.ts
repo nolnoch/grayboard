@@ -4,7 +4,7 @@ import { DEFAULT_TRUSTED_PROXIES } from "./client_addr.ts";
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
 import { McpServer, WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/server";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ApplicationError, createApplication } from "./application.ts";
@@ -655,7 +655,7 @@ for (const version of ["2025-11-25", "2025-06-18"]) test(`${version}: concurrent
 
 for (const failure of ["storage", "revoke"] as const) test(`legacy timer contains storage and close failures while healthy users retain capacity: ${failure}`, async () => {
   await hosted.close();
-  const callbacks: (() => void)[] = [], interval = globalThis.setInterval;
+  const callbacks: (() => unknown)[] = [], interval = globalThis.setInterval;
   const timers = spyOn(globalThis, "setInterval").mockImplementation(((fn: () => void, ms: number, ...args: unknown[]) => {
     if (ms === 1000) callbacks.push(fn);
     return interval(fn, ms, ...args);
@@ -672,13 +672,12 @@ for (const failure of ["storage", "revoke"] as const) test(`legacy timer contain
   const serverFault = spyOn(McpServer.prototype, "close").mockImplementation(() => { throw hostile; });
   const transportFault = spyOn(WebStandardStreamableHTTPServerTransport.prototype, "close").mockImplementation(async () => { throw hostile; });
   try {
-    expect(callbacks.at(-1)!).not.toThrow();
+    await callbacks.at(-1)!();
     expect(hosted.activeLegacySessions).toBe(1);
-    await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
     expect(reads).toBe(0);
     expect(log.mock.calls).toEqual([[`[grayboard] {"operation":"mcp.legacy","category":"failure","level":"error"}`]]);
     serverFault.mockRestore(); transportFault.mockRestore();
-    expect(callbacks.at(-1)!).not.toThrow();
+    await callbacks.at(-1)!();
     await healthy.listResources();
     restoreAccess();
     if (failure === "revoke") token = (await issuedOAuth(store.repo, oauth.resource)).token;
@@ -788,19 +787,21 @@ test("global POST admission remains bounded across distinct authenticated users"
 
 // Rebuilds OAuth and hosted MCP on a fake clock and captures the 1 s timers for explicit ticks: `tick` runs every one,
 // `tickStream` only the stream timer, which createHostedMcp starts last.
-async function clocked(limits?: McpLimits, streamRecheckMs?: number) {
+// `manual`: the 1 s timers run only when the test calls tick or tickStream, never on real time.
+async function clocked(limits?: McpLimits, streamRecheckMs?: number, manual = false) {
   await hosted.close(); oauth.close();
   const time = { now: Date.now() };
   oauth = createOAuthServer(store.repo, { dbPath: scratchDbPath(), blobDir, httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl: "https://grayboard.example.com", messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES }, { now: () => time.now });
-  const intervals: (() => void)[] = [];
+  const intervals: (() => unknown)[] = [];
   const interval = globalThis.setInterval;
   const spy = spyOn(globalThis, "setInterval").mockImplementation(((fn: () => void, ms: number, ...args: unknown[]) => {
     if (ms === 1000) intervals.push(fn);
-    return interval(fn, ms, ...args);
+    return manual && ms === 1000 ? interval(() => {}, 3_600_000) : interval(fn, ms, ...args);
   }) as typeof setInterval);
   try { hosted = createHostedMcp(application, oauth, { trustedOrigin: oauth.issuer, now: () => time.now, ...(limits ? { limits } : {}), ...(streamRecheckMs ? { streamRecheckMs } : {}) }); }
   finally { spy.mockRestore(); }
-  return { time, tick: () => { for (const tick of intervals) tick(); }, tickStream: () => intervals.at(-1)!() };
+  // Each resolves once the tick's async work (the stream timer's phase B, #807 P3 A7d) is done.
+  return { time, tick: async () => { for (const tick of intervals) await tick(); }, tickStream: async () => { await intervals.at(-1)!(); } };
 }
 
 for (const ending of ["revoke", "expiry"] as const) test(`${ending} releases modern and legacy admission before replacements`, async () => {
@@ -811,7 +812,7 @@ for (const ending of ["revoke", "expiry"] as const) test(`${ending} releases mod
   await modern.listen({ resourceSubscriptions: ["grayboard://boards/expiry"] });
   if (ending === "revoke") await seed(store.repo, tx => store.repo.oauth.revokeToken(tx, hashToken(token), OPENCODE_CLIENT, time.now));
   else time.now += OAUTH_TTL.access + 1;
-  tick();
+  await tick();
   await untilHosted(() => hosted.activeListens === 0 && hosted.activeLegacySessions === 0 && hosted.activePosts === 0);
   // Expiry with the grant active sleeps the legacy session without its admission; a revoked token retires it (#476).
   expect(hosted.dormantLegacySessions).toBe(ending === "expiry" ? 1 : 0);
@@ -867,7 +868,7 @@ test("a legacy session idle past access expiry sleeps without admission and resu
   const hostedId = sessionContext((await oauth.authenticate(new Request("http://localhost/mcp", { headers: { Authorization: `Bearer ${f.grant.token}` } }))) as OAuthPrincipal, meta);
   f.time.now += OAUTH_TTL.access + 1;
   await f.refresh();
-  f.tick();
+  await f.tick();
   expect(hosted.activeLegacySessions).toBe(0);
   expect(hosted.dormantLegacySessions).toBe(1);
   expect(hosted.activeGetStreams).toBe(0);
@@ -886,8 +887,10 @@ test("a legacy session idle past access expiry sleeps without admission and resu
     { action: "hosted.legacy_rehydrated", target, dormant_ms: expect.any(Number), ref: rows[0]!.ref, grant: f.grant.grantId, client_id: OPENCODE_CLIENT },
   ]);
   expect(JSON.stringify(rows)).not.toContain(f.sid);
-  const closed = store.db.query<{ detail: string }, []>("SELECT detail FROM access_log WHERE action = 'hosted.stream_closed'").all();
-  expect(closed.map(row => JSON.parse(row.detail).reason)).toEqual(["access_expired"]);
+  // The close row is a posted write, which may wait behind a body phase B started (#807 P3 A7d).
+  const closedReasons = () => store.db.query<{ detail: string }, []>("SELECT detail FROM access_log WHERE action = 'hosted.stream_closed'").all().map(row => JSON.parse(row.detail).reason);
+  await untilHosted(() => closedReasons().length >= 1);
+  expect(closedReasons()).toEqual(["access_expired"]);
   // The expected close is audited above, not logged as a stream failure (#494 item 10).
   expect(logged.mock.calls.filter(args => String(args[0]).includes("mcp.stream"))).toEqual([]);
   logged.mockRestore();
@@ -896,7 +899,7 @@ test("a legacy session idle past access expiry sleeps without admission and resu
 test("a dormant sid answers 404 to another binding and only its own user's new grant drops it", async () => {
   const f = await dormantFixture();
   f.time.now += OAUTH_TTL.access + 1;
-  f.tick();
+  await f.tick();
   expect(hosted.dormantLegacySessions).toBe(1);
   const stranger = (await issueOAuth(store.repo, oauth.resource, "bob@example.com", ["grayboard:tools"], f.time.now, OPENCODE_CLIENT)).token;
   expect((await rawLegacy("GET", f.sid, stranger)).status).toBe(404);
@@ -914,15 +917,15 @@ test("a dormant sid answers 404 to another binding and only its own user's new g
 for (const ending of ["idle", "grant_ended", "deleted", "shutdown"] as const) test(`a dormant legacy session is dropped: ${ending}`, async () => {
   const f = await dormantFixture();
   f.time.now += OAUTH_TTL.access + 1;
-  f.tick();
+  await f.tick();
   expect(hosted.dormantLegacySessions).toBe(1);
   if (ending === "idle") {
-    f.time.now += 59_999; f.tick();
+    f.time.now += 59_999; await f.tick();
     expect(hosted.dormantLegacySessions).toBe(1);
-    f.time.now += 1; f.tick();
+    f.time.now += 1; await f.tick();
   } else if (ending === "grant_ended") {
     await seed(store.repo, tx => store.repo.oauth.revokeToken(tx, hashToken(f.grant.refreshToken), OPENCODE_CLIENT, f.time.now));
-    f.tick();
+    await f.tick();
   } else if (ending === "shutdown") {
     await hosted.close();
   } else {
@@ -938,7 +941,7 @@ for (const ending of ["idle", "grant_ended", "deleted", "shutdown"] as const) te
 test("a full legacy limit refuses rehydration with the session's ref, keeps it dormant, and still lets DELETE drop it (#494 items 1, 3, 7)", async () => {
   const f = await dormantFixture({ ...DEFAULT_MCP_LIMITS, legacy: { global: 1, perUser: 1 } });
   f.time.now += OAUTH_TTL.access + 1;
-  f.tick();
+  await f.tick();
   expect(hosted.dormantLegacySessions).toBe(1);
   // Another legacy session takes the only admission.
   token = (await issueOAuth(store.repo, oauth.resource, "alice@example.com", ["grayboard:tools"], f.time.now, OPENCODE_CLIENT)).token;
@@ -959,7 +962,7 @@ test("a full legacy limit refuses rehydration with the session's ref, keeps it d
 test("the dormant registry is bounded by the legacy limits", async () => {
   const f = await dormantFixture({ ...DEFAULT_MCP_LIMITS, legacy: { global: 1, perUser: 1 } });
   f.time.now += OAUTH_TTL.access + 1;
-  f.tick();
+  await f.tick();
   expect(hosted.dormantLegacySessions).toBe(1);
   // A second session whose token expires inside the first one's idle window finds the dormant bound full.
   token = (await issueOAuth(store.repo, oauth.resource, "alice@example.com", ["grayboard:tools"], f.time.now - OAUTH_TTL.access + 30_000, OPENCODE_CLIENT)).token;
@@ -967,15 +970,17 @@ test("the dormant registry is bounded by the legacy limits", async () => {
   await untilHosted(() => hosted.activeGetStreams === 1);
   expect(hosted.activeLegacySessions).toBe(1);
   f.time.now += 30_000;
-  f.tick();
+  await f.tick();
   expect(hosted.activeLegacySessions).toBe(0);
   expect(hosted.dormantLegacySessions).toBe(1);
   expect(legacyRows().map(row => [row.action, row.reason])).toEqual([["hosted.legacy_dormant", undefined], ["hosted.legacy_dropped", "capacity"]]);
   const refused = store.db.query<{ detail: string }, []>("SELECT detail FROM access_log WHERE action = 'hosted.capacity_refused'").all();
   expect(refused.map(row => JSON.parse(row.detail).kind)).toEqual(["dormant"]);
   // The dropped session's GET still gets its close row.
-  const closed = store.db.query<{ detail: string }, []>("SELECT detail FROM access_log WHERE action = 'hosted.stream_closed'").all();
-  expect(closed.map(row => JSON.parse(row.detail).reason)).toEqual(["access_expired", "access_expired"]);
+  // The close row is a posted write, which may wait behind a body phase B started (#807 P3 A7d).
+  const closedReasons = () => store.db.query<{ detail: string }, []>("SELECT detail FROM access_log WHERE action = 'hosted.stream_closed'").all().map(row => JSON.parse(row.detail).reason);
+  await untilHosted(() => closedReasons().length >= 2);
+  expect(closedReasons()).toEqual(["access_expired", "access_expired"]);
 });
 
 test("modern listen capacity is reserved and reusable after cancellation", async () => {
@@ -1185,19 +1190,31 @@ test("authentication storage errors return a redacted HTTP 500 before identity s
   expect(hosted.activeContexts).toBe(hosted.activeGetStreams);
 });
 
-// #431: a raw 2025-11-25 standalone GET, as omp's native client opens it (1 s header timeout, no reopen).
-async function rawLegacyGet(access: string, initMeta?: Record<string, unknown>, extra: Record<string, string> = {}) {
+// A raw initialized 2025-11-25 session: `post` (under another access token when given) and `get` (unawaited by it).
+async function rawLegacySession(access: string, initMeta?: Record<string, unknown>, extra: Record<string, string> = {}) {
   const base = { Authorization: `Bearer ${access}`, "Content-Type": "application/json", Accept: "application/json, text/event-stream", ...extra };
   let next = 1;
-  const post = async (headers: Record<string, string>, method: string, params?: Record<string, unknown>) => {
+  const send = async (headers: Record<string, string>, method: string, params?: Record<string, unknown>) => {
     const response = await hosted.fetch(new Request("http://localhost/mcp", { method: "POST", headers, body: JSON.stringify({ jsonrpc: "2.0", ...(method.startsWith("notifications/") ? {} : { id: next++ }), method, ...(params ? { params } : {}) }) }));
     return { response, text: await response.text() };
   };
-  const init = await post(base, "initialize", { protocolVersion: "2025-11-25", capabilities: {}, clientInfo: { name: "raw", version: "0" }, ...(initMeta ? { _meta: initMeta } : {}) });
+  const init = await send(base, "initialize", { protocolVersion: "2025-11-25", capabilities: {}, clientInfo: { name: "raw", version: "0" }, ...(initMeta ? { _meta: initMeta } : {}) });
   const headers = { ...base, "Mcp-Session-Id": init.response.headers.get("Mcp-Session-Id")!, "Mcp-Protocol-Version": "2025-11-25" };
-  await post(headers, "notifications/initialized");
+  await send(headers, "notifications/initialized");
+  return {
+    headers,
+    post: (method: string, params?: Record<string, unknown>, as?: string) => send(as ? { ...headers, Authorization: `Bearer ${as}` } : headers, method, params),
+    get: (signal: AbortSignal) => hosted.fetch(new Request("http://localhost/mcp", { method: "GET", headers, signal })),
+    delete: () => hosted.fetch(new Request("http://localhost/mcp", { method: "DELETE", headers })),
+  };
+}
+
+// #431: a raw 2025-11-25 standalone GET, as omp's native client opens it (1 s header timeout, no reopen).
+async function rawLegacyGet(access: string, initMeta?: Record<string, unknown>, extra: Record<string, string> = {}) {
+  const session = await rawLegacySession(access, initMeta, extra);
+  const { headers } = session, post = (_headers: Record<string, string>, method: string, params?: Record<string, unknown>) => session.post(method, params);
   const abort = new AbortController();
-  const get = await hosted.fetch(new Request("http://localhost/mcp", { method: "GET", headers, signal: abort.signal }));
+  const get = await session.get(abort.signal);
   const reader = get.body!.getReader();
   let ended = false, received = "";
   // Resolves once the stream's text so far satisfies `done`, or with what arrived by the deadline.
@@ -1368,10 +1385,10 @@ test("#902: a native tool call authorizes under one auth-generation read and lea
   const { Database } = await import("bun:sqlite");
   const client = await connect();
   await client.callTool({ name: "board_list", arguments: {} });
-  // The exchange's authorization check reads through the synchronous form until #807 P3 A7d.
-  const authRead = store.repo.authNow.read, validate = application.revalidateSession;
+  // The exchange's authorization check reads through the async form since #807 P3 A7d.
+  const authRead = store.repo.authRead, validate = application.revalidateSession;
   let depth = 0, pinned = 0, unpinned = 0;
-  store.repo.authNow.read = fn => { depth++; try { return authRead(fn); } finally { depth--; } };
+  store.repo.authRead = async fn => { depth++; try { return await authRead(fn); } finally { depth--; } };
   application.revalidateSession = (session, allowUnbound) => { if (depth) pinned++; else unpinned++; validate(session, allowUnbound); };
   const query = spyOn(Database.prototype, "query");
   try {
@@ -1385,20 +1402,20 @@ test("#902: a native tool call authorizes under one auth-generation read and lea
     // and the call ends inside the touch window, so its end touch reads nothing.
     expect(rowReads).toBe(4);
     expect({ pinned, unpinned }).toEqual({ pinned: 1, unpinned: 0 });
-  } finally { query.mockRestore(); store.repo.authNow.read = authRead; application.revalidateSession = validate; }
+  } finally { query.mockRestore(); store.repo.authRead = authRead; application.revalidateSession = validate; }
 });
 
 // #899: the stream timer re-reads a live's hosted rows only when they could have changed. A listen checked once
 // (stamped), then each way it can end, within a tick of the write or deadline that ends it.
-async function stampedListen(recheckMs = 3_600_000) {
-  const { time, tick, tickStream } = await clocked(undefined, recheckMs);
+async function stampedListen(recheckMs = 3_600_000, manual = false) {
+  const { time, tick, tickStream } = await clocked(undefined, recheckMs, manual);
   const grant = await issueOAuth(store.repo, oauth.resource, "alice@example.com", ["grayboard:tools"], time.now, OPENCODE_CLIENT);
   token = grant.token;
   const client = await connect();
   expect((await client.callTool({ name: "board_create", arguments: { name: "stamped", purpose: "#899" } })).isError).not.toBe(true);
   const listen = await client.listen({ resourceSubscriptions: ["grayboard://boards/stamped"] });
   expect(hosted.activeListens).toBe(1);
-  tick(); tick(); // the first stamps it; the second is a quiet one
+  await tick(); await tick(); // the first stamps it; the second is a quiet one
   expect(hosted.activeListens).toBe(1);
   return { time, tick, tickStream, grant, listen };
 }
@@ -1416,18 +1433,47 @@ const ends: [string, (f: Awaited<ReturnType<typeof stampedListen>>) => unknown][
 for (const [what, end] of ends) test(`#899: a stamped listen ends within a stream tick of ${what}`, async () => {
   const f = await stampedListen(OAUTH_TTL.access * 10);
   await end(f);
-  f.tickStream();
+  await f.tickStream();
   expect(hosted.activeListens).toBe(0);
   await f.listen.close();
 });
 
-test("#899: a failed generation read leaves every stream to phase B's full check, which closes a revoked one", async () => {
-  const f = await stampedListen();
+test("#899: a failed generation read in phase A leaves every stream to phase B's full check, which closes a revoked one", async () => {
+  const f = await stampedListen(3_600_000, true);
+  const authPeek = store.repo.authPeek, authRead = store.repo.authRead;
+  let full = 0;
+  const peekFailing = async () => {
+    store.repo.authPeek = () => { throw new Error("generation read failed"); };
+    store.repo.authRead = fn => (full++, authRead(fn));
+    try { await f.tickStream(); } finally { store.repo.authPeek = authPeek; store.repo.authRead = authRead; }
+  };
+  // A healthy stream survives: its stamp is fresh, but with no peek its full check runs, and passes.
+  await peekFailing();
+  expect(full).toBeGreaterThan(0);
+  expect(hosted.activeListens).toBe(1);
   await seed(store.repo, tx => store.repo.oauth.revokeToken(tx, hashToken(token), OPENCODE_CLIENT, f.time.now));
-  const authGeneration = store.repo.authGeneration;
-  store.repo.authGeneration = () => { throw new Error("generation read failed"); };
-  try { f.tickStream(); } finally { store.repo.authGeneration = authGeneration; }
+  await peekFailing();
   expect(hosted.activeListens).toBe(0);
+  await store.repo.write(() => {});
+  expect(streamClosedReasons()).toEqual(["unauthenticated"]);
+  await f.listen.close();
+});
+
+// #807 P3 A7d: phase B's generation read is authRead's own; a failure there fails the check closed, as a failed token
+// read would, and the close row says `failed`.
+test("#807 P3 A7d: a failed generation read in phase B's check closes the stream as failed", async () => {
+  const f = await stampedListen(3_600_000, true);
+  const authPeek = store.repo.authPeek, authRead = store.repo.authRead;
+  const logged = spyOn(console, "error").mockImplementation(() => {});
+  store.repo.authPeek = () => undefined;
+  store.repo.authRead = async () => { throw new Error("generation read failed"); };
+  let failures: unknown[][];
+  try { await f.tickStream(); failures = logged.mock.calls.filter(args => args.some(a => String(a).includes("mcp.stream"))); }
+  finally { store.repo.authPeek = authPeek; store.repo.authRead = authRead; logged.mockRestore(); }
+  expect(failures.length).toBe(1);
+  expect(hosted.activeListens).toBe(0);
+  await store.repo.write(() => {});
+  expect(streamClosedReasons()).toEqual(["failed"]);
   await f.listen.close();
 });
 
@@ -1436,13 +1482,13 @@ test("#899: a stamped listen ends within a tick of its root's lease lapsing, a d
   const root = aliceRoot().session_id;
   // The update's notice makes the next tick a full check, which stamps the new deadline.
   await seed(store.repo, tx => { const r = aliceRoot(); return store.repo.hosted.update(tx, { ...r, lease_deadline: f.time.now + 5_000 }); });
-  f.tick(); f.tick();
+  await f.tick(); await f.tick();
   expect(hosted.activeListens).toBe(1);
-  f.time.now += 4_999; f.tick();
+  f.time.now += 4_999; await f.tick();
   expect(hosted.activeListens).toBe(1);
   // Before the hosted sweep's own timer could end the root, the stream tick ends the listen at once and posts the
   // settle, which ends the root when its async body commits (#807 P3 A6e2).
-  f.time.now += 1; f.tick();
+  f.time.now += 1; await f.tick();
   expect(hosted.activeListens).toBe(0);
   await store.repo.write(() => {});
   expect(store.repo.hosted.get(store.repo.read, root)).toBeUndefined();
@@ -1475,9 +1521,9 @@ test("#899: a write no notice or generation sees reaches a stamped listen at the
   const f = await stampedListen(10_000);
   // Raw SQL on the repo's own connection: no hosted notice, no generation move.
   await seed(store.repo, () => store.db.run("UPDATE hosted_sessions SET bind_gen = bind_gen + 1 WHERE session_id = ?", [aliceRoot().session_id]));
-  f.time.now += 9_999; f.tick();
+  f.time.now += 9_999; await f.tick();
   expect(hosted.activeListens).toBe(1);
-  f.time.now += 1; f.tick();
+  f.time.now += 1; await f.tick();
   await untilHosted(() => hosted.activeListens === 0);
   await f.listen.close();
 });
@@ -1499,9 +1545,172 @@ test("#899: another connection's commit reaches a stamped listen within a tick",
   const f = await stampedListen();
   const other = new Database(path);
   try { other.run("UPDATE hosted_sessions SET bind_gen = bind_gen + 1 WHERE session_id = ?", [aliceRoot().session_id]); } finally { other.close(); }
-  f.tick();
+  await f.tick();
   await untilHosted(() => hosted.activeListens === 0);
   await f.listen.close();
+});
+
+// #807 P3 A7d: `start`'s work holds at `point` until it has been hit `hits` times (or fails after 5 s), then `during`
+// runs, then the pause releases. Resolves with `start`'s value once it settles.
+async function held<T>(point: string, start: () => Promise<T>, during: () => Promise<void>, hits = 1) {
+  const dir = mkdtempSync(join(tmpdir(), "gb-mcp-pause-")), file = join(dir, "release");
+  let seen = 0;
+  const reached = Promise.withResolvers<void>();
+  const log = spyOn(console, "error").mockImplementation((message: unknown) => {
+    if (message === `[grayboard] test pause hit: ${point}` && ++seen === hits) reached.resolve();
+  });
+  process.env.BUS_TEST_PAUSE = point; process.env.BUS_TEST_PAUSE_FILE = file;
+  const deadline = setTimeout(() => reached.reject(new Error(`pause point ${point} hit ${seen} of ${hits} times in 5 s`)), 5_000);
+  try {
+    const result = start();
+    result.catch(() => {});
+    await reached.promise;
+    clearTimeout(deadline);
+    await during();
+    writeFileSync(file, "release");
+    const value = await result;
+    expect(seen).toBe(hits);
+    return { value, failures: () => log.mock.calls.filter(args => String(args[0]).includes("mcp.stream")) };
+  } finally {
+    clearTimeout(deadline);
+    writeFileSync(file, "release");
+    delete process.env.BUS_TEST_PAUSE; delete process.env.BUS_TEST_PAUSE_FILE;
+    log.mockRestore(); rmSync(dir, { recursive: true, force: true });
+  }
+}
+// Phase B's full check held at `mcp:stream:check` (after its generation read, before authorize) while a second tick
+// overlaps it (skipping it), then `during`.
+const heldCheck = (tickStream: () => Promise<void>, during: () => Promise<void>) =>
+  held("mcp:stream:check", tickStream, async () => { await tickStream(); await during(); });
+const streamClosedReasons = () => store.db.query<{ detail: string }, []>("SELECT detail FROM access_log WHERE action = 'hosted.stream_closed'").all().map(row => JSON.parse(row.detail).reason);
+const revokeAccess = (access: string, at: number) => seed(store.repo, tx => store.repo.oauth.revokeToken(tx, hashToken(access), OPENCODE_CLIENT, at));
+
+test("#807 P3 A7d: a revoke during a held phase-B check stales its stamp: the next tick closes the listen once", async () => {
+  const f = await stampedListen(10_000, true);
+  f.time.now += 10_000; // past the recheck backstop: the next tick checks in full
+  const { failures } = await heldCheck(f.tickStream, () => revokeAccess(token, f.time.now));
+  // The check read under the generation before the revoke: its answer stands, linearized before the revoke, and its
+  // stamp keeps that generation, so the next tick checks in full and closes the listen.
+  expect(hosted.activeListens).toBe(1);
+  await f.tickStream();
+  expect(hosted.activeListens).toBe(0);
+  await store.repo.write(() => {});
+  expect(streamClosedReasons()).toEqual(["unauthenticated"]);
+  expect(failures()).toEqual([]);
+  await f.listen.close();
+});
+
+test("#807 P3 A7d: a held phase-B check whose live stopped meanwhile acts on nothing", async () => {
+  const f = await stampedListen(10_000, true);
+  f.time.now += 10_000;
+  const { failures } = await heldCheck(f.tickStream, async () => {
+    // A binding change stops the live, unaudited; the revoke then refuses the released check.
+    await seed(store.repo, tx => { const r = aliceRoot(); return store.repo.hosted.update(tx, { ...r, bind_gen: r.bind_gen + 1 }); });
+    expect(hosted.activeListens).toBe(0);
+    await revokeAccess(token, f.time.now);
+  });
+  await store.repo.write(() => {});
+  expect(streamClosedReasons()).toEqual([]);
+  expect(failures()).toEqual([]);
+  await f.listen.close();
+});
+
+test("#807 P3 A7d: a held phase-B check of an idle legacy GET that an attach re-selects leaves the GET open", async () => {
+  const { time, tickStream } = await clocked(undefined, 10_000, true);
+  const grant = await issueOAuth(store.repo, oauth.resource, "alice@example.com", ["grayboard:tools"], time.now, OPENCODE_CLIENT);
+  const auth = new Headers({ Authorization: `Bearer ${grant.token}` });
+  token = grant.token;
+  const legacy = await connect("2025-11-25", undefined, auth);
+  expect((await legacy.callTool({ name: "board_create", arguments: { name: "attach", purpose: "A7d" } })).isError).not.toBe(true);
+  await untilHosted(() => hosted.activeGetStreams === 1);
+  await tickStream();
+  // The GET's own token is revoked once its client sends a refreshed one. The revoke moves the generation, so the
+  // next tick checks the GET in full, under the old token.
+  const { access } = await rotateOAuth(store.repo, grant, grant.refreshToken, time.now);
+  auth.set("Authorization", `Bearer ${access}`);
+  // A POST under the refreshed token re-authorizes the legacy session; the idle GET keeps its old context.
+  expect((await legacy.callTool({ name: "board_list", arguments: {} })).isError).not.toBe(true);
+  await revokeAccess(grant.token, time.now);
+  const { failures } = await heldCheck(tickStream, async () => {
+    // The subscribing POST re-selects the idle GET's context under the refreshed token.
+    expect(await legacy.subscribeResource({ uri: "grayboard://boards/attach" })).toEqual({});
+  });
+  // The released check, refused under the old token, is about a context the GET no longer has.
+  expect(hosted.activeGetStreams).toBe(1);
+  await store.repo.write(() => {});
+  expect(streamClosedReasons()).toEqual([]);
+  expect(failures()).toEqual([]);
+  await tickStream();
+  expect(hosted.activeGetStreams).toBe(1);
+  await legacy.close();
+});
+
+// #807 P3 A7d: a legacy GET's check awaits before it takes the stream; the session and the stream are read again after.
+test("#807 P3 A7d: a legacy GET whose session the sweep retires while its check awaits answers 404 and opens no stream", async () => {
+  const { time, tickStream } = await clocked(undefined, undefined, true);
+  const access = (await issueOAuth(store.repo, oauth.resource, "alice@example.com", ["grayboard:tools"], time.now, OPENCODE_CLIENT)).token;
+  const raw = await rawLegacySession(access);
+  const abort = new AbortController();
+  const { value: get } = await held("mcp:legacy:get-checked", () => raw.get(abort.signal), async () => {
+    await revokeAccess(access, time.now);
+    await tickStream();
+    expect(hosted.activeLegacySessions).toBe(0);
+  });
+  expect(get.status).toBe(404);
+  expect(hosted.activeGetStreams).toBe(0);
+  abort.abort(); await get.body?.cancel().catch(() => {});
+});
+
+test("#807 P3 A7d: of two legacy GETs whose checks await together, one takes the stream and the other answers 409", async () => {
+  const { time } = await clocked(undefined, undefined, true);
+  const access = (await issueOAuth(store.repo, oauth.resource, "alice@example.com", ["grayboard:tools"], time.now, OPENCODE_CLIENT)).token;
+  const raw = await rawLegacySession(access, meta);
+  const aborts = [new AbortController(), new AbortController()];
+  const { value: gets } = await held("mcp:legacy:get-checked", () => Promise.all(aborts.map(a => raw.get(a.signal))), async () => {}, 2);
+  expect(gets.map(g => g.status).sort()).toEqual([200, 409]);
+  expect(hosted.activeGetStreams).toBe(1);
+  // The SDK's transport would refuse the second stream too, but a GET that took the session's stream past the
+  // recheck would clear it when its refused stream stopped: a later subscription would then join no stream.
+  expect((await raw.post("tools/call", { name: "board_create", arguments: { name: "raced", purpose: "A7d" }, _meta: meta })).text).not.toContain("isError\":true");
+  expect((await raw.post("resources/subscribe", { uri: "grayboard://boards/raced", _meta: meta })).text).not.toContain("\"error\"");
+  expect(hosted.activeWatches).toBe(1);
+  for (const a of aborts) a.abort();
+  for (const g of gets) await g.body?.cancel().catch(() => {});
+  await raw.delete();
+});
+
+// #807 P3 A7d: a revoke reaches a legacy GET through two phase-B tasks, its own check and its session's sweep; the
+// sweep writes the close row when it retires the session, so the GET gets one whichever settles first.
+test("#807 P3 A7d: a revoked legacy GET whose session the sweep retires before its own check settles gets one close row", async () => {
+  const { time, tickStream } = await clocked(undefined, undefined, true);
+  token = (await issueOAuth(store.repo, oauth.resource, "alice@example.com", ["grayboard:tools"], time.now, OPENCODE_CLIENT)).token;
+  const legacy = await connect("2025-11-25");
+  expect((await legacy.callTool({ name: "board_create", arguments: { name: "swept", purpose: "A7d" } })).isError).not.toBe(true);
+  await untilHosted(() => hosted.activeGetStreams === 1);
+  await revokeAccess(token, time.now);
+  await held("mcp:stream:check", tickStream, () => untilHosted(() => hosted.activeLegacySessions === 0));
+  expect(hosted.activeGetStreams).toBe(0);
+  await store.repo.write(() => {});
+  expect(streamClosedReasons()).toEqual(["unauthenticated"]);
+  await legacy.close();
+});
+
+// #807 P3 A7d: the legacy sweep acts on the session as it stands after its reads: a POST that re-authorized it
+// meanwhile (a new principal) leaves it to the next tick, which checks the new principal.
+test("#807 P3 A7d: a legacy session a POST re-authorizes while the sweep's reads await is not retired", async () => {
+  const { time, tickStream } = await clocked(undefined, undefined, true);
+  const grant = await issueOAuth(store.repo, oauth.resource, "alice@example.com", ["grayboard:tools"], time.now, OPENCODE_CLIENT);
+  const raw = await rawLegacySession(grant.token);
+  const { access } = await rotateOAuth(store.repo, grant, grant.refreshToken, time.now);
+  await revokeAccess(grant.token, time.now);
+  await held("mcp:legacy:sweep", tickStream, async () => {
+    // The sweep read the old token as revoked; a POST under the refreshed one re-authorizes the session meanwhile.
+    expect((await raw.post("tools/list", {}, access)).response.status).toBe(200);
+  });
+  expect(hosted.activeLegacySessions).toBe(1);
+  await tickStream();
+  expect(hosted.activeLegacySessions).toBe(1);
+  await raw.delete();
 });
 
 test("#899: a quiet tick reads no hosted row or alias hold for a stamped listen or legacy GET", async () => {
@@ -1510,10 +1719,10 @@ test("#899: a quiet tick reads no hosted row or alias hold for a stamped listen 
   const legacy = await connect("2025-11-25");
   expect(await legacy.subscribeResource({ uri: "grayboard://boards/stamped" })).toEqual({});
   await untilHosted(() => hosted.activeGetStreams === 1);
-  f.tick();
+  await f.tick();
   const query = spyOn(Database.prototype, "query"), prepare = spyOn(Database.prototype, "prepare");
   try {
-    for (let i = 0; i < 5; i++) { f.time.now += 1000; f.tick(); }
+    for (let i = 0; i < 5; i++) { f.time.now += 1000; await f.tick(); }
     const reads = [...query.mock.calls, ...prepare.mock.calls].map(([sql]) => String(sql)).filter(sql => /hosted_sessions|alias_holds/.test(sql));
     // Before #899: every tick read each live's row and root and, for its binding, the root's holds.
     expect(reads).toEqual([]);
