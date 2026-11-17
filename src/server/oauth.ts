@@ -2,7 +2,7 @@ import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { hashToken, mintToken, type AuthedUser } from "./auth.ts";
 import { callbackPath, defaultProviders, DomainRefused, idpSignIn, type IdentityProvider, type UpstreamIdentity } from "./idp.ts";
 import { checkIdpConfig, type Config } from "./config.ts";
-import type { Repo } from "./db.ts";
+import type { AuthPeek, Repo } from "./db.ts";
 import type { Read, Tx } from "./store/tx.ts";
 import { BUILTIN_CLIENT_IDS, BUILTIN_CLIENTS, CLI_CLIENT, CLI_CLIENT_ID, LOGIN_SCOPE, matchesRedirect, oauthPublicUrl, OAUTH_SCOPES, OPENCODE_CLIENT, parseOAuthClients, sourceKeyFor, type OAuthClient } from "./oauth-config.ts";
 import { OAUTH_TTL, type OAuthRequest, type OAuthAccess } from "./oauth-types.ts";
@@ -684,6 +684,14 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
       if (closed || principal.accessExpiry <= now()) return false;
       const a = (await activeAccess(principal.accessHash, r))?.access;
       return !closed && authorizedBy(principal, a);
+    },
+    // isAuthorized from the auth cache alone (Repo.authPeek, #807 P3 A7d): undefined on a miss, which the caller
+    // checks in full with isAuthorized.
+    peekAuthorized(principal: OAuthPrincipal, peek: AuthPeek): boolean | undefined {
+      if (closed || principal.accessExpiry <= now()) return false;
+      const a = peek.access(principal.accessHash, resource, now());
+      if (!a) return undefined;
+      return repo.users.activeEmail(a.userId) !== undefined && authorizedBy(principal, a);
     },
     isAuthorizedNow(principal: OAuthPrincipal, r?: Read): boolean {
       if (closed || principal.accessExpiry <= now()) return false;

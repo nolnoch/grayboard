@@ -655,7 +655,7 @@ for (const version of ["2025-11-25", "2025-06-18"]) test(`${version}: concurrent
 
 for (const failure of ["storage", "revoke"] as const) test(`legacy timer contains storage and close failures while healthy users retain capacity: ${failure}`, async () => {
   await hosted.close();
-  const callbacks: (() => void)[] = [], interval = globalThis.setInterval;
+  const callbacks: (() => unknown)[] = [], interval = globalThis.setInterval;
   const timers = spyOn(globalThis, "setInterval").mockImplementation(((fn: () => void, ms: number, ...args: unknown[]) => {
     if (ms === 1000) callbacks.push(fn);
     return interval(fn, ms, ...args);
@@ -672,13 +672,12 @@ for (const failure of ["storage", "revoke"] as const) test(`legacy timer contain
   const serverFault = spyOn(McpServer.prototype, "close").mockImplementation(() => { throw hostile; });
   const transportFault = spyOn(WebStandardStreamableHTTPServerTransport.prototype, "close").mockImplementation(async () => { throw hostile; });
   try {
-    expect(callbacks.at(-1)!).not.toThrow();
+    await callbacks.at(-1)!();
     expect(hosted.activeLegacySessions).toBe(1);
-    await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
     expect(reads).toBe(0);
     expect(log.mock.calls).toEqual([[`[grayboard] {"operation":"mcp.legacy","category":"failure","level":"error"}`]]);
     serverFault.mockRestore(); transportFault.mockRestore();
-    expect(callbacks.at(-1)!).not.toThrow();
+    await callbacks.at(-1)!();
     await healthy.listResources();
     restoreAccess();
     if (failure === "revoke") token = (await issuedOAuth(store.repo, oauth.resource)).token;
@@ -792,7 +791,7 @@ async function clocked(limits?: McpLimits, streamRecheckMs?: number) {
   await hosted.close(); oauth.close();
   const time = { now: Date.now() };
   oauth = createOAuthServer(store.repo, { dbPath: scratchDbPath(), blobDir, httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl: "https://grayboard.example.com", messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES }, { now: () => time.now });
-  const intervals: (() => void)[] = [];
+  const intervals: (() => unknown)[] = [];
   const interval = globalThis.setInterval;
   const spy = spyOn(globalThis, "setInterval").mockImplementation(((fn: () => void, ms: number, ...args: unknown[]) => {
     if (ms === 1000) intervals.push(fn);
@@ -800,7 +799,8 @@ async function clocked(limits?: McpLimits, streamRecheckMs?: number) {
   }) as typeof setInterval);
   try { hosted = createHostedMcp(application, oauth, { trustedOrigin: oauth.issuer, now: () => time.now, ...(limits ? { limits } : {}), ...(streamRecheckMs ? { streamRecheckMs } : {}) }); }
   finally { spy.mockRestore(); }
-  return { time, tick: () => { for (const tick of intervals) tick(); }, tickStream: () => intervals.at(-1)!() };
+  // Each resolves once the tick's async work (the stream timer's phase B, #807 P3 A7d) is done.
+  return { time, tick: async () => { for (const tick of intervals) await tick(); }, tickStream: async () => { await intervals.at(-1)!(); } };
 }
 
 for (const ending of ["revoke", "expiry"] as const) test(`${ending} releases modern and legacy admission before replacements`, async () => {
@@ -811,7 +811,7 @@ for (const ending of ["revoke", "expiry"] as const) test(`${ending} releases mod
   await modern.listen({ resourceSubscriptions: ["grayboard://boards/expiry"] });
   if (ending === "revoke") await seed(store.repo, tx => store.repo.oauth.revokeToken(tx, hashToken(token), OPENCODE_CLIENT, time.now));
   else time.now += OAUTH_TTL.access + 1;
-  tick();
+  await tick();
   await untilHosted(() => hosted.activeListens === 0 && hosted.activeLegacySessions === 0 && hosted.activePosts === 0);
   // Expiry with the grant active sleeps the legacy session without its admission; a revoked token retires it (#476).
   expect(hosted.dormantLegacySessions).toBe(ending === "expiry" ? 1 : 0);
@@ -867,7 +867,7 @@ test("a legacy session idle past access expiry sleeps without admission and resu
   const hostedId = sessionContext((await oauth.authenticate(new Request("http://localhost/mcp", { headers: { Authorization: `Bearer ${f.grant.token}` } }))) as OAuthPrincipal, meta);
   f.time.now += OAUTH_TTL.access + 1;
   await f.refresh();
-  f.tick();
+  await f.tick();
   expect(hosted.activeLegacySessions).toBe(0);
   expect(hosted.dormantLegacySessions).toBe(1);
   expect(hosted.activeGetStreams).toBe(0);
@@ -896,7 +896,7 @@ test("a legacy session idle past access expiry sleeps without admission and resu
 test("a dormant sid answers 404 to another binding and only its own user's new grant drops it", async () => {
   const f = await dormantFixture();
   f.time.now += OAUTH_TTL.access + 1;
-  f.tick();
+  await f.tick();
   expect(hosted.dormantLegacySessions).toBe(1);
   const stranger = (await issueOAuth(store.repo, oauth.resource, "bob@example.com", ["grayboard:tools"], f.time.now, OPENCODE_CLIENT)).token;
   expect((await rawLegacy("GET", f.sid, stranger)).status).toBe(404);
@@ -914,15 +914,15 @@ test("a dormant sid answers 404 to another binding and only its own user's new g
 for (const ending of ["idle", "grant_ended", "deleted", "shutdown"] as const) test(`a dormant legacy session is dropped: ${ending}`, async () => {
   const f = await dormantFixture();
   f.time.now += OAUTH_TTL.access + 1;
-  f.tick();
+  await f.tick();
   expect(hosted.dormantLegacySessions).toBe(1);
   if (ending === "idle") {
-    f.time.now += 59_999; f.tick();
+    f.time.now += 59_999; await f.tick();
     expect(hosted.dormantLegacySessions).toBe(1);
-    f.time.now += 1; f.tick();
+    f.time.now += 1; await f.tick();
   } else if (ending === "grant_ended") {
     await seed(store.repo, tx => store.repo.oauth.revokeToken(tx, hashToken(f.grant.refreshToken), OPENCODE_CLIENT, f.time.now));
-    f.tick();
+    await f.tick();
   } else if (ending === "shutdown") {
     await hosted.close();
   } else {
@@ -938,7 +938,7 @@ for (const ending of ["idle", "grant_ended", "deleted", "shutdown"] as const) te
 test("a full legacy limit refuses rehydration with the session's ref, keeps it dormant, and still lets DELETE drop it (#494 items 1, 3, 7)", async () => {
   const f = await dormantFixture({ ...DEFAULT_MCP_LIMITS, legacy: { global: 1, perUser: 1 } });
   f.time.now += OAUTH_TTL.access + 1;
-  f.tick();
+  await f.tick();
   expect(hosted.dormantLegacySessions).toBe(1);
   // Another legacy session takes the only admission.
   token = (await issueOAuth(store.repo, oauth.resource, "alice@example.com", ["grayboard:tools"], f.time.now, OPENCODE_CLIENT)).token;
@@ -959,7 +959,7 @@ test("a full legacy limit refuses rehydration with the session's ref, keeps it d
 test("the dormant registry is bounded by the legacy limits", async () => {
   const f = await dormantFixture({ ...DEFAULT_MCP_LIMITS, legacy: { global: 1, perUser: 1 } });
   f.time.now += OAUTH_TTL.access + 1;
-  f.tick();
+  await f.tick();
   expect(hosted.dormantLegacySessions).toBe(1);
   // A second session whose token expires inside the first one's idle window finds the dormant bound full.
   token = (await issueOAuth(store.repo, oauth.resource, "alice@example.com", ["grayboard:tools"], f.time.now - OAUTH_TTL.access + 30_000, OPENCODE_CLIENT)).token;
@@ -967,7 +967,7 @@ test("the dormant registry is bounded by the legacy limits", async () => {
   await untilHosted(() => hosted.activeGetStreams === 1);
   expect(hosted.activeLegacySessions).toBe(1);
   f.time.now += 30_000;
-  f.tick();
+  await f.tick();
   expect(hosted.activeLegacySessions).toBe(0);
   expect(hosted.dormantLegacySessions).toBe(1);
   expect(legacyRows().map(row => [row.action, row.reason])).toEqual([["hosted.legacy_dormant", undefined], ["hosted.legacy_dropped", "capacity"]]);
@@ -1368,10 +1368,10 @@ test("#902: a native tool call authorizes under one auth-generation read and lea
   const { Database } = await import("bun:sqlite");
   const client = await connect();
   await client.callTool({ name: "board_list", arguments: {} });
-  // The exchange's authorization check reads through the synchronous form until #807 P3 A7d.
-  const authRead = store.repo.authNow.read, validate = application.revalidateSession;
+  // The exchange's authorization check reads through the async form since #807 P3 A7d.
+  const authRead = store.repo.authRead, validate = application.revalidateSession;
   let depth = 0, pinned = 0, unpinned = 0;
-  store.repo.authNow.read = fn => { depth++; try { return authRead(fn); } finally { depth--; } };
+  store.repo.authRead = async fn => { depth++; try { return await authRead(fn); } finally { depth--; } };
   application.revalidateSession = (session, allowUnbound) => { if (depth) pinned++; else unpinned++; validate(session, allowUnbound); };
   const query = spyOn(Database.prototype, "query");
   try {
@@ -1385,7 +1385,7 @@ test("#902: a native tool call authorizes under one auth-generation read and lea
     // and the call ends inside the touch window, so its end touch reads nothing.
     expect(rowReads).toBe(4);
     expect({ pinned, unpinned }).toEqual({ pinned: 1, unpinned: 0 });
-  } finally { query.mockRestore(); store.repo.authNow.read = authRead; application.revalidateSession = validate; }
+  } finally { query.mockRestore(); store.repo.authRead = authRead; application.revalidateSession = validate; }
 });
 
 // #899: the stream timer re-reads a live's hosted rows only when they could have changed. A listen checked once
@@ -1398,7 +1398,7 @@ async function stampedListen(recheckMs = 3_600_000) {
   expect((await client.callTool({ name: "board_create", arguments: { name: "stamped", purpose: "#899" } })).isError).not.toBe(true);
   const listen = await client.listen({ resourceSubscriptions: ["grayboard://boards/stamped"] });
   expect(hosted.activeListens).toBe(1);
-  tick(); tick(); // the first stamps it; the second is a quiet one
+  await tick(); await tick(); // the first stamps it; the second is a quiet one
   expect(hosted.activeListens).toBe(1);
   return { time, tick, tickStream, grant, listen };
 }
@@ -1416,17 +1416,25 @@ const ends: [string, (f: Awaited<ReturnType<typeof stampedListen>>) => unknown][
 for (const [what, end] of ends) test(`#899: a stamped listen ends within a stream tick of ${what}`, async () => {
   const f = await stampedListen(OAUTH_TTL.access * 10);
   await end(f);
-  f.tickStream();
+  await f.tickStream();
   expect(hosted.activeListens).toBe(0);
   await f.listen.close();
 });
 
 test("#899: a failed generation read leaves every stream to phase B's full check, which closes a revoked one", async () => {
   const f = await stampedListen();
+  // Phase A's peek and phase B's stamp both read the generation (#807 P3 A7d).
+  const authGeneration = store.repo.authGeneration, authPeek = store.repo.authPeek;
+  const fail = () => { throw new Error("generation read failed"); };
+  const failing = async () => {
+    store.repo.authGeneration = fail; store.repo.authPeek = fail;
+    try { await f.tickStream(); } finally { store.repo.authGeneration = authGeneration; store.repo.authPeek = authPeek; }
+  };
+  // A healthy stream survives the failed reads: its full check passes and stamps nothing.
+  await failing();
+  expect(hosted.activeListens).toBe(1);
   await seed(store.repo, tx => store.repo.oauth.revokeToken(tx, hashToken(token), OPENCODE_CLIENT, f.time.now));
-  const authGeneration = store.repo.authGeneration;
-  store.repo.authGeneration = () => { throw new Error("generation read failed"); };
-  try { f.tickStream(); } finally { store.repo.authGeneration = authGeneration; }
+  await failing();
   expect(hosted.activeListens).toBe(0);
   await f.listen.close();
 });
@@ -1436,13 +1444,13 @@ test("#899: a stamped listen ends within a tick of its root's lease lapsing, a d
   const root = aliceRoot().session_id;
   // The update's notice makes the next tick a full check, which stamps the new deadline.
   await seed(store.repo, tx => { const r = aliceRoot(); return store.repo.hosted.update(tx, { ...r, lease_deadline: f.time.now + 5_000 }); });
-  f.tick(); f.tick();
+  await f.tick(); await f.tick();
   expect(hosted.activeListens).toBe(1);
-  f.time.now += 4_999; f.tick();
+  f.time.now += 4_999; await f.tick();
   expect(hosted.activeListens).toBe(1);
   // Before the hosted sweep's own timer could end the root, the stream tick ends the listen at once and posts the
   // settle, which ends the root when its async body commits (#807 P3 A6e2).
-  f.time.now += 1; f.tick();
+  f.time.now += 1; await f.tick();
   expect(hosted.activeListens).toBe(0);
   await store.repo.write(() => {});
   expect(store.repo.hosted.get(store.repo.read, root)).toBeUndefined();
@@ -1475,9 +1483,9 @@ test("#899: a write no notice or generation sees reaches a stamped listen at the
   const f = await stampedListen(10_000);
   // Raw SQL on the repo's own connection: no hosted notice, no generation move.
   await seed(store.repo, () => store.db.run("UPDATE hosted_sessions SET bind_gen = bind_gen + 1 WHERE session_id = ?", [aliceRoot().session_id]));
-  f.time.now += 9_999; f.tick();
+  f.time.now += 9_999; await f.tick();
   expect(hosted.activeListens).toBe(1);
-  f.time.now += 1; f.tick();
+  f.time.now += 1; await f.tick();
   await untilHosted(() => hosted.activeListens === 0);
   await f.listen.close();
 });
@@ -1499,7 +1507,7 @@ test("#899: another connection's commit reaches a stamped listen within a tick",
   const f = await stampedListen();
   const other = new Database(path);
   try { other.run("UPDATE hosted_sessions SET bind_gen = bind_gen + 1 WHERE session_id = ?", [aliceRoot().session_id]); } finally { other.close(); }
-  f.tick();
+  await f.tick();
   await untilHosted(() => hosted.activeListens === 0);
   await f.listen.close();
 });
@@ -1510,10 +1518,10 @@ test("#899: a quiet tick reads no hosted row or alias hold for a stamped listen 
   const legacy = await connect("2025-11-25");
   expect(await legacy.subscribeResource({ uri: "grayboard://boards/stamped" })).toEqual({});
   await untilHosted(() => hosted.activeGetStreams === 1);
-  f.tick();
+  await f.tick();
   const query = spyOn(Database.prototype, "query"), prepare = spyOn(Database.prototype, "prepare");
   try {
-    for (let i = 0; i < 5; i++) { f.time.now += 1000; f.tick(); }
+    for (let i = 0; i < 5; i++) { f.time.now += 1000; await f.tick(); }
     const reads = [...query.mock.calls, ...prepare.mock.calls].map(([sql]) => String(sql)).filter(sql => /hosted_sessions|alias_holds/.test(sql));
     // Before #899: every tick read each live's row and root and, for its binding, the root's holds.
     expect(reads).toEqual([]);
