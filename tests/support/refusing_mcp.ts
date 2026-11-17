@@ -16,10 +16,18 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 
 const argv = process.argv.slice(2);
 // `2,4` or `2-5`: the set of call numbers.
-const calls = (spec: string): Set<number> => new Set(spec.split(",").flatMap((part) => {
-  const [a, b = a] = part.split("-").map(Number);
-  return Array.from({ length: b! - a! + 1 }, (_, i) => a! + i);
-}));
+const calls = (spec: string): Set<number> => {
+  const set = new Set(spec.split(",").flatMap((part) => {
+    const [a, b = a] = part.split("-").map(Number);
+    return b! >= a! ? Array.from({ length: b! - a! + 1 }, (_, i) => a! + i) : [NaN];
+  }));
+  // A typo must not quietly refuse nothing.
+  if (!set.size || ![...set].every((n) => Number.isInteger(n) && n > 0)) {
+    console.error(`refusing_mcp: bad --session calls "${spec}"`);
+    process.exit(2);
+  }
+  return set;
+};
 const proxy = argv[0] === "--session" ? { counter: argv[1]!, refused: calls(argv[2]!) } : undefined;
 const [cmd, ...args] = proxy ? argv.slice(3) : argv;
 if (args.includes("tools")) {

@@ -547,6 +547,8 @@ test("opencode: a switch handshake refused after a newer root superseded it does
   const s2 = oc.send("event", { event: { type: "message.updated", properties: { info: { role: "user", sessionID: "s2" } } } });
   await until(async () => (await oc.send("state")).heldAssociation === "s2", 10_000, "the held switch refusal");
   const s3 = oc.send("event", { event: { type: "message.updated", properties: { info: { role: "user", sessionID: "s3" } } } });
+  // Not redundant: this round trip lets s3's selectTarget run before the
+  // release, which the driver would otherwise read in the same chunk.
   await oc.send("state");
   await oc.send("releaseAssociation");
   await Promise.all([s2, s3]);
