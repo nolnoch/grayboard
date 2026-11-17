@@ -1,7 +1,7 @@
 import { LOCAL_MSG_COLS, LOCAL_SENT_PENDING_SQL, LOCAL_UNDELIVERED_FROM_SQL, localHistorySql } from "./binding.ts";
 import { openLocalDb } from "./open.ts";
 import { SqliteBlobs } from "./blobs.ts";
-import { markDelivered } from "./mailbox.ts";
+import { markDmDelivered } from "./mailbox.ts";
 import { bindAttachments, dropAttachments, releaseUpload, storeAttachment, withAttachments, type Uploader } from "../core/attachments.ts";
 import { DEFAULT_ATTACHMENT_LIMITS, type AttachmentFile, type AttachmentInfo } from "../shared/attachments.ts";
 import { lastCoreAudit, writeCoreAudit } from "../core/audit.ts";
@@ -113,7 +113,7 @@ export function getCursor(reader: string): number {
 }
 
 export function deliveredTo(reader: string, id: number, at = Date.now()): void {
-  markDelivered(db, reader, id, at);
+  markDmDelivered(db, reader, id, at);
 }
 
 export function getMessage(id: number): Message | undefined {
