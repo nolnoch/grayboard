@@ -31,7 +31,7 @@ describe("retention pruning", () => {
     const m = await seed(repo, tx => repo.messages.insert(tx, "a@example.com/fe", "user", "b@example.com/be", "old", null));
     // Prune everything up to and including now — should remove the message
     await seed(repo, tx => pruneMessages(repo, tx, Date.now() + 1));
-    const gone = repo.messages.getById(m.id);
+    const gone = repo.messages.getById(repo.read, m.id);
     expect(gone).toBeUndefined();
   });
 
@@ -39,7 +39,7 @@ describe("retention pruning", () => {
     const m = await seed(repo, tx => repo.messages.insert(tx, "a@example.com/fe", "user", "b@example.com/be", "new", null));
     // Prune only things older than 1 hour ago — should keep the fresh message
     await seed(repo, tx => pruneMessages(repo, tx, Date.now() - 3_600_000));
-    const still = repo.messages.getById(m.id);
+    const still = repo.messages.getById(repo.read, m.id);
     expect(still).not.toBeUndefined();
   });
 
@@ -51,8 +51,8 @@ describe("retention pruning", () => {
       return { root, reply: r.messages.insert(tx, "b@example.com/be", "user", "a@example.com/fe", "reply", root.id) };
     });
     await expect(seed(r, tx => pruneMessages(r, tx, 1))).resolves.toBeUndefined(); // used to fail the parent_id foreign key
-    expect(r.messages.getById(root.id)).toBeUndefined();
-    expect(r.messages.getById(reply.id)?.parent_id).toBeNull();
+    expect(r.messages.getById(r.read, root.id)).toBeUndefined();
+    expect(r.messages.getById(r.read, reply.id)?.parent_id).toBeNull();
   });
 
   test("retention takes a pruned message's files, and their bytes only once nothing names them", async () => {
@@ -72,7 +72,7 @@ describe("retention pruning", () => {
     });
     await runRetention(r, db, config);
     expect(db.query("SELECT message_id FROM attachments").all()).toEqual([{ message_id: kept.id }]);
-    expect(r.messages.thread(kept.id)[0].attachments).toHaveLength(1);
+    expect(r.messages.thread(r.read, kept.id)[0].attachments).toHaveLength(1);
     expect(db.query("SELECT COUNT(*) AS n FROM attachment_blobs").get()).toEqual({ n: 1 });
     expect(readdirSync(blobDir).filter((d) => d !== "tmp")).toHaveLength(1);
     await runRetention(r, db, config, Date.now() + 2 * 86_400_000);

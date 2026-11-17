@@ -242,7 +242,7 @@ export class SlackBridge implements SlackLinker {
         repo.aliases.create(tx, { scope_kind: "person", scope_ref: user.email, name: HUMAN_NAME }, user.email);
         writeAudit(repo, "alias.created", user.email, handle, { slack: true });
         onAliasCreated(db, repo, user.id, handle);
-        const newest = repo.messages.history([handle], undefined, 1)[0];
+        const newest = repo.messages.history(tx, [handle], undefined, 1)[0];
         if (newest) repo.cursors.advance(tx, handle, "direct", handle, newest.id);
       }
       markHuman(db, handle, true);
@@ -401,7 +401,7 @@ export class SlackBridge implements SlackLinker {
       // In process: the read check the download route makes, and the store an
       // upload makes, audited the same way.
       async attachment(id) {
-        const read = requestAttachment(repo, db, handle, String(id), null, { user: link.email, address: handle }, { via: "slack" });
+        const read = requestAttachment(repo, repo.read, db, handle, String(id), null, { user: link.email, address: handle }, { via: "slack" });
         if ("refused" in read) throw new Error(read.refused);
         const { row } = read;
         return { id: row.id, filename: row.filename, type: row.type, size: row.size, sha256: row.sha256, data: await repo.blobs.get(row.sha256) };

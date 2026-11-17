@@ -5,7 +5,7 @@ import { queueFor } from "./store/queue.ts";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 
-import { setAccess } from "../core/boards.ts";
+import { ALIAS_SESSION_SQL, setAccess } from "../core/boards.ts";
 import { dropHold, logBinding } from "../core/bindings.ts";
 import type { AuditAction } from "./audit.ts";
 import { bindAttachments, dropAttachments, withAttachments, type BlobStore, type Uploader } from "../core/attachments.ts";
@@ -257,6 +257,9 @@ export interface Repo {
     countForScope(r: Read, kind: ScopeKind, ref: string): number;
     // Every scope's alias of this name.
     findAllByName(r: Read, name: string): Alias[];
+    // When each of these addresses was last used, and the cwd or place of the
+    // session that holds or last held it (ALIAS_SESSION_SQL); unused ones are absent.
+    seen(r: Read, addresses: string[]): Map<string, { last_seen: number; cwd: string | null; place: string | null }>;
     // Also deletes the alias's read points.
     remove(tx: Tx, address: string): void;
   };
@@ -303,31 +306,31 @@ export interface Repo {
     ): MessageRow;
     // The writer's signed-in user of each message and post that has one
     // recorded (rows from before F-10, bounces and system posts have none).
-    writerUsers(messageIds: number[], postIds: number[]): { messages: Map<number, string>; posts: Map<number, string> };
+    writerUsers(r: Read, messageIds: number[], postIds: number[]): { messages: Map<number, string>; posts: Map<number, string> };
     // Which of these messages `delegate` wrote: each has a delegation.requested row targeting its recipient (#256).
-    delegationIds(messageIds: number[]): Set<number>;
+    delegationIds(r: Read, messageIds: number[]): Set<number>;
     // The row alone, without its attachments: an access or ack check.
-    getById(id: number): MessageRow | undefined;
+    getById(r: Read, id: number): MessageRow | undefined;
     // The bounces an ended session's end sent (#284 decision 4): an ID ends once.
     // since: only an end's own bounces, made at or after its time (a reopened ID can end again, #475).
-    bouncesFrom(id: string, since?: number): MessageRow[];
+    bouncesFrom(r: Read, id: string, since?: number): MessageRow[];
     // A session's direct messages, sent or received by any of its addresses
     // (#284 S8): with peer, only those between the set and peer.
-    history(addresses: string[], peer?: string, limit?: number, beforeId?: number): MessageRow[];
-    thread(id: number): MessageRow[];
-    unreadSince(streams: { type: "direct" | "team"; ref: string; since: number }[]): MessageRow[];
+    history(r: Read, addresses: string[], peer?: string, limit?: number, beforeId?: number): MessageRow[];
+    thread(r: Read, id: number): MessageRow[];
+    unreadSince(r: Read, streams: { type: "direct" | "team"; ref: string; since: number }[]): MessageRow[];
     // Direct messages to each of recipients still past its cursor, sent by
     // someone else; recipients with none are absent.
-    queuedTo(recipients: string[]): Map<string, number>;
+    queuedTo(r: Read, recipients: string[]): Map<string, number>;
     // Direct messages from any of senders still past each recipient's cursor, per recipient.
-    undeliveredFrom(senders: string[], olderThan?: number): { recipient: string; n: number; oldest_id: number }[];
+    undeliveredFrom(r: Read, senders: string[], olderThan?: number): { recipient: string; n: number; oldest_id: number }[];
     // Direct messages to any of readers since `since` that their recipient hasn't acked, oldest first.
-    receivedUnacked(readers: string[], since: number): MessageRow[];
+    receivedUnacked(r: Read, readers: string[], since: number): MessageRow[];
     // Direct messages from any of senders since `since` sent pending and not acked by their sender, oldest first.
-    sentPending(senders: string[], since: number): MessageRow[];
+    sentPending(r: Read, senders: string[], since: number): MessageRow[];
     ack(tx: Tx, reader: string, id: number): void;
     // A launcher's delegation requests since `since` it hasn't taken (#252, countOpenDelegations).
-    openDelegations(launcher: string, since: number): number;
+    openDelegations(r: Read, launcher: string, since: number): number;
     // Stamps delivered_at on a direct message handed to its recipient's harness; the first stamp stands.
     markDelivered(tx: Tx, id: number, at: number): void;
     // Deletes a direct message from sender that's past the recipient's cursor
@@ -786,15 +789,17 @@ function initSchema(db: Database): void {
   const logCols = db.prepare(`PRAGMA table_info(access_log)`).all() as { name: string }[];
   if (!logCols.some((c) => c.name === "ip")) db.exec(`ALTER TABLE access_log ADD COLUMN ip TEXT`);
   if (!logCols.some((c) => c.name === "ua")) db.exec(`ALTER TABLE access_log ADD COLUMN ua TEXT`);
+  // client_id: the OAuth client of the hosted MCP request that wrote the row (#847); null off /mcp and on older rows.
+  if (!logCols.some((c) => c.name === "client_id")) db.exec(`ALTER TABLE access_log ADD COLUMN client_id TEXT`);
 }
 
 /**
- * Every access_log row goes in here: it stamps the client address and user
- * agent of the request whose handling wrote it (security audit F-19).
+ * Every access_log row goes in here: it stamps the client address, user agent
+ * and OAuth client of the request whose handling wrote it (security audit F-19).
  */
 function insertAudit(db: Database, at: number, actor: string | null, action: string, target: string | null, detail: string | null): void {
   const o = requestOrigin();
-  db.run("INSERT INTO access_log (at, actor, action, target, detail, ip, ua) VALUES (?, ?, ?, ?, ?, ?, ?)", [at, actor, action, target, detail, o?.ip ?? null, o?.ua ?? null]);
+  db.run("INSERT INTO access_log (at, actor, action, target, detail, ip, ua, client_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", [at, actor, action, target, detail, o?.ip ?? null, o?.ua ?? null, o?.client_id ?? null]);
 }
 
 // #284's seeds, inside the schema transaction. Principals follow users and
@@ -839,7 +844,7 @@ export class PrincipalTaken extends Error {
 }
 
 function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLimits, attachmentUserQuota: number, clock: () => number = Date.now): Repo {
-  const att = (rows: MessageRow[]) => withAttachments(db, "message", rows);
+  const att = (c: Database, rows: MessageRow[]) => withAttachments(c, "message", rows);
   // Refuses to take `userId`'s ownership away when it is the team's last
   // owner and other members remain. A sole member may leave; a team with
   // no owner (its creator left before roles existed) has nothing to guard.
@@ -1128,6 +1133,13 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       findAllByName(r, name) {
         return sqliteOf(r).query<Alias, [string]>(`SELECT ${ALIAS_COLS} FROM aliases WHERE name = ? ORDER BY address`).all(name);
       },
+      seen(r, addresses) {
+        const rows = sqliteOf(r).query<{ address: string; last_seen: number; cwd: string | null; place: string | null }, [string]>(
+          `SELECT a.address, a.last_seen, i.cwd, i.place FROM aliases a LEFT JOIN ids i ON i.id = ${ALIAS_SESSION_SQL}
+            WHERE a.address IN (SELECT value FROM json_each(?)) AND a.last_seen IS NOT NULL`,
+        ).all(JSON.stringify(addresses));
+        return new Map(rows.map(({ address, ...facts }) => [address, facts]));
+      },
       remove(tx, address) {
         const db = sqliteOf(tx);
         db.transaction(() => {
@@ -1234,12 +1246,14 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
           return attachments.length ? { ...row, attachments } : row;
         })();
       },
-      getById(id) {
-        return db.query<MessageRow, [number]>(`SELECT ${MSG_COLS} FROM messages WHERE id = ?`).get(id) ?? undefined;
+      getById(r, id) {
+        const c = sqliteOf(r);
+        return c.query<MessageRow, [number]>(`SELECT ${MSG_COLS} FROM messages WHERE id = ?`).get(id) ?? undefined;
       },
-      writerUsers(messageIds, postIds) {
+      writerUsers(r, messageIds, postIds) {
+        const c = sqliteOf(r);
         const pairs = (table: "messages" | "posts", column: "sender_user" | "author_user", ids: number[]) => new Map(ids.length === 0 ? [] :
-          db.query<{ id: number; user: string }, [string]>(`SELECT id, ${column} AS user FROM ${table} WHERE id IN (SELECT value FROM json_each(?)) AND ${column} IS NOT NULL`)
+          c.query<{ id: number; user: string }, [string]>(`SELECT id, ${column} AS user FROM ${table} WHERE id IN (SELECT value FROM json_each(?)) AND ${column} IS NOT NULL`)
             .all(JSON.stringify(ids)).map((r) => [r.id, r.user] as const));
         return { messages: pairs("messages", "sender_user", messageIds), posts: pairs("posts", "author_user", postIds) };
       },
@@ -1251,8 +1265,9 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       // a slow transaction or a clock step. CROSS JOIN fixes the order
       // (messages first), so the planner can't drive from access_log by
       // action alone.
-      delegationIds(messageIds) {
-        return new Set(db.query<{ id: number }, [string]>(
+      delegationIds(r, messageIds) {
+        const c = sqliteOf(r);
+        return new Set(c.query<{ id: number }, [string]>(
           `SELECT m.id FROM messages m
            CROSS JOIN access_log a ON a.action = 'delegation.requested' AND a.target = m.recipient
              AND a.at BETWEEN m.created_at - 60000 AND m.created_at + 60000
@@ -1260,15 +1275,17 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
            WHERE m.id IN (SELECT value FROM json_each(?))`,
         ).all(JSON.stringify(messageIds)).map((r) => r.id));
       },
-      bouncesFrom(id, since = 0) {
-        return db.query<MessageRow, [string, number]>(`SELECT ${MSG_COLS} FROM messages WHERE sender = ? AND kind = 'bounce' AND created_at >= ? ORDER BY id`).all(id, since);
+      bouncesFrom(r, id, since = 0) {
+        const c = sqliteOf(r);
+        return c.query<MessageRow, [string, number]>(`SELECT ${MSG_COLS} FROM messages WHERE sender = ? AND kind = 'bounce' AND created_at >= ? ORDER BY id`).all(id, since);
       },
-      history(addresses, peer, limit = 20, beforeId) {
+      history(r, addresses, peer, limit = 20, beforeId) {
+        const c = sqliteOf(r);
         const set = JSON.stringify(addresses);
         const before = beforeId ?? Number.MAX_SAFE_INTEGER;
         const cap = Math.min(limit, 200);
         if (peer) {
-          return att(db.query<MessageRow, [string, string, number, number]>(
+          return att(c, c.query<MessageRow, [string, string, number, number]>(
             `SELECT ${MSG_COLS} FROM messages
              WHERE ((sender IN (SELECT value FROM json_each(?1)) AND recipient = ?2)
                  OR (sender = ?2 AND recipient IN (SELECT value FROM json_each(?1))))
@@ -1276,7 +1293,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
              ORDER BY id DESC LIMIT ?4`,
           ).all(set, peer, before, cap));
         }
-        return att(db.query<MessageRow, [string, number, number]>(
+        return att(c, c.query<MessageRow, [string, number, number]>(
           `SELECT ${MSG_COLS} FROM messages
            WHERE (sender IN (SELECT value FROM json_each(?1))
                OR (recipient IN (SELECT value FROM json_each(?1)) AND recipient_type = 'user'))
@@ -1285,8 +1302,9 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
         ).all(set, before, cap));
       },
       // The whole thread containing message `id`: walk up to its root, then down.
-      thread(id) {
-        return att(db.query<MessageRow, [number]>(`
+      thread(r, id) {
+        const c = sqliteOf(r);
+        return att(c, c.query<MessageRow, [number]>(`
           WITH RECURSIVE up(id, parent_id) AS (
             SELECT id, parent_id FROM messages WHERE id = ?
             UNION ALL
@@ -1300,45 +1318,51 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
           SELECT ${M_MSG_COLS} FROM messages m JOIN tree t ON m.id = t.id ORDER BY m.id ASC
         `).all(id));
       },
-      unreadSince(streams) {
+      unreadSince(r, streams) {
+        const c = sqliteOf(r);
         if (streams.length === 0) return [];
         const all: MessageRow[] = [];
         for (const s of streams) {
           const colType = s.type === "direct" ? "user" : "team";
-          const rows = db.query<MessageRow, [string, string, number]>(
+          const rows = c.query<MessageRow, [string, string, number]>(
             `SELECT ${MSG_COLS} FROM messages WHERE recipient_type = ? AND recipient = ? AND id > ? ORDER BY id ASC`,
           ).all(colType, s.ref, s.since);
           all.push(...rows);
         }
         all.sort((a, b) => a.id - b.id);
-        return att(all);
+        return att(c, all);
       },
-      queuedTo(recipients) {
-        const rows = db.query<{ recipient: string; n: number }, [string]>(
+      queuedTo(r, recipients) {
+        const c = sqliteOf(r);
+        const rows = c.query<{ recipient: string; n: number }, [string]>(
           QUEUED_TO_SQL,
         ).all(JSON.stringify(recipients));
         return new Map(rows.map((r) => [r.recipient, r.n]));
       },
-      undeliveredFrom(senders, olderThan = Number.MAX_SAFE_INTEGER) {
-        return db.query<{ recipient: string; n: number; oldest_id: number }, [string, number]>(
+      undeliveredFrom(r, senders, olderThan = Number.MAX_SAFE_INTEGER) {
+        const c = sqliteOf(r);
+        return c.query<{ recipient: string; n: number; oldest_id: number }, [string, number]>(
           UNDELIVERED_FROM_SQL,
         ).all(JSON.stringify(senders), olderThan);
       },
-      receivedUnacked(readers, since) {
-        return att(db.query<MessageRow, [string, number]>(
+      receivedUnacked(r, readers, since) {
+        const c = sqliteOf(r);
+        return att(c, c.query<MessageRow, [string, number]>(
           `SELECT ${M_MSG_COLS} FROM messages m
             WHERE m.recipient_type = 'user' AND m.recipient IN (SELECT value FROM json_each(?)) AND m.sender != m.recipient AND m.created_at >= ?
               AND NOT EXISTS (SELECT 1 FROM dm_acks a WHERE a.reader = m.recipient AND a.message_id = m.id)
             ORDER BY m.id ASC`,
         ).all(JSON.stringify(readers), since));
       },
-      sentPending(senders, since) {
-        return att(db.query<MessageRow, [string, number]>(
+      sentPending(r, senders, since) {
+        const c = sqliteOf(r);
+        return att(c, c.query<MessageRow, [string, number]>(
           SENT_PENDING_SQL,
         ).all(JSON.stringify(senders), since));
       },
-      openDelegations(launcher, since) {
-        return countOpenDelegations(db, "access_log", launcher, since);
+      openDelegations(r, launcher, since) {
+        const c = sqliteOf(r);
+        return countOpenDelegations(c, "access_log", launcher, since);
       },
       ack(tx, reader, id) {
         sqliteOf(tx).run("INSERT OR IGNORE INTO dm_acks (reader, message_id, acked_at) VALUES (?, ?, ?)", [reader, id, clock()]);

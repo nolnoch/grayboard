@@ -5,7 +5,7 @@
 // carry the marks, so a poll session or one after /clear loses none. Decided per call, so a grant
 // set or revoked changes the next read (principle 11). The reader's own
 // user's items are never marked.
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { TestServer } from "../support/server.ts";
 
 const A = "alice@example.com";
@@ -94,4 +94,23 @@ test("board_read marks another user's post, follows the grant, and leaves the re
   expect(marks(await snap(), "alice's post")).toEqual(OWN);
   expect((await policy("collaborative")).status).toBe(200);
   expect(marks(await snap(), "bob's post")).toEqual(GRANTED);
+});
+
+// #807 P1c-14b: another user's DMs make dm_history look up which are delegations; that read runs on the history body's Tx.
+test("dm_history's delegation lookup for another user's DMs reads on its body's Tx (#807 P1c-14b)", async () => {
+  const repo = srv.app.repo;
+  const checks: string[] = [];
+  const original = repo.messages.delegationIds.bind(repo.messages);
+  const spy = spyOn(repo.messages, "delegationIds").mockImplementation((r, ids) => {
+    checks.push(`${r === repo.read ? "pool" : "tx"}:${srv.app.db.inTransaction}`);
+    return original(r, ids);
+  });
+  try {
+    const abe = await srv.hosted(A, "be");
+    const bfe = await srv.hosted(B, "fe");
+    await bfe.call("dm_send", { to: `${A}/be`, body: "from bob" });
+    expect(marks(await abe.call<Marked[]>("dm_history", {}), "from bob")).toEqual(OTHER);
+  } finally { spy.mockRestore(); }
+  expect(checks).toContain("tx:true");
+  expect(checks.filter((c) => c !== "tx:true")).toEqual([]);
 });

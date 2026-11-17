@@ -5,7 +5,7 @@
 // exact handle is refused as for a name nobody has (#1014), except a reply in
 // a DM thread with it. People's names stay the open directory (vision.md
 // principle 9).
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import type { WhoResult } from "../../src/core/boards.ts";
 import type { AppSession } from "../support/app_session.ts";
 import { board, direct } from "../support/events.ts";
@@ -231,4 +231,25 @@ test("a team-scoped refusal reads the same to a non-member whether or not the te
   expect(await both((t) => err(hosted.call("bind", { name: `${t}/x`, create: true })))).toMatchObject({ code: "not_found" });
   const http = await both((t) => srv.api(carol, "POST", "/api/claims/call", { as: `${t}/x`, tool: "claim_take", args: { key: "k" } }));
   expect(http).toMatchObject({ status: 403, body: { code: "forbidden", message: `you can't act as "TEAM/x": no principal owns its scope` } });
+});
+
+// #807 P1c-14b: the reply check reads the parent on the send body's Tx, not the pool.
+test("a reply to a team alias reads its parent on the send body's Tx (#807 P1c-14b)", async () => {
+  const outsider = srv.appSession(carol, "qa");
+  await outsider.connect();
+  const build = srv.appSession(bob, "eng/build", { bind: { create: true } });
+  await build.connect();
+  const first = await build.send("carol@example.com/qa", "from the team");
+  await outsider.next(direct((m) => m.body === "from the team"));
+  const repo = srv.app.repo;
+  const checks: string[] = [];
+  const original = repo.messages.getById.bind(repo.messages);
+  const spy = spyOn(repo.messages, "getById").mockImplementation((r, id) => {
+    if (new Error().stack?.includes("replyingTo")) checks.push(`${r === repo.read ? "pool" : "tx"}:${srv.app.db.inTransaction}`);
+    return original(r, id);
+  });
+  try {
+    expect((await outsider.send("eng/build", "reply", { parent_id: first.message_id })).message_id).toBeGreaterThan(0);
+  } finally { spy.mockRestore(); }
+  expect(checks).toEqual(["tx:true"]);
 });

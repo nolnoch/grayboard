@@ -148,7 +148,7 @@ test("attachments cross the org bridge both ways for a hosted session, and the a
   expect(sent.actor).toBe("alice@example.com");
   // The relay's drain started inside be's /mcp request, but carries every
   // queued item: its rows carry no request's address (security audit F-19).
-  expect(auditOrigins(srv.app.db, "attachment.sent_to_slack")).toEqual([{ ip: null, ua: null }]);
+  expect(auditOrigins(srv.app.db, "attachment.sent_to_slack")).toEqual([{ ip: null, ua: null, client_id: null }]);
   const sha256 = createHash("sha256").update(png).digest("hex");
   expect(sent.detail).toEqual({ identity: "alice@example.com/human", channel: DM, thread_ts: s.ts, slack_file: s.files[0].id, sha256 });
   // Binding says which message carried each file, to whom: be's to the human, the human's reply to be.
@@ -498,6 +498,28 @@ test("#807 P1c-13: link and unlink read and write the human alias on their body'
     expect((await api(alice, "POST", "/api/slack/unlink")).status).toBe(200);
   } finally { for (const spy of spies) spy.mockRestore(); }
   expect(checks).toEqual([{ op: "find", inTxn: true, handle: "tx" }, { op: "create", inTxn: true, handle: "tx" }, { op: "remove", inTxn: true, handle: "tx" }]);
+});
+
+// #807 P1c-14b: the link's newest-message read (where the new human's cursor starts) and the Slack receipt's
+// message read run on their body's Tx.
+test("#807 P1c-14b: link and the Slack receipt read messages on their body's Tx", async () => {
+  const repo = srv.app.repo;
+  const checks: { op: string; inTxn: boolean; handle: "pool" | "tx" }[] = [];
+  const spies = (["history", "getById"] as const).map((name) => {
+    const original = repo.messages[name].bind(repo.messages) as (...a: unknown[]) => unknown;
+    return spyOn(repo.messages, name).mockImplementation(((r: unknown, ...rest: unknown[]) => {
+      if (new Error().stack?.includes("/slack.ts:")) checks.push({ op: name, inTxn: srv.app.db.inTransaction, handle: r === repo.read ? "pool" : "tx" });
+      return original(r, ...rest);
+    }) as never);
+  });
+  try {
+    const alice = await login("alice@example.com");
+    await link(alice);
+    const be = await hosted("alice@example.com", "be");
+    await be.call<SendResult>("dm_send", { to: "human", body: "receipt check" });
+    await until(() => checks.some((c) => c.op === "getById"));
+  } finally { for (const spy of spies) spy.mockRestore(); }
+  expect(checks).toEqual([{ op: "history", inTxn: true, handle: "tx" }, { op: "getById", inTxn: true, handle: "tx" }]);
 });
 
 test("thread replies while unlinked don't flood in at relink", async () => {

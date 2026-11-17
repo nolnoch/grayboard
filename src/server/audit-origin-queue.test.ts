@@ -19,7 +19,7 @@ function setup() {
 }
 
 const a = { ip: "203.0.113.1", ua: "a" };
-const b = { ip: "203.0.113.2", ua: "b" };
+const b = { ip: "203.0.113.2", ua: "b", client_id: "client-b" };
 const c = { ip: "203.0.113.3", ua: "c" };
 
 test("#1042: bodies queued behind an async body write their own request's origin, a detached one none", async () => {
@@ -36,12 +36,12 @@ test("#1042: bodies queued behind an async body write their own request's origin
   release();
   await Promise.all([held, wrote]);
   await repo.write(() => undefined); // the posted bodies ran before this one
-  const got = db.query("SELECT action, ip, ua FROM access_log WHERE action LIKE 't.%' ORDER BY id").all();
+  const got = db.query("SELECT action, ip, ua, client_id FROM access_log WHERE action LIKE 't.%' ORDER BY id").all();
   expect(got).toEqual([
-    { action: "t.a", ip: a.ip, ua: a.ua },
-    { action: "t.b", ip: b.ip, ua: b.ua },
-    { action: "t.b.committed", ip: b.ip, ua: b.ua },
-    { action: "t.c", ip: c.ip, ua: c.ua },
-    { action: "t.none", ip: null, ua: null },
+    { action: "t.a", ip: a.ip, ua: a.ua, client_id: null },
+    { action: "t.b", ip: b.ip, ua: b.ua, client_id: b.client_id },
+    { action: "t.b.committed", ip: b.ip, ua: b.ua, client_id: b.client_id },
+    { action: "t.c", ip: c.ip, ua: c.ua, client_id: null },
+    { action: "t.none", ip: null, ua: null, client_id: null },
   ]);
 });
