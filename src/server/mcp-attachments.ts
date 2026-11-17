@@ -1,4 +1,3 @@
-import type { CoreDb } from "../core/boards.ts";
 import { ApplicationError } from "./application.ts";
 import { sourceContext, type HostedSessions } from "./hosted.ts";
 import type { Repo } from "./db.ts";
@@ -18,7 +17,7 @@ const privateResponse = (response: Response) => {
   return response;
 };
 
-export function createMcpAttachments(repo: Repo, db: CoreDb, oauth: Pick<ReturnType<typeof createOAuthServer>, "authenticate" | "resource">, uploads: UploadGate, opts: { trustedOrigin: string; sessions: HostedSessions }) {
+export function createMcpAttachments(repo: Repo, oauth: Pick<ReturnType<typeof createOAuthServer>, "authenticate" | "resource">, uploads: UploadGate, opts: { trustedOrigin: string; sessions: HostedSessions }) {
   const origin = new URL(opts.trustedOrigin).origin;
   const paths = new Set(["/mcp/attachments", `${new URL(oauth.resource).pathname}/attachments`]);
   const pending = new Set<Promise<Response>>();
@@ -70,9 +69,9 @@ export function createMcpAttachments(repo: Repo, db: CoreDb, oauth: Pick<ReturnT
           if (!repo.aliases.find(repo.read, session.identityFull)) throw new Refusal(error("not_found", "identity not found", 404));
         };
         guard();
-        const response = req.method === "POST" ? await attachmentUpload(req, selected, principal.authed, repo, db, uploads, guard, signal)
-          : req.method === "GET" ? await attachmentDownload(id!, selected, principal.authed, repo, db, guard)
-          : await attachmentRelease(id!, selected, principal.authed, repo, db, guard);
+        const response = req.method === "POST" ? await attachmentUpload(req, selected, principal.authed, repo, uploads, guard, signal)
+          : req.method === "GET" ? await attachmentDownload(id!, selected, principal.authed, repo, guard)
+          : await attachmentRelease(id!, selected, principal.authed, repo, guard);
         if (req.method === "POST" && req.body && !req.body.locked) await req.body.cancel();
         guard();
         return response;

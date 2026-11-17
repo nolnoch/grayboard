@@ -363,7 +363,7 @@ export function claimExpiryTimer(
     try {
       // The server's queue may make the sweep wait (#807 D4): the clock is read inside it, and a stop while it
       // waited still stops what follows.
-      const { wake, boards } = await tx(() => sweepChanges(db, Date.now()));
+      const { wake, boards } = await tx((w) => sweepChanges(w, Date.now()));
       if (stopped) return;
       if (boards.length) {
         try { void Promise.resolve(onBoardsChanged?.(boards)).catch(() => {}); } catch {}

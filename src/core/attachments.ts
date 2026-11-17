@@ -89,20 +89,20 @@ export async function storeAttachment(
   let unnamed = false;
   try {
     return await withBlob(sha256, async () => {
-      const row = await tx(() => {
+      const row = await tx((w) => {
         opts.guard?.();
-        unnamed = pruneUnbound(db, now - UNBOUND_TTL_MS) > 0;
+        unnamed = pruneUnbound(w, now - UNBOUND_TTL_MS) > 0;
         const q = opts.quota;
         // Bytes the principal already has under this blob add nothing.
-        const adds = (unbound: boolean) => (q && heldBlob(db, q.principal, sha256, unbound) ? 0 : file.data.length);
-        if (q && uploadedBytes(db, q.principal, true) + adds(true) > q.unsent) {
+        const adds = (unbound: boolean) => (q && heldBlob(w, q.principal, sha256, unbound) ? 0 : file.data.length);
+        if (q && uploadedBytes(w, q.principal, true) + adds(true) > q.unsent) {
           throw new TooLargeError(`your unsent uploads would exceed ${formatSize(q.unsent)}; send or wait for them to expire`);
         }
-        if (q && uploadedBytes(db, q.principal, false) + adds(false) > q.stored) {
+        if (q && uploadedBytes(w, q.principal, false) + adds(false) > q.stored) {
           throw new TooLargeError(`your stored attachments would exceed ${formatSize(q.stored)}; they're freed as their messages and posts age out`);
         }
-        db.prepare(`INSERT OR IGNORE INTO attachment_blobs (sha256, size, created_at) VALUES (?, ?, ?)`).run(sha256, file.data.length, now);
-        return db
+        w.prepare(`INSERT OR IGNORE INTO attachment_blobs (sha256, size, created_at) VALUES (?, ?, ?)`).run(sha256, file.data.length, now);
+        return w
           .prepare(
             `INSERT INTO attachments (sha256, filename, type, size, uploader, uploader_principal, created_at)
              VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING *`,
@@ -113,7 +113,7 @@ export async function storeAttachment(
         // Put even when the catalog knew this sha256: it heals bytes a crash lost.
         await blobs.put(sha256, file.data);
       } catch (e) {
-        await tx(() => db.prepare(`DELETE FROM attachments WHERE id = ?`).run(row.id));
+        await tx((w) => w.prepare(`DELETE FROM attachments WHERE id = ?`).run(row.id));
         unnamed = true;
         throw e;
       }
@@ -288,9 +288,9 @@ function heldBlob(db: Database, principal: string, sha256: string, unbound: bool
 export async function releaseUpload(
   db: Database, blobs: BlobStore, id: number, from: Uploader, guard?: () => void, tx: WriteTx = immediateTx(db),
 ): Promise<AttachmentRow | null> {
-  const row = await tx(() => {
+  const row = await tx((w) => {
     guard?.();
-    return db.prepare(`DELETE FROM attachments WHERE ${UNSENT} RETURNING *`).get(...unsentArgs([id], from)) as AttachmentRow | null;
+    return w.prepare(`DELETE FROM attachments WHERE ${UNSENT} RETURNING *`).get(...unsentArgs([id], from)) as AttachmentRow | null;
   });
   if (row) await sweepBlobs(db, blobs, tx);
   return row;
@@ -322,7 +322,7 @@ export async function sweepBlobs(db: Database, blobs: BlobStore, tx: WriteTx = i
       await withBlob(sha256, async () => {
         if (db.prepare(`SELECT 1 FROM attachments WHERE sha256 = ?`).get(sha256)) return;
         await blobs.delete(sha256);
-        swept += await tx(() => db.prepare(`DELETE FROM attachment_blobs WHERE sha256 = ? AND ${UNNAMED}`).run(sha256).changes);
+        swept += await tx((w) => w.prepare(`DELETE FROM attachment_blobs WHERE sha256 = ? AND ${UNNAMED}`).run(sha256).changes);
       });
     } catch (e) {
       console.error(`[grayboard] blob sweep: ${sha256}: ${(e as Error).message}`);

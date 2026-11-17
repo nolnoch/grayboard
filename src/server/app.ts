@@ -48,7 +48,7 @@ export function startServer(config: Config, opts: StartOptions = {}) {
     const revoked = repo.writeNow(tx => repo.sessions.revokeDev(tx));
     if (revoked > 0) writeAudit(repo, "auth.dev_sessions_revoked", null, null, { count: revoked });
   }
-  const application = createApplication(repo, db, { humanReach, slackRunning: () => slack?.running ?? false, ...startLimits(config, opts) });
+  const application = createApplication(repo, { humanReach, slackRunning: () => slack?.running ?? false, ...startLimits(config, opts) });
   const { revalidate, disconnectUser, accessChanged, stopExpiry, wake } = application;
 
   const authGate = new AuthGate(repo, {
@@ -66,7 +66,7 @@ export function startServer(config: Config, opts: StartOptions = {}) {
 
   // A Slack outage or bad token mustn't take the bus down: log and run without it.
   slack = config.slack ? new SlackBridge({
-    repo, db, application, ...config.slack,
+    repo, application, ...config.slack,
     ...(process.env.GRAYBOARD_SLACK_DEBUG ? { debug: (msg: string) => console.error(`[grayboard slack] debug: ${msg}`) } : {}),
   }) : undefined;
   const slackReady = slack?.start().catch((e) => {
@@ -79,7 +79,7 @@ export function startServer(config: Config, opts: StartOptions = {}) {
 
   // Room for four messages' worth of upload bodies at once, one per user.
   const uploads = new UploadGate(4 * repo.attachmentLimits.total, repo.attachmentLimits.total);
-  const attachments = createMcpAttachments(repo, db, oauth, uploads, { trustedOrigin: new URL(config.publicUrl).origin, sessions: mcp.sessions });
+  const attachments = createMcpAttachments(repo, oauth, uploads, { trustedOrigin: new URL(config.publicUrl).origin, sessions: mcp.sessions });
 
   async function route(req: Request, caller: Caller): Promise<Response> {
     const url = new URL(req.url);
@@ -161,7 +161,7 @@ export function startServer(config: Config, opts: StartOptions = {}) {
       // A throw here would surface as an unhandled error every 30 s with no context; log it and let the next tick retry.
       try { revalidate(); } catch (e) { console.error(`[grayboard] revalidate failed: ${(e as Error).stack ?? e}`); }
     }, 30_000));
-    stopRetention = startRetentionJobs(repo, db, config, opts.retentionFirstDelayMs !== undefined ? { firstDelayMs: opts.retentionFirstDelayMs } : undefined, application.boardsChanged);
+    stopRetention = startRetentionJobs(repo, config, opts.retentionFirstDelayMs !== undefined ? { firstDelayMs: opts.retentionFirstDelayMs } : undefined, application.boardsChanged);
   }
   // The lag sampler runs with or without a listener: /healthz's lag gate reads it (#805).
   const stopLag = opts.background !== false ? startLagSampler() : undefined;

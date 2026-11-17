@@ -1,7 +1,6 @@
 // Who may read an attachment on the server: the HTTP download route and the
 // Slack bridge's human identities ask the same question.
 import { attachmentReach, getAttachment, releaseUpload, storeAttachment, type AttachmentRow } from "../core/attachments.ts";
-import type { CoreDb } from "../core/boards.ts";
 import { unboundCap, type AttachmentFile } from "../shared/attachments.ts";
 import { writeAudit } from "./audit.ts";
 import { participant, queuedTx, type Repo } from "./db.ts";
@@ -16,7 +15,8 @@ import { authorize, recordDecision, type Actor, type AuthzRequest } from "./poli
 // null for the Slack bridge's humans, which have no session. `user` is the
 // reading user's email, always set on a server: an unsent upload is readable
 // only by the user who made it, not by whoever holds its address next (#367).
-function readRequest(repo: Repo, r: Read, db: CoreDb, handle: string, idText: string, principal: string | null, user: string) {
+function readRequest(repo: Repo, r: Read, handle: string, idText: string, principal: string | null, user: string) {
+  const db = repo.coreOn(r);
   const id = Number(idText);
   const row = Number.isInteger(id) && id > 0 ? getAttachment(db, id) : undefined;
   const addresses = addressSet(db, handle, principal);
@@ -29,8 +29,8 @@ function readRequest(repo: Repo, r: Read, db: CoreDb, handle: string, idText: st
 // its `attachment.download_refused` row and an `authz.decision` row (security audit F-01, #851). `detail` joins the
 // first. `r` is the caller's handle: `repo.read` for the download's first read and the Slack bridge's, the recheck body's `Tx`
 // inside it. `writeAudit` joins an open transaction and queues otherwise, so neither row needs deferring.
-export function requestAttachment(repo: Repo, r: Read, db: CoreDb, handle: string, idText: string, principal: string | null, actor: Actor & { user: string }, detail: Record<string, unknown> = {}): { row: AttachmentRow } | { refused: string } {
-  const { row, req } = readRequest(repo, r, db, handle, idText, principal, actor.user);
+export function requestAttachment(repo: Repo, r: Read, handle: string, idText: string, principal: string | null, actor: Actor & { user: string }, detail: Record<string, unknown> = {}): { row: AttachmentRow } | { refused: string } {
+  const { row, req } = readRequest(repo, r, handle, idText, principal, actor.user);
   const d = authorize(repo, {}, req);
   // An allow has a row: authorize() refuses an attachment that doesn't exist.
   if (d.allow) return { row: row! };
@@ -42,10 +42,10 @@ export function requestAttachment(repo: Repo, r: Read, db: CoreDb, handle: strin
 // Stores a checked file as an unsent upload of `handle`'s, within the quotas
 // of its principal, the user `email` (unsent bytes, and stored bytes in all),
 // and audits it. The HTTP upload route and the Slack app's in-process sends
-// both store this way.
+// both store this way. Each runs outside any write body: its transactions
+// queue behind the others, and its reads outside them are the pool's.
 export async function storeUpload(
   repo: Repo,
-  db: CoreDb,
   email: string,
   handle: string,
   file: AttachmentFile,
@@ -54,16 +54,21 @@ export async function storeUpload(
 ): Promise<AttachmentRow> {
   const quota = { principal: email, unsent: unboundCap(repo.attachmentLimits), stored: repo.attachmentUserQuota };
   const tx = queuedTx(repo);
-  const row = await storeAttachment(db, repo.blobs, handle, file, { quota, guard, tx });
+  const pool = repo.coreOn(repo.read);
+  const row = await storeAttachment(pool, repo.blobs, handle, file, { quota, guard, tx });
   try {
-    guard?.();
-    writeAudit(repo, "attachment.uploaded", email, `attachment:${row.id}`, {
-      identity: handle, filename: row.filename, type: row.type, size: row.size, sha256: row.sha256, ...detail,
+    // The guard and the audit row are one awaited write (#965): a failed audit row fails the upload, which is
+    // released, rather than keeping bytes no `attachment.uploaded` row records.
+    await repo.write(() => {
+      guard?.();
+      writeAudit(repo, "attachment.uploaded", email, `attachment:${row.id}`, {
+        identity: handle, filename: row.filename, type: row.type, size: row.size, sha256: row.sha256, ...detail,
+      });
     });
     return row;
   } catch (error) {
     // Only this upload, and only while unbound; concurrent sends keep their bytes.
-    if (guard) await releaseUpload(db, repo.blobs, row.id, { addresses: [handle], principal: email }, undefined, tx);
+    await releaseUpload(pool, repo.blobs, row.id, { addresses: [handle], principal: email }, undefined, tx);
     throw error;
   }
 }
@@ -72,14 +77,13 @@ export async function storeUpload(
 // failed after uploading. Null if it isn't theirs or is already sent.
 export async function releaseStored(
   repo: Repo,
-  db: CoreDb,
   email: string,
   handle: string,
   id: number,
   detail: Record<string, unknown> = {},
   guard?: () => void,
 ): Promise<AttachmentRow | null> {
-  const row = await releaseUpload(db, repo.blobs, id, { addresses: [handle], principal: email }, guard, queuedTx(repo));
+  const row = await releaseUpload(repo.coreOn(repo.read), repo.blobs, id, { addresses: [handle], principal: email }, guard, queuedTx(repo));
   if (row) {
     writeAudit(repo, "attachment.released", email, `attachment:${row.id}`, {
       identity: handle, filename: row.filename, size: row.size, sha256: row.sha256, ...detail,

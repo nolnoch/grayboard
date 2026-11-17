@@ -9,7 +9,7 @@
 // app gets linked.
 import { randomInt } from "node:crypto";
 
-import { forgetHandle, markHuman, refOf, type CoreDb } from "../core/boards.ts";
+import { forgetHandle, markHuman, refOf } from "../core/boards.ts";
 import { boardNotification, dmNotification } from "../shared/notifications.ts";
 import { HUMAN_NAME } from "../shared/addressing.ts";
 import { Relay, fromSlack, type Bus, type ChannelParams, type RelayStore } from "../bridge/relay.ts";
@@ -45,7 +45,6 @@ const NOT_LINKED =
 
 export type SlackBridgeOptions = {
   repo: Repo;
-  db: CoreDb;
   application: Application;
   appToken: string;
   botToken: string;
@@ -166,7 +165,7 @@ export class SlackBridge implements SlackLinker {
   // `slackUser`: only that Slack account's link (the Slack `unlink` command), re-checked inside the write, since a
   // relink to another account may have committed while it waited.
   unlink(userId: number, slackUser?: string): Promise<boolean> {
-    const { repo, db } = this.o;
+    const { repo } = this.o;
     return repo.write((tx: Tx): boolean => {
       const link = repo.slack.linkFor(tx, userId);
       if (!link || (slackUser !== undefined && link.slack_user !== slackUser)) return false;
@@ -175,7 +174,7 @@ export class SlackBridge implements SlackLinker {
       // starts from the newest message (see linkUser).
       const handle = `${link.email}/${HUMAN_NAME}`;
       repo.aliases.remove(tx, handle);
-      forgetHandle(db, handle);
+      forgetHandle(repo.coreOn(tx), handle);
       writeAudit(repo, "slack.unlinked", link.email, link.slack_user);
       return true;
     }, unlinked => { if (unlinked) this.detach(userId); return unlinked; });
@@ -188,7 +187,7 @@ export class SlackBridge implements SlackLinker {
   }
 
   private async linkUser(slackUser: string, channel: string, ts: string, code: string): Promise<void> {
-    const { repo, db } = this.o;
+    const { repo } = this.o;
     const now = Date.now();
     const t = this.tries.get(slackUser);
     if (t && t.until > now && t.n >= MAX_TRIES) {
@@ -238,14 +237,14 @@ export class SlackBridge implements SlackLinker {
       const handle = `${user.email}/${HUMAN_NAME}`;
       if (!repo.aliases.find(tx, handle)) {
         // Start from now: drop what queued for an earlier link's alias.
-        forgetHandle(db, handle);
+        forgetHandle(repo.coreOn(tx), handle);
         repo.aliases.create(tx, { scope_kind: "person", scope_ref: user.email, name: HUMAN_NAME }, user.email);
         writeAudit(repo, "alias.created", user.email, handle, { slack: true });
         onAliasCreated(repo, tx, user.id, handle);
         const newest = repo.messages.history(tx, [handle], undefined, 1)[0];
         if (newest) repo.cursors.advance(tx, handle, "direct", handle, newest.id);
       }
-      markHuman(db, handle, true);
+      markHuman(repo.coreOn(tx), handle, true);
       writeAudit(repo, "slack.linked", user.email, slackUser);
       return { moved, link: repo.slack.linkFor(tx, user.id)! };
     }, (r): Linked & { attached?: Promise<void> } => {
@@ -288,7 +287,7 @@ export class SlackBridge implements SlackLinker {
   // ── a linked user's human ──────────────────────────────────────────────────
 
   private async attach(link: SlackLink): Promise<void> {
-    const { repo, db } = this.o;
+    const { repo } = this.o;
     const user = repo.users.findById(link.user_id);
     if (!user || user.disabled_at !== null || this.stopped) return;
     const prefix = `${link.email}/`;
@@ -401,7 +400,7 @@ export class SlackBridge implements SlackLinker {
       // In process: the read check the download route makes, and the store an
       // upload makes, audited the same way.
       async attachment(id) {
-        const read = requestAttachment(repo, repo.read, db, handle, String(id), null, { user: link.email, address: handle }, { via: "slack" });
+        const read = requestAttachment(repo, repo.read, handle, String(id), null, { user: link.email, address: handle }, { via: "slack" });
         if ("refused" in read) throw new Error(read.refused);
         const { row } = read;
         return { id: row.id, filename: row.filename, type: row.type, size: row.size, sha256: row.sha256, data: await repo.blobs.get(row.sha256) };
@@ -412,12 +411,12 @@ export class SlackBridge implements SlackLinker {
         const ids: number[] = [];
         let sent = false;
         try {
-          for (const f of files) ids.push((await storeUpload(repo, db, link.email, handle, f, { slack_file: f.slack_file })).id);
+          for (const f of files) ids.push((await storeUpload(repo, link.email, handle, f, { slack_file: f.slack_file })).id);
           const r = await send({ attachment_ids: ids });
           sent = (r as { ok?: boolean }).ok !== false;
           return r;
         } finally {
-          if (!sent) for (const id of ids) await releaseStored(repo, db, link.email, handle, id, { via: "slack" });
+          if (!sent) for (const id of ids) await releaseStored(repo, link.email, handle, id, { via: "slack" });
         }
       },
     };
