@@ -360,7 +360,7 @@ export async function attachmentUpload(req: Request, url: URL, authed: AuthedUse
 export async function attachmentDownload(idStr: string, url: URL, authed: AuthedUser, repo: Repo, guard?: Guard): Promise<Response> {
   const handle = await queryAs(url, authed, repo);
   if (handle instanceof Response) return handle;
-  const read = requestAttachment(repo, repo.read, handle, idStr, authed.user_email, { user: authed.user_email, address: handle });
+  const read = await requestAttachment(repo, repo.read, handle, idStr, authed.user_email, { user: authed.user_email, address: handle });
   if ("refused" in read) return jsonErr("not_found", read.refused, 404);
   const { row } = read;
   // Audited once the bytes are in hand, so a failed read isn't logged as a download.
@@ -377,7 +377,7 @@ export async function attachmentDownload(idStr: string, url: URL, authed: Authed
   await guard?.(tx);
   if (guard) {
     // A refusal here is a decision too (#851); the transaction returns, so its rows commit.
-    const current = requestAttachment(repo, tx, handle, String(row.id), authed.user_email, { user: authed.user_email, address: handle });
+    const current = await requestAttachment(repo, tx, handle, String(row.id), authed.user_email, { user: authed.user_email, address: handle });
     if ("refused" in current || current.row.sha256 !== row.sha256) return notFound();
   }
   writeAudit(repo, tx, "attachment.downloaded", authed.user_email, `attachment:${row.id}`, { identity: handle, sha256: row.sha256 });
@@ -729,7 +729,7 @@ export async function handleHttp(
   if (path === "/api/slack/link" && !slack!.running) {
     return jsonErr("not_found", "this server's Slack bridge isn't running (its admin checks the server log)", 404);
   }
-  if (path === "/api/slack/link" && method === "POST") return json(slack!.newCode(authed));
+  if (path === "/api/slack/link" && method === "POST") return json(await slack!.newCode(authed));
   if (path === "/api/slack/unlink" && method === "POST") {
     return (await slack!.unlink(authed.user_id)) ? json({ ok: true }) : jsonErr("not_found", "you have no Slack link", 404);
   }

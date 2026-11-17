@@ -368,11 +368,11 @@ test("#807: an HTTP unlink while another body holds the write queue waits, then 
   const holder = holdQueue();
   const unlinked = srv.app.slack!.unlink(userId);
   await ticks();
-  expect(srv.app.repo.slack.linkFor(srv.app.repo.read, userId)).toBeDefined();
+  expect((await srv.app.repo.slack.linkFor(srv.app.repo.read, userId))).toBeDefined();
   holder.release();
   await holder.done;
   expect(await unlinked).toBe(true);
-  expect(srv.app.repo.slack.linkFor(srv.app.repo.read, userId)).toBeUndefined();
+  expect((await srv.app.repo.slack.linkFor(srv.app.repo.read, userId))).toBeUndefined();
 });
 
 // #807 D4: a Slack user's tool call is one transaction through the write queue, as a hosted call is.
@@ -596,7 +596,7 @@ test("#807: an unlink for one Slack account leaves a link that moved to another 
   await link(alice);
   const userId = (await srv.app.repo.users.findByEmail(srv.app.repo.read, "alice@example.com"))!.id;
   expect(await srv.app.slack!.unlink(userId, "U0SOMEONEELSE")).toBe(false);
-  expect(srv.app.repo.slack.linkFor(srv.app.repo.read, userId)).toMatchObject({ slack_user: ALICE_SLACK });
+  expect((await srv.app.repo.slack.linkFor(srv.app.repo.read, userId))).toMatchObject({ slack_user: ALICE_SLACK });
   expect(await srv.app.slack!.unlink(userId, ALICE_SLACK)).toBe(true);
 });
 
@@ -610,7 +610,7 @@ test("#807: a rolled-back unlink leaves the link and its human online", async ()
   try {
     expect((await api(alice, "POST", "/api/slack/unlink")).status).not.toBe(200);
   } finally { spy.mockRestore(); }
-  expect(srv.app.repo.slack.linkFor(srv.app.repo.read, userId)).toBeDefined();
+  expect((await srv.app.repo.slack.linkFor(srv.app.repo.read, userId))).toBeDefined();
   expect(await srv.app.repo.aliases.find(srv.app.repo.read, "alice@example.com/human")).toBeDefined();
   const sent = await be.call<SendResult>("dm_send", { to: "human", body: "still linked?" });
   expect(sent.delivered_now).toBe(true);
@@ -627,7 +627,7 @@ test("#807: a rolled-back link leaves no link, no human identity and nothing att
     slack.say(`link ${r.body.code}`);
     await until(() => spy.mock.calls.some((c) => c.map(String).join(" ").includes("audit refused")), 5000, "the link's failure was logged");
   } finally { spy.mockRestore(); }
-  expect(srv.app.repo.slack.linkFor(srv.app.repo.read, userId)).toBeUndefined();
+  expect((await srv.app.repo.slack.linkFor(srv.app.repo.read, userId))).toBeUndefined();
   expect(await srv.app.repo.aliases.find(srv.app.repo.read, "alice@example.com/human")).toBeUndefined();
   expect((await api(alice, "GET", "/api/whoami")).body.identities).not.toContain("human");
 });
@@ -906,6 +906,29 @@ test("an attach that fails after a newer one for the same user went live leaves 
   await until(() => slack.posts().find((p) => p.markdown_text?.includes("still there?")));
 }, 30_000);
 
+// #807 P3 A7i: attach's stale check reads the link, then the stop flag, so a stop that lands while that read awaits
+// is seen. The third link read on the write's Tx is the late check's (the first check's, then the hello's, then it).
+test("#807 P3 A7i: a bridge stop during attach's last link read refuses the attach", async () => {
+  const alice = await login("alice@example.com");
+  await link(alice);
+  const bridge = srv.app.slack!, repo = srv.app.repo;
+  const id = (await seed(repo, tx => repo.users.upsertByEmail(tx, "alice@example.com", null))).id;
+  const original = repo.slack.linkFor.bind(repo.slack);
+  let onTx = 0;
+  const reads = spyOn(repo.slack, "linkFor").mockImplementation(async (r, userId) => {
+    const row = await original(r, userId);
+    if (r !== repo.read && ++onTx === 3) bridge.stop();
+    return row;
+  });
+  const attach = spyOn(srv.app.application, "attachHuman");
+  try {
+    await bridge.userChanged(id);
+    expect(onTx).toBe(3);
+    expect(attach).toHaveBeenCalledTimes(1);
+    await expect(attach.mock.results[0]!.value).rejects.toThrow("the Slack bridge stopped");
+  } finally { reads.mockRestore(); attach.mockRestore(); }
+}, 30_000);
+
 // #805 F-05: a link code proves the CLI's token, not who sends it. Only the
 // Slack account whose email is the user's may redeem it; a stolen code sent
 // from another account is refused, used up, and leaves the link as it was.
@@ -917,7 +940,7 @@ test("a link code redeemed from a Slack account with another email is refused an
   const seen = slack.posts().length;
   slack.say(`link ${r.body.code}`, { user: "U0MALLORY", channel: "D0MALLORY" });
   await until(() => slack.posts().slice(seen).find((p) => p.channel === "D0MALLORY" && p.markdown_text?.includes("email isn't `alice@example.com`")));
-  expect(srv.app.repo.slack.linkFor(srv.app.repo.read, (await srv.app.repo.users.findByEmail(srv.app.repo.read, "alice@example.com"))!.id)).toMatchObject({ slack_user: ALICE_SLACK, dm_channel: DM });
+  expect((await srv.app.repo.slack.linkFor(srv.app.repo.read, (await srv.app.repo.users.findByEmail(srv.app.repo.read, "alice@example.com"))!.id))).toMatchObject({ slack_user: ALICE_SLACK, dm_channel: DM });
   expect(accessAudits(srv.app.db, "slack.link_refused").map((row) => [row.actor, row.target, row.detail])).toEqual([["alice@example.com", "U0MALLORY", { reason: "email_mismatch" }]]);
 
   // Used up: the right account can't redeem it after the refusal.
@@ -933,7 +956,7 @@ test("without the email scope, a link is refused with what the admin must add", 
   const r = await api(alice, "POST", "/api/slack/link");
   slack.say(`link ${r.body.code}`);
   await until(() => slack.posts().find((p) => p.markdown_text?.includes("users:read.email")));
-  expect(srv.app.repo.slack.linkFor(srv.app.repo.read, (await srv.app.repo.users.findByEmail(srv.app.repo.read, "alice@example.com"))!.id)).toBeUndefined();
+  expect((await srv.app.repo.slack.linkFor(srv.app.repo.read, (await srv.app.repo.users.findByEmail(srv.app.repo.read, "alice@example.com"))!.id))).toBeUndefined();
   expect(accessAudits(srv.app.db, "slack.link_refused").map((row) => row.detail)).toEqual([{ reason: "no_email" }]);
 }, 30_000);
 
@@ -946,7 +969,7 @@ test("when Slack can't be reached to check the email, the link is refused with a
   slack.say(`link ${r.body.code}`);
   const reply = await until(() => slack.posts().find((p) => p.markdown_text?.includes("couldn't reach Slack")));
   expect(reply.markdown_text).not.toContain("users:read.email");
-  expect(srv.app.repo.slack.linkFor(srv.app.repo.read, (await srv.app.repo.users.findByEmail(srv.app.repo.read, "alice@example.com"))!.id)).toBeUndefined();
+  expect((await srv.app.repo.slack.linkFor(srv.app.repo.read, (await srv.app.repo.users.findByEmail(srv.app.repo.read, "alice@example.com"))!.id))).toBeUndefined();
   expect(accessAudits(srv.app.db, "slack.link_refused").map((row) => row.detail)).toEqual([{ reason: "slack_unavailable" }]);
 }, 30_000);
 

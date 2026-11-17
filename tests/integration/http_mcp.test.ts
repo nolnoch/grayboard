@@ -97,7 +97,7 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: HTTP delegation u
   const result = value(await client.callTool({ name: "delegate", arguments: { persona: "a researcher", task: "inspect the fixture", to: "AlLoWeD" } }));
   expect(result).toMatchObject({ to: "alice@example.com/allowed", delivered_now: true, pending: true });
   expect(result.note).toContain("settle the thread");
-  expect(app.repo.messages.getById(app.repo.read, result.message_id)).toMatchObject({ sender: "alice@example.com/be", recipient: "alice@example.com/allowed", pending: 1 });
+  expect((await app.repo.messages.getById(app.repo.read, result.message_id))).toMatchObject({ sender: "alice@example.com/be", recipient: "alice@example.com/allowed", pending: 1 });
   expect(JSON.parse((await app.repo.audit.last(app.repo.read, "delegation.requested", "alice@example.com/allowed"))!.detail!)).toMatchObject({ via: "explicit", message_id: result.message_id });
   expect((value(await client.callTool({ name: "peer_list", arguments: {} })).peers as { handle: string; launcher?: boolean }[]).find(p => p.handle === "alice@example.com/be")?.launcher).toBeUndefined();
 });
