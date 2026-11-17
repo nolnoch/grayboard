@@ -248,7 +248,7 @@ test("board_archive: the creator retires a board; others still read and reply by
   await a.call("board_create", { name: "task-1", purpose: "One task" });
   const root = (await bs.call<BoardPostResult>("board_post", { board: "task-1", body: "started" })).post_id;
   await a.next(board());
-  await expect(as.call("board_archive", { board: "task-1" })).rejects.toMatchObject({ message: `only #task-1's creator (${A}/be) or your user can archive or reopen it` });
+  await expect(as.call("board_archive", { board: "task-1" })).rejects.toMatchObject({ message: `only #task-1's creator (${A}/be) or its user (${A}, from Slack: archive #task-1 / reopen #task-1) can archive or reopen it` });
   await expect(a.call("board_archive", { board: "eng" })).rejects.toMatchObject({ message: "#eng belongs to the bus itself and can't be archived" });
   expect(await a.call("board_archive", { board: "task-1" })).toMatchObject({ name: "task-1", archived_by: `${A}/be` });
 
@@ -257,6 +257,11 @@ test("board_archive: the creator retires a board; others still read and reply by
   await bs.call("board_post", { board: "task-1", body: "done", parent_id: root });
   expect((await a.next(board())).event.item).toMatchObject({ post: { body: "done", parent_id: root } });
   expect((await bs.call<ReadResult>("board_read", { board: "task-1", before_id: 999 })).posts.map((p) => p.body)).toEqual(["started", "done"]);
+
+  // A team alias's board names no user who may archive it from Slack (#848).
+  const deploy = await srv.hosted(A, "eng/deploy");
+  await deploy.call("board_create", { name: "rollout", purpose: "Team rollout" });
+  await expect(a.call("board_archive", { board: "rollout" })).rejects.toMatchObject({ message: "only #rollout's creator (eng/deploy) can archive or reopen it" });
 });
 
 // #848: board_archive acts as the address that sees the board (BOARD_USES), as board_read does: a session whose

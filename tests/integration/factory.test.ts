@@ -899,10 +899,10 @@ test("an archived fleet or work board is named as archived, not retried", async 
   };
   const { logs, done } = loop({ runner, bus, maxConcurrent: 1, fleets: [{ name: "sim", agent: "researcher" }, { name: "be", agent: "researcher" }] });
   await until(() => logs.some((l) => l.includes("#be-tasks")), 5000, "the sync");
-  expect(logs).toContain(`fleet be: #be-tasks is archived; its creator or their user reopens it (Slack: "reopen #be-tasks"), then the fleet joins it`);
+  expect(logs).toContain(`fleet be: #be-tasks is archived; its creator reopens it with board_archive(board, false), or, for a user's board, that user from Slack: "reopen #be-tasks", then the fleet joins it`);
   bus.deliver(task(7));
   await until(() => bus.replies(7).length === 2, 5000, "7 couldn't fan out");
-  expect(bus.replies(7)[1]).toBe(`[factory] failed: #sim-work, where sim's subtasks would go, is archived; its creator or their user reopens it (Slack: "reopen #sim-work"). Nothing was fanned out.`);
+  expect(bus.replies(7)[1]).toBe(`[factory] failed: #sim-work, where sim's subtasks would go, is archived; its creator reopens it with board_archive(board, false), or, for a user's board, that user from Slack: "reopen #sim-work". Nothing was fanned out.`);
   expect(workCreates).toBe(1);
   await bus.close();
   await done;

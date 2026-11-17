@@ -121,5 +121,10 @@ export function serverAccess(repo: Repo, db: CoreDb, humanReach: HumanReach = "t
       const h = repo.resolver.principalOf(human), a = repo.resolver.principalOf(address);
       return h?.kind === "user" && a?.kind === "user" && h.name === a.name;
     },
+
+    ownerOf(address) {
+      const p = repo.resolver.principalOf(address);
+      return p?.kind === "user" ? p.name : null;
+    },
   };
 }

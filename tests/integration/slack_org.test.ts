@@ -1068,7 +1068,7 @@ test("the Slack human archives and reopens its own user's boards, not another us
   const reacted = (ts: string) => until(() => slack.reactions().some((r) => r.timestamp === ts), 5000, "the reaction reached Slack");
 
   const refused = slack.say("archive #theirs");
-  expect((await reply(refused.ts)).markdown_text).toBe("⚠️ not archived: only #theirs's creator (bob@example.com/fe) or your user can archive or reopen it");
+  expect((await reply(refused.ts)).markdown_text).toBe("⚠️ not archived: only #theirs's creator (bob@example.com/fe) or its user (bob@example.com, from Slack: archive #theirs / reopen #theirs) can archive or reopen it");
   expect(await listed()).toContain("theirs");
 
   await reacted(slack.say("archive #mine").ts);
