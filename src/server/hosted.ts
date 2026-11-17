@@ -758,12 +758,14 @@ export function createHostedSessions(application: Application, options: { now?: 
         } catch (error) { if (!done) await late.flushQueued(); throw error; }
       });
     },
-    async control<T>(p: OAuthPrincipal, context: SessionContext, writer: boolean, fn: (row: HostedSession) => Promise<T> | T): Promise<T> {
+    // `absent`: an ending call's answer for an ID the server doesn't hold, which it then doesn't admit (#1097).
+    async control<T>(p: OAuthPrincipal, context: SessionContext, writer: boolean, fn: (row: HostedSession) => Promise<T> | T, absent?: () => T): Promise<T> {
       return withGate(p, context, writer, async row => {
+        if (!row && absent) return absent();
         if (!row) throw new ApplicationError("unbound", "unbound; bind a name first");
         rootOnly(row);
         return fn(row);
-      });
+      }, true, true, true, !absent);
     },
     // `held`: every hold, oldest first, and `primary` the one it sends as (#451): the client's
     // hold list, which the Controller restarts on when it changes (a bind, an unbind, a revocation).

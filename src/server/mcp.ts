@@ -40,6 +40,8 @@ export function claimsModern(body: unknown): boolean {
   return isPlainObject(meta) && PROTOCOL_VERSION_META_KEY in meta;
 }
 
+// Subscriber calls that end a session: their selection admits no unknown ID (#1097).
+const ENDING_CALLS = new Set<unknown>(["session_end", "delivery_release"]);
 export const MCP_PROTOCOL_VERSIONS = ["2026-07-28", "2025-11-25", "2025-06-18"];
 type CallToolResult = z.infer<typeof CallToolResultSchema>;
 const id = z.number().int().positive();
@@ -217,9 +219,9 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     try {
       if (admit) application.admitHosted(principal.authed, "id" in routing ? routing.id : null, role);
       // A native tool call's end is touched by its tool's gate, which also reuses this selection's verdict (#907). A
-      // subscriber's session_end admits no unknown ID (#1097): ending must never start a session.
+      // subscriber's ending call admits no unknown ID (#1097): ending must never start a session.
       const exchange = exchanges.getStore();
-      selected = await hosted.snapshot(principal, routing, !(role === "native" && exchange?.method === "tools/call"), !(role === "subscriber" && exchange?.call === "session_end"));
+      selected = await hosted.snapshot(principal, routing, !(role === "native" && exchange?.method === "tools/call"), !(role === "subscriber" && ENDING_CALLS.has(exchange?.call)));
     } catch (error) {
       const exchange = exchanges.getStore();
       if (exchange && error instanceof ApplicationError && error.code === "rate_limited" && typeof error.extra.retry_after_ms === "number" && Number.isFinite(error.extra.retry_after_ms) && error.extra.retry_after_ms > 0) {

@@ -36,11 +36,11 @@ afterEach(async () => {
 function issue(email = "alice@example.com") {
   return issueOAuth(app.repo, app.oauth.resource, email, ["grayboard:tools", "grayboard:delivery"], Date.now(), OPENCODE_CLIENT);
 }
-async function connect(version: string, token: string, source: string) {
+async function connect(version: string, token: string, source: string, headers: Record<string, string> = {}) {
   const client = new Client({ name: "session-end-test", version: "1" }, { supportedProtocolVersions: [version], versionNegotiation: { mode: version === "2026-07-28" ? { pin: version } : "legacy" } });
   clients.push(client);
   await client.connect(new StreamableHTTPClientTransport(new URL(`${base}/mcp`), {
-    requestInit: { headers: { Authorization: `Bearer ${token}`, "X-Grayboard-Client": "subscriber" } },
+    requestInit: { headers: { Authorization: `Bearer ${token}`, "X-Grayboard-Client": "subscriber", ...headers } },
     fetch: async (input, init) => fetch(await withMeta(new Request(input, init), OPENCODE_SESSION_META, source)),
   }));
   return client;
@@ -154,24 +154,30 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: a parked child's 
   expect(app.db.query("SELECT 1 FROM access_log WHERE action = 'hosted.child_unparked'").all()).toEqual([]);
 });
 
-// #1097: session_end under an ID the server no longer holds ends nothing and starts nothing: no row, no ownership, no
-// audit. An SDK client's connect (server/discover) admits its ID as any session start does, so over HTTP this is the
-// row ending between that connect and the call (here the server releases it); neither the call's exchange nor its
-// tool gate admits the ID again. The direct call covers the tool's gate for an ID never seen.
-test("session_end under an unknown ID writes nothing and reports ended: false", async () => {
+// #1097: an ending call (session_end, delivery_release) under an ID the server no longer holds ends nothing and starts
+// nothing: no row, no ownership, no audit but the stale lease's own refusal row. A client's connect admits its ID as any
+// session start does (#1099; on the legacy protocols the standing GET stream too, so only the stateless protocol can
+// put the row's end between connect and the calls), so over HTTP this is the row ending after the connect (here the
+// server releases it), as the controller's release sends the two calls. The direct calls cover the tool gates for an
+// ID never seen.
+test("ending calls under an unknown ID write nothing; session_end reports ended: false", async () => {
   const grant = await issue();
-  const stranger = await connect("2026-07-28", grant.token, "gone-before-end");
+  const stranger = await connect("2026-07-28", grant.token, "gone-before-end", { "X-Grayboard-Lease": "a".repeat(43) });
   const [admitted] = app.repo.hosted.all(app.repo.read);
   await app.mcp.sessions.release(admitted!.session_id, "closed");
   expect(hostedRowCount(app.db)).toBe(0);
-  const audits = () => app.db.query<{ n: number }, []>("SELECT count(*) AS n FROM access_log").get()!.n;
+  const audits = () => app.db.query<{ action: string }, []>("SELECT action FROM access_log ORDER BY rowid").all().map(a => a.action);
   const before = audits();
-  expect(await value(stranger, "session_end")).toEqual({ ended: false });
+  expect((await stranger.callTool({ name: "delivery_release", arguments: {} })).isError).toBe(true);
   expect(hostedRowCount(app.db)).toBe(0);
-  expect(audits()).toBe(before);
+  expect(audits()).toEqual([...before, "hosted.stale_capability"]);
+  expect(await value(stranger, "session_end")).toEqual({ ended: false });
   const principal = app.oauth.authenticate(new Request(`${base}/mcp`, { headers: { Authorization: `Bearer ${grant.token}` } }));
   if (principal instanceof Response) throw new Error("fixture authorization failed");
-  expect(await app.mcp.sessions.end(principal, sessionContext(principal, { "ai.opencode/sessionID": "never-seen" }))).toEqual({ ended: false });
+  const unseen = sessionContext(principal, { "ai.opencode/sessionID": "never-seen" });
+  expect(await app.mcp.sessions.end(principal, unseen)).toEqual({ ended: false });
+  expect(await app.mcp.sessions.control(principal, unseen, true, () => "ran", () => "absent")).toBe("absent");
+  expect(await app.mcp.delivery.release(principal, unseen, "a".repeat(43))).toBeUndefined();
   expect(hostedRowCount(app.db)).toBe(0);
-  expect(audits()).toBe(before);
+  expect(audits()).toEqual([...before, "hosted.stale_capability"]);
 });
