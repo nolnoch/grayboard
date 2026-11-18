@@ -688,7 +688,8 @@ test("a claim's watchers are mentioned on its release or expiry, in any mode, on
   expect(() => watch(db, "sim", "boardless")).toThrow(/renew it with board=/);
 
   expect(release(db, "be", "dev:env", "done, reset complete").wake.sort()).toEqual(["fe", "sim"]);
-  expect(drain("sim")).toMatchObject([{ kind: "push", reason: "mention", post: { body: "[release] dev:env — done, reset complete cc @sim @fe" } }]);
+  // Watchers are cc'd by handle, not in watch order: one order for every cc, and one a store with no row order can give (#807 B5b3a).
+  expect(drain("sim")).toMatchObject([{ kind: "push", reason: "mention", post: { body: "[release] dev:env — done, reset complete cc @fe @sim" } }]);
   expect(drain("fe")).toMatchObject([{ kind: "push", reason: "mention" }]);
 
   // Watches end with the claim; a later one on the key starts without them.
