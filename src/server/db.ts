@@ -1085,10 +1085,10 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
   const att = (c: Database, rows: MessageRow[]) => withAttachments(c, "message", rows);
   // Role bindings (#927). Every read and write is one statement on the caller's handle; grant and revoke re-check
   // the granter's authority in their own statement, and revoke holds the last-owner guard, so every writer
-  // (the admin routes, `team add --role`, team creation, member removal) gets both. The Postgres port is a straight
-  // translation: grant's INSERT ... SELECT ... ON CONFLICT DO NOTHING RETURNING, revoke's DELETE ... RETURNING, plus
-  // a FOR SHARE on the team's row before a team_owner grant and D3's FOR UPDATE on it before the last-owner count;
-  // SQLite's single writer serializes them.
+  // (the admin routes, `team add --role`, team creation, member removal) gets both. SQLite's single writer serializes
+  // them. The Postgres port (store/pg/identity.ts) keeps the statements but not the reasoning: under READ COMMITTED
+  // the in-statement re-checks don't exclude a concurrent revoke, so every role-binding writer takes one advisory lock
+  // first (D3), and the refusals thrown after a write run in the store's own savepoint.
   const BINDING_SQL = `SELECT b.id, b.principal_id, p.name AS principal, b.role, b.scope_id, s.name AS scope, b.granted_by, g.name AS granter, b.granted_at
     FROM role_bindings b JOIN principals p ON p.id = b.principal_id LEFT JOIN principals s ON s.id = b.scope_id LEFT JOIN principals g ON g.id = b.granted_by`;
   const bindingById = (c: Database, id: number): RoleBinding | undefined =>
@@ -1122,8 +1122,8 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
         if (c && c.owners === 0 && c.members > 1) throw new LastOwner(c.team, "team");
       }
       // Every service keeps an owner (#270 D1), with no sole-member exception: the owner is its accountability record.
-      // SQLite's single writer serializes this count with any concurrent revoke; the Postgres port locks the service's
-      // principal row (FOR UPDATE) before it, as D3 does the team's.
+      // SQLite's single writer serializes this count with any concurrent revoke; the Postgres port takes the role-write
+      // advisory lock before the revoke, as for a team's (D3).
       if (role === "service_owner" && scopeId !== null) {
         const c = db.query<{ owners: number; name: string }, [number, number]>(
           `SELECT (SELECT COUNT(*) FROM role_bindings WHERE scope_id = ? AND role = 'service_owner') AS owners, ps.name

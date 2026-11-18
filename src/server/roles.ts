@@ -4,7 +4,7 @@
 import type { Repo } from "./db.ts";
 import { ROLES, type Decision, type Role } from "./policy.ts";
 import { LastOwner } from "./store/errors.ts";
-import type { AuditFields, RoleAuthority, RoleBinding } from "./store/identity.ts";
+import type { AuditFields, RoleAuthority, RoleBinding, RoleGrant } from "./store/identity.ts";
 import type { Tx } from "./store/tx_base.ts";
 
 export type RoleSpec = { holder: string; role: Role; scope: string | null };
@@ -65,10 +65,11 @@ async function resolve(repo: RoleStores, tx: Tx, spec: RoleSpec): Promise<Refusa
 // answers an existing member), or the refusal.
 export async function grantRole(repo: RoleStores, tx: Tx, spec: RoleSpec, g: Granter, audit: AuditFields = {}): Promise<RoleOutcome> {
   const role = ROLES[spec.role];
-  const b = await repo.roles.grant(tx, {
+  const grant: RoleGrant = {
     holder: spec.holder, role: spec.role, scope: spec.scope, holderKinds: role.holders, scopeKind: role.scope,
     member: spec.role === "team_owner", by: g.email, byUser: g.userId, authority: g.authority, actor: g.email, audit,
-  });
+  };
+  const b = await repo.roles.grant(tx, grant);
   if (b) return { binding: b, changed: true };
   const missing = await resolve(repo, tx, spec);
   if (missing) return { refused: missing };
@@ -79,6 +80,12 @@ export async function grantRole(repo: RoleStores, tx: Tx, spec: RoleSpec, g: Gra
   if (!(await authorityHolds(repo, tx, g, spec))) return refuse(403, "forbidden", `${g.email} no longer holds the role that allowed this grant`);
   const held = await repo.roles.find(tx, spec.holder, spec.role, spec.scope);
   if (held) return { binding: held, changed: false };
+  // Every read above found the grant's preconditions met. On Postgres (READ COMMITTED) each read is a newer snapshot
+  // than the grant's statement, so a precondition that committed in between (the holder's sign-in, the scope's
+  // creation, the membership) passes here though the statement missed it (#807 P3 C3 R6). One more attempt, a new
+  // statement, sees it; SQLite's single writer makes it a no-op repeat.
+  const again = await repo.roles.grant(tx, grant);
+  if (again) return { binding: again, changed: true };
   if (spec.role === "team_owner") {
     return refuse(409, "conflict", `${spec.holder} isn't a member of team "${spec.scope}"; an owner is a member: add them first with grayboard team add ${spec.scope} ${spec.holder}`);
   }

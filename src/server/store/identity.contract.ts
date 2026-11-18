@@ -14,8 +14,8 @@
 //   policy no setter writes) and the raw reads (principal rows, audit rows) are the harness's, so no row touches a
 //   connection. users.setDisabled isn't used: Postgres ports it with the hosted store (C8).
 // - Rows that force an interleaving with a SQLite trigger are registered on SQLite only (`sqliteOnly`), with their
-//   reason. Postgres needs its own two-connection test for each in C3b's pg/identity.pg.test.ts: T-C3-6 for the
-//   teams.create name race, and T-C3-5b (still to write) for the sign-in link race below.
+//   reason. Postgres runs each as a two-connection race in pg/identity.pg.test.ts: T-C3-6 for the teams.create name
+//   race, T-C3-5b for the sign-in link race below.
 import { expect, test } from "bun:test";
 import { grantRole, revokeRole, type Granter, type RoleSpec } from "../roles.ts";
 import { authorize, type AuthzRequest } from "../policy.ts";
@@ -181,10 +181,8 @@ function users(it: It, sqliteOnly: (name: string, why: string, fn: (h: IdentityS
 
   // D3: the link is a conditional write. A trigger links the row to another account between signIn's read and its
   // write (what a concurrent sign-in does on Postgres) and drops signIn's own update: signIn re-reads and refuses.
-  // No Postgres test covers this race yet (security audit F-13: one unlinked email row, two sign-ins from the same
-  // issuer with different subjects). T-C3-5 is a different race (two emails, one subject). C3b adds T-C3-5b: A links
-  // (G, s-A) and holds, B links (G, s-B) and blocks; B ends subject_mismatch and the row keeps s-A. It must fail when
-  // the link's `idp_subject IS NULL` guard is dropped, and has an issuer variant (B from OKTA: issuer_mismatch).
+  // On Postgres, T-C3-5b (pg/identity.pg.test.ts) runs it with two connections (security audit F-13: one unlinked
+  // email row, two sign-ins with different subjects), from the same issuer and from another.
   for (const [winner, status] of [[OKTA, "issuer_mismatch"], [G, "subject_mismatch"]] as const) {
     sqliteOnly(`users.signIn: a row linked between the read and the conditional write ends in ${status}, not a double link`, "a trigger forces the interleaving", async h => {
       const u = await upsert(h, "race@example.com");
@@ -324,6 +322,9 @@ function teams(it: It, sqliteOnly: (name: string, why: string, fn: (h: IdentityS
       await h.teams.addMember(tx, ts[0]!.id, u3.id),
     ]);
     expect(added).toEqual([true, true, true, true, true, false]);
+    // On Postgres an UPDATE writes the row's new version at the end of the heap, so a scan with no ORDER BY now meets
+    // u1 and t1 last: the id order below must come from the reads' ORDER BY. SQLite updates in place.
+    await h.write(async tx => { await h.users.upsertByEmail(tx, A, "Ada"); await h.teams.setPolicy(tx, ts[0]!.id, "open"); });
     expect(await h.teams.isMember(h.read, ts[0]!.id, u2.id)).toBe(true);
     expect(await h.teams.isMember(h.read, ts[1]!.id, u2.id)).toBe(false);
     expect((await h.teams.listForUser(h.read, u1.id)).map(t => t.id)).toEqual(ts.map(t => t.id));

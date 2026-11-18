@@ -1,6 +1,7 @@
 // #807 P3 C1: the row mappers, and what Bun.SQL actually returns for int8 (the second half needs Postgres).
 import { expect, test } from "bun:test";
 import { describePg, pgEmptyDatabase } from "../../../../tests/support/pg.ts";
+import type { AuditFields } from "../identity.ts";
 import { int8, int8OrNull, type JsonParam } from "./sql.ts";
 
 test("int8 maps strings, numbers and bigints to a safe integer and refuses the rest", () => {
@@ -20,11 +21,15 @@ test("int8 maps strings, numbers and bigints to a safe integer and refuses the r
   expect(() => int8OrNull("x")).toThrow("not a safe integer");
 });
 
-test("JsonParam refuses a string", () => {
-  const ok: JsonParam = { a: [1, true, null, { b: 2 }] };
+test("JsonParam refuses a string at the top, and takes strings inside", () => {
+  const ok: JsonParam = { a: [1, true, null, { b: 2, c: "x" }], d: "y", e: ["z"] };
+  // An audit row's detail as the identity store builds it (#807 P3 C3b): AuditFields fit with no cast.
+  const audit: AuditFields = { as_admin: true, via: "test" };
+  const detail: JsonParam = { binding: 1, scope: null, ...audit };
   // @ts-expect-error a string bound to ::jsonb is stored as a JSON string scalar, not parsed
   const bad: JsonParam = JSON.stringify(ok);
   expect(typeof bad).toBe("string");
+  expect(detail).toMatchObject({ via: "test" });
 });
 
 describePg("Bun.SQL's int8 (the mappers exist for this)", () => {
