@@ -30,6 +30,7 @@ import { detached, inRequest, requestOrigin } from "./request_context.ts";
 import { GOOGLE_ISSUER } from "./idp_google.ts";
 import { LOGIN_SCOPE } from "./oauth-config.ts";
 import { OAUTH_TTL, type OAuthStore, type OAuthBinding, type OAuthAuthorization, type OAuthRequest, type OAuthBrowserSession, type OAuthCode, type OAuthGrant, type OAuthTokenPair, type OAuthAccess, type OAuthFailure } from "./oauth-types.ts";
+import { LastOwner, PrincipalTaken } from "./store/errors.ts";
 
 // Row types
 // idp_issuer + idp_subject: the IdP that proved the user's email and its stable
@@ -1075,17 +1076,8 @@ export type TeamRole = "owner" | "member";
 export type TeamMember = { user_id: number; email: string; role: TeamRole };
 const OWNER_SQL = `(tm.role = 'owner' OR (tm.role IS NULL AND tm.user_id = (SELECT created_by FROM teams WHERE id = tm.team_id)))`;
 
-export class LastOwner extends Error {
-  constructor(readonly team: string) {
-    super(`the last owner of team "${team}" can't leave while others remain; make another member an owner first: grayboard team add ${team} <email> --role owner`);
-  }
-}
-
-export class PrincipalTaken extends Error {
-  constructor(readonly name: string) {
-    super(`the name "${name}" belongs to another team or service principal`);
-  }
-}
+// Moved to store/errors.ts for the Postgres store; re-exported for http.ts and the tests.
+export { LastOwner, PrincipalTaken } from "./store/errors.ts";
 
 // The column a write's UNIQUE violation names ("principals.name"), or undefined for any other error. D6 classifies
 // Postgres's 23505 by its constraint in P3; on SQLite the message is the only place the column appears.
