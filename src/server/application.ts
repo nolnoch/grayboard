@@ -25,7 +25,7 @@ import { authorize, recordDecision, type Actor, type AuthzRequest, type Decision
 import { serverAuditSink, writeAudit } from "./audit.ts";
 import type { AuthedUser } from "./auth.ts";
 import {
-  age, snapshot, canSeeBoard, checkBody, checkPostAccess, parseAliasMeta, pendingKey, refOf,
+  age, checkBody, checkPostAccess, parseAliasMeta, pendingKey, refOf,
   cleanFact, idCollisionText, normalizeBoard, getBoard,
   type AliasMetaSet, type Board, type CoreDb, type PendingRef, type ReadResult, type SnapshotOptions, type UnboundPeer,
 } from "../core/boards.ts";
@@ -1341,7 +1341,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     },
     // Of `boards`, which the session may receive: one of its addresses, as they stand at the call, may see the board;
     // a missing board is false (#807 P3 B5a2). Read on `r`, so inside a body it sees the body's writes. A sync caller
-    // judges the answer with no await since (mcp's `Checked.boards`).
+    // judges the answer later (mcp's `Checked.boards`, read before the hosted row, the check's last await).
     async boardsVisible(r: Read, session: ApplicationSession, boards: Iterable<string>): Promise<Map<string, boolean>> {
       validNow(session);
       return boardsVisibleTo(r, [...session.addresses], boards);
