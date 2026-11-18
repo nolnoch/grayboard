@@ -1,15 +1,19 @@
 // Granting and revoking a role binding (#927), for every writer: the admin role routes, `team add --role` and team
 // creation (http.ts). The store's grant and revoke are one statement each, which re-checks the granter's authority and
 // the binding's preconditions and writes the audit row (db.ts roles); when one writes nothing, the reads here say why.
-import { LastOwner, type Repo, type RoleAuthority, type RoleBinding } from "./db.ts";
+import type { Repo } from "./db.ts";
 import { ROLES, type Decision, type Role } from "./policy.ts";
-import type { Tx } from "./store/tx.ts";
+import { LastOwner } from "./store/errors.ts";
+import type { AuditFields, RoleAuthority, RoleBinding } from "./store/identity.ts";
+import type { Tx } from "./store/tx_base.ts";
 
 export type RoleSpec = { holder: string; role: Role; scope: string | null };
 // Who grants or revokes: their user, and the authority their write re-checks.
 export type Granter = { email: string; userId: number; authority: RoleAuthority };
 export type Refusal = { status: number; code: string; message: string };
 export type RoleOutcome = { binding: RoleBinding; changed: boolean } | { refused: Refusal };
+// The store groups a grant or revoke reads and writes: a Repo's, or another backend's without one (#807 P3 C3a).
+export type RoleStores = Pick<Repo, "roles" | "principals" | "teams">;
 
 const refuse = (status: number, code: string, message: string): RoleOutcome => ({ refused: { status, code, message } });
 
@@ -37,7 +41,7 @@ export function roleSpec(body: { principal?: unknown; role?: unknown; scope?: un
 
 // Whether the granter's authority still holds, read on the write's own transaction: the follow-up to a write that
 // changed nothing.
-async function authorityHolds(repo: Repo, tx: Tx, g: Granter, spec: RoleSpec): Promise<boolean> {
+async function authorityHolds(repo: RoleStores, tx: Tx, g: Granter, spec: RoleSpec): Promise<boolean> {
   if (g.authority === "none") return true;
   if ((await repo.roles.bindingOf(tx, g.userId, "org_admin", null)) !== undefined) return true;
   if (g.authority !== "owner_or_admin" || spec.scope === null) return false;
@@ -46,7 +50,7 @@ async function authorityHolds(repo: Repo, tx: Tx, g: Granter, spec: RoleSpec): P
 }
 
 // The names' principals, or the 404 for the first missing one; a scope must be of the role's kind.
-async function resolve(repo: Repo, tx: Tx, spec: RoleSpec): Promise<Refusal | null> {
+async function resolve(repo: RoleStores, tx: Tx, spec: RoleSpec): Promise<Refusal | null> {
   const kind = ROLES[spec.role].scope;
   if (!(await repo.principals.findByName(tx, spec.holder))) {
     return { status: 404, code: "not_found", message: `no principal named "${spec.holder}"; a user must sign in to grayboard once first` };
@@ -59,7 +63,7 @@ async function resolve(repo: Repo, tx: Tx, spec: RoleSpec): Promise<Refusal | nu
 
 // Grants the role: the new binding, or the one already held (changed false: no second role.granted row, as teamAdd
 // answers an existing member), or the refusal.
-export async function grantRole(repo: Repo, tx: Tx, spec: RoleSpec, g: Granter, audit: Record<string, unknown> = {}): Promise<RoleOutcome> {
+export async function grantRole(repo: RoleStores, tx: Tx, spec: RoleSpec, g: Granter, audit: AuditFields = {}): Promise<RoleOutcome> {
   const role = ROLES[spec.role];
   const b = await repo.roles.grant(tx, {
     holder: spec.holder, role: spec.role, scope: spec.scope, holderKinds: role.holders, scopeKind: role.scope,
@@ -83,7 +87,7 @@ export async function grantRole(repo: Repo, tx: Tx, spec: RoleSpec, g: Granter, 
 
 // Revokes the role: the deleted binding, or the refusal (404 when it isn't held, 409 for the last owner of a team
 // with members). `bootstrap`: whether the holder is a GRAYBOARD_ADMINS email, whose org_admin no revoke removes.
-export async function revokeRole(repo: Repo, tx: Tx, spec: RoleSpec, g: Granter, bootstrap: boolean, audit: Record<string, unknown> = {}): Promise<RoleOutcome> {
+export async function revokeRole(repo: RoleStores, tx: Tx, spec: RoleSpec, g: Granter, bootstrap: boolean, audit: AuditFields = {}): Promise<RoleOutcome> {
   let b: RoleBinding | null;
   try {
     b = await repo.roles.revoke(tx, { holder: spec.holder, role: spec.role, scope: spec.scope, byUser: g.userId, authority: g.authority, actor: g.email, audit });
