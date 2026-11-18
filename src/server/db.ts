@@ -6,7 +6,7 @@ import { mkdirSync } from "node:fs";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { dirname } from "node:path";
 
-import { acknowledge, ALIAS_SESSION_SQL, boardViewRows, openSummaryRows, setQueueParticipation, whoRows, writeStatus, type BoardSummary, type BoardView, type UnboundFacts, type WhoRow, ensureBoard, forgetHandle, isSubscribed, markHuman, prunePosts, setSubscription, unsubscribeScope, type SubMode, catalogPage, getBoard, getPost, HOLD_ORDER, lastSeen, pendingDigests, pendingPushes, snapshotPage, type Board, type BoardSnapshot, type DigestRow, type PendingRef, type PushRow, type SnapshotOptions, pruneEndedIds, registerId, setAccess, setAliasMeta, setIdFacts, setPlace, touchAlias, touchId, type AliasMetaSet, type CoreDb, type IdFacts, type IdSessionFacts, type ReusedId } from "../core/boards.ts";
+import { acknowledge, aliasScopeRows, insertBoard, isHuman, readRows, setArchived, setMute, threadRoot, type AliasScopeRow, type ReadResult, ALIAS_SESSION_SQL, boardViewRows, openSummaryRows, setQueueParticipation, whoRows, writeStatus, type BoardSummary, type BoardView, type UnboundFacts, type WhoRow, ensureBoard, forgetHandle, isSubscribed, markHuman, prunePosts, setSubscription, unsubscribeScope, type SubMode, catalogPage, getBoard, getPost, HOLD_ORDER, lastSeen, pendingDigests, pendingPushes, snapshotPage, type Board, type BoardSnapshot, type DigestRow, type PendingRef, type PushRow, type SnapshotOptions, pruneEndedIds, registerId, setAccess, setAliasMeta, setIdFacts, setPlace, touchAlias, touchId, type AliasMetaSet, type CoreDb, type IdFacts, type IdSessionFacts, type ReusedId } from "../core/boards.ts";
 import type { Post } from "../shared/notifications.ts";
 import { listClaims, sweepChanges, type Claim, type ClaimChanges } from "../core/claims.ts";
 import { addressSet, aliasUser, aliasUses, dropHold, holderOf, holdsOf, idRow, idStatuses, logBinding, unendedIds, type AliasUse, type BindingEvent, type IdRow } from "../core/bindings.ts";
@@ -302,6 +302,10 @@ export interface Repo {
     remove(tx: Tx, address: string): Promise<void>;
     // Sets or clears the handle's human mark (core markHuman: one linked user's Slack handle), touching its last_seen.
     markHuman(tx: Tx, handle: string, human: boolean): Promise<void>;
+    // Whether the handle carries the human mark (core isHuman) (#807 P3 B5b1b2).
+    isHuman(r: Read, handle: string): Promise<boolean>;
+    // Each of addresses' scope columns (core aliasScopeRows); an address with no aliases row is absent.
+    scopesOf(r: Read, addresses: string[]): Promise<Map<string, AliasScopeRow>>;
   };
   // Holds, session rows and presence (#807 P3 B1): every read returns a promise on the caller's handle (B1a), and every
   // write on the caller's Tx (B1c).
@@ -415,6 +419,18 @@ export interface Repo {
     openSummaries(r: Read): Promise<BoardSummary[]>;
     // peer_list's roster: every alias that has had a session, or a board's subscribers (core whoRows).
     roster(r: Read, board: string | null): Promise<WhoRow[]>;
+    // The board tools' writes (#807 P3 B5b1b2), their arguments and access already checked. The new board, or null
+    // when the name is taken (core insertBoard); no creator subscription.
+    create(tx: Tx, b: { name: string; purpose: string; scope: string | null; kind: string; createdBy: string; now: number }): Promise<Board | null>;
+    // Archives the board as `by`, or with `by` null reopens it: the board after, or null when it was already in that
+    // state (core setArchived).
+    setArchived(tx: Tx, name: string, by: string | null, now: number): Promise<Board | null>;
+    // A read of a board already judged visible (core readRows): `handle`'s cursor and pushes advance, unless null.
+    read(tx: Tx, board: string, handle: string | null, opts: { limit?: number; before_id?: number; thread?: number }): Promise<ReadResult>;
+    // The root of the thread postId is in (core threadRoot).
+    threadRoot(r: Read, postId: number): Promise<number>;
+    // Mutes or unmutes the thread at `root` for `handle` (core setMute).
+    mute(tx: Tx, handle: string, root: number, muted: boolean): Promise<void>;
   };
   // A session's end and its ID's deliverability (#807 P3 B4a), on the caller's handle.
   sessionEnd: {
@@ -1468,6 +1484,8 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
         })();
       },
       markHuman: async (tx, handle, human) => markHuman(sqliteOf(tx), handle, human),
+      isHuman: async (r, handle) => isHuman(sqliteOf(r), handle),
+      scopesOf: async (r, addresses) => aliasScopeRows(sqliteOf(r), addresses),
     },
 
     bindings: {
@@ -1586,6 +1604,11 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       views: async (r, handles, board) => boardViewRows(sqliteOf(r), handles, board),
       openSummaries: async (r) => openSummaryRows(sqliteOf(r)),
       roster: async (r, board) => whoRows(sqliteOf(r), board),
+      create: async (tx, b) => insertBoard(sqliteOf(tx), b),
+      setArchived: async (tx, name, by, now) => setArchived(sqliteOf(tx), name, by, now),
+      read: async (tx, board, handle, opts) => readRows(sqliteOf(tx), board, handle, opts),
+      threadRoot: async (r, postId) => threadRoot(sqliteOf(r), postId),
+      mute: async (tx, handle, root, muted) => setMute(sqliteOf(tx), handle, root, muted),
     },
 
     sessionEnd: {
