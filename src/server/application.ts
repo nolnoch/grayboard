@@ -1720,9 +1720,25 @@ async function unwoken(repo: Repo, r: Read, session: ApplicationSession, live: A
   if (decision.allow) return { user: toUser, fields: {} };
   // Named only when the address already names them (a person alias): a team
   // alias's or an ID's holder is a handle, not a user (security audit F-12).
-  const whose = to.startsWith(`${toUser}/`) ? `${toUser}'s agent` : "its holder (another user's agent)";
+  const named = to.startsWith(`${toUser}/`);
+  // A service on either side (#1241): no team policy reaches it (a service is never a team member, #270 D1), so the
+  // person's remedy would mislead. A service's name is no secret here only when the address names it already.
+  if (live?.authed.kind === "service") {
+    const whose = named ? `service ${toUser}'s agent` : "its holder (another principal's agent)";
+    return { user: toUser, fields: { wakes: false, wake_note: `Delivered as mail: ${whose} isn't woken by a user's direct messages, and no team policy changes that (a service is never a team member).` } };
+  }
+  if (session.authed.kind === "service") {
+    const whose = named ? `${toUser}'s agent` : "its holder (a user's agent)";
+    return { user: toUser, fields: { wakes: false, wake_note: `Delivered as mail: ${whose} won't act on it until its user does; a service's direct messages don't wake a user's agents, and no team policy changes that (a service is never a team member).` } };
+  }
+  const whose = named ? `${toUser}'s agent` : "its holder (another user's agent)";
   return { user: toUser, fields: { wakes: false, wake_note: `Delivered as mail: ${whose} won't act on it until its user does (no shared collaborative team; \`grayboard team policy\`).` } };
 }
+
+// crossUserRefusal's twin when a service is the requester or the target's principal (#1241): no team policy reaches
+// a service (it is never a team member, #270 D1); delegation across a service and a user has no grant yet (#874).
+const serviceCrossRefusal = (to: string): string =>
+  `"${to}" belongs to another principal, and a service and a user can't delegate to each other: no team policy reaches a service, which is never a team member`;
 
 // Only after the outermost commit, never on a replay.
 function deliverSend(hub: Hub, msg: MessageRow): void {
@@ -1845,7 +1861,9 @@ async function handleDelegate(hub: Hub, tx: Tx, session: ApplicationSession, m: 
     const req: AuthzRequest = { verb: "delegate.to", from_user: authed.user_email, to_user: owner };
     const decision = await authorize(repo, h, {}, req);
     if (decision.allow) return { result: { ok: "granted" } };
-    return { result: { refused: crossUserRefusal(to) }, row: w => recordDecision(repo, w, sessionActor(session, session.primary), req, decision, { launcher: to }) };
+    // A service on either side (#1241): a team's delegating policy can't reach it, so the person's remedy would mislead.
+    const service = authed.kind === "service" || (await repo.principals.findByName(h, owner))?.kind === "service";
+    return { result: { refused: service ? serviceCrossRefusal(to) : crossUserRefusal(to) }, row: w => recordDecision(repo, w, sessionActor(session, session.primary), req, decision, { launcher: to }) };
   };
   const emit = (h: Tx, r: Reach): DelegateReach => {
     if (r.row) rowAfterRollback(session, h, r.row);

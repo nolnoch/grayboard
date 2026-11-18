@@ -310,6 +310,45 @@ describe("audit fixes (#270 step 2)", () => {
     expect(ownerRows()).toEqual([]);
   });
 
+  test("service-appropriate texts (#1241): the wake note both ways, delegation to a user, and create refuses the name human", async () => {
+    const root = await service();
+    const s = await srv.hosted(SVC, "w-1");
+    const b = await srv.hosted(B, "be", { delivery: false });
+    const sent = await s.call<{ message_id: number; wakes?: false; wake_note?: string }>("dm_send", { to: `${B}/be`, body: "a question" });
+    expect(sent.wakes).toBe(false);
+    expect(sent.wake_note).toBe(`Delivered as mail: ${B}'s agent won't act on it until its user does; a service's direct messages don't wake a user's agents, and no team policy changes that (a service is never a team member).`);
+    const reply = await b.call<{ wakes?: false; wake_note?: string }>("dm_send", { to: `${SVC}/w-1`, body: "an answer", parent_id: sent.message_id });
+    expect(reply.wake_note).toBe(`Delivered as mail: service ${SVC}'s agent isn't woken by a user's direct messages, and no team policy changes that (a service is never a team member).`);
+    for (const note of [sent.wake_note, reply.wake_note]) expect(note).not.toContain("grayboard team policy");
+    const d = await refusedText(s.call("delegate", { persona: "p", task: "t", to: `${B}/be` }));
+    expect(d).toBe(`"${B}/be" belongs to another principal, and a service and a user can't delegate to each other: no team policy reaches a service, which is never a team member`);
+    expect(await create(root, "human", [A])).toMatchObject({ status: 400, body: { message: expect.stringContaining("reserved") } });
+    expect(serviceRows()).toEqual([{ name: SVC, kind: "service", email: SVC }]);
+  });
+
+  test("peer_list judges a service's ID rows by its service scope (#1241): the service sees its own sessions' facts, a user none", async () => {
+    await service();
+    const s = await srv.hosted(SVC, "w-1");
+    await s.call("board_create", { name: "svc-out", purpose: "a service's board" });
+    const u = await srv.hosted(SVC, null);
+    await u.call("peer_list");
+    const a = await srv.hosted(A, "fe");
+    const ids = srv.app.db.query(`SELECT id FROM ids WHERE principal = ? ORDER BY started_at`).all(SVC) as { id: string }[];
+    const unboundId = ids.find(r => r.id === u.sessionId)?.id ?? ids.at(-1)!.id;
+    await seed(srv.app.repo, () => {
+      srv.app.db.prepare(`INSERT INTO subscriptions (board, handle, mode, cursor, notified_id) VALUES ('svc-out', ?, 'push', 0, 0)`).run(unboundId);
+      srv.app.db.prepare(`UPDATE ids SET place = 'host:/src/pipeline (main)', harness = 'svc_x', model = 'model-s', effort = 'high', status = 'on a run', status_at = ? WHERE id = ?`).run(Date.now(), unboundId);
+    });
+    const FACTS = ["where", "status", "harness", "model", "effort"];
+    const shown = (r: { peers: Record<string, unknown>[] }) => {
+      const row = r.peers.find(p => p.handle === unboundId);
+      expect(row).toBeDefined();
+      return FACTS.filter(k => row![k] !== undefined);
+    };
+    expect(shown(await s.call("peer_list", { board: "svc-out", include_offline: true }))).toEqual(FACTS);
+    expect(shown(await a.call("peer_list", { board: "svc-out", include_offline: true }))).toEqual([]);
+  });
+
   test("at the alias cap a service is pointed at the admin route", async () => {
     await srv.stop();
     srv = new TestServer({ admins: [ROOT], aliasScopeCap: 1, hostedRequestLimit: { burst: 10_000, perSec: 10_000 } });

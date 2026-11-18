@@ -802,6 +802,8 @@ async function adminServiceCreate(req: Request, authed: AuthedUser, repo: Repo, 
   const name = body.name.toLowerCase();
   // The team name rule (D1): no "@", so a service's name is never a person scope and never an email.
   if (!isValidIdentityName(name)) return badRequest(`invalid service name "${name.slice(0, 64)}": 1-32 chars of a-z 0-9 _ -`);
+  // The Slack bridge's name in every scope (#1241): a service called it would read as everyone's phone.
+  if (name === HUMAN_NAME) return badRequest(`"${HUMAN_NAME}" is reserved; no service may take it`);
   if (!Array.isArray(body.owners) || !body.owners.length || !body.owners.every(o => typeof o === "string" && o)) {
     return badRequest("owners required: one or more users' emails; every service has an owner");
   }
