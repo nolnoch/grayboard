@@ -6,7 +6,7 @@ import { mkdirSync } from "node:fs";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { dirname } from "node:path";
 
-import { acknowledge, ALIAS_SESSION_SQL, ensureBoard, forgetHandle, isSubscribed, markHuman, prunePosts, setSubscription, unsubscribeScope, type SubMode, catalogPage, getBoard, getPost, HOLD_ORDER, lastSeen, pendingDigests, pendingPushes, snapshotPage, type Board, type BoardSnapshot, type DigestRow, type PendingRef, type PushRow, type SnapshotOptions, pruneEndedIds, registerId, setAccess, setAliasMeta, setIdFacts, setPlace, touchAlias, touchId, type AliasMetaSet, type CoreDb, type IdFacts, type IdSessionFacts, type ReusedId } from "../core/boards.ts";
+import { acknowledge, ALIAS_SESSION_SQL, boardViewRows, openSummaryRows, setQueueParticipation, whoRows, writeStatus, type BoardSummary, type BoardView, type UnboundFacts, type WhoRow, ensureBoard, forgetHandle, isSubscribed, markHuman, prunePosts, setSubscription, unsubscribeScope, type SubMode, catalogPage, getBoard, getPost, HOLD_ORDER, lastSeen, pendingDigests, pendingPushes, snapshotPage, type Board, type BoardSnapshot, type DigestRow, type PendingRef, type PushRow, type SnapshotOptions, pruneEndedIds, registerId, setAccess, setAliasMeta, setIdFacts, setPlace, touchAlias, touchId, type AliasMetaSet, type CoreDb, type IdFacts, type IdSessionFacts, type ReusedId } from "../core/boards.ts";
 import type { Post } from "../shared/notifications.ts";
 import { listClaims, sweepChanges, type Claim, type ClaimChanges } from "../core/claims.ts";
 import { addressSet, aliasUser, aliasUses, dropHold, holderOf, holdsOf, idRow, idStatuses, logBinding, unendedIds, type AliasUse, type BindingEvent, type IdRow } from "../core/bindings.ts";
@@ -342,6 +342,15 @@ export interface Repo {
     setPlace(tx: Tx, id: string, place: string | null): Promise<void>;
     // An alias's labels (core setAliasMeta), audited through `audit`.
     setMeta(tx: Tx, address: string, meta: AliasMetaSet, session: string, audit: AuditSink, actor: string): Promise<void>;
+    // The board tools' session reads and writes (#807 P3 B5b1b1). The viewer sessions' IDs (core viewers).
+    viewerIds(r: Read): Promise<Set<string>>;
+    // Each of ids' facts peer_list shows for an unbound session (core unboundRows' read); an ID with no row is absent.
+    idFacts(r: Read, ids: string[]): Promise<Map<string, UnboundFacts>>;
+    // Touches `handle` and sets the status of the session holding it (an ID: its own, while unended) to `text`,
+    // already cleaned (core statusText); empty clears it. false: no live session holds it (core setStatus).
+    setStatus(tx: Tx, handle: string, text: string, now: number): Promise<boolean>;
+    // A name's queue-board opt-out, touching it (core setQueueParticipation).
+    setQueueParticipation(tx: Tx, handle: string, on: boolean): Promise<void>;
   };
   // Uploads and the blob catalog (#807 P3 B3), on the caller's handle. Messages' attachments stay inside the messages
   // store; posts' go with the board writes (B5b). The flows over these (store, release, sweep) are in attachments.ts.
@@ -399,6 +408,13 @@ export interface Repo {
     forget(tx: Tx, handle: string): Promise<void>;
     // Retention (core prunePosts): posts, claim and binding events older than `olderThan`; returns the boards that lost posts.
     prunePosts(tx: Tx, olderThan: number): Promise<string[]>;
+    // The board tools' reads (#807 P3 B5b1b1), unjudged. Each of `handles`' view of every board (of `board` alone),
+    // in handle order, then board name (core boardViewRows).
+    views(r: Read, handles: string[], board: string | null): Promise<BoardView[]>;
+    // Every open board with no mode and nothing unread, by name (core openSummaryRows).
+    openSummaries(r: Read): Promise<BoardSummary[]>;
+    // peer_list's roster: every alias that has had a session, or a board's subscribers (core whoRows).
+    roster(r: Read, board: string | null): Promise<WhoRow[]>;
   };
   // A session's end and its ID's deliverability (#807 P3 B4a), on the caller's handle.
   sessionEnd: {
@@ -1506,6 +1522,19 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       setIdFacts: async (tx, id, facts) => setIdFacts(sqliteOf(tx), id, facts),
       setPlace: async (tx, id, place) => setPlace(sqliteOf(tx), id, place),
       setMeta: async (tx, address, meta, session, audit, actor) => setAliasMeta(sqliteOf(tx), address, meta, session, audit, actor),
+      viewerIds: async (r) => new Set(sqliteOf(r).query<{ id: string }, []>(`SELECT id FROM ids WHERE viewer = 1`).all().map(({ id }) => id)),
+      async idFacts(r, ids) {
+        const rows = sqliteOf(r).query<UnboundFacts & { id: string }, [string]>(
+          `SELECT id, principal, harness, model, effort, launcher FROM ids WHERE id IN (SELECT value FROM json_each(?))`,
+        ).all(JSON.stringify(ids));
+        return new Map(rows.map(({ id, ...f }) => [id, f]));
+      },
+      async setStatus(tx, handle, text, now) {
+        const db = sqliteOf(tx);
+        touchAlias(db, handle, now);
+        return writeStatus(db, handle, text, now);
+      },
+      setQueueParticipation: async (tx, handle, on) => setQueueParticipation(sqliteOf(tx), handle, on),
     },
 
     attachments: {
@@ -1554,6 +1583,9 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       unsubscribeScope: async (tx, handle, scope) => unsubscribeScope(sqliteOf(tx), handle, scope),
       forget: async (tx, handle) => forgetHandle(sqliteOf(tx), handle),
       prunePosts: async (tx, olderThan) => prunePosts(sqliteOf(tx), olderThan),
+      views: async (r, handles, board) => boardViewRows(sqliteOf(r), handles, board),
+      openSummaries: async (r) => openSummaryRows(sqliteOf(r)),
+      roster: async (r, board) => whoRows(sqliteOf(r), board),
     },
 
     sessionEnd: {

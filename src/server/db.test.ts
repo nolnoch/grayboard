@@ -1248,6 +1248,79 @@ test("#807 P3 B5b1: repo.boards writes run on the Tx they're given and roll back
   expect(await human()).toBeFalsy();
 });
 
+// #807 P3 B5b1b1: the board tools' reads and session writes run on the handle they're given: a kept Tx and a non-store
+// handle are refused, a read inside a body sees that body's writes, and a status or queue opt-out rolls back with its body.
+test("#807 P3 B5b1b1: the board tools' repo reads and writes run on the handle they're given", async () => {
+  const { repo, db } = fresh();
+  const [be, fe] = ["a@example.com/be", "a@example.com/fe"];
+  const [s1, tail, solo] = ["id:0000000000001", "id:0000000000002", "id:0000000000003"];
+  const kept = await seed(repo, async tx => {
+    await repo.users.upsertByEmail(tx, "a@example.com", null);
+    for (const name of ["be", "fe"]) await repo.aliases.create(tx, person("a@example.com", name), "a@example.com");
+    const core = repo.coreOn(tx);
+    registerId(core, { id: s1, principal: "a@example.com", launcher: false, harness: "pi", model: "m1" });
+    registerId(core, { id: tail, principal: "a@example.com", launcher: false, viewer: true });
+    registerId(core, { id: solo, principal: "a@example.com", launcher: true });
+    holdAlias(core, be, s1, 100);
+    touchAlias(core, be, 100);
+    createBoard(core, be, "hall", "tests");
+    subscribe(core, fe, "hall", "digest");
+    post(core, be, "hall", "hi");
+    return tx;
+  });
+  const settled = /used after its transaction settled/;
+  const stranger = /not a SQLite store handle/;
+  const [b, i] = [repo.boards, repo.bindings];
+  await expect(b.views(kept, [fe], null)).rejects.toThrow(settled);
+  await expect(b.openSummaries(kept)).rejects.toThrow(settled);
+  await expect(b.roster(kept, null)).rejects.toThrow(settled);
+  await expect(i.viewerIds(kept)).rejects.toThrow(settled);
+  await expect(i.idFacts(kept, [s1])).rejects.toThrow(settled);
+  await expect(i.setStatus(kept, be, "x", 1)).rejects.toThrow(settled);
+  await expect(i.setQueueParticipation(kept, be, false)).rejects.toThrow(settled);
+  await expect(b.views({} as Tx, [fe], null)).rejects.toThrow(stranger);
+  await expect(b.openSummaries({} as Tx)).rejects.toThrow(stranger);
+  await expect(b.roster({} as Tx, null)).rejects.toThrow(stranger);
+  await expect(i.viewerIds({} as Tx)).rejects.toThrow(stranger);
+  await expect(i.idFacts({} as Tx, [s1])).rejects.toThrow(stranger);
+  await expect(i.setStatus({} as Tx, be, "x", 1)).rejects.toThrow(stranger);
+  await expect(i.setQueueParticipation({} as Tx, be, false)).rejects.toThrow(stranger);
+  // The reads: fe's view carries its subscription and the unread post; be's, its creator's, not its own post; a board
+  // filter narrows them.
+  const views = await b.views(repo.read, [fe, be], null);
+  expect(views.map(v => [v.handle, v.row.name, v.row.mode, v.row.unread])).toEqual([[fe, "hall", "digest", 1], [be, "hall", "push", 0]]);
+  expect(await b.views(repo.read, [fe], "nope")).toEqual([]);
+  expect((await b.openSummaries(repo.read)).map(r => [r.name, r.mode, r.unread])).toEqual([["hall", null, 0]]);
+  expect((await b.roster(repo.read, "hall")).map(r => [r.handle, r.mode])).toEqual([[be, "push"], [fe, "digest"]]);
+  expect((await b.roster(repo.read, null)).find(r => r.handle === be)?.id).toBe(s1);
+  expect(await i.viewerIds(repo.read)).toEqual(new Set([tail]));
+  // A missing ID is absent; a repeat once.
+  expect(await i.idFacts(repo.read, [s1, "id:0000000000009", s1])).toEqual(new Map([[s1, { principal: "a@example.com", harness: "pi", model: "m1", effort: null, launcher: 0 }]]));
+  const statusOf = (id: string) => db.query<{ status: string | null; status_at: number | null }, [string]>("SELECT status, status_at FROM ids WHERE id = ?").get(id);
+  const queueOff = () => db.query<{ queue_off: number | null }, [string]>("SELECT queue_off FROM aliases WHERE address = ?").get(be)?.queue_off ?? null;
+  await expect(seed(repo, async tx => {
+    expect(await i.setStatus(tx, be, "busy", 500)).toBe(true);
+    await i.setQueueParticipation(tx, be, false);
+    expect((await b.roster(tx, null)).find(r => r.handle === be)).toMatchObject({ status: "busy", queue_off: 1 });
+    throw new Error("rolled back");
+  })).rejects.toThrow("rolled back");
+  expect(statusOf(s1)).toEqual({ status: null, status_at: null });
+  expect(queueOff()).toBeNull();
+  // Committed: the holder's status and the opt-out land; an unheld name has no session to set, an ID-only one its own.
+  expect(await seed(repo, tx => i.setStatus(tx, be, "busy", 500))).toBe(true);
+  expect(statusOf(s1)).toEqual({ status: "busy", status_at: 500 });
+  expect(db.query<{ last_seen: number }, [string]>("SELECT last_seen FROM aliases WHERE address = ?").get(be)?.last_seen).toBe(500);
+  expect(await seed(repo, tx => i.setStatus(tx, fe, "x", 600))).toBe(false);
+  expect(await seed(repo, tx => i.setStatus(tx, solo, "own", 600))).toBe(true);
+  expect(statusOf(solo)).toEqual({ status: "own", status_at: 600 });
+  expect(await seed(repo, tx => i.setStatus(tx, be, "", 700))).toBe(true);
+  expect(statusOf(s1)).toEqual({ status: null, status_at: null });
+  await seed(repo, tx => i.setQueueParticipation(tx, be, false));
+  expect(queueOff()).toBe(1);
+  await seed(repo, tx => i.setQueueParticipation(tx, be, true));
+  expect(queueOff()).toBeNull();
+});
+
 // #807 P3 B5b1: a team's follow judges the board for the alias before subscribing it, as core's subscribe did: an
 // alias whose user isn't a member is refused as for a missing board, and its body rolls back.
 test("#807 P3 B5b1: a team follow refuses an alias that can't see the team board", async () => {
