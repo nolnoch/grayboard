@@ -2,7 +2,6 @@ import type { Repo } from "./db.ts";
 import { sweepStoredBlobs } from "./attachments.ts";
 import type { Tx } from "./store/tx.ts";
 import type { Config } from "./config.ts";
-import { prunePosts } from "../core/boards.ts";
 import { UNBOUND_TTL_MS } from "../shared/attachments.ts";
 import { WRITE_DEDUP_WINDOW_MS } from "../shared/dedup.ts";
 import { logReclaimed, RECLAIM_PAGES_PER_RUN } from "../core/sqlite.ts";
@@ -43,7 +42,7 @@ export async function runRetention(repo: Repo, config: Config, now = Date.now(),
   try {
     // Board posts share the message retention window.
     await repo.write(tx => pruneMessages(repo, tx, now - config.messageRetentionDays * 86_400_000));
-    await repo.write((tx: Tx) => prunePosts(repo.coreOn(tx), now - config.messageRetentionDays * 86_400_000), boards => {
+    await repo.write((tx: Tx) => repo.boards.prunePosts(tx, now - config.messageRetentionDays * 86_400_000), boards => {
       if (boards.length) {
         try { void Promise.resolve(onBoardsChanged?.(boards)).catch(() => {}); } catch {}
       }

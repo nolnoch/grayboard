@@ -14,7 +14,6 @@ import { isLoopbackIp } from "./client_addr.ts";
 import { DEFAULT_LAG_GATE, lagSampler, lagVerdict, lagWindows, type LagGate, type LagSampler, type LagWindow } from "./metrics.ts";
 import { authorize, decidePure, recordDecision, type AuthzRequest, type PureRequest } from "./policy.ts";
 import { HUMAN_NAME, HUMAN_RESERVED, isValidEmail, isValidIdentityName } from "../shared/addressing.ts";
-import { forgetHandle } from "../core/boards.ts";
 import { addressParts } from "../core/addresses.ts";
 import { BlobMissing, CoreError, TooLargeError } from "../core/errors.ts";
 import { transferTimeoutMs } from "../shared/http.ts";
@@ -288,7 +287,7 @@ function identityDelete(name: string, authed: AuthedUser, repo: Repo): Response 
     const user = await repo.bindings.userOf(tx, existing.address);
     if (user) return jsonErr("alias_held", aliasHeldText(existing.address, `the session ${user}`, "end it, or bind it elsewhere, first"), 409);
     await repo.aliases.remove(tx, existing.address);
-    forgetHandle(repo.coreOn(tx), existing.address);
+    await repo.boards.forget(tx, existing.address);
     writeAudit(repo, tx, "alias.deleted", authed.user_email, existing.address);
     return json({ ok: true });
   });
@@ -427,7 +426,7 @@ async function teamCreate(req: Request, authed: AuthedUser, repo: Repo): Promise
       throw e;
     }
     await repo.teams.addMember(tx, team.id, authed.user_id, "owner");
-    ensureTeamBoard(repo, tx, team, authed.user_email);
+    await ensureTeamBoard(repo, tx, team, authed.user_email);
     await onTeamJoined(repo, tx, team, authed.user_email);
     writeAudit(repo, tx, "team.created", authed.user_email, name);
     writeAudit(repo, tx, "team.member_added", authed.user_email, name, { member: authed.user_email, role: "owner" });
@@ -593,7 +592,7 @@ async function teamDeleteAlias(teamName: string, req: Request, authed: AuthedUse
     const user = await repo.bindings.userOf(tx, existing.address);
     if (user) return jsonErr("alias_held", aliasHeldText(existing.address, `the session ${user}`, "end it, or have it unbind the name, first"), 409);
     await repo.aliases.remove(tx, existing.address);
-    forgetHandle(repo.coreOn(tx), existing.address);
+    await repo.boards.forget(tx, existing.address);
     writeAudit(repo, tx, "alias.deleted", authed.user_email, existing.address, { team: managed.team.name, ...managed.audit });
     return json({ ok: true, deleted: existing.address });
   });

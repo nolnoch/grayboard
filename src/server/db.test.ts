@@ -11,6 +11,7 @@ import { holdAlias } from "../core/bindings.ts";
 import { createBoard, post, registerId, subscribe, touchAlias } from "../core/boards.ts";
 import { seed } from "../../tests/support/seed.ts";
 import { GOOGLE_ISSUER } from "./idp_google.ts";
+import { onTeamJoined } from "./teams.ts";
 import { hashToken } from "./auth.ts";
 import { issueOAuth } from "../../tests/helpers/oauth.ts";
 
@@ -1177,6 +1178,91 @@ test("#807 P3 B5a1: repo.boards runs on the handle it's given; acknowledge rolls
   expect(await pushed(repo.read)).toEqual([id]);
   await seed(repo, tx => b.acknowledge(tx, fe, ref));
   expect(await pushed(repo.read)).toEqual([]);
+});
+
+// #807 P3 B5b1: the board writes outside the tools run on the handle they're given: a kept Tx and a non-store handle are
+// refused, and a body that ensures a board and subscribes, then throws, leaves neither.
+test("#807 P3 B5b1: repo.boards writes run on the Tx they're given and roll back with their body", async () => {
+  const { repo, db } = fresh();
+  const [be, fe] = ["a@example.com/be", "a@example.com/fe"];
+  const kept = await seed(repo, async tx => {
+    await repo.users.upsertByEmail(tx, "a@example.com", null);
+    for (const name of ["be", "fe"]) await repo.aliases.create(tx, person("a@example.com", name), "a@example.com");
+    return tx;
+  });
+  const settled = /used after its transaction settled/;
+  const b = repo.boards;
+  await expect(b.ensure(kept, "hall", "p", null, be)).rejects.toThrow(settled);
+  await expect(b.isSubscribed(kept, be, "hall")).rejects.toThrow(settled);
+  await expect(b.setSubscription(kept, be, "hall", "push")).rejects.toThrow(settled);
+  await expect(b.unsubscribeScope(kept, be, "team:x")).rejects.toThrow(settled);
+  await expect(b.forget(kept, be)).rejects.toThrow(settled);
+  await expect(b.prunePosts(kept, 0)).rejects.toThrow(settled);
+  await expect(repo.aliases.markHuman(kept, be, true)).rejects.toThrow(settled);
+  const stranger = /not a SQLite store handle/;
+  await expect(b.ensure({} as Tx, "hall", "p", null, be)).rejects.toThrow(stranger);
+  await expect(b.isSubscribed({} as Tx, be, "hall")).rejects.toThrow(stranger);
+  await expect(b.setSubscription({} as Tx, be, "hall", "push")).rejects.toThrow(stranger);
+  await expect(b.unsubscribeScope({} as Tx, be, "team:x")).rejects.toThrow(stranger);
+  await expect(b.forget({} as Tx, be)).rejects.toThrow(stranger);
+  await expect(b.prunePosts({} as Tx, 0)).rejects.toThrow(stranger);
+  await expect(repo.aliases.markHuman({} as Tx, be, true)).rejects.toThrow(stranger);
+  const human = async () => db.query<{ human: number | null }, [string]>("SELECT human FROM aliases WHERE address = ?").get(fe)?.human ?? null;
+  await expect(seed(repo, async tx => {
+    expect(await b.ensure(tx, "hall", "p", "team:x", be)).toBe(true);
+    expect(await b.ensure(tx, "hall", "other", null, fe)).toBe(false);
+    await b.setSubscription(tx, fe, "hall", "digest");
+    expect(await b.isSubscribed(tx, fe, "hall")).toBe(true);
+    await repo.aliases.markHuman(tx, fe, true);
+    throw new Error("rolled back");
+  })).rejects.toThrow("rolled back");
+  expect(await b.get(repo.read, "hall")).toBeUndefined();
+  expect(await b.isSubscribed(repo.read, fe, "hall")).toBe(false);
+  expect(await human()).toBeFalsy();
+  // Committed: a subscription starts at the tip, so the post before it is no backlog; "off" and a scope's drop delete it.
+  const id = await seed(repo, async tx => {
+    await b.ensure(tx, "hall", "p", null, be);
+    await b.ensure(tx, "crew", "p", "team:x", be);
+    const id = post(repo.coreOn(tx), be, "hall", "before").post.id;
+    await b.setSubscription(tx, fe, "hall", "push");
+    await repo.aliases.markHuman(tx, fe, true);
+    return id;
+  });
+  expect((await b.get(repo.read, "hall"))?.purpose).toBe("p");
+  expect(db.query("SELECT cursor, notified_id FROM subscriptions WHERE handle = ? AND board = 'hall'").get(fe)).toEqual({ cursor: id, notified_id: id });
+  expect(await human()).toBeTruthy();
+  await seed(repo, tx => b.setSubscription(tx, fe, "hall", "off"));
+  expect(await b.isSubscribed(repo.read, fe, "hall")).toBe(false);
+  await seed(repo, tx => b.setSubscription(tx, fe, "crew", "digest"));
+  await seed(repo, tx => b.unsubscribeScope(tx, fe, "team:other"));
+  expect(await b.isSubscribed(repo.read, fe, "crew")).toBe(true);
+  await seed(repo, tx => b.unsubscribeScope(tx, fe, "team:x"));
+  expect(await b.isSubscribed(repo.read, fe, "crew")).toBe(false);
+  await seed(repo, tx => b.setSubscription(tx, fe, "hall", "push"));
+  await seed(repo, tx => b.forget(tx, fe));
+  expect(await b.isSubscribed(repo.read, fe, "hall")).toBe(false);
+  // The prune names the boards that lost posts, and the post goes.
+  expect(await seed(repo, tx => b.prunePosts(tx, Date.now() + 1))).toEqual(["hall"]);
+  expect(await b.post(repo.read, id)).toBeUndefined();
+  await seed(repo, tx => repo.aliases.markHuman(tx, fe, false));
+  expect(await human()).toBeFalsy();
+});
+
+// #807 P3 B5b1: a team's follow judges the board for the alias before subscribing it, as core's subscribe did: an
+// alias whose user isn't a member is refused as for a missing board, and its body rolls back.
+test("#807 P3 B5b1: a team follow refuses an alias that can't see the team board", async () => {
+  const { repo } = fresh();
+  const team = await seed(repo, async tx => {
+    const a = await repo.users.upsertByEmail(tx, "a@example.com", null);
+    await repo.users.upsertByEmail(tx, "b@example.com", null);
+    await repo.aliases.create(tx, person("b@example.com", "be"), "b@example.com");
+    const team = await repo.teams.create(tx, "crew", a.id);
+    await repo.teams.addMember(tx, team.id, a.id, "owner");
+    return team;
+  });
+  await expect(seed(repo, tx => onTeamJoined(repo, tx, team, "b@example.com"))).rejects.toThrow("no such board #crew; see board_list");
+  expect(await repo.boards.get(repo.read, "crew")).toBeUndefined();
+  expect(await repo.boards.isSubscribed(repo.read, "b@example.com/be", "crew")).toBe(false);
 });
 
 // #807 P3 B4b: repo.delegation reads on the handle it's given, and its facts answer only what they read: a question

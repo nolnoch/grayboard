@@ -637,23 +637,25 @@ test("#807: a rolled-back link leaves no link, no human identity and nothing att
   expect((await api(alice, "GET", "/api/whoami")).body.identities).not.toContain("human");
 });
 
-// #807 P1c-13: the link's human create and the unlink's remove run on their body's Tx.
+// #807 P1c-13: the link's human create and the unlink's remove run on their body's Tx. P3 B5b1: so do the human mark
+// and the dropped subscriptions and pushes (repo.boards.forget), and the bridge reaches core for neither.
 test("#807 P1c-13: link and unlink read and write the human alias on their body's Tx", async () => {
   const repo = srv.app.repo;
   const checks: { op: string; inTxn: boolean; handle: "pool" | "tx" }[] = [];
-  const spies = (["find", "create", "remove"] as const).map((name) => {
-    const original = repo.aliases[name].bind(repo.aliases) as (...a: unknown[]) => unknown;
-    return spyOn(repo.aliases, name).mockImplementation(((r: unknown, ...rest: unknown[]) => {
+  const spy = <G extends object>(group: G, name: keyof G & string) => {
+    const original = (group[name] as (...a: unknown[]) => unknown).bind(group);
+    return spyOn(group, name as never).mockImplementation(((r: unknown, ...rest: unknown[]) => {
       if (new Error().stack?.includes("/slack.ts:")) checks.push({ op: name, inTxn: srv.app.db.inTransaction, handle: r === repo.read ? "pool" : "tx" });
       return original(r, ...rest);
     }) as never);
-  });
+  };
+  const spies = [...(["find", "create", "remove", "markHuman"] as const).map((name) => spy(repo.aliases, name)), spy(repo.boards, "forget"), spy(repo, "coreOn")];
   try {
     const alice = await login("alice@example.com");
     await link(alice);
     expect((await api(alice, "POST", "/api/slack/unlink")).status).toBe(200);
-  } finally { for (const spy of spies) spy.mockRestore(); }
-  expect(checks).toEqual([{ op: "find", inTxn: true, handle: "tx" }, { op: "create", inTxn: true, handle: "tx" }, { op: "remove", inTxn: true, handle: "tx" }]);
+  } finally { for (const s of spies) s.mockRestore(); }
+  expect(checks.map(c => `${c.op}:${c.handle}:${c.inTxn}`)).toEqual(["find:tx:true", "forget:tx:true", "create:tx:true", "markHuman:tx:true", "remove:tx:true", "forget:tx:true"]);
 });
 
 // #807 P1c-14b: the link's newest-message read (where the new human's cursor starts) and the Slack receipt's

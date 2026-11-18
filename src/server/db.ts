@@ -6,7 +6,7 @@ import { mkdirSync } from "node:fs";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { dirname } from "node:path";
 
-import { acknowledge, ALIAS_SESSION_SQL, catalogPage, getBoard, getPost, HOLD_ORDER, lastSeen, pendingDigests, pendingPushes, snapshotPage, type Board, type BoardSnapshot, type DigestRow, type PendingRef, type PushRow, type SnapshotOptions, pruneEndedIds, registerId, setAccess, setAliasMeta, setIdFacts, setPlace, touchAlias, touchId, type AliasMetaSet, type CoreDb, type IdFacts, type IdSessionFacts, type ReusedId } from "../core/boards.ts";
+import { acknowledge, ALIAS_SESSION_SQL, ensureBoard, forgetHandle, isSubscribed, markHuman, prunePosts, setSubscription, unsubscribeScope, type SubMode, catalogPage, getBoard, getPost, HOLD_ORDER, lastSeen, pendingDigests, pendingPushes, snapshotPage, type Board, type BoardSnapshot, type DigestRow, type PendingRef, type PushRow, type SnapshotOptions, pruneEndedIds, registerId, setAccess, setAliasMeta, setIdFacts, setPlace, touchAlias, touchId, type AliasMetaSet, type CoreDb, type IdFacts, type IdSessionFacts, type ReusedId } from "../core/boards.ts";
 import type { Post } from "../shared/notifications.ts";
 import { listClaims, sweepChanges, type Claim, type ClaimChanges } from "../core/claims.ts";
 import { addressSet, aliasUser, aliasUses, dropHold, holderOf, holdsOf, idRow, idStatuses, logBinding, unendedIds, type AliasUse, type BindingEvent, type IdRow } from "../core/bindings.ts";
@@ -300,6 +300,8 @@ export interface Repo {
     seen(r: Read, addresses: string[]): Promise<Map<string, { last_seen: number; cwd: string | null; place: string | null }>>;
     // Also deletes the alias's read points.
     remove(tx: Tx, address: string): Promise<void>;
+    // Sets or clears the handle's human mark (core markHuman: one linked user's Slack handle), touching its last_seen.
+    markHuman(tx: Tx, handle: string, human: boolean): Promise<void>;
   };
   // Holds, session rows and presence (#807 P3 B1): every read returns a promise on the caller's handle (B1a), and every
   // write on the caller's Tx (B1c).
@@ -384,6 +386,19 @@ export interface Repo {
     pendingDigests(r: Read, handle: string): Promise<DigestRow[]>;
     // Marks a pending item delivered to `handle` (core acknowledge): a push's outbox row, a push-mode cursor, a digest's catch-up.
     acknowledge(tx: Tx, handle: string, ref: PendingRef): Promise<void>;
+    // The board writes outside the board tools (#807 P3 B5b1): a mode's bookkeeping, unchecked. The caller judges
+    // visibility first where it matters (teams.ts follow).
+    // Creates the board unless one has the name (core ensureBoard): no creator subscription; false when it existed.
+    ensure(tx: Tx, name: string, purpose: string, scope: string | null, createdBy: string): Promise<boolean>;
+    isSubscribed(r: Read, handle: string, board: string): Promise<boolean>;
+    // Subscribes at the board's tip, or changes the mode of a subscription; "off" deletes it (core setSubscription).
+    setSubscription(tx: Tx, handle: string, board: string, mode: SubMode | "off"): Promise<void>;
+    // Deletes the handle's subscriptions to every board of `scope` (core unsubscribeScope).
+    unsubscribeScope(tx: Tx, handle: string, scope: string): Promise<void>;
+    // A deleted handle's subscriptions, pushes, mutes, watches and holds (core forgetHandle); its posts and claims stay.
+    forget(tx: Tx, handle: string): Promise<void>;
+    // Retention (core prunePosts): posts, claim and binding events older than `olderThan`; returns the boards that lost posts.
+    prunePosts(tx: Tx, olderThan: number): Promise<string[]>;
   };
   // A session's end and its ID's deliverability (#807 P3 B4a), on the caller's handle.
   sessionEnd: {
@@ -1436,6 +1451,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
           db.run("DELETE FROM aliases WHERE address = ?", [address]);
         })();
       },
+      markHuman: async (tx, handle, human) => markHuman(sqliteOf(tx), handle, human),
     },
 
     bindings: {
@@ -1532,6 +1548,12 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       pendingPushes: async (r, handle) => pendingPushes(sqliteOf(r), handle),
       pendingDigests: async (r, handle) => pendingDigests(sqliteOf(r), handle),
       acknowledge: async (tx, handle, ref) => acknowledge(sqliteOf(tx), handle, ref),
+      ensure: async (tx, name, purpose, scope, createdBy) => ensureBoard(sqliteOf(tx), name, purpose, scope, createdBy),
+      isSubscribed: async (r, handle, board) => isSubscribed(sqliteOf(r), handle, board),
+      setSubscription: async (tx, handle, board, mode) => setSubscription(sqliteOf(tx), handle, board, mode),
+      unsubscribeScope: async (tx, handle, scope) => unsubscribeScope(sqliteOf(tx), handle, scope),
+      forget: async (tx, handle) => forgetHandle(sqliteOf(tx), handle),
+      prunePosts: async (tx, olderThan) => prunePosts(sqliteOf(tx), olderThan),
     },
 
     sessionEnd: {
