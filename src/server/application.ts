@@ -36,6 +36,7 @@ import type { Principal } from "../core/resolver.ts";
 import { coreRefusalCode, Undeliverable } from "../core/session_end.ts";
 import { claimsInstruction, isBoardTool, type ToolContext, type BoardPostResult } from "../core/tools.ts";
 import { postGateOn, serverPost } from "./board_post.ts";
+import { sweepClaims } from "./claims.ts";
 import { attachmentIds, type Uploader } from "../core/attachments.ts";
 import type { AttachmentLimits } from "../shared/attachments.ts";
 import { expiryTimer } from "../core/claims.ts";
@@ -649,7 +650,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
   // on the pool (#807 P3 B2).
   const claimTimer = expiryTimer({
     next: () => repo.claims.nextExpiry(repo.read),
-    sweep: () => repo.write(tx => repo.claims.sweep(tx, Date.now())),
+    sweep: () => repo.write(tx => sweepClaims(repo, hub.access, tx, Date.now())),
   }, handles => wake(hub, expiryCommit, handles), boards => boardsChanged(expiryCommit, boards));
   const expiry = { arm: () => detached(() => claimTimer.arm()), stop: () => claimTimer.stop() };
   // The session leaves the hub's registry: superseded, revoked or closed.
