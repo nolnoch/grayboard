@@ -40,7 +40,7 @@ export type ActScope = { scope_kind: ScopeKind; scope_ref: string };
 // identity downloading an attachment (by its requested ID's text), with core's
 // facts of its carrier (none: no such attachment); team.read / team.manage /
 // team.leave: a user reading, changing or leaving a team's membership; admin: an
-// admin route; msg.wake: whether a delivery written by one signed-in user
+// admin route, by the signed-in user (id and email: a role rule finds its principal); msg.wake: whether a delivery written by one signed-in user
 // wakes a session of another (users by email: the writer recorded at write
 // time and the receiving session's user, never an address's spelling, F-01);
 // delegate.to: whether a user's session may name another user's launcher in
@@ -57,7 +57,7 @@ export type AuthzRequest =
   | { verb: "hosted.session"; session: string; user: number; client: string; row: { user: number; client: string } }
   | { verb: "attachment.read"; identity: string; attachment: string; reach: AttachmentReach | undefined }
   | { verb: "team.read" | "team.manage" | "team.leave"; user: { id: number; email: string }; team: Team | undefined }
-  | { verb: "admin"; email: string }
+  | { verb: "admin"; user: { id: number; email: string } }
   | { verb: "msg.wake" | "delegate.to"; from_user: string; to_user: string }
   | { verb: "alias.see"; principal: Principal; scope: ActScope };
 
@@ -65,9 +65,28 @@ export type AuthzRequest =
 // viewer's or has ended.
 export type SessionFacts = { principal: string | null; viewer: boolean; ended_at: number | null };
 
+// A role-based decision (#927) names its rule from a closed set (`role.org_admin`, `role.team_owner`) and carries
+// the role and scope (a team's name, null for the org) it looked for; an allow also carries the binding that allowed
+// it. The id rides beside the rule, never in it: callers compare rule strings, and rows group by them.
+export type RoleFacts = { binding?: number; role?: Role; scope?: string | null };
 export type Decision =
-  | { allow: true; rule: string }
-  | { allow: false; code: "forbidden" | "not_found"; reason: string; rule: string };
+  | ({ allow: true; rule: string } & RoleFacts)
+  | ({ allow: false; code: "forbidden" | "not_found"; reason: string; rule: string } & Omit<RoleFacts, "binding">);
+
+// The roles (#927): each fixes its scope's kind (null: the org) and the principal kinds that may hold it.
+// A row whose role isn't here grants nothing: every lookup names its role. service_invoke's holder kinds, verb and
+// check are #270's; until then no principal may hold it, and with no service principal every grant is refused on its
+// scope first.
+export type Role = "org_admin" | "team_owner" | "service_invoke";
+export const ROLES: Readonly<Record<Role, { scope: "team" | "service" | null; holders: readonly Principal["kind"][] }>> = {
+  org_admin: { scope: null, holders: ["user"] },
+  team_owner: { scope: "team", holders: ["user"] },
+  service_invoke: { scope: "service", holders: [] },
+};
+export const isRole = (r: unknown): r is Role => typeof r === "string" && Object.hasOwn(ROLES, r);
+
+// Whether a decision exercised admin authority, by the env list or a binding: `as_admin` on the act's audit rows.
+export const byAdmin = (d: Decision): boolean => d.allow && (d.rule === "admin.env" || d.rule === "role.org_admin");
 
 // Who asked: the signed-in user (null for none), and, when the act came
 // through a session, the address it acted as and the session's ID. The Slack
@@ -75,8 +94,8 @@ export type Decision =
 // these rows with #847.)
 export type Actor = { user: string | null; address?: string; session?: string };
 
-const allow = (rule: string): Decision => ({ allow: true, rule });
-const deny = (rule: string, reason: string, code: "forbidden" | "not_found" = "forbidden"): Decision => ({ allow: false, code, reason, rule });
+const allow = (rule: string, facts: RoleFacts = {}): Decision => ({ allow: true, rule, ...facts });
+const deny = (rule: string, reason: string, code: "forbidden" | "not_found" = "forbidden", facts: Omit<RoleFacts, "binding"> = {}): Decision => ({ allow: false, code, reason, rule, ...facts });
 
 // Every storage read a rule makes, synchronously. `repo.policyNow` implements it (and AccessReadsSync) over the
 // SQLite connection (#807 P3 A7e1): reads in the caller's own transaction see its writes, as routeReads gives them.
@@ -85,7 +104,8 @@ export interface PolicyReadsSync extends Resolver {
   principalByName(name: string): PrincipalRow | undefined;
   teamByName(name: string): Team | undefined;
   isMember(teamId: number, userId: number): boolean;
-  isOwner(teamId: number, userId: number): boolean;
+  // A user's binding id for a role on the org (teamId null) or a team, if held (#927).
+  roleBinding(userId: number, role: Role, teamId: number | null): number | undefined;
   shareAny(userA: number, userB: number): boolean;
   shareCollaborative(userA: number, userB: number): boolean;
   shareDelegating(userA: number, userB: number): boolean;
@@ -134,7 +154,7 @@ function policyReads(repo: Repo, r: Read): PolicyReads {
     principalOf: (address) => repo.principals.of(r, address),
     teamByName: (name) => repo.teams.findByName(r, name),
     isMember: (teamId, userId) => repo.teams.isMember(r, teamId, userId),
-    isOwner: (teamId, userId) => repo.teams.isOwner(r, teamId, userId),
+    roleBinding: (userId, role, teamId) => repo.roles.bindingOf(r, userId, role, teamId),
     shareAny: (userA, userB) => repo.teams.shareAny(r, userA, userB),
     shareCollaborative: (userA, userB) => repo.teams.shareCollaborative(r, userA, userB),
     shareDelegating: (userA, userB) => repo.teams.shareDelegating(r, userA, userB),
@@ -155,7 +175,7 @@ export function authorizeNow(repo: Repo, ctx: PolicyContext, req: AuthzRequest):
 }
 
 // The verbs whose rules read no storage: their callers hand over every fact.
-export type PureRequest = Extract<AuthzRequest, { verb: "session.act" | "hosted.session" | "attachment.read" | "admin" }>;
+export type PureRequest = Extract<AuthzRequest, { verb: "session.act" | "hosted.session" | "attachment.read" }>;
 
 // The decision of a verb that reads nothing, with no store at all. A rule that asks for a read here is a bug: it throws.
 export function decidePure(ctx: PolicyContext, req: PureRequest): Decision {
@@ -198,16 +218,20 @@ export function* decide(ctx: PolicyContext, req: AuthzRequest): Rule<Decision> {
     case "team.read": {
       const { team, user } = req;
       if (team && (yield* ask("isMember", team.id, user.id))) return allow("team.member");
-      if (team && isAdmin(ctx, user.email)) return allow("admin.env");
-      return deny("team.member", "not found", "not_found");
+      const admin = team ? yield* orgAdmin(ctx, user) : null;
+      return admin ?? deny("team.member", "not found", "not_found");
     }
     case "team.manage": {
+      // An owner is a member (#927): a non-member's binding, if one were left, manages nothing.
       const { team, user } = req;
-      const member = !!team && (yield* ask("isMember", team.id, user.id));
-      if (!team || (!member && !isAdmin(ctx, user.email))) return deny("team.member", "not found", "not_found");
-      if (member && (yield* ask("isOwner", team.id, user.id))) return allow("team.owner");
-      if (isAdmin(ctx, user.email)) return allow("admin.env");
-      return deny("team.owner", `only an owner of team "${team.name}" (or an admin) can add or remove members; \`grayboard team members ${team.name}\` lists its owners`);
+      if (!team) return deny("team.member", "not found", "not_found");
+      const member = yield* ask("isMember", team.id, user.id);
+      const owner = member ? yield* ask("roleBinding", user.id, "team_owner", team.id) : undefined;
+      if (owner !== undefined) return allow("role.team_owner", { binding: owner, role: "team_owner", scope: team.name });
+      const admin = yield* orgAdmin(ctx, user);
+      if (admin) return admin;
+      if (!member) return deny("team.member", "not found", "not_found");
+      return deny("role.team_owner", `only an owner of team "${team.name}" (or an admin) can add or remove members; \`grayboard team members ${team.name}\` lists its owners`, "forbidden", { role: "team_owner", scope: team.name });
     }
     case "msg.wake":
       return yield* wakeRule(req.from_user, req.to_user);
@@ -222,11 +246,8 @@ export function* decide(ctx: PolicyContext, req: AuthzRequest): Rule<Decision> {
       if (req.scope.scope_kind === "person") return allow("alias.see_person");
       if (req.principal.kind === "team" && req.scope.scope_kind === "team" && req.principal.name === req.scope.scope_ref) return allow("alias.see_own_team");
       return yield* actIn(req.principal, req.scope);
-    case "admin": {
-      if (isAdmin(ctx, req.email)) return allow("admin.env");
-      const admins = ctx.admins ?? [];
-      return deny("admin.env", admins.length === 0 ? "no admins are configured on this server (GRAYBOARD_ADMINS)" : `${req.email} is not an admin`);
-    }
+    case "admin":
+      return (yield* orgAdmin(ctx, req.user)) ?? deny("role.org_admin", `${req.user.email} is not an org admin`, "forbidden", { role: "org_admin", scope: null });
   }
 }
 
@@ -305,6 +326,9 @@ export function recordDecision(repo: Repo, h: Read, actor: Actor, req: AuthzRequ
     allow: d.allow,
     rule: d.rule,
     ...(d.allow ? {} : { code: d.code, reason: d.reason }),
+    // The binding that allowed, or the role and scope a deny looked for (#927).
+    ...(d.allow && d.binding !== undefined ? { binding: d.binding } : {}),
+    ...(d.role !== undefined ? { role: d.role, scope: d.scope ?? null } : {}),
     ...Object.fromEntries(Object.entries({ ...detail, ...extra }).map(([k, v]) => [k, clip(v)])),
     user: actor.user,
     address: actor.address ?? null,
@@ -314,6 +338,14 @@ export function recordDecision(repo: Repo, h: Read, actor: Actor, req: AuthzRequ
 
 function isAdmin(ctx: PolicyContext, email: string): boolean {
   return (ctx.admins ?? []).includes(email.toLowerCase());
+}
+
+// The org admin's allow, or null (#927): a GRAYBOARD_ADMINS email first, reading nothing, so a bootstrap admin
+// keeps its powers whatever the table holds; else the user's org_admin binding, one indexed lookup, never cached.
+function* orgAdmin(ctx: PolicyContext, user: { id: number; email: string }): Rule<Decision | null> {
+  if (isAdmin(ctx, user.email)) return allow("admin.env");
+  const b = yield* ask("roleBinding", user.id, "org_admin", null);
+  return b === undefined ? null : allow("role.org_admin", { binding: b, role: "org_admin", scope: null });
 }
 
 // Whether principal p may act in a scope: bind an alias there, or write as
@@ -408,10 +440,6 @@ export function canSend(from: string, target: SendTarget, ctx: SendContext): Sen
 
 export function reachesHuman(repo: Repo, reach: HumanReach, from: string, to: string): boolean {
   return authorizeNow(repo, { humanReach: reach }, { verb: "human.reach", from, to }).allow;
-}
-
-export function canAdmin(email: string, admins: readonly string[]): SendDecision {
-  return plain(decidePure({ admins }, { verb: "admin", email }));
 }
 
 export function mayActIn(repo: Repo, p: Principal, scope: ActScope): string | null {

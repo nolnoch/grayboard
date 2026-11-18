@@ -26,6 +26,7 @@ const PG_ONLY_TABLES = new Set(["schema_migrations"]); // migrate.ts's record, n
 const DROPPED = new Set([
   "hosted_sessions.name", // vestigial since #451: holds are alias_holds rows; migrateHostedHolds clears it on open
   "ids.token_session", // unused since #282: nothing reads or writes it
+  "team_members.role", // ownership moved to role_bindings (#927); read only by the one-time seed on SQLite
 ]);
 // Columns Postgres adds: insertion order for the queries that tiebreak on SQLite's rowid (D6).
 const ADDED = new Set([

@@ -57,7 +57,10 @@ test("decidePure refuses a verb whose rule reads storage", () => {
   const p = { kind: "user", name: "a@example.com" } as const;
   const reading = { verb: "scope.act", principal: p, scope: { scope_kind: "team", scope_ref: "eng" } } as unknown as PureRequest;
   expect(() => decidePure({}, reading)).toThrow("scope.act asked for a storage read (principalByName)");
-  expect(decidePure({ admins: ["a@example.com"] }, { verb: "admin", email: "a@example.com" })).toEqual({ allow: true, rule: "admin.env" });
+  // admin reads the caller's org_admin binding once the env list doesn't decide (#927): it isn't pure.
+  const admin = { verb: "admin", user: { id: 1, email: "a@example.com" } } as unknown as PureRequest;
+  expect(decidePure({ admins: ["a@example.com"] }, admin)).toEqual({ allow: true, rule: "admin.env" });
+  expect(() => decidePure({}, admin)).toThrow("admin asked for a storage read (roleBinding)");
 });
 
 // recordDecision stays synchronous (#807 P3 A7f1): its deny limiter points the audit writer at the caller's handle
@@ -67,10 +70,10 @@ test("recordDecision returns nothing, not a promise", async () => {
   const blobDir = mkdtempSync(join(tmpdir(), "gb-blobs-"));
   const { repo, db } = openDatabase(scratchDbPath(), { blobDir });
   try {
-    const req: PureRequest = { verb: "admin", email: "a@example.com" };
+    const req: PureRequest = { verb: "session.act", user: "a@example.com", session: "id:1", row: undefined };
     const results = await repo.write(async tx => [
       recordDecision(repo, tx, { user: "a@example.com" }, req, decidePure({}, req)),
-      recordDecision(repo, tx, { user: "a@example.com" }, req, decidePure({ admins: ["a@example.com"] }, req)),
+      recordDecision(repo, tx, { user: "a@example.com" }, req, decidePure({}, { ...req, row: { principal: "a@example.com", viewer: false, ended_at: null } })),
     ]);
     expect(results).toEqual([undefined, undefined]);
   } finally {

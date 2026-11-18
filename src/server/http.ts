@@ -1,5 +1,5 @@
 import pkg from "../../package.json" with { type: "json" };
-import { DEV_SESSION_LABEL, LastOwner, PrincipalTaken, TEAM_POLICIES, type Repo, type Team, type TeamPolicy, type TeamRole, type User } from "./db.ts";
+import { DEV_SESSION_LABEL, LastOwner, PrincipalTaken, TEAM_POLICIES, type Repo, type RoleFilter, type Team, type TeamPolicy, type User } from "./db.ts";
 import { DEFAULT_CLI_TOKEN_IDLE_DAYS, type Config } from "./config.ts";
 import {
   verifySessionToken, extractBearer,
@@ -12,7 +12,8 @@ import { UploadTimeout, readUploadBody, type UploadGate } from "./uploads.ts";
 import { writeAudit } from "./audit.ts";
 import { isLoopbackIp } from "./client_addr.ts";
 import { DEFAULT_LAG_GATE, lagSampler, lagVerdict, lagWindows, type LagGate, type LagSampler, type LagWindow } from "./metrics.ts";
-import { authorize, decidePure, recordDecision, type AuthzRequest, type PureRequest } from "./policy.ts";
+import { authorize, byAdmin, decidePure, isRole, recordDecision, type AuthzRequest, type Decision, type PureRequest } from "./policy.ts";
+import { authorityOf, grantRole, revokeRole, roleSpec, type Granter, type RoleOutcome } from "./roles.ts";
 import { HUMAN_NAME, HUMAN_RESERVED, isValidEmail, isValidIdentityName } from "../shared/addressing.ts";
 import { addressParts } from "../core/addresses.ts";
 import { seenScopeOf } from "../core/boards.ts";
@@ -427,11 +428,14 @@ async function teamCreate(req: Request, authed: AuthedUser, repo: Repo): Promise
       if (e instanceof PrincipalTaken) return conflict(e.message);
       throw e;
     }
-    await repo.teams.addMember(tx, team.id, authed.user_id, "owner");
+    await repo.teams.addMember(tx, team.id, authed.user_id);
     await ensureTeamBoard(repo, tx, team, authed.user_email);
     await onTeamJoined(repo, tx, team, authed.user_email);
     writeAudit(repo, tx, "team.created", authed.user_email, name);
-    writeAudit(repo, tx, "team.member_added", authed.user_email, name, { member: authed.user_email, role: "owner" });
+    writeAudit(repo, tx, "team.member_added", authed.user_email, name, { member: authed.user_email });
+    // Its creator is its first owner (#927): a team_owner binding they grant themselves, with its role.granted row.
+    const owner = await grantRole(repo, tx, { holder: authed.user_email, role: "team_owner", scope: team.name }, { email: authed.user_email, userId: authed.user_id, authority: "none" });
+    if ("refused" in owner) throw new Error(`team ${team.name}: its creator's ownership was refused: ${owner.refused.message}`);
     return json({ name: team.name, created_at: team.created_at }, 201);
   });
 }
@@ -453,17 +457,17 @@ async function memberTeam(h: Read, teamName: string, authed: AuthedUser, repo: R
   return req.team!;
 }
 
-// Members read their team's roster; admins can read any team's. as_admin
-// marks the audit row when an admin isn't a member. A denial is recorded
-// (policy.ts), and reads as not found.
+// Members read their team's roster; admins (by GRAYBOARD_ADMINS or an
+// org_admin binding) can read any team's. as_admin marks the audit row when an
+// admin isn't a member. A denial is recorded (policy.ts), and reads as not
+// found; so is an admin's read, an exercise of admin authority (#927). A
+// member's read isn't.
 async function managedTeam(h: Read, teamName: string, authed: AuthedUser, repo: Repo, config: Config): Promise<{ team: Team; audit: { as_admin?: true } } | null> {
   const req: AuthzRequest = { verb: "team.read", user: { id: authed.user_id, email: authed.user_email }, team: await repo.teams.findByName(h, teamName.toLowerCase()) };
   const d = await authorize(repo, h, { admins: config.admins }, req);
-  if (!d.allow) {
-    recordDecision(repo, h, { user: authed.user_email }, req, d, { team_requested: teamName.toLowerCase() });
-    return null;
-  }
-  return { team: req.team!, audit: d.rule === "admin.env" ? { as_admin: true } : {} };
+  if (!d.allow || byAdmin(d)) recordDecision(repo, h, { user: authed.user_email }, req, d, { team_requested: teamName.toLowerCase() });
+  if (!d.allow) return null;
+  return { team: req.team!, audit: byAdmin(d) ? { as_admin: true } : {} };
 }
 
 // Owners change their team's membership; admins can change any team's, e.g.
@@ -472,12 +476,12 @@ async function managedTeam(h: Read, teamName: string, authed: AuthedUser, repo: 
 // team names the creator lost). as_admin marks an admin acting without
 // owning. A non-member still reads not found; a member who isn't an owner
 // is refused, naming who can. Every decision is recorded (policy.ts).
-async function ownedTeam(h: Read, teamName: string, authed: AuthedUser, repo: Repo, config: Config): Promise<{ team: Team; audit: { as_admin?: true } } | Response> {
+async function ownedTeam(h: Read, teamName: string, authed: AuthedUser, repo: Repo, config: Config): Promise<{ team: Team; audit: { as_admin?: true }; decision: Decision } | Response> {
   const req: AuthzRequest = { verb: "team.manage", user: { id: authed.user_id, email: authed.user_email }, team: await repo.teams.findByName(h, teamName.toLowerCase()) };
   const d = await authorize(repo, h, { admins: config.admins }, req);
   recordDecision(repo, h, { user: authed.user_email }, req, d, { team_requested: teamName.toLowerCase() });
   if (!d.allow) return d.code === "not_found" ? notFound() : forbidden(d.reason);
-  return { team: req.team!, audit: d.rule === "admin.env" ? { as_admin: true } : {} };
+  return { team: req.team!, audit: byAdmin(d) ? { as_admin: true } : {}, decision: d };
 }
 
 const lastOwner = (e: LastOwner): Response => jsonErr("conflict", e.message, 409);
@@ -487,7 +491,7 @@ function teamLeave(teamName: string, authed: AuthedUser, repo: Repo, sessions: S
     const team = await memberTeam(tx, teamName, authed, repo);
     if (!team) return notFound();
     try {
-      await repo.teams.removeMember(tx, team.id, authed.user_id);
+      await repo.teams.removeMember(tx, team.id, authed.user_id, authed.user_email);
     } catch (e) {
       if (e instanceof LastOwner) return lastOwner(e);
       throw e;
@@ -499,6 +503,10 @@ function teamLeave(teamName: string, authed: AuthedUser, repo: Repo, sessions: S
   });
 }
 
+// A refusal that rolls back what its savepoint wrote (a member added before their ownership's grant was refused).
+class Refused extends Error { constructor(readonly response: Response) { super("refused"); } }
+const refusedResponse = (o: Extract<RoleOutcome, { refused: unknown }>): Response => jsonErr(o.refused.code, o.refused.message, o.refused.status);
+
 async function teamAdd(teamName: string, req: Request, authed: AuthedUser, repo: Repo, config: Config): Promise<Response> {
   // Read the body before the ownership check (security audit F-02): an owner
   // demoted while a slow body trickles in must not act on a stale check.
@@ -509,26 +517,35 @@ async function teamAdd(teamName: string, req: Request, authed: AuthedUser, repo:
     const { team } = managed;
     if (!body?.email) return badRequest("email required");
     if (body.role !== undefined && body.role !== "owner" && body.role !== "member") return badRequest(`role must be "owner" or "member"`);
-    const role = body.role as TeamRole | undefined;
+    const role = body.role as "owner" | "member" | undefined;
     const email = body.email.toLowerCase();
     const user  = await repo.users.findByEmail(tx, email);
     if (!user) return jsonErr("not_found", `${email} has never signed in to grayboard; they need to run grayboard login first`, 404);
-    if (await repo.teams.addMember(tx, team.id, user.id, role ?? "member")) {
-      await onTeamJoined(repo, tx, team, email);
-      writeAudit(repo, tx, "team.member_added", authed.user_email, team.name, { member: email, role: role ?? "member", ...managed.audit });
-      return json({ ok: true });
-    }
-    // Already a member: a role changes only when one is asked for.
-    if (role === undefined) return json({ ok: true });
-    let from: TeamRole | null;
+    // Ownership is a team_owner binding (#927), granted and revoked by the same store calls as the admin route's,
+    // re-checking the caller's authority in the write. A refused grant takes the membership it followed with it.
+    const granter: Granter = { email: authed.user_email, userId: authed.user_id, authority: authorityOf(managed.decision) };
+    const spec = { holder: email, role: "team_owner" as const, scope: team.name };
     try {
-      from = await repo.teams.setRole(tx, team.id, user.id, role);
+      return await tx.savepoint(async (sp) => {
+        if (await repo.teams.addMember(sp, team.id, user.id)) {
+          await onTeamJoined(repo, sp, team, email);
+          writeAudit(repo, sp, "team.member_added", authed.user_email, team.name, { member: email, ...managed.audit });
+        }
+        // A role changes only when one is asked for; a new member is a member unless made an owner.
+        if (role === "owner") {
+          const out = await grantRole(repo, sp, spec, granter, managed.audit);
+          if ("refused" in out) throw new Refused(refusedResponse(out));
+        } else if (role === "member") {
+          const out = await revokeRole(repo, sp, spec, granter, false, managed.audit);
+          // Not an owner already: nothing to change.
+          if ("refused" in out && out.refused.status !== 404) throw new Refused(refusedResponse(out));
+        }
+        return json({ ok: true });
+      });
     } catch (e) {
-      if (e instanceof LastOwner) return lastOwner(e);
+      if (e instanceof Refused) return e.response;
       throw e;
     }
-    if (from !== null && from !== role) writeAudit(repo, tx, "team.role_changed", authed.user_email, team.name, { member: email, role, from, ...managed.audit });
-    return json({ ok: true });
   });
 }
 
@@ -545,7 +562,7 @@ async function teamRemove(teamName: string, req: Request, authed: AuthedUser, re
       return jsonErr("not_found", `${email} is not a member of team "${team.name}"`, 404);
     }
     try {
-      await repo.teams.removeMember(tx, team.id, user.id);
+      await repo.teams.removeMember(tx, team.id, user.id, authed.user_email, managed.audit);
     } catch (e) {
       if (e instanceof LastOwner) return lastOwner(e);
       throw e;
@@ -679,6 +696,66 @@ async function adminUnlinkIdp(req: Request, authed: AuthedUser, repo: Repo, conf
   });
 }
 
+// ── roles (#927) ─────────────────────────────────────────────────────────────
+
+// Grant and revoke behind the /api/admin/ gate, whose decision (`gate`) says which authority the write re-checks: a
+// granter revoked between the gate and the write is refused there. The binding is named by its triple, not its
+// id.
+async function adminRoleGrant(req: Request, authed: AuthedUser, repo: Repo, gate: Decision): Promise<Response> {
+  const spec = roleSpec(await parseBody(req));
+  if (!("role" in spec)) return jsonErr(spec.code, spec.message, spec.status);
+  await testPauseAsync("http:admin-role-grant:before-write");
+  return repo.write(async tx => {
+    const out = await grantRole(repo, tx, spec, { email: authed.user_email, userId: authed.user_id, authority: authorityOf(gate) });
+    if ("refused" in out) return refusedResponse(out);
+    return json({ binding: out.binding, created: out.changed }, out.changed ? 201 : 200);
+  });
+}
+
+async function adminRoleRevoke(req: Request, authed: AuthedUser, repo: Repo, config: Config, gate: Decision): Promise<Response> {
+  const spec = roleSpec(await parseBody(req));
+  if (!("role" in spec)) return jsonErr(spec.code, spec.message, spec.status);
+  await testPauseAsync("http:admin-role-revoke:before-write");
+  const bootstrap = config.admins.includes(spec.holder);
+  return repo.write(async tx => {
+    const out = await revokeRole(repo, tx, spec, { email: authed.user_email, userId: authed.user_id, authority: authorityOf(gate) }, bootstrap);
+    if ("refused" in out) return refusedResponse(out);
+    const said: { note?: string; warning?: string } = {};
+    if (spec.role === "org_admin" && bootstrap) said.note = `${spec.holder} is still an admin by the server's GRAYBOARD_ADMINS`;
+    // No guard on the last org admin: the env list is the way back, and the answer says when it's needed.
+    if (spec.role === "org_admin" && config.admins.length === 0 && (await repo.roles.list(tx, { role: "org_admin" }, 0, 1)).length === 0) {
+      said.warning = "no org admin remains on this server: set GRAYBOARD_ADMINS and restart it to have one";
+    }
+    return json({ revoked: out.binding, ...said });
+  });
+}
+
+// The bindings, filtered by role, holder and scope, a page at a time by id (principle 13). GRAYBOARD_ADMINS emails
+// are listed first, on the first page, with no id and source "bootstrap", whether or not they have signed in.
+const ROLE_PAGE = 100;
+async function adminRoleList(url: URL, repo: Repo, config: Config): Promise<Response> {
+  const q = url.searchParams;
+  const filter: RoleFilter = {};
+  const role = q.get("role"), principal = q.get("principal"), scope = q.get("scope"), after = q.get("after"), limit = q.get("limit");
+  if (role !== null) {
+    if (!isRole(role)) return badRequest(`role must be one of org_admin, team_owner, service_invoke`);
+    filter.role = role;
+  }
+  if (principal !== null) filter.principal = principal.toLowerCase();
+  if (scope !== null) filter.scope = scope.toLowerCase();
+  if (after !== null && !/^\d{1,15}$/.test(after)) return badRequest("after must be a binding id");
+  if (limit !== null && !/^\d{1,4}$/.test(limit)) return badRequest("limit must be a number");
+  const size = Math.min(Math.max(Number(limit ?? ROLE_PAGE), 1), ROLE_PAGE);
+  const page = await repo.roles.list(repo.read, filter, Number(after ?? 0), size);
+  const bootstrap = after === null && (filter.role ?? "org_admin") === "org_admin" && filter.scope === undefined
+    ? config.admins.filter(e => filter.principal === undefined || e === filter.principal).map(e => ({ id: null, principal: e, role: "org_admin", scope: null, source: "bootstrap" }))
+    : [];
+  return json({
+    bindings: [...bootstrap, ...page.map(b => ({ ...b, source: "binding" }))],
+    next: page.length === size ? page[page.length - 1]!.id : null,
+  });
+}
+
 // ── main router ──────────────────────────────────────────────────────────────
 
 // What the server does when an HTTP action changes who a user's
@@ -750,12 +827,17 @@ export async function handleHttp(
     if (action === "delete-alias" && method === "POST") return teamDeleteAlias(teamName, req, authed, repo, config);
   }
 
+  let gate: Decision | undefined;
   if (path.startsWith("/api/admin/")) {
-    const req: PureRequest = { verb: "admin", email: authed.user_email };
-    const decision = decidePure({ admins: config.admins }, req);
+    const req: AuthzRequest = { verb: "admin", user: { id: authed.user_id, email: authed.user_email } };
+    const decision = await authorize(repo, repo.read, { admins: config.admins }, req);
     recordDecision(repo, repo.read, { user: authed.user_email }, req, decision, { route: path });
     if (!decision.allow) return forbidden(decision.reason);
+    gate = decision;
   }
+  if (path === "/api/admin/roles"          && method === "GET")  return adminRoleList(url, repo, config);
+  if (path === "/api/admin/roles/grant"    && method === "POST") return adminRoleGrant(req, authed, repo, gate!);
+  if (path === "/api/admin/roles/revoke"   && method === "POST") return adminRoleRevoke(req, authed, repo, config, gate!);
   if (path === "/api/admin/revoke-session" && method === "POST") return adminRevokeSession(req, authed, repo, sessions.disconnectUser);
   if (path === "/api/admin/disable-user"   && method === "POST") return adminDisableUser(req, authed, repo, sessions.disconnectUser, slack);
   if (path === "/api/admin/enable-user"    && method === "POST") return adminEnableUser(req, authed, repo, slack);

@@ -1234,7 +1234,7 @@ export async function hostedPeer(srv: HostedServer, dir: string): Promise<Peer> 
   await seed(repo, async tx => {
     const alice = await repo.users.upsertByEmail(tx, "alice@example.com", null), bob = (await repo.users.findByEmail(tx, "bob@example.com"))!;
     const team = (await repo.teams.findByName(tx, "peers")) ?? await repo.teams.create(tx, "peers", alice.id);
-    await repo.teams.addMember(tx, team.id, alice.id, "owner");
+    await repo.teams.addMember(tx, team.id, alice.id);
     await repo.teams.addMember(tx, team.id, bob.id);
     await repo.teams.setPolicy(tx, team.id, "collaborative");
   });

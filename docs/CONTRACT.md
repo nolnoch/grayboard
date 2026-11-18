@@ -62,7 +62,8 @@ flowchart TD
 | Hosted admission, ownership history, grant attachment, the BindGate | `docs/server-hosted-ownership.md` |
 | The server's application sessions: request context, bind, the server's binding-event sources, address set, revalidation | `docs/server-sessions.md` |
 | The server's operations: delegation, DM send, write dedup, `call` | `docs/server-operations.md` |
-| The server's access policy: authorization seam, teams, attachment uploads and reads, retained HTTP routes, rate limits | `docs/server-access.md` |
+| The server's access policy: authorization seam, role bindings and admin, teams, attachment uploads and reads, retained HTTP routes | `docs/server-access.md` |
+| The server's rate limits: binds, authentication failures, the refused-token memo | `docs/server-rate-limits.md` |
 | Build, verified install, deploy files, metrics, backups, plugin distribution | `docs/server-deploy.md` |
 | The shared core's board side: boards, posts, subscriptions, attention and delivery policy, mentions, queue boards; local-mode wakeup; tool-surface rules; refused features | `docs/boards.md` |
 | Handles: names, binding, acting addresses, identity suggestion, presence | `docs/handles.md` |

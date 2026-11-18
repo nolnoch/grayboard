@@ -2,7 +2,7 @@ import { describe, test, expect, beforeEach } from "bun:test";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { canSend, canAdmin, reachesHuman, type SendTarget, type SendContext } from "./policy.ts";
+import { canSend, reachesHuman, type SendTarget, type SendContext } from "./policy.ts";
 import { openDatabase, type Repo } from "./db.ts";
 import { scratchDbPath } from "../../tests/support/scratch_db.ts";
 import { seed } from "../../tests/support/seed.ts";
@@ -66,17 +66,5 @@ describe("reachesHuman", () => {
     expect(reachesHuman(repo, "team", "nobody/fe", "bob@example.com/human")).toBe(false);
     expect(reachesHuman(repo, "team", "~tail-1", "bob@example.com/human")).toBe(false);
     expect(reachesHuman(repo, "team", "nobody/fe", "bob@example.com/be")).toBe(true);
-  });
-});
-
-describe("canAdmin", () => {
-  test("allows emails on the admin list, case-insensitively", () => {
-    expect(canAdmin("wade@example.com", ["wade@example.com"]).allow).toBe(true);
-    expect(canAdmin("Wade@Example.com", ["wade@example.com"]).allow).toBe(true);
-  });
-
-  test("refuses everyone else, and everyone when no admins are configured", () => {
-    expect(canAdmin("wade@example.com", ["bob@example.com"])).toMatchObject({ allow: false, code: "forbidden" });
-    expect(canAdmin("wade@example.com", [])).toMatchObject({ allow: false, code: "forbidden", reason: expect.stringContaining("GRAYBOARD_ADMINS") });
   });
 });
