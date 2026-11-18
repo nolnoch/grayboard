@@ -472,6 +472,16 @@ test("a reply wakes the post's author and the thread's starter; other participan
   expect(read(db, "fe", "e2e", { thread: reply.post.id }).posts).toHaveLength(4);
 });
 
+test("a reply's thread participants are listed by their first post in the thread, not by depth", () => {
+  subscribe(db, "be", "e2e", "off"); // be created the board, so it's push-subscribed
+  const root = post(db, "sim", "e2e", "question").post;
+  const fe = post(db, "fe", "e2e", "me too", root.id).post;
+  post(db, "be", "e2e", "under fe", fe.id);
+  post(db, "qa", "e2e", "under the root", root.id);
+  // A walk by depth would list qa before be; by first post, be (post 3) comes before qa (post 4).
+  expect(post(db, "sim", "e2e", "answer", root.id).deferred).toEqual(["fe", "be", "qa"]);
+});
+
 test("a deferred push shows as unread, and reading the board delivers it", () => {
   const root = post(db, "sim", "e2e", "question").post;
   const mid = post(db, "fe", "e2e", "me too", root.id).post;
