@@ -476,12 +476,14 @@ function writePath(backend: TxBackend, it: It): void {
     await h.write(tx => h.put(tx, "a"));
     await expect(h.write(() => { throw new Error("boom"); })).rejects.toThrow("boom");
     await expect(h.write(async tx => { await h.put(tx, "c"); throw new Error("boom"); })).rejects.toThrow("boom");
+    // The refusal is caught as it's made: the outer commit can take ticks (an async one on Postgres), and a rejection
+    // unhandled until then is reported as the test's failure.
     let nested: Promise<unknown> | undefined;
-    await h.write(() => { nested = h.write(() => 1); });
-    await expect(nested!).rejects.toThrow("nested code calls its Tx's savepoint");
+    await h.write(() => { nested = h.write(() => 1).catch(e => e); });
+    expect(String(await nested)).toContain("nested code calls its Tx's savepoint");
     nested = undefined;
-    await h.write(async () => { await tick(); nested = h.write(() => 1); });
-    await expect(nested!).rejects.toThrow("nested code calls its Tx's savepoint");
+    await h.write(async () => { await tick(); nested = h.write(() => 1).catch(e => e); });
+    expect(String(await nested)).toContain("nested code calls its Tx's savepoint");
     expect(await h.rows(h.read)).toEqual(["a"]);
   });
 
