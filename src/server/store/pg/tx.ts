@@ -1,25 +1,28 @@
 // The Postgres store's transaction handles and write path (#807 P3 C2, docs/future/postgres-server.md D2, D4, D6): a
 // `Read` is the pool, a `Tx` one transaction's connection, both over tx_base.ts's backend-neutral contract, and
 // `write`/`post` run through the same write queue (store/queue.ts) as SQLite's. A store function takes a handle and
-// runs its statements on `pgOf(handle)`.
+// runs its statements on `pgOf(handle)`, which sends each as it's built (PgSql).
 //
 // What differs from SQLite (tx.ts, db.ts `queued`/`posted`):
 // - Every commit is async: no synchronous body exists, and `post` never runs now (it returns false). A post from the
 //   queue's holder (its committed callback, its afterCommit flush) queues behind any body already waiting.
-// - A Bun query nobody awaits never runs: every statement is awaited.
+// - A Bun query is lazy: an `await` alone sends it a microtask later. pgOf's statements are sent as they're built, and
+//   every one is awaited (to see its error).
 // - Savepoints are raw SAVEPOINT/RELEASE/ROLLBACK TO with a frame stack per transaction, never Bun's
 //   `tx.savepoint`: Bun releases an outer savepoint while an un-awaited inner one is open and then commits the inner
 //   one's rows although its body threw. On Postgres the stack carries weight: RELEASE or ROLLBACK TO naming a
 //   savepoint an enclosing statement already destroyed fails 3B001 and aborts the whole transaction, so a frame an
 //   enclosing ROLLBACK TO or RELEASE ended (or its transaction's end) sends nothing.
-// - Writer ownership is structural (D4): the pool is read-only (default_transaction_read_only), each BEGIN says
-//   `read write`, and a `Tx` dies with its body. There is no shared writer connection to guard per statement.
+// - Writer ownership (D4): the pool is read-only (default_transaction_read_only), each BEGIN says `read write`, a `Tx`
+//   dies with its body, and pgOf's handle has no begin, reserve or savepoint. There is no shared writer connection to
+//   guard per statement; SQL text that changes a pooled session's settings is caught only in review.
 // - An error a body catches without a savepoint aborts the transaction; the failure surfaces later as 25P02 or a
 //   rolled-back COMMIT, and the write rejects with TxAborted, which names the cause.
 //
 // Runtime imports stay off bun:sqlite (pg/isolation.test.ts): tx_base.ts, queue.ts and request_context.ts import
 // nothing that reaches it.
 import { SQL } from "bun";
+import { errorDiagnostic } from "../../diagnostics.ts";
 import { detached, inRequest, requestOrigin } from "../../request_context.ts";
 import { queueFor, type WriteQueue } from "../queue.ts";
 import { BaseRead, BaseTx, flushEffect, isThenable, type Read, type SavepointFrame, type Tx } from "../tx_base.ts";
@@ -107,7 +110,11 @@ class PgTx extends BaseTx {
         if (!end()) return;
         const back = conn.unsafe(`ROLLBACK TO ${name}`).execute();
         const released = conn.unsafe(`RELEASE ${name}`).execute();
-        await Promise.all([opened.catch(() => {}), back, released]);
+        // A SAVEPOINT that failed (25P02: the transaction was already aborted) fails the two after it: the cause is
+        // the aborted transaction, named as TxAborted, as the write's own rejection would be.
+        const [o, ...rest] = await Promise.allSettled([opened, back, released]);
+        if (o.status === "rejected") throw TxAborted.wrap(o.reason);
+        for (const r of rest) if (r.status === "rejected") throw r.reason;
       },
     };
     return { frame, tx: new PgTx(this.store, this.txn, root) };
@@ -122,15 +129,65 @@ class PgTx extends BaseTx {
   }
 }
 
-// The connection a Postgres store function runs its statements on: a live Tx's transaction, or the pool. Refuses a
-// settled Tx (or one whose savepoint is open), a handle from another backend, and the store's Read from the task
-// holding its open transaction: a pool read there sees none of the body's rows and, on a small pool, waits forever
-// for the connection the transaction holds. Such a caller passes its body's Tx. The refusals read as SQLite's.
-export function pgOf(r: Read): SQL {
-  if (r instanceof PgTx) { r.assertLive(); return r.txn.conn; }
+declare const fragmentBrand: unique symbol;
+// A piece of a statement for a PgSql template (a column or table name, a clause). It is never sent on its own:
+// awaiting one throws.
+export type PgFragment = { readonly [fragmentBrand]: true };
+
+// The statement handle pgOf gives a store function: the only part of Bun.SQL a store function reaches. A tagged
+// template or `unsafe` checks the handle and sends the statement at once (`.execute()`), so statements reach the
+// connection in the order the code builds them. An `await` alone would send a Bun query a microtask later: a parent
+// statement started beside `tx.savepoint` would then follow the SAVEPOINT and roll back with it, where SQLite runs it
+// in the parent (D2). The other calls build what a template interpolates and send nothing: rows or a value list
+// (`sql(obj)`, `sql(array)`), a name (`sql("col")`) and `fragment`. No begin, reserve, savepoint or close: a store
+// function writes only in its queued transaction, and nests through `tx.savepoint`.
+export interface PgSql {
+  <T = any>(strings: TemplateStringsArray, ...values: unknown[]): Promise<T>;
+  (name: string): PgFragment;
+  <T extends { [Key in PropertyKey]: unknown }, Keys extends keyof T = keyof T>(obj: T | T[] | readonly T[], ...columns: readonly Keys[]): SQL.Helper<Pick<T, Keys>>;
+  <T>(value: T & {}): SQL.Helper<T>;
+  unsafe<T = any>(text: string, values?: unknown[]): Promise<T>;
+  fragment(strings: TemplateStringsArray, ...values: unknown[]): PgFragment;
+}
+
+const isTemplate = (v: unknown): v is TemplateStringsArray => Array.isArray(v) && Object.hasOwn(v, "raw");
+
+// Bun nests a fragment by its Query class; its own `then` stops it being sent alone (Bun would run it as a statement).
+function fragment(q: SQL.Query<unknown>): PgFragment {
+  Object.defineProperty(q, "then", { value() { throw new Error("a PgSql fragment awaited: it goes inside a statement (pgOf)"); } });
+  return q as unknown as PgFragment;
+}
+
+function statements(conn: SQL, check: () => void): PgSql {
+  const sql = ((first: unknown, ...rest: unknown[]) => {
+    if (isTemplate(first)) { check(); return conn(first, ...rest).execute(); }
+    if (typeof first === "string") return fragment(conn(first));
+    return (conn as unknown as (...a: unknown[]) => unknown)(first, ...rest);
+  }) as PgSql;
+  sql.unsafe = (text, values) => { check(); return conn.unsafe(text, values).execute(); };
+  sql.fragment = (strings, ...values) => fragment(conn(strings, ...values));
+  return sql;
+}
+
+// The statements of a Postgres store function: a live Tx's transaction, or the pool. Refuses a settled Tx (or one
+// whose savepoint is open), a handle from another backend, and the store's Read from the task holding its open
+// transaction: a pool read there sees none of the body's rows and, on a small pool, waits forever for the connection
+// the transaction holds. Such a caller passes its body's Tx. Checked here and again as each statement is sent. The
+// refusals read as SQLite's.
+export function pgOf(r: Read): PgSql {
+  if (r instanceof PgTx) { r.assertLive(); return statements(r.txn.conn, () => r.assertLive()); }
   if (!(r instanceof PgRead)) throw new Error("not a Postgres store handle");
-  if (r.store.open && r.store.queue.mine) throw new Error(READ_REFUSAL);
-  return r.store.sql;
+  const { store } = r;
+  const check = () => { if (store.open && store.queue.mine) throw new Error(READ_REFUSAL); };
+  check();
+  return statements(store.sql, check);
+}
+
+// What a failure log may carry. A Postgres error (or a TxAborted, whose cause is one) logs as its class, code and
+// SQLSTATE only: its detail quotes row values (23505's "Key (email)=(…)"), and so can its message (22P02's input).
+// Any other error logs whole, as SQLite's do.
+function loggable(error: unknown): unknown {
+  return error instanceof SQL.SQLError || error instanceof TxAborted ? errorDiagnostic(error) : error;
 }
 
 export type PgTransactions = {
@@ -192,7 +249,7 @@ export function makePgTransactions(url: string, opts: Omit<PgOptions, "connectio
         // The body fulfilled and COMMIT failed without a SQLSTATE (the connection lost): the server may have
         // committed. The effects don't run, so memory may lag the database until a restart.
         if (fulfilled && !(error instanceof SQL.PostgresError && (typeof error.errno === "string" || pgFailure(error)))) {
-          console.error("[grayboard] commit outcome unknown:", error);
+          console.error("[grayboard] commit outcome unknown:", loggable(error));
         }
         throw TxAborted.wrap(error);
       }
@@ -208,9 +265,9 @@ export function makePgTransactions(url: string, opts: Omit<PgOptions, "connectio
     // write's own catch, once either way.
     const committed = given && ((value: T) => {
       const r = given(value);
-      if (isThenable(r)) Promise.resolve(r).catch(error => console.error(`[grayboard] ${what} failed:`, error));
+      if (isThenable(r)) Promise.resolve(r).catch(error => console.error(`[grayboard] ${what} failed:`, loggable(error)));
     });
-    write(fn, committed).catch(error => console.error(`[grayboard] ${what} failed:`, error));
+    write(fn, committed).catch(error => console.error(`[grayboard] ${what} failed:`, loggable(error)));
     return false;
   }
 

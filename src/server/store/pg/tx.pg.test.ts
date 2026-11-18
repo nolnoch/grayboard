@@ -11,9 +11,8 @@ import { sqliteOf, sqliteRead } from "../tx.ts";
 import type { Read, Tx } from "../tx_base.ts";
 import { makePgTransactions, pgOf, TxAborted, type PgTransactions } from "./tx.ts";
 
-// The INSERT is sent before put returns (.execute()): an `await` alone sends a Bun query a microtask later, and the
-// contract's un-awaited-savepoint rows read what landed before the body settled.
-const put = async (tx: Tx, v: string) => { await pgOf(tx)`INSERT INTO t (v) VALUES (${v})`.execute(); };
+// Written as a store function will be: a plain `await` on pgOf's statement, which pgOf sends as it's built.
+const put = async (tx: Tx, v: string) => { await pgOf(tx)`INSERT INTO t (v) VALUES (${v})`; };
 const rows = async (r: Read) => (await pgOf(r)`SELECT v FROM t ORDER BY seq`).map((x: { v: string }) => x.v) as string[];
 const tick = () => new Promise<void>(r => setTimeout(r, 0));
 
@@ -235,11 +234,17 @@ describePg("Postgres transactions", () => {
     const seen: string[] = [];
     let settled: Promise<unknown> = Promise.resolve();
     await x.s.write(async tx => {
+      let inner!: Tx;
       settled = tx.savepoint(async sp => {
+        inner = sp;
         sp.afterCommit(() => { seen.push("effect"); });
       }).catch(e => e);
-      // A few microtasks: enough for the savepoint's body to fulfil and its RELEASE to be sent, not for the ack.
-      for (let i = 0; i < 5; i++) await Promise.resolve();
+      // The savepoint's Tx closes as its body settles, and the template sends RELEASE in the same synchronous step.
+      // Microtasks only: the ack is socket I/O, which can't arrive until the body yields to the event loop.
+      for (let i = 0; (inner as unknown as { live: boolean }).live; i++) {
+        if (i > 1000) throw new Error("the savepoint's body never settled");
+        await Promise.resolve();
+      }
     });
     expect(String(await settled)).toContain("savepoint outlived its transaction");
     expect(seen).toEqual([]);
@@ -333,4 +338,158 @@ describePg("Postgres transactions", () => {
     await x.s.write(async tx => { await pgOf(tx)`UPDATE t SET v = 'free'`; });
     expect(await rows(x.s.read)).toEqual(["free"]);
   }, 20000);
+
+  test("T-P14 pgOf's handle sends a statement as it's built: a parent statement started beside a savepoint stays the parent's", async () => {
+    await using x = await scratch();
+    const pool = pgOf(x.s.read);
+    await x.s.write(async tx => {
+      // Plain awaits, as a store function writes them. Lazily sent, these would follow the SAVEPOINT and roll back.
+      await Promise.allSettled([
+        (async () => { await pgOf(tx)`INSERT INTO t (v) VALUES ('parent')`; })(),
+        (async () => { await pgOf(tx).unsafe("INSERT INTO t (v) VALUES ('parent unsafe')"); })(),
+        tx.savepoint(async sp => { await pgOf(sp)`INSERT INTO t (v) VALUES ('rolled back')`; throw new Error("expected"); }),
+      ]);
+      // A handle taken before the savepoint opened checks again as each statement is sent: it refuses rather than
+      // landing inside the savepoint.
+      const sql = pgOf(tx);
+      const open = tx.savepoint(async () => { await tick(); });
+      expect(() => sql`INSERT INTO t (v) VALUES ('refused')`).toThrow("Tx used while its savepoint is open");
+      expect(() => sql.unsafe("INSERT INTO t (v) VALUES ('refused')")).toThrow("Tx used while its savepoint is open");
+      await open;
+      // And a pool handle taken outside refuses inside the transaction's own task.
+      expect(() => pool`SELECT 1`).toThrow("repo.read inside the caller's own transaction");
+      await sql`INSERT INTO t (v) VALUES ('after')`;
+    });
+    expect(await rows(x.s.read)).toEqual(["parent", "parent unsafe", "after"]);
+  });
+
+  test("T-P15 pgOf's handle: helpers and fragments build without sending, a fragment refuses an await; no begin, reserve or savepoint", async () => {
+    await using x = await scratch();
+    await x.s.write(async tx => {
+      const sql = pgOf(tx);
+      await sql`INSERT INTO t ${sql([{ v: "a" }, { v: "b" }])}`;
+      await sql`INSERT INTO t ${sql({ v: "c" }, "v")}`;
+      const where = sql.fragment`WHERE ${sql("v")} IN ${sql(["a", "c"])}`;
+      expect(await sql`SELECT v FROM t ${where} ORDER BY seq`).toEqual([{ v: "a" }, { v: "c" }]);
+      // Run alone, Bun would send "v" as a statement (a syntax error that aborts the transaction).
+      await expect((async () => await (sql("v") as unknown as Promise<unknown>))()).rejects.toThrow("fragment awaited");
+      await expect((async () => await (where as unknown as Promise<unknown>))()).rejects.toThrow("fragment awaited");
+      await sql`INSERT INTO t (v) VALUES ('d')`;
+    });
+    expect(await rows(x.s.read)).toEqual(["a", "b", "c", "d"]);
+    for (const h of [pgOf(x.s.read), await x.s.write(tx => pgOf(tx))]) {
+      for (const name of ["begin", "reserve", "savepoint", "close", "transaction", "file"]) expect(name in h).toBe(false);
+    }
+    // @ts-expect-error a store function can't open a transaction outside the queue (D4)
+    void pgOf(x.s.read).begin;
+    // @ts-expect-error nor reach Bun's savepoint (tx.savepoint is the one, D2)
+    void pgOf(x.s.read).savepoint;
+    // @ts-expect-error nor hold a connection
+    void pgOf(x.s.read).reserve;
+  });
+
+  test("T-P16 a savepoint opened in an already-aborted transaction rejects TxAborted, and so does the write", async () => {
+    await using x = await scratch();
+    let spError: any;
+    const e = await rejection(x.s.write(async tx => {
+      try { await pgOf(tx)`SELECT 1/0`; } catch { /* swallowed without a savepoint: the transaction is aborted */ }
+      spError = await rejection(tx.savepoint(async sp => { await put(sp, "x"); }));
+      throw spError;
+    }));
+    expect(spError).toBeInstanceOf(TxAborted);
+    expect(spError.errno).toBe("25P02");
+    expect(e).toBe(spError);
+    await x.s.write(tx => put(tx, "next"));
+    expect(await rows(x.s.read)).toEqual(["next"]);
+  });
+
+  test("T-P17 a failed post logs a Postgres error as its class, code and SQLSTATE, never the row values it quotes", async () => {
+    await using x = await scratch();
+    await x.db.sql`CREATE UNIQUE INDEX t_v ON t (v)`;
+    await x.s.write(tx => put(tx, "alice@example.com"));
+    const logged = await capturingErrors(async logged => {
+      expect(x.s.post(tx => put(tx, "alice@example.com"), undefined, "dup write")).toBe(false);
+      expect(x.s.post(async tx => { try { await put(tx, "alice@example.com"); } catch { /* swallowed */ } }, undefined, "aborted write")).toBe(false);
+      await until(() => logged.length === 2, 5000, "both posts' failures to be logged");
+    });
+    expect(logged).toEqual([
+      ["[grayboard] dup write failed:", { class: "PostgresError", code: "ERR_POSTGRES_SERVER_ERROR", sqlstate: "23505" }],
+      ["[grayboard] aborted write failed:", { class: "TxAbortedError", code: "ERR_POSTGRES_COMMIT_ROLLED_BACK" }],
+    ]);
+    expect(Bun.inspect(logged)).not.toContain("alice");
+  });
+});
+
+// A proxy between the store and the database that cuts the connection at the client's COMMIT: dropped before the
+// server sees it ("dropped"), or forwarded and its ack lost ("ack lost"). Either way the client can't know the outcome.
+describePg("Postgres in-doubt COMMIT", () => {
+  for (const mode of ["dropped", "ack lost"] as const) {
+    test(`T-P18 COMMIT ${mode}: the write rejects, "commit outcome unknown" is logged, no effect runs, the queue goes on`, async () => {
+      const db = await pgEmptyDatabase({ max: 2 });
+      await db.sql`CREATE TABLE t (seq int8 GENERATED ALWAYS AS IDENTITY, v text)`;
+      const target = new URL(db.url);
+      const sockets = new Set<{ end(): void }>();
+      let armed = false;
+      type Link = { up?: { write(d: Uint8Array): number; end(): void }; pending: Uint8Array[]; muted: boolean };
+      const proxy = Bun.listen<Link>({
+        hostname: "127.0.0.1", port: 0,
+        socket: {
+          open(client) {
+            client.data = { pending: [], muted: false };
+            sockets.add(client);
+            void Bun.connect({ hostname: target.hostname, port: Number(target.port), socket: {
+              open(up) { sockets.add(up); client.data.up = up; for (const b of client.data.pending) up.write(b); client.data.pending = []; },
+              // The ack of a muted COMMIT never reaches the client: both ends close instead.
+              data(up, d) { if (client.data.muted) { up.end(); client.end(); } else client.write(d); },
+              close() { client.end(); },
+              error() { client.end(); },
+            } }).catch(() => client.end());
+          },
+          data(client, d) {
+            const buf = Buffer.from(d);
+            if (armed && buf.includes("COMMIT")) {
+              armed = false;
+              if (mode === "dropped") { client.data.up?.end(); client.end(); return; }
+              client.data.muted = true;
+            }
+            if (client.data.up) client.data.up.write(buf); else client.data.pending.push(buf);
+          },
+          close(client) { client.data.up?.end(); },
+        },
+      });
+      const url = new URL(db.url);
+      url.hostname = "127.0.0.1";
+      url.port = String(proxy.port);
+      const s = makePgTransactions(url.toString(), { max: 2 });
+      const seen: string[] = [];
+      try {
+        const logged = await capturingErrors(async () => {
+          let deadline: ReturnType<typeof setTimeout> | undefined;
+          const e = await Promise.race([
+            rejection(s.write(async tx => {
+              await put(tx, "in doubt");
+              tx.afterCommit(() => { seen.push("effect"); });
+              armed = true;
+            }, () => { seen.push("committed"); })),
+            new Promise((_, reject) => { deadline = setTimeout(() => reject(new Error("the in-doubt write never settled within 10 s")), 10000); }),
+          ]).finally(() => clearTimeout(deadline)) as any;
+          expect(e.code).toBe("ERR_POSTGRES_CONNECTION_CLOSED");
+          expect(e.errno).toBeUndefined();
+        });
+        expect(logged).toEqual([["[grayboard] commit outcome unknown:", { class: "PostgresError", code: "ERR_POSTGRES_CONNECTION_CLOSED" }]]);
+        expect(seen).toEqual([]);
+        expect(s.queue.held).toBe(false);
+        expect(s.inTransaction()).toBe(false);
+        // The server's outcome is what the client couldn't learn.
+        expect((await db.sql`SELECT v FROM t`).map((r: { v: string }) => r.v)).toEqual(mode === "dropped" ? [] : ["in doubt"]);
+        await s.write(tx => put(tx, "next"));
+        expect((await db.sql`SELECT v FROM t ORDER BY seq`).map((r: { v: string }) => r.v)).toEqual(mode === "dropped" ? ["next"] : ["in doubt", "next"]);
+      } finally {
+        await s.close();
+        for (const sock of sockets) sock.end();
+        proxy.stop(true);
+        await db[Symbol.asyncDispose]();
+      }
+    }, 30000);
+  }
 });

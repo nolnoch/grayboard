@@ -17,7 +17,7 @@ export interface Tx extends Read {
   // Runs after the outermost COMMIT resolves, in registration order; never on rollback (of the transaction, or of a
   // savepoint the effect was registered in). Its synchronous part runs before the write queue's next body (D4).
   // A savepoint its body didn't await (a D4 violation) is dropped with its effects when the transaction ends, though
-  // the writes it made before then commit (on Postgres, only those its body issued before its first await).
+  // the writes it sent before then commit (on Postgres, any it sent before COMMIT, which follows them on the connection).
   afterCommit(effect: () => void | Promise<void>): void;
   // A nested transaction: fn's writes and effects roll back alone when it throws or rejects. Awaitable on every
   // store, so callers are written once for Postgres. Only an async write() body's Tx has it: a synchronous body
@@ -145,8 +145,15 @@ export abstract class BaseTx extends BaseRead {
     if (this !== this.#root) this.#added.push(key);
   }
   get hasBeforeCommit(): boolean { return [...this.#hooks.values()].some(h => h !== undefined); }
-  // The root's pending hooks, each once, until none is left: one a hook registers runs in the same pass.
+  // The root's pending hooks, each once, until none is left: one a hook registers runs in the same pass. A savepoint
+  // the body didn't await (D4) is dead from here, as at the transaction's end: its Tx (and any open inside it) closes,
+  // so it registers nothing more, and the keys it added drop, as its afterCommit effects do. The root stays blocked
+  // while that frame is open: a hook's statement could otherwise land inside the savepoint and roll back with it.
   async runBeforeCommit(): Promise<void> {
+    for (let t = this.#child; t; t = t.#child) {
+      t.#live = false;
+      for (const key of t.#added) this.#hooks.delete(key);
+    }
     for (;;) {
       const next = [...this.#hooks].find(([, h]) => h !== undefined);
       if (!next) return;
