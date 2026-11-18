@@ -255,6 +255,67 @@ describe("a service session (D4)", () => {
   });
 });
 
+describe("audit fixes (#270 step 2)", () => {
+  test("a service's delegate with no launcher has no human to fall back to", async () => {
+    await service();
+    const s = await srv.hosted(SVC, "w-1");
+    expect(await refusedText(s.call("delegate", { persona: "a researcher", task: "t" }))).toContain(`no live launcher session of service ${SVC}`);
+  });
+
+  test("a user's mail or delegation to a service's name reads alike whether the name exists or not; a reply still reaches it", async () => {
+    await service();
+    const s = await srv.hosted(SVC, "w-1");
+    const sessions: Record<string, Awaited<ReturnType<typeof srv.hosted>>> = {};
+    for (const email of [A, B]) {
+      const u = sessions[email] = await srv.hosted(email, email === A ? "fe" : "be");
+      const held = await refusedText(u.call("dm_send", { to: `${SVC}/w-1`, body: "hi" }));
+      expect(held).toBe(await refusedText(u.call("dm_send", { to: `${SVC}/nope`, body: "hi" })).then(t => t.replaceAll("nope", "w-1")));
+      expect(held).toContain("not found");
+      const d = await refusedText(u.call("delegate", { persona: "p", task: "t", to: `${SVC}/w-1` }));
+      expect(d).toBe(await refusedText(u.call("delegate", { persona: "p", task: "t", to: `${SVC}/nope` })).then(t => t.replaceAll("nope", "w-1")));
+    }
+    expect(srv.app.db.query("SELECT count(*) AS n FROM messages WHERE recipient LIKE 'ingest/%'").get()).toEqual({ n: 0 });
+    // The service writes first: the user may answer in that thread (the replyingTo exception).
+    const sent = await s.call<{ message_id: number }>("dm_send", { to: `${B}/be`, body: "a question" });
+    await sessions[B]!.call("dm_send", { to: `${SVC}/w-1`, body: "an answer", parent_id: sent.message_id });
+    expect(srv.app.db.query("SELECT recipient FROM messages WHERE body = 'an answer'").get()).toEqual({ recipient: `${SVC}/w-1` });
+  });
+
+  test("a claim call as a service's name reads like one in a scope nobody owns", async () => {
+    await service();
+    const alice = await srv.login(A);
+    const call = (as: string) => api(alice, "POST", "/api/claims/call", { as, tool: "claim_take", args: { key: "k" } });
+    const there = await call(`${SVC}/x`), missing = await call("nosvc/x");
+    expect(there.status).toBe(403);
+    expect(there.body.message).toBe(missing.body.message.replaceAll("nosvc", SVC));
+  });
+
+  test("admin role list leaves out a GRAYBOARD_ADMINS entry that is no email", async () => {
+    await srv.stop();
+    srv = new TestServer({ admins: [ROOT, SVC], hostedRequestLimit: { burst: 10_000, perSec: 10_000 } });
+    const root = await service();
+    const l = await api(root, "GET", "/api/admin/roles?role=org_admin");
+    expect(l.body.bindings.map((b: { principal: string }) => b.principal)).toEqual([ROOT]);
+  });
+
+  test("create refuses a disabled owner and writes nothing", async () => {
+    const root = await srv.login(ROOT);
+    await srv.login(A); await srv.login(B);
+    expect((await api(root, "POST", "/api/admin/disable-user", { email: B })).status).toBe(200);
+    expect(await create(root, SVC, [A, B])).toMatchObject({ status: 409, body: { message: expect.stringContaining(`${B} is disabled`) } });
+    expect(serviceRows()).toEqual([]);
+    expect(ownerRows()).toEqual([]);
+  });
+
+  test("at the alias cap a service is pointed at the admin route", async () => {
+    await srv.stop();
+    srv = new TestServer({ admins: [ROOT], aliasScopeCap: 1, hostedRequestLimit: { burst: 10_000, perSec: 10_000 } });
+    await service();
+    const s = await srv.hosted(SVC, "w-1");
+    expect(await refusedText(s.call("bind", { name: "w-2", create: true }))).toContain(`service "${SVC}" already has 1 names, the server's cap of 1; bind an existing name, or an admin frees one with grayboard admin service delete-alias ${SVC} <name>`);
+  });
+});
+
 test("the CLI creates, lists, disables and enables a service against a server process", async () => {
   const dir = mkdtempSync(join(tmpdir(), "gb-services-cli-"));
   const server = await ServerProcess.start([process.execPath, join(REPO_ROOT, "src/server/main.ts")], join(dir, "bus.db"), { GRAYBOARD_ADMINS: ROOT });
