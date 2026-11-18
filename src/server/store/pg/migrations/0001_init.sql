@@ -51,7 +51,6 @@ CREATE TABLE team_members (
   team_id   int8 NOT NULL CONSTRAINT team_members_team_id_fkey REFERENCES teams (id) ON DELETE CASCADE,
   user_id   int8 NOT NULL CONSTRAINT team_members_user_id_fkey REFERENCES users (id),
   joined_at int8 NOT NULL,
-  role      text COLLATE "C",
   PRIMARY KEY (team_id, user_id)
 );
 CREATE INDEX team_members_user ON team_members (user_id);
@@ -65,6 +64,23 @@ CREATE TABLE principals (
   parent_id  int8 CONSTRAINT principals_parent_id_fkey REFERENCES principals (id),
   created_at int8 NOT NULL
 );
+CREATE INDEX idx_principals_user ON principals (user_id);
+CREATE INDEX idx_principals_team ON principals (team_id);
+
+-- #927: runtime role bindings. RESTRICT, not CASCADE: deleting a principal must revoke its bindings (each with its
+-- role.revoked row) in the same transaction. A NULL never collides in a unique index, so org and scoped bindings
+-- each get a partial one.
+CREATE TABLE role_bindings (
+  id           int8 GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  principal_id int8 NOT NULL CONSTRAINT role_bindings_principal_id_fkey REFERENCES principals (id) ON DELETE RESTRICT,
+  role         text COLLATE "C" NOT NULL,
+  scope_id     int8 CONSTRAINT role_bindings_scope_id_fkey REFERENCES principals (id) ON DELETE RESTRICT,
+  granted_by   int8 CONSTRAINT role_bindings_granted_by_fkey REFERENCES principals (id) ON DELETE RESTRICT,
+  granted_at   int8 NOT NULL
+);
+CREATE UNIQUE INDEX idx_role_bindings_org ON role_bindings (principal_id, role) WHERE scope_id IS NULL;
+CREATE UNIQUE INDEX idx_role_bindings_scoped ON role_bindings (principal_id, role, scope_id) WHERE scope_id IS NOT NULL;
+CREATE INDEX idx_role_bindings_scope ON role_bindings (scope_id, role);
 
 CREATE TABLE oauth_grants (
   id         text COLLATE "C" PRIMARY KEY,
