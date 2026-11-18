@@ -10,11 +10,14 @@
 import { createHash } from "node:crypto";
 import type { SQL } from "bun";
 import { testPauseAsync } from "../../../shared/testpause.ts";
+import init from "./migrations/0001_init.sql" with { type: "text" };
 
 export type Migration = { version: number; name: string; sql: string };
 
-// Each file imported `with { type: "text" }`, so `bun build --compile` embeds it. 0001_init lands in C1b.
-export const MIGRATIONS: readonly Migration[] = [];
+// Each file imported `with { type: "text" }`, so `bun build --compile` embeds it.
+export const MIGRATIONS: readonly Migration[] = [
+  { version: 1, name: "0001_init", sql: init },
+];
 
 // pg_advisory_xact_lock's key: any constant; advisory locks are per database.
 export const MIGRATE_LOCK = 0x67626d6967726174n; // "gbmigrat"
