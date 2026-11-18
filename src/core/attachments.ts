@@ -167,7 +167,14 @@ export function bindAttachments(
   const tally = new SizeTally(limits, ids.length);
   for (const r of rows) tally.add(`attachment ${r.id}`, r.size);
   const [col, value] = "message_id" in target ? ["message_id", target.message_id] : ["post_id", target.post_id];
-  db.prepare(`UPDATE attachments SET ${col} = ? WHERE id IN (SELECT value FROM json_each(?))`).run(value, JSON.stringify(ids));
+  // Conditional on still being unsent, so a store whose read can miss a concurrent bind (Postgres) can't move a file
+  // another write just took: a row that no longer matches refuses as the read would have.
+  const bound = new Set(
+    (db.prepare(`UPDATE attachments SET ${col} = ?4 WHERE ${UNSENT} RETURNING id`).all(...unsentArgs(ids, from), value) as { id: number }[])
+      .map((r) => r.id),
+  );
+  const lost = ids.find((id) => !bound.has(id));
+  if (lost !== undefined) throw new CoreError(`attachment ${lost} isn't an unsent upload of yours`);
   return rows.map(info);
 }
 

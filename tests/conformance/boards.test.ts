@@ -171,4 +171,14 @@ conformance("boards", [
       expect((ok(await peers.be!.call("peer_list")) as any).peers.find((p: any) => p.handle === "be")).toMatchObject({ status: "busy" });
     },
   },
+  {
+    name: "a post naming an @id: no session holds is refused and adds nothing",
+    peers: ["be", "fe"],
+    async run(ctx) {
+      const { ok, refused, peers } = ctx;
+      await create(ctx);
+      refused(await peers.be!.call("board_post", { board: "e2e", body: "hi @id:0000000000000" }), "not_found");
+      expect(ok(await peers.fe!.call("board_read", { board: "e2e" })).posts).toEqual([]);
+    },
+  },
 ]);
