@@ -63,6 +63,21 @@ describePg("migrate", () => {
     expect((await recorded(db.sql)).map(r => r.version)).toEqual([1, 2]);
   });
 
+  test("a list out of order is refused by migrate itself, before touching the database", async () => {
+    await using db = await pgEmptyDatabase();
+    await expect(migrate(db.sql, [FIXTURES[1]!, FIXTURES[0]!])).rejects.toThrow("version 2 at position 1");
+    expect(await table(db.sql, "schema_migrations")).toBeNull();
+  });
+
+  test("a pending migration below a recorded one is refused, not applied out of order", async () => {
+    await using db = await pgEmptyDatabase();
+    await migrate(db.sql, FIXTURES.slice(0, 1));
+    // Version 3 recorded without 2 (a branch's database, or a hand edit).
+    await db.sql`INSERT INTO schema_migrations (version, name, checksum, applied_at) VALUES (3, '0003_three', ${checksum(FIXTURES[2]!)}, 1)`;
+    await expect(migrate(db.sql, FIXTURES)).rejects.toThrow("migration 0002_two is not applied but version 3 is");
+    expect(await table(db.sql, "two")).toBeNull();
+  });
+
   test("versions this binary doesn't know are reported, not refused (rolling deploy, N-1)", async () => {
     await using db = await pgEmptyDatabase();
     await migrate(db.sql, FIXTURES);
@@ -79,7 +94,8 @@ describePg("migrate", () => {
     try {
       await a.wait("test pause hit: pg:migrate:applied");
       const second = migrate(b, FIXTURES);
-      await until(async () => (await db.sql`SELECT 1 FROM pg_stat_activity WHERE application_name = 'gb-migrate-b' AND wait_event_type = 'Lock' AND wait_event = 'advisory'`).length > 0, 10_000, "boot B waiting on the advisory lock");
+      second.catch(() => {}); // asserted below; a failure before then must not surface as an unhandled rejection
+      await until(async () => (await db.sql`SELECT 1 FROM pg_stat_activity WHERE datname = ${db.name} AND application_name = 'gb-migrate-b' AND wait_event_type = 'Lock' AND wait_event = 'advisory'`).length > 0, 10_000, "boot B waiting on the advisory lock");
       writeFileSync(release, "");
       expect(await a.proc.exited).toBe(0);
       await a.done;
@@ -87,8 +103,9 @@ describePg("migrate", () => {
       expect(await second).toEqual({ applied: [], ahead: [] });
       expect((await recorded(db.sql)).map(r => r.version)).toEqual([1, 2, 3]);
     } finally {
-      await b.close();
+      // A first: B may be waiting on A, and close() waits for B's query.
       await a.stop();
+      await b.close({ timeout: 0 });
       rmSync(dir, { recursive: true, force: true });
     }
   });

@@ -9,7 +9,7 @@
 import { describe } from "bun:test";
 import { createHash } from "node:crypto";
 import type { SQL } from "bun";
-import { migrate, MIGRATIONS, type Migration } from "../../src/server/store/pg/migrate.ts";
+import { migrate, MIGRATIONS, RECORD_TABLE_SQL, type Migration } from "../../src/server/store/pg/migrate.ts";
 import { openPg } from "../../src/server/store/pg/sql.ts";
 
 export const PG_URL = process.env.GRAYBOARD_TEST_PG_URL || undefined;
@@ -43,9 +43,10 @@ function admin(): SQL {
   return adminPool ??= openPg(PG_URL, { max: 2, applicationName: "gb-test-admin" });
 }
 
-// The template's name for a migration set: any change to a version, name or text names a new template.
-export function templateName(migrations: readonly Migration[] = MIGRATIONS): string {
-  const h = createHash("sha256");
+// The template's name for a migration set: any change to a version, name or text, or to the runner's record table,
+// names a new template.
+export function templateName(migrations: readonly Migration[] = MIGRATIONS, recordTable = RECORD_TABLE_SQL): string {
+  const h = createHash("sha256").update(`${recordTable}\0`);
   for (const m of migrations) h.update(`${m.version}\0${m.name}\0${m.sql}\0`);
   return `gb_tpl_${h.digest("hex").slice(0, 12)}`;
 }
