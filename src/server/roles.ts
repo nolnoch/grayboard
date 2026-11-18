@@ -64,7 +64,7 @@ export async function grantRole(repo: Repo, tx: Tx, spec: RoleSpec, g: Granter, 
   const role = ROLES[spec.role];
   const b = await repo.roles.grant(tx, {
     holder: spec.holder, role: spec.role, scope: spec.scope, holderKinds: role.holders, scopeKind: role.scope,
-    member: spec.role === "team_owner", by: g.email, authority: g.authority, actor: g.email, audit,
+    member: spec.role === "team_owner", by: g.email, byUser: g.userId, authority: g.authority, actor: g.email, audit,
   });
   if (b) return { binding: b, changed: true };
   const missing = await resolve(repo, tx, spec);
@@ -87,7 +87,7 @@ export async function grantRole(repo: Repo, tx: Tx, spec: RoleSpec, g: Granter, 
 export async function revokeRole(repo: Repo, tx: Tx, spec: RoleSpec, g: Granter, bootstrap: boolean, audit: Record<string, unknown> = {}): Promise<RoleOutcome> {
   let b: RoleBinding | null;
   try {
-    b = await repo.roles.revoke(tx, { holder: spec.holder, role: spec.role, scope: spec.scope, by: g.email, authority: g.authority, actor: g.email, audit });
+    b = await repo.roles.revoke(tx, { holder: spec.holder, role: spec.role, scope: spec.scope, byUser: g.userId, authority: g.authority, actor: g.email, audit });
   } catch (e) {
     if (e instanceof LastOwner) return refuse(409, "conflict", e.message);
     throw e;

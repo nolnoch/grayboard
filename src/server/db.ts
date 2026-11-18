@@ -1162,12 +1162,14 @@ export type RoleGrant = {
   holderKinds: readonly Principal["kind"][]; scopeKind: Principal["kind"] | null;
   // Whether the holder must be a member of the scope's team (team_owner).
   member: boolean;
-  // The granter's principal name, recorded as granted_by and checked as `authority` says.
-  by: string; authority: RoleAuthority;
+  // The granter's principal name, recorded as granted_by; their user id, whose bindings `authority` checks (the
+  // same key as roles.ts's follow-up read, so the two can't disagree on who the granter is).
+  by: string; byUser: number | null; authority: RoleAuthority;
   // The audit row's actor, and fields its detail carries beside the binding (as_admin).
   actor: string; audit?: Record<string, unknown>;
 };
-export type RoleRevoke = { holder: string; role: string; scope: string | null; by: string | null; authority: RoleAuthority; actor: string | null; audit?: Record<string, unknown> };
+// byUser: the revoking user's id, whose bindings `authority` checks (null with authority "none").
+export type RoleRevoke = { holder: string; role: string; scope: string | null; byUser: number | null; authority: RoleAuthority; actor: string | null; audit?: Record<string, unknown> };
 export type RoleFilter = { role?: string; principal?: string; scope?: string };
 
 // Moved to store/errors.ts for the Postgres store; re-exported for http.ts and the tests.
@@ -1208,16 +1210,16 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
   const bindingById = (c: Database, id: number): RoleBinding | undefined =>
     c.query<RoleBinding, [number]>(`${BINDING_SQL} WHERE b.id = ?`).get(id) ?? undefined;
   // The granter's authority as of this statement, `scope` the SQL naming the binding's scope id.
-  // Its `n` placeholders all take the granter's principal name.
+  // Its `n` placeholders all take the granter's user id.
   const authoritySql = (a: RoleAuthority, scope: string): { sql: string; n: number } => {
-    const admin = `EXISTS (SELECT 1 FROM role_bindings ga JOIN principals gp ON gp.id = ga.principal_id WHERE gp.name = ? AND ga.role = 'org_admin' AND ga.scope_id IS NULL)`;
-    const owner = `EXISTS (SELECT 1 FROM role_bindings gt JOIN principals gp ON gp.id = gt.principal_id WHERE gp.name = ? AND gt.role = 'team_owner' AND gt.scope_id = ${scope})`;
+    const admin = `EXISTS (SELECT 1 FROM role_bindings ga JOIN principals gp ON gp.id = ga.principal_id WHERE gp.kind = 'user' AND gp.user_id = ? AND ga.role = 'org_admin' AND ga.scope_id IS NULL)`;
+    const owner = `EXISTS (SELECT 1 FROM role_bindings gt JOIN principals gp ON gp.id = gt.principal_id WHERE gp.kind = 'user' AND gp.user_id = ? AND gt.role = 'team_owner' AND gt.scope_id = ${scope})`;
     return a === "none" ? { sql: "1", n: 0 } : a === "org_admin" ? { sql: admin, n: 1 } : { sql: `(${admin} OR ${owner})`, n: 2 };
   };
   // One binding deleted by ids, if the granter's authority holds, with its role.revoked row carrying the whole
   // binding. A team_owner revoke that leaves a team with members and no owner throws LastOwner (security audit F-02)
   // and rolls back: a sole member may give it up; a team that already has no owner has nothing to guard.
-  const revokeBinding = (db: Database, principalId: number, role: string, scopeId: number | null, r: Pick<RoleRevoke, "by" | "authority" | "actor" | "audit">): RoleBinding | null =>
+  const revokeBinding = (db: Database, principalId: number, role: string, scopeId: number | null, r: Pick<RoleRevoke, "byUser" | "authority" | "actor" | "audit">): RoleBinding | null =>
     db.transaction(() => {
       const auth = authoritySql(r.authority, "role_bindings.scope_id");
       const before = db.query<RoleBinding, (number | string)[]>(
@@ -1225,7 +1227,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       ).get(...[principalId, role, ...(scopeId === null ? [] : [scopeId])]);
       const gone = db.query<{ id: number }, (number | string | null)[]>(
         `DELETE FROM role_bindings WHERE principal_id = ? AND role = ? AND ${scopeId === null ? "scope_id IS NULL" : "scope_id = ?"} AND ${auth.sql} RETURNING id`,
-      ).get(...[principalId, role, ...(scopeId === null ? [] : [scopeId]), ...Array(auth.n).fill(r.by)]);
+      ).get(...[principalId, role, ...(scopeId === null ? [] : [scopeId]), ...Array(auth.n).fill(r.byUser)]);
       if (!gone || !before) return null;
       if (role === "team_owner" && scopeId !== null) {
         const c = db.query<{ owners: number; members: number; team: string }, [number, number]>(
@@ -1831,7 +1833,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
             `SELECT (SELECT id FROM principals WHERE kind = 'user' AND user_id = ?) AS pu, (SELECT id FROM principals WHERE kind = 'team' AND team_id = ?) AS pt`,
           ).get(userId, teamId)!;
           const revoked = ids.pu !== null && ids.pt !== null
-            ? revokeBinding(db, ids.pu, "team_owner", ids.pt, { by: null, authority: "none", actor, audit })
+            ? revokeBinding(db, ids.pu, "team_owner", ids.pt, { byUser: null, authority: "none", actor, audit })
             : null;
           db.run("DELETE FROM team_members WHERE team_id = ? AND user_id = ?", [teamId, userId]);
           return revoked;
@@ -1874,7 +1876,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
              ${scoped && g.member ? "AND EXISTS (SELECT 1 FROM team_members tm WHERE tm.team_id = s.team_id AND tm.user_id = h.user_id)" : ""}
              AND ${auth.sql}
           ON CONFLICT DO NOTHING RETURNING id`;
-        const args: (string | number | null)[] = [g.role, g.by, now, ...(scoped ? [g.scope, g.scopeKind] : []), g.holder, ...g.holderKinds, ...Array(auth.n).fill(g.by)];
+        const args: (string | number | null)[] = [g.role, g.by, now, ...(scoped ? [g.scope, g.scopeKind] : []), g.holder, ...g.holderKinds, ...Array(auth.n).fill(g.byUser)];
         return db.transaction(() => {
           const row = db.query<{ id: number }, (string | number | null)[]>(sql).get(...args);
           if (!row) return null;

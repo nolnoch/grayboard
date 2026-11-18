@@ -513,7 +513,7 @@ test(`server: a database ${FROM} wrote opens and reads back`, async () => {
   // The ownership seed runs once, with the table: a binding revoked after it isn't seeded back by a later open, though
   // team_members.role still says owner.
   if (roles) {
-    await srv.app.repo.write(tx => srv!.app.repo.roles.revoke(tx, { holder: "bob@example.com", role: "team_owner", scope: "core", by: null, authority: "none", actor: null }));
+    await srv.app.repo.write(tx => srv!.app.repo.roles.revoke(tx, { holder: "bob@example.com", role: "team_owner", scope: "core", byUser: null, authority: "none", actor: null }));
     await srv.stop();
     srv = new TestServer({ dbPath, blobDir: join(dir, "old", "blobs") });
     expect(owners(dbPath)).toEqual([["alice@example.com", "core"]]);
