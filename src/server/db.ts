@@ -36,7 +36,7 @@ import { DEV_SESSION_LABEL, TEAM_POLICIES, type User, type IdpSignIn, type Sessi
 // The identity groups' row types and interfaces live in store/identity.ts for the Postgres store (#807 P3 C3a);
 // re-exported for every importer.
 export { DEV_SESSION_LABEL, TEAM_POLICIES } from "./store/identity.ts";
-export type { User, IdpSignIn, Session, PrincipalRow, Team, TeamPolicy, TeamRole, TeamMember, RoleBinding, RoleAuthority, RoleGrant, RoleRevoke, RoleFilter, ServiceRow, UsersStore, SessionsStore, PrincipalsStore, TeamsStore, RolesStore, ServicesStore } from "./store/identity.ts";
+export type { User, IdpSignIn, Session, PrincipalRow, Team, TeamPolicy, TeamRole, TeamMember, RoleBinding, RoleAuthority, RoleGrant, RoleRevoke, RoleFilter, ServiceRow, UsersStore, SessionsStore, PrincipalsStore, TeamsStore, RolesStore, ServicesStore, JsonValue, AuditFields, IdentityGroups } from "./store/identity.ts";
 
 // Row types
 // Every read of a user row goes through this, so `kind` is never missing (a "SELECT *" would type-check without it).
@@ -1315,8 +1315,10 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
     c.query<User, [string]>(`${USER_SQL} WHERE u.email = ?`).get(email) ?? undefined;
   const teamByName = (c: Database, name: string): Team | undefined =>
     c.query<Team, [string]>("SELECT * FROM teams WHERE name = ?").get(name) ?? undefined;
-  // The three team list reads return in id order, on every backend (#807 P3 C3 decision 4): SQLite's indexes gave it
-  // anyway, a Postgres plan promises nothing.
+  // The three team list reads return in id order, on every backend (#807 P3 C3 decision 4): teams by team id, members by
+  // user id. Before C3a, teamsOf returned SQLite's membership (rowid) order, so a user's teams can now come back
+  // reordered (/api/teams, whoami, hello); the member reads already had id order from the primary key. A Postgres plan
+  // promises no order without one.
   const teamsOf = (c: Database, userId: number): Team[] =>
     c.query<Team, [number]>(`SELECT t.* FROM teams t JOIN team_members tm ON tm.team_id = t.id WHERE tm.user_id = ? ORDER BY t.id`).all(userId);
   const isMember = (c: Database, teamId: number, userId: number): boolean =>

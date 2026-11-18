@@ -26,8 +26,8 @@ export const sqliteIdentityBackend: IdentityBackend = {
           "SELECT kind, name, user_id, team_id FROM principals ORDER BY id").all();
       },
       async audits(action) {
-        return sqliteOf(repo.read).query<{ actor: string | null; target: string | null; detail: string | null }, [string]>(
-          "SELECT actor, target, detail FROM access_log WHERE action = ? ORDER BY id").all(action)
+        return sqliteOf(repo.read).query<{ actor: string | null; target: string | null; detail: string | null; detail_type: string | null }, [string]>(
+          "SELECT actor, target, detail, json_type(detail) AS detail_type FROM access_log WHERE action = ? ORDER BY id").all(action)
           .map(r => ({ ...r, detail: r.detail === null ? null : JSON.parse(r.detail) as unknown }));
       },
       raw: sql => { db.run(sql); },

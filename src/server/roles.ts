@@ -4,7 +4,7 @@
 import type { Repo } from "./db.ts";
 import { ROLES, type Decision, type Role } from "./policy.ts";
 import { LastOwner } from "./store/errors.ts";
-import type { RoleAuthority, RoleBinding } from "./store/identity.ts";
+import type { AuditFields, RoleAuthority, RoleBinding } from "./store/identity.ts";
 import type { Tx } from "./store/tx_base.ts";
 
 export type RoleSpec = { holder: string; role: Role; scope: string | null };
@@ -63,7 +63,7 @@ async function resolve(repo: RoleStores, tx: Tx, spec: RoleSpec): Promise<Refusa
 
 // Grants the role: the new binding, or the one already held (changed false: no second role.granted row, as teamAdd
 // answers an existing member), or the refusal.
-export async function grantRole(repo: RoleStores, tx: Tx, spec: RoleSpec, g: Granter, audit: Record<string, unknown> = {}): Promise<RoleOutcome> {
+export async function grantRole(repo: RoleStores, tx: Tx, spec: RoleSpec, g: Granter, audit: AuditFields = {}): Promise<RoleOutcome> {
   const role = ROLES[spec.role];
   const b = await repo.roles.grant(tx, {
     holder: spec.holder, role: spec.role, scope: spec.scope, holderKinds: role.holders, scopeKind: role.scope,
@@ -87,7 +87,7 @@ export async function grantRole(repo: RoleStores, tx: Tx, spec: RoleSpec, g: Gra
 
 // Revokes the role: the deleted binding, or the refusal (404 when it isn't held, 409 for the last owner of a team
 // with members). `bootstrap`: whether the holder is a GRAYBOARD_ADMINS email, whose org_admin no revoke removes.
-export async function revokeRole(repo: RoleStores, tx: Tx, spec: RoleSpec, g: Granter, bootstrap: boolean, audit: Record<string, unknown> = {}): Promise<RoleOutcome> {
+export async function revokeRole(repo: RoleStores, tx: Tx, spec: RoleSpec, g: Granter, bootstrap: boolean, audit: AuditFields = {}): Promise<RoleOutcome> {
   let b: RoleBinding | null;
   try {
     b = await repo.roles.revoke(tx, { holder: spec.holder, role: spec.role, scope: spec.scope, byUser: g.userId, authority: g.authority, actor: g.email, audit });

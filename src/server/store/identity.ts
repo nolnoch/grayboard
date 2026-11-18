@@ -52,6 +52,10 @@ export type RoleBinding = {
 // doesn't change at runtime, a team's creator, a member's own removal), the granter's org_admin binding, or their
 // team_owner binding on the binding's scope or an org_admin binding.
 export type RoleAuthority = "none" | "org_admin" | "owner_or_admin";
+// A JSON value, as an audit row's detail stores it: fields a caller adds beside the binding (`audit`) are JSON,
+// never a value that serializes to something else or to nothing (a Date, a function, a bigint).
+export type JsonValue = string | number | boolean | null | readonly JsonValue[] | { readonly [k: string]: JsonValue | undefined };
+export type AuditFields = { readonly [k: string]: JsonValue | undefined };
 export type RoleGrant = {
   holder: string; role: string; scope: string | null;
   // The role table's facts (policy.ts ROLES): the holder kinds allowed, the scope's kind (null: the org).
@@ -62,10 +66,10 @@ export type RoleGrant = {
   // same key as roles.ts's follow-up read, so the two can't disagree on who the granter is).
   by: string; byUser: number | null; authority: RoleAuthority;
   // The audit row's actor, and fields its detail carries beside the binding (as_admin).
-  actor: string; audit?: Record<string, unknown>;
+  actor: string; audit?: AuditFields;
 };
 // byUser: the revoking user's id, whose bindings `authority` checks (null with authority "none").
-export type RoleRevoke = { holder: string; role: string; scope: string | null; byUser: number | null; authority: RoleAuthority; actor: string | null; audit?: Record<string, unknown> };
+export type RoleRevoke = { holder: string; role: string; scope: string | null; byUser: number | null; authority: RoleAuthority; actor: string | null; audit?: AuditFields };
 export type RoleFilter = { role?: string; principal?: string; scope?: string };
 // A service principal as the admin list shows it (#270 D1): id is its principals row's.
 export type ServiceRow = { id: number; name: string; created_at: number; disabled_at: number | null; owners: string[] };
@@ -116,7 +120,7 @@ export interface TeamsStore {
   // Removes a member, revoking their team_owner binding first through the roles revoke (its role.revoked row,
   // `actor` its actor and `audit` beside the binding in its detail), which rejects with LastOwner rather than
   // leave a team with members and no owner (security audit F-02). The revoked binding, or null.
-  removeMember(tx: Tx, teamId: number, userId: number, actor?: string | null, audit?: Record<string, unknown>): Promise<RoleBinding | null>;
+  removeMember(tx: Tx, teamId: number, userId: number, actor?: string | null, audit?: AuditFields): Promise<RoleBinding | null>;
   // The roster, each member's role read from the team's team_owner bindings. Both in user id order.
   listMembers(r: Read, teamId: number): Promise<TeamMember[]>;
   listMemberUserIds(r: Read, teamId: number): Promise<number[]>;
@@ -161,3 +165,14 @@ export interface ServicesStore {
   // accountable owner (#930 replaces them).
   orphanedBy(r: Read, userId: number): Promise<string[]>;
 }
+
+// The groups as the Postgres store implements them in C3: users.setDisabled and sessions.revokeAllForUser port with
+// the hosted and OAuth stores (C8), users.isDisabled and users.active with the auth cache (C9).
+export type IdentityGroups = {
+  users: Omit<UsersStore, "setDisabled" | "isDisabled" | "active">;
+  sessions: Omit<SessionsStore, "revokeAllForUser">;
+  principals: PrincipalsStore;
+  teams: TeamsStore;
+  roles: RolesStore;
+  services: ServicesStore;
+};

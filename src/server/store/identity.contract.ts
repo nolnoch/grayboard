@@ -14,24 +14,14 @@
 //   policy no setter writes) and the raw reads (principal rows, audit rows) are the harness's, so no row touches a
 //   connection. users.setDisabled isn't used: Postgres ports it with the hosted store (C8).
 // - Rows that force an interleaving with a SQLite trigger are registered on SQLite only (`sqliteOnly`), with their
-//   reason; Postgres covers the same races with two connections (C3b's pg/identity.pg.test.ts).
+//   reason. Postgres needs its own two-connection test for each in C3b's pg/identity.pg.test.ts: T-C3-6 for the
+//   teams.create name race, and T-C3-5b (still to write) for the sign-in link race below.
 import { expect, test } from "bun:test";
 import { grantRole, revokeRole, type Granter, type RoleSpec } from "../roles.ts";
 import { authorize, type AuthzRequest } from "../policy.ts";
 import { LastOwner, PrincipalTaken } from "./errors.ts";
-import type { PrincipalsStore, RolesStore, ServicesStore, SessionsStore, TeamsStore, User, UsersStore } from "./identity.ts";
+import type { IdentityGroups, User } from "./identity.ts";
 import type { Read, Tx } from "./tx_base.ts";
-
-// The groups as the Postgres store implements them in C3: users.setDisabled and sessions.revokeAllForUser port with
-// the hosted and OAuth stores (C8), users.isDisabled and users.active with the auth cache (C9).
-export type IdentityGroups = {
-  users: Omit<UsersStore, "setDisabled" | "isDisabled" | "active">;
-  sessions: Omit<SessionsStore, "revokeAllForUser">;
-  principals: PrincipalsStore;
-  teams: TeamsStore;
-  roles: RolesStore;
-  services: ServicesStore;
-};
 
 // One store, fresh per row.
 export type IdentityStore = IdentityGroups & {
@@ -45,10 +35,12 @@ export type IdentityStore = IdentityGroups & {
   setPolicyRaw(teamId: number, policy: string): Promise<void>;
   // A session's ids row naming its principal (what registerId writes).
   registerId(id: string, principal: string | null): Promise<void>;
-  // Raw reads: every principal row in id order; an action's access_log rows in id order, detail parsed. A detail that
-  // isn't stored as a JSON object reads back as whatever it is (a string, on Postgres, for a stringified one).
+  // Raw reads: every principal row in id order; an action's access_log rows in id order, detail parsed, with
+  // detail_type the stored detail's JSON type as the database computes it (SQLite json_type, Postgres jsonb_typeof).
+  // A stored object is "object" on both, so a detail written as a JSON string (a double stringify) fails a row that
+  // asserts it, whatever the harness's parse makes of the value.
   principalRows(): Promise<{ kind: string; name: string; user_id: number | null; team_id: number | null }[]>;
-  audits(action: string): Promise<{ actor: string | null; target: string | null; detail: unknown }[]>;
+  audits(action: string): Promise<{ actor: string | null; target: string | null; detail: unknown; detail_type: string | null }[]>;
   // SQLite only: runs a statement on the writer outside any transaction (a TEMP trigger).
   raw?(sql: string): void;
   close(): void | Promise<void>;
@@ -189,6 +181,10 @@ function users(it: It, sqliteOnly: (name: string, why: string, fn: (h: IdentityS
 
   // D3: the link is a conditional write. A trigger links the row to another account between signIn's read and its
   // write (what a concurrent sign-in does on Postgres) and drops signIn's own update: signIn re-reads and refuses.
+  // No Postgres test covers this race yet (security audit F-13: one unlinked email row, two sign-ins from the same
+  // issuer with different subjects). T-C3-5 is a different race (two emails, one subject). C3b adds T-C3-5b: A links
+  // (G, s-A) and holds, B links (G, s-B) and blocks; B ends subject_mismatch and the row keeps s-A. It must fail when
+  // the link's `idp_subject IS NULL` guard is dropped, and has an issuer variant (B from OKTA: issuer_mismatch).
   for (const [winner, status] of [[OKTA, "issuer_mismatch"], [G, "subject_mismatch"]] as const) {
     sqliteOnly(`users.signIn: a row linked between the read and the conditional write ends in ${status}, not a double link`, "a trigger forces the interleaving", async h => {
       const u = await upsert(h, "race@example.com");
@@ -260,10 +256,18 @@ function sessionsAndPrincipals(it: It): void {
     expect(await h.principals.of(h.read, "eng/be")).toEqual({ kind: "team", name: "eng" });
     expect(await h.principals.of(h.read, "team:eng")).toEqual({ kind: "team", name: "eng" });
     expect(await h.principals.of(h.read, "ingest/worker")).toEqual({ kind: "service", name: "ingest" });
-    // team:x names a team, never a service; a person scope is only a user's; a bare name acts for no one.
+    // team:x names a team, never a service; a bare name acts for no one.
     expect(await h.principals.of(h.read, "team:ingest")).toBeNull();
     expect(await h.principals.of(h.read, `${B}/fe`)).toBeNull();
     expect(await h.principals.of(h.read, "fe")).toBeNull();
+    // A person scope (an email) is only a user's, and a user's principal is reached only through one: a team named
+    // with an email, and a user row whose email isn't one (an upsert of a bare name), act for no one under a scope.
+    await h.write(tx => h.teams.create(tx, C, u.id));
+    expect(await h.principals.findByName(h.read, C)).toMatchObject({ kind: "team" });
+    expect(await h.principals.of(h.read, `${C}/fe`)).toBeNull();
+    await upsert(h, "legacy");
+    expect(await h.principals.findByName(h.read, "legacy")).toMatchObject({ kind: "user" });
+    expect(await h.principals.of(h.read, "legacy/fe")).toBeNull();
   });
 }
 
@@ -293,6 +297,7 @@ function teams(it: It, sqliteOnly: (name: string, why: string, fn: (h: IdentityS
     expect(missing).toBeInstanceOf(Error);
     expect(missing).not.toBeInstanceOf(PrincipalTaken);
     expect(String(missing)).toMatch(/foreign key/i);
+    expect(await h.teams.findByName(h.read, "qa")).toBeUndefined();
   });
 
   sqliteOnly("teams.create refuses a name another principal takes mid-create", "a trigger lands the principal inside the create", async h => {
@@ -328,9 +333,13 @@ function teams(it: It, sqliteOnly: (name: string, why: string, fn: (h: IdentityS
     expect(await h.teams.listMembers(h.read, ts[0]!.id)).toEqual([
       { user_id: u1.id, email: A, role: "member" }, { user_id: u2.id, email: B, role: "member" }, { user_id: u3.id, email: C, role: "member" },
     ]);
-    // A member's role is the team_owner binding's.
-    await h.write(tx => grantRole(h, tx, { holder: B, role: "team_owner", scope: "t1" }, { email: A, userId: u1.id, authority: "none" }));
+    // A member's role is the team_owner binding's on this team: u1 owning t2 is still a member of t1.
+    await h.write(async tx => {
+      await grantRole(h, tx, { holder: B, role: "team_owner", scope: "t1" }, { email: A, userId: u1.id, authority: "none" });
+      await grantRole(h, tx, { holder: A, role: "team_owner", scope: "t2" }, { email: A, userId: u1.id, authority: "none" });
+    });
     expect((await h.teams.listMembers(h.read, ts[0]!.id)).map(m => m.role)).toEqual(["member", "owner", "member"]);
+    expect(await h.teams.listMembers(h.read, ts[1]!.id)).toEqual([{ user_id: u1.id, email: A, role: "owner" }]);
   });
 
   it("teams.setPolicy returns the previous policy (one no setter writes reads as open), null for no team", async h => {
@@ -377,7 +386,7 @@ function teams(it: It, sqliteOnly: (name: string, why: string, fn: (h: IdentityS
     expect(revoked).toEqual(before!);
     expect(await h.roles.find(h.read, B, "team_owner", "eng")).toBeUndefined();
     expect((await h.teams.listMembers(h.read, t.id)).map(m => m.email)).toEqual([A, C]);
-    expect(await h.audits("role.revoked")).toEqual([{ actor: A, target: B, detail: expect.objectContaining({ binding: before!.id, role: "team_owner", principal: B, scope: "eng", via: "test" }) }]);
+    expect(await h.audits("role.revoked")).toEqual([{ actor: A, target: B, detail_type: "object", detail: expect.objectContaining({ binding: before!.id, role: "team_owner", principal: B, scope: "eng", via: "test" }) }]);
     const c = (await h.users.findByEmail(h.read, C))!;
     expect(await h.write(tx => h.teams.removeMember(tx, t.id, c.id))).toBeNull();
     expect(await h.teams.listMemberUserIds(h.read, t.id)).toEqual([(await h.users.findByEmail(h.read, A))!.id]);
@@ -441,8 +450,8 @@ function roles(it: It): void {
     expect(await h.roles.bindingOf(h.read, admin.id, "team_owner", eng.id)).toBeUndefined();
     const audits = await h.audits("role.granted");
     expect(audits).toEqual([
-      { actor: D, target: D, detail: { binding: org.id, role: "org_admin", principal: D, principal_id: org.principal_id, scope: null, scope_id: null, granted_by: org.granted_by, granter: D, granted_at: org.granted_at } },
-      { actor: D, target: A, detail: { binding: b!.id, role: "team_owner", principal: A, principal_id: b!.principal_id, scope: "eng", scope_id: b!.scope_id, granted_by: b!.granted_by, granter: D, granted_at: b!.granted_at, as_admin: true } },
+      { actor: D, target: D, detail_type: "object", detail: { binding: org.id, role: "org_admin", principal: D, principal_id: org.principal_id, scope: null, scope_id: null, granted_by: org.granted_by, granter: D, granted_at: org.granted_at } },
+      { actor: D, target: A, detail_type: "object", detail: { binding: b!.id, role: "team_owner", principal: A, principal_id: b!.principal_id, scope: "eng", scope_id: b!.scope_id, granted_by: b!.granted_by, granter: D, granted_at: b!.granted_at, as_admin: true } },
     ]);
     // Held already: the binding, unchanged, and no second row.
     expect(await h.write(tx => grantRole(h, tx, spec(A, "team_owner", "eng"), asAdmin))).toEqual({ binding: b, changed: false });
@@ -459,6 +468,8 @@ function roles(it: It): void {
     await refused(spec(A, "team_owner", "nope"), 404, "not_found", /no team named "nope"/);
     await refused(spec(A, "service_owner", "eng"), 404, "not_found", /no service named "eng"/);
     await refused(spec("eng", "team_owner", "eng"), 400, "bad_request", /held by a user, and "eng" is a team/);
+    // An org role has no membership precondition, so only the holder-kind check in the grant's statement refuses this.
+    await refused(spec("eng", "org_admin", null), 400, "bad_request", /"eng" is a team/);
     // service_invoke's holder list is empty: no principal matches it.
     await refused(spec(A, "service_invoke", "ingest"), 400, "bad_request", /no principal may hold service_invoke/);
     await refused(spec(A, "org_admin", null), 403, "forbidden", /no longer holds/, { email: B, userId: bob.id, authority: "org_admin" });
@@ -482,7 +493,7 @@ function roles(it: It): void {
     const b = (await h.roles.find(h.read, B, "team_owner", "eng"))!;
     expect(await h.write(tx => revokeRole(h, tx, spec(B, "team_owner", "eng"), asAdmin, false, { as_admin: true }))).toEqual({ binding: b, changed: true });
     expect(await h.roles.find(h.read, B, "team_owner", "eng")).toBeUndefined();
-    expect(await h.audits("role.revoked")).toEqual([{ actor: D, target: B, detail: {
+    expect(await h.audits("role.revoked")).toEqual([{ actor: D, target: B, detail_type: "object", detail: {
       binding: b.id, role: "team_owner", principal: B, principal_id: b.principal_id, scope: "eng", scope_id: b.scope_id,
       granted_by: b.granted_by, granter: D, granted_at: b.granted_at, as_admin: true,
     } }]);
