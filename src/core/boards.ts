@@ -338,6 +338,13 @@ export function isHuman(db: Database, handle: string): boolean {
   return !!(db.prepare(`SELECT human FROM aliases WHERE address = ?`).get(handle) as { human: number | null } | undefined)?.human;
 }
 
+/** Of `handles`, those that are a declared human's (isHuman for each, one statement). */
+export function humansAmong(db: Database, handles: string[]): Set<string> {
+  if (!handles.length) return new Set();
+  return new Set((db.prepare(`SELECT address FROM aliases WHERE human = 1 AND address IN (SELECT value FROM json_each(?))`)
+    .all(JSON.stringify([...new Set(handles)])) as { address: string }[]).map((r) => r.address));
+}
+
 /** Declared human handles. */
 export function humanHandles(db: Database): string[] {
   return (db.prepare(`SELECT address FROM aliases WHERE human = 1 ORDER BY address`).all() as { address: string }[]).map((r) => r.address);
@@ -1274,14 +1281,14 @@ export function postWakes(targets: [string, PostTarget][]): { wake: string[]; de
   };
 }
 
+/** A post's row before it's written. */
+export type NewPost = {
+  board: string; author: string; body: string; parentId: number | null; now: number; expiresAt: number | null;
+  authorId: string | null; via: string | null; authorUser: string | null;
+};
+
 /** Writes a post's row. */
-export function insertPost(
-  db: Database,
-  p: {
-    board: string; author: string; body: string; parentId: number | null; now: number; expiresAt: number | null;
-    authorId: string | null; via: string | null; authorUser: string | null;
-  },
-): Post {
+export function insertPost(db: Database, p: NewPost): Post {
   return showPost(db
     .prepare(
       `INSERT INTO posts (board, author, body, parent_id, created_at, expires_at, author_id, via, author_user)

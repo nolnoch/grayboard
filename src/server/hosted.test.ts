@@ -317,19 +317,22 @@ test("#807 P1c-15b: core helpers inside hosted bodies run on that body's Tx, out
   } finally { spy.mockRestore(); for (const s of boardSpies) s.mockRestore(); }
 });
 
-// #807 P3 B5b1b1/B5b1b2: board_list, peer_list, peer_status, board_create, board_archive, board_subscribe, board_read
-// and claim_list run on the server's port, never core over `coreOn`, their reads and writes on the call's Tx; and every
-// board tool's actor pick reads the board views on that Tx.
+// #807 P3 B5b1b1/B5b1b2/B5b2: board_list, peer_list, peer_status, board_create, board_archive, board_subscribe,
+// board_read, claim_list and board_post run on the server's port, never core over `coreOn`, their reads and writes on
+// the call's Tx; and every board tool's actor pick reads the board views on that Tx.
 test("#807 P3 B5b1b: the ported board tools and the actor pick read and write through the repo on the call's Tx", async () => {
   const checks: { op: string; inTxn: boolean; handle: "pool" | "tx" }[] = [];
   const log = (op: string, h: unknown) => checks.push({ op, inTxn: database.db.inTransaction, handle: h === database.repo.read ? "pool" : "tx" });
   const original = database.repo.coreOn.bind(database.repo);
   const spies: { mockRestore(): void }[] = [spyOn(database.repo, "coreOn").mockImplementation(((h: Parameters<typeof original>[0]) => { log("coreOn", h); return original(h); }) as never)];
   const groups = {
-    boards: ["views", "openSummaries", "roster", "get", "post", "create", "setArchived", "setSubscription", "read", "threadRoot", "mute"],
+    boards: [
+      "views", "openSummaries", "roster", "get", "post", "create", "setArchived", "setSubscription", "read", "threadRoot", "mute",
+      "insertPost", "bindAttachments", "authorAddresses", "subscribers", "threadFacts", "laneRows", "claimQueuePost", "insertOutbox",
+    ],
     bindings: ["viewerIds", "idFacts", "setStatus", "setQueueParticipation"],
-    aliases: ["isHuman", "scopesOf"],
-    claims: ["list"],
+    aliases: ["isHuman", "scopesOf", "humansAmong"],
+    claims: ["list", "ackQueue"],
   } as const;
   for (const [g, names] of Object.entries(groups)) {
     const group = database.repo[g as keyof typeof groups] as unknown as Record<string, (...a: unknown[]) => unknown>;
@@ -338,15 +341,17 @@ test("#807 P3 B5b1b: the ported board tools and the actor pick read and write th
       spies.push(spyOn(group, name as never).mockImplementation(((h: unknown, ...rest: unknown[]) => { log(`${g}.${name}`, h); return own(h, ...rest); }) as never));
     }
   }
-  const a = context("b5b1b1-a");
+  const a = context("b5b1b1-a"), lane = context("b5b2-lane");
   try {
     await hosted.bind(principal, a, { name: "b5b1b1a", create: true });
+    await hosted.bind(principal, lane, { name: "b5b2lane", create: true });
     const ported: typeof checks = [];
-    const call = async (tool: string, args: Record<string, unknown>) => {
+    let last: unknown;
+    const call = async (tool: string, args: Record<string, unknown>, as = a) => {
       const from = checks.length;
-      await hosted.run(principal, a, tool, (session, tx) => application.call(tx, session, tool, args));
+      last = await hosted.run(principal, as, tool, (session, tx) => application.call(tx, session, tool, args));
       const these = checks.slice(from);
-      if (tool !== "board_post") ported.push(...these);
+      ported.push(...these);
       return these;
     };
     const ops = (cs: typeof checks) => [...new Set(cs.map(c => c.op))].sort();
@@ -363,18 +368,33 @@ test("#807 P3 B5b1b: the ported board tools and the actor pick read and write th
     expect(ops(await call("peer_list", { board: "b5b1b1" }))).toEqual(["bindings.viewerIds", "boards.get", "boards.roster"]);
     expect(ops(await call("peer_status", { text: "porting", queue: "off" }))).toEqual(["bindings.setQueueParticipation", "bindings.setStatus"]);
     expect(ops(await call("board_subscribe", { board: "b5b1b1", mode: "digest" }))).toEqual(expect.arrayContaining(["boards.get", "boards.setSubscription"]));
-    const root = (await hosted.run(principal, a, "board_post", (session, tx) => application.call(tx, session, "board_post", { board: "b5b1b1", body: "root" }))) as { post_id: number };
+    // board_post (B5b2): a broadcast reads the subscribers, a reply its thread, and every post writes its row and outbox.
+    expect(ops(await call("board_post", { board: "b5b1b1", body: "root" }))).toEqual(
+      expect.arrayContaining(["boards.views", "boards.get", "aliases.isHuman", "boards.insertPost", "boards.authorAddresses", "boards.subscribers", "boards.insertOutbox"]),
+    );
+    const root = last as { post_id: number };
+    expect(ops(await call("board_post", { board: "b5b1b1", body: "reply @b5b2lane", parent_id: root.post_id }))).toEqual(
+      expect.arrayContaining(["boards.post", "boards.threadFacts", "aliases.humansAmong", "boards.insertOutbox", "aliases.scopesOf"]),
+    );
     expect(ops(await call("board_subscribe", { board: "b5b1b1", mode: "off", thread: root.post_id }))).toEqual(expect.arrayContaining(["boards.post", "boards.threadRoot", "boards.mute"]));
+    // A queue post rotates to the lane, which claims it; the lane's reply acks the claim.
+    await call("board_create", { name: "b5b2q", purpose: "tests", kind: "queue" });
+    await call("board_subscribe", { board: "b5b2q", mode: "push" }, lane);
+    expect(ops(await call("board_post", { board: "b5b2q", body: "work" }))).toEqual(expect.arrayContaining(["boards.laneRows", "boards.claimQueuePost"]));
+    const work = last as { post_id: number; notified: string[] };
+    expect(work.notified).toEqual(["you@example.com/b5b2lane"]);
+    expect(ops(await call("board_post", { board: "b5b2q", body: "done", parent_id: work.post_id }, lane))).toContain("claims.ackQueue");
+    expect(ops(await call("claim_list", { prefix: "queue:b5b2q:" }))).toContain("claims.list");
+    expect(last).toEqual([]);
     expect(ops(await call("board_read", { board: "b5b1b1" }))).toEqual(expect.arrayContaining(["boards.read", "claims.list"]));
     expect(ops(await call("claim_list", {}))).toContain("claims.list");
     expect(ops(await call("board_archive", { board: "b5b1b1" }))).toEqual(expect.arrayContaining(["aliases.isHuman", "boards.setArchived"]));
     expect(ops(await call("board_archive", { board: "b5b1b1", archived: false }))).toContain("boards.setArchived");
     // None of them reaches core.
     expect(ported.filter(c => c.op === "coreOn")).toEqual([]);
-    // A tool still on core picks its actor through the views on the Tx before core runs.
-    const post = await call("board_post", { board: "b5b1b1", body: "x" });
-    expect(post[0]).toMatchObject({ op: "boards.views", handle: "tx", inTxn: true });
-    expect(post.some(c => c.op === "coreOn")).toBe(true);
+    // claim_take is still core's (B5b3): the spy sees coreOn when it's reached.
+    const take = await call("claim_take", { key: "b5b2:x", board: "b5b1b1" });
+    expect(take.some(c => c.op === "coreOn")).toBe(true);
     expect(checks.filter(c => c.handle !== "tx" || !c.inTxn)).toEqual([]);
   } finally { for (const s of spies) s.mockRestore(); }
 });

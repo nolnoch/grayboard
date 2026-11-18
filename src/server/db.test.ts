@@ -1392,6 +1392,64 @@ test("#807 P3 B5b1b2: the board tools' repo writes and reads run on the handle t
   expect(archivedAt()).toBeNull();
 });
 
+// #807 P3 B5b2b: board_post's repo reads and writes run on the handle they're given: a kept Tx and a non-store handle
+// are refused, the writes roll back with their body, and committed they land.
+test("#807 P3 B5b2b: board_post's repo reads and writes run on the handle they're given", async () => {
+  const { repo, db } = fresh();
+  const [be, fe] = ["a@example.com/be", "a@example.com/fe"];
+  let root = 0;
+  const kept = await seed(repo, async tx => {
+    await repo.users.upsertByEmail(tx, "a@example.com", null);
+    for (const name of ["be", "fe"]) await repo.aliases.create(tx, person("a@example.com", name), "a@example.com");
+    const core = repo.coreOn(tx);
+    createBoard(core, be, "hall", "tests");
+    createBoard(core, be, "jobs", "work", null, { kind: "queue" });
+    subscribe(core, fe, "hall", "push");
+    subscribe(core, fe, "jobs", "push");
+    root = post(core, be, "hall", "root").post.id;
+    return tx;
+  });
+  const settled = /used after its transaction settled/;
+  const stranger = /not a SQLite store handle/;
+  const [b, al, cl] = [repo.boards, repo.aliases, repo.claims];
+  const np = (board: string, body: string) => ({ board, author: be, body, parentId: null, now: 900, expiresAt: null, authorId: null, via: null, authorUser: null });
+  const limits = { file: 1 << 20, total: 1 << 20 };
+  const target = [[fe, { reason: "subscription", wake: true }]] as [string, { reason: "subscription"; wake: boolean }][];
+  for (const h of [kept, {} as Tx]) {
+    const want = h === kept ? settled : stranger;
+    await expect(al.humansAmong(h, [fe])).rejects.toThrow(want);
+    await expect(cl.ackQueue(h, [fe], "queue:jobs:1", 1)).rejects.toThrow(want);
+    await expect(b.insertPost(h, np("hall", "x"))).rejects.toThrow(want);
+    await expect(b.bindAttachments(h, [1], { addresses: [be], principal: "a@example.com" }, root, limits)).rejects.toThrow(want);
+    await expect(b.authorAddresses(h, be, null)).rejects.toThrow(want);
+    await expect(b.subscribers(h, "hall")).rejects.toThrow(want);
+    await expect(b.threadFacts(h, root)).rejects.toThrow(want);
+    await expect(b.laneRows(h, "jobs", [be])).rejects.toThrow(want);
+    await expect(b.claimQueuePost(h, "jobs", root, fe, 1, { note: "n", push: true })).rejects.toThrow(want);
+    await expect(b.insertOutbox(h, root, target)).rejects.toThrow(want);
+  }
+  const count = (sql: string) => db.query<{ n: number }, []>(sql).get()!.n;
+  const before = { posts: count("SELECT count(*) AS n FROM posts"), outbox: count("SELECT count(*) AS n FROM outbox"), claims: count("SELECT count(*) AS n FROM claims") };
+  // Inside a body the writes are seen by its reads, and all of it rolls back.
+  await expect(seed(repo, async tx => {
+    const p = await b.insertPost(tx, np("jobs", "build"));
+    expect(await b.laneRows(tx, "jobs", [be])).toEqual([fe]);
+    expect(await b.claimQueuePost(tx, "jobs", p.id, fe, 901, { note: "n", push: true })).toBe(true);
+    await b.insertOutbox(tx, p.id, target);
+    expect(await cl.ackQueue(tx, [fe], `queue:jobs:${p.id}`, 902)).toBe(true);
+    throw new Error("rolled back");
+  })).rejects.toThrow("rolled back");
+  expect({ posts: count("SELECT count(*) AS n FROM posts"), outbox: count("SELECT count(*) AS n FROM outbox"), claims: count("SELECT count(*) AS n FROM claims") }).toEqual(before);
+  // Committed: they land.
+  const landed = await seed(repo, async tx => {
+    const p = await b.insertPost(tx, np("hall", "later"));
+    await b.insertOutbox(tx, p.id, target);
+    return p.id;
+  });
+  expect(db.query<{ handle: string }, [number]>("SELECT handle FROM outbox WHERE post_id = ?").all(landed)).toEqual([{ handle: fe }]);
+  expect(await b.subscribers(repo.read, "hall")).toEqual([{ handle: be, mode: "push" }, { handle: fe, mode: "push" }]);
+});
+
 // #807 P3 B5b1: a team's follow judges the board for the alias before subscribing it, as core's subscribe did: an
 // alias whose user isn't a member is refused as for a missing board, and its body rolls back.
 test("#807 P3 B5b1: a team follow refuses an alias that can't see the team board", async () => {

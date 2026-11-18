@@ -7,13 +7,14 @@
 // when delivery and the answer run. The rest drive it in process through
 // AppSession, where a lost answer is a write whose result the caller never
 // read, and the retry is the same call again from the same session.
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { mintSessionKey } from "../../src/core/bindings.ts";
+import { idAddress, mintSessionKey } from "../../src/core/bindings.ts";
+import { CoreError } from "../../src/core/errors.ts";
 import { WRITE_DEDUP_WINDOW_MS } from "../../src/shared/dedup.ts";
 import type { SendResult } from "../../src/server/application.ts";
 import { openDatabase } from "../../src/server/db.ts";
@@ -358,6 +359,58 @@ describe("dedup and state answers (in process)", () => {
     expect(n("SELECT COUNT(*) AS n FROM access_log WHERE action = 'attachment.released'")).toBe(1);
     await expect(be.call("board_post", { board: "e2e", body: [[1]] })).rejects.toMatchObject({ code: "bad_request", message: "body must be a string" });
     await expect(be.call("board_post", { board: "e2e", body: "reply", parent_id: "1" })).rejects.toMatchObject({ code: "bad_request", message: "parent_id must be a number" });
+  });
+
+  // #807 P3 B5b2b: the server's board_post writes inside the dedup savepoint, so a step failing after the queue claim
+  // leaves no post, claim, take event or receipt, and the retry writes fresh rather than replaying a post that's gone.
+  test("board_post: a queue post failing after its claim leaves nothing; the retry writes fresh", async () => {
+    const be = await session("be");
+    await be.call("board_create", { name: "jobs", purpose: "work", kind: "queue" });
+    const fe = await session("fe");
+    await fe.call("board_subscribe", { board: "jobs", mode: "push" });
+    const failing = spyOn(srv.app.repo.boards, "insertOutbox").mockImplementation(async () => { throw new Error("outbox write failed"); });
+    try {
+      await expect(be.call("board_post", { board: "jobs", body: "build it" })).rejects.toMatchObject({ code: "internal" });
+    } finally { failing.mockRestore(); }
+    expect(n("SELECT COUNT(*) AS n FROM posts WHERE body = 'build it'")).toBe(0);
+    expect(n("SELECT COUNT(*) AS n FROM claims WHERE key LIKE 'queue:jobs:%'")).toBe(0);
+    expect(n("SELECT COUNT(*) AS n FROM claim_events WHERE key LIKE 'queue:jobs:%'")).toBe(0);
+    expect(n("SELECT COUNT(*) AS n FROM write_receipts WHERE tool = 'board_post'")).toBe(0);
+    const retry = await be.call<{ post_id: number } & Replayed>("board_post", { board: "jobs", body: "build it" });
+    expect(retry.replayed).toBeUndefined();
+    expect(q("SELECT key, holder FROM claims WHERE key LIKE 'queue:jobs:%'")).toEqual([{ key: `queue:jobs:${retry.post_id}`, holder: "you@example.com/fe" }]);
+  });
+
+  test("board_post: a strict @id: refused after the attachment bind leaves the upload unsent", async () => {
+    const be = await session("be");
+    await be.call("board_create", { name: "e2e", purpose: "files" });
+    const up = (await srv.uploadAs(you, "be", "notes.md", "v1")).body.id as number;
+    const nobody = idAddress("f".repeat(64));
+    await expect(be.call("board_post", { board: "e2e", body: `see @${nobody}`, attachment_ids: [up] })).rejects.toMatchObject({ code: "not_found" });
+    expect(q(`SELECT post_id, message_id FROM attachments WHERE id = ${up}`)).toEqual([{ post_id: null, message_id: null }]);
+    expect(n("SELECT COUNT(*) AS n FROM posts WHERE board = 'e2e'")).toBe(0);
+    // Still the caller's to send.
+    expect((await be.call<{ post_id: number }>("board_post", { board: "e2e", body: "see file", attachment_ids: [up] })).post_id).toBeGreaterThan(0);
+  });
+
+  // The lost-row refusal (core bindAttachments: an upload the read saw but a concurrent bind took first) can't happen
+  // on one SQLite connection; a store that reports it must refuse the post as a stale id would, and roll it back.
+  test("board_post: a store's lost-row bind refusal refuses the post and leaves both uploads unsent", async () => {
+    const be = await session("be");
+    await be.call("board_create", { name: "e2e", purpose: "files" });
+    const a = (await srv.uploadAs(you, "be", "a.md", "a")).body.id as number;
+    const b = (await srv.uploadAs(you, "be", "b.md", "b")).body.id as number;
+    const lost = spyOn(srv.app.repo.boards, "bindAttachments").mockImplementation(async () => {
+      throw new CoreError(`attachment ${b} isn't an unsent upload of yours`);
+    });
+    try {
+      await expect(be.call("board_post", { board: "e2e", body: "two files", attachment_ids: [a, b] }))
+        .rejects.toMatchObject({ message: `attachment ${b} isn't an unsent upload of yours` });
+    } finally { lost.mockRestore(); }
+    expect(n("SELECT COUNT(*) AS n FROM posts WHERE board = 'e2e'")).toBe(0);
+    expect(q(`SELECT id, post_id, message_id FROM attachments WHERE id IN (${a}, ${b}) ORDER BY id`))
+      .toEqual([{ id: a, post_id: null, message_id: null }, { id: b, post_id: null, message_id: null }]);
+    expect(n("SELECT COUNT(*) AS n FROM write_receipts WHERE tool = 'board_post'")).toBe(0);
   });
 
   // #296: the access checks run before the receipt lookup, so a repeat from a
