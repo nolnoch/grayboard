@@ -368,13 +368,25 @@ export function oneLine(text: string): string {
 // it. Status is the session's (#284), so it goes to the alias's holder: a
 // tools-only process sets its owner's.
 export function setStatus(db: Database, handle: string, text: string, now = Date.now()): void {
+  const t = statusText(text);
+  touchAlias(db, handle, now);
+  if (!writeStatus(db, handle, t, now)) throw new CoreError(noStatusText(handle));
+}
+
+/** A status as stored: one line, at most MAX_STATUS chars; empty clears it. */
+export function statusText(text: string): string {
   const t = oneLine(text);
   if (t.length > MAX_STATUS) throw new CoreError(`status must be at most ${MAX_STATUS} chars`);
-  touchAlias(db, handle, now);
-  // An ID-only session (#284 S13) sets its own row; a name, its holder's.
+  return t;
+}
+
+export const noStatusText = (handle: string): string => `no live session holds "${handle}", so it has no status to set`;
+
+// setStatus's write: false when no live session holds `handle`. An ID-only session (#284 S13) sets its own row; a
+// name, its holder's.
+export function writeStatus(db: Database, handle: string, t: string, now: number): boolean {
   const session = addressParts(handle)?.kind === "id" ? `?3 AND ended_at IS NULL` : `(SELECT id FROM alias_holds WHERE address = ?3)`;
-  const r = db.prepare(`UPDATE ids SET status = ?1, status_at = ?2 WHERE id = ${session}`).run(t || null, t ? now : null, handle);
-  if (r.changes === 0) throw new CoreError(`no live session holds "${handle}", so it has no status to set`);
+  return db.prepare(`UPDATE ids SET status = ?1, status_at = ?2 WHERE id = ${session}`).run(t || null, t ? now : null, handle).changes > 0;
 }
 
 // Queue boards skip a lane that opted out (peer_status queue:"off"); it
@@ -412,12 +424,7 @@ export function createBoard(
   scope: string | null = null,
   opts: { kind?: string } = {},
 ): Board {
-  const board = normalizeBoard(name);
-  if (!String(purpose ?? "").trim()) throw new CoreError("purpose is required");
-  // One line, shown in every board_list (#76).
-  if (purpose.length > MAX_PURPOSE_CHARS) throw new CoreError(`purpose must be at most ${MAX_PURPOSE_CHARS} chars`);
-  const kind = opts.kind ?? "broadcast";
-  if (kind !== "broadcast" && kind !== "queue") throw new CoreError(`kind must be "broadcast" or "queue"`);
+  const c = createArgs(name, purpose, opts.kind);
   const denied = access(db).checkCreate(handle, scope);
   if (denied) throw new CoreError(denied);
   const res = db
@@ -425,14 +432,40 @@ export function createBoard(
       `INSERT INTO boards (name, purpose, scope, created_by, created_at, kind) VALUES (?, ?, ?, ?, ?, ?)
        ON CONFLICT(name) DO NOTHING`,
     )
-    .run(board, purpose.trim(), scope, handle, Date.now(), kind);
+    .run(c.board, c.purpose, scope, handle, Date.now(), c.kind);
   if (res.changes === 0) {
-    const old = getBoard(db, board);
-    throw new CoreError(old?.archived_at && sees(db, handle, old) ? `board #${board} already exists, archived; board_archive(board, false) reopens it` : `board #${board} already exists`);
+    const old = getBoard(db, c.board);
+    throw new CoreError(boardExistsText(c.board, !!old?.archived_at && sees(db, handle, old)));
   }
-  subscribe(db, handle, board, "push");
-  return getBoard(db, board)!;
+  subscribe(db, handle, c.board, "push");
+  return getBoard(db, c.board)!;
 }
+
+/** createBoard's argument checks, in its order: the name, then the purpose, then the kind. */
+export function createArgs(name: string, purpose: string, kind: string | undefined): { board: string; purpose: string; kind: "broadcast" | "queue" } {
+  const board = normalizeBoard(name);
+  if (!String(purpose ?? "").trim()) throw new CoreError("purpose is required");
+  // One line, shown in every board_list (#76).
+  if (purpose.length > MAX_PURPOSE_CHARS) throw new CoreError(`purpose must be at most ${MAX_PURPOSE_CHARS} chars`);
+  const k = kind ?? "broadcast";
+  if (k !== "broadcast" && k !== "queue") throw new CoreError(`kind must be "broadcast" or "queue"`);
+  return { board, purpose: purpose.trim(), kind: k };
+}
+
+/** A create's refusal for a taken name; `archivedSeen`: the board is archived and the creator may see it. */
+export const boardExistsText = (board: string, archivedSeen: boolean): string =>
+  archivedSeen ? `board #${board} already exists, archived; board_archive(board, false) reopens it` : `board #${board} already exists`;
+
+/**
+ * Whether board_create's arguments repeat `mine`, made by `handle` (#254), apart from its visibility: the open board
+ * with this scope, kind and purpose. `purpose` is read only once the rest matches, as its refusal comes after them.
+ */
+export function createRepeats(mine: Board | undefined, handle: string, scope: string | null, kind: string | undefined, purpose: () => string): boolean {
+  return !!mine && !mine.archived_at && mine.created_by === handle && mine.scope === scope && (mine.kind ?? "broadcast") === (kind ?? "broadcast") && mine.purpose === purpose().trim();
+}
+
+/** board_create's answer to a repeat (#254). */
+export const createdNote = (mine: Board) => ({ ...mine, note: `you created #${mine.name} at ${new Date(mine.created_at).toISOString()}` });
 
 // Archive or reopen a board (#635). An archived board leaves board_list,
 // refuses new top-level posts (replies still land, so open threads finish) and
@@ -449,29 +482,40 @@ export function archiveBoard(
   opts: { addresses?: string[]; human?: boolean } = {},
 ): { board: Board; note?: string } {
   const b = visibleBoard(db, handle, boardInput);
-  if (b.name === access(db).announceBoard || b.scope === `team:${b.name}`) {
-    throw new CoreError(`#${b.name} belongs to the bus itself and can't be archived`);
-  }
+  archiveGate(b, access(db).announceBoard);
   const addresses = opts.addresses ?? [handle];
   const human = (opts.human || isHuman(db, handle)) && (access(db).sameUser?.(handle, b.created_by) ?? true);
   if (!human && !addresses.includes(b.created_by)) {
-    throw new CoreError(archiveRefusal(db, b));
+    const a = access(db);
+    throw new CoreError(archiveRefusalText(b, a.ownerOf ? a.ownerOf(b.created_by) : undefined));
   }
-  // A repeat is answered from state (#254), never written twice.
-  if (archived && b.archived_at) {
-    return { board: b, note: `#${b.name} was already archived at ${new Date(b.archived_at).toISOString()} by ${b.archived_by}` };
-  }
-  if (!archived && !b.archived_at) return { board: b, note: `#${b.name} isn't archived` };
+  const note = archiveRepeat(b, archived);
+  if (note) return { board: b, note };
   db.prepare(`UPDATE boards SET archived_at = ?, archived_by = ? WHERE name = ?`).run(archived ? Date.now() : null, archived ? handle : null, b.name);
   return { board: getBoard(db, b.name)! };
 }
 
-// Who may archive or reopen `b`, named for a caller who may not.
-function archiveRefusal(db: Database, b: Board): string {
-  const a = access(db);
+/** Refuses to archive a mode's own board (#announce, a team's board). */
+export function archiveGate(b: Board, announceBoard: string | null): void {
+  if (b.name === announceBoard || b.scope === `team:${b.name}`) {
+    throw new CoreError(`#${b.name} belongs to the bus itself and can't be archived`);
+  }
+}
+
+/** A repeat archive or reopen, answered from state (#254) and never written twice; undefined when it changes `b`. */
+export function archiveRepeat(b: Board, archived: boolean): string | undefined {
+  if (archived && b.archived_at) return `#${b.name} was already archived at ${new Date(b.archived_at).toISOString()} by ${b.archived_by}`;
+  if (!archived && !b.archived_at) return `#${b.name} isn't archived`;
+  return undefined;
+}
+
+/**
+ * Who may archive or reopen `b`, named for a caller who may not. `owner`: the creator's user (null for none), or
+ * undefined in a mode with one user.
+ */
+export function archiveRefusalText(b: Board, owner: string | null | undefined): string {
   const who = `only #${b.name}'s creator (${b.created_by})`;
-  if (!a.ownerOf) return `${who} or your user can archive or reopen it`;
-  const owner = a.ownerOf(b.created_by);
+  if (owner === undefined) return `${who} or your user can archive or reopen it`;
   return owner
     ? `${who} or its user (${owner}, from Slack: archive #${b.name} / reopen #${b.name}) can archive or reopen it`
     : `${who} can archive or reopen it`;
@@ -562,7 +606,15 @@ export type BoardUse = "read" | "subscribe" | "post";
 // A board summary's columns before mode and unread, shared by both list paths.
 const BOARD_COLUMNS = `b.*, (SELECT COUNT(*) FROM posts p WHERE p.board = b.name) AS posts`;
 
-function boardViews(db: Database, handles: string[], board: string | null): { handle: string; row: BoardSummary }[] {
+export type BoardView = { handle: string; row: BoardSummary };
+
+function boardViews(db: Database, handles: string[], board: string | null): BoardView[] {
+  const a = access(db);
+  return boardViewRows(db, handles, board).filter((v) => a.canSee(v.handle, v.row));
+}
+
+/** Each of `handles`' view of every board (of `board` alone, when given), unjudged: in handle order, then board name. */
+export function boardViewRows(db: Database, handles: string[], board: string | null): BoardView[] {
   const q = db.prepare(
     `SELECT ${BOARD_COLUMNS}, s.mode AS mode,
             CASE WHEN s.handle IS NULL THEN 0 ELSE
@@ -573,12 +625,11 @@ function boardViews(db: Database, handles: string[], board: string | null): { ha
       WHERE ? IS NULL OR b.name = ?
       ORDER BY b.name`,
   );
-  const a = access(db);
-  return handles.flatMap((h) => (q.all(h, h, h, h, h, board, board) as BoardSummary[]).filter((b) => a.canSee(h, b)).map((row) => ({ handle: h, row: showBoard(row) })));
+  return handles.flatMap((h) => (q.all(h, h, h, h, h, board, board) as BoardSummary[]).map((row) => ({ handle: h, row: showBoard(row) })));
 }
 
-// The view a use acts as, from one board's views in address order.
-function pickView<T extends { row: BoardSummary }>(views: T[], use: BoardUse): T | undefined {
+/** The view a use acts as, from one board's views in address order. */
+export function pickView<T extends { row: BoardSummary }>(views: T[], use: BoardUse): T | undefined {
   const subscribed = views.filter((v) => v.row.mode !== null);
   const preferred = use === "read" ? (subscribed.find((v) => v.row.unread > 0) ?? subscribed[0]) : use === "subscribe" ? subscribed[0] : undefined;
   return preferred ?? views[0];
@@ -596,16 +647,24 @@ export function boardAddress(db: Database, board: string, handles: string[], use
  * addressless reader) sees rows with no mode and nothing unread.
  */
 export function listBoards(db: Database, handles: string[] | BoardPredicate): BoardSummary[] {
-  if (typeof handles === "function") {
-    const rows = db.prepare(
-      `SELECT ${BOARD_COLUMNS}, NULL AS mode, 0 AS unread
-         FROM boards b WHERE b.archived_at IS NULL ORDER BY b.name`,
-    ).all() as BoardSummary[];
-    return rows.map(showBoard).filter(handles);
-  }
-  const byBoard = new Map<string, { handle: string; row: BoardSummary }[]>();
-  for (const v of boardViews(db, handles, null)) if (v.row.archived_at === undefined) byBoard.set(v.row.name, [...(byBoard.get(v.row.name) ?? []), v]);
-  return [...byBoard.values()].map((views) => pickView(views, "read")!.row).sort((x, y) => (x.name < y.name ? -1 : x.name > y.name ? 1 : 0));
+  if (typeof handles === "function") return openSummaryRows(db).filter(handles);
+  return boardsFromViews(boardViews(db, handles, null));
+}
+
+/** Every open board as an addressless reader sees it: no mode, nothing unread. */
+export function openSummaryRows(db: Database): BoardSummary[] {
+  const rows = db.prepare(
+    `SELECT ${BOARD_COLUMNS}, NULL AS mode, 0 AS unread
+       FROM boards b WHERE b.archived_at IS NULL ORDER BY b.name`,
+  ).all() as BoardSummary[];
+  return rows.map(showBoard);
+}
+
+/** board_list's rows from the judged views in address order: open boards, each the view a read acts as, by name. */
+export function boardsFromViews(views: BoardView[]): BoardSummary[] {
+  const byBoard = new Map<string, BoardView[]>();
+  for (const v of views) if (v.row.archived_at === undefined) byBoard.set(v.row.name, [...(byBoard.get(v.row.name) ?? []), v]);
+  return [...byBoard.values()].map((vs) => pickView(vs, "read")!.row).sort((x, y) => (x.name < y.name ? -1 : x.name > y.name ? 1 : 0));
 }
 
 // mode "off" unsubscribes. New subscriptions start at the tip: no backlog.
@@ -635,14 +694,21 @@ export function setSubscription(db: Database, handle: string, board: string, mod
 export function muteThread(db: Database, handle: string, boardInput: string, postId: number, muted: boolean): number {
   const board = visibleBoard(db, handle, boardInput).name;
   const p = getPost(db, postId);
-  if (!p || p.board !== board) throw new CoreError(`thread ${postId} is not a post on #${board}`);
+  if (!p || p.board !== board) throw new CoreError(threadNotOnBoard(postId, board));
   const root = threadRoot(db, postId);
+  setMute(db, handle, root, muted);
+  return root;
+}
+
+export const threadNotOnBoard = (postId: number, board: string): string => `thread ${postId} is not a post on #${board}`;
+
+// muteThread's write, for a root the caller already found.
+export function setMute(db: Database, handle: string, root: number, muted: boolean): void {
   if (muted) {
     db.prepare(`INSERT INTO thread_mutes (handle, root_id) VALUES (?, ?) ON CONFLICT DO NOTHING`).run(handle, root);
   } else {
     db.prepare(`DELETE FROM thread_mutes WHERE handle = ? AND root_id = ?`).run(handle, root);
   }
-  return root;
 }
 
 export function isSubscribed(db: Database, handle: string, board: string): boolean {
@@ -1067,7 +1133,8 @@ function threadAuthors(db: Database, postId: number): string[] {
   ).map((r) => r.author);
 }
 
-function threadRoot(db: Database, postId: number): number {
+/** The root of the thread `postId` is in (`postId` itself when it's missing or a root). */
+export function threadRoot(db: Database, postId: number): number {
   let id = postId;
   while (true) {
     const row = db.prepare(`SELECT parent_id FROM posts WHERE id = ?`).get(id) as
@@ -1157,12 +1224,23 @@ export function seenHandles(db: Database, viewer: string, handles: string[]): st
   if (!acc.seesAlias) return handles;
   const scopeOf = db.prepare(`SELECT scope_kind, scope_ref FROM aliases WHERE address = ?`);
   return handles.filter((h) => {
-    const r = scopeOf.get(h) as { scope_kind: AliasScope["scope_kind"] | null; scope_ref: string | null } | null;
-    if (r) return r.scope_kind === null || acc.seesAlias!(viewer, { scope_kind: r.scope_kind, scope_ref: r.scope_ref });
-    // A deleted team name (#347) keeps its claims; it stays inside the team that had it (#871).
-    const p = addressParts(h);
-    return p?.kind !== "alias" || p.scopeKind !== "principal" || acc.seesAlias!(viewer, { scope_kind: "team", scope_ref: p.scope });
+    const scope = seenScopeOf(scopeOf.get(h) as AliasScopeRow | null, h);
+    return scope === null || acc.seesAlias!(viewer, scope);
   });
+}
+
+/** An aliases row's scope columns. */
+export type AliasScopeRow = { scope_kind: AliasScope["scope_kind"] | null; scope_ref: string | null };
+
+/**
+ * The scope whose sight decides whether a viewer may see that `handle` exists (#348), from its aliases row (null when
+ * it has none); null when anyone may.
+ */
+export function seenScopeOf(row: AliasScopeRow | null | undefined, handle: string): AliasScopeOf | null {
+  if (row) return row.scope_kind === null ? null : { scope_kind: row.scope_kind, scope_ref: row.scope_ref };
+  // A deleted team name (#347) keeps its claims; it stays inside the team that had it (#871).
+  const p = addressParts(handle);
+  return p?.kind === "alias" && p.scopeKind === "principal" ? { scope_kind: "team", scope_ref: p.scope } : null;
 }
 
 export function viewers(db: Database): (handle: string) => boolean {
@@ -1240,99 +1318,133 @@ export function who(
 ): WhoResult {
   const isViewer = viewers(db);
   const acc = access(db);
-  const own = new Set(ctx.addresses ?? [handle]);
-  type Row = {
-    handle: string; last_seen: number | null; mode?: SubMode; id: string | null; principal: string | null; cwd: string | null; place: string | null;
-    status: string | null; status_at: number | null; harness: string | null; model: string | null; effort: string | null; launcher: number | null;
-    human: number | null; queue_off: number | null; scope_kind: ScopeKind | null; scope_ref: string | null;
-  } & { [K in keyof AliasMeta]-?: string | null };
+  let rows: WhoRow[];
+  if (opts.board !== undefined) {
+    const b = visibleBoard(db, ctx.reader ?? handle, opts.board);
+    rows = whoRows(db, b.name).filter((r) => acc.canSee(r.handle, b));
+  } else {
+    rows = whoRows(db, null);
+  }
+  // One scope check per alias scope, not one per row (#373).
+  const viewer = ctx.session ?? handle;
+  const memo = (check: (scope: AliasScopeOf) => boolean) => {
+    const seen = new Map<string, boolean>();
+    return (scope: AliasScopeOf): boolean => {
+      const key = `${scope.scope_kind}\0${scope.scope_ref}`;
+      let v = seen.get(key);
+      if (v === undefined) seen.set(key, v = check(scope));
+      return v;
+    };
+  };
+  const peers = assembleWho(rows, opts.match, {
+    isViewer,
+    seesName: acc.seesAlias ? memo((s) => acc.seesAlias!(viewer, s)) : () => true,
+    seesMeta: memo((s) => acc.seesAliasMeta(viewer, s)),
+    online,
+    own: new Set(ctx.addresses ?? [handle]),
+    now: Date.now(),
+  });
+  // A board's roster lists its unbound subscribers by ID among its peers.
+  const unbound = opts.board === undefined ? unboundRows(db, ctx.unbound ?? [], opts.match) : [];
+  return finishWho(peers, unbound, isViewer(handle) ? undefined : handle, opts.include_offline);
+}
+
+type AliasScopeOf = Omit<AliasScope, "name">;
+
+/** One roster row (who's query): an alias or a board's subscriber, with its session's facts (ALIAS_SESSION_SQL). */
+export type WhoRow = {
+  handle: string; last_seen: number | null; mode?: SubMode; id: string | null; principal: string | null; cwd: string | null; place: string | null;
+  status: string | null; status_at: number | null; harness: string | null; model: string | null; effort: string | null; launcher: number | null;
+  human: number | null; queue_off: number | null; scope_kind: ScopeKind | null; scope_ref: string | null;
+} & { [K in keyof AliasMeta]-?: string | null };
+
+/**
+ * The roster's rows, unjudged: every alias that has had a session, or `board`'s subscribers (a board already judged
+ * visible to the caller; the caller judges each row's sight of it).
+ */
+export function whoRows(db: Database, board: string | null): WhoRow[] {
   const held = `EXISTS (SELECT 1 FROM alias_holds h WHERE h.address = a.address AND h.id = i.id)`;
   const facts = `i.id, i.principal, i.cwd, i.place, i.harness, i.model, i.effort, i.launcher,
     a.human, a.queue_off, a.scope_kind, a.scope_ref, ${ALIAS_META_KEYS.map((k) => `a.${k}`).join(", ")}`;
-  let rows: Row[];
-  if (opts.board !== undefined) {
-    const b = visibleBoard(db, ctx.reader ?? handle, opts.board);
-    // A subscription a session took as its ID is listed under its primary
-    // (as queueLanes does), or as the ID with its own session's facts; a
-    // name's own subscription wins over its ID's.
-    const subs = db
-      .prepare(
-        `SELECT m.handle, m.mode, m.own, COALESCE(a.last_seen, i.last_seen) AS last_seen, ${facts},
-             CASE WHEN a.address IS NULL AND i.ended_at IS NULL OR ${held} THEN i.status END AS status,
-             CASE WHEN a.address IS NULL AND i.ended_at IS NULL OR ${held} THEN i.status_at END AS status_at FROM (
-             SELECT COALESCE(s.ph, s.handle) AS handle, s.mode, s.ph IS NULL AS own
-               FROM (SELECT s0.handle, s0.mode, ${primaryHoldSql("s0.handle")} AS ph FROM subscriptions s0 WHERE s0.board = ?) s) m
-           LEFT JOIN aliases a ON a.address = m.handle
-           LEFT JOIN ids i ON i.id = COALESCE(${ALIAS_SESSION_SQL}, m.handle)
-          ORDER BY m.handle, m.own DESC`,
-      )
-      .all(b.name) as (Row & { own: number })[];
-    rows = subs
-      .filter((r, n) => n === 0 || subs[n - 1]!.handle !== r.handle)
-      .map(({ own: _, ...r }) => r)
-      .filter((r) => acc.canSee(r.handle, b));
-  } else {
-    rows = db
+  if (board === null) {
+    return db
       .prepare(
         `SELECT a.address AS handle, a.last_seen, ${facts},
              CASE WHEN ${held} THEN i.status END AS status, CASE WHEN ${held} THEN i.status_at END AS status_at FROM aliases a
            LEFT JOIN ids i ON i.id = ${ALIAS_SESSION_SQL}
           WHERE a.last_seen IS NOT NULL ORDER BY a.address`,
       )
-      .all() as Row[];
+      .all() as WhoRow[];
   }
-  const now = Date.now();
+  // A subscription a session took as its ID is listed under its primary
+  // (as queueLanes does), or as the ID with its own session's facts; a
+  // name's own subscription wins over its ID's.
+  const subs = db
+    .prepare(
+      `SELECT m.handle, m.mode, m.own, COALESCE(a.last_seen, i.last_seen) AS last_seen, ${facts},
+           CASE WHEN a.address IS NULL AND i.ended_at IS NULL OR ${held} THEN i.status END AS status,
+           CASE WHEN a.address IS NULL AND i.ended_at IS NULL OR ${held} THEN i.status_at END AS status_at FROM (
+           SELECT COALESCE(s.ph, s.handle) AS handle, s.mode, s.ph IS NULL AS own
+             FROM (SELECT s0.handle, s0.mode, ${primaryHoldSql("s0.handle")} AS ph FROM subscriptions s0 WHERE s0.board = ?) s) m
+         LEFT JOIN aliases a ON a.address = m.handle
+         LEFT JOIN ids i ON i.id = COALESCE(${ALIAS_SESSION_SQL}, m.handle)
+        ORDER BY m.handle, m.own DESC`,
+    )
+    .all(board) as (WhoRow & { own: number })[];
+  return subs.filter((r, n) => n === 0 || subs[n - 1]!.handle !== r.handle).map(({ own: _, ...r }) => r);
+}
+
+/**
+ * What assembleWho asks of the mode, each a sync lookup. `seesName`/`seesMeta`: whether the caller (its session's
+ * principal) may see that an alias of a scope exists, and read its labels; `seesMeta` is also asked of
+ * `{scope_kind: "person", scope_ref: principal}` for every row (principal null included) to gate an ID row's session
+ * facts and a `match.scope` on a principal. `own`: the caller's addresses.
+ */
+export type WhoFacts = {
+  isViewer: (handle: string) => boolean;
+  seesName: (scope: AliasScopeOf) => boolean;
+  seesMeta: (scope: AliasScopeOf) => boolean;
+  online: (handle: string) => boolean;
+  own: Set<string>;
+  now: number;
+};
+
+/** The peers the caller is shown of roster `rows` it may see the board of, cut and matched as who's comment says. */
+export function assembleWho(rows: WhoRow[], match: PeerMatch | undefined, f: WhoFacts): Peer[] {
   const all: Peer[] = [];
-  // One scope check per alias scope, not one per row (#373).
-  const viewer = ctx.session ?? handle;
-  const seen = new Map<string, boolean>();
-  const sees = (scope: Omit<AliasScope, "name">): boolean => {
-    const key = `${scope.scope_kind}\0${scope.scope_ref}`;
-    let v = seen.get(key);
-    if (v === undefined) seen.set(key, v = acc.seesAliasMeta(viewer, scope));
-    return v;
-  };
-  // Whether the row is listed at all: a team's alias only to the team's
-  // members (#348), before `match` and the offline count, so neither probes
-  // a hidden name. Memoized per scope as the label cut is.
-  const listed = new Map<string, boolean>();
-  const seesName = (scope: Omit<AliasScope, "name">): boolean => {
-    if (!acc.seesAlias) return true;
-    const key = `${scope.scope_kind}\0${scope.scope_ref}`;
-    let v = listed.get(key);
-    if (v === undefined) listed.set(key, v = acc.seesAlias(viewer, scope));
-    return v;
-  };
   for (const r of rows) {
-    if (isViewer(r.handle)) continue;
-    if (r.scope_kind !== null && !own.has(r.handle) && !seesName({ scope_kind: r.scope_kind, scope_ref: r.scope_ref })) continue;
-    const seesMeta = r.scope_kind !== null && sees({ scope_kind: r.scope_kind, scope_ref: r.scope_ref });
+    if (f.isViewer(r.handle)) continue;
+    // Whether the row is listed at all: a team's alias only to the team's
+    // members (#348), before `match` and the offline count, so neither probes
+    // a hidden name.
+    if (r.scope_kind !== null && !f.own.has(r.handle) && !f.seesName({ scope_kind: r.scope_kind, scope_ref: r.scope_ref })) continue;
+    const seesMeta = r.scope_kind !== null && f.seesMeta({ scope_kind: r.scope_kind, scope_ref: r.scope_ref });
     // The session's facts (where it runs, its status, harness, model, effort,
     // launcher) follow the labels' cut: an alias's to a caller that may act
     // in its scope, an ID's to one that may act in its principal's (security
     // audit F-12). Another user's agent is a handle and its presence, nothing
     // about their machine or work. Locally every row passes.
-    const seesSession = own.has(r.handle) || (r.scope_kind !== null ? seesMeta : sees({ scope_kind: "person", scope_ref: r.principal }));
+    const seesSession = f.own.has(r.handle) || (r.scope_kind !== null ? seesMeta : f.seesMeta({ scope_kind: "person", scope_ref: r.principal }));
     const where = !seesSession ? null : r.cwd ? describeLocation(r.cwd) : r.place;
     const session = seesSession ? sessionFacts(r) : {};
     const meta: AliasMeta = {};
     if (seesMeta) for (const k of ALIAS_META_KEYS) if (r[k]) meta[k] = r[k];
     // An ID row's scope is its principal, which the row doesn't show: it
     // matches only for a caller that may act in that principal's scope (#371).
-    if (opts.match) {
-      const idScope = opts.match.scope !== undefined && r.principal !== null && sees({ scope_kind: "person", scope_ref: r.principal });
+    if (match) {
+      const idScope = match.scope !== undefined && r.principal !== null && f.seesMeta({ scope_kind: "person", scope_ref: r.principal });
       const scope = (r.scope_kind !== null ? r.scope_ref : idScope ? r.principal : null) ?? undefined;
-      if (!matches(opts.match, { id: r.id ?? undefined, ...session, ...meta, scope })) continue;
+      if (!matches(match, { id: r.id ?? undefined, ...session, ...meta, scope })) continue;
     }
     all.push({
       handle: r.handle,
-      online: own.has(r.handle) || online(r.handle),
+      online: f.own.has(r.handle) || f.online(r.handle),
       last_seen: r.last_seen ?? 0,
-      ...(own.has(r.handle) ? { self: true as const } : {}),
+      ...(f.own.has(r.handle) ? { self: true as const } : {}),
       ...(r.id ? { id: r.id } : {}),
       ...(r.mode ? { mode: r.mode } : {}),
       ...(where ? { where } : {}),
-      ...(seesSession && r.status ? { status: r.status, status_age: age(now - (r.status_at ?? now)) } : {}),
+      ...(seesSession && r.status ? { status: r.status, status_age: age(f.now - (r.status_at ?? f.now)) } : {}),
       ...session,
       ...meta,
       ...(r.human ? { human: true as const } : {}),
@@ -1340,14 +1452,17 @@ export function who(
       ...(seesSession && r.launcher ? { launcher: true as const } : {}),
     });
   }
-  // A board's roster lists its unbound subscribers by ID among its peers.
-  const unbound = opts.board === undefined ? unboundRows(db, ctx.unbound ?? [], opts.match) : [];
+  return all;
+}
+
+/** peer_list's result from its peers: `you` unless the caller is a viewer (undefined), offline peers counted unless asked for. */
+export function finishWho(all: Peer[], unbound: UnboundPeer[], you: string | undefined, includeOffline: boolean | undefined): WhoResult {
   const sessions = unbound.length ? { unbound_sessions: unbound } : {};
-  const you = isViewer(handle) ? {} : { you: handle };
-  if (opts.include_offline) return { ...you, peers: all, ...sessions };
+  const y = you === undefined ? {} : { you };
+  if (includeOffline) return { ...y, peers: all, ...sessions };
   const peers = all.filter((p) => p.online);
   const hidden = all.length - peers.length;
-  return { ...you, peers, ...sessions, ...(hidden ? { offline_hidden: hidden } : {}) };
+  return { ...y, peers, ...sessions, ...(hidden ? { offline_hidden: hidden } : {}) };
 }
 
 function sessionFacts(r: { harness: string | null; model: string | null; effort: string | null }): SessionFacts {
@@ -1363,9 +1478,17 @@ function sessionFacts(r: { harness: string | null; model: string | null; effort:
 // check here, or a scope match probes their principal (#371, #391).
 function unboundRows(db: Database, unbound: UnboundPeer[], match: PeerMatch | undefined): UnboundPeer[] {
   const q = db.prepare(`SELECT principal, harness, model, effort, launcher FROM ids WHERE id = ?`);
+  return unboundFrom(unbound, (id) => (q.get(id) as UnboundFacts | null) ?? undefined, match);
+}
+
+/** An unbound session's ID facts, as peer_list reads them. */
+export type UnboundFacts = { principal: string | null; harness: string | null; model: string | null; effort: string | null; launcher: number | null };
+
+/** unboundRows over the sessions' facts, read by the caller (`factsOf`: undefined for a session with no row). */
+export function unboundFrom(unbound: UnboundPeer[], factsOf: (id: string) => UnboundFacts | undefined, match: PeerMatch | undefined): UnboundPeer[] {
   const out: UnboundPeer[] = [];
   for (const u of unbound) {
-    const r = q.get(u.session_id) as { principal: string | null; harness: string | null; model: string | null; effort: string | null; launcher: number | null } | null;
+    const r = factsOf(u.session_id);
     const session = r ? sessionFacts(r) : {};
     if (match && !matches(match, { id: u.session_id, ...session, scope: r?.principal ?? undefined })) continue;
     // An unbound launcher is delegable by its ID (#337), so it's marked as a bound one is (#764).
@@ -1507,7 +1630,14 @@ export function read(
   opts: { limit?: number; before_id?: number; thread?: number; peek?: boolean } = {},
 ): ReadResult {
   const board = visibleBoard(db, viewer, boardInput).name;
-  const handle = typeof viewer === "string" && !opts.peek ? viewer : null;
+  return readRows(db, board, typeof viewer === "string" && !opts.peek ? viewer : null, opts);
+}
+
+/**
+ * read on a board already judged visible: `handle` is whose cursor and pushes the read uses and advances, or null
+ * for a read that changes nothing (a predicate viewer, a peek).
+ */
+export function readRows(db: Database, board: string, handle: string | null, opts: { limit?: number; before_id?: number; thread?: number } = {}): ReadResult {
   const limit = Math.min(Math.max(opts.limit ?? 20, 1), 200);
   let posts: PostRow[];
 

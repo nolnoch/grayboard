@@ -321,10 +321,13 @@ export function listClaims(db: Database, prefix?: string, viewer?: Viewer, seer?
     )
     .all(Date.now(), `${(prefix ?? "").replace(/[\\%_]/g, "\\$&")}%`) as Claim[];
   if (viewer === undefined) return rows;
-  return rows.map((c) => {
-    const v: ClaimView = c.board && !canSeeBoard(db, viewer, c.board) ? { ...c, board: null } : c;
-    return seer !== undefined && holderHidden(db, seer, c.holder) ? { ...v, holder: null, note: null } : v;
-  });
+  return rows.map((c) => claimView(c, !c.board || canSeeBoard(db, viewer, c.board), seer === undefined || !holderHidden(db, seer, c.holder)));
+}
+
+/** A claim as a reader sees it: its board named only when `boardSeen`, its holder and note only when `holderSeen`. */
+export function claimView(c: Claim, boardSeen: boolean, holderSeen: boolean): ClaimView {
+  const v: ClaimView = boardSeen ? c : { ...c, board: null };
+  return holderSeen ? v : { ...v, holder: null, note: null };
 }
 
 // Delete lapsed claims and say so on their boards. The holder never confirmed

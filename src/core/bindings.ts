@@ -186,20 +186,31 @@ export function boardActor(
   args: Record<string, unknown>,
   s: { addresses: string[]; asAddresses: string[]; ownScope: string | null },
 ): string {
+  const c = actorChoice(tool, args, s);
+  return "actor" in c ? c.actor : (boardAddress(db, c.board, s.addresses, c.use) ?? c.primary);
+}
+
+/**
+ * boardActor's rule before any read: the actor itself (`as`, or the primary for a tool that picks none), or the
+ * board and use to pick among `addresses` by (boardAddress), falling back to `primary`.
+ */
+export function actorChoice(
+  tool: string,
+  args: Record<string, unknown>,
+  s: { addresses: string[]; asAddresses: string[]; ownScope: string | null },
+): { actor: string } | { board: string; use: BoardUse; primary: string } {
   const primary = s.addresses[0]!;
   if (args.as !== undefined) {
     if (!AS_TOOLS.has(tool)) throw new CoreError(`${tool} takes no "as": it acts as your primary`);
-    return actingAs(String(args.as), s.asAddresses, s.ownScope);
+    return { actor: actingAs(String(args.as), s.asAddresses, s.ownScope) };
   }
   const use = BOARD_USES[tool];
-  if (!use || typeof args.board !== "string") return primary;
-  let board: string;
+  if (!use || typeof args.board !== "string") return { actor: primary };
   try {
-    board = normalizeBoard(args.board);
+    return { board: normalizeBoard(args.board), use, primary };
   } catch {
-    return primary;
+    return { actor: primary };
   }
-  return boardAddress(db, board, s.addresses, use) ?? primary;
 }
 
 // The board tools whose schema takes `as`. Built on first use: tools.ts ->
