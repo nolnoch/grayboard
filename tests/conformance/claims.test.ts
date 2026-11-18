@@ -136,12 +136,14 @@ conformance("claims", [
       await workBoard(ctx);
       refused(await peers.fe!.call("claim_watch", { key: KEY }), "bad_request");
       ok(await peers.be!.call("claim_take", { key: KEY }));
-      refused(await peers.be!.call("claim_watch", { key: KEY }), "bad_request");
       refused(await peers.fe!.call("claim_watch", { key: KEY }), "bad_request");
+      // Your own claim refuses even on a board, where a watch would otherwise land.
+      ok(await peers.be!.call("claim_take", { key: "ticket:own", board: "work" }));
+      refused(await peers.be!.call("claim_watch", { key: "ticket:own" }), "bad_request");
       // The refused watches left nothing: a release once the claim is on a board cc's nobody.
       ok(await peers.be!.call("claim_take", { key: KEY, board: "work" }));
       ok(await peers.be!.call("claim_release", { key: KEY }));
-      expect(await bodies(ctx, "be", "work")).toEqual([`[release] ${KEY}`]);
+      expect(await bodies(ctx, "be", "work")).toEqual([`[claim] ticket:own`, `[release] ${KEY}`]);
     },
   },
 ]);

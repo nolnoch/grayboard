@@ -52,7 +52,7 @@ Each read-then-write invariant becomes one statement or a lock on a row the inva
 
 `MAX_HOLDS` counts a session's in-memory `holds`, so the write queue covers it until Stage 4 moves holds out of process.
 
-These forms also run on SQLite except `FOR UPDATE`, which SQLite's single writer makes unnecessary. The server-only sites without a lock (OAuth, `dedupWrite`, `teams.create`) take them before Postgres does (P2 below); the count caps and `guardLastOwner`, whose forms need `FOR UPDATE` or the capacity row, take theirs in P3. The shared-core sites (`holdAlias`, `claim()`, the attachment quota) take them in the server's ports (P3), so local mode's core is untouched.
+These forms also run on SQLite except `FOR UPDATE`, which SQLite's single writer makes unnecessary. The server-only sites without a lock (OAuth, `dedupWrite`, `teams.create`) take them before Postgres does (P2 below); the count caps and `guardLastOwner`, whose forms need `FOR UPDATE` or the capacity row, take theirs in P3. Claims already run theirs in core (`takeClaim`'s conditional upsert, `releaseClaim`'s conditional delete, `src/core/claims.ts`), so both modes share the form; their Postgres statements order handles and keys with `COLLATE "C"`, matching SQLite's byte order, since a default collation such as `en_US` ignores `-` and `_`. The other shared-core sites (`holdAlias`, the attachment quota) take theirs in the server's ports (P3), so local mode's core is untouched there.
 
 Isolation stays READ COMMITTED. SERIALIZABLE everywhere would turn every conflict into a retry of a whole tool call, whose in-memory side effects then need making re-runnable, for no gain at one pod.
 

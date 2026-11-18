@@ -156,7 +156,7 @@ export function checkMove(renewed: boolean, row: Claim, cur: Claim | undefined, 
 }
 
 /** Whether a renewal announces: its note changed. The caller also needs the board, seen by the holder. */
-export function renewAnnounces(note: string | undefined, cur: Claim | undefined): note is string {
+export function renewAnnounces(note: string | undefined, cur: Claim | undefined): boolean {
   return note !== undefined && note !== cur?.note;
 }
 
@@ -178,7 +178,7 @@ export function checkRelease(keyInput: string, note: string | undefined): string
 }
 
 /** Whether `cur` is a live claim held by one of `addresses`: the only claim release ends. */
-export function releasable(cur: Claim | undefined, addresses: string[], now: number): cur is Claim {
+export function releasable(cur: Claim | undefined, addresses: string[], now: number): boolean {
   return !!cur && cur.expires_at > now && addresses.includes(cur.holder);
 }
 
@@ -207,6 +207,10 @@ export const watchNoBoard = (key: string, holder: string | null) => new CoreErro
 );
 export const watching = (key: string, board: string) => `ok: watching ${key}; its updates, release or expiry on #${board} will mention you`;
 export const notWatching = (key: string) => `ok: not watching ${key}`;
+
+/** claim_release's answers: a release, and a repeat of the caller's own. */
+export const releasedText = (key: string) => `released ${key}`;
+export const alreadyReleasedText = (at: number) => `already released by you at ${new Date(at).toISOString()}`;
 
 // --- The claim SQL (#807 B5b3a). Each statement is already the form a concurrent store needs, so SQLite runs the
 // shape Postgres will: a take or release that a racing write beat returns no row rather than overwriting.
@@ -273,11 +277,12 @@ export function removeClaimWatch(db: Database, key: string, handle: string): voi
   db.prepare(`DELETE FROM claim_watches WHERE key = ? AND handle = ?`).run(key, handle);
 }
 
-/** Delete the claims lapsed at `now`, and return them by key: the delete makes each lapse announce once, however
- * many sweep, and the order is the store's, not the delete's. */
+/** Delete the claims lapsed at `now`, and return them in lapse order, by key within a tie: the delete makes each
+ * lapse announce once, however many sweep, and the order is the store's, not the delete's. A queue claim's lapse
+ * redelivers its post, so lapse order keeps the lanes' rotation as the claims were taken. */
 export function expireClaims(db: Database, now: number): ClaimRow[] {
   const gone = db.prepare(`DELETE FROM claims WHERE expires_at <= ? RETURNING *`).all(now) as ClaimRow[];
-  return gone.sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
+  return gone.sort((a, b) => a.expires_at - b.expires_at || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
 }
 
 // --- Core's claim tools, composed over the rules and the SQL above.
@@ -327,7 +332,7 @@ export function claim(
     const changed = !d.renewed
       ? announce(db, d.as, row.board, claimText(key, row.note), opts, false)
       : renewAnnounces(opts.note, cur) && row.board && canSeeBoard(db, d.as, row.board)
-        ? announce(db, d.as, row.board, updateText(key, opts.note, claimWatchers(db, key)), opts)
+        ? announce(db, d.as, row.board, updateText(key, opts.note!, claimWatchers(db, key)), opts)
         : { wake: [], boards: [] };
     return {
       ok: true, claim: row, renewed: d.renewed,
@@ -383,7 +388,7 @@ export function release(
     };
     const cur = claimRow(db, key);
     if (!releasable(cur, addresses, now)) return refuse(cur);
-    const gone = releaseClaim(db, key, cur.holder, now);
+    const gone = releaseClaim(db, key, cur!.holder, now);
     if (!gone) return refuse(claimRow(db, key));
     const as = gone.holder;
     logEvent(db, "release", as, { ...gone, note: note ?? null }, now);

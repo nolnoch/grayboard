@@ -40,9 +40,11 @@ test("a release ends only the named holder's live claim", () => {
   expect([claimRow(db, "lapsed")?.key, claimRow(db, "theirs")?.key, claimRow(db, "mine")]).toEqual(["lapsed", "theirs", undefined]);
 });
 
-test("the sweep's lapses come back by key, whatever order the delete gave", () => {
+test("the sweep's lapses come back in lapse order, by key within a tie, whatever order the delete gave", () => {
   for (const k of ["c", "a", "b"]) row(k, "be", NOW);
+  row("queue:work:10", "be", NOW - 1);
+  row("queue:work:9", "be", NOW - 2);
   row("live", "be", NOW + 1);
-  expect(expireClaims(db, NOW).map(c => c.key)).toEqual(["a", "b", "c"]);
+  expect(expireClaims(db, NOW).map(c => c.key)).toEqual(["queue:work:9", "queue:work:10", "a", "b", "c"]);
   expect(claimRow(db, "live")?.key).toBe("live");
 });

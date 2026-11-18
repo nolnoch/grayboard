@@ -29,7 +29,7 @@ import {
 } from "./boards.ts";
 import { addressParts } from "./addresses.ts";
 import { CoreError } from "./errors.ts";
-import { claim, listClaims, release, watch, type Claim } from "./claims.ts";
+import { alreadyReleasedText, claim, listClaims, release, releasedText, watch, type Claim, type TakeOpts } from "./claims.ts";
 import { attachmentIds, type FileSend } from "./attachments.ts";
 import { ATTACHMENTS_PARAM, ATTACHMENT_IDS_PARAM, type AttachmentInfo } from "../shared/attachments.ts";
 import type { Post } from "../shared/notifications.ts";
@@ -419,6 +419,11 @@ export function optNum(a: Record<string, unknown>, k: string): number | undefine
   return v;
 }
 
+/** claim_take's arguments, read in the order both modes check them. */
+export function claimTakeArgs(a: Record<string, unknown>): TakeOpts & { key: string } {
+  return { key: str(a, "key"), ttl_minutes: optNum(a, "ttl_minutes"), until: optStr(a, "until"), note: optStr(a, "note"), board: optStr(a, "board") };
+}
+
 export type ToolOutcome = { result: unknown; wake: string[]; boards?: string[] };
 
 // board_post's result.
@@ -587,11 +592,9 @@ export function callBoardTool(
     }
 
     case "claim_take": {
-      const r = claim(db, handle, str(a, "key"), {
-        ttl_minutes: optNum(a, "ttl_minutes"),
-        until: optStr(a, "until"),
-        note: optStr(a, "note"),
-        board: optStr(a, "board"),
+      const { key, ...take } = claimTakeArgs(a);
+      const r = claim(db, handle, key, {
+        ...take,
         addresses: ctx.addresses,
         session: ctx.session,
         via: ctx.via,
@@ -604,7 +607,7 @@ export function callBoardTool(
     case "claim_release": {
       const key = str(a, "key");
       const { wake, boards, releasedAt } = release(db, handle, key, optStr(a, "note"), { addresses: ctx.addresses, session: ctx.session, via: ctx.via, user: ctx.user });
-      return { result: releasedAt === undefined ? `released ${key}` : `already released by you at ${new Date(releasedAt).toISOString()}`, wake, boards };
+      return { result: releasedAt === undefined ? releasedText(key) : alreadyReleasedText(releasedAt), wake, boards };
     }
 
     case "claim_watch":
