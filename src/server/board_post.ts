@@ -57,10 +57,10 @@ export async function serverPost(
   return { result, wake: out.wake };
 }
 
-/** What writePost writes as: the post's body and parent, and its writer's facts. `strict` refuses an unknown or ended
- * `@id:` mention (an author's own words); `addresses` is the poster's address set, `[actor]` when absent (a claim
+/** What writePost writes as: the post's body and parent, and its writer's facts. `strict` (an author's own words) refuses
+ * an unknown or ended `@id:` mention and bare names core refuses, and lets a single mention claim a queue post; `addresses` is the poster's address set, `[actor]` when absent (a claim
  * announcement); `online` orders a rotation's live lanes first; `files` binds uploads (board_post only). */
-export type PostWrite = {
+type PostWrite = {
   body: string; parentId: number | null; strict: boolean; addresses?: string[];
   session?: string; via?: string; user?: string; online?: (h: string) => boolean; files?: { ids: number[]; send?: FileSend };
 };
@@ -69,7 +69,7 @@ export type PostWrite = {
  * core post's write on `tx`, for a board its gate (postGateOn) passed and whose pre-checks ran: the post row, its
  * attachments, its targets planned by core and written, a queue claim or ack. Core's order throughout.
  */
-export async function writePost(
+async function writePost(
   repo: Repo, access: BoardAccess, tx: Tx, actor: string, b: Board, gate: PostGate, w: PostWrite,
 ): Promise<{ post: Post; out: { wake: string[]; deferred: string[]; unresolved: string[] }; isViewer: (h: string) => boolean; tokens: string[] }> {
   const { body, parentId, strict } = w;
@@ -129,7 +129,7 @@ export async function writePost(
 /**
  * core post as the system writes it for a claim (announce, requeue's `[unclaimed]`): the gate on `tx` (allowArchived for
  * a post ending a claim), core's pre-checks with no files or live sessions, and the write with mentions non-strict, so
- * a watcher's ended `@id:` goes unresolved rather than refusing. Throws the gate's refusals.
+ * a watcher's ended `@id:` goes unresolved rather than refusing. Throws the gate's and the pre-checks' refusals.
  */
 export async function systemPost(
   repo: Repo, access: BoardAccess, tx: Tx, actor: string, board: string, body: string, parentId: number | null,

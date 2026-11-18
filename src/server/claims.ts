@@ -69,7 +69,7 @@ export async function requeue(repo: Repo, access: BoardAccess, tx: Tx, c: ClaimR
 }
 
 /** core canSeeBoard on `r`: the board exists and `handle` may see it. */
-export async function boardVisible(repo: Repo, access: BoardAccess, r: Read, handle: string, name: string): Promise<boolean> {
+async function boardVisible(repo: Repo, access: BoardAccess, r: Read, handle: string, name: string): Promise<boolean> {
   const b = await repo.boards.get(r, name);
   return !!b && (await access.canSee(r, handle, b));
 }
