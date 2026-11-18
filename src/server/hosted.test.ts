@@ -317,8 +317,8 @@ test("#807 P1c-15b: core helpers inside hosted bodies run on that body's Tx, out
   } finally { spy.mockRestore(); for (const s of boardSpies) s.mockRestore(); }
 });
 
-// #807 P3 B5b1b1/B5b1b2/B5b2: board_list, peer_list, peer_status, board_create, board_archive, board_subscribe,
-// board_read, claim_list and board_post run on the server's port, never core over `coreOn`, their reads and writes on
+// #807 P3 B5b1b1/B5b1b2/B5b2/B5b3c: board_list, peer_list, peer_status, board_create, board_archive, board_subscribe,
+// board_read, claim_list, board_post and claim_take/release/watch run on the server's port, never core over `coreOn`, their reads and writes on
 // the call's Tx; and every board tool's actor pick reads the board views on that Tx.
 test("#807 P3 B5b1b: the ported board tools and the actor pick read and write through the repo on the call's Tx", async () => {
   const checks: { op: string; inTxn: boolean; handle: "pool" | "tx" }[] = [];
@@ -332,7 +332,7 @@ test("#807 P3 B5b1b: the ported board tools and the actor pick read and write th
     ],
     bindings: ["viewerIds", "idFacts", "setStatus", "setQueueParticipation"],
     aliases: ["isHuman", "scopesOf", "humansAmong"],
-    claims: ["list", "ackQueue"],
+    claims: ["list", "ackQueue", "get", "take", "release", "recentEvents", "watchers", "liveForWatch", "addWatch", "unwatch", "expire", "logEvent", "takeWatchers"],
   } as const;
   for (const [g, names] of Object.entries(groups)) {
     const group = database.repo[g as keyof typeof groups] as unknown as Record<string, (...a: unknown[]) => unknown>;
@@ -390,11 +390,15 @@ test("#807 P3 B5b1b: the ported board tools and the actor pick read and write th
     expect(ops(await call("claim_list", {}))).toContain("claims.list");
     expect(ops(await call("board_archive", { board: "b5b1b1" }))).toEqual(expect.arrayContaining(["aliases.isHuman", "boards.setArchived"]));
     expect(ops(await call("board_archive", { board: "b5b1b1", archived: false }))).toContain("boards.setArchived");
+    // B5b3c: claim_take, claim_watch and claim_release run on the server's port too.
+    expect(ops(await call("claim_take", { key: "b5b2:x", board: "b5b1b1" }))).toEqual(expect.arrayContaining(["claims.expire", "claims.get", "claims.take", "claims.logEvent", "boards.insertPost"]));
+    expect(ops(await call("claim_watch", { key: "b5b2:x" }, lane))).toEqual(expect.arrayContaining(["claims.liveForWatch", "claims.addWatch"]));
+    expect(ops(await call("claim_take", { key: "b5b2:x", note: "renew" }))).toEqual(expect.arrayContaining(["claims.take", "claims.watchers"]));
+    expect(ops(await call("claim_release", { key: "b5b2:x" }))).toEqual(expect.arrayContaining(["claims.release", "claims.logEvent"]));
+    expect(ops(await call("claim_release", { key: "b5b2:x" }))).toEqual(expect.arrayContaining(["claims.recentEvents"]));
+    expect(ops(await call("claim_watch", { key: "b5b2:x", off: true }, lane))).toContain("claims.unwatch");
     // None of them reaches core.
     expect(ported.filter(c => c.op === "coreOn")).toEqual([]);
-    // claim_take is still core's (B5b3): the spy sees coreOn when it's reached.
-    const take = await call("claim_take", { key: "b5b2:x", board: "b5b1b1" });
-    expect(take.some(c => c.op === "coreOn")).toBe(true);
     expect(checks.filter(c => c.handle !== "tx" || !c.inTxn)).toEqual([]);
   } finally { for (const s of spies) s.mockRestore(); }
 });
