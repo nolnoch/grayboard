@@ -40,7 +40,7 @@ export function holderPrincipals(db: Database, holder: string): { idPrincipal: s
   return { idPrincipal: idRow(db, holder)?.principal ?? null, heldPrincipal: held?.principal ?? null };
 }
 
-function holderUser(db: Database, c: ClaimRow): string | undefined {
+export function holderUser(db: Database, c: ClaimRow): string | undefined {
   if (c.holder_user) return c.holder_user;
   const f = holderPrincipals(db, c.holder);
   return holderUserRule(c, f.idPrincipal, f.heldPrincipal);

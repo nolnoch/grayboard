@@ -225,19 +225,21 @@ test("an expired claim's post @mentioning another user's agent arrives ungranted
   expect(ungranted(watcher.event)).toBeUndefined();
 });
 
-// #807 P3 B2: the server's expiry timer reads and sweeps through repo.claims, so a Postgres store serves it: a claim
-// taken with a short ttl lapses on the timer, nobody asking, and its [expired] post reaches the board's watcher.
-test("#807 P3 B2: the server's expiry timer sweeps a lapse through repo.claims", async () => {
+// #807 P3 B2, B5b3b: the server's expiry timer reads and sweeps through repo.claims and the server's own sweep, so a
+// Postgres store serves it: a claim taken with a short ttl lapses on the timer, nobody asking, and its [expired] post
+// reaches the board's watcher, swept by repo.claims.expire (the old opaque claims.sweep is gone).
+test("#807 P3 B5b3b: the server's expiry timer sweeps a lapse through repo.claims.expire", async () => {
   const next = spyOn(srv.app.repo.claims, "nextExpiry");
-  const sweep = spyOn(srv.app.repo.claims, "sweep");
+  const expire = spyOn(srv.app.repo.claims, "expire");
   try {
     const abe = await srv.hosted(A, "be");
     await abe.call("board_create", { name: "lobby", purpose: "general" });
     const aqa = await srv.hosted(A, "qa");
     await aqa.call("board_subscribe", { board: "lobby", mode: "push" });
     await abe.call("claim_take", { key: "soon", board: "lobby", ttl_minutes: 0.002 });
+    expire.mockClear();
     await aqa.next(board((i) => i.kind === "push" && i.post.body.startsWith("[expired] soon")));
     expect(next).toHaveBeenCalled();
-    expect(sweep).toHaveBeenCalled();
-  } finally { next.mockRestore(); sweep.mockRestore(); }
+    expect(expire).toHaveBeenCalled();
+  } finally { next.mockRestore(); expire.mockRestore(); }
 });

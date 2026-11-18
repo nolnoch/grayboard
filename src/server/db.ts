@@ -6,9 +6,9 @@ import { mkdirSync } from "node:fs";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { dirname } from "node:path";
 
-import { acknowledge, aliasScopeRows, authorAddresses, claimQueuePost, humansAmong, insertOutbox, insertPost, queueLaneRows, subscriberRows, threadFacts, type NewPost, type PostTarget, type ThreadFacts, insertBoard, isHuman, readRows, setArchived, setMute, threadRoot, type AliasScopeRow, type ReadResult, ALIAS_SESSION_SQL, boardViewRows, openSummaryRows, setQueueParticipation, whoRows, writeStatus, type BoardSummary, type BoardView, type UnboundFacts, type WhoRow, ensureBoard, forgetHandle, isSubscribed, markHuman, prunePosts, setSubscription, unsubscribeScope, type SubMode, catalogPage, getBoard, getPost, HOLD_ORDER, lastSeen, pendingDigests, pendingPushes, snapshotPage, type Board, type BoardSnapshot, type DigestRow, type PendingRef, type PushRow, type SnapshotOptions, pruneEndedIds, registerId, setAccess, setAliasMeta, setIdFacts, setPlace, touchAlias, touchId, type AliasMetaSet, type CoreDb, type IdFacts, type IdSessionFacts, type ReusedId } from "../core/boards.ts";
+import { acknowledge, redeliveryFacts, type RedeliveryFacts, aliasScopeRows, authorAddresses, claimQueuePost, humansAmong, insertOutbox, insertPost, queueLaneRows, subscriberRows, threadFacts, type NewPost, type PostTarget, type ThreadFacts, insertBoard, isHuman, readRows, setArchived, setMute, threadRoot, type AliasScopeRow, type ReadResult, ALIAS_SESSION_SQL, boardViewRows, openSummaryRows, setQueueParticipation, whoRows, writeStatus, type BoardSummary, type BoardView, type UnboundFacts, type WhoRow, ensureBoard, forgetHandle, isSubscribed, markHuman, prunePosts, setSubscription, unsubscribeScope, type SubMode, catalogPage, getBoard, getPost, HOLD_ORDER, lastSeen, pendingDigests, pendingPushes, snapshotPage, type Board, type BoardSnapshot, type DigestRow, type PendingRef, type PushRow, type SnapshotOptions, pruneEndedIds, registerId, setAccess, setAliasMeta, setIdFacts, setPlace, touchAlias, touchId, type AliasMetaSet, type CoreDb, type IdFacts, type IdSessionFacts, type ReusedId } from "../core/boards.ts";
 import type { Post } from "../shared/notifications.ts";
-import { ackQueueClaim, listClaims, sweepChanges, type Claim, type ClaimChanges } from "../core/claims.ts";
+import { ackQueueClaim, expireClaims, holderUser, listClaims, logEvent, takeClaimWatchers, type Claim, type ClaimEvent, type ClaimRow } from "../core/claims.ts";
 import { addressSet, aliasUser, aliasUses, dropHold, holderOf, holdsOf, idRow, idStatuses, logBinding, unendedIds, type AliasUse, type BindingEvent, type IdRow } from "../core/bindings.ts";
 import type { AuditAction } from "./audit.ts";
 import { bindAttachments, blobNamed, dropAttachments, dropBlobEntry, dropUnsentUploads, getAttachment, insertUpload, pruneUnbound, removeUpload, unnamedBlobs, uploadDigests, withAttachments, type AttachmentRow, type BlobStore, type NewUpload, type Uploader } from "../core/attachments.ts";
@@ -377,15 +377,22 @@ export interface Repo {
     named(r: Read, sha256: string): Promise<boolean>;
     dropBlobEntry(tx: Tx, sha256: string): Promise<number>;
   };
-  // Claims' reads and the expiry sweep (#807 P3 B2), on the caller's handle. The claim tools' writes stay with
-  // callBoardTool (B5b).
+  // Claims' reads and writes (#807 P3 B2, B5b3), on the caller's handle. The sweep's steps are the server's
+  // (src/server/claims.ts); the claim tools' writes stay with callBoardTool until B5b3c.
   claims: {
     // Live claims, by key; with prefix, only keys that start with it.
     list(r: Read, prefix?: string): Promise<Claim[]>;
     // The earliest expiry of a claim with a board (the expiry timer's next fire), or null.
     nextExpiry(r: Read): Promise<number | null>;
-    // Deletes the claims lapsed at now and announces them (core sweepChanges).
-    sweep(tx: Tx, now: number): Promise<ClaimChanges>;
+    // Deletes the claims lapsed at `now` and returns them in lapse order, by key within a tie (core expireClaims). It
+    // logs nothing: the sweep logs each row's expire event before that row's requeue, in core's order.
+    expire(tx: Tx, now: number): Promise<ClaimRow[]>;
+    // Appends a claim event (core logEvent).
+    logEvent(tx: Tx, event: ClaimEvent, handle: string, c: Partial<Claim> & { key: string }, at: number, heldBy?: string): Promise<void>;
+    // The watchers of a claim that ended, by handle, their watches deleted (core takeClaimWatchers).
+    takeWatchers(tx: Tx, key: string): Promise<string[]>;
+    // The user the system's announcement for `c` is written as (core holderUser).
+    holderUser(r: Read, c: ClaimRow): Promise<string | undefined>;
     // A queue-board reply's ack (#807 P3 B5b2): releases `key` when one of `addresses` holds it, lapsed or not, with
     // its watches and an "ack" or "ack (late)" release event (core ackQueueClaim); whether it did.
     ackQueue(tx: Tx, addresses: string[], key: string, now: number): Promise<boolean>;
@@ -454,6 +461,8 @@ export interface Repo {
     claimQueuePost(tx: Tx, board: string, postId: number, lane: string, now: number, o: { note: string; push: boolean }): Promise<boolean>;
     // A post plan's outbox rows, in its order (core insertOutbox).
     insertOutbox(tx: Tx, postId: number, targets: [string, PostTarget][]): Promise<void>;
+    // A queue post's redelivery facts for a claim on `key` that `prevHolder` held (core redeliveryFacts), or null.
+    redeliveryFacts(r: Read, key: string, prevHolder: string): Promise<RedeliveryFacts | null>;
   };
   // A session's end and its ID's deliverability (#807 P3 B4a), on the caller's handle.
   sessionEnd: {
@@ -1594,7 +1603,10 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
     claims: {
       list: async (r, prefix) => listClaims(sqliteOf(r), prefix),
       nextExpiry: async (r) => sqliteOf(r).query<{ next: number | null }, []>(`SELECT MIN(expires_at) AS next FROM claims WHERE board IS NOT NULL`).get()!.next,
-      sweep: async (tx, now) => sweepChanges(sqliteOf(tx), now),
+      expire: async (tx, now) => expireClaims(sqliteOf(tx), now),
+      logEvent: async (tx, event, handle, c, at, heldBy) => logEvent(sqliteOf(tx), event, handle, c, at, heldBy),
+      takeWatchers: async (tx, key) => takeClaimWatchers(sqliteOf(tx), key),
+      holderUser: async (r, c) => holderUser(sqliteOf(r), c),
       ackQueue: async (tx, addresses, key, now) => ackQueueClaim(sqliteOf(tx), addresses, key, now),
     },
 
@@ -1642,6 +1654,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       laneRows: async (r, board, poster) => queueLaneRows(sqliteOf(r), board, poster),
       claimQueuePost: async (tx, board, postId, lane, now, o) => claimQueuePost(sqliteOf(tx), board, postId, lane, now, o),
       insertOutbox: async (tx, postId, targets) => insertOutbox(sqliteOf(tx), postId, targets),
+      redeliveryFacts: async (r, key, prevHolder) => redeliveryFacts(sqliteOf(r), key, prevHolder),
     },
 
     sessionEnd: {

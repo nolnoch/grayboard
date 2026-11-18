@@ -9,6 +9,7 @@ import type { Tx } from "./store/tx.ts";
 import { scratchDbPath } from "../../tests/support/scratch_db.ts";
 import { holdAlias } from "../core/bindings.ts";
 import { createBoard, post, registerId, subscribe, touchAlias } from "../core/boards.ts";
+import { claim, watch } from "../core/claims.ts";
 import { seed } from "../../tests/support/seed.ts";
 import { GOOGLE_ISSUER } from "./idp_google.ts";
 import { onTeamJoined } from "./teams.ts";
@@ -1520,4 +1521,61 @@ test("#807 P3 B4b: repo.delegation runs on the handle it's given; its facts answ
   // The target's facts answer for that address only.
   expect(() => named.everConnected(be)).toThrow(/whether "b@example.com\/be" connected was not read/);
   expect(() => named.isLauncher(be)).toThrow(/whether "b@example.com\/be" is a launcher was not read/);
+});
+
+// #807 P3 B5b3b: the sweep's repo steps (claims.expire, logEvent, takeWatchers, holderUser; boards.redeliveryFacts)
+// run on the handle they're given, and the writes roll back with their body.
+test("#807 P3 B5b3b: the claim sweep's repo reads and writes run on the handle they're given", async () => {
+  const { repo, db } = fresh();
+  const [be, fe] = ["a@example.com/be", "a@example.com/fe"];
+  let qkey = "";
+  const kept = await seed(repo, async tx => {
+    await repo.users.upsertByEmail(tx, "a@example.com", null);
+    for (const name of ["be", "fe"]) await repo.aliases.create(tx, person("a@example.com", name), "a@example.com");
+    const core = repo.coreOn(tx);
+    createBoard(core, be, "hall", "tests");
+    createBoard(core, be, "jobs", "work", null, { kind: "queue" });
+    qkey = `queue:jobs:${post(core, be, "jobs", "build").post.id}`;
+    claim(core, be, "ticket:1", { board: "hall", ttl_minutes: 5 });
+    watch(core, fe, "ticket:1");
+    return tx;
+  });
+  const settled = /used after its transaction settled/;
+  const stranger = /not a SQLite store handle/;
+  const [b, cl] = [repo.boards, repo.claims];
+  const row = (await cl.list(repo.read))[0]!;
+  const later = row.expires_at + 1;
+  for (const h of [kept, {} as Tx]) {
+    const want = h === kept ? settled : stranger;
+    await expect(cl.expire(h, later)).rejects.toThrow(want);
+    await expect(cl.logEvent(h, "expire", be, row, later)).rejects.toThrow(want);
+    await expect(cl.takeWatchers(h, "ticket:1")).rejects.toThrow(want);
+    await expect(cl.holderUser(h, { ...row, holder_user: null })).rejects.toThrow(want);
+    await expect(b.redeliveryFacts(h, qkey, fe)).rejects.toThrow(want);
+  }
+  const count = (sql: string) => db.query<{ n: number }, []>(sql).get()!.n;
+  const tally = () => ({ claims: count("SELECT count(*) AS n FROM claims"), watches: count("SELECT count(*) AS n FROM claim_watches"), events: count("SELECT count(*) AS n FROM claim_events") });
+  const before = tally();
+  // Inside a body the writes are seen by its reads, and all of it rolls back.
+  await expect(seed(repo, async tx => {
+    const gone = await cl.expire(tx, later);
+    expect(gone.map(c => c.key)).toEqual(["ticket:1"]);
+    expect(await cl.holderUser(tx, gone[0]!)).toBe("a@example.com");
+    await cl.logEvent(tx, "expire", be, gone[0]!, later);
+    expect(await cl.takeWatchers(tx, "ticket:1")).toEqual([fe]);
+    expect(await cl.takeWatchers(tx, "ticket:1")).toEqual([]);
+    expect(await cl.list(tx)).toEqual([]);
+    throw new Error("rolled back");
+  })).rejects.toThrow("rolled back");
+  expect(tally()).toEqual(before);
+  // Committed: they land.
+  await seed(repo, async tx => {
+    await cl.expire(tx, later);
+    await cl.logEvent(tx, "expire", be, row, later);
+    await cl.takeWatchers(tx, "ticket:1");
+  });
+  expect(tally()).toEqual({ claims: before.claims - 1, watches: before.watches - 1, events: before.events + 1 });
+  const facts = await b.redeliveryFacts(repo.read, qkey, fe);
+  expect(facts && { board: facts.board.name, takers: facts.takers, held: facts.held.has(fe) }).toEqual({ board: "jobs", takers: 1, held: true });
+  expect(await b.redeliveryFacts(repo.read, "ticket:1", fe)).toBeNull();
 });

@@ -6,25 +6,26 @@ import {
   type Board, type PostGate, type PostTargetFacts,
 } from "../core/boards.ts";
 import { CoreError } from "../core/errors.ts";
-import { attachmentIds } from "../core/attachments.ts";
+import { attachmentIds, type FileSend } from "../core/attachments.ts";
 import { boardPostResult, optNum, str, type BoardPostResult, type ToolContext } from "../core/tools.ts";
 import { scopeKey, type AliasScopeOf, type BoardAccess } from "./access.ts";
 import { readableBoard } from "./board_reads.ts";
 import type { Repo } from "./db.ts";
 import type { Read, Tx } from "./store/tx.ts";
+import type { Post } from "../shared/notifications.ts";
 
 /**
  * core postGate on `r`: the board `actor` may post on, and what its gate decided. Throws core's refusals in core's
- * order. The server has no announce board, and nothing a caller reaches posts with allowArchived.
+ * order. The server has no announce board; only the system's posts ending a claim pass `allowArchived`.
  */
 export async function postGateOn(
-  repo: Repo, access: BoardAccess, r: Read, actor: string, boardInput: string, parentId: number | null,
+  repo: Repo, access: BoardAccess, r: Read, actor: string, boardInput: string, parentId: number | null, allowArchived = false,
 ): Promise<{ board: Board; gate: PostGate }> {
   const board = await readableBoard(repo, access, r, actor, boardInput);
   // Read before the rule needs them: reads have no effects, and the rule still throws in core's order.
   const parent = parentId === null ? undefined : await repo.boards.post(r, parentId);
   const human = await repo.aliases.isHuman(r, actor);
-  return { board, gate: postGateRule(board, parentId, false, null, () => parent, () => human) };
+  return { board, gate: postGateRule(board, parentId, allowArchived, null, () => parent, () => human) };
 }
 
 /**
@@ -41,36 +42,67 @@ export async function serverPost(
   const parentId = optNum(args, "parent_id") ?? null;
   const files = { ids: attachmentIds(args.attachment_ids), send: ctx.files };
   postPreChecks(b.name, body, gate.announcement, { online: ctx.online, attachments: files });
+  const w = await writePost(repo, access, tx, actor, b, gate, {
+    body, parentId, strict: true, addresses: ctx.addresses, session: ctx.session, via: ctx.via, user: ctx.user, online: ctx.online, files,
+  });
+  const { out, isViewer, tokens } = w;
+  const asked = [...out.wake, ...out.deferred, ...tokens];
+  const seen = await seenAmong(repo, access, tx, ctx.session ?? actor, asked);
+  const known = new Set(asked);
+  const result = boardPostResult(w.post, out, body, isViewer, (hs) =>
+    hs.filter((h) => {
+      if (!known.has(h)) throw new Error(`board_post: whether ${h} is seen wasn't prefetched`);
+      return seen.has(h);
+    }));
+  return { result, wake: out.wake };
+}
+
+/** What writePost writes as: the post's body and parent, and its writer's facts. `strict` (an author's own words) refuses
+ * an unknown or ended `@id:` mention and bare names core refuses, and lets a single mention claim a queue post; `addresses` is the poster's address set, `[actor]` when absent (a claim
+ * announcement); `online` orders a rotation's live lanes first; `files` binds uploads (board_post only). */
+type PostWrite = {
+  body: string; parentId: number | null; strict: boolean; addresses?: string[];
+  session?: string; via?: string; user?: string; online?: (h: string) => boolean; files?: { ids: number[]; send?: FileSend };
+};
+
+/**
+ * core post's write on `tx`, for a board its gate (postGateOn) passed and whose pre-checks ran: the post row, its
+ * attachments, its targets planned by core and written, a queue claim or ack. Core's order throughout.
+ */
+async function writePost(
+  repo: Repo, access: BoardAccess, tx: Tx, actor: string, b: Board, gate: PostGate, w: PostWrite,
+): Promise<{ post: Post; out: { wake: string[]; deferred: string[]; unresolved: string[] }; isViewer: (h: string) => boolean; tokens: string[] }> {
+  const { body, parentId, strict } = w;
   const isViewer = await viewerCheck(repo, tx);
 
   const now = Date.now();
   const p = await repo.boards.insertPost(tx, {
     board: b.name, author: actor, body, parentId, now, expiresAt: null,
-    authorId: ctx.session ?? null, via: ctx.via ?? null, authorUser: ctx.user ?? null,
+    authorId: w.session ?? null, via: w.via ?? null, authorUser: w.user ?? null,
   });
-  const { send } = files;
-  const attachments = send && files.ids.length
-    ? await repo.boards.bindAttachments(tx, files.ids, { addresses: ctx.addresses ?? [actor], principal: send.principal }, p.id, send.limits)
+  const addresses = w.addresses ?? [actor];
+  const send = w.files?.send;
+  const attachments = send && w.files!.ids.length
+    ? await repo.boards.bindAttachments(tx, w.files!.ids, { addresses, principal: send.principal }, p.id, send.limits)
     : [];
-  const addresses = ctx.addresses ?? [actor];
-  const own = [...new Set([...addresses, ...(await repo.boards.authorAddresses(tx, actor, ctx.session ?? null))])];
-  const viewer = ctx.session ?? actor;
+  const own = [...new Set([...addresses, ...(await repo.boards.authorAddresses(tx, actor, w.session ?? null))])];
+  const viewer = w.session ?? actor;
   const branch = postBranch(b, parentId, gate.announcement);
   const tokens = mentionTokens(body);
   const facts: PostTargetFacts = {
-    board: b, handle: actor, parentId, strict: true, gate, own, ackAddresses: addresses, isViewer,
+    board: b, handle: actor, parentId, strict, gate, own, ackAddresses: addresses, isViewer,
     isHuman: prefetched([], new Set(), "isHuman"), sees: prefetched([], new Set(), "sees"),
     mentions: { handles: [], unresolved: [] },
   };
   if (branch === "queue") {
-    facts.mentions = await access.resolveMentions(tx, tokens, actor, b, true, viewer);
+    facts.mentions = await access.resolveMentions(tx, tokens, actor, b, strict, viewer);
     const seen = await seenAmong(repo, access, tx, viewer, facts.mentions.handles);
     facts.seenMentioned = facts.mentions.handles.filter((h) => seen.has(h));
     facts.isHuman = prefetched(facts.seenMentioned, await repo.aliases.humansAmong(tx, facts.seenMentioned), "isHuman");
     if (needsRotation(facts.seenMentioned)) {
       const rows = await repo.boards.laneRows(tx, b.name, own);
       const sees = rows.length ? await access.canSeeMany(tx, rows, b) : new Set<string>();
-      facts.lanes = orderLanes(rows, isViewer, (h) => sees.has(h), ctx.online);
+      facts.lanes = orderLanes(rows, isViewer, (h) => sees.has(h), w.online);
     }
   } else if (branch === "announcement") {
     throw new Error("board_post: the server has no announce board");
@@ -85,23 +117,30 @@ export async function serverPost(
       facts.isHuman = prefetched(authors, await repo.aliases.humansAmong(tx, authors), "isHuman");
     }
     facts.sees = prefetched(judged, judged.length ? await access.canSeeMany(tx, judged, b) : new Set(), "sees");
-    facts.mentions = await access.resolveMentions(tx, tokens, actor, b, true, viewer);
+    facts.mentions = await access.resolveMentions(tx, tokens, actor, b, strict, viewer);
   }
   const plan = planPostTargets(facts);
   if (plan.claim) await repo.boards.claimQueuePost(tx, b.name, p.id, plan.claim.lane, now, { note: plan.claim.note, push: plan.claim.push });
   if (plan.ack) await repo.claims.ackQueue(tx, plan.ack.addresses, plan.ack.key, now);
   await repo.boards.insertOutbox(tx, p.id, plan.targets);
+  return { post: attachments.length ? { ...p, attachments } : p, out: { ...postWakes(plan.targets), unresolved: plan.unresolved }, isViewer, tokens };
+}
 
-  const out = { ...postWakes(plan.targets), unresolved: plan.unresolved };
-  const asked = [...out.wake, ...out.deferred, ...tokens];
-  const seen = await seenAmong(repo, access, tx, viewer, asked);
-  const known = new Set(asked);
-  const result = boardPostResult(attachments.length ? { ...p, attachments } : p, out, body, isViewer, (hs) =>
-    hs.filter((h) => {
-      if (!known.has(h)) throw new Error(`board_post: whether ${h} is seen wasn't prefetched`);
-      return seen.has(h);
-    }));
-  return { result, wake: out.wake };
+/**
+ * core post as the system writes it for a claim (announce, requeue's `[unclaimed]`): the gate on `tx` (allowArchived for
+ * a post ending a claim), core's pre-checks with no files or live sessions, and the write with mentions non-strict, so
+ * a watcher's ended `@id:` goes unresolved rather than refusing. Throws the gate's and the pre-checks' refusals.
+ */
+export async function systemPost(
+  repo: Repo, access: BoardAccess, tx: Tx, actor: string, board: string, body: string, parentId: number | null,
+  o: { allowArchived: boolean; session?: string; via?: string; user?: string; addresses?: string[] },
+): Promise<{ wake: string[]; boards: string[] }> {
+  const { board: b, gate } = await postGateOn(repo, access, tx, actor, board, parentId, o.allowArchived);
+  postPreChecks(b.name, body, gate.announcement, {});
+  const { post, out } = await writePost(repo, access, tx, actor, b, gate, {
+    body, parentId, strict: false, addresses: o.addresses, session: o.session, via: o.via, user: o.user,
+  });
+  return { wake: out.wake, boards: [post.board] };
 }
 
 // core viewers on `r`.
