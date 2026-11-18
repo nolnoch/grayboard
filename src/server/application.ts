@@ -34,7 +34,7 @@ import { CoreError } from "../core/errors.ts";
 import { countRefusal } from "./metrics.ts";
 import type { Principal } from "../core/resolver.ts";
 import { coreRefusalCode, Undeliverable } from "../core/session_end.ts";
-import { callBoardTool, claimsInstruction, isBoardTool, type ToolContext, type BoardPostResult } from "../core/tools.ts";
+import { callBoardTool as coreCallBoardTool, claimsInstruction, isBoardTool, type ToolContext, type BoardPostResult } from "../core/tools.ts";
 import { attachmentIds, type Uploader } from "../core/attachments.ts";
 import type { AttachmentLimits } from "../shared/attachments.ts";
 import { expiryTimer } from "../core/claims.ts";
@@ -42,6 +42,7 @@ import { detached } from "./request_context.ts";
 import { onAliasCreated } from "./teams.ts";
 import { boardAccess, ownScopeOn, principalCanSee, type BoardAccess } from "./access.ts";
 import { boardCatalog, boardSnapshot, pendingOf, visibleBoards } from "./board_reads.ts";
+import { callBoardTool, serverBoardActor } from "./boards.ts";
 import { PROMISE_DAYS, STALE_UNDELIVERED_MS, alreadyRetracted, historyLimit, inboxDays, promised, queuedNote, retractRefusal, showMessage, unanswered, undeliveredInstruction, type InboxItem, type PromiseItem } from "../shared/inbox.ts";
 import type { Pending } from "../shared/notifications.ts";
 
@@ -1959,7 +1960,7 @@ async function handleCall(hub: Hub, tx: Tx, session: ApplicationSession, tool: s
   // `as`, else the first address that can see the board (#284 S3, S14).
   let actor: string;
   try {
-    actor = boardActor(repo.coreOn(tx), tool, args, { addresses: session.addresses, asAddresses: asAddresses(session), ownScope: session.authed.user_email });
+    actor = await serverBoardActor(repo, hub.access, tx, tool, args, { addresses: session.addresses, asAddresses: asAddresses(session), ownScope: session.authed.user_email });
   } catch (e) {
     if (e instanceof CoreError) return fail("bad_request", e.message);
     throw e;
@@ -1967,7 +1968,7 @@ async function handleCall(hub: Hub, tx: Tx, session: ApplicationSession, tool: s
   const { as: _as, ...rest } = args;
   if (tool === "board_post") return handleBoardPost(hub, tx, session, actor, rest, ctx, publish);
   let outcome;
-  try { outcome = callBoardTool(repo.coreOn(tx), actor, tool, rest, ctx); }
+  try { outcome = await callBoardTool(repo, hub.access, tx, actor, tool, rest, { ...ctx, ...(session.readOnly ? { principal: userOf(session) } : {}) }); }
   catch (e) {
     if (e instanceof CoreError) throw coreRefusal(e);
     console.error(`[grayboard] ${tool} failed:`, e);
@@ -2007,7 +2008,7 @@ async function handleBoardPost(hub: Hub, tx: Tx, session: ApplicationSession, me
     checkPostAccess(repo.coreOn(tx), me, postArgs.board, parentId);
     const fp = { board: normalizeBoard(postArgs.board), body: postArgs.body, parent_id: parentId, attachments: await repo.attachments.unsentDigests(tx, ids, uploaderOf(session)) };
     out = await writeOnce(hub, tx, session, "board_post", me, fp, resend === true, ids, sp => {
-      const o = callBoardTool(repo.coreOn(sp), me, "board_post", postArgs, ctx);
+      const o = coreCallBoardTool(repo.coreOn(sp), me, "board_post", postArgs, ctx);
       const r = o.result as BoardPostResult;
       for (const a of r.attachments ?? []) writeAudit(repo, sp, "attachment.bound", session.authed.user_email, `attachment:${a.id}`, { identity: me, post_id: r.post_id, board: r.board });
       return { payload: r, ref: { kind: "post", id: r.post_id } satisfies WriteRef, wake: o.wake };

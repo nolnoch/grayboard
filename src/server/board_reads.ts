@@ -35,7 +35,7 @@ const keep = (boards: Board[], names: Set<string>) => new Map(boards.filter((b) 
 
 // core's visibleBoard: the board named `input` if `viewer` may see it; one that's missing or hidden reads as missing,
 // so its existence doesn't leak.
-async function readableBoard(repo: Repo, access: BoardAccess, r: Read, viewer: BoardViewer, input: string): Promise<Board> {
+export async function readableBoard(repo: Repo, access: BoardAccess, r: Read, viewer: BoardViewer, input: string): Promise<Board> {
   const name = normalizeBoard(input);
   const b = (await visibleBoards(repo, access, r, viewer, [name])).get(name);
   if (!b) throw new CoreError(`no such board #${name}; see board_list`);

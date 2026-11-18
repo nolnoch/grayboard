@@ -2,58 +2,18 @@
 // handle and inside a write body, against the sync seam core still calls; and its reads go on the handle it's given,
 // so a body sees its own uncommitted rows and not its rollback.
 import { describe, test, expect, beforeEach } from "bun:test";
-import { mkdtempSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { idAddress } from "../core/bindings.ts";
-import { registerId, type Board, type CoreDb } from "../core/boards.ts";
+import type { CoreDb } from "../core/boards.ts";
 import type { Principal } from "../core/resolver.ts";
-import { boardAccess, principalCanSee, scopeKey, serverAccess, type AliasScopeOf } from "./access.ts";
-import { openDatabase, type Repo } from "./db.ts";
+import { boardAccess, principalCanSee, scopeKey, serverAccess } from "./access.ts";
+import type { Repo } from "./db.ts";
 import type { Read, Tx } from "./store/tx.ts";
-import { scratchDbPath } from "../../tests/support/scratch_db.ts";
-import { seed } from "../../tests/support/seed.ts";
-
-const person = (email: string, name: string) => ({ scope_kind: "person" as const, scope_ref: email, name });
-const team = (ref: string, name: string) => ({ scope_kind: "team" as const, scope_ref: ref, name });
-const board = (name: string, scope: string | null): Board => ({ name, purpose: "", scope, created_by: "x", created_at: 0 });
-
-const BOARDS = [board("general", null), board("eng", "team:eng"), board("ops", "team:ops"), board("odd", "weird")];
-const WADE_ID = idAddress("a".repeat(64));
-const ENDED_ID = idAddress("b".repeat(64));
-const W = "wade@example.com", B = "bob@example.com", E = "eve@example.com", D = "dan@example.com";
-const HANDLES = [`${W}/be`, `${B}/be`, `${B}/qa`, `${E}/be`, `${D}/be`, "eng/deploy", "ops/deploy", "team:eng", WADE_ID, ENDED_ID, "nobody@example.com/be", "be", ""];
-const SCOPES: AliasScopeOf[] = [
-  { scope_kind: "person", scope_ref: W }, { scope_kind: "person", scope_ref: null }, { scope_kind: "team", scope_ref: "eng" },
-  { scope_kind: "team", scope_ref: "ops" }, { scope_kind: "team", scope_ref: "nope" }, { scope_kind: "team", scope_ref: null },
-  { scope_kind: "service", scope_ref: "svc" },
-];
-const TOKENS = [`${B}/qa`, `${B}/human`, `${D}/human`, "eng/deploy", "be", "qa", "deploy", "human", "team:eng", WADE_ID, ENDED_ID, idAddress("f".repeat(64)), "nope", "!!", "eng/ghost", `${B}/ghost`];
-const AUTHORS = [`${W}/be`, `${B}/be`, `${E}/be`, `${D}/be`, WADE_ID, "eng/deploy", "eng/other"];
+import { AUTHORS, B, BOARDS, D, HANDLES, openBoardParity, SCOPES, TOKENS, W, WADE_ID } from "../../tests/support/board_parity.ts";
 
 let repo: Repo;
 let db: CoreDb;
 
 beforeEach(async () => {
-  ({ repo, db } = openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) }));
-  await seed(repo, async tx => {
-    const [wade, bob, eve] = [await repo.users.upsertByEmail(tx, W, null), await repo.users.upsertByEmail(tx, B, null), await repo.users.upsertByEmail(tx, E, null)];
-    await repo.users.upsertByEmail(tx, D, null);
-    const eng = await repo.teams.create(tx, "eng", wade.id);
-    await repo.teams.addMember(tx, eng.id, wade.id, "owner");
-    await repo.teams.addMember(tx, eng.id, bob.id);
-    await repo.teams.setPolicy(tx, eng.id, "collaborative");
-    const ops = await repo.teams.create(tx, "ops", eve.id);
-    await repo.teams.addMember(tx, ops.id, eve.id, "owner");
-    await repo.teams.addMember(tx, ops.id, wade.id);
-    await repo.teams.setPolicy(tx, ops.id, "delegating");
-    for (const [email, name] of [[W, "be"], [B, "be"], [B, "qa"], [B, "human"], [E, "be"], [D, "be"], [D, "human"]] as const) await repo.aliases.create(tx, person(email, name), email);
-    await repo.aliases.create(tx, team("eng", "deploy"), W);
-    await repo.aliases.create(tx, team("ops", "deploy"), E);
-    registerId(repo.coreOn(tx), { id: WADE_ID, principal: W, launcher: false });
-    registerId(repo.coreOn(tx), { id: ENDED_ID, principal: B, launcher: false });
-  });
-  await seed(repo, tx => repo.sessionEnd.end(tx, ENDED_ID, { why: "test", now: 5 }));
+  ({ repo, db } = await openBoardParity());
 });
 
 // A call's outcome, a throw as its message, so a refusal compares by text.
