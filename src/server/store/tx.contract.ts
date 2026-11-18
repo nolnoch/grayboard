@@ -26,6 +26,8 @@ export type TxStore = {
   queue: { readonly held: boolean; readonly mine: boolean; run<T>(fn: () => T | PromiseLike<T>): Promise<T> };
   // One row on the handle's transaction, and the table's values on any handle. Each refuses as the store's handle
   // check does (a settled Tx, the holder's own read); synchronously or by rejecting, as the backend's statements run.
+  // Either way `put` checks its handle and sends its statement before it returns: rows that start a write without
+  // awaiting it (an un-awaited savepoint, an orphan) read what landed by the time the body settles.
   put(tx: Tx, v: string): void | Promise<void>;
   rows(r: Read): string[] | Promise<string[]>;
   // Whether the store's root transaction is open: false in a commit's `committed` callback and its effects.

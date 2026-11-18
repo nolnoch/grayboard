@@ -49,10 +49,11 @@ export function flushEffect(effect: Effect): void {
 // One open savepoint on the backend's connection. Each settles it once. commit() releases it, and throws (having
 // rolled it back) when it can't: an inner frame still open, its transaction gone, a failed RELEASE. A backend whose
 // statements are synchronous returns void, and the savepoint settles in the same turn as its body: SQLite's commit
-// timing doesn't move. Postgres returns a promise.
+// timing doesn't move. Postgres returns a promise, and must have sent its statement before it returns it (a Bun
+// query is lazy until awaited, and an await sends it a microtask later, after anything already queued).
 export type SavepointFrame = { commit(): void | Promise<void>; rollback(): void | Promise<void> };
 
-const isThenable = (v: unknown): v is PromiseLike<unknown> =>
+export const isThenable = (v: unknown): v is PromiseLike<unknown> =>
   v !== null && (typeof v === "object" || typeof v === "function") && typeof (v as { then?: unknown }).then === "function";
 
 // A store's read handle outside any transaction.
@@ -87,14 +88,16 @@ export abstract class BaseTx extends BaseRead {
   get live(): boolean { return this.#live; }
   assertLive(): void {
     if (!this.#live) throw new Error("Tx used after its transaction settled: a body awaits only its own statements (#807 D4)");
-    if (this.#child?.live) throw new Error("Tx used while its savepoint is open: use the savepoint's Tx");
+    if (this.#child) throw new Error("Tx used while its savepoint is open: use the savepoint's Tx");
   }
   afterCommit(effect: Effect): void {
     this.assertLive();
     this.deferEffect(effect);
   }
-  // fn always runs after an await, as before the split; only the frame's settle awaits conditionally, so a
-  // synchronous backend's RELEASE or ROLLBACK TO lands in the same turn as fn's settle.
+  // fn is called synchronously and its result awaited, as before the split; only the frame's settle awaits
+  // conditionally, so a synchronous backend's RELEASE or ROLLBACK TO lands in the same turn as fn's settle. The inner
+  // Tx closes as fn settles, and this Tx stays blocked until the frame has: a task fn started and didn't await (D4)
+  // can't write, register or open a savepoint on either while an async RELEASE or ROLLBACK TO is in flight.
   async savepoint<T>(fn: (tx: Tx) => T | Promise<T>): Promise<T> {
     this.assertLive();
     if (!this.nests) throw new Error("savepoint in a synchronous write body: only an async write() body can await one");
@@ -104,11 +107,14 @@ export abstract class BaseTx extends BaseRead {
     try {
       value = await fn(inner as unknown as Tx);
     } catch (error) {
-      this.#settle(inner, false);
-      const r = frame.rollback();
-      if (isThenable(r)) await r;
+      inner.close();
+      try {
+        const r = frame.rollback();
+        if (isThenable(r)) await r;
+      } finally { this.#settle(inner, false); }
       throw error;
     }
+    inner.close();
     try {
       const r = frame.commit();
       if (isThenable(r)) await r;
