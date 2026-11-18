@@ -898,7 +898,8 @@ async function adminServiceCredentialAdd(req: Request, authed: AuthedUser, repo:
   }
   const source = (body?.source ?? "generic") as CredentialSource;
   if (!(CREDENTIAL_SOURCES as readonly unknown[]).includes(source)) return badRequest(`source must be one of ${CREDENTIAL_SOURCES.join(", ")}`);
-  const tokenSeconds = body?.token_seconds ?? OAUTH_TTL.access / 1000;
+  // No lifetime given: the default, under a lower ceiling the ceiling (#270 audit L-2).
+  const tokenSeconds = body?.token_seconds ?? Math.min(OAUTH_TTL.access / 1000, ceiling);
   if (!Number.isSafeInteger(tokenSeconds) || (tokenSeconds as number) < SERVICE_TOKEN_MIN_SECONDS || (tokenSeconds as number) > ceiling) {
     return badRequest(`token_seconds must be a whole number from ${SERVICE_TOKEN_MIN_SECONDS} to ${ceiling} (GRAYBOARD_SERVICE_TOKEN_MAX_SECONDS)`);
   }

@@ -401,12 +401,13 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
     if (path === "/oauth/authorize" && req.method === "GET") {
       const raw = parameters(u.search.slice(1));
       const p = recognized(withoutEmpty(raw), ["response_type", "client_id", "redirect_uri", "scope", "resource", "state", "code_challenge", "code_challenge_method"]);
+      // A service credential never runs the browser flow (#270 D2): auth codes and refresh never reach it. It has no
+      // redirect to answer at, so the refusal is this page's, and it comes before any lookup: one answer for every
+      // svc_ ID, live, revoked or unknown, so the page tells no one whether a credential is live (audit L-3).
+      if (isServiceClientId(required(p, "client_id"))) fail("unauthorized_client");
       const client = await resolveClient(required(p, "client_id"));
       if (closed) fail("temporarily_unavailable", 503);
       const redirectUri = required(p, "redirect_uri");
-      // A service credential never runs the browser flow (#270 D2): auth codes and refresh never reach it. It has no
-      // redirect to answer at, so the refusal is this page's.
-      if (client?.credential) fail("unauthorized_client");
       if (!client || !matchesRedirect(client, redirectUri)) fail();
       const state = required(p, "state");
       if (state.length > 1024) fail();

@@ -1530,8 +1530,10 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
     commitGeneration: () => ownsTx(db) ? undefined : readGeneration(),
 
     oauth: { ...oauth, findActiveAccess, redeemCode: change(oauth.redeemCode), rotateRefresh: change(oauth.rotateRefresh), revokeToken: change(oauth.revokeToken),
-      addServiceCredential: change(oauth.addServiceCredential), rotateServiceCredential: change(oauth.rotateServiceCredential),
-      revokeServiceCredential: change(oauth.revokeServiceCredential), revokeServiceSecret: change(oauth.revokeServiceSecret), mintServiceToken: change(oauth.mintServiceToken) },
+      // A service credential's add, rotate and mint only add authority: no session's shrinks, so they send no change
+      // notice (each null notice is a full hosted re-check pass, and mints come per run, #270 audit M-1). The
+      // generation trigger on oauth_tokens still clears the access cache. Only the revokes notify.
+      revokeServiceCredential: change(oauth.revokeServiceCredential), revokeServiceSecret: change(oauth.revokeServiceSecret) },
     hosted: { ...hostedStore, insert: marks(hosted.insert, (_tx, row) => row.session_id), update: marks(hosted.update, (_tx, row) => row.session_id),
       end: marks(hosted.end, (_tx, session) => session), childEnd: marks(hosted.childEnd, (_tx, session) => session),
       park: marks(hosted.park, (_tx, session) => session), unpark: marks(hosted.unpark, (_tx, session) => session),
@@ -2691,11 +2693,14 @@ function oauthOps(db: Database, hosted: HostedStoreOf): OAuthOps {
     findActiveAccess(h, resource, requiredScopes, now) {
       if (!time(now) || !hash(h) || !Array.isArray(requiredScopes)) return undefined;
       // One read snapshot binds token, grant and user liveness.
-      // A service credential's source rides the same join (#270 D3), so the cached access carries it.
+      // A service credential's source rides the same join (#270 D3), so the cached access carries it. A run token's
+      // secret must be live too (a primary-key join, no extra query): on SQLite the secret's revoke revokes its tokens
+      // in its transaction, but on Postgres a mint racing that revoke can land a token the revoke didn't see (audit L-1).
       const row = db.query<{ data: string; created_at: number; token_expiry: number; access_scopes: string | null; grant_expiry: number; source: CredentialSource | null }, [string, number, number]>(`
         SELECT g.data, t.created_at, t.expires_at AS token_expiry, t.access_scopes, g.expires_at AS grant_expiry, c.source FROM oauth_tokens t
         JOIN oauth_grants g ON g.id = t.grant_id JOIN users u ON u.id = g.user_id LEFT JOIN service_credentials c ON c.grant_id = g.id
-        WHERE t.hash = ? AND t.kind = 'access' AND t.revoked_at IS NULL AND t.expires_at > ?
+        LEFT JOIN service_credential_secrets s ON s.id = t.secret_id
+        WHERE t.hash = ? AND t.kind = 'access' AND t.revoked_at IS NULL AND t.expires_at > ? AND (t.secret_id IS NULL OR s.revoked_at IS NULL)
           AND g.revoked_at IS NULL AND g.expires_at > ? AND u.disabled_at IS NULL`).get(h, now, now);
       if (!row) return undefined;
       const g: OAuthGrant = JSON.parse(row.data);
@@ -2768,7 +2773,7 @@ function oauthOps(db: Database, hosted: HostedStoreOf): OAuthOps {
       return db.transaction(() => {
         const c = liveCredential(clientId, now);
         if (!c) return missing;
-        // At most two live secrets (D2), checked in the insert.
+        // At most two live secrets (D2), counted in the insert: on Postgres, after the credential row FOR UPDATE (D3).
         const secret = db.query<{ id: number }, [number, string, number, number]>(`INSERT INTO service_credential_secrets(credential_id, hash, created_at)
           SELECT ?1, ?2, ?3 WHERE (SELECT COUNT(*) FROM service_credential_secrets WHERE credential_id = ?1 AND revoked_at IS NULL) < ?4
           RETURNING id`).get(c.id, secretHash, now, 2);
@@ -2812,8 +2817,10 @@ function oauthOps(db: Database, hosted: HostedStoreOf): OAuthOps {
       if (!time(now) || !hash(tokenHash) || !Number.isSafeInteger(secretId) || !scopes(selected) || !selected.every(s => (OAUTH_SCOPES as readonly string[]).includes(s)) ||
           ![limits.maxSeconds, limits.mintsPerMinute, limits.unexpired].every(n => Number.isSafeInteger(n) && n > 0)) return invalid;
       return db.transaction(() => {
-        // One statement (postgres-server.md D3): the credential, its grant, the secret and the service all live, the
-        // bucket (mints in the last minute, revoked ones included) and the cap (unexpired, unrevoked tokens) unspent.
+        // One INSERT … SELECT: the credential, its grant, the secret and the service all live, the bucket (mints in the
+        // last minute, revoked ones included) and the cap (unexpired, unrevoked tokens) unspent. That holds under
+        // SQLite's single writer; at Postgres's READ COMMITTED the counts and the secret check need the credential row
+        // FOR UPDATE first, as rotate and both revokes do (postgres-server.md D3).
         // The expiry is the credential's lifetime, clamped to the ceiling and to the grant's expiry.
         const row = db.query<{ expires_at: number }, [string, number, number, string, string, number, number, number]>(`
           INSERT INTO oauth_tokens(hash, grant_id, kind, expires_at, created_at, access_scopes, secret_id)

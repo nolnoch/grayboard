@@ -22,6 +22,7 @@ import { hostedRowCount } from "../support/hosted_rows.ts";
 import { ROOT as REPO_ROOT } from "../support/paths.ts";
 import { seed } from "../support/seed.ts";
 import { ServerProcess, TestServer } from "../support/server.ts";
+import { until } from "../support/until.ts";
 
 const A = "alice@example.com", ROOT = "root@example.com", SVC = "ingest";
 const LIMIT = { burst: 10_000, perSec: 10_000 };
@@ -148,6 +149,14 @@ describe("add: the secret reaches the launcher only", () => {
     expect((await api(root, "POST", "/api/admin/services/disable", { name: SVC })).status).toBe(200);
     expect((await add({})).status).toBe(409);
   });
+
+  test("with no lifetime given, a credential takes the default, or the ceiling when the ceiling is lower", async () => {
+    expect((await credential(await service())).token_seconds).toBe(3600);
+    await fresh({ serviceTokens: { maxSeconds: 600, mintsPerMinute: 60, unexpired: 1000 } });
+    const c = await credential(await service());
+    expect(c.token_seconds).toBe(600);
+    expect((await mint(srv.base, c.client_id, c.client_secret)).body.expires_in).toBeLessThanOrEqual(600);
+  });
 });
 
 describe("the token route", () => {
@@ -200,6 +209,22 @@ describe("the token route", () => {
     expect(await mint(srv.base, c.client_id, c.client_secret, { grant_type: "authorization_code", code: "c", code_verifier: "v".repeat(43), redirect_uri: "http://127.0.0.1:9/cb" }))
       .toEqual({ status: 400, body: { error: "unauthorized_client" } });
     expect(accessAudits(srv.app.db, "oauth.token_issued")).toEqual([]);
+  });
+
+  test("/oauth/authorize answers every svc_ ID alike, live, revoked or unknown: the page is no liveness oracle", async () => {
+    const root = await service();
+    const live = await credential(root);
+    const revoked = await credential(root);
+    expect((await api(root, "POST", "/api/admin/services/credentials/revoke", { client_id: revoked.client_id })).status).toBe(200);
+    const answer = async (clientId: string) => {
+      const q = new URLSearchParams({ response_type: "code", client_id: clientId, redirect_uri: "http://127.0.0.1:9/cb", state: "s", code_challenge: "x".repeat(43), code_challenge_method: "S256" });
+      const a = await fetch(`${srv.base}/oauth/authorize?${q}`, { redirect: "manual" });
+      return { status: a.status, body: await a.text() };
+    };
+    const expected = await answer(live.client_id);
+    expect(expected).toEqual({ status: 400, body: JSON.stringify({ error: "unauthorized_client" }) });
+    expect(await answer(revoked.client_id)).toEqual(expected);
+    expect(await answer(`svc_${"0".repeat(32)}`)).toEqual(expected);
   });
 
   test("a startup client, confidential or public, can't use client_credentials", async () => {
@@ -343,6 +368,31 @@ describe("sessions", () => {
     await refused(old.call("whoami"));
     expect(await mint(srv.base, c.client_id, c.client_secret)).toEqual({ status: 401, body: { error: "invalid_client" } });
     expect((await mint(srv.base, c.client_id, rotated.client_secret)).status).toBe(200);
+  });
+
+  test("a mint only adds authority, so it starts no full hosted re-check pass; a secret's revoke does", async () => {
+    const root = await service();
+    const c = await credential(root);
+    const rotated = await credential(root, { rotate: c.client_id });
+    // A null notice is what makes the hosted registry re-check every root (hosted.ts reconcile → requestFull).
+    let full = 0;
+    const unsubscribe = srv.app.repo.hosted.subscribe(id => { if (id === null) full++; });
+    try {
+      for (let i = 0; i < 5; i++) await token(srv.base, c);
+      expect(full).toBe(0);
+      expect((await api(root, "POST", "/api/admin/services/credentials/revoke", { secret: rotated.secret_id })).status).toBe(200);
+      await until(() => full > 0, 5000, "the secret revoke's change notice");
+    } finally { unsubscribe(); }
+  });
+
+  test("a run token whose secret is revoked is refused, even if the token row itself was missed (Postgres's mint-vs-revoke race)", async () => {
+    const root = await service();
+    const c = await credential(root);
+    await credential(root, { rotate: c.client_id });
+    const t = await token(srv.base, c);
+    // Only the secret's row: the shape a mint racing the revoke leaves on Postgres at READ COMMITTED.
+    await seed(srv.app.repo, () => { srv.app.db.run("UPDATE service_credential_secrets SET revoked_at = ? WHERE id = ?", [Date.now(), c.secret_id]); });
+    await refused(session(t));
   });
 
   test("a token is re-read on every call: one revoked on another connection refuses the next call", async () => {
