@@ -4,7 +4,7 @@
 import { actorChoice } from "../core/bindings.ts";
 import {
   archiveGate, archiveRefusalText, archiveRepeat, assembleWho, boardExistsText, boardsFromViews, checkSubMode, createArgs, createdNote, createRepeats,
-  finishWho, normalizeBoard, noStatusText, parseMatch, pickView, seenScopeOf, statusText, threadNotOnBoard, unboundFrom,
+  finishWho, normalizeBoard, noStatusText, parseMatch, pickView, statusText, threadNotOnBoard, unboundFrom,
   type Board, type BoardSummary, type WhoRow,
 } from "../core/boards.ts";
 import { claimView, type ClaimView } from "../core/claims.ts";
@@ -15,6 +15,7 @@ import {
   type ToolContext, type ToolOutcome,
 } from "../core/tools.ts";
 import { scopeKey, type AliasScopeOf, type BoardAccess } from "./access.ts";
+import { seenAmong } from "./board_post.ts";
 import { readableBoard, visibleBoards } from "./board_reads.ts";
 import type { Repo } from "./db.ts";
 import type { Read, Tx } from "./store/tx.ts";
@@ -166,15 +167,8 @@ async function claimViews(repo: Repo, access: BoardAccess, r: Read, prefix: stri
   const rows = await repo.claims.list(r, prefix);
   if (!rows.length) return [];
   const boards = await visibleBoards(repo, access, r, viewer, rows.flatMap((c) => (c.board ? [c.board] : [])));
-  const holders = [...new Set(rows.map((c) => c.holder))];
-  const aliasRows = await repo.aliases.scopesOf(r, holders);
-  const scopeOf = new Map(holders.map((h) => [h, seenScopeOf(aliasRows.get(h), h)]));
-  const scopes = [...new Map([...scopeOf.values()].flatMap((s) => (s ? [[scopeKey(s), s] as const] : []))).values()];
-  const sees = scopes.length ? await access.seesAliasScopes(r, seer, scopes) : new Map<string, boolean>();
-  return rows.map((c) => {
-    const scope = scopeOf.get(c.holder);
-    return claimView(c, !c.board || boards.has(c.board), !scope || sees.get(scopeKey(scope)) === true);
-  });
+  const seen = await seenAmong(repo, access, r, seer, rows.map((c) => c.holder));
+  return rows.map((c) => claimView(c, !c.board || boards.has(c.board), seen.has(c.holder)));
 }
 
 // core's listBoards: each open board's row is the view of the address a read without `as` acts as (S14); a principal
