@@ -65,6 +65,8 @@ test("no non-test module under src/server/store/pg/ reaches bun:sqlite or the SQ
 test("the walk follows relative imports and skips type-only ones", () => {
   // store/tx.ts reaches bun:sqlite through core/sqlite.ts: a pg module importing it at runtime must fail.
   expect(forbiddenReach([join(SRC, "server/store/tx.ts")])).toEqual(["server/store/tx.ts -> core/sqlite.ts -> bun:sqlite"]);
+  // The neutral handle base a pg module may import (#807 P3 C2a): nothing at runtime.
+  expect(forbiddenReach([join(SRC, "server/store/tx_base.ts")])).toEqual([]);
   expect(runtimeImports(`import type { X } from "../tx.ts";\nexport type { Y } from "../db.ts";`)).toEqual([]);
   expect(runtimeImports(`import {\n  a,\n  b,\n} from "../tx.ts";\nexport { c } from "./d.ts";\nimport "./e.ts";\nconst f = await import("../db.ts");`))
     .toEqual(["../tx.ts", "./d.ts", "./e.ts", "../db.ts"]);
