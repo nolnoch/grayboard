@@ -113,8 +113,8 @@ for (const [route, action] of [["revoke-session", "auth.session_revoked"], ["dis
 
 // #807 P1c-15c-1: the claim, identity and team routes reach core's helpers through `repo.coreOn(handle)`: their write
 // body's `Tx` inside it, the pool outside (the claim list). P3 B1a: and their binding reads through `repo.bindings`, the same way.
-// P3 B5b1: the identity, team and Slack-free alias routes write boards through `repo.boards` and never reach core; only
-// the claim call (callBoardTool, B5b3) still does.
+// P3 B5b1: the identity, team and Slack-free alias routes write boards through `repo.boards` and never reach core.
+// B5b3c: nor does the claim call, which runs the server's claim port (callClaimTool) on its body's Tx.
 test("#807 P1c-15c-1: claim, identity and team routes reach the store on their body's Tx", async () => {
   const srv = new TestServer();
   cleanups.push(() => srv.stop());
@@ -146,6 +146,7 @@ test("#807 P1c-15c-1: claim, identity and team routes reach the store on their b
     await call("identity create", you, "POST", "/api/identities", { name: "agent" }, 201);
     await call("claim call", you, "POST", "/api/claims/call", { as: "agent", tool: "claim_take", args: { key: "k" } });
     // A session-ID `as` reaches ownAddress's ID branch, which reads the `ids` row on the claim call's Tx.
+    route = "seed";
     await seed(repo, tx => { registerId(repo.coreOn(tx), { id: "id:0000000000001", principal: "you@example.com", launcher: false }); });
     await call("claim call as id", you, "POST", "/api/claims/call", { as: "id:0000000000001", tool: "claim_take", args: { key: "j" } });
     await call("claim list", you, "GET", "/api/claims");
@@ -158,8 +159,8 @@ test("#807 P1c-15c-1: claim, identity and team routes reach the store on their b
     const inBody = ["team create", "team add", "identity create", "claim call", "claim call as id", "identity delete", "team delete-alias", "team remove", "team leave"];
     // Each in-body route reached the store at least once, so the last check isn't vacuous for it.
     expect(inBody.filter(r => !checks.some(c => c.route === r && c.handle === "tx"))).toEqual([]);
-    // B5b1: core only under the claim call.
-    expect(checks.filter(c => c.op === "coreOn" && !c.route.startsWith("claim call")).map(c => c.route)).toEqual([]);
+    // B5b1/B5b3c: no route reaches core.
+    expect(checks.filter(c => c.op === "coreOn" && c.route !== "seed").map(c => c.route)).toEqual([]);
     const boardOps = (r: string) => checks.filter(c => c.route === r && c.op in repo.boards).map(c => `${c.op}:${c.handle}`);
     // The name's board check, then the board ensured twice (teamCreate's own and the join's).
     expect(boardOps("team create")).toEqual(["get:tx", "ensure:tx", "ensure:tx"]);
@@ -173,9 +174,11 @@ test("#807 P1c-15c-1: claim, identity and team routes reach the store on their b
     // The expiry timer's re-arm (`nextExpiry`) runs detached after a claim call's commit, so its route label is whichever
     // call is current when it lands: it is left out of the per-route reads and must read on the pool, outside any body.
     expect(checks.filter(c => c.op === "nextExpiry" && (c.handle !== "pool" || c.inTxn))).toEqual([]);
-    const reads = (r: string) => checks.filter(c => c.route === r && c.op !== "coreOn" && c.op !== "nextExpiry").map(c => `${c.op}:${c.handle}`);
-    expect(reads("claim call as id")).toEqual(["idRow:tx", "addressSet:tx"]);
-    expect(reads("claim call")).toEqual(["userOf:tx", "addressSet:tx"]);
+    const reads = (r: string) => checks.filter(c => c.route === r && c.op !== "nextExpiry").map(c => `${c.op}:${c.handle}`);
+    // Then the take itself: the sweep, the key's row, the upsert and its event, all on the body's Tx.
+    const take = ["expire:tx", "get:tx", "take:tx", "logEvent:tx"];
+    expect(reads("claim call as id")).toEqual(["idRow:tx", "addressSet:tx", ...take]);
+    expect(reads("claim call")).toEqual(["userOf:tx", "addressSet:tx", ...take]);
     expect(reads("identity delete")).toEqual(["userOf:tx", "forget:tx"]);
     expect(reads("team delete-alias")).toEqual(["userOf:tx", "forget:tx"]);
     expect(checks.filter(c => c.inTxn !== (c.handle === "tx"))).toEqual([]);
