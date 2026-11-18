@@ -4,10 +4,11 @@
 // (an ID, a held alias, an unheld person alias, an unheld team alias, a recorded user), a holder who lost the board, an
 // archived board, a regular claim on a queue board, no board, and queue posts with a lane left, none left, and none
 // left whose `[unclaimed]` reply the holder can no longer write.
-import { beforeEach, expect, test } from "bun:test";
+import { beforeEach, expect, spyOn, test } from "bun:test";
 import { claimQueuePost, post, subscribe } from "../core/boards.ts";
 import { boardActor } from "../core/bindings.ts";
 import { logEvent, sweepChanges } from "../core/claims.ts";
+import { CoreError } from "../core/errors.ts";
 import { callBoardTool as coreCallBoardTool, type ToolContext } from "../core/tools.ts";
 import { boardAccess } from "./access.ts";
 import { callClaimTool, sweepClaims } from "./claims.ts";
@@ -206,4 +207,51 @@ test("claim_take, claim_release and claim_watch give core's answers and leave it
   expect(text("eve", "claim_watch", { key: "ticket:eng" })).not.toContain("eng/deploy");
   expect(text("wade", "claim_watch", { key: "ticket:absent" })).toContain("error");
   expect(JSON.stringify(call("bob", "claim_watch", { key: "ticket:live" }).rows.claim_watches)).toContain(`"handle":"${B}/be"`);
+});
+
+// #807 P3 B5b3c rollback: a take or a decline that throws after its writes leaves none of them, its sweep's included;
+// and a refusal after a write is rolled back by the tool's own savepoint even when the caller catches it and commits,
+// as HTTP's claim call does (it answers a CoreError inside the body).
+const claimRows = () => ({
+  claims: repo.coreOn(repo.read).prepare(`SELECT key, holder, board, note FROM claims ORDER BY key`).all(),
+  events: repo.coreOn(repo.read).prepare(`SELECT key, event, handle FROM claim_events ORDER BY id`).all(),
+  posts: repo.coreOn(repo.read).prepare(`SELECT body FROM posts ORDER BY id`).all(),
+  watches: repo.coreOn(repo.read).prepare(`SELECT key, handle FROM claim_watches ORDER BY key, handle`).all(),
+});
+const wade: ToolContext = { user: W, addresses: [`${W}/be`, "eng/deploy"], session: WADE_ID };
+const bob: ToolContext = { user: B, addresses: [`${B}/be`, `${B}/qa`], session: BOB_ID };
+
+test("a take whose [claim] post fails leaves no claim, no event and none of its sweep", async () => {
+  const access = boardAccess(repo);
+  const before = claimRows();
+  const spy = spyOn(repo.boards, "insertOutbox").mockImplementation((() => { throw new Error("outbox down"); }) as never);
+  try {
+    await expect(repo.write(tx => callClaimTool(repo, access, tx, `${W}/be`, "claim_take", { key: "ticket:new", board: "general" }, wade))).rejects.toThrow("outbox down");
+  } finally { spy.mockRestore(); }
+  expect(claimRows()).toEqual(before);
+  // The lapsed rows are still there for the next sweep to announce.
+  expect(JSON.stringify(before.claims)).toContain("ticket:watched");
+});
+
+test("a decline whose redelivery fails leaves the claim held and no release event", async () => {
+  const access = boardAccess(repo);
+  const before = claimRows();
+  const spy = spyOn(repo.boards, "claimQueuePost").mockImplementation((() => { throw new Error("queue down"); }) as never);
+  try {
+    await expect(repo.write(tx => callClaimTool(repo, access, tx, `${B}/be`, "claim_release", { key: `queue:q:${QLIVE}` }, bob))).rejects.toThrow("queue down");
+  } finally { spy.mockRestore(); }
+  expect(claimRows()).toEqual(before);
+  expect(JSON.stringify(before.claims)).toContain(`"key":"queue:q:${QLIVE}","holder":"${B}/be"`);
+});
+
+test("a refusal after a write, caught in a body that commits, leaves nothing of the call (the tool's savepoint)", async () => {
+  const access = boardAccess(repo);
+  const before = claimRows();
+  // A renewal moving ticket:live onto the archived attic: the upsert and the sweep ran before checkMove refuses.
+  const answer = await repo.write(async tx => {
+    try { await callClaimTool(repo, access, tx, `${W}/be`, "claim_take", { key: "ticket:live", board: "attic" }, wade); return "taken"; }
+    catch (e) { if (e instanceof CoreError) return e.message; throw e; }
+  });
+  expect(answer).toContain("attic");
+  expect(claimRows()).toEqual(before);
 });
