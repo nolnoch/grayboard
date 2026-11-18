@@ -1129,7 +1129,7 @@ export function post(
 /** Who a post reaches and why. Highest-priority reason wins per handle: mention > thread > subscription. */
 export type PostTarget = { reason: "mention" | "thread" | "subscription"; wake: boolean };
 
-/** Which of post's three target rules a post follows. */
+/** Which of post's four target rules a post follows. */
 export type PostBranch = "queue" | "announcement" | "thread" | "broadcast";
 
 /**
