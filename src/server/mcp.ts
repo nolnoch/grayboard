@@ -609,6 +609,9 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
       const control = async (uri: string, ctx: ServerContext, subscribe: boolean) => {
         const context = current(ctx);
         try {
+          // A stopped stream's prune (stop) judged its boards before this request: it settles first, so it can't
+          // delete a registration this request makes after a board came back.
+          if (subscribe && legacy.pruning) await legacy.pruning;
           const checked = await authorize(context, ctx.mcpReq.signal, true, [uri]);
           if (subscribe) {
             if (!legacy.subscriptions.has(uri) && legacy.subscriptions.size >= caps.watches.perSession) { countRefusal("resource_watch"); throw new ApplicationError("bad_request", "resource watch capacity reached"); }
@@ -815,16 +818,18 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     }
   }
   // Phase B's board check for a native live phase A passed (`validStamped`'s "boards"): its uris' visibility read
-  // now, judged with no await since, as `capability` judges a full check's (#807 P3 B5a2). A uri a control added while
-  // the read awaited waits for the next tick; a lost board stops the live.
+  // now, judged with no await since, as `capability` judges a full check's (#807 P3 B5a2). Each uri whose board was read
+  // is judged; one a control added while the read awaited waits for the next tick. A lost board stops the live.
   async function checkBoards(live: Live, context: Context) {
     checking.set(context, seq);
     try {
       const boards = await boardFacts(context, live.uris.keys());
       await testPauseAsync("mcp:board:checked");
       if (closed || live.stopped || live.context !== context) return;
-      if (!boardsOf(context, live.uris.keys()).every(b => boards.has(b))) return;
-      for (const [uri, cap] of live.uris) if (capability(context, uri, { row: live.bound.row, seq, boards }) !== cap) throw new ApplicationError("not_found", "resource not found");
+      for (const [uri, cap] of live.uris) {
+        if (!boardsOf(context, [uri]).every(b => boards.has(b))) continue;
+        if (capability(context, uri, { row: live.bound.row, seq, boards }) !== cap) throw new ApplicationError("not_found", "resource not found");
+      }
     } catch (e) {
       if (closed || live.stopped || live.context !== context) return;
       stamps.delete(context); unexpected(e); streamClosed(context, e); live.stop();
