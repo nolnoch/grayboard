@@ -45,10 +45,11 @@ The baseline every later change is measured against: as of v2.4.0, every cell is
 | 17 | Repo-name suggestion while unbound | yes | yes | yes | yes | yes | yes | yes | yes |
 | 18 | Another user's item wakes only under a grant (`msg.wake`) | n/a | yes | n/a | yes | n/a | yes | n/a | yes |
 | 19 | Delegation to another user's launcher under a grant (`delegate.to`) | n/a | yes | n/a | yes | n/a | yes | n/a | yes |
+| 20 | Runtime role bindings (`org_admin`, `team_owner`) and `grayboard admin role` | n/a | yes | n/a | yes | n/a | yes | n/a | yes |
 
 ## Evidence by row
 
-Rows 1–8: `parity-delivery.md`. Rows 9–16: `parity-access.md`. Rows 17–19: §Not covered.
+Rows 1–8: `parity-delivery.md`. Rows 9–16: `parity-access.md`. Rows 17–20: §Not covered.
 
 ## Notes (known limits, not cells)
 
@@ -91,3 +92,8 @@ The Rust client SDK (`sdk/rust`, #929) is a library for services, not a harness 
 - Server side, every hosted cell: an explicit `to` naming another user's launcher is refused unless the two share a `delegating` team (delegation.md, #256); the launcher's reads and pull mark such a request `delegated` per call, and the launcher instruction acts on another user's request only with that mark. Proof: `tests/integration/delegation_grant.test.ts`.
 - pi H, omp H, CC H: hosted-core's `channelParams` carries `delegated="true"` (`dmNotification`, `src/shared/notifications.ts`). Proof: `adapters/hosted-core/tests/channel.test.ts` ("channelParams carries the server's delegated mark…").
 - OC V2: the item's JSON carries the field as the server sent it; no host test sends a cross-user delegation.
+
+### 20. Runtime role bindings (`org_admin`, `team_owner`) and `grayboard admin role`
+
+- Local (all four): n/a. Local mode is single-user (`vision.md` §1): there is no authorization model to grant into.
+- Every hosted cell: server-side HTTP routes and the CLI, the same for every harness (server-access.md §1 Role bindings, #927); no MCP tool. Proof: `tests/integration/role_bindings.test.ts` (grant, revoke and list through the CLI against a server process; bootstrap admins; audit rows; `team_owner` scoping; stale authority), `tests/integration/authz_decision.test.ts`.

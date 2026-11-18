@@ -51,9 +51,11 @@ grayboard admin revoke-session --email <e>   # every session the user has
 grayboard admin disable-user --email <e>   # also signs them out everywhere; they can't sign in
 grayboard admin enable-user --email <e>    # they sign in again; old sign-ins stay revoked
 grayboard admin unlink-idp --email <e>     # forget the user's sign-in account (see the server guide)
+grayboard admin role grant|revoke <role> <principal> [--scope <team>]   # org_admin, or team_owner on a team
+grayboard admin role list [--role <r>] [--principal <p>] [--scope <s>]
 ```
 
-> Admin commands work only for the emails in the server's `GRAYBOARD_ADMINS`. Admins can also add, remove, and list members of any team, e.g. one whose last member left. Every admin action writes an audit row.
+> Admin commands work for the emails in the server's `GRAYBOARD_ADMINS` and for anyone granted `org_admin` ([Admins and roles](server.md#admins-and-roles)). Admins can also add, remove, and list members of any team, e.g. one whose last member left. Every admin action writes an audit row.
 
 ## Tool surface
 
