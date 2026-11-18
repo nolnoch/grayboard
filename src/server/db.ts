@@ -32,15 +32,13 @@ import { GOOGLE_ISSUER } from "./idp_google.ts";
 import { LOGIN_SCOPE } from "./oauth-config.ts";
 import { OAUTH_TTL, type OAuthStore, type OAuthBinding, type OAuthAuthorization, type OAuthRequest, type OAuthBrowserSession, type OAuthCode, type OAuthGrant, type OAuthTokenPair, type OAuthAccess, type OAuthFailure } from "./oauth-types.ts";
 import { LastOwner, PrincipalTaken } from "./store/errors.ts";
+import { DEV_SESSION_LABEL, TEAM_POLICIES, type User, type IdpSignIn, type Session, type PrincipalRow, type Team, type TeamPolicy, type TeamMember, type RoleBinding, type RoleAuthority, type RoleRevoke, type ServiceRow, type UsersStore, type SessionsStore, type PrincipalsStore, type TeamsStore, type RolesStore, type ServicesStore } from "./store/identity.ts";
+// The identity groups' row types and interfaces live in store/identity.ts for the Postgres store (#807 P3 C3a);
+// re-exported for every importer.
+export { DEV_SESSION_LABEL, TEAM_POLICIES } from "./store/identity.ts";
+export type { User, IdpSignIn, Session, PrincipalRow, Team, TeamPolicy, TeamRole, TeamMember, RoleBinding, RoleAuthority, RoleGrant, RoleRevoke, RoleFilter, ServiceRow, UsersStore, SessionsStore, PrincipalsStore, TeamsStore, RolesStore, ServicesStore } from "./store/identity.ts";
 
 // Row types
-// idp_issuer + idp_subject: the IdP that proved the user's email and its stable
-// account ID there (Google `sub`), keyed together (security audit F-13, #928
-// D3). Both: linked. Issuer only: a pre-F-13 row, reserved for that IdP.
-// Neither: a dev-auth user, or one an admin unlinked.
-// A user row (#270 D1): a person, or a service whose `email` holds its name (never an email: it has no "@"). The kind
-// is its principal row's, read with the row (USER_SQL): there's no users.kind column.
-export type User     = { id: number; email: string; display_name: string | null; created_at: number; disabled_at: number | null; idp_issuer: string | null; idp_subject: string | null; kind: "user" | "service" };
 // Every read of a user row goes through this, so `kind` is never missing (a "SELECT *" would type-check without it).
 // A users row with no service principal is a person's: user principals are seeded on every open.
 const USER_SQL = `SELECT u.id, u.email, u.display_name, u.created_at, u.disabled_at, u.idp_issuer, u.idp_subject,
@@ -48,33 +46,9 @@ const USER_SQL = `SELECT u.id, u.email, u.display_name, u.created_at, u.disabled
   FROM users u LEFT JOIN principals p ON p.user_id = u.id AND p.kind = 'service'`;
 // A user row by id, the auth cache's read (tests count it).
 export const USER_BY_ID_SQL = `${USER_SQL} WHERE u.id = ?`;
-// What an IdP sign-in resolved to (security audit F-13, #928 D4). `linked`: the
-// user had no subject yet and now has this one. Refusals: `subject_mismatch`,
-// the email's user belongs to another account at the same IdP (the email was
-// reassigned); `issuer_mismatch`, the email's user belongs to another IdP
-// (`issuer`, the one holding it); `email_changed`, this IdP account's user has
-// another email; `service`, the email names a service principal (#270 D1).
-export type IdpSignIn =
-  | { status: "ok"; user: User; linked: boolean }
-  | { status: "subject_mismatch" | "email_changed" | "service"; user: User }
-  | { status: "issuer_mismatch"; user: User; issuer: string };
-// The label `grayboard login --dev` sessions carry: a server started without dev auth revokes them (#805 F-04).
-export const DEV_SESSION_LABEL = "dev";
-export type Session  = { id: number; user_id: number; token_hash: string; created_at: number; last_used_at: number; revoked_at: number | null; label: string | null };
 // An alias (#284): a name in a scope, `<scope_ref>/<name>`. A person scope's
 // ref is the user's email; a team or service scope's is the principal's name.
 export type Alias = { id: number; address: string; scope_kind: ScopeKind; scope_ref: string; name: string; created_at: number };
-// A scope owner (#284 decision 5): a user (name = email), a team or a service principal.
-export type PrincipalRow = { id: number; kind: Principal["kind"]; name: string; user_id: number | null; team_id: number | null; parent_id: number | null; created_at: number };
-
-export type Team     = { id: number; name: string; created_by: number; policy: string; created_at: number };
-// A team's wake policy (#806): 'open' (the default) isolates members' agents
-// from each other's wakes, as from anyone's; 'collaborative' grants members'
-// agents a wake across users (vision.md principle 9); 'delegating' (#256)
-// is collaborative and also lets a member's session name another member's
-// launcher in `delegate`'s `to`.
-export type TeamPolicy = "open" | "collaborative" | "delegating";
-export const TEAM_POLICIES: readonly TeamPolicy[] = ["open", "collaborative", "delegating"];
 // attachments: present on reads when the message carries files.
 // delivered_at: when it was handed to the recipient's harness; null until then, and for mail delivered before the column.
 // via: the child session (a harness subagent, #523) that wrote it under its root's addresses; null for a root's own write.
@@ -256,38 +230,9 @@ export interface Repo {
   commitGeneration(): string | undefined;
   oauth: OAuthStore;
   hosted: HostedStore;
-  users: {
-    upsertByEmail(tx: Tx, email: string, displayName: string | null): Promise<User>;
-    // An IdP sign-in: matches (issuer, subject) first, then the email (F-13, #928 D4).
-    signIn(tx: Tx, issuer: string, subject: string, email: string, displayName: string | null): Promise<IdpSignIn>;
-    // Forgets a user's IdP issuer and subject, so the next sign-in with the email, from any IdP, links its account.
-    clearSubject(tx: Tx, userId: number): Promise<void>;
-    findByEmail(r: Read, email: string): Promise<User | undefined>;
-    // Uncached: a fresh read on the caller's handle.
-    findById(r: Read, userId: number): Promise<User | undefined>;
-    // findById(r, id)?.disabled_at != null, cached on authGeneration (#853); inside the caller's own transaction it
-    // reads on its Tx, uncached.
-    isDisabled(r: Read, userId: number): Promise<boolean>;
-    // The user's email and kind (#270 D1) while it exists and isn't disabled, cached as isDisabled is.
-    active(r: Read, userId: number): Promise<{ email: string; kind: User["kind"] } | undefined>;
-    setDisabled(tx: Tx, userId: number, disabled: boolean): Promise<void>;
-  };
-  sessions: {
-    create(tx: Tx, userId: number, tokenHash: string, label: string | null): Promise<Session>;
-    findByTokenHash(r: Read, hash: string): Promise<Session | undefined>;
-    findById(r: Read, sessionId: number): Promise<Session | undefined>;
-    revoke(tx: Tx, sessionId: number): Promise<void>;
-    revokeAllForUser(tx: Tx, userId: number): Promise<void>;
-    // Revokes every live dev-auth session (`grayboard login --dev`); returns how many.
-    revokeDev(tx: Tx): Promise<number>;
-    touch(tx: Tx, sessionId: number, now: number): Promise<void>;
-  };
-  // Policy's reads on the caller's handle (#807 P3 A7e3), as are the teams reads below and users.findByEmail.
-  principals: {
-    findByName(r: Read, name: string): Promise<PrincipalRow | undefined>;
-    // Who an address acts for (#284 S12): an ID's registering user, an alias's scope owner, a team broadcast's team.
-    of(r: Read, address: string): Promise<Principal | null>;
-  };
+  users: UsersStore;
+  sessions: SessionsStore;
+  principals: PrincipalsStore;
   // Policy's reads (and resolveMention's alias reads), synchronously on the SQLite connection (#807 P3 A7e1): the
   // loader authorizeNow drives, and the core Access seam's, until #807 B makes them async. Inside the caller's own
   // transaction they read its writes. principalOf is principals.of. SQLite only: a Postgres Repo won't have it.
@@ -512,63 +457,9 @@ export interface Repo {
     // open count (requests since `since` it hasn't taken, #252). A fact not read throws when asked.
     facts(r: Read, q: { to?: string; since: number }): Promise<ReadDelegationFacts>;
   };
-  // The writes return promises (#807 P3 A6g), and so do the reads, on the caller's handle (A7e3).
-  teams: {
-    // Inserts the team's principal in the same transaction; rejects with
-    // PrincipalTaken if another principal has the name.
-    create(tx: Tx, name: string, createdBy: number): Promise<Team>;
-    findByName(r: Read, name: string): Promise<Team | undefined>;
-    listForUser(r: Read, userId: number): Promise<Team[]>;
-    // Adds a member; an existing member is left as is (false). Ownership is a role binding (#927): roles.grant.
-    addMember(tx: Tx, teamId: number, userId: number): Promise<boolean>;
-    // Removes a member, revoking their team_owner binding first through the roles revoke (its role.revoked row,
-    // `actor` its actor and `audit` beside the binding in its detail), which rejects with LastOwner rather than
-    // leave a team with members and no owner (security audit F-02). The revoked binding, or null.
-    removeMember(tx: Tx, teamId: number, userId: number, actor?: string | null, audit?: Record<string, unknown>): Promise<RoleBinding | null>;
-    // The roster, each member's role read from the team's team_owner bindings.
-    listMembers(r: Read, teamId: number): Promise<TeamMember[]>;
-    listMemberUserIds(r: Read, teamId: number): Promise<number[]>;
-    isMember(r: Read, teamId: number, userId: number): Promise<boolean>;
-    // The previous policy, or null when the team is gone.
-    setPolicy(tx: Tx, teamId: number, policy: TeamPolicy): Promise<TeamPolicy | null>;
-    // Whether two users share a team whose policy is 'collaborative' or
-    // 'delegating': the grant under which one's agents may wake the other's (#806).
-    shareCollaborative(r: Read, userA: number, userB: number): Promise<boolean>;
-    // Whether two users share a team whose policy is 'delegating': the grant
-    // under which one's session may delegate to the other's launcher (#256).
-    shareDelegating(r: Read, userA: number, userB: number): Promise<boolean>;
-    // Whether two users share any team: the human-reach rule's teammates, in one statement (A7e3).
-    shareAny(r: Read, userA: number, userB: number): Promise<boolean>;
-  };
-  // Runtime role bindings (#927). Grant and revoke name the binding by its principals' names, resolved inside their
-  // statements; each writes its role.granted or role.revoked row in the caller's transaction.
-  roles: {
-    // One INSERT ... SELECT: the binding inserted, or null when nothing was (already held, or a precondition failed:
-    // a name with no principal, a kind the role doesn't take, a team_owner holder who isn't a member, the granter's
-    // authority gone). The caller's follow-up reads say which.
-    grant(tx: Tx, g: RoleGrant): Promise<RoleBinding | null>;
-    // One DELETE ... RETURNING: the binding deleted, or null when there was none or the granter's authority is gone.
-    // Rejects with LastOwner rather than leave a team with members and no owner.
-    revoke(tx: Tx, r: RoleRevoke): Promise<RoleBinding | null>;
-    // The binding a principal holds, by names.
-    find(r: Read, holder: string, role: string, scope: string | null): Promise<RoleBinding | undefined>;
-    // A user's binding id for a role on the org (teamId null) or a team: a decision's one indexed lookup.
-    bindingOf(r: Read, userId: number, role: string, teamId: number | null): Promise<number | undefined>;
-    // Bindings with ids above `after`, in id order, at most `limit`, filtered by role, holder name and scope name.
-    list(r: Read, filter: RoleFilter, after: number, limit: number): Promise<RoleBinding[]>;
-  };
-  // Service principals (#270 D1): a users row whose email column holds the service's name, and a principals row of
-  // kind 'service' on it. Lifecycle is the admin routes' (`/api/admin/services`); nothing deletes one.
-  services: {
-    // Both rows, in one statement each and no prior read: the UNIQUE names decide, so a name a user, team or
-    // service already holds throws PrincipalTaken. Owners are the caller's grants, in the same transaction.
-    create(tx: Tx, name: string): Promise<User>;
-    // Services with principal ids above `after`, in id order, at most `limit`, each with its owners' names.
-    list(r: Read, after: number, limit: number): Promise<ServiceRow[]>;
-    // The services this user owns whose every owner is now disabled: what disabling them left without an
-    // accountable owner (#930 replaces them).
-    orphanedBy(r: Read, userId: number): Promise<string[]>;
-  };
+  teams: TeamsStore;
+  roles: RolesStore;
+  services: ServicesStore;
   // Every read and write returns a promise (#807 P3 A6d2, A7i).
   messages: {
     // files: unbound uploads (ids) of their uploader (the sending session's
@@ -1162,37 +1053,6 @@ function seedSchema(db: Database, first: boolean, firstRoles: boolean): void {
   `);
 }
 
-// A team member's role as the roster shows it (security audit F-02): an owner holds a team_owner binding on the
-// team (#927); every other member is a member. Owners (and org admins) manage membership; members read.
-export type TeamRole = "owner" | "member";
-export type TeamMember = { user_id: number; email: string; role: TeamRole };
-
-// A role binding (#927) with its principals' names: holder, scope (null for the org) and granter (null when seeded).
-export type RoleBinding = {
-  id: number; principal_id: number; principal: string; role: string;
-  scope_id: number | null; scope: string | null; granted_by: number | null; granter: string | null; granted_at: number;
-};
-// Whose authority a grant or revoke re-checks in its own write (#927): none (a bootstrap admin, whose env list
-// doesn't change at runtime, a team's creator, a member's own removal), the granter's org_admin binding, or their
-// team_owner binding on the binding's scope or an org_admin binding.
-export type RoleAuthority = "none" | "org_admin" | "owner_or_admin";
-export type RoleGrant = {
-  holder: string; role: string; scope: string | null;
-  // The role table's facts (policy.ts ROLES): the holder kinds allowed, the scope's kind (null: the org).
-  holderKinds: readonly Principal["kind"][]; scopeKind: Principal["kind"] | null;
-  // Whether the holder must be a member of the scope's team (team_owner).
-  member: boolean;
-  // The granter's principal name, recorded as granted_by; their user id, whose bindings `authority` checks (the
-  // same key as roles.ts's follow-up read, so the two can't disagree on who the granter is).
-  by: string; byUser: number | null; authority: RoleAuthority;
-  // The audit row's actor, and fields its detail carries beside the binding (as_admin).
-  actor: string; audit?: Record<string, unknown>;
-};
-// byUser: the revoking user's id, whose bindings `authority` checks (null with authority "none").
-export type RoleRevoke = { holder: string; role: string; scope: string | null; byUser: number | null; authority: RoleAuthority; actor: string | null; audit?: Record<string, unknown> };
-export type RoleFilter = { role?: string; principal?: string; scope?: string };
-// A service principal as the admin list shows it (#270 D1): id is its principals row's.
-export type ServiceRow = { id: number; name: string; created_at: number; disabled_at: number | null; owners: string[] };
 
 // Moved to store/errors.ts for the Postgres store; re-exported for http.ts and the tests.
 export { LastOwner, PrincipalTaken } from "./store/errors.ts";
@@ -1455,8 +1315,10 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
     c.query<User, [string]>(`${USER_SQL} WHERE u.email = ?`).get(email) ?? undefined;
   const teamByName = (c: Database, name: string): Team | undefined =>
     c.query<Team, [string]>("SELECT * FROM teams WHERE name = ?").get(name) ?? undefined;
+  // The three team list reads return in id order, on every backend (#807 P3 C3 decision 4): SQLite's indexes gave it
+  // anyway, a Postgres plan promises nothing.
   const teamsOf = (c: Database, userId: number): Team[] =>
-    c.query<Team, [number]>(`SELECT t.* FROM teams t JOIN team_members tm ON tm.team_id = t.id WHERE tm.user_id = ?`).all(userId);
+    c.query<Team, [number]>(`SELECT t.* FROM teams t JOIN team_members tm ON tm.team_id = t.id WHERE tm.user_id = ? ORDER BY t.id`).all(userId);
   const isMember = (c: Database, teamId: number, userId: number): boolean =>
     !!c.query<{ x: number }, [number, number]>("SELECT 1 AS x FROM team_members WHERE team_id = ? AND user_id = ?").get(teamId, userId);
   const teamMembers = (c: Database, teamId: number): TeamMember[] =>
@@ -1465,7 +1327,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
          SELECT 1 FROM role_bindings b JOIN principals pu ON pu.id = b.principal_id JOIN principals pt ON pt.id = b.scope_id
           WHERE b.role = 'team_owner' AND pu.kind = 'user' AND pu.user_id = u.id AND pt.kind = 'team' AND pt.team_id = tm.team_id
        ) AS owner FROM users u
-       JOIN team_members tm ON tm.user_id = u.id WHERE tm.team_id = ?`,
+       JOIN team_members tm ON tm.user_id = u.id WHERE tm.team_id = ? ORDER BY tm.user_id`,
     ).all(teamId).map(({ owner, ...m }) => ({ ...m, role: owner ? "owner" : "member" }));
   const shareCollaborative = (c: Database, userA: number, userB: number) => sharePolicy(c, userA, userB, ["collaborative", "delegating"]);
   const shareDelegating = (c: Database, userA: number, userB: number) => sharePolicy(c, userA, userB, ["delegating"]);
@@ -1878,7 +1740,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       async listMembers(r, teamId) { return teamMembers(sqliteOf(r), teamId); },
       async listMemberUserIds(r, teamId) {
         return sqliteOf(r).query<{ user_id: number }, [number]>(
-          "SELECT user_id FROM team_members WHERE team_id = ?",
+          "SELECT user_id FROM team_members WHERE team_id = ? ORDER BY user_id",
         ).all(teamId).map(row => row.user_id);
       },
       async isMember(r, teamId, userId) { return isMember(sqliteOf(r), teamId, userId); },
