@@ -1,6 +1,6 @@
 // The server's board tools (#807 P3 B5b1b): the store's rows on the caller's Tx, judged by the async BoardAccess on
 // that same Tx, then core's own rule over them (src/core/tools.ts, boards.ts, bindings.ts), so local and the server
-// share each rule and refusal text and only the reads differ. A tool not yet ported runs core over coreOn(tx).
+// share each rule and refusal text and only the reads differ.
 import { actorChoice } from "../core/bindings.ts";
 import {
   archiveGate, archiveRefusalText, archiveRepeat, assembleWho, boardExistsText, boardsFromViews, checkSubMode, createArgs, createdNote, createRepeats,
@@ -11,11 +11,12 @@ import { claimView, type ClaimView } from "../core/claims.ts";
 import { CoreError } from "../core/errors.ts";
 import type { Principal } from "../core/resolver.ts";
 import {
-  callBoardTool as coreCallBoardTool, muteText, optBool, optNum, optStr, peerStatusArgs, str, subscribeArgs, subscribedText,
+  muteText, optBool, optNum, optStr, peerStatusArgs, str, subscribeArgs, subscribedText,
   type ToolContext, type ToolOutcome,
 } from "../core/tools.ts";
 import { scopeKey, type AliasScopeOf, type BoardAccess } from "./access.ts";
 import { seenAmong } from "./board_post.ts";
+import { callClaimTool } from "./claims.ts";
 import { readableBoard, visibleBoards } from "./board_reads.ts";
 import type { Repo } from "./db.ts";
 import type { Read, Tx } from "./store/tx.ts";
@@ -150,6 +151,11 @@ export async function callBoardTool(
       return { result: "ok", wake: [] };
     }
 
+    case "claim_take":
+    case "claim_release":
+    case "claim_watch":
+      return callClaimTool(repo, access, tx, actor, tool, a, ctx);
+
     case "peer_list": {
       if (!ctx.online) throw new CoreError("peer_list isn't available in this mode");
       const board = optStr(a, "board");
@@ -157,8 +163,8 @@ export async function callBoardTool(
       return { result, wake: [] };
     }
   }
-  const { principal: _, ...coreCtx } = ctx;
-  return coreCallBoardTool(repo.coreOn(tx), actor, tool, a, coreCtx);
+  // board_post is the caller's (application handleBoardPost, serverPost); nothing else falls to core.
+  throw new CoreError(`unknown tool: ${tool}`);
 }
 
 // core's listClaims for a reader: live claims by key, each board named only when `viewer` sees it, each holder and note

@@ -9,6 +9,7 @@ import { createTouchQueue, hashToken, verifySessionToken } from "./auth.ts";
 import { queueFor } from "./store/queue.ts";
 import { TestServer } from "../../tests/support/server.ts";
 import { handleHttp } from "./http.ts";
+import { boardAccess } from "./access.ts";
 import type { Config } from "./config.ts";
 import { DEFAULT_AUTH_FAIL_LIMIT, DEFAULT_HELLO_LIMIT } from "./rate_limit.ts";
 import { DEFAULT_TRUSTED_PROXIES } from "./client_addr.ts";
@@ -85,7 +86,7 @@ for (const [route, action] of [["revoke-session", "auth.session_revoked"], ["dis
     const hooks = { disconnectUser: (id: number) => { disconnected.push(id); }, accessChanged: async () => {} };
     const call = (path: string, body: unknown, token?: string) => handleHttp(
       new Request(`http://localhost${path}`, { method: "POST", body: JSON.stringify(body), headers: token ? { Authorization: `Bearer ${token}` } : {} }),
-      repo, config, touches, () => {}, undefined, hooks, "127.0.0.1");
+      repo, boardAccess(repo, "team"), config, touches, () => {}, undefined, hooks, "127.0.0.1");
     const login = async (email: string) => (await (await call("/api/auth/dev-login", { email })).json() as { session_token: string }).session_token;
     const root = await login("root@example.com");
     const bobToken = await login("bob@example.com");
@@ -103,7 +104,7 @@ for (const [route, action] of [["revoke-session", "auth.session_revoked"], ["dis
     expect(await repo.audit.last(repo.read, action, "bob@example.com")).toBeUndefined();
     expect(bob.disabled_at).toBeNull();
     expect((await handleHttp(new Request("http://localhost/api/whoami", { headers: { Authorization: `Bearer ${bobToken}` } }),
-      repo, config, touches, () => {}, undefined, hooks, "127.0.0.1")).status).toBe(200);
+      repo, boardAccess(repo, "team"), config, touches, () => {}, undefined, hooks, "127.0.0.1")).status).toBe(200);
     const ok = await call(`/api/admin/${route}`, { email: "bob@example.com" }, root);
     expect(ok.status).toBe(200);
     expect(disconnected).toEqual([bob.id]);

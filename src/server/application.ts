@@ -1391,6 +1391,8 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
       try { return await handleCall(hub, tx, session, tool, args, publish); }
       finally { tx.afterCommit(() => expiry.arm()); }
     },
+    // The server's one BoardAccess: HTTP's claim calls judge boards with it, as the hub's tools do (#807 P3 B5b3c).
+    access: hub.access,
     // Trusted committed domain operations, not client-supplied invalidations; called after their commit, so effects run now.
     boardsChanged: (boards: string[]) => boardsChanged(onCommit(repo.read), boards),
     wake(handles: string[]) {
