@@ -233,6 +233,24 @@ describe("acceptance 4: team_owner on that team only", () => {
   });
 });
 
+describe("holder kinds", () => {
+  // The grant's WHERE admits only the role table's holder kinds: a team never holds org_admin or team_owner, and
+  // nothing holds service_invoke until #270 names its holders (an empty list, so the clause alone refuses it).
+  test("org_admin or team_owner to a team, and service_invoke to anyone, is refused 400 with nothing written", async () => {
+    const [root, alice] = [await srv.login(ROOT), await srv.login(A)];
+    expect((await api(alice, "POST", "/api/teams", { name: "eng" })).status).toBe(201);
+    await seed(srv.app.repo, () => srv.app.db.run("INSERT INTO principals (kind, name, created_at) VALUES ('service', 'ingest', 0)"));
+    const before = bindings();
+    expect(await grant(root, "org_admin", "eng")).toMatchObject({ status: 400, body: { message: expect.stringContaining('"eng" is a team') } });
+    expect(await grant(root, "team_owner", "eng", "eng")).toMatchObject({ status: 400, body: { message: expect.stringContaining('"eng" is a team') } });
+    expect(await grant(root, "service_invoke", A, "ingest")).toMatchObject({ status: 400, body: { message: expect.stringContaining("no principal may hold service_invoke yet") } });
+    expect(await grant(root, "service_invoke", "eng", "ingest")).toMatchObject({ status: 400 });
+    expect(bindings()).toEqual(before);
+    // Only the creator's ownership was granted.
+    expect(accessAudits(srv.app.db, "role.granted")).toHaveLength(1);
+  });
+});
+
 describe("service_invoke", () => {
   test("a grant is refused 404 while no service principal exists", async () => {
     const [root] = [await srv.login(ROOT), await srv.login(A)];
@@ -252,6 +270,19 @@ describe("stale authority", () => {
     expect(res).toMatchObject({ status: 403, body: { message: expect.stringContaining("no longer holds") } });
     expect(bindings()).toEqual([]);
     expect(accessAudits(srv.app.db, "role.granted")).toHaveLength(1);
+  });
+
+  test("an org admin revoked between the gate and the revoke's write is refused, and the binding stays", async () => {
+    const [root, alice] = [await srv.login(ROOT), await srv.login(A), await srv.login(B)];
+    expect((await grant(root, "org_admin", A)).status).toBe(201);
+    expect((await grant(root, "org_admin", B)).status).toBe(201);
+    const res = await hostedPause("http:admin-role-revoke:before-write",
+      () => revoke(alice, "org_admin", B),
+      // Through the store: the route's own revoke would stop at the same pause point.
+      async () => { await seed(srv.app.repo, tx => srv.app.repo.roles.revoke(tx, { holder: A, role: "org_admin", scope: null, byUser: null, authority: "none", actor: ROOT })); });
+    expect(res).toMatchObject({ status: 403, body: { message: expect.stringContaining("no longer holds") } });
+    expect(bindings().map(b => b.principal_id)).toEqual([principalId(B)]);
+    expect(accessAudits(srv.app.db, "role.revoked").map(r => r.target)).toEqual([A]);
   });
 
   // `team add` decides inside its write transaction, so on SQLite nothing lands between the decision and the write;
