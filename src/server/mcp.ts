@@ -59,10 +59,11 @@ type Binding = { user: number; email: string; grant: string; role: HostedRole; i
 // (#476): its admission is released, its sid stays, and the binding's next
 // authenticated request re-admits it. `dormant` holds the separate dormant bound.
 // `controls`: the tail of this protocol session's subscribe/unsubscribe chain; each runs after the previous settles (#431).
-type Legacy = { ref: string; meta?: unknown; server: McpServer; transport: WebStandardStreamableHTTPServerTransport; binding: Binding; principal: OAuthPrincipal; release(): void; subscriptions: Map<string, string | null>; stream?: Live; posts: number; lastUsed: number; stopped: boolean; controls: Promise<unknown>; dormant?: { since: number; release(): void } };
+type Legacy = { ref: string; meta?: unknown; server: McpServer; transport: WebStandardStreamableHTTPServerTransport; binding: Binding; principal: OAuthPrincipal; release(): void; subscriptions: Map<string, string | null>; stream?: Live; posts: number; lastUsed: number; stopped: boolean; controls: Promise<unknown>; pruning?: Promise<void>; dormant?: { since: number; release(): void } };
 // `seq`: the hosted notice number when the read began; a notice since naming one of its rows makes it stale (#807 P3
-// A7h2, `moved`).
-type Checked = { row: HostedSession | undefined; root?: HostedSession; seq: number };
+// A7h2, `moved`). `boards`: of the boards authorize was asked about, which the session may receive, read with it
+// (#807 P3 B5a2); a sync judge reads them with no await since, and a board it wasn't asked about is refused.
+type Checked = { row: HostedSession | undefined; root?: HostedSession; seq: number; boards?: Map<string, boolean> };
 type Bound = { row: HostedSession | undefined; root?: HostedSession };
 // `bound`: the binding's row and root as the last read or commit notice left them, which a notice judges (#807 P3
 // A7h2). `rechecking`: the context a re-read of them is in flight for.
@@ -185,14 +186,39 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
   // The grant and user checks share one auth-generation read (#902). `withRow: false` (a native tool, whose hosted
   // gate reads and settles the row itself) skips the row.
   // `root`: the row's root as read, when no settle wrote since (#899).
-  async function authorize(context: Context, signal?: AbortSignal, withRow?: true): Promise<Checked>;
+  // `uris`: the resources the caller will judge with the result; a native session's board visibility for them is
+  // read first, before the row, so the row's synchronous reuse window stays the last (#807 P3 B5a2).
+  async function authorize(context: Context, signal?: AbortSignal, withRow?: true, uris?: Iterable<string>): Promise<Checked>;
   async function authorize(context: Context, signal: AbortSignal | undefined, withRow: false): Promise<void>;
-  async function authorize(context: Context, signal?: AbortSignal, withRow = true): Promise<Checked | void> {
+  async function authorize(context: Context, signal?: AbortSignal, withRow = true, uris: Iterable<string> = []): Promise<Checked | void> {
     await authCheck(context, signal);
     if (!withRow) return;
+    const boards = await boardFacts(context, uris);
+    if (cancelled(context, signal)) throw new ApplicationError("unauthenticated", "request cancelled");
     const checked = await rowCheck(context);
     if (cancelled(context, signal)) throw new ApplicationError("unauthenticated", "request cancelled");
-    return checked;
+    return { ...checked, boards };
+  }
+  // A native session's boards among `uris` (a uri that names none is refused by `capability` itself).
+  function boardsOf(context: Context, uris: Iterable<string>): string[] {
+    if (context.role !== "native") return [];
+    const out: string[] = [];
+    for (const uri of uris) { try { out.push(parseBoardResourceUri(uri)); } catch { /* capability refuses it */ } }
+    return out;
+  }
+  // Their visibility for the session's addresses as they stand at the call; `capability` checks the session itself.
+  async function boardFacts(context: Context, uris: Iterable<string>): Promise<Map<string, boolean>> {
+    const boards = boardsOf(context, uris);
+    return boards.length ? application.boardsVisibleTo(application.repo.read, [...context.session.addresses], boards) : new Map();
+  }
+  // authorize for a set of uris read after its awaits (a live's, a legacy session's registrations), which a control
+  // may grow meanwhile: read again while a board the set names went unread, up to three times; past that the
+  // unread board is refused, as `capability` refuses one it wasn't asked about.
+  async function authorizeFor(context: Context, uris: () => Iterable<string>, signal?: AbortSignal): Promise<Checked> {
+    for (let attempt = 1; ; attempt++) {
+      const checked = await authorize(context, signal, true, uris());
+      if (attempt >= 3 || boardsOf(context, uris()).every(b => checked.boards!.has(b))) return checked;
+    }
   }
   // authorize's hosted-row part, also a live's recheck (#807 P3 A7h2). The row and root are two pool reads: a commit
   // between them leaves a mixed pair, which `bindingLive` refuses unless the root still names the row's ownership,
@@ -421,7 +447,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     return capability(context, uri, checked);
   }
   // watchable's check of the resource itself, past the binding: a subscriber's lease (in memory, against
-  // `checked.row`), a native session's board access.
+  // `checked.row`), a native session's board access (`checked.boards`, read with the row).
   function capability(context: Context, uri: string, checked: Checked): string | null {
     if (context.role === "subscriber") {
       const cap = context.request.headers.get("X-Grayboard-Lease");
@@ -432,13 +458,14 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
       return cap;
     }
     const board = parseBoardResourceUri(uri);
-    if (!application.canReceiveBoard(application.repo.read, context.session, board)) throw new ApplicationError("not_found", "resource not found");
+    application.revalidateNow(context.session);
+    if (checked.boards?.get(board) !== true) throw new ApplicationError("not_found", "resource not found");
     return null;
   }
   // One authorize for the live's every uri: watchable and describe reuse its row (#853). The uris are read after
   // the awaits, as they stand then (#807 P3 A7d).
   async function valid(live: Live): Promise<Checked> {
-    const checked = validChecked(live, await authorize(live.context));
+    const checked = validChecked(live, await authorizeFor(live.context, () => live.uris.keys()));
     adopt(live, checked);
     return checked;
   }
@@ -448,17 +475,20 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
   }
   // valid for a live whose stamp is fresh (#899), from the auth cache (phase A): every check but the binding's row,
   // root and holds reads, which nothing could have changed; the lease is checked against the stamped row, unchanged
-  // since. Undefined on an auth cache miss, which phase B checks in full.
-  function validStamped(live: Live, s: Stamp, peek: AuthPeek): true | undefined {
+  // since. Undefined on an auth cache miss, which phase B checks in full. "boards": a native live, whose board
+  // visibility no stamp covers (membership writes move no generation and send no notice), so phase B reads it alone
+  // (`checkBoards`, #807 P3 B5a2), as the sync read here did each tick.
+  function validStamped(live: Live, s: Stamp, peek: AuthPeek): true | "boards" | undefined {
     if (!authPeekCheck(live.context, peek)) return undefined;
+    if (live.context.role === "native" && live.uris.size) return "boards";
     for (const [uri, cap] of live.uris) if (capability(live.context, uri, { row: s.row, seq: s.seq }) !== cap) throw new ApplicationError("not_found", "resource not found");
     return true;
   }
-  function addWatch(live: Live, uri: string) {
+  function addWatch(live: Live, uri: string, checked: Checked) {
     // Every caller has just authorized live.context, with no read since (makeLive's callers, the legacy control).
     if (live.context.role === "native") live.watches.push(resources.watch(live.context.session, uri, {
       changed: () => live.hint(uri), closed: () => live.stop(),
-    }, true));
+    }, checked.boards?.get(parseBoardResourceUri(uri)) === true));
   }
   // A legacy GET with no watched resource carries nothing a binding governs, so it stays
   // open (idle) across bind changes until a resource subscription attaches it (#431).
@@ -509,14 +539,19 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
         lives.delete(live);
         unindex(live);
         const context = live.context;
-        if (legacy && context.role === "native") {
-          // A lost board must not poison every later GET on this protocol session.
-          // Access rotation alone preserves registrations that remain visible.
-          for (const uri of live.uris.keys()) {
-            try {
-              if (!application.canReceiveBoard(application.repo.read, context.session, parseBoardResourceUri(uri))) legacy.subscriptions.delete(uri);
-            } catch (e) { hostedFailure("mcp.stream", e); }
-          }
+        if (legacy && context.role === "native" && live.uris.size) {
+          // A lost board must not poison every later GET on this protocol session: its registration goes. Access
+          // rotation alone preserves registrations that remain visible. The read awaits (#807 P3 B5a2), for the
+          // addresses as they stand now; the next GET waits for it (`pruning`). A failed read prunes nothing.
+          const addresses = [...context.session.addresses], uris = [...live.uris.keys()];
+          const prune = (async () => {
+            const seen = await application.boardsVisibleTo(application.repo.read, addresses, uris.flatMap(uri => { try { return [parseBoardResourceUri(uri)]; } catch { return []; } }));
+            await testPauseAsync("mcp:legacy:pruned");
+            for (const uri of uris) { try { if (seen.get(parseBoardResourceUri(uri)) === false) legacy.subscriptions.delete(uri); } catch { /* not a board */ } }
+          })().catch(e => hostedFailure("mcp.stream", e));
+          const pruning: Promise<void> = Promise.all([legacy.pruning, prune]).then(() => {});
+          legacy.pruning = pruning;
+          track(pruning.finally(() => { if (legacy.pruning === pruning) legacy.pruning = undefined; }));
         }
         if (legacy?.stream === live) legacy.stream = undefined;
         // The SDK closes the source first; application.close releases its observer set.
@@ -529,7 +564,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     lives.add(live);
     indexInbox(live); indexRows(live);
     adopt(live, checked);
-    try { for (const uri of uris.keys()) addWatch(live, uri); }
+    try { for (const uri of uris.keys()) addWatch(live, uri, checked); }
     catch (error) { live.stop(); throw error; }
     return live;
   }
@@ -574,7 +609,10 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
       const control = async (uri: string, ctx: ServerContext, subscribe: boolean) => {
         const context = current(ctx);
         try {
-          const checked = await authorize(context, ctx.mcpReq.signal);
+          // A stopped stream's prune (stop) judged its boards before this request: it settles first, so it can't
+          // delete a registration this request makes after a board came back.
+          if (subscribe && legacy.pruning) await legacy.pruning;
+          const checked = await authorize(context, ctx.mcpReq.signal, true, [uri]);
           if (subscribe) {
             if (!legacy.subscriptions.has(uri) && legacy.subscriptions.size >= caps.watches.perSession) { countRefusal("resource_watch"); throw new ApplicationError("bad_request", "resource watch capacity reached"); }
             const cap = watchable(context, uri, checked);
@@ -594,27 +632,33 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
                 streamClosed(idleStream.context, error);
                 idleStream.stop();
               }
-              await authorize(context, ctx.mcpReq.signal);
             }
-            const stream = legacy.stream;
+            const stream = legacy.stream, streamContext = stream?.context;
+            // The checks this registration is judged by, both in one last await (#807 P3 A7d, B5a2): this POST's
+            // context again (an attach may have awaited since the first), and the stream's, whose answer decides
+            // whether this uri joins it. Each is judged below with no await since.
+            const expected = (error: unknown) => error instanceof ApplicationError && (error.code === "unauthenticated" || error.code === "not_found");
+            const [final, streamChecked] = await Promise.all([
+              authorize(context, ctx.mcpReq.signal, true, [uri]),
+              streamContext ? authorize(streamContext, undefined, true, [uri]).catch(error => { if (expected(error)) return undefined; throw error; }) : undefined,
+            ]);
+            // A session retired or parked meanwhile takes no registration, and the capability is checked again, since
+            // an inbox lease may have closed, or the board been lost, while the checks awaited.
+            if (legacy.stopped || legacy.dormant) throw new ApplicationError("unauthenticated", "MCP session is closed");
+            if (watchable(context, uri, final) !== cap) throw new ApplicationError("not_found", "resource not found");
             let compatible = false;
-            if (stream) {
+            if (stream && streamChecked && stream.context === streamContext) {
               try {
-                const streamChecked = await authorize(stream.context);
-                compatible = watchable(stream.context, uri, streamChecked) === cap && (!stream.uris.has(uri) || stream.uris.get(uri) === cap);
+                compatible = watchable(streamContext, uri, streamChecked) === cap && (!stream.uris.has(uri) || stream.uris.get(uri) === cap);
               } catch (error) {
-                if (!(error instanceof ApplicationError) || error.code !== "unauthenticated" && error.code !== "not_found") throw error;
+                if (!expected(error)) throw error;
               }
             }
-            // Past the last await (#807 P3 A7d): a session retired or parked meanwhile takes no registration, and the
-            // capability is checked again, since an inbox lease may have closed while the checks awaited.
-            if (legacy.stopped || legacy.dormant) throw new ApplicationError("unauthenticated", "MCP session is closed");
-            if (watchable(context, uri, checked) !== cap) throw new ApplicationError("not_found", "resource not found");
             // A stream stopped or replaced while the check awaited is left alone: nothing to join or stop.
             if (!stream || legacy.stream !== stream || stream.stopped) {}
             else if (compatible) {
               // Publish registration only after observer installation succeeds.
-              if (!stream.uris.has(uri)) { addWatch(stream, uri); stream.uris.set(uri, cap); indexInbox(stream); }
+              if (!stream.uris.has(uri)) { addWatch(stream, uri, streamChecked!); stream.uris.set(uri, cap); indexInbox(stream); }
             } else {
               // The current POST owns registration; an incompatible GET must recover
               // with fresh credentials rather than inherit this request's snapshot.
@@ -745,7 +789,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
   const unexpected = (e: unknown) => { if (!(e instanceof ApplicationError && e.code === "unauthenticated")) hostedFailure("mcp.stream", e); };
   // A full check under one generation read, which its stamp keeps: a commit after the read moves the generation and
   // stales the stamp. The notice number is read before it, so a notice during the check stales it too.
-  async function fullCheck(context: Context, rest: (checked: Checked) => Checked): Promise<{ gen: string | undefined; start: number; checked: Checked }> {
+  async function fullCheck(context: Context, rest: (checked: Checked) => Checked, uris: () => Iterable<string> = () => []): Promise<{ gen: string | undefined; start: number; checked: Checked }> {
     const start = seq;
     checking.set(context, start);
     try {
@@ -755,14 +799,14 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
       return await application.repo.authRead(async () => {
         const gen = application.repo.authGeneration();
         await testPauseAsync("mcp:stream:check");
-        return { gen, start, checked: rest(await authorize(context)) };
+        return { gen, start, checked: rest(await authorizeFor(context, uris)) };
       });
     } finally { checking.delete(context); }
   }
   // `context`: the live's as the tick queued it; an attach that re-selected it since leaves the answer unused.
   async function checkLive(live: Live, context: Context, t: number) {
     try {
-      const { gen, start, checked } = await fullCheck(context, checked => validChecked(live, checked));
+      const { gen, start, checked } = await fullCheck(context, checked => validChecked(live, checked), () => live.uris.keys());
       // Stopped, or re-selected by an attach, while the check awaited: its answer is about a context the live no
       // longer has.
       if (closed || live.stopped || live.context !== context) return;
@@ -772,6 +816,24 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
       if (closed || live.stopped || live.context !== context) return;
       stamps.delete(context); unexpected(e); streamClosed(context, e); live.stop();
     }
+  }
+  // Phase B's board check for a native live phase A passed (`validStamped`'s "boards"): its uris' visibility read
+  // now, judged with no await since, as `capability` judges a full check's (#807 P3 B5a2). Each uri whose board was read
+  // is judged; one a control added while the read awaited waits for the next tick. A lost board stops the live.
+  async function checkBoards(live: Live, context: Context) {
+    checking.set(context, seq);
+    try {
+      const boards = await boardFacts(context, live.uris.keys());
+      await testPauseAsync("mcp:board:checked");
+      if (closed || live.stopped || live.context !== context) return;
+      for (const [uri, cap] of live.uris) {
+        if (!boardsOf(context, [uri]).every(b => boards.has(b))) continue;
+        if (capability(context, uri, { row: live.bound.row, seq, boards }) !== cap) throw new ApplicationError("not_found", "resource not found");
+      }
+    } catch (e) {
+      if (closed || live.stopped || live.context !== context) return;
+      stamps.delete(context); unexpected(e); streamClosed(context, e); live.stop();
+    } finally { checking.delete(context); }
   }
   async function checkStream(stream: OwnedStream, context: Context, t: number) {
     const current = () => !closed && streamContexts.get(stream) === context;
@@ -824,7 +886,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     // A live's stream is in streamContexts too (wrap adds both): valid() just authorized its context (#853).
     // Phase A, synchronous, from the auth cache (#899, #807 P3 A7d): a fresh stamp's checks, which read no hosted row
     // and write nothing. A stale stamp or an auth cache miss waits for phase B's full check, whose settle may commit.
-    const owned = new Set<Context>(), full: [Live, Context][] = [], fullStreams: [OwnedStream, Context][] = [];
+    const owned = new Set<Context>(), full: [Live, Context][] = [], boardsDue: [Live, Context][] = [], fullStreams: [OwnedStream, Context][] = [];
     const t = now();
     let peek: AuthPeek | undefined;
     // A failed generation read leaves every context to phase B, whose own checks close the ones that fail.
@@ -834,7 +896,11 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
       owned.add(live.context);
       if (checking.has(live.context)) continue;
       const s = peek && fresh(live.context, peek.generation, t);
-      try { if (s && validStamped(live, s, peek!)) continue; }
+      try {
+        const v = s && validStamped(live, s, peek!);
+        if (v === true) continue;
+        if (v === "boards") { boardsDue.push([live, live.context]); checking.set(live.context, seq); continue; }
+      }
       catch (e) { unexpected(e); streamClosed(live.context, e); live.stop(); continue; }
       full.push([live, live.context]); checking.set(live.context, seq);
     }
@@ -850,6 +916,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     // drives the timer by hand, to which it's returned.
     const phaseB = Promise.all([
       bounded(full, ([live, context]) => checkLive(live, context, t)),
+      bounded(boardsDue, ([live, context]) => checkBoards(live, context)),
       bounded(fullStreams, ([stream, context]) => checkStream(stream, context, t)),
       bounded(legacies, sweepLegacy),
     ]).then(() => {}, e => hostedFailure("mcp.stream", e));
@@ -959,7 +1026,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
                 const context = exchange.context = await select(req);
                 const uris = listen.data.params.notifications.resourceSubscriptions ?? [];
                 if (uris.length > caps.watches.perSession) { countRefusal("resource_watch"); throw new ApplicationError("bad_request", "resource watch capacity reached"); }
-                const checked = await authorize(context);
+                const checked = await authorize(context, undefined, true, uris);
                 const authorized = new Map(uris.map(uri => [uri, watchable(context, uri, checked)]));
                 ownHandler = createMcpHandler(modernFactory, { legacy: "reject", keepAliveMs: 5000, bus: isolatedBus(), onerror: error => report(error) });
                 live = makeLive(context, checked, authorized, ownHandler);
@@ -1018,7 +1085,11 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
               legacy.lastUsed = now();
               if (req.method === "GET") {
                 if (legacy.stream) { context.finish(); releasePost(); return new Response("MCP GET already active", { status: 409 }); }
-                const checked = await authorize(context);
+                // A stopped stream's prune of its lost boards first, so a lost board's registration doesn't refuse
+                // this GET (#807 P3 B5a2).
+                await legacy.pruning;
+                const registered = legacy;
+                const checked = await authorizeFor(context, () => registered.subscriptions.keys());
                 await testPauseAsync("mcp:legacy:get-checked");
                 // Another GET took the stream, or the timer retired or parked the session, while the check awaited (#807 P3 A7d).
                 if (legacy.stopped || legacy.dormant) { context.finish(); releasePost(); return new Response("unknown MCP session", { status: 404 }); }
