@@ -182,7 +182,8 @@ export function queuedTx(repo: Repo): WriteTx {
 // or after the bodies ahead of it. Inside an open transaction it refuses (#807 P3 A3): a write that belongs to a body
 // goes on that body's Tx. fn may be async, except from the holder: the holder resumes while fn awaits, so a thenable
 // there rolls fn back and throws. True when it ran now (its error, and committed's, thrown), false when it waits or
-// awaits; a failure then is logged as `what` failed.
+// awaits; a failure then is logged as `what` failed. The Postgres store's post (store/pg/tx.ts) is always false: every
+// commit there is async, and a holder's post queues behind the bodies already waiting.
 function posted<T>(db: Database, fn: (tx: Tx) => T | PromiseLike<T>, given: ((value: T) => unknown) | undefined, what: string): boolean {
   const queue = queueFor(db);
   // No caller awaits a post, so a promise its committed returns is caught here, on every branch, and logged as `what`
@@ -223,7 +224,7 @@ export interface Repo {
   write<T, R = T>(fn: (tx: Tx) => Promise<T>, committed?: (value: T) => R): Promise<Awaited<R>>;
   write<T, R = T>(fn: (tx: Tx) => Sync<T>, committed?: (value: T) => R): Promise<Awaited<R>>;
   // A write no caller awaits, for code that can't (posted, above): true when it ran now, false when it waits behind
-  // another body or awaits, its failure then logged as `what` failed. It refuses inside an open transaction (a body's
+  // another body or awaits (always, on Postgres), its failure then logged as `what` failed. It refuses inside an open transaction (a body's
   // write goes on its Tx). A promise `committed` returns is caught and its rejection logged as `what` failed on every
   // branch (#1051). fn may be async (#807 P3 A3), except from the queue's holder; its Tx is live until fn settles.
   post<T>(fn: (tx: Tx) => T | Promise<T>, committed?: (value: T) => unknown, what?: string): boolean;

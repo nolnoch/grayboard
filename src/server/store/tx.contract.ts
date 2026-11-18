@@ -451,6 +451,42 @@ function handles(backend: TxBackend, it: It): void {
     expect(await h.rows(h.read)).toEqual(["body"]);
   });
 
+  // #807 P3 C2b audit: `put` sends as it's built on every backend, so a statement a parent task started before
+  // tx.savepoint opened runs in the parent, not inside the savepoint (where it would roll back with it).
+  it("a parent statement started beside a failing savepoint stays the parent's", async h => {
+    await h.write(async tx => {
+      await Promise.allSettled([(async () => { await h.put(tx, "parent"); })(), tx.savepoint(async () => { throw new Error("expected"); })]);
+      await h.put(tx, "after");
+    });
+    expect(await h.rows(h.read)).toEqual(["parent", "after"]);
+  });
+
+  // #807 P3 C2b audit: a savepoint the body didn't await is dead once the body has fulfilled: its hook keys drop
+  // before the hooks run, and its Tx can't register another while they do.
+  it("a beforeCommit key from a savepoint the body didn't await doesn't run at COMMIT", async h => {
+    const seen: string[] = [];
+    const release = gate();
+    let stray: Promise<unknown> = Promise.resolve();
+    await h.write(tx => {
+      stray = tx.savepoint(async sp => { sp.beforeCommit({}, async () => { seen.push("stray"); }); await release.wait; }).catch(e => e);
+    });
+    release.open();
+    expect(String(await stray)).toContain("outlived");
+    expect(seen).toEqual([]);
+  });
+
+  it("a savepoint the body didn't await can't register a hook while the hooks run", async h => {
+    const seen: string[] = [];
+    const release = gate();
+    let stray: Promise<unknown> = Promise.resolve();
+    await h.write(tx => {
+      tx.beforeCommit({}, async () => { seen.push("root"); release.open(); await tick(); await tick(); });
+      stray = tx.savepoint(async sp => { await release.wait; sp.beforeCommit({}, async () => { seen.push("late stray"); }); }).catch(e => e);
+    });
+    expect(String(await stray)).toContain("Tx used after its transaction settled");
+    expect(seen).toEqual(["root"]);
+  });
+
   it("a hook that re-registers its own key doesn't run again; a key from a hook's rolled-back savepoint drops", async h => {
     const seen: string[] = [];
     const key = {};
@@ -476,12 +512,14 @@ function writePath(backend: TxBackend, it: It): void {
     await h.write(tx => h.put(tx, "a"));
     await expect(h.write(() => { throw new Error("boom"); })).rejects.toThrow("boom");
     await expect(h.write(async tx => { await h.put(tx, "c"); throw new Error("boom"); })).rejects.toThrow("boom");
+    // The refusal is caught as it's made: the outer commit can take ticks (an async one on Postgres), and a rejection
+    // unhandled until then is reported as the test's failure.
     let nested: Promise<unknown> | undefined;
-    await h.write(() => { nested = h.write(() => 1); });
-    await expect(nested!).rejects.toThrow("nested code calls its Tx's savepoint");
+    await h.write(() => { nested = h.write(() => 1).catch(e => e); });
+    expect(String(await nested)).toContain("nested code calls its Tx's savepoint");
     nested = undefined;
-    await h.write(async () => { await tick(); nested = h.write(() => 1); });
-    await expect(nested!).rejects.toThrow("nested code calls its Tx's savepoint");
+    await h.write(async () => { await tick(); nested = h.write(() => 1).catch(e => e); });
+    expect(String(await nested)).toContain("nested code calls its Tx's savepoint");
     expect(await h.rows(h.read)).toEqual(["a"]);
   });
 

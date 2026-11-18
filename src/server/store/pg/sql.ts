@@ -12,6 +12,9 @@ export type PgOptions = {
   // Seconds; Bun's defaults otherwise.
   idleTimeout?: number;
   connectionTimeout?: number;
+  // Startup parameters (GUCs) every connection of the pool sets, beside application_name: the transaction store's
+  // read-only default and lock_timeout (store/pg/tx.ts).
+  connection?: Record<string, string | number | boolean>;
 };
 
 export function openPg(url: string, opts: PgOptions = {}): SQL {
@@ -20,7 +23,8 @@ export function openPg(url: string, opts: PgOptions = {}): SQL {
     max: opts.max,
     idleTimeout: opts.idleTimeout,
     connectionTimeout: opts.connectionTimeout,
-    connection: opts.applicationName === undefined ? undefined : { application_name: opts.applicationName },
+    connection: opts.applicationName === undefined && opts.connection === undefined ? undefined
+      : { ...opts.connection, ...(opts.applicationName === undefined ? {} : { application_name: opts.applicationName }) },
   });
 }
 

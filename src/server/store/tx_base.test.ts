@@ -102,6 +102,33 @@ describe("tx_base savepoint template", () => {
     root.put("after");
   });
 
+  test("runBeforeCommit: an open savepoint's keys drop and its Tx closes before the hooks run; the root stays blocked", async () => {
+    const log: string[] = [];
+    const root = new FakeTx("root", log, "async");
+    const seen: string[] = [];
+    const resume = gate();
+    let inner!: FakeTx, nested!: FakeTx;
+    // A body that started these and didn't await them (D4); the inner one's key was registered outside it first.
+    const shared = {};
+    root.beforeCommit(shared, async () => { seen.push("root"); });
+    const stray = root.savepoint(async tx => {
+      inner = fake(tx);
+      inner.beforeCommit({}, async () => { seen.push("stray"); });
+      inner.beforeCommit(shared, async () => { seen.push("stray shared"); });
+      void inner.savepoint(async t => { nested = fake(t); nested.beforeCommit({}, async () => { seen.push("nested"); }); await resume.promise; }).catch(() => {});
+      await resume.promise;
+    }).catch(e => (e as Error).message);
+    await root.runBeforeCommit();
+    expect(seen).toEqual(["root"]);
+    expect(refusal(() => inner.beforeCommit({}, async () => {}))).toContain("Tx used after its transaction settled");
+    expect(refusal(() => nested.put("late"))).toContain("Tx used after its transaction settled");
+    expect(refusal(() => root.put("hook"))).toContain("Tx used while its savepoint is open");
+    expect(root.hasBeforeCommit).toBe(false);
+    // The transaction ends; the strays' frames never settle here (their gates stay shut), as nothing awaits them.
+    root.close();
+    void stray;
+  });
+
   test("a synchronous frame settles in the same turn as the body's result: no extra await", async () => {
     const log: string[] = [];
     const root = new FakeTx("root", log, "sync");
