@@ -618,16 +618,17 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
   const bearerError = (status: 401 | 403, error: string | undefined, requiredScopes: string[]) => json({ error: error ?? "unauthorized" }, status, {
     "WWW-Authenticate": `Bearer resource_metadata="${resourceMetadata}", scope="${(status === 401 ? OAUTH_SCOPES : requiredScopes).join(" ")}"${error ? `, error="${error}"` : ""}`,
   });
-  // A live access token and its user's email, by hash. Both reads are cached in the Repo on
+  // A live access token and its user's email and kind, by hash. Both reads are cached in the Repo on
   // authGeneration (#853), so the hot path skips the token-grant-user join, and share one read of it (#881).
   // `r`: the Tx of the body the check runs in (hosted's in-body checks, #998), read uncached; else the pool.
-  function activeAccess(accessHash: string, r: Read = repo.read): Promise<{ access: OAuthAccess; email: string } | undefined> {
-    return repo.authRead(async () => withEmail(r, await repo.oauth.findActiveAccess(r, accessHash, resource, [], now())));
+  type Found = { access: OAuthAccess; email: string; kind: AuthedUser["kind"] };
+  function activeAccess(accessHash: string, r: Read = repo.read): Promise<Found | undefined> {
+    return repo.authRead(async () => withUser(r, await repo.oauth.findActiveAccess(r, accessHash, resource, [], now())));
   }
-  async function withEmail(r: Read, access: OAuthAccess | undefined): Promise<{ access: OAuthAccess; email: string } | undefined> {
+  async function withUser(r: Read, access: OAuthAccess | undefined): Promise<Found | undefined> {
     if (!access) return undefined;
-    const email = await repo.users.activeEmail(r, access.userId);
-    return email === undefined ? undefined : { access, email };
+    const user = await repo.users.active(r, access.userId);
+    return user === undefined ? undefined : { access, ...user };
   }
   // A bearer header's token hash, or the refusal; the access lookup is the caller's.
   function bearer(req: Request, requiredScopes: string[]): string | Response {
@@ -637,11 +638,11 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
     if (u.searchParams.has("access_token") || !auth || !/^Bearer [A-Za-z0-9_-]{43}$/i.test(auth)) return bearerError(401, auth ? "invalid_token" : undefined, requiredScopes);
     return hashToken(auth.slice(7));
   }
-  function principalOf(found: { access: OAuthAccess; email: string } | undefined, accessHash: string, requiredScopes: string[]): OAuthPrincipal | Response {
+  function principalOf(found: Found | undefined, accessHash: string, requiredScopes: string[]): OAuthPrincipal | Response {
     if (!found) return bearerError(401, "invalid_token", requiredScopes);
-    const { access, email } = found;
+    const { access, email, kind } = found;
     if (!requiredScopes.every(s => access.scopes.includes(s))) return bearerError(403, "insufficient_scope", requiredScopes);
-    return { authed: { user_id: access.userId, user_email: email, session_id: 0 }, grantId: access.grantId, clientId: access.clientId,
+    return { authed: { user_id: access.userId, user_email: email, kind, session_id: 0 }, grantId: access.grantId, clientId: access.clientId,
       sourceKey: sourceKeyFor(access.clientId, clients), scopes: [...access.scopes], accessHash, accessExpiry: access.expiresAt };
   }
   function authorizedBy(principal: OAuthPrincipal, a: OAuthAccess | undefined): boolean {

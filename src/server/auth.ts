@@ -1,11 +1,20 @@
 import { createHash, randomBytes } from "node:crypto";
+import type { Principal } from "../core/resolver.ts";
 import type { Repo } from "./db.ts";
+import type { SignedIn } from "./policy.ts";
 
+// The signed-in principal: its users row's id and name (an email, or a service's name), and its kind, read with the
+// row (#270 D1). Every check that keys on "a user is a person" reads `kind`.
 export type AuthedUser = {
   user_id: number;
   user_email: string;
+  kind: "user" | "service";
   session_id: number;
 };
+
+// The signed-in principal, as a scope rule (actIn) and a user-keyed verb (admin, team.*) take it: kind from the row.
+export const principalOfAuthed = (a: AuthedUser): Principal => ({ kind: a.kind, name: a.user_email });
+export const signedIn = (a: AuthedUser): SignedIn => ({ id: a.user_id, email: a.user_email, kind: a.kind });
 
 export function hashToken(raw: string): string {
   return createHash("sha256").update(raw).digest("hex");
@@ -60,7 +69,7 @@ export async function verifySessionToken(raw: string, repo: Repo, touches: Touch
   // Off the request path: last-used is a stamp, not a result the caller waits on. Posted, so a touch that fires
   // while another body holds the write queue waits behind it (#807).
   touches.schedule(() => { repo.post(tx => repo.sessions.touch(tx, session.id, repo.now()), undefined, "session touch"); });
-  return { user_id: session.user_id, user_email: user!.email, session_id: session.id };
+  return { user_id: session.user_id, user_email: user!.email, kind: user!.kind, session_id: session.id };
 }
 
 export function extractBearer(req: Request): string | null {

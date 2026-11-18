@@ -1154,10 +1154,10 @@ adminCmd
     catch (e) { handleApiError(e); }
   });
 
-// Role bindings (#927): who holds org_admin, team_owner or service_invoke, granted and revoked at runtime.
+// Role bindings (#927): who holds org_admin, team_owner, service_owner or service_invoke, granted and revoked at runtime.
 type RoleRow = { id: number | null; principal: string; role: string; scope: string | null; granter?: string | null; source: string };
 const roleLine = (b: RoleRow) => `${b.role}${b.scope ? ` on ${b.scope}` : ""}: ${b.principal}${b.source === "bootstrap" ? " (GRAYBOARD_ADMINS)" : ` (binding ${b.id}${b.granter ? `, granted by ${b.granter}` : ""})`}`;
-const roleCmd = adminCmd.command("role").description("Grant, revoke and list role bindings: org_admin (whole server), team_owner (--scope <team>), service_invoke (--scope <service>)");
+const roleCmd = adminCmd.command("role").description("Grant, revoke and list role bindings: org_admin (whole server), team_owner (--scope <team>), service_owner and service_invoke (--scope <service>)");
 
 for (const verb of ["grant", "revoke"] as const) {
   roleCmd
@@ -1197,6 +1197,56 @@ roleCmd
       if (!rows.length) { console.log("no role bindings"); return; }
       for (const b of rows) console.log(roleLine(b));
     } catch (e) { handleApiError(e); }
+  });
+
+// Service principals (#270): a pipeline's agents act as a service, owned by users and managed by org admins.
+type ServiceRow = { id: number; name: string; created_at: number; disabled_at: number | null; owners: string[] };
+const serviceCmd = adminCmd.command("service").description("Create, list, disable and enable service principals, and delete their unused names");
+
+serviceCmd
+  .command("create <name>")
+  .description("Create a service principal (a name: 1-32 chars of a-z 0-9 _ -) with its owners, users who answer for it")
+  .requiredOption("--owner <email...>", "An owner's email (repeatable; at least one, each signed in once)")
+  .action(async (name: string, opts: { owner: string[] }) => {
+    try { output(await makeClient().post("/api/admin/services", { name, owners: opts.owner }), globalJson()); }
+    catch (e) { handleApiError(e); }
+  });
+
+serviceCmd
+  .command("list")
+  .description("List service principals with their owners")
+  .action(async () => {
+    try {
+      const client = makeClient();
+      const rows: ServiceRow[] = [];
+      for (let after: number | null = null;;) {
+        const page = await client.get(`/api/admin/services${after !== null ? `?after=${after}` : ""}`) as { services: ServiceRow[]; next: number | null };
+        rows.push(...page.services);
+        if (page.next === null) break;
+        after = page.next;
+      }
+      if (globalJson()) { output({ services: rows }, true); return; }
+      if (!rows.length) { console.log("no services"); return; }
+      for (const r of rows) console.log(`${r.name}${r.disabled_at !== null ? " (disabled)" : ""}: owners ${r.owners.join(", ") || "(none)"}`);
+    } catch (e) { handleApiError(e); }
+  });
+
+for (const verb of ["disable", "enable"] as const) {
+  serviceCmd
+    .command(`${verb} <name>`)
+    .description(verb === "disable" ? "Disable a service: revokes its grants and ends its sessions" : "Re-enable a disabled service (its revoked grants stay revoked)")
+    .action(async (name: string) => {
+      try { output(await makeClient().post(`/api/admin/services/${verb}`, { name }), globalJson()); }
+      catch (e) { handleApiError(e); }
+    });
+}
+
+serviceCmd
+  .command("delete-alias <service> <name>")
+  .description("Delete a service's name no session is using, freeing a slot under the server's per-scope cap")
+  .action(async (service: string, name: string) => {
+    try { output(await makeClient().post("/api/admin/services/delete-alias", { service, name }), globalJson()); }
+    catch (e) { handleApiError(e); }
   });
 
 program.parseAsync(process.argv);

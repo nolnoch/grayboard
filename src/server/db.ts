@@ -37,16 +37,25 @@ import { LastOwner, PrincipalTaken } from "./store/errors.ts";
 // account ID there (Google `sub`), keyed together (security audit F-13, #928
 // D3). Both: linked. Issuer only: a pre-F-13 row, reserved for that IdP.
 // Neither: a dev-auth user, or one an admin unlinked.
-export type User     = { id: number; email: string; display_name: string | null; created_at: number; disabled_at: number | null; idp_issuer: string | null; idp_subject: string | null };
+// A user row (#270 D1): a person, or a service whose `email` holds its name (never an email: it has no "@"). The kind
+// is its principal row's, read with the row (USER_SQL): there's no users.kind column.
+export type User     = { id: number; email: string; display_name: string | null; created_at: number; disabled_at: number | null; idp_issuer: string | null; idp_subject: string | null; kind: "user" | "service" };
+// Every read of a user row goes through this, so `kind` is never missing (a "SELECT *" would type-check without it).
+// A users row with no service principal is a person's: user principals are seeded on every open.
+const USER_SQL = `SELECT u.id, u.email, u.display_name, u.created_at, u.disabled_at, u.idp_issuer, u.idp_subject,
+  CASE WHEN p.id IS NULL THEN 'user' ELSE 'service' END AS kind
+  FROM users u LEFT JOIN principals p ON p.user_id = u.id AND p.kind = 'service'`;
+// A user row by id, the auth cache's read (tests count it).
+export const USER_BY_ID_SQL = `${USER_SQL} WHERE u.id = ?`;
 // What an IdP sign-in resolved to (security audit F-13, #928 D4). `linked`: the
 // user had no subject yet and now has this one. Refusals: `subject_mismatch`,
 // the email's user belongs to another account at the same IdP (the email was
 // reassigned); `issuer_mismatch`, the email's user belongs to another IdP
 // (`issuer`, the one holding it); `email_changed`, this IdP account's user has
-// another email.
+// another email; `service`, the email names a service principal (#270 D1).
 export type IdpSignIn =
   | { status: "ok"; user: User; linked: boolean }
-  | { status: "subject_mismatch" | "email_changed"; user: User }
+  | { status: "subject_mismatch" | "email_changed" | "service"; user: User }
   | { status: "issuer_mismatch"; user: User; issuer: string };
 // The label `grayboard login --dev` sessions carry: a server started without dev auth revokes them (#805 F-04).
 export const DEV_SESSION_LABEL = "dev";
@@ -260,8 +269,8 @@ export interface Repo {
     // findById(r, id)?.disabled_at != null, cached on authGeneration (#853); inside the caller's own transaction it
     // reads on its Tx, uncached.
     isDisabled(r: Read, userId: number): Promise<boolean>;
-    // The user's email while it exists and isn't disabled, cached as isDisabled is.
-    activeEmail(r: Read, userId: number): Promise<string | undefined>;
+    // The user's email and kind (#270 D1) while it exists and isn't disabled, cached as isDisabled is.
+    active(r: Read, userId: number): Promise<{ email: string; kind: User["kind"] } | undefined>;
     setDisabled(tx: Tx, userId: number, disabled: boolean): Promise<void>;
   };
   sessions: {
@@ -548,6 +557,18 @@ export interface Repo {
     bindingOf(r: Read, userId: number, role: string, teamId: number | null): Promise<number | undefined>;
     // Bindings with ids above `after`, in id order, at most `limit`, filtered by role, holder name and scope name.
     list(r: Read, filter: RoleFilter, after: number, limit: number): Promise<RoleBinding[]>;
+  };
+  // Service principals (#270 D1): a users row whose email column holds the service's name, and a principals row of
+  // kind 'service' on it. Lifecycle is the admin routes' (`/api/admin/services`); nothing deletes one.
+  services: {
+    // Both rows, in one statement each and no prior read: the UNIQUE names decide, so a name a user, team or
+    // service already holds throws PrincipalTaken. Owners are the caller's grants, in the same transaction.
+    create(tx: Tx, name: string): Promise<User>;
+    // Services with principal ids above `after`, in id order, at most `limit`, each with its owners' names.
+    list(r: Read, after: number, limit: number): Promise<ServiceRow[]>;
+    // The services this user owns whose every owner is now disabled: what disabling them left without an
+    // accountable owner (#930 replaces them).
+    orphanedBy(r: Read, userId: number): Promise<string[]>;
   };
   // Every read and write returns a promise (#807 P3 A6d2, A7i).
   messages: {
@@ -1171,6 +1192,8 @@ export type RoleGrant = {
 // byUser: the revoking user's id, whose bindings `authority` checks (null with authority "none").
 export type RoleRevoke = { holder: string; role: string; scope: string | null; byUser: number | null; authority: RoleAuthority; actor: string | null; audit?: Record<string, unknown> };
 export type RoleFilter = { role?: string; principal?: string; scope?: string };
+// A service principal as the admin list shows it (#270 D1): id is its principals row's.
+export type ServiceRow = { id: number; name: string; created_at: number; disabled_at: number | null; owners: string[] };
 
 // Moved to store/errors.ts for the Postgres store; re-exported for http.ts and the tests.
 export { LastOwner, PrincipalTaken } from "./store/errors.ts";
@@ -1191,7 +1214,9 @@ function upsertUser(db: Database, email: string, displayName: string | null, now
        ON CONFLICT(email) DO UPDATE SET display_name = excluded.display_name`,
       [email, displayName, now],
     );
-    const user = db.query<User, [string]>("SELECT * FROM users WHERE email = ?").get(email)!;
+    const user = db.query<User, [string]>(`${USER_SQL} WHERE u.email = ?`).get(email)!;
+    // A service's row is never a person's (#270 D1): no sign-in or upsert names it, so no IdP subject links to it.
+    if (user.kind === "service") throw new PrincipalTaken(email);
     db.run(`INSERT OR IGNORE INTO principals (kind, name, user_id, created_at) VALUES ('user', ?, ?, ?)`, [email, user.id, now]);
     return user;
   })();
@@ -1235,7 +1260,17 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
                   (SELECT COUNT(*) FROM team_members WHERE team_id = t.id) AS members, t.name AS team
              FROM principals pt JOIN teams t ON t.id = pt.team_id WHERE pt.id = ?`,
         ).get(scopeId, scopeId);
-        if (c && c.owners === 0 && c.members > 1) throw new LastOwner(c.team);
+        if (c && c.owners === 0 && c.members > 1) throw new LastOwner(c.team, "team");
+      }
+      // Every service keeps an owner (#270 D1), with no sole-member exception: the owner is its accountability record.
+      // SQLite's single writer serializes this count with any concurrent revoke; the Postgres port locks the service's
+      // principal row (FOR UPDATE) before it, as D3 does the team's.
+      if (role === "service_owner" && scopeId !== null) {
+        const c = db.query<{ owners: number; name: string }, [number, number]>(
+          `SELECT (SELECT COUNT(*) FROM role_bindings WHERE scope_id = ? AND role = 'service_owner') AS owners, ps.name
+             FROM principals ps WHERE ps.id = ? AND ps.kind = 'service'`,
+        ).get(scopeId, scopeId);
+        if (c && c.owners === 0) throw new LastOwner(c.name, "service");
       }
       insertAudit(db, clock(), r.actor, "role.revoked", before.principal, JSON.stringify({ ...bindingDetail(before), ...r.audit }));
       return before;
@@ -1346,11 +1381,11 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
     return n === undefined ? undefined : `${n}:${dataVersion.get()!.data_version}`;
   };
   const authGeneration = () => ownsTx(db) ? undefined : pinned() ?? readGeneration();
-  const userById = (c: Database, userId: number) => c.query<User, [number]>("SELECT * FROM users WHERE id = ?").get(userId) ?? undefined;
+  const userById = (c: Database, userId: number) => c.query<User, [number]>(USER_BY_ID_SQL).get(userId) ?? undefined;
   // Caches of what the auth tables say, keyed on authGeneration: a live access token only (an unknown or dead one is
   // re-read every time); a user row, or its absence, as read (#853). They sit here, under the store's own methods, so
   // a test that replaces one of those methods replaces the cache behind it, except authPeek's: it reads the access
-  // and user caches directly, so a stubbed findActiveAccess, isDisabled or activeEmail changes only what a miss later fills.
+  // and user caches directly, so a stubbed findActiveAccess, isDisabled or active changes only what a miss later fills.
   // A lookup hits only when its generation is the cache's. A miss reads, then fills only if the generation is still
   // its own once the read is done (#807 P3 A7b): a lookup pinned before a commit neither fills nor clears the cache a
   // newer one keyed, so bodies with different pins don't thrash it, and generations need no order.
@@ -1418,7 +1453,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
   const aliasesNamed = (c: Database, name: string): Alias[] =>
     c.query<Alias, [string]>(`SELECT ${ALIAS_COLS} FROM aliases WHERE name = ? ORDER BY address`).all(name);
   const userByEmail = (c: Database, email: string): User | undefined =>
-    c.query<User, [string]>("SELECT * FROM users WHERE email = ?").get(email) ?? undefined;
+    c.query<User, [string]>(`${USER_SQL} WHERE u.email = ?`).get(email) ?? undefined;
   const teamByName = (c: Database, name: string): Team | undefined =>
     c.query<Team, [string]>("SELECT * FROM teams WHERE name = ?").get(name) ?? undefined;
   const teamsOf = (c: Database, userId: number): Team[] =>
@@ -1493,13 +1528,15 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
             [issuer, subject, displayName, id, issuer]).changes === 1;
           for (let attempt = 0; attempt < 3; attempt++) {
             // 1. This IdP account's user.
-            const bySubject = db.query<User, [string, string]>("SELECT * FROM users WHERE idp_issuer = ? AND idp_subject = ?").get(issuer, subject);
+            const bySubject = db.query<User, [string, string]>(`${USER_SQL} WHERE u.idp_issuer = ? AND u.idp_subject = ?`).get(issuer, subject);
             if (bySubject) {
               if (bySubject.email !== email) return { status: "email_changed", user: bySubject };
               db.run("UPDATE users SET display_name = ? WHERE id = ?", [displayName, bySubject.id]);
               return { status: "ok", user: { ...bySubject, display_name: displayName }, linked: false };
             }
-            const byEmail = db.query<User, [string]>("SELECT * FROM users WHERE email = ?").get(email);
+            const byEmail = db.query<User, [string]>(`${USER_SQL} WHERE u.email = ?`).get(email);
+            // A service's row (#270 D1): no IdP account links to it, whatever the issuer.
+            if (byEmail?.kind === "service") return { status: "service", user: byEmail };
             if (byEmail) {
               // 3. Another IdP holds the email, linked or (pre-F-13) not: never a merge by email.
               if (byEmail.idp_issuer !== null && byEmail.idp_issuer !== issuer) return { status: "issuer_mismatch", user: byEmail, issuer: byEmail.idp_issuer };
@@ -1527,9 +1564,9 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       async isDisabled(r, userId) {
         return (await cachedUser(r, userId))?.disabled_at != null;
       },
-      async activeEmail(r, userId) {
+      async active(r, userId) {
         const u = await cachedUser(r, userId);
-        return u && u.disabled_at === null ? u.email : undefined;
+        return u && u.disabled_at === null ? { email: u.email, kind: u.kind } : undefined;
       },
       async setDisabled(tx, userId, disabled) {
         const db = sqliteOf(tx);
@@ -1905,6 +1942,46 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
         if (f.principal !== undefined) { where.push("p.name = ?"); args.push(f.principal); }
         if (f.scope !== undefined) { where.push("s.name = ?"); args.push(f.scope); }
         return sqliteOf(r).query<RoleBinding, (string | number)[]>(`${BINDING_SQL} WHERE ${where.join(" AND ")} ORDER BY b.id LIMIT ?`).all(...args, limit);
+      },
+    },
+
+    services: {
+      async create(tx, name) {
+        const db = sqliteOf(tx);
+        return db.transaction(() => {
+          const now = clock();
+          try {
+            const id = db.query<{ id: number }, [string, number]>(
+              "INSERT INTO users (email, display_name, created_at) VALUES (?, NULL, ?) RETURNING id",
+            ).get(name, now)!.id;
+            db.run(`INSERT INTO principals (kind, name, user_id, created_at) VALUES ('service', ?, ?, ?)`, [name, id, now]);
+            return userById(db, id)!;
+          } catch (e) {
+            const column = uniqueViolation(e);
+            if (column === "principals.name" || column === "users.email") throw new PrincipalTaken(name);
+            throw e;
+          }
+        })();
+      },
+      async list(r, after, limit) {
+        return sqliteOf(r).query<Omit<ServiceRow, "owners"> & { owners: string }, [number, number]>(
+          `SELECT p.id, p.name, p.created_at, u.disabled_at,
+                  (SELECT json_group_array(h.name) FROM (SELECT h.name FROM role_bindings b JOIN principals h ON h.id = b.principal_id
+                     WHERE b.scope_id = p.id AND b.role = 'service_owner' ORDER BY h.name) h) AS owners
+             FROM principals p JOIN users u ON u.id = p.user_id
+            WHERE p.kind = 'service' AND p.id > ? ORDER BY p.id LIMIT ?`,
+        ).all(after, limit).map((row) => ({ ...row, owners: JSON.parse(row.owners) as string[] }));
+      },
+      async orphanedBy(r, userId) {
+        return sqliteOf(r).query<{ name: string }, [number]>(
+          `SELECT s.name FROM role_bindings b
+             JOIN principals h ON h.id = b.principal_id AND h.kind = 'user'
+             JOIN principals s ON s.id = b.scope_id AND s.kind = 'service'
+            WHERE b.role = 'service_owner' AND h.user_id = ?
+              AND NOT EXISTS (SELECT 1 FROM role_bindings o JOIN principals oh ON oh.id = o.principal_id JOIN users ou ON ou.id = oh.user_id
+                               WHERE o.scope_id = b.scope_id AND o.role = 'service_owner' AND ou.disabled_at IS NULL)
+            ORDER BY s.name`,
+        ).all(userId).map((row) => row.name);
       },
     },
 

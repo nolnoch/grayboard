@@ -525,7 +525,7 @@ describe("dedup and state answers (in process)", () => {
     await offline("be");
     const user = (await srv.app.repo.users.findByEmail(srv.app.repo.read, "you@example.com"))!;
     const { session } = await srv.app.application.attachHuman(
-      { user_id: user.id, user_email: user.email, session_id: 0 },
+      { user_id: user.id, user_email: user.email, kind: "user", session_id: 0 },
       { deliver() {}, closed() {} },
     );
     // Each line in its own queued body, as the bridge's inWrite runs it.

@@ -702,7 +702,7 @@ test("the bridge's human connection binds and unbinds nothing", async () => {
   const user = (await srv.app.repo.users.findByEmail(srv.app.repo.read, A))!;
   const pushes: string[] = [];
   const sink = { deliver: (e: any) => { if (e.kind === "direct") pushes.push(e.message.body); }, closed() {} };
-  const { session, ok } = await srv.app.application.attachHuman({ user_id: user.id, user_email: A, session_id: 0 }, sink);
+  const { session, ok } = await srv.app.application.attachHuman({ user_id: user.id, user_email: A, kind: "user", session_id: 0 }, sink);
   expect(ok).toMatchObject({ id: "human" });
   const human = `${A}/human`;
   const refused = async (f: () => unknown) => { try { await f(); } catch (e) { return { code: (e as any).code, message: (e as Error).message }; } return undefined; };

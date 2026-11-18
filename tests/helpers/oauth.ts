@@ -19,7 +19,10 @@ export function issueOAuth(repo: Repo, resource: string, email = "alice@example.
 export type IssuedOAuth = Awaited<ReturnType<typeof issueOAuth>>;
 
 async function issueNow(repo: Repo, tx: Tx, resource: string, email: string, scopes: string[], now: number, clientId: string) {
-  const user = await repo.users.upsertByEmail(tx, email, null);
+  // A service principal (#270) has no sign-in, so upsertByEmail refuses its name: issue to the existing row, the
+  // test-only stand-in for the credential grant a later step adds.
+  const existing = await repo.users.findByEmail(tx, email);
+  const user = existing?.kind === "service" ? existing : await repo.users.upsertByEmail(tx, email, null);
   const binding = { clientId, resource, scopes: [...scopes].sort(), redirectUri: "http://127.0.0.1/callback", codeChallenge: random() };
   const request = { ...binding, requestHash: hashToken(random()), browserHash: hashToken(random()), csrfHash: hashToken(random()), stateHash: hashToken(random()), consentSessionHash: null, createdAt: now, expiresAt: now + OAUTH_TTL.request };
   const sessionHash = hashToken(random());
@@ -31,7 +34,7 @@ async function issueNow(repo: Repo, tx: Tx, resource: string, email: string, sco
   const token = random(), refreshToken = random(), grantId = random();
   const tokens = { ...binding, accessHash: hashToken(token), refreshHash: hashToken(refreshToken), accessExpiresAt: now + OAUTH_TTL.access, refreshExpiresAt: now + OAUTH_TTL.refresh };
   checked(await repo.oauth.redeemCode(tx, { ...binding, codeHash: code.codeHash, grantId, grantExpiresAt: now + OAUTH_TTL.grant, tokens }, now));
-  const authed: AuthedUser = { user_id: user.id, user_email: user.email, session_id: 0 };
+  const authed: AuthedUser = { user_id: user.id, user_email: user.email, kind: user.kind, session_id: 0 };
   return { token, refreshToken, grantId, authed, tokens, binding, now };
 }
 

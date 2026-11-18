@@ -16,10 +16,10 @@ import { scratchDbPath } from "../../tests/support/scratch_db.ts";
 import { seed, seedSync } from "../../tests/support/seed.ts";
 import { grantOwner } from "../../tests/support/roles.ts";
 
-type Fixture = { repo: Repo; db: CoreDb; a: User; b: User; c: User; d: User; eng: Team; ops: Team; x: Team; id: string };
+type Fixture = { repo: Repo; db: CoreDb; a: User; b: User; c: User; d: User; svc: User; eng: Team; ops: Team; x: Team; id: string };
 
 // Users a, b, c, d; eng collaborative (a owner, b), ops delegating (a owner, c), x open (d owner); an ID registered
-// by a; aliases a@example.com/x and eng/bot; a service principal, svc, by raw SQL (nothing creates one before #270);
+// by a; aliases a@example.com/x and eng/bot; a service principal, svc, owned by a (#270), and another, ci;
 // c holds org_admin by a binding (#927).
 async function fixture(): Promise<Fixture> {
   const { repo, db } = openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
@@ -46,11 +46,13 @@ async function fixture(): Promise<Fixture> {
     await grantOwner(repo, tx, "x", "d@example.com");
     await repo.aliases.create(tx, { scope_kind: "person", scope_ref: "a@example.com", name: "x" }, "a@example.com");
     await repo.aliases.create(tx, { scope_kind: "team", scope_ref: "eng", name: "bot" }, "a@example.com");
-    return { a, b, c, d, eng: (await repo.teams.findByName(tx, "eng"))!, ops: (await repo.teams.findByName(tx, "ops"))!, x };
+    const svc = await repo.services.create(tx, "svc");
+    await repo.services.create(tx, "ci");
+    await repo.roles.grant(tx, { holder: "a@example.com", role: "service_owner", scope: "svc", holderKinds: ["user"], scopeKind: "service", member: false, by: "a@example.com", byUser: null, authority: "none", actor: "a@example.com" });
+    return { a, b, c, d, svc, eng: (await repo.teams.findByName(tx, "eng"))!, ops: (await repo.teams.findByName(tx, "ops"))!, x };
   });
   await seed(db, () => {
     registerId(db, { id, principal: "a@example.com", launcher: false });
-    db.run("INSERT INTO principals (kind, name, created_at) VALUES ('service', 'svc', 0)");
     db.run("INSERT INTO role_bindings (principal_id, role, scope_id, granted_by, granted_at) SELECT id, 'org_admin', NULL, NULL, 0 FROM principals WHERE name = 'c@example.com'");
   });
   return { repo, db, id, ...rows };
@@ -64,8 +66,10 @@ const personScope = (ref: string) => ({ scope_kind: "person" as const, scope_ref
 
 function rows(f: Fixture): Row[] {
   const A = "a@example.com", B = "b@example.com", C = "c@example.com", D = "d@example.com";
-  const ua = { id: f.a.id, email: A }, ub = { id: f.b.id, email: B }, uc = { id: f.c.id, email: C }, ud = { id: f.d.id, email: D };
+  const ua = { id: f.a.id, email: A, kind: "user" as const }, ub = { id: f.b.id, email: B, kind: "user" as const }, uc = { id: f.c.id, email: C, kind: "user" as const }, ud = { id: f.d.id, email: D, kind: "user" as const };
   const live = { principal: A, viewer: false, ended_at: null };
+  const svc = { kind: "service" as const, name: "svc" }, us = { id: f.svc.id, email: "svc", kind: "service" as const };
+  const serviceScope = (ref: string) => ({ scope_kind: "service" as const, scope_ref: ref });
   return [
     // msg.send / human.reach
     { name: "not a human", req: { verb: "msg.send", from: `${A}/fe`, to: `${B}/be` }, allow: true, rule: "human.not_human" },
@@ -79,8 +83,16 @@ function rows(f: Fixture): Row[] {
     { name: "team alias to a member", req: { verb: "msg.send", from: "eng/bot", to: `${B}/human` }, allow: true, rule: "human.team_alias" },
     { name: "team alias to a non-member", req: { verb: "human.reach", from: "eng/bot", to: `${C}/human` }, allow: false, rule: "human.team_alias" },
     // scope.act / alias.bind / act_as
-    { name: "service principal", req: { verb: "scope.act", principal: { kind: "service", name: "svc" }, scope: teamScope("eng") }, allow: false, rule: "scope.service" },
-    { name: "service scope", req: { verb: "scope.act", principal: user(A), scope: { scope_kind: "service", scope_ref: "svc" } }, allow: false, rule: "scope.service" },
+    { name: "service in its own scope", req: { verb: "scope.act", principal: svc, scope: serviceScope("svc") }, allow: true, rule: "scope.own_service" },
+    { name: "service binds in its own scope", req: { verb: "alias.bind", principal: svc, scope: serviceScope("svc"), name: "w-1" }, allow: true, rule: "scope.own_service" },
+    { name: "service in a team's scope", req: { verb: "scope.act", principal: svc, scope: teamScope("eng") }, allow: false, rule: "scope.own_service" },
+    { name: "service in a person's scope", req: { verb: "alias.bind", principal: svc, scope: personScope(A), name: "w-1" }, allow: false, rule: "scope.own_service" },
+    { name: "service in another service's scope", req: { verb: "scope.act", principal: svc, scope: serviceScope("ci") }, allow: false, rule: "scope.own_service" },
+    { name: "service binds human", req: { verb: "alias.bind", principal: svc, scope: serviceScope("svc"), name: "human" }, allow: false, rule: "alias.human_reserved" },
+    { name: "service scope", req: { verb: "scope.act", principal: user(B), scope: serviceScope("svc") }, allow: false, rule: "scope.service" },
+    { name: "owner in its service's scope", req: { verb: "alias.bind", principal: user(A), scope: serviceScope("svc"), name: "w-1" }, allow: false, rule: "scope.service" },
+    { name: "owner as its service's alias", req: { verb: "act_as", principal: user(A), address: "svc/w-1", name: "w-1", scope: serviceScope("svc") }, allow: false, rule: "scope.service" },
+    { name: "team in a service's scope", req: { verb: "scope.act", principal: { kind: "team", name: "eng" }, scope: serviceScope("svc") }, allow: false, rule: "scope.service" },
     { name: "team principal", req: { verb: "scope.act", principal: { kind: "team", name: "eng" }, scope: personScope(A) }, allow: false, rule: "scope.user_only" },
     { name: "own person scope", req: { verb: "scope.act", principal: user(A), scope: personScope(A) }, allow: true, rule: "scope.own_person" },
     { name: "another's person scope", req: { verb: "scope.act", principal: user(A), scope: personScope(B) }, allow: false, rule: "scope.own_person" },
@@ -123,10 +135,13 @@ function rows(f: Fixture): Row[] {
     { name: "member manages", req: { verb: "team.manage", user: ub, team: f.eng }, allow: false, rule: "role.team_owner" },
     { name: "stranger manages", req: { verb: "team.manage", user: ud, team: f.eng }, allow: false, rule: "team.member" },
     { name: "missing team managed", req: { verb: "team.manage", user: ua, team: undefined }, allow: false, rule: "team.member" },
+    { name: "service in the admin list manages", ctx: { admins: ["svc"] }, req: { verb: "team.manage", user: us, team: f.eng }, allow: false, rule: "team.member" },
+    { name: "service in the admin list reads", ctx: { admins: ["svc"] }, req: { verb: "team.read", user: us, team: f.eng }, allow: false, rule: "team.member" },
     // admin
     { name: "admin", ctx: { admins: [A] }, req: { verb: "admin", user: ua }, allow: true, rule: "admin.env" },
     { name: "org admin by binding", ctx: { admins: [A] }, req: { verb: "admin", user: uc }, allow: true, rule: "role.org_admin" },
     { name: "not admin", ctx: { admins: [A] }, req: { verb: "admin", user: ub }, allow: false, rule: "role.org_admin" },
+    { name: "service in the admin list", ctx: { admins: ["svc"] }, req: { verb: "admin", user: us }, allow: false, rule: "role.org_admin" },
     // msg.wake / delegate.to
     { name: "wake self", req: { verb: "msg.wake", from_user: A, to_user: A }, allow: true, rule: "wake.same_user" },
     { name: "wake collaborative", req: { verb: "msg.wake", from_user: A, to_user: B }, allow: true, rule: "wake.team_policy" },
@@ -140,6 +155,11 @@ function rows(f: Fixture): Row[] {
     { name: "team sees its own", req: { verb: "alias.see", principal: { kind: "team", name: "eng" }, scope: teamScope("eng") }, allow: true, rule: "alias.see_own_team" },
     { name: "member sees a team's", req: { verb: "alias.see", principal: user(B), scope: teamScope("eng") }, allow: true, rule: "scope.team_member" },
     { name: "stranger sees a team's", req: { verb: "alias.see", principal: user(D), scope: teamScope("eng") }, allow: false, rule: "scope.team_member" },
+    { name: "service sees its own", req: { verb: "alias.see", principal: svc, scope: serviceScope("svc") }, allow: true, rule: "scope.own_service" },
+    { name: "owner sees a service's", req: { verb: "alias.see", principal: user(A), scope: serviceScope("svc") }, allow: false, rule: "scope.service" },
+    { name: "service sees a person's", req: { verb: "alias.see", principal: svc, scope: personScope(A) }, allow: true, rule: "alias.see_person" },
+    { name: "service wakes a user", req: { verb: "msg.wake", from_user: "svc", to_user: A }, allow: false, rule: "wake.cross_user" },
+    { name: "service's alias reaches a human", req: { verb: "msg.send", from: "svc/w-1", to: `${A}/human` }, allow: false, rule: "human.teammates" },
   ];
 }
 

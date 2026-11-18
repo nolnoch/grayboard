@@ -35,7 +35,7 @@ beforeEach(async () => {
   application = createApplication(store.repo);
   const principal = async (email: string): Promise<DeliveryPrincipal> => {
     const user = await seed(store.repo, tx => store.repo.users.upsertByEmail(tx, email, null));
-    return { authed: { user_id: user.id, user_email: email, session_id: 0 }, grantId: `grant:${user.id}`, clientId: OPENCODE_CLIENT, sourceKey: OPENCODE_SESSION_META, scopes: ["tools", "delivery"], accessHash: "test", accessExpiry: Number.MAX_SAFE_INTEGER };
+    return { authed: { user_id: user.id, user_email: email, kind: "user", session_id: 0 }, grantId: `grant:${user.id}`, clientId: OPENCODE_CLIENT, sourceKey: OPENCODE_SESSION_META, scopes: ["tools", "delivery"], accessHash: "test", accessExpiry: Number.MAX_SAFE_INTEGER };
   };
   alice = await principal("alice@example.com"); bob = await principal("bob@example.com");
   now = Date.now(); authorized = true;

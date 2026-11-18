@@ -3,7 +3,7 @@ import { DEV_SESSION_LABEL, LastOwner, PrincipalTaken, TEAM_POLICIES, type Repo,
 import { DEFAULT_CLI_TOKEN_IDLE_DAYS, type Config } from "./config.ts";
 import {
   verifySessionToken, extractBearer,
-  mintToken, hashToken, type AuthedUser, type TouchQueue,
+  mintToken, hashToken, principalOfAuthed, signedIn, type AuthedUser, type TouchQueue,
 } from "./auth.ts";
 import { defaultProviders } from "./idp.ts";
 import { releaseStored, requestAttachment, storeUpload, type Guard } from "./attachments.ts";
@@ -12,7 +12,7 @@ import { UploadTimeout, readUploadBody, type UploadGate } from "./uploads.ts";
 import { writeAudit } from "./audit.ts";
 import { isLoopbackIp } from "./client_addr.ts";
 import { DEFAULT_LAG_GATE, lagSampler, lagVerdict, lagWindows, type LagGate, type LagSampler, type LagWindow } from "./metrics.ts";
-import { authorize, byAdmin, decidePure, isRole, recordDecision, type AuthzRequest, type Decision, type PureRequest } from "./policy.ts";
+import { ROLES, authorize, byAdmin, decidePure, isRole, recordDecision, type AuthzRequest, type Decision, type PureRequest } from "./policy.ts";
 import { authorityOf, grantRole, revokeRole, roleSpec, type Granter, type RoleOutcome } from "./roles.ts";
 import { HUMAN_NAME, HUMAN_RESERVED, isValidEmail, isValidIdentityName } from "../shared/addressing.ts";
 import { addressParts } from "../core/addresses.ts";
@@ -167,7 +167,7 @@ async function whoami(authed: AuthedUser, repo: Repo): Promise<Response> {
 // withheld with its note, as claim_list does (#871).
 async function claimList(url: URL, authed: AuthedUser, repo: Repo): Promise<Response> {
   const prefix = url.searchParams.get("prefix") ?? undefined;
-  const principal = { kind: "user" as const, name: authed.user_email };
+  const principal = principalOfAuthed(authed);
   const sees = async (holder: string): Promise<boolean> => {
     // A deleted team name (#347) keeps its claims and stays inside the team that had it (core seenScopeOf).
     const scope = seenScopeOf(await repo.aliases.find(repo.read, holder), holder);
@@ -203,13 +203,13 @@ async function ownAddress(r: Read, input: string | null | undefined, authed: Aut
   const address = p.kind === "bare" ? `${authed.user_email}/${p.name}` : p.address;
   // The rule decides the human name first (`humanReason`), before the scope's owner.
   const owner = await repo.principals.of(r, address);
-  const req: AuthzRequest = { verb: "act_as", principal: { kind: "user", name: authed.user_email }, address, name: p.name, scope: owner && { scope_kind: owner.kind === "user" ? "person" : owner.kind, scope_ref: owner.name } };
+  const req: AuthzRequest = { verb: "act_as", principal: principalOfAuthed(authed), address, name: p.name, scope: owner && { scope_kind: owner.kind === "user" ? "person" : owner.kind, scope_ref: owner.name } };
   const d = await authorize(repo, r, {}, req);
   if (!d.allow) {
     recordDecision(repo, r, { user: authed.user_email, address }, req, d);
     if (d.rule === "alias.human_reserved") return forbidden(humanReason);
-    // A team reads as missing to a non-member (#1020), as a scope nobody owns.
-    if (d.rule === "scope.ownerless" || d.rule === "scope.team_member") return forbidden(`you can't act as "${address}": no principal owns its scope`);
+    // A team reads as missing to a non-member (#1020), and a service's scope to a user (#270 D1), as a scope nobody owns.
+    if (d.rule === "scope.ownerless" || d.rule === "scope.team_member" || d.rule === "scope.service") return forbidden(`you can't act as "${address}": no principal owns its scope`);
     return forbidden(`you can't act as "${address}": ${d.reason}`);
   }
   if (!(await repo.aliases.find(r, address))) {
@@ -448,7 +448,7 @@ function teamJoin(): Response {
 // A team the caller isn't in reads as not found, like its board; an admin
 // can't leave a team it isn't in. A refusal is recorded (policy.ts).
 async function memberTeam(h: Read, teamName: string, authed: AuthedUser, repo: Repo): Promise<Team | null> {
-  const req: AuthzRequest = { verb: "team.leave", user: { id: authed.user_id, email: authed.user_email }, team: await repo.teams.findByName(h, teamName.toLowerCase()) };
+  const req: AuthzRequest = { verb: "team.leave", user: signedIn(authed), team: await repo.teams.findByName(h, teamName.toLowerCase()) };
   const d = await authorize(repo, h, {}, req);
   if (!d.allow) {
     recordDecision(repo, h, { user: authed.user_email }, req, d, { team_requested: teamName.toLowerCase() });
@@ -463,7 +463,7 @@ async function memberTeam(h: Read, teamName: string, authed: AuthedUser, repo: R
 // found; so is an admin's read, an exercise of admin authority (#927). A
 // member's read isn't.
 async function managedTeam(h: Read, teamName: string, authed: AuthedUser, repo: Repo, config: Config): Promise<{ team: Team; audit: { as_admin?: true } } | null> {
-  const req: AuthzRequest = { verb: "team.read", user: { id: authed.user_id, email: authed.user_email }, team: await repo.teams.findByName(h, teamName.toLowerCase()) };
+  const req: AuthzRequest = { verb: "team.read", user: signedIn(authed), team: await repo.teams.findByName(h, teamName.toLowerCase()) };
   const d = await authorize(repo, h, { admins: config.admins }, req);
   if (!d.allow || byAdmin(d)) recordDecision(repo, h, { user: authed.user_email }, req, d, { team_requested: teamName.toLowerCase() });
   if (!d.allow) return null;
@@ -477,7 +477,7 @@ async function managedTeam(h: Read, teamName: string, authed: AuthedUser, repo: 
 // owning. A non-member still reads not found; a member who isn't an owner
 // is refused, naming who can. Every decision is recorded (policy.ts).
 async function ownedTeam(h: Read, teamName: string, authed: AuthedUser, repo: Repo, config: Config): Promise<{ team: Team; audit: { as_admin?: true }; decision: Decision } | Response> {
-  const req: AuthzRequest = { verb: "team.manage", user: { id: authed.user_id, email: authed.user_email }, team: await repo.teams.findByName(h, teamName.toLowerCase()) };
+  const req: AuthzRequest = { verb: "team.manage", user: signedIn(authed), team: await repo.teams.findByName(h, teamName.toLowerCase()) };
   const d = await authorize(repo, h, { admins: config.admins }, req);
   recordDecision(repo, h, { user: authed.user_email }, req, d, { team_requested: teamName.toLowerCase() });
   if (!d.allow) return d.code === "not_found" ? notFound() : forbidden(d.reason);
@@ -521,6 +521,8 @@ async function teamAdd(teamName: string, req: Request, authed: AuthedUser, repo:
     const email = body.email.toLowerCase();
     const user  = await repo.users.findByEmail(tx, email);
     if (!user) return jsonErr("not_found", `${email} has never signed in to grayboard; they need to run grayboard login first`, 404);
+    // A service is never a team member (#270 D1): membership would carry the team's wakes, boards and names.
+    if (user.kind === "service") return badRequest(`${email} is a service; services don't join teams`);
     // Ownership is a team_owner binding (#927), granted and revoked by the same store calls as the admin route's,
     // re-checking the caller's authority in the write. A refused grant takes the membership it followed with it.
     const granter: Granter = { email: authed.user_email, userId: authed.user_id, authority: authorityOf(managed.decision) };
@@ -631,6 +633,11 @@ async function teamMembers(teamName: string, authed: AuthedUser, repo: Repo, con
 
 // ── admin ────────────────────────────────────────────────────────────────────
 
+// The generic user routes act on people only (#270 D1): a service goes through /api/admin/services, whose disable
+// is audited as the service's, and which no generic revoke reaches.
+const serviceRefused = (u: User, verb: string): Response | null =>
+  u.kind === "service" ? badRequest(`${u.email} is a service, not a user; use grayboard admin service ${verb} ${u.email}`) : null;
+
 // Revokes every session the user has; there's no session id to pick one by.
 // Older CLIs send all: true, which is ignored.
 async function adminRevokeSession(req: Request, authed: AuthedUser, repo: Repo, disconnectUser: (userId: number) => void): Promise<Response> {
@@ -640,10 +647,13 @@ async function adminRevokeSession(req: Request, authed: AuthedUser, repo: Repo, 
   const target = await repo.write(async (tx: Tx) => {
     const target = await repo.users.findByEmail(tx, body.email.toLowerCase());
     if (!target) return null;
+    const refused = serviceRefused(target, "disable");
+    if (refused) return refused;
     await repo.sessions.revokeAllForUser(tx, target.id);
     writeAudit(repo, tx, "auth.session_revoked", authed.user_email, body.email);
     return target;
-  }, target => { if (target) disconnectUser(target.id); return target; });
+  }, target => { if (target && !(target instanceof Response)) disconnectUser(target.id); return target; });
+  if (target instanceof Response) return target;
   return target ? json({ ok: true }) : notFound();
 }
 
@@ -652,16 +662,22 @@ async function adminDisableUser(
 ): Promise<Response> {
   const body = await parseBody<{ email: string }>(req);
   if (!body?.email) return badRequest("email required");
-  const target = await repo.write(async (tx: Tx) => {
+  const out = await repo.write(async (tx: Tx) => {
     const target = await repo.users.findByEmail(tx, body.email.toLowerCase());
     if (!target) return null;
+    const refused = serviceRefused(target, "disable");
+    if (refused) return refused;
     await repo.users.setDisabled(tx, target.id, true);
-    writeAudit(repo, tx, "auth.user_disabled", authed.user_email, body.email);
-    return target;
-  }, target => { if (target) disconnectUser(target.id); return target; });
-  if (!target) return notFound();
-  await slack?.userChanged(target.id);
-  return json({ ok: true });
+    // Their service_owner bindings stay (#930 replaces disabled owners); the answer names the services left with no
+    // enabled owner, so the admin knows whose accountability lapsed (#270 D1).
+    const orphaned = await repo.services.orphanedBy(tx, target.id);
+    writeAudit(repo, tx, "auth.user_disabled", authed.user_email, body.email, orphaned.length ? { orphaned_services: orphaned } : undefined);
+    return { target, orphaned };
+  }, out => { if (out && !(out instanceof Response)) disconnectUser(out.target.id); return out; });
+  if (out instanceof Response) return out;
+  if (!out) return notFound();
+  await slack?.userChanged(out.target.id);
+  return json({ ok: true, ...(out.orphaned.length ? { orphaned_services: out.orphaned } : {}) });
 }
 
 async function adminEnableUser(req: Request, authed: AuthedUser, repo: Repo, slack?: SlackLinker): Promise<Response> {
@@ -670,10 +686,13 @@ async function adminEnableUser(req: Request, authed: AuthedUser, repo: Repo, sla
   const target = await repo.write(async tx => {
     const target = await repo.users.findByEmail(tx, body.email.toLowerCase());
     if (!target) return null;
+    const refused = serviceRefused(target, "enable");
+    if (refused) return refused;
     await repo.users.setDisabled(tx, target.id, false);
     writeAudit(repo, tx, "auth.user_enabled", authed.user_email, body.email);
     return target;
   });
+  if (target instanceof Response) return target;
   if (!target) return notFound();
   await slack?.userChanged(target.id);
   return json({ ok: true });
@@ -689,6 +708,8 @@ async function adminUnlinkIdp(req: Request, authed: AuthedUser, repo: Repo, conf
   return repo.write(async tx => {
     const target = await repo.users.findByEmail(tx, body.email.toLowerCase());
     if (!target) return notFound();
+    // A service has no IdP account to forget (#270 D1).
+    if (target.kind === "service") return badRequest(`${target.email} is a service, not a user; no sign-in links to it`);
     await repo.users.clearSubject(tx, target.id);
     writeAudit(repo, tx, "auth.subject_cleared", authed.user_email, target.email, {
       had_subject: target.idp_subject !== null, provider: defaultProviders(config).find(p => p.issuer === target.idp_issuer)?.id ?? null, issuer: target.idp_issuer });
@@ -738,7 +759,7 @@ async function adminRoleList(url: URL, repo: Repo, config: Config): Promise<Resp
   const filter: RoleFilter = {};
   const role = q.get("role"), principal = q.get("principal"), scope = q.get("scope"), after = q.get("after"), limit = q.get("limit");
   if (role !== null) {
-    if (!isRole(role)) return badRequest(`role must be one of org_admin, team_owner, service_invoke`);
+    if (!isRole(role)) return badRequest(`role must be one of ${Object.keys(ROLES).join(", ")}`);
     filter.role = role;
   }
   if (principal !== null) filter.principal = principal.toLowerCase();
@@ -753,6 +774,102 @@ async function adminRoleList(url: URL, repo: Repo, config: Config): Promise<Resp
   return json({
     bindings: [...bootstrap, ...page.map(b => ({ ...b, source: "binding" }))],
     next: page.length === size ? page[page.length - 1]!.id : null,
+  });
+}
+
+// ── services (#270 D1) ───────────────────────────────────────────────────────
+
+// A service principal: a users row whose email column holds its name, and a principals row of kind service. Every
+// route here is behind the /api/admin/ gate (org_admin, with its decision row); no MCP tool reaches them.
+
+// The service a route names, or the 404: a user's email or a team's name reads as no service.
+async function serviceNamed(h: Read, repo: Repo, name: unknown): Promise<User | Response> {
+  if (typeof name !== "string" || !name) return badRequest("name required");
+  const u = await repo.users.findByEmail(h, name.toLowerCase());
+  return u?.kind === "service" ? u : jsonErr("not_found", `no service named "${name.toLowerCase()}"`, 404);
+}
+
+// Create: the users and principals rows and every owner's service_owner binding, in one transaction (D1: a service
+// always has an owner). The owners are granted with the gate's authority, re-checked in each grant's write, so an
+// admin revoked between the gate and the write creates nothing: a refused grant rolls the savepoint back.
+async function adminServiceCreate(req: Request, authed: AuthedUser, repo: Repo, gate: Decision): Promise<Response> {
+  const body = await parseBody<{ name?: unknown; owners?: unknown }>(req);
+  if (typeof body?.name !== "string" || !body.name) return badRequest("name required");
+  const name = body.name.toLowerCase();
+  // The team name rule (D1): no "@", so a service's name is never a person scope and never an email.
+  if (!isValidIdentityName(name)) return badRequest(`invalid service name "${name.slice(0, 64)}": 1-32 chars of a-z 0-9 _ -`);
+  if (!Array.isArray(body.owners) || !body.owners.length || !body.owners.every(o => typeof o === "string" && o)) {
+    return badRequest("owners required: one or more users' emails; every service has an owner");
+  }
+  const owners = [...new Set((body.owners as string[]).map(o => o.toLowerCase()))];
+  await testPauseAsync("http:admin-service-create:before-write");
+  const granter: Granter = { email: authed.user_email, userId: authed.user_id, authority: authorityOf(gate) };
+  return repo.write(async tx => {
+    try {
+      return await tx.savepoint(async sp => {
+        let svc: User;
+        try {
+          svc = await repo.services.create(sp, name);
+        } catch (e) {
+          if (e instanceof PrincipalTaken) throw new Refused(conflict(`the name "${name}" belongs to another user, team or service`));
+          throw e;
+        }
+        for (const owner of owners) {
+          const out = await grantRole(repo, sp, { holder: owner, role: "service_owner", scope: name }, granter);
+          if ("refused" in out) throw new Refused(refusedResponse(out));
+        }
+        writeAudit(repo, sp, "service.created", authed.user_email, name, { owners });
+        return json({ name, created_at: svc.created_at, owners: [...owners].sort() }, 201);
+      });
+    } catch (e) {
+      if (e instanceof Refused) return e.response;
+      throw e;
+    }
+  });
+}
+
+const SERVICE_PAGE = 100;
+async function adminServiceList(url: URL, repo: Repo): Promise<Response> {
+  const after = url.searchParams.get("after"), limit = url.searchParams.get("limit");
+  if (after !== null && !/^\d{1,15}$/.test(after)) return badRequest("after must be a service id");
+  if (limit !== null && !/^\d{1,4}$/.test(limit)) return badRequest("limit must be a number");
+  const size = Math.min(Math.max(Number(limit ?? SERVICE_PAGE), 1), SERVICE_PAGE);
+  const page = await repo.services.list(repo.read, Number(after ?? 0), size);
+  return json({ services: page, next: page.length === size ? page[page.length - 1]!.id : null });
+}
+
+// Disable is setDisabled, as for a user: it revokes every grant and ends the service's hosted sessions in its
+// transaction (F-14); enable revives none of them. Audited as the user routes are, naming the service.
+async function adminServiceSetDisabled(req: Request, authed: AuthedUser, repo: Repo, disabled: boolean, disconnectUser: (userId: number) => void): Promise<Response> {
+  const body = await parseBody<{ name?: unknown }>(req);
+  const out = await repo.write(async (tx: Tx) => {
+    const svc = await serviceNamed(tx, repo, body?.name);
+    if (svc instanceof Response) return svc;
+    await repo.users.setDisabled(tx, svc.id, disabled);
+    writeAudit(repo, tx, disabled ? "auth.user_disabled" : "auth.user_enabled", authed.user_email, svc.email, { service: true });
+    return svc;
+  }, out => { if (disabled && !(out instanceof Response)) disconnectUser(out.id); return out; });
+  return out instanceof Response ? out : json({ ok: true });
+}
+
+// A service's name no session is using, deleted (D4: the team route's twin), freeing a slot under the scope cap.
+async function adminServiceDeleteAlias(req: Request, authed: AuthedUser, repo: Repo): Promise<Response> {
+  const body = await parseBody<{ service?: unknown; name?: unknown }>(req);
+  return repo.write(async tx => {
+    const svc = await serviceNamed(tx, repo, body?.service);
+    if (svc instanceof Response) return svc;
+    if (typeof body?.name !== "string" || !body.name) return badRequest("name required");
+    const name = body.name.toLowerCase();
+    if (name === HUMAN_NAME) return badRequest(`"${HUMAN_NAME}" is reserved in every scope; no service has one`);
+    if (!isValidIdentityName(name)) return badRequest("invalid name");
+    const existing = await repo.aliases.find(tx, `${svc.email}/${name}`);
+    if (!existing) return jsonErr("not_found", `service "${svc.email}" has no name "${name}"`, 404);
+    const holder = await repo.bindings.userOf(tx, existing.address);
+    if (holder) return jsonErr("alias_held", aliasHeldText(existing.address, `the session ${holder}`, "end it, or have it unbind the name, first"), 409);
+    await repo.aliases.remove(tx, existing.address);
+    await repo.boards.forget(tx, existing.address);
+    writeAudit(repo, tx, "alias.deleted", authed.user_email, existing.address, { service: svc.email });
+    return json({ ok: true, deleted: existing.address });
   });
 }
 
@@ -829,7 +946,7 @@ export async function handleHttp(
 
   let gate: Decision | undefined;
   if (path.startsWith("/api/admin/")) {
-    const req: AuthzRequest = { verb: "admin", user: { id: authed.user_id, email: authed.user_email } };
+    const req: AuthzRequest = { verb: "admin", user: signedIn(authed) };
     const decision = await authorize(repo, repo.read, { admins: config.admins }, req);
     recordDecision(repo, repo.read, { user: authed.user_email }, req, decision, { route: path });
     if (!decision.allow) return forbidden(decision.reason);
@@ -842,6 +959,11 @@ export async function handleHttp(
   if (path === "/api/admin/disable-user"   && method === "POST") return adminDisableUser(req, authed, repo, sessions.disconnectUser, slack);
   if (path === "/api/admin/enable-user"    && method === "POST") return adminEnableUser(req, authed, repo, slack);
   if (path === "/api/admin/unlink-idp"     && method === "POST") return adminUnlinkIdp(req, authed, repo, config);
+  if (path === "/api/admin/services"       && method === "GET")  return adminServiceList(url, repo);
+  if (path === "/api/admin/services"       && method === "POST") return adminServiceCreate(req, authed, repo, gate!);
+  if (path === "/api/admin/services/disable" && method === "POST") return adminServiceSetDisabled(req, authed, repo, true, sessions.disconnectUser);
+  if (path === "/api/admin/services/enable"  && method === "POST") return adminServiceSetDisabled(req, authed, repo, false, sessions.disconnectUser);
+  if (path === "/api/admin/services/delete-alias" && method === "POST") return adminServiceDeleteAlias(req, authed, repo);
 
   return notFound();
 }

@@ -101,6 +101,7 @@ export type AuditAction =
   | "role.granted"
   | "role.revoked"
   | "server.started"
+  | "service.created"
   | "slack.link_refused"
   | "slack.linked"
   | "slack.relinked"

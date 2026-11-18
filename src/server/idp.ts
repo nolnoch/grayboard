@@ -75,6 +75,11 @@ export async function idpSignIn(
     writeAudit(repo, tx, "auth.subject_refused", identity.email, null, { reason: r.status, ...audited });
     return { refused: `${identity.email} is linked to a different ${provider.label} account. If this account should have it, ${fix(identity.email)}` };
   }
+  if (r.status === "service") {
+    // Unreachable through a verified IdP email (a service's name has no "@"), refused all the same (#270 D1).
+    writeAudit(repo, tx, "auth.subject_refused", identity.email, null, { reason: r.status, ...audited });
+    return { refused: `${identity.email} is a service principal; no sign-in reaches it` };
+  }
   if (r.status === "email_changed") {
     writeAudit(repo, tx, "auth.subject_refused", r.user.email, null, { reason: r.status, email: identity.email, ...audited });
     return { refused: `this ${provider.label} account belongs to grayboard user ${r.user.email} but now reports ${identity.email}. To sign in as ${identity.email} (a new account), ${fix(r.user.email)}` };
