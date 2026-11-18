@@ -20,7 +20,8 @@ import { BlobMissing, CoreError, TooLargeError } from "../core/errors.ts";
 import { transferTimeoutMs } from "../shared/http.ts";
 import { testPauseAsync } from "../shared/testpause.ts";
 import { aliasHeldText } from "../core/bindings.ts";
-import { callBoardTool } from "../core/tools.ts";
+import { callClaimTool } from "./claims.ts";
+import type { BoardAccess } from "./access.ts";
 import { SizeTally, checkFile, contentDisposition, reprDigest, sanitizeFilename } from "../shared/attachments.ts";
 import { ALIAS_SCOPE_CAP, aliasCapRefusal } from "./alias_cap.ts";
 import { ensureTeamBoard, onAliasCreated, onTeamJoined, onTeamLeft } from "./teams.ts";
@@ -221,9 +222,10 @@ async function ownAddress(r: Read, input: string | null | undefined, authed: Aut
 }
 
 // For `grayboard claim`: a claim tool run as one of the caller's identities.
-const CLAIM_TOOLS = new Set(["claim_take", "claim_release", "claim_watch"]);
+type ClaimTool = "claim_take" | "claim_release" | "claim_watch";
+const CLAIM_TOOLS = new Set<string>(["claim_take", "claim_release", "claim_watch"] satisfies ClaimTool[]);
 
-async function claimCall(req: Request, authed: AuthedUser, repo: Repo, wake: (handles: string[]) => void, onBoardsChanged?: (boards: string[]) => void | Promise<void>): Promise<Response> {
+async function claimCall(req: Request, authed: AuthedUser, repo: Repo, access: BoardAccess, wake: (handles: string[]) => void, onBoardsChanged?: (boards: string[]) => void | Promise<void>): Promise<Response> {
   const body = await parseBody<{ as?: string; tool?: string; args?: Record<string, unknown> }>(req);
   if (!body?.as || !body.tool || !CLAIM_TOOLS.has(body.tool)) return badRequest("as and a claim tool required");
   const tool = body.tool, args = body.args ?? {};
@@ -233,10 +235,11 @@ async function claimCall(req: Request, authed: AuthedUser, repo: Repo, wake: (ha
     if (handle instanceof Response) return handle;
     if (args.as !== undefined) return badRequest("name the address to act as in as, not args.as");
     // As the session the address is or is held by: its claims under any of
-    // its addresses are its own here (#360). Read before the synchronous tool (#807 P3 B1a).
+    // its addresses are its own here (#360).
     const addresses = await repo.bindings.addressSet(tx, handle, authed.user_email);
     try {
-      return callBoardTool(repo.coreOn(tx), handle, tool, args, { addresses, user: authed.user_email });
+      // The tool's own savepoint rolls back a refusal's writes, so answering it here commits none (#807 P3 B5b3c).
+      return await callClaimTool(repo, access, tx, handle, tool as ClaimTool, args, { addresses, user: authed.user_email });
     } catch (e) {
       if (e instanceof CoreError) return badRequest(e.message);
       throw e;
@@ -688,7 +691,8 @@ export type SessionHooks = {
 };
 
 export async function handleHttp(
-  req: Request, repo: Repo, config: Config, touches: TouchQueue, wake: (handles: string[]) => void, slack: SlackLinker | undefined,
+  // `access`: the application's BoardAccess, which the claim tools judge boards with (#807 P3 B5b3c).
+  req: Request, repo: Repo, access: BoardAccess, config: Config, touches: TouchQueue, wake: (handles: string[]) => void, slack: SlackLinker | undefined,
   sessions: SessionHooks,
   // The client's address as the auth gate resolved it (src/server/client_addr.ts).
   ip: string | null,
@@ -711,7 +715,7 @@ export async function handleHttp(
   if (path === "/api/whoami"      && method === "GET")  return whoami(authed, repo);
 
   if (path === "/api/claims" && method === "GET") return claimList(url, authed, repo);
-  if (path === "/api/claims/call" && method === "POST") return claimCall(req, authed, repo, wake, onBoardsChanged);
+  if (path === "/api/claims/call" && method === "POST") return claimCall(req, authed, repo, access, wake, onBoardsChanged);
 
   if (path === "/api/identities" && method === "GET")  return identityList(authed, repo);
   if (path === "/api/identities" && method === "POST") return identityCreate(req, authed, repo, config);

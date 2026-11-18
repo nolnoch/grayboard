@@ -79,7 +79,7 @@ function expiresAt(now: number, minutes: number | undefined, until: string | und
   return now + m * 60_000;
 }
 
-function validKey(key: string): string {
+export function validKey(key: string): string {
   const k = key.trim();
   if (!k || k.length > 200) throw new CoreError("claim key must be 1-200 chars");
   return k;

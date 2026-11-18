@@ -116,7 +116,7 @@ export function startServer(config: Config, opts: StartOptions = {}) {
       if (!isJsonRequest(req)) return Response.json({ code: "unsupported_media_type", message: "sign-in takes Content-Type: application/json" }, { status: 415 });
       authGate.charge(caller, req, path, "sign-in");
     }
-    return handleHttp(req, repo, config, touches, wake, slack, { disconnectUser, accessChanged }, caller.ip, application.boardsChanged, url).then((res) => authGate.chargeRefusedToken(caller, req, path, res));
+    return handleHttp(req, repo, application.access, config, touches, wake, slack, { disconnectUser, accessChanged }, caller.ip, application.boardsChanged, url).then((res) => authGate.chargeRefusedToken(caller, req, path, res));
   }
 
   // Every value an O(1) getter (vision P13): no row count, no walk over sessions.

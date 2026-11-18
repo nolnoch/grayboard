@@ -1579,3 +1579,62 @@ test("#807 P3 B5b3b: the claim sweep's repo reads and writes run on the handle t
   expect(facts && { board: facts.board.name, takers: facts.takers, held: facts.held.has(fe) }).toEqual({ board: "jobs", takers: 1, held: true });
   expect(await b.redeliveryFacts(repo.read, "ticket:1", fe)).toBeNull();
 });
+
+// #807 P3 B5b3c: the claim tools' repo steps (claims.get, take, release, recentEvents, watchers, liveForWatch, addWatch,
+// unwatch) run on the handle they're given, and the writes roll back with their body.
+test("#807 P3 B5b3c: the claim tools' repo reads and writes run on the handle they're given", async () => {
+  const { repo, db } = fresh();
+  const [be, fe] = ["a@example.com/be", "a@example.com/fe"];
+  const kept = await seed(repo, async tx => {
+    await repo.users.upsertByEmail(tx, "a@example.com", null);
+    for (const name of ["be", "fe"]) await repo.aliases.create(tx, person("a@example.com", name), "a@example.com");
+    const core = repo.coreOn(tx);
+    createBoard(core, be, "hall", "tests");
+    claim(core, be, "ticket:1", { board: "hall", ttl_minutes: 5 });
+    return tx;
+  });
+  const settled = /used after its transaction settled/;
+  const stranger = /not a SQLite store handle/;
+  const cl = repo.claims;
+  const now = Date.now();
+  const take = { key: "ticket:2", as: be, note: "n", board: "hall", now, expires: now + 60_000, user: "a@example.com" };
+  for (const h of [kept, {} as Tx]) {
+    const want = h === kept ? settled : stranger;
+    await expect(cl.get(h, "ticket:1")).rejects.toThrow(want);
+    await expect(cl.take(h, take)).rejects.toThrow(want);
+    await expect(cl.release(h, "ticket:1", be, now)).rejects.toThrow(want);
+    await expect(cl.recentEvents(h, "ticket:1")).rejects.toThrow(want);
+    await expect(cl.watchers(h, "ticket:1")).rejects.toThrow(want);
+    await expect(cl.liveForWatch(h, "ticket:1", now)).rejects.toThrow(want);
+    await expect(cl.addWatch(h, "ticket:1", fe)).rejects.toThrow(want);
+    await expect(cl.unwatch(h, "ticket:1", fe)).rejects.toThrow(want);
+  }
+  const count = (sql: string) => db.query<{ n: number }, []>(sql).get()!.n;
+  const tally = () => ({ claims: count("SELECT count(*) AS n FROM claims"), watches: count("SELECT count(*) AS n FROM claim_watches") });
+  const before = tally();
+  // Inside a body the writes are seen by its reads, and all of it rolls back.
+  await expect(seed(repo, async tx => {
+    expect((await cl.get(tx, "ticket:1"))?.holder).toBe(be);
+    expect((await cl.liveForWatch(tx, "ticket:1", now))?.holder).toBe(be);
+    await cl.addWatch(tx, "ticket:1", fe);
+    expect(await cl.watchers(tx, "ticket:1")).toEqual([fe]);
+    await cl.unwatch(tx, "ticket:1", fe);
+    expect(await cl.watchers(tx, "ticket:1")).toEqual([]);
+    expect((await cl.take(tx, take))?.key).toBe("ticket:2");
+    // Someone else's live claim isn't taken over (D3).
+    expect(await cl.take(tx, { ...take, as: fe })).toBeNull();
+    expect(await cl.release(tx, "ticket:1", fe, now)).toBeNull();
+    expect((await cl.release(tx, "ticket:1", be, now))?.key).toBe("ticket:1");
+    expect(await cl.get(tx, "ticket:1")).toBeUndefined();
+    expect(await cl.liveForWatch(tx, "ticket:1", now)).toBeUndefined();
+    expect((await cl.recentEvents(tx, "ticket:1")).map(e => e.event)).toContain("take");
+    throw new Error("rolled back");
+  })).rejects.toThrow("rolled back");
+  expect(tally()).toEqual(before);
+  // Committed: they land.
+  await seed(repo, async tx => {
+    await cl.take(tx, take);
+    await cl.addWatch(tx, "ticket:1", fe);
+  });
+  expect(tally()).toEqual({ claims: before.claims + 1, watches: before.watches + 1 });
+});
