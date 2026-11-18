@@ -460,7 +460,7 @@ export const boardExistsText = (board: string, archivedSeen: boolean): string =>
  * Whether board_create's arguments repeat `mine`, made by `handle` (#254), apart from its visibility: the open board
  * with this scope, kind and purpose. `purpose` is read only once the rest matches, as its refusal comes after them.
  */
-export function createRepeats(mine: Board | undefined, handle: string, scope: string | null, kind: string | undefined, purpose: () => string): mine is Board {
+export function createRepeats(mine: Board | undefined, handle: string, scope: string | null, kind: string | undefined, purpose: () => string): boolean {
   return !!mine && !mine.archived_at && mine.created_by === handle && mine.scope === scope && (mine.kind ?? "broadcast") === (kind ?? "broadcast") && mine.purpose === purpose().trim();
 }
 
@@ -1396,7 +1396,9 @@ export function whoRows(db: Database, board: string | null): WhoRow[] {
 
 /**
  * What assembleWho asks of the mode, each a sync lookup. `seesName`/`seesMeta`: whether the caller (its session's
- * principal) may see that an alias of a scope exists, and read its labels; `own`: the caller's addresses.
+ * principal) may see that an alias of a scope exists, and read its labels; `seesMeta` is also asked of
+ * `{scope_kind: "person", scope_ref: principal}` for every row (principal null included) to gate an ID row's session
+ * facts and a `match.scope` on a principal. `own`: the caller's addresses.
  */
 export type WhoFacts = {
   isViewer: (handle: string) => boolean;

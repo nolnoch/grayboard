@@ -516,7 +516,7 @@ export function callBoardTool(
       const name = normalizeBoard(str(a, "name"));
       const mine = ctx.human ? undefined : getBoard(db, name);
       if (createRepeats(mine, handle, scope, kind, () => str(a, "purpose")) && canSeeBoard(db, handle, name)) {
-        return { result: createdNote(mine), wake: [] };
+        return { result: createdNote(mine!), wake: [] };
       }
       const b = createBoard(db, handle, str(a, "name"), str(a, "purpose"), scope, { kind });
       return { result: b, wake: [], boards: [b.name] };
