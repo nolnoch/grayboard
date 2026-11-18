@@ -467,6 +467,18 @@ test(`server: a database ${FROM} wrote opens and reads back`, async () => {
   await sendWhileOffline(m, be, fe, () => session("alice@example.com", "sim"), "alice@example.com/be", "bob@example.com/fe");
   await stopOld();
   keep(`${label}-as-written`, join(dir, "old"));
+  // #927: ownership moves into role bindings once, on the first open. Bob is made an explicit owner and alice a
+  // creator from before roles (a null role), the two rows the seed reads, by hand on whatever the release wrote (a
+  // release from before team_members.role gets the column as this tree's open would add it).
+  const roles = teams;
+  if (roles) {
+    const d = new Database(dbPath);
+    try {
+      if (!("role" in (schema(dbPath).team_members ?? {}))) d.run("ALTER TABLE team_members ADD COLUMN role TEXT");
+      d.run("UPDATE team_members SET role = 'owner' WHERE user_id = (SELECT id FROM users WHERE email = 'bob@example.com')");
+      d.run("UPDATE team_members SET role = NULL WHERE user_id = (SELECT id FROM users WHERE email = 'alice@example.com')");
+    } finally { d.close(); }
+  }
   const before = schema(dbPath);
 
   srv = new TestServer({ dbPath, blobDir: join(dir, "old", "blobs"), hostedRequestLimit: { burst: 10_000, perSec: 10_000 } });
@@ -486,6 +498,7 @@ test(`server: a database ${FROM} wrote opens and reads back`, async () => {
     const members = await runCli(["--json", "team", "members", "core"], { cwd: dir, env: serverEnv(dir, srv.base, alice, "be", { GRAYBOARD_CREDENTIALS: creds }) });
     expect(members.out).toContain("bob@example.com");
   }
+  if (roles) expect(owners(dbPath)).toEqual([["alice@example.com", "core"], ["bob@example.com", "core"]]);
 
   const fresh = new TestServer({ dbPath: join(dir, "fresh.db") });
   await fresh.stop();
@@ -497,7 +510,23 @@ test(`server: a database ${FROM} wrote opens and reads back`, async () => {
   srv = new TestServer({ dbPath, blobDir: join(dir, "old", "blobs") });
   expect((await srv.app.repo.users.findByEmail(srv.app.repo.read, "bob@example.com"))).toMatchObject({ idp_issuer: null, idp_subject: null });
   expect((await srv.app.repo.users.findByEmail(srv.app.repo.read, "alice@example.com"))).toMatchObject({ idp_issuer: GOOGLE_ISSUER });
+  // The ownership seed runs once, with the table: a binding revoked after it isn't seeded back by a later open, though
+  // team_members.role still says owner.
+  if (roles) {
+    await srv.app.repo.write(tx => srv!.app.repo.roles.revoke(tx, { holder: "bob@example.com", role: "team_owner", scope: "core", by: null, authority: "none", actor: null }));
+    await srv.stop();
+    srv = new TestServer({ dbPath, blobDir: join(dir, "old", "blobs") });
+    expect(owners(dbPath)).toEqual([["alice@example.com", "core"]]);
+  }
 }, 60_000);
+
+// Every team_owner binding, as [holder, team].
+function owners(path: string): [string, string][] {
+  const d = new Database(path, { readonly: true });
+  try {
+    return (d.query("SELECT p.name AS holder, s.name AS team FROM role_bindings b JOIN principals p ON p.id = b.principal_id JOIN principals s ON s.id = b.scope_id WHERE b.role = 'team_owner' ORDER BY p.name").all() as { holder: string; team: string }[]).map(r => [r.holder, r.team]);
+  } finally { d.close(); }
+}
 
 // #928 D3, the documented rollback: this tree opens a database, the release's binary then runs on it, and this
 // tree opens it again. A release's Google sign-in can't be driven from another process (releaseToken), so the

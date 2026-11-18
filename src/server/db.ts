@@ -511,16 +511,13 @@ export interface Repo {
     create(tx: Tx, name: string, createdBy: number): Promise<Team>;
     findByName(r: Read, name: string): Promise<Team | undefined>;
     listForUser(r: Read, userId: number): Promise<Team[]>;
-    // Adds a member with an explicit role; an existing member is left as is
-    // (false). Roles change through setRole.
-    addMember(tx: Tx, teamId: number, userId: number, role?: TeamRole): Promise<boolean>;
-    // Both reject with LastOwner rather than leave a team with members and no
-    // owner (security audit F-02); the check and the write share one
-    // transaction. A team that already has no owner isn't guarded.
-    removeMember(tx: Tx, teamId: number, userId: number): Promise<void>;
-    // The member's previous role, or null when it isn't a member.
-    setRole(tx: Tx, teamId: number, userId: number, role: TeamRole): Promise<TeamRole | null>;
-    isOwner(r: Read, teamId: number, userId: number): Promise<boolean>;
+    // Adds a member; an existing member is left as is (false). Ownership is a role binding (#927): roles.grant.
+    addMember(tx: Tx, teamId: number, userId: number): Promise<boolean>;
+    // Removes a member, revoking their team_owner binding first through the roles revoke (its role.revoked row,
+    // `actor` its actor and `audit` beside the binding in its detail), which rejects with LastOwner rather than
+    // leave a team with members and no owner (security audit F-02). The revoked binding, or null.
+    removeMember(tx: Tx, teamId: number, userId: number, actor?: string | null, audit?: Record<string, unknown>): Promise<RoleBinding | null>;
+    // The roster, each member's role read from the team's team_owner bindings.
     listMembers(r: Read, teamId: number): Promise<TeamMember[]>;
     listMemberUserIds(r: Read, teamId: number): Promise<number[]>;
     isMember(r: Read, teamId: number, userId: number): Promise<boolean>;
@@ -534,6 +531,23 @@ export interface Repo {
     shareDelegating(r: Read, userA: number, userB: number): Promise<boolean>;
     // Whether two users share any team: the human-reach rule's teammates, in one statement (A7e3).
     shareAny(r: Read, userA: number, userB: number): Promise<boolean>;
+  };
+  // Runtime role bindings (#927). Grant and revoke name the binding by its principals' names, resolved inside their
+  // statements; each writes its role.granted or role.revoked row in the caller's transaction.
+  roles: {
+    // One INSERT ... SELECT: the binding inserted, or null when nothing was (already held, or a precondition failed:
+    // a name with no principal, a kind the role doesn't take, a team_owner holder who isn't a member, the granter's
+    // authority gone). The caller's follow-up reads say which.
+    grant(tx: Tx, g: RoleGrant): Promise<RoleBinding | null>;
+    // One DELETE ... RETURNING: the binding deleted, or null when there was none or the granter's authority is gone.
+    // Rejects with LastOwner rather than leave a team with members and no owner.
+    revoke(tx: Tx, r: RoleRevoke): Promise<RoleBinding | null>;
+    // The binding a principal holds, by names.
+    find(r: Read, holder: string, role: string, scope: string | null): Promise<RoleBinding | undefined>;
+    // A user's binding id for a role on the org (teamId null) or a team: a decision's one indexed lookup.
+    bindingOf(r: Read, userId: number, role: string, teamId: number | null): Promise<number | undefined>;
+    // Bindings with ids above `after`, in id order, at most `limit`, filtered by role, holder name and scope name.
+    list(r: Read, filter: RoleFilter, after: number, limit: number): Promise<RoleBinding[]>;
   };
   // Every read and write returns a promise (#807 P3 A6d2, A7i).
   messages: {
@@ -708,12 +722,14 @@ export function openDatabase(path: string, opts: OpenOptions): { db: Database; r
   const db = openSqlite(path, "PRAGMA auto_vacuum = INCREMENTAL; PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;", (d) => {
     // The first open under #284 creates aliases; that open seeds it.
     const first = !d.prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'aliases'`).get();
+    // The first open under #927 creates role_bindings; that open seeds team ownership into it.
+    const firstRoles = !d.prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'role_bindings'`).get();
     initSchema(d);
     initCoreSchema(d);
     migrateHostedHolds(d);
     recordChildRoots(d);
     sweepStaleLaunchers(d, (opts.now ?? Date.now)());
-    seedSchema(d, first);
+    seedSchema(d, first, firstRoles);
   });
   authGenerationTriggers(db);
   routeReads(db, openReader(path));
@@ -931,6 +947,29 @@ function initSchema(db: Database): void {
       parent_id   INTEGER REFERENCES principals(id),
       created_at  INTEGER NOT NULL
     );
+    -- A user's and a team's principal row, for a role decision's one lookup (#927).
+    CREATE INDEX IF NOT EXISTS idx_principals_user ON principals(user_id);
+    CREATE INDEX IF NOT EXISTS idx_principals_team ON principals(team_id);
+
+    -- Runtime role bindings (#927): authority is that a row exists, read on every
+    -- decision. principal_id holds the role; scope_id is null for the org
+    -- (org_admin), else the team's or service's principal row. RESTRICT, not
+    -- CASCADE: deleting a scope or holder must revoke its bindings first, each
+    -- with its role.revoked row. granted_by is null only for the #927 seed. No
+    -- CHECK on role: the role table in policy.ts validates, and a CHECK can't be
+    -- widened additively. A NULL never collides in a unique index, so the org
+    -- and scoped bindings each get a partial one.
+    CREATE TABLE IF NOT EXISTS role_bindings (
+      id           INTEGER PRIMARY KEY AUTOINCREMENT,
+      principal_id INTEGER NOT NULL REFERENCES principals(id) ON DELETE RESTRICT,
+      role         TEXT    NOT NULL,
+      scope_id     INTEGER REFERENCES principals(id) ON DELETE RESTRICT,
+      granted_by   INTEGER REFERENCES principals(id) ON DELETE RESTRICT,
+      granted_at   INTEGER NOT NULL
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_role_bindings_org ON role_bindings(principal_id, role) WHERE scope_id IS NULL;
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_role_bindings_scoped ON role_bindings(principal_id, role, scope_id) WHERE scope_id IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS idx_role_bindings_scope ON role_bindings(scope_id, role);
 
     CREATE TABLE IF NOT EXISTS access_log (
       id     INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1041,7 +1080,8 @@ function initSchema(db: Database): void {
   // recipient of another user can be told so; null before it and for bounces.
   if (!msgCols.some((c) => c.name === "sender_user")) db.exec(`ALTER TABLE messages ADD COLUMN sender_user TEXT`);
   // role: 'owner' or 'member' (security audit F-02); null on rows from
-  // before it, read through OWNER_SQL.
+  // before it. Read once, by the #927 seed (seedSchema); role_bindings holds
+  // ownership since, and nothing reads or writes this column.
   const tmCols = db.prepare(`PRAGMA table_info(team_members)`).all() as { name: string }[];
   if (!tmCols.some((c) => c.name === "role")) db.exec(`ALTER TABLE team_members ADD COLUMN role TEXT`);
   // ip, ua: the client address and user agent of the request that wrote the
@@ -1068,11 +1108,29 @@ function insertAudit(db: Database, at: number, actor: string | null, action: str
 // points come from the 1.x identities, handles and cursors once, on the open
 // that creates aliases (`first`): after it, nothing reads or writes those
 // tables, and a later seed would bring back an alias deleted since.
-function seedSchema(db: Database, first: boolean): void {
+// Team ownership (#927) moves from team_members.role into role_bindings
+// once, on the open that creates role_bindings (`firstRoles`), for the same
+// reason: a later seed would bring back a revoked ownership. An owner is a
+// row whose role is 'owner', or, on a row from before roles (F-02), whose role
+// is null and whose user created the team. granted_by is null ("seeded") and
+// granted_at the join time. It joins users and teams to their principal rows,
+// so it runs after the principals seed.
+function seedSchema(db: Database, first: boolean, firstRoles: boolean): void {
   db.exec(`
     INSERT OR IGNORE INTO principals (kind, name, user_id, created_at) SELECT 'user', email, id, created_at FROM users;
     INSERT OR IGNORE INTO principals (kind, name, team_id, created_at) SELECT 'team', name, id, created_at FROM teams;
   `);
+  if (firstRoles) {
+    db.exec(`
+      INSERT OR IGNORE INTO role_bindings (principal_id, role, scope_id, granted_by, granted_at)
+      SELECT pu.id, 'team_owner', pt.id, NULL, tm.joined_at
+        FROM team_members tm
+        JOIN principals pu ON pu.kind = 'user' AND pu.user_id = tm.user_id
+        JOIN principals pt ON pt.kind = 'team' AND pt.team_id = tm.team_id
+       WHERE tm.role = 'owner' OR (tm.role IS NULL AND tm.user_id = (SELECT created_by FROM teams WHERE id = tm.team_id))
+       ORDER BY tm.joined_at, tm.team_id, tm.user_id;
+    `);
+  }
   if (!first) return;
   db.exec(`
     INSERT OR IGNORE INTO aliases (address, scope_kind, scope_ref, name, human, queue_off, created_by_principal, created_at, last_seen)
@@ -1084,14 +1142,33 @@ function seedSchema(db: Database, first: boolean): void {
   `);
 }
 
-/** A team's name another principal already has (#284 decision 5). */
-// A team member's role (security audit F-02). Owners (and admins) manage
-// membership; members read. A row written before roles existed has a null
-// role and reads as owner only for the team's creator (OWNER_SQL), so no
-// backfill is needed; every write since stores an explicit role.
+// A team member's role as the roster shows it (security audit F-02): an owner holds a team_owner binding on the
+// team (#927); every other member is a member. Owners (and org admins) manage membership; members read.
 export type TeamRole = "owner" | "member";
 export type TeamMember = { user_id: number; email: string; role: TeamRole };
-const OWNER_SQL = `(tm.role = 'owner' OR (tm.role IS NULL AND tm.user_id = (SELECT created_by FROM teams WHERE id = tm.team_id)))`;
+
+// A role binding (#927) with its principals' names: holder, scope (null for the org) and granter (null when seeded).
+export type RoleBinding = {
+  id: number; principal_id: number; principal: string; role: string;
+  scope_id: number | null; scope: string | null; granted_by: number | null; granter: string | null; granted_at: number;
+};
+// Whose authority a grant or revoke re-checks in its own write (#927): none (a bootstrap admin, whose env list
+// doesn't change at runtime, a team's creator, a member's own removal), the granter's org_admin binding, or their
+// team_owner binding on the binding's scope or an org_admin binding.
+export type RoleAuthority = "none" | "org_admin" | "owner_or_admin";
+export type RoleGrant = {
+  holder: string; role: string; scope: string | null;
+  // The role table's facts (policy.ts ROLES): the holder kinds allowed, the scope's kind (null: the org).
+  holderKinds: readonly Principal["kind"][]; scopeKind: Principal["kind"] | null;
+  // Whether the holder must be a member of the scope's team (team_owner).
+  member: boolean;
+  // The granter's principal name, recorded as granted_by and checked as `authority` says.
+  by: string; authority: RoleAuthority;
+  // The audit row's actor, and fields its detail carries beside the binding (as_admin).
+  actor: string; audit?: Record<string, unknown>;
+};
+export type RoleRevoke = { holder: string; role: string; scope: string | null; by: string | null; authority: RoleAuthority; actor: string | null; audit?: Record<string, unknown> };
+export type RoleFilter = { role?: string; principal?: string; scope?: string };
 
 // Moved to store/errors.ts for the Postgres store; re-exported for http.ts and the tests.
 export { LastOwner, PrincipalTaken } from "./store/errors.ts";
@@ -1120,19 +1197,57 @@ function upsertUser(db: Database, email: string, displayName: string | null, now
 
 function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLimits, attachmentUserQuota: number, clock: () => number = Date.now): Repo {
   const att = (c: Database, rows: MessageRow[]) => withAttachments(c, "message", rows);
-  // Refuses to take `userId`'s ownership away when it is the team's last
-  // owner and other members remain. A sole member may leave; a team with
-  // no owner (its creator left before roles existed) has nothing to guard.
-  const guardLastOwner = (db: Database, teamId: number, userId: number): void => {
-    const c = db.query<{ owners: number; members: number; me: number }, [number, number]>(
-      `SELECT COALESCE(SUM(${OWNER_SQL}), 0) AS owners, COUNT(*) AS members,
-              COALESCE(SUM(tm.user_id = ? AND ${OWNER_SQL}), 0) AS me
-       FROM team_members tm WHERE tm.team_id = ?`,
-    ).get(userId, teamId)!;
-    if (c.me && c.owners === 1 && c.members > 1) {
-      throw new LastOwner(db.query<{ name: string }, [number]>("SELECT name FROM teams WHERE id = ?").get(teamId)!.name);
-    }
+  // Role bindings (#927). Every read and write is one statement on the caller's handle; grant and revoke re-check
+  // the granter's authority in their own statement, and revoke holds the last-owner guard, so every writer
+  // (the admin routes, `team add --role`, team creation, member removal) gets both. The Postgres port is a straight
+  // translation: grant's INSERT ... SELECT ... ON CONFLICT DO NOTHING RETURNING, revoke's DELETE ... RETURNING, plus
+  // a FOR SHARE on the team's row before a team_owner grant and D3's FOR UPDATE on it before the last-owner count;
+  // SQLite's single writer serializes them.
+  const BINDING_SQL = `SELECT b.id, b.principal_id, p.name AS principal, b.role, b.scope_id, s.name AS scope, b.granted_by, g.name AS granter, b.granted_at
+    FROM role_bindings b JOIN principals p ON p.id = b.principal_id LEFT JOIN principals s ON s.id = b.scope_id LEFT JOIN principals g ON g.id = b.granted_by`;
+  const bindingById = (c: Database, id: number): RoleBinding | undefined =>
+    c.query<RoleBinding, [number]>(`${BINDING_SQL} WHERE b.id = ?`).get(id) ?? undefined;
+  // The granter's authority as of this statement, `scope` the SQL naming the binding's scope id.
+  // Its `n` placeholders all take the granter's principal name.
+  const authoritySql = (a: RoleAuthority, scope: string): { sql: string; n: number } => {
+    const admin = `EXISTS (SELECT 1 FROM role_bindings ga JOIN principals gp ON gp.id = ga.principal_id WHERE gp.name = ? AND ga.role = 'org_admin' AND ga.scope_id IS NULL)`;
+    const owner = `EXISTS (SELECT 1 FROM role_bindings gt JOIN principals gp ON gp.id = gt.principal_id WHERE gp.name = ? AND gt.role = 'team_owner' AND gt.scope_id = ${scope})`;
+    return a === "none" ? { sql: "1", n: 0 } : a === "org_admin" ? { sql: admin, n: 1 } : { sql: `(${admin} OR ${owner})`, n: 2 };
   };
+  // One binding deleted by ids, if the granter's authority holds, with its role.revoked row carrying the whole
+  // binding. A team_owner revoke that leaves a team with members and no owner throws LastOwner (security audit F-02)
+  // and rolls back: a sole member may give it up; a team that already has no owner has nothing to guard.
+  const revokeBinding = (db: Database, principalId: number, role: string, scopeId: number | null, r: Pick<RoleRevoke, "by" | "authority" | "actor" | "audit">): RoleBinding | null =>
+    db.transaction(() => {
+      const auth = authoritySql(r.authority, "role_bindings.scope_id");
+      const before = db.query<RoleBinding, (number | string)[]>(
+        `${BINDING_SQL} WHERE b.principal_id = ? AND b.role = ? AND ${scopeId === null ? "b.scope_id IS NULL" : "b.scope_id = ?"}`,
+      ).get(...[principalId, role, ...(scopeId === null ? [] : [scopeId])]);
+      const gone = db.query<{ id: number }, (number | string | null)[]>(
+        `DELETE FROM role_bindings WHERE principal_id = ? AND role = ? AND ${scopeId === null ? "scope_id IS NULL" : "scope_id = ?"} AND ${auth.sql} RETURNING id`,
+      ).get(...[principalId, role, ...(scopeId === null ? [] : [scopeId]), ...Array(auth.n).fill(r.by)]);
+      if (!gone || !before) return null;
+      if (role === "team_owner" && scopeId !== null) {
+        const c = db.query<{ owners: number; members: number; team: string }, [number, number]>(
+          `SELECT (SELECT COUNT(*) FROM role_bindings WHERE scope_id = ? AND role = 'team_owner') AS owners,
+                  (SELECT COUNT(*) FROM team_members WHERE team_id = t.id) AS members, t.name AS team
+             FROM principals pt JOIN teams t ON t.id = pt.team_id WHERE pt.id = ?`,
+        ).get(scopeId, scopeId);
+        if (c && c.owners === 0 && c.members > 1) throw new LastOwner(c.team);
+      }
+      insertAudit(db, clock(), r.actor, "role.revoked", before.principal, JSON.stringify({ ...bindingDetail(before), ...r.audit }));
+      return before;
+    })();
+  const bindingDetail = (b: RoleBinding) => ({
+    binding: b.id, role: b.role, principal: b.principal, principal_id: b.principal_id, scope: b.scope, scope_id: b.scope_id,
+    granted_by: b.granted_by, granter: b.granter, granted_at: b.granted_at,
+  });
+  // The decision's one indexed lookup: the binding id of a user's role, on the org or on a team, if held.
+  const roleBinding = (c: Database, userId: number, role: string, teamId: number | null): number | undefined =>
+    c.query<{ id: number }, number[] | (number | string)[]>(
+      `SELECT b.id FROM role_bindings b JOIN principals p ON p.id = b.principal_id AND p.kind = 'user' AND p.user_id = ?
+        WHERE b.role = ? AND ${teamId === null ? "b.scope_id IS NULL" : "b.scope_id = (SELECT id FROM principals WHERE kind = 'team' AND team_id = ?)"}`,
+    ).get(...(teamId === null ? [userId, role] : [userId, role, teamId]))?.id;
   // Whether two users share a team whose policy is one of `policies`: one indexed lookup (principle 11).
   // Whether two users share a team, of one of these policies when given (#807 P3 A7e3: none for shareAny).
   const sharePolicy = (c: Database, userA: number, userB: number, policies?: readonly TeamPolicy[]): boolean =>
@@ -1306,15 +1421,14 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
     c.query<Team, [string]>("SELECT * FROM teams WHERE name = ?").get(name) ?? undefined;
   const teamsOf = (c: Database, userId: number): Team[] =>
     c.query<Team, [number]>(`SELECT t.* FROM teams t JOIN team_members tm ON tm.team_id = t.id WHERE tm.user_id = ?`).all(userId);
-  const isOwner = (c: Database, teamId: number, userId: number): boolean =>
-    !!c.query<{ x: number }, [number, number]>(
-      `SELECT 1 AS x FROM team_members tm WHERE tm.team_id = ? AND tm.user_id = ? AND ${OWNER_SQL}`,
-    ).get(teamId, userId);
   const isMember = (c: Database, teamId: number, userId: number): boolean =>
     !!c.query<{ x: number }, [number, number]>("SELECT 1 AS x FROM team_members WHERE team_id = ? AND user_id = ?").get(teamId, userId);
   const teamMembers = (c: Database, teamId: number): TeamMember[] =>
     c.query<{ user_id: number; email: string; owner: number }, [number]>(
-      `SELECT u.id as user_id, u.email, ${OWNER_SQL} AS owner FROM users u
+      `SELECT u.id as user_id, u.email, EXISTS (
+         SELECT 1 FROM role_bindings b JOIN principals pu ON pu.id = b.principal_id JOIN principals pt ON pt.id = b.scope_id
+          WHERE b.role = 'team_owner' AND pu.kind = 'user' AND pu.user_id = u.id AND pt.kind = 'team' AND pt.team_id = tm.team_id
+       ) AS owner FROM users u
        JOIN team_members tm ON tm.user_id = u.id WHERE tm.team_id = ?`,
     ).all(teamId).map(({ owner, ...m }) => ({ ...m, role: owner ? "owner" : "member" }));
   const shareCollaborative = (c: Database, userA: number, userB: number) => sharePolicy(c, userA, userB, ["collaborative", "delegating"]);
@@ -1480,7 +1594,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       principalOf: address => principalOf(db, address),
       teamByName: name => teamByName(db, name),
       isMember: (teamId, userId) => isMember(db, teamId, userId),
-      isOwner: (teamId, userId) => isOwner(db, teamId, userId),
+      roleBinding: (userId, role, teamId) => roleBinding(db, userId, role, teamId),
       shareAny: (userA, userB) => sharePolicy(db, userA, userB),
       shareCollaborative: (userA, userB) => shareCollaborative(db, userA, userB),
       shareDelegating: (userA, userB) => shareDelegating(db, userA, userB),
@@ -1702,33 +1816,27 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       },
       async findByName(r, name) { return teamByName(sqliteOf(r), name); },
       async listForUser(r, userId) { return teamsOf(sqliteOf(r), userId); },
-      async addMember(tx, teamId, userId, role = "member") {
+      async addMember(tx, teamId, userId) {
         const db = sqliteOf(tx);
         return db.run(
-          "INSERT OR IGNORE INTO team_members (team_id, user_id, joined_at, role) VALUES (?, ?, ?, ?)",
-          [teamId, userId, clock(), role],
+          "INSERT OR IGNORE INTO team_members (team_id, user_id, joined_at) VALUES (?, ?, ?)",
+          [teamId, userId, clock()],
         ).changes > 0;
       },
-      async removeMember(tx, teamId, userId) {
-        const db = sqliteOf(tx);
-        db.transaction(() => {
-          guardLastOwner(db, teamId, userId);
-          db.run("DELETE FROM team_members WHERE team_id = ? AND user_id = ?", [teamId, userId]);
-        })();
-      },
-      async setRole(tx, teamId, userId, role) {
+      async removeMember(tx, teamId, userId, actor = null, audit) {
         const db = sqliteOf(tx);
         return db.transaction(() => {
-          const row = db.query<{ owner: number }, [number, number]>(
-            `SELECT ${OWNER_SQL} AS owner FROM team_members tm WHERE tm.team_id = ? AND tm.user_id = ?`,
-          ).get(teamId, userId);
-          if (!row) return null;
-          if (role === "member") guardLastOwner(db, teamId, userId);
-          db.run("UPDATE team_members SET role = ? WHERE team_id = ? AND user_id = ?", [role, teamId, userId]);
-          return row.owner ? "owner" : "member";
+          // An owner is a member (#927): their binding goes first, through revoke, with its row and the guard.
+          const ids = db.query<{ pu: number | null; pt: number | null }, [number, number]>(
+            `SELECT (SELECT id FROM principals WHERE kind = 'user' AND user_id = ?) AS pu, (SELECT id FROM principals WHERE kind = 'team' AND team_id = ?) AS pt`,
+          ).get(userId, teamId)!;
+          const revoked = ids.pu !== null && ids.pt !== null
+            ? revokeBinding(db, ids.pu, "team_owner", ids.pt, { by: null, authority: "none", actor, audit })
+            : null;
+          db.run("DELETE FROM team_members WHERE team_id = ? AND user_id = ?", [teamId, userId]);
+          return revoked;
         })();
       },
-      async isOwner(r, teamId, userId) { return isOwner(sqliteOf(r), teamId, userId); },
       async listMembers(r, teamId) { return teamMembers(sqliteOf(r), teamId); },
       async listMemberUserIds(r, teamId) {
         return sqliteOf(r).query<{ user_id: number }, [number]>(
@@ -1748,6 +1856,54 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       async shareAny(r, userA, userB) { return sharePolicy(sqliteOf(r), userA, userB); },
       async shareCollaborative(r, userA, userB) { return shareCollaborative(sqliteOf(r), userA, userB); },
       async shareDelegating(r, userA, userB) { return shareDelegating(sqliteOf(r), userA, userB); },
+    },
+
+    roles: {
+      async grant(tx, g) {
+        const db = sqliteOf(tx);
+        const now = clock();
+        const kinds = g.holderKinds.length ? `h.kind IN (${g.holderKinds.map(() => "?").join(", ")})` : "0";
+        const scoped = g.scope !== null;
+        const auth = authoritySql(g.authority, scoped ? "s.id" : "NULL");
+        // The holder and scope by name with their kinds, the membership precondition and the granter's authority,
+        // all in the statement's WHERE: zero rows is already held or a failed precondition (D3).
+        const sql = `INSERT INTO role_bindings (principal_id, role, scope_id, granted_by, granted_at)
+          SELECT h.id, ?, ${scoped ? "s.id" : "NULL"}, (SELECT id FROM principals WHERE name = ?), ?
+            FROM principals h ${scoped ? "JOIN principals s ON s.name = ? AND s.kind = ?" : ""}
+           WHERE h.name = ? AND ${kinds}
+             ${scoped && g.member ? "AND EXISTS (SELECT 1 FROM team_members tm WHERE tm.team_id = s.team_id AND tm.user_id = h.user_id)" : ""}
+             AND ${auth.sql}
+          ON CONFLICT DO NOTHING RETURNING id`;
+        const args: (string | number | null)[] = [g.role, g.by, now, ...(scoped ? [g.scope, g.scopeKind] : []), g.holder, ...g.holderKinds, ...Array(auth.n).fill(g.by)];
+        return db.transaction(() => {
+          const row = db.query<{ id: number }, (string | number | null)[]>(sql).get(...args);
+          if (!row) return null;
+          const b = bindingById(db, row.id)!;
+          insertAudit(db, now, g.actor, "role.granted", b.principal, JSON.stringify({ ...bindingDetail(b), ...g.audit }));
+          return b;
+        })();
+      },
+      async revoke(tx, r) {
+        const db = sqliteOf(tx);
+        const ids = db.query<{ pu: number | null; ps: number | null }, (string | null)[]>(
+          "SELECT (SELECT id FROM principals WHERE name = ?) AS pu, (SELECT id FROM principals WHERE name = ?) AS ps",
+        ).get(r.holder, r.scope)!;
+        if (ids.pu === null || (r.scope !== null && ids.ps === null)) return null;
+        return revokeBinding(db, ids.pu, r.role, r.scope === null ? null : ids.ps, r);
+      },
+      async find(r, holder, role, scope) {
+        return sqliteOf(r).query<RoleBinding, (string | null)[]>(
+          `${BINDING_SQL} WHERE p.name = ? AND b.role = ? AND ${scope === null ? "b.scope_id IS NULL" : "s.name = ?"}`,
+        ).get(...(scope === null ? [holder, role] : [holder, role, scope])) ?? undefined;
+      },
+      async bindingOf(r, userId, role, teamId) { return roleBinding(sqliteOf(r), userId, role, teamId); },
+      async list(r, f, after, limit) {
+        const where = ["b.id > ?"], args: (string | number)[] = [after];
+        if (f.role !== undefined) { where.push("b.role = ?"); args.push(f.role); }
+        if (f.principal !== undefined) { where.push("p.name = ?"); args.push(f.principal); }
+        if (f.scope !== undefined) { where.push("s.name = ?"); args.push(f.scope); }
+        return sqliteOf(r).query<RoleBinding, (string | number)[]>(`${BINDING_SQL} WHERE ${where.join(" AND ")} ORDER BY b.id LIMIT ?`).all(...args, limit);
+      },
     },
 
     messages: {

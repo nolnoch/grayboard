@@ -14,11 +14,13 @@ import { authorize, authorizeNow, type AuthzRequest, type PolicyContext } from "
 import { openDatabase, type Repo, type Team, type User } from "./db.ts";
 import { scratchDbPath } from "../../tests/support/scratch_db.ts";
 import { seed, seedSync } from "../../tests/support/seed.ts";
+import { grantOwner } from "../../tests/support/roles.ts";
 
 type Fixture = { repo: Repo; db: CoreDb; a: User; b: User; c: User; d: User; eng: Team; ops: Team; x: Team; id: string };
 
 // Users a, b, c, d; eng collaborative (a owner, b), ops delegating (a owner, c), x open (d owner); an ID registered
-// by a; aliases a@example.com/x and eng/bot; a service principal, svc, by raw SQL (nothing creates one before #270).
+// by a; aliases a@example.com/x and eng/bot; a service principal, svc, by raw SQL (nothing creates one before #270);
+// c holds org_admin by a binding (#927).
 async function fixture(): Promise<Fixture> {
   const { repo, db } = openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
   const id = idAddress("a".repeat(64));
@@ -30,15 +32,18 @@ async function fixture(): Promise<Fixture> {
       await repo.users.upsertByEmail(tx, "d@example.com", null),
     ];
     const eng = await repo.teams.create(tx, "eng", a.id);
-    await repo.teams.addMember(tx, eng.id, a.id, "owner");
+    await repo.teams.addMember(tx, eng.id, a.id);
+    await grantOwner(repo, tx, "eng", "a@example.com");
     await repo.teams.addMember(tx, eng.id, b.id);
     await repo.teams.setPolicy(tx, eng.id, "collaborative");
     const ops = await repo.teams.create(tx, "ops", a.id);
-    await repo.teams.addMember(tx, ops.id, a.id, "owner");
+    await repo.teams.addMember(tx, ops.id, a.id);
+    await grantOwner(repo, tx, "ops", "a@example.com");
     await repo.teams.addMember(tx, ops.id, c.id);
     await repo.teams.setPolicy(tx, ops.id, "delegating");
     const x = await repo.teams.create(tx, "x", d.id);
-    await repo.teams.addMember(tx, x.id, d.id, "owner");
+    await repo.teams.addMember(tx, x.id, d.id);
+    await grantOwner(repo, tx, "x", "d@example.com");
     await repo.aliases.create(tx, { scope_kind: "person", scope_ref: "a@example.com", name: "x" }, "a@example.com");
     await repo.aliases.create(tx, { scope_kind: "team", scope_ref: "eng", name: "bot" }, "a@example.com");
     return { a, b, c, d, eng: (await repo.teams.findByName(tx, "eng"))!, ops: (await repo.teams.findByName(tx, "ops"))!, x };
@@ -46,6 +51,7 @@ async function fixture(): Promise<Fixture> {
   await seed(db, () => {
     registerId(db, { id, principal: "a@example.com", launcher: false });
     db.run("INSERT INTO principals (kind, name, created_at) VALUES ('service', 'svc', 0)");
+    db.run("INSERT INTO role_bindings (principal_id, role, scope_id, granted_by, granted_at) SELECT id, 'org_admin', NULL, NULL, 0 FROM principals WHERE name = 'c@example.com'");
   });
   return { repo, db, id, ...rows };
 }
@@ -109,15 +115,18 @@ function rows(f: Fixture): Row[] {
     { name: "non-member leaves", req: { verb: "team.leave", user: ud, team: f.eng }, allow: false, rule: "team.member" },
     { name: "member reads", req: { verb: "team.read", user: uc, team: f.ops }, allow: true, rule: "team.member" },
     { name: "admin reads", ctx: { admins: [D] }, req: { verb: "team.read", user: ud, team: f.eng }, allow: true, rule: "admin.env" },
+    { name: "org admin by binding reads", req: { verb: "team.read", user: uc, team: f.eng }, allow: true, rule: "role.org_admin" },
     { name: "stranger reads", req: { verb: "team.read", user: ud, team: f.eng }, allow: false, rule: "team.member" },
-    { name: "owner manages", req: { verb: "team.manage", user: ua, team: f.eng }, allow: true, rule: "team.owner" },
+    { name: "owner manages", req: { verb: "team.manage", user: ua, team: f.eng }, allow: true, rule: "role.team_owner" },
     { name: "admin manages", ctx: { admins: [D] }, req: { verb: "team.manage", user: ud, team: f.eng }, allow: true, rule: "admin.env" },
-    { name: "member manages", req: { verb: "team.manage", user: ub, team: f.eng }, allow: false, rule: "team.owner" },
-    { name: "stranger manages", req: { verb: "team.manage", user: uc, team: f.eng }, allow: false, rule: "team.member" },
+    { name: "org admin by binding manages", req: { verb: "team.manage", user: uc, team: f.eng }, allow: true, rule: "role.org_admin" },
+    { name: "member manages", req: { verb: "team.manage", user: ub, team: f.eng }, allow: false, rule: "role.team_owner" },
+    { name: "stranger manages", req: { verb: "team.manage", user: ud, team: f.eng }, allow: false, rule: "team.member" },
     { name: "missing team managed", req: { verb: "team.manage", user: ua, team: undefined }, allow: false, rule: "team.member" },
     // admin
-    { name: "admin", ctx: { admins: [A] }, req: { verb: "admin", email: A }, allow: true, rule: "admin.env" },
-    { name: "not admin", ctx: { admins: [A] }, req: { verb: "admin", email: B }, allow: false, rule: "admin.env" },
+    { name: "admin", ctx: { admins: [A] }, req: { verb: "admin", user: ua }, allow: true, rule: "admin.env" },
+    { name: "org admin by binding", ctx: { admins: [A] }, req: { verb: "admin", user: uc }, allow: true, rule: "role.org_admin" },
+    { name: "not admin", ctx: { admins: [A] }, req: { verb: "admin", user: ub }, allow: false, rule: "role.org_admin" },
     // msg.wake / delegate.to
     { name: "wake self", req: { verb: "msg.wake", from_user: A, to_user: A }, allow: true, rule: "wake.same_user" },
     { name: "wake collaborative", req: { verb: "msg.wake", from_user: A, to_user: B }, allow: true, rule: "wake.team_policy" },
@@ -136,7 +145,8 @@ function rows(f: Fixture): Row[] {
 
 const READS: Record<string, Record<string, string>> = {
   principals: { findByName: "principalByName", of: "principalOf" },
-  teams: { findByName: "teamByName", isMember: "isMember", isOwner: "isOwner", shareAny: "shareAny", shareCollaborative: "shareCollaborative", shareDelegating: "shareDelegating", listForUser: "teamsOf" },
+  teams: { findByName: "teamByName", isMember: "isMember", shareAny: "shareAny", shareCollaborative: "shareCollaborative", shareDelegating: "shareDelegating", listForUser: "teamsOf" },
+  roles: { bindingOf: "roleBinding" },
   users: { findByEmail: "userByEmail" },
 };
 
@@ -170,7 +180,7 @@ function traced(repo: Repo, log: unknown[][], after?: (read: string) => void): R
 function ruleLiterals(): string[] {
   const src = readFileSync(join(import.meta.dir, "policy.ts"), "utf8").split("\n").filter(l => !l.trim().startsWith("//")).join("\n");
   const out = new Set<string>();
-  for (const m of src.matchAll(/\ballow\("([\w.]+)"\)/g)) out.add(`${m[1]}:allow`);
+  for (const m of src.matchAll(/\ballow\("([\w.]+)"[,)]/g)) out.add(`${m[1]}:allow`);
   for (const m of src.matchAll(/\bdeny\("([\w.]+)"/g)) out.add(`${m[1]}:deny`);
   for (const m of src.matchAll(/\{ allow: ([^}]*?), rule: "([\w.]+)" \}/g)) {
     if (m[1] !== "false") out.add(`${m[2]}:allow`);

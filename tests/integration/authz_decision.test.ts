@@ -68,8 +68,8 @@ describe("team management", () => {
     expect((await srv.api(c, "GET", "/api/teams/eng/members")).status).toBe(404);
     expect((await srv.api(b, "GET", "/api/teams/eng/members")).status).toBe(200);
     expect(rows()).toEqual([
-      { actor: A, target: "team:eng", verb: "team.manage", allow: true, rule: "team.owner" },
-      { actor: B, target: "team:eng", verb: "team.manage", allow: false, rule: "team.owner" },
+      { actor: A, target: "team:eng", verb: "team.manage", allow: true, rule: "role.team_owner" },
+      { actor: B, target: "team:eng", verb: "team.manage", allow: false, rule: "role.team_owner" },
       { actor: C, target: "team:eng", verb: "team.manage", allow: false, rule: "team.member" },
       { actor: C, target: "team:eng", verb: "team.read", allow: false, rule: "team.member" },
     ]);
@@ -93,7 +93,7 @@ describe("team management", () => {
     expect((await srv.api(a, "POST", "/api/admin/enable-user", { email: A })).status).toBe(403);
     expect((await srv.api(root, "POST", "/api/admin/enable-user", { email: A })).status).toBe(200);
     expect(rows()).toEqual([
-      { actor: A, target: null, verb: "admin", allow: false, rule: "admin.env", route: "/api/admin/enable-user" },
+      { actor: A, target: null, verb: "admin", allow: false, rule: "role.org_admin", route: "/api/admin/enable-user" },
       { actor: ROOT, target: null, verb: "admin", allow: true, rule: "admin.env", route: "/api/admin/enable-user" },
     ]);
   });

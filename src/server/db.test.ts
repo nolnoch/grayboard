@@ -15,6 +15,7 @@ import { GOOGLE_ISSUER } from "./idp_google.ts";
 import { onTeamJoined } from "./teams.ts";
 import { hashToken } from "./auth.ts";
 import { issueOAuth } from "../../tests/helpers/oauth.ts";
+import { grantOwner } from "../../tests/support/roles.ts";
 
 const person = (email: string, name: string) => ({ scope_kind: "person" as const, scope_ref: email, name });
 
@@ -529,6 +530,45 @@ const indexes = (path: string) => {
 };
 const reopen = (path: string) => openDatabase(path, { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) }).db.close();
 
+// #927: a database from before role_bindings gets one team_owner binding per owner on its first open: each
+// team_members row with role 'owner', and each team creator still in it with a null role (rows from before roles).
+// A member, a creator demoted to member, and a creator who left get none. The seed runs once, with the table.
+test("schema: team ownership is seeded into role bindings once, from team_members.role and creators from before roles", async () => {
+  const path = scratchDbPath();
+  const first = openDatabase(path, { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
+  await seed(first.repo, async tx => {
+    const u = await Promise.all(["a", "b", "c", "d"].map(n => first.repo.users.upsertByEmail(tx, `${n}@example.com`, null)));
+    const eng = await first.repo.teams.create(tx, "eng", u[0]!.id), ops = await first.repo.teams.create(tx, "ops", u[1]!.id), qa = await first.repo.teams.create(tx, "qa", u[2]!.id);
+    for (const [t, m] of [[eng, 0], [eng, 1], [eng, 3], [ops, 1], [ops, 2], [qa, 3]] as const) await first.repo.teams.addMember(tx, t.id, u[m]!.id);
+  });
+  // As a pre-#927 server left them: eng's creator a with a null role, d an explicit owner, b a member; ops's creator
+  // b demoted to member and c its owner; qa's creator c gone, d a member.
+  first.db.close();
+  const raw = new Database(path);
+  raw.exec("DROP TABLE role_bindings");
+  const role = (team: string, email: string, r: string | null) => raw.run("UPDATE team_members SET role = ? WHERE team_id = (SELECT id FROM teams WHERE name = ?) AND user_id = (SELECT id FROM users WHERE email = ?)", [r, team, email]);
+  role("eng", "a@example.com", null); role("eng", "b@example.com", "member"); role("eng", "d@example.com", "owner");
+  role("ops", "b@example.com", "member"); role("ops", "c@example.com", "owner");
+  role("qa", "d@example.com", "member");
+  raw.close();
+  const owners = (db: Database) => db.query("SELECT p.name AS holder, s.name AS team, b.granted_by FROM role_bindings b JOIN principals p ON p.id = b.principal_id JOIN principals s ON s.id = b.scope_id WHERE b.role = 'team_owner' ORDER BY s.name, p.name").all();
+  const second = openDatabase(path, { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
+  try {
+    expect(owners(second.db)).toEqual([
+      { holder: "a@example.com", team: "eng", granted_by: null },
+      { holder: "d@example.com", team: "eng", granted_by: null },
+      { holder: "c@example.com", team: "ops", granted_by: null },
+    ]);
+  } finally { second.db.close(); }
+  const raw2 = new Database(path);
+  raw2.run("DELETE FROM role_bindings WHERE principal_id = (SELECT id FROM principals WHERE name = 'd@example.com')");
+  raw2.close();
+  const third = openDatabase(path, { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
+  try {
+    expect(owners(third.db).map(r => (r as { holder: string }).holder)).toEqual(["a@example.com", "c@example.com"]);
+  } finally { third.db.close(); }
+});
+
 test("schema: a v1.0.0-shaped database (no idp_subject) comes out stamped with Google's issuer", () => {
   const path = scratchDbPath();
   const raw = new Database(path);
@@ -820,14 +860,14 @@ test("#807 P1c-10: team writes run on the handle they're given", async () => {
   const { kept, t, a, b } = await seed(repo, async tx => {
     const a = await repo.users.upsertByEmail(tx, "a@example.com", null), b = await repo.users.upsertByEmail(tx, "b@example.com", null);
     const t = await repo.teams.create(tx, "ops", a.id);
-    await repo.teams.addMember(tx, t.id, a.id, "owner");
+    await repo.teams.addMember(tx, t.id, a.id);
+    await grantOwner(repo, tx, "ops", "a@example.com");
     return { kept: tx, t, a, b };
   });
   const settled = /used after its transaction settled/;
   await expect(repo.teams.create(kept, "dev", a.id)).rejects.toThrow(settled);
   await expect(repo.teams.addMember(kept, t.id, b.id)).rejects.toThrow(settled);
   await expect(repo.teams.removeMember(kept, t.id, a.id)).rejects.toThrow(settled);
-  await expect(repo.teams.setRole(kept, t.id, a.id, "member")).rejects.toThrow(settled);
   await expect(repo.teams.setPolicy(kept, t.id, "collaborative")).rejects.toThrow(settled);
   await expect(repo.teams.addMember({} as Tx, t.id, b.id)).rejects.toThrow("not a SQLite store handle");
   expect((await repo.teams.findByName(repo.read, "dev"))).toBeUndefined();
@@ -1460,7 +1500,7 @@ test("#807 P3 B5b1: a team follow refuses an alias that can't see the team board
     await repo.users.upsertByEmail(tx, "b@example.com", null);
     await repo.aliases.create(tx, person("b@example.com", "be"), "b@example.com");
     const team = await repo.teams.create(tx, "crew", a.id);
-    await repo.teams.addMember(tx, team.id, a.id, "owner");
+    await repo.teams.addMember(tx, team.id, a.id);
     return team;
   });
   await expect(seed(repo, tx => onTeamJoined(repo, tx, team, "b@example.com"))).rejects.toThrow("no such board #crew; see board_list");

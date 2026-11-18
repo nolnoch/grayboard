@@ -1116,7 +1116,7 @@ teamCmd
 
 const adminCmd = program
   .command("admin")
-  .description("Admin commands (emails in the server's GRAYBOARD_ADMINS only; all actions are logged)");
+  .description("Admin commands (org admins: the server's GRAYBOARD_ADMINS and org_admin role holders; all actions are logged)");
 
 adminCmd
   .command("revoke-session")
@@ -1152,6 +1152,51 @@ adminCmd
   .action(async (opts: { email: string }) => {
     try { output(await makeClient().post("/api/admin/unlink-idp", { email: opts.email }), globalJson()); }
     catch (e) { handleApiError(e); }
+  });
+
+// Role bindings (#927): who holds org_admin, team_owner or service_invoke, granted and revoked at runtime.
+type RoleRow = { id: number | null; principal: string; role: string; scope: string | null; granter?: string | null; source: string };
+const roleLine = (b: RoleRow) => `${b.role}${b.scope ? ` on ${b.scope}` : ""}: ${b.principal}${b.source === "bootstrap" ? " (GRAYBOARD_ADMINS)" : ` (binding ${b.id}${b.granter ? `, granted by ${b.granter}` : ""})`}`;
+const roleCmd = adminCmd.command("role").description("Grant, revoke and list role bindings: org_admin (whole server), team_owner (--scope <team>), service_invoke (--scope <service>)");
+
+for (const verb of ["grant", "revoke"] as const) {
+  roleCmd
+    .command(`${verb} <role> <principal>`)
+    .description(verb === "grant" ? "Grant a role to a user (by email)" : "Revoke a role binding")
+    .option("--scope <name>", "The team or service the role is held on")
+    .action(async (role: string, principal: string, opts: { scope?: string }) => {
+      try {
+        const r = await makeClient().post(`/api/admin/roles/${verb}`, { role, principal, ...(opts.scope ? { scope: opts.scope } : {}) }) as { binding?: RoleRow; revoked?: RoleRow; created?: boolean; note?: string; warning?: string };
+        if (globalJson()) { output(r, true); return; }
+        if (r.binding) console.log(`${r.created ? "granted" : "already held"}: ${roleLine({ ...r.binding, source: "binding" })}`);
+        if (r.revoked) console.log(`revoked: ${roleLine({ ...r.revoked, source: "binding" })}`);
+        if (r.note) console.log(`note: ${r.note}`);
+        if (r.warning) console.error(`warning: ${r.warning}`);
+      } catch (e) { handleApiError(e); }
+    });
+}
+
+roleCmd
+  .command("list")
+  .description("List role bindings, GRAYBOARD_ADMINS first")
+  .option("--role <role>", "Only this role")
+  .option("--principal <name>", "Only this holder")
+  .option("--scope <name>", "Only this team or service")
+  .action(async (opts: { role?: string; principal?: string; scope?: string }) => {
+    try {
+      const client = makeClient();
+      const rows: RoleRow[] = [];
+      for (let after: number | null = null;;) {
+        const q = new URLSearchParams({ ...opts, ...(after !== null ? { after: String(after) } : {}) } as Record<string, string>);
+        const page = await client.get(`/api/admin/roles?${q}`) as { bindings: RoleRow[]; next: number | null };
+        rows.push(...page.bindings);
+        if (page.next === null) break;
+        after = page.next;
+      }
+      if (globalJson()) { output({ bindings: rows }, true); return; }
+      if (!rows.length) { console.log("no role bindings"); return; }
+      for (const b of rows) console.log(roleLine(b));
+    } catch (e) { handleApiError(e); }
   });
 
 program.parseAsync(process.argv);

@@ -149,46 +149,22 @@ test("owners promote and demote; the last owner can't leave, be removed or demot
   // A sole owner who is the sole member may leave.
   expect((await api(bob, "POST", "/api/teams/eng/leave")).status).toBe(200);
 
-  const changes = srv.app.db.query("SELECT actor, detail FROM access_log WHERE action = 'team.role_changed' ORDER BY rowid").all();
+  // Ownership changes are role bindings' rows (#927 R6), the creator's grant first.
+  const changes = srv.app.db.query("SELECT actor, action, target, json_extract(detail, '$.role') AS role, json_extract(detail, '$.scope') AS scope FROM access_log WHERE action LIKE 'role.%' ORDER BY id").all();
   expect(changes).toEqual([
-    { actor: "alice@example.com", detail: '{"member":"bob@example.com","role":"owner","from":"member"}' },
-    { actor: "bob@example.com", detail: '{"member":"alice@example.com","role":"member","from":"owner"}' },
+    { actor: "alice@example.com", action: "role.granted", target: "alice@example.com", role: "team_owner", scope: "eng" },
+    { actor: "alice@example.com", action: "role.granted", target: "bob@example.com", role: "team_owner", scope: "eng" },
+    { actor: "bob@example.com", action: "role.revoked", target: "alice@example.com", role: "team_owner", scope: "eng" },
+    { actor: "bob@example.com", action: "role.revoked", target: "bob@example.com", role: "team_owner", scope: "eng" },
   ]);
-});
-
-// Rows written before roles existed carry no role: the creator reads as the
-// owner and keeps it when another is promoted; anyone else is a member, and
-// a team whose creator already left is the admins' to manage.
-test("a team from before roles: its creator owns it, per row", async () => {
-  await restart({ admins: ["root@example.com"] });
-  const root = await login("root@example.com");
-  const alice = await login("alice@example.com");
-  const bob = await login("bob@example.com");
-  const carol = await login("carol@example.com");
-  for (const name of ["eng", "ops"]) {
-    await api(alice, "POST", "/api/teams", { name });
-    await api(alice, "POST", `/api/teams/${name}/add`, { email: "bob@example.com" });
-  }
-  await seed(srv.app.repo, () => { srv.app.db.run("UPDATE team_members SET role = NULL"); });
-
-  expect((await api(bob, "POST", "/api/teams/eng/add", { email: "carol@example.com" })).status).toBe(403);
-  expect((await api(alice, "POST", "/api/teams/eng/add", { email: "bob@example.com", role: "owner" })).status).toBe(200);
-  const roles = (await api(alice, "GET", "/api/teams/eng/members")).body.map((m: { email: string; role: string }) => [m.email, m.role]).sort();
-  expect(roles).toEqual([["alice@example.com", "owner"], ["bob@example.com", "owner"]]);
-
-  // ops: the creator left before roles; nobody owns it, so bob can't manage
-  // it, and leaving isn't guarded; an admin can.
-  await seed(srv.app.repo, () => { srv.app.db.run("DELETE FROM team_members WHERE team_id = (SELECT id FROM teams WHERE name = 'ops') AND user_id = (SELECT id FROM users WHERE email = 'alice@example.com')"); });
-  expect((await api(bob, "POST", "/api/teams/ops/add", { email: "carol@example.com" })).status).toBe(403);
-  expect((await api(root, "POST", "/api/teams/ops/add", { email: "carol@example.com", role: "owner" })).status).toBe(200);
-  expect((await api(carol, "POST", "/api/teams/ops/remove", { email: "bob@example.com" })).status).toBe(200);
+  expect(srv.app.db.query("SELECT COUNT(*) AS n FROM access_log WHERE action = 'team.role_changed'").get()).toEqual({ n: 0 });
 });
 
 test("admin routes: refused for non-admins and when no admins are configured", async () => {
   const alice = await login("alice@example.com");
   await login("bob@example.com");
   const none = await api(alice, "POST", "/api/admin/disable-user", { email: "bob@example.com" });
-  expect(none).toMatchObject({ status: 403, body: { code: "forbidden", message: expect.stringContaining("GRAYBOARD_ADMINS") } });
+  expect(none).toMatchObject({ status: 403, body: { code: "forbidden", message: "alice@example.com is not an org admin" } });
 
   await restart({ admins: ["alice@example.com"] });
   const admin = await login("alice@example.com");
@@ -289,7 +265,7 @@ test("an admin can manage a team they're not in, e.g. after its last member left
     .query("SELECT actor, action, detail FROM access_log WHERE action LIKE 'team.member_%' AND actor = 'root@example.com'")
     .all();
   expect(audit).toEqual([
-    { actor: "root@example.com", action: "team.member_added", detail: '{"member":"bob@example.com","role":"member","as_admin":true}' },
+    { actor: "root@example.com", action: "team.member_added", detail: '{"member":"bob@example.com","as_admin":true}' },
     { actor: "root@example.com", action: "team.member_removed", detail: '{"member":"bob@example.com","as_admin":true}' },
   ]);
 });
