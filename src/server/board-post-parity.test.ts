@@ -1,7 +1,7 @@
 // The server's board_post (#807 P3 B5b2b) gives core's answers: postGateOn then serverPost, as handleBoardPost runs
 // them, return core callBoardTool's board_post result or refusal and leave its rows (posts, outbox, claims, claim
 // events and watches, subscriptions, attachment bindings), over the shared parity fixture extended with live sessions,
-// a muted thread, a queue board with lanes (a viewer's and an opted-out one among them), held and lapsed queue claims,
+// a muted thread, a thread a human wrote in, a queue board with lanes (a viewer's and an opted-out one among them), a held queue claim and one since deleted,
 // and uploads, for callers bound and unbound, a cross-user writer, humans and a child session.
 import { beforeEach, expect, test } from "bun:test";
 import { attachmentIds, insertUpload } from "../core/attachments.ts";
@@ -55,6 +55,8 @@ beforeEach(async () => {
     REPLY = post(core, `${E}/be`, "general", "a reply", ROOT).post.id;
     post(core, `${W}/be`, "general", "me too", ROOT);
     muteThread(core, `${W}/be`, "general", ROOT, true);
+    // bob's human wrote in it too: neither parent nor root author, so only the human mark wakes it on a reply.
+    post(core, `${B}/human`, "general", "human weighs in", ROOT);
     PLAN = post(core, `${W}/be`, "eng", "eng plan").post.id;
     createBoard(core, `${W}/be`, "attic", "old");
     ATTIC = post(core, `${W}/be`, "attic", "last").post.id;
@@ -112,7 +114,7 @@ const CALLS = (): Record<string, unknown>[] => [
   { board: "general", body: "@human hi" }, { board: "general", body: "@nobody hi" },
   { board: "eng", body: "plan b" }, { board: "eng", body: `@${D}/be you?` }, { board: "eng", body: "@deploy go" }, { board: "ops", body: "@deploy page" },
   { board: "attic", body: "revive" }, { board: "attic", body: "late reply", parent_id: ATTIC },
-  { board: "q", body: "work item" }, { board: "q", body: "@qa take this" }, { board: "q", body: `@${E}/be take this` }, { board: "q", body: "@be @deploy both" }, { board: "q", body: `@${B}/be @${E}/be both` },
+  { board: "q", body: "work item" }, { board: "q", body: "@qa take this" }, { board: "q", body: `@${E}/be take this` }, { board: "q", body: "@be @deploy both" }, { board: "q", body: `@${B}/be @${E}/be both` }, { board: "q", body: `@${B}/human take` },
   { board: "q", body: `@${TAIL_ID} you?` }, { board: "q", body: "done", parent_id: QPOST }, { board: "q", body: "late", parent_id: QLATE }, { board: "q", body: `@${UNKNOWN_ID} x` },
   { board: "general", body: "@eng/deploy hi" }, { board: "q", body: "@eng/deploy take" },
   { board: "engq", body: `@${D}/be you?` }, { board: "engq", body: "work" },
@@ -221,6 +223,8 @@ test("board_post gives core's answers and leaves its rows, for every caller and 
   const reply = call("eve", { board: "general", body: "reply", parent_id: ROOT }).out.value!;
   expect(reply.wake).toContain(`${B}/be`);
   expect(reply.wake).not.toContain(`${W}/be`);
+  // bob's human is neither parent nor root author of bob's reply: only the human mark wakes it (eve may not reach it).
+  expect(call("bob", { board: "general", body: "reply", parent_id: ROOT }).out.value!.wake).toContain(`${B}/human`);
   expect(call("eve", { board: "general", body: `@${W}/be look`, parent_id: ROOT }).out.value!.wake).toContain(`${W}/be`);
   // Queue rotation: one lane, never the poster, the viewer tail or the opted-out qa; the claim and its take event.
   const rot = call("wade", { board: "q", body: "work item" });
@@ -232,6 +236,10 @@ test("board_post gives core's answers and leaves its rows, for every caller and 
   const two = call("wade", { board: "q", body: `@${B}/be @${E}/be both` });
   expect(two.out.value!.wake.sort()).toEqual([`${B}/be`, `${E}/be`]);
   expect(JSON.stringify(two.rows.claims)).not.toContain(`queue:q:${two.out.value!.result.post_id}`);
+  // A human named on a queue board is woken but holds no claim (#219: only an agent takes a mention claim).
+  const human = call("wade", { board: "q", body: `@${B}/human take` });
+  expect(human.out.value!.wake).toEqual([`${B}/human`]);
+  expect(JSON.stringify(human.rows.claims)).not.toContain(`queue:q:${human.out.value!.result.post_id}`);
   // bob's reply acks his claim and its watch goes; the lapsed one has nothing to ack.
   const ack = call("bob", { board: "q", body: "done", parent_id: QPOST }).rows;
   expect(JSON.stringify(ack.claims)).not.toContain(`queue:q:${QPOST}`);

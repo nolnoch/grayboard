@@ -400,7 +400,10 @@ describe("dedup and state answers (in process)", () => {
     await be.call("board_create", { name: "e2e", purpose: "files" });
     const a = (await srv.uploadAs(you, "be", "a.md", "a")).body.id as number;
     const b = (await srv.uploadAs(you, "be", "b.md", "b")).body.id as number;
-    const lost = spyOn(srv.app.repo.boards, "bindAttachments").mockImplementation(async () => {
+    // The store binds the first upload, then finds the second taken.
+    const bind = srv.app.repo.boards.bindAttachments.bind(srv.app.repo.boards);
+    const lost = spyOn(srv.app.repo.boards, "bindAttachments").mockImplementation(async (tx, _ids, from, postId, limits) => {
+      await bind(tx, [a], from, postId, limits);
       throw new CoreError(`attachment ${b} isn't an unsent upload of yours`);
     });
     try {

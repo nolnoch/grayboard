@@ -328,7 +328,7 @@ test("#807 P3 B5b1b: the ported board tools and the actor pick read and write th
   const groups = {
     boards: [
       "views", "openSummaries", "roster", "get", "post", "create", "setArchived", "setSubscription", "read", "threadRoot", "mute",
-      "insertPost", "bindAttachments", "authorAddresses", "subscribers", "threadFacts", "laneRows", "claimQueuePost", "insertOutbox",
+      "insertPost", "authorAddresses", "subscribers", "threadFacts", "laneRows", "claimQueuePost", "insertOutbox",
     ],
     bindings: ["viewerIds", "idFacts", "setStatus", "setQueueParticipation"],
     aliases: ["isHuman", "scopesOf", "humansAmong"],

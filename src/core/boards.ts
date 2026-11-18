@@ -1050,13 +1050,6 @@ export function postPreChecks(
   if (files.ids.length && !files.send) throw new CoreError("this mode can't post files");
 }
 
-// post()'s access checks alone, for a caller that must refuse before a
-// deduplicated write replays a first answer (#296): a repeat to a board the
-// caller has since lost is refused, not replayed.
-export function checkPostAccess(db: Database, handle: string, boardInput: string, parentId: number | null): void {
-  postGate(db, handle, boardInput, parentId);
-}
-
 // Inserts the post and queues pushes for handles that can see the board.
 // Returns the handles that should be woken; delivery is the caller's job. A
 // reply wakes the author of the post it answers and the thread's starter;
