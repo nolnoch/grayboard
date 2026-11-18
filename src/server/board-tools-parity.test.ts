@@ -358,7 +358,7 @@ test("board_archive answers a lost conditional update as the repeat it now is, r
   const wade = serverCtx(CALLERS[0]!);
   const stubbed = (setArchived: Repo["boards"]["setArchived"]): Repo => ({ ...repo, boards: { ...repo.boards, setArchived } });
   const archive = (r: Repo) => inBodyBoards(tx => outcomeAsync(() => callBoardTool(r, access, tx, `${W}/be`, "board_archive", { board: "general" }, wade)));
-  // Eve's archive commits between wade's read and his update.
+  // Eve's archive commits between wade's read and wade's update.
   let calls = 0;
   const lost = await archive(stubbed(async (tx, name, _by, now) => { calls++; await repo.boards.setArchived(tx, name, `${E}/be`, now); return null; }));
   expect(calls).toBe(1);
