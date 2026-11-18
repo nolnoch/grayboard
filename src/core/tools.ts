@@ -7,6 +7,8 @@ import {
   archiveBoard,
   canSeeBoard,
   createBoard,
+  createdNote,
+  createRepeats,
   getBoard,
   listBoards,
   muteThread,
@@ -396,21 +398,21 @@ export function channelInstructions(source: string): string[] {
 }
 
 // Tool args arrive as untrusted JSON (from an MCP client, or over the wire).
-function str(a: Record<string, unknown>, k: string): string {
+export function str(a: Record<string, unknown>, k: string): string {
   const v = a[k];
   if (typeof v !== "string") throw new CoreError(`${k} must be a string`);
   return v;
 }
-function optStr(a: Record<string, unknown>, k: string): string | undefined {
+export function optStr(a: Record<string, unknown>, k: string): string | undefined {
   return a[k] === undefined || a[k] === null ? undefined : str(a, k);
 }
-function optBool(a: Record<string, unknown>, k: string): boolean | undefined {
+export function optBool(a: Record<string, unknown>, k: string): boolean | undefined {
   const v = a[k];
   if (v === undefined || v === null) return undefined;
   if (typeof v !== "boolean") throw new CoreError(`${k} must be a boolean`);
   return v;
 }
-function optNum(a: Record<string, unknown>, k: string): number | undefined {
+export function optNum(a: Record<string, unknown>, k: string): number | undefined {
   const v = a[k];
   if (v === undefined || v === null) return undefined;
   if (typeof v !== "number" || !Number.isFinite(v)) throw new CoreError(`${k} must be a number`);
@@ -457,6 +459,37 @@ export type ToolContext = {
   reader?: BoardPredicate;
 };
 
+/** peer_status's arguments, checked in its order: the queue flag, then the text (read, not yet cleaned). */
+export function peerStatusArgs(a: Record<string, unknown>, handle: string): { text: string; queue?: "on" | "off" } {
+  const queue = optStr(a, "queue");
+  if (queue !== undefined && queue !== "on" && queue !== "off") {
+    throw new CoreError(`queue must be "on" or "off"`);
+  }
+  // The opt-out is a name's flag (#284 S13); an ID leaves a rotation by leaving push (#340 2).
+  if (queue !== undefined && addressParts(handle)?.kind === "id") {
+    throw new CoreError(`queue opt-out is a name's; bind(name) first, or board_subscribe(board, "quiet") to leave that board's rotation`);
+  }
+  return { text: str(a, "text"), ...(queue !== undefined ? { queue } : {}) };
+}
+
+/**
+ * board_subscribe's arguments: with `thread`, mode must be off (mute) or push (unmute); the board is read as given.
+ * The mode itself is checked by the write (setSubscription), after the board's visibility.
+ */
+export function subscribeArgs(a: Record<string, unknown>): { board: string; mode: SubMode | "off"; thread?: number } {
+  const mode = str(a, "mode") as SubMode | "off";
+  const thread = optNum(a, "thread");
+  if (thread !== undefined && mode !== "off" && mode !== "push") {
+    throw new CoreError('with thread, mode is "off" (mute its replies) or "push" (unmute)');
+  }
+  return { board: str(a, "board"), mode, ...(thread !== undefined ? { thread } : {}) };
+}
+
+export const muteText = (board: string, root: number, muted: boolean): string =>
+  `ok: #${normalizeBoard(board)} thread ${root} ${muted ? "muted (@mentions still reach you)" : "unmuted"}`;
+
+export const subscribedText = (board: string, mode: SubMode | "off"): string => `ok: #${board.replace(/^#/, "").toLowerCase()} → ${mode}`;
+
 export function callBoardTool(
   db: Database,
   handle: string,
@@ -482,11 +515,8 @@ export function callBoardTool(
       // treats success as a fresh create.
       const name = normalizeBoard(str(a, "name"));
       const mine = ctx.human ? undefined : getBoard(db, name);
-      if (
-        mine && !mine.archived_at && mine.created_by === handle && mine.scope === scope && (mine.kind ?? "broadcast") === (kind ?? "broadcast") &&
-        mine.purpose === str(a, "purpose").trim() && canSeeBoard(db, handle, name)
-      ) {
-        return { result: { ...mine, note: `you created #${name} at ${new Date(mine.created_at).toISOString()}` }, wake: [] };
+      if (createRepeats(mine, handle, scope, kind, () => str(a, "purpose")) && canSeeBoard(db, handle, name)) {
+        return { result: createdNote(mine), wake: [] };
       }
       const b = createBoard(db, handle, str(a, "name"), str(a, "purpose"), scope, { kind });
       return { result: b, wake: [], boards: [b.name] };
@@ -541,32 +571,20 @@ export function callBoardTool(
     }
 
     case "peer_status": {
-      const queue = optStr(a, "queue");
-      if (queue !== undefined && queue !== "on" && queue !== "off") {
-        throw new CoreError(`queue must be "on" or "off"`);
-      }
-      // The opt-out is a name's flag (#284 S13); an ID leaves a rotation by leaving push (#340 2).
-      if (queue !== undefined && addressParts(handle)?.kind === "id") {
-        throw new CoreError(`queue opt-out is a name's; bind(name) first, or board_subscribe(board, "quiet") to leave that board's rotation`);
-      }
-      setStatus(db, handle, str(a, "text"));
+      const { text, queue } = peerStatusArgs(a, handle);
+      setStatus(db, handle, text);
       if (queue !== undefined) setQueueParticipation(db, handle, queue === "on");
       return { result: "ok", wake: [] };
     }
 
     case "board_subscribe": {
-      const mode = str(a, "mode") as SubMode | "off";
-      const thread = optNum(a, "thread");
-      if (thread !== undefined) {
-        if (mode !== "off" && mode !== "push") {
-          throw new CoreError('with thread, mode is "off" (mute its replies) or "push" (unmute)');
-        }
-        const root = muteThread(db, handle, str(a, "board"), thread, mode === "off");
-        const state = mode === "off" ? "muted (@mentions still reach you)" : "unmuted";
-        return { result: `ok: #${normalizeBoard(str(a, "board"))} thread ${root} ${state}`, wake: [] };
+      const s = subscribeArgs(a);
+      if (s.thread !== undefined) {
+        const root = muteThread(db, handle, s.board, s.thread, s.mode === "off");
+        return { result: muteText(s.board, root, s.mode === "off"), wake: [] };
       }
-      subscribe(db, handle, str(a, "board"), mode);
-      return { result: `ok: #${str(a, "board").replace(/^#/, "").toLowerCase()} → ${mode}`, wake: [] };
+      subscribe(db, handle, s.board, s.mode);
+      return { result: subscribedText(s.board, s.mode), wake: [] };
     }
 
     case "peer_list": {
