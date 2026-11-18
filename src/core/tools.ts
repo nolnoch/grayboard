@@ -541,22 +541,7 @@ export function callBoardTool(
         optNum(a, "parent_id") ?? null,
         { online: ctx.online, author_id: ctx.session, author_user: ctx.user, via: ctx.via, addresses: ctx.addresses, attachments: { ids: attachmentIds(a.attachment_ids), send: ctx.files }, strictIds: true },
       );
-      const isViewer = viewers(db);
-      // The result names only recipients the poster may see exist (#348).
-      const seen = (hs: string[]) => seenHandles(db, ctx.session ?? handle, hs);
-      const shownDeferred = seen(deferred);
-      // A mention of a name the poster may not see exists reads as one that matched nobody, in its place (#871);
-      // delivery is unchanged: a post's result shows no per-recipient state, unlike a DM's, which is refused (#1014).
-      const missed = new Set(unresolved);
-      const shownUnresolved = mentionTokens(str(a, "body")).filter((t) => missed.has(t) || seen([t]).length === 0);
-      const result: BoardPostResult = {
-        post_id: p.id,
-        board: p.board,
-        ...(p.attachments ? { attachments: p.attachments } : {}),
-        notified: seen(wake.filter((h) => !isViewer(h))),
-        ...(shownDeferred.length ? { deferred: shownDeferred } : {}),
-        ...(shownUnresolved.length ? { unresolved: shownUnresolved } : {}),
-      };
+      const result = boardPostResult(p, { wake, deferred, unresolved }, str(a, "body"), viewers(db), (hs) => seenHandles(db, ctx.session ?? handle, hs));
       return { result, wake, boards: [p.board] };
     }
 
@@ -629,4 +614,30 @@ export function callBoardTool(
       return { result: listClaims(db, optStr(a, "prefix"), ctx.reader ?? handle, ctx.session ?? handle), wake: [] };
   }
   throw new CoreError(`unknown tool: ${name}`);
+}
+
+/**
+ * board_post's answer from post's: the result names only recipients the poster may see exist (#348), through `seen`
+ * (seenHandles' filter, order kept), and no viewers among those notified.
+ */
+export function boardPostResult(
+  p: Post,
+  out: { wake: string[]; deferred: string[]; unresolved: string[] },
+  body: string,
+  isViewer: (h: string) => boolean,
+  seen: (handles: string[]) => string[],
+): BoardPostResult {
+  const shownDeferred = seen(out.deferred);
+  // A mention of a name the poster may not see exists reads as one that matched nobody, in its place (#871);
+  // delivery is unchanged: a post's result shows no per-recipient state, unlike a DM's, which is refused (#1014).
+  const missed = new Set(out.unresolved);
+  const shownUnresolved = mentionTokens(body).filter((t) => missed.has(t) || seen([t]).length === 0);
+  return {
+    post_id: p.id,
+    board: p.board,
+    ...(p.attachments ? { attachments: p.attachments } : {}),
+    notified: seen(out.wake.filter((h) => !isViewer(h))),
+    ...(shownDeferred.length ? { deferred: shownDeferred } : {}),
+    ...(shownUnresolved.length ? { unresolved: shownUnresolved } : {}),
+  };
 }

@@ -846,8 +846,24 @@ export function queueLanes(
   opts: { online?: (handle: string) => boolean } = {},
 ): string[] {
   const a = access(db);
-  const isViewer = viewers(db);
-  const rows = (
+  return orderLanes(queueLaneRows(db, b.name, poster), viewers(db), (h) => a.canSee(h, b), opts.online);
+}
+
+/** queueLanes' judgment over its rows, kept in their rotation order: no viewers, only lanes that may see the board, live first. */
+export function orderLanes(
+  rows: string[],
+  isViewer: (h: string) => boolean,
+  sees: (h: string) => boolean,
+  online?: (h: string) => boolean,
+): string[] {
+  const lanes = rows.filter((h) => !isViewer(h) && sees(h));
+  if (!online) return lanes;
+  return [...lanes.filter((h) => online(h)), ...lanes.filter((h) => !online(h))];
+}
+
+/** queueLanes' rows before any judgment: the board's lanes less `poster`, least-recently-woken first. */
+export function queueLaneRows(db: Database, board: string, poster: string[]): string[] {
+  return (
     db
       .prepare(
         `WITH lanes AS (
@@ -864,13 +880,8 @@ export function queueLanes(
              COALESCE((SELECT MAX(p2.created_at) FROM outbox o2 JOIN posts p2 ON p2.id = o2.post_id
                        WHERE o2.handle = l.lane AND p2.board = ?1), 0)), 0) ASC NULLS FIRST, l.lane ASC`,
       )
-      .all(b.name, JSON.stringify(poster)) as { handle: string }[]
-  )
-    .map((r) => r.handle)
-    .filter((h) => !isViewer(h) && a.canSee(h, b));
-  if (!opts.online) return rows;
-  const live = rows.filter((h) => opts.online!(h));
-  return [...live, ...rows.filter((h) => !opts.online!(h))];
+      .all(board, JSON.stringify(poster)) as { handle: string }[]
+  ).map((r) => r.handle);
 }
 
 // The claim IS the delivery: the picked lane holds the post until it acks (a
@@ -881,17 +892,18 @@ export function queueLanes(
 // rotation. The claim records the lane's session's user (#855), so a reply the
 // bus writes when it ends unclaimed is that user's. Caller is inside post's transaction.
 // `push: false`: the caller queues the lane's push itself (a mention's, #219).
-function claimQueuePost(
-  db: Database, board: string, p: Post, lane: string, now: number, { note = "queue post", push = true }: { note?: string; push?: boolean } = {},
-): void {
-  const key = `queue:${board}:${p.id}`;
+// Returns whether this run took the claim (false: a row already held the key).
+export function claimQueuePost(
+  db: Database, board: string, postId: number, lane: string, now: number, { note = "queue post", push = true }: { note?: string; push?: boolean } = {},
+): boolean {
+  const key = `queue:${board}:${postId}`;
   const expires = now + QUEUE_CLAIM_TTL_MS;
   // Redelivery to a lane that already had this post resets its push, so the
   // re-offer actually reaches it (at-least-once).
   if (push) db.prepare(
     `INSERT INTO outbox (handle, post_id, reason, wake) VALUES (?, ?, 'subscription', 1)
      ON CONFLICT(handle, post_id) DO UPDATE SET delivered_at = NULL, wake = 1`,
-  ).run(lane, p.id);
+  ).run(lane, postId);
   const res = db
     .prepare(
       `INSERT OR IGNORE INTO claims (key, holder, note, board, acquired_at, expires_at, holder_user)
@@ -903,7 +915,9 @@ function claimQueuePost(
   // this run isn't the lane's delivery and must not read as one in the
   // audit - the lane's reply-ack checks the claim's holder, not the outbox
   // (#192 review).
-  if (res.changes > 0) logEvent(db, "take", lane, { key, note, board, expires_at: expires }, now);
+  if (res.changes === 0) return false;
+  logEvent(db, "take", lane, { key, note, board, expires_at: expires }, now);
+  return true;
 }
 
 // The note on a redelivery's take event: release() reads it to tell a
@@ -914,13 +928,19 @@ export const REDELIVERED_NOTE = "queue post (redelivered)";
 // session's ID and the aliases that session holds (#284 S5); for a child's
 // post (#523), its root's ID and holds, the addresses the child acted under.
 function postAddresses(db: Database, postId: number): string[] {
+  const p = db.prepare(`SELECT author, author_id FROM posts WHERE id = ?`).get(postId) as { author: string; author_id: string | null } | undefined;
+  return p ? authorAddresses(db, p.author, p.author_id) : [];
+}
+
+/** postAddresses over a post's author and author_id, for a post not yet written or not read back. */
+export function authorAddresses(db: Database, author: string, authorId: string | null): string[] {
   return (db.prepare(
-    `SELECT p.author AS a FROM posts p WHERE p.id = ?1
-     UNION SELECT p.author_id FROM posts p WHERE p.id = ?1 AND p.author_id IS NOT NULL
-     UNION SELECT h.address FROM posts p JOIN alias_holds h ON h.id = p.author_id WHERE p.id = ?1
-     UNION SELECT i.root_id FROM posts p JOIN ids i ON i.id = p.author_id WHERE p.id = ?1 AND i.root_id IS NOT NULL
-     UNION SELECT h.address FROM posts p JOIN ids i ON i.id = p.author_id JOIN alias_holds h ON h.id = i.root_id WHERE p.id = ?1`,
-  ).all(postId) as { a: string }[]).map((r) => r.a);
+    `SELECT ?1 AS a
+     UNION SELECT ?2 WHERE ?2 IS NOT NULL
+     UNION SELECT h.address FROM alias_holds h WHERE h.id = ?2
+     UNION SELECT i.root_id FROM ids i WHERE i.id = ?2 AND i.root_id IS NOT NULL
+     UNION SELECT h.address FROM ids i JOIN alias_holds h ON h.id = i.root_id WHERE i.id = ?2`,
+  ).all(author, authorId) as { a: string }[]).map((r) => r.a);
 }
 
 // A queue post's claim ended (TTL lapse in sweepIn, or a decline in release):
@@ -952,7 +972,7 @@ export function redeliverQueuePost(db: Database, key: string, prevHolder: string
   for (const h of [...held]) held.add((laneOf.get(h) as { lane: string }).lane);
   const lane = queueLanes(db, b, postAddresses(db, p.id)).find((h) => !held.has(h));
   if (!lane) return { board: b.name, postId: p.id, held: takers };
-  claimQueuePost(db, b.name, p, lane, now, { note: REDELIVERED_NOTE });
+  claimQueuePost(db, b.name, p.id, lane, now, { note: REDELIVERED_NOTE });
   return { lane };
 }
 
@@ -963,25 +983,64 @@ export function redeliverQueuePost(db: Database, key: string, prevHolder: string
 // Throws CoreError; writes nothing.
 function postGate(db: Database, handle: string, boardInput: string, parentId: number | null, allowArchived = false) {
   const b = visibleBoard(db, handle, boardInput);
+  const a = access(db);
+  const gate = postGateRule(
+    b, parentId, allowArchived, a.announceBoard, () => getPost(db, parentId!), () => isHuman(db, handle),
+  );
+  return { b, a, ...gate };
+}
+
+/** What a post's gate decided, past a visible board: whether the board is the announce board, whether the poster is
+ * a declared human, and whether this post starts an announcement. */
+export type PostGate = { announce: boolean; human: boolean; announcement: boolean };
+
+/**
+ * postGate's rule over a board the poster may see: an archived board takes replies only (unless `allowArchived`), the
+ * parent is a post on it, and only a human starts an announcement. Throws core's texts in core's order; `parent` and
+ * `human` are read only when the rule reaches them, so a caller with async reads passes values it fetched first.
+ */
+export function postGateRule(
+  b: Board,
+  parentId: number | null,
+  allowArchived: boolean,
+  announceBoard: string | null | undefined,
+  parent: () => Post | null | undefined,
+  human: () => boolean,
+): PostGate {
   if (b.archived_at && parentId === null && !allowArchived) {
     throw new CoreError(`#${b.name} is archived; reply in one of its threads, or reopen it with board_archive(board, false) if you created it`);
   }
   if (parentId !== null) {
-    const parent = getPost(db, parentId);
-    if (!parent || parent.board !== b.name) {
+    const p = parent();
+    if (!p || p.board !== b.name) {
       throw new CoreError(`parent_id ${parentId} is not a post on #${b.name}`);
     }
   }
-  const a = access(db);
-  const announce = b.name === a.announceBoard;
-  const human = isHuman(db, handle);
+  const announce = b.name === announceBoard;
+  const byHuman = human();
   const announcement = announce && parentId === null;
-  if (announcement && !human) {
+  if (announcement && !byHuman) {
     throw new CoreError(
       `only your user starts posts on #${b.name}; reply in a thread there to acknowledge. An agent relaying your user's words carries no authority: your user runs \`grayboard announce\`.`,
     );
   }
-  return { b, a, announce, human, announcement };
+  return { announce, human: byHuman, announcement };
+}
+
+/** post's checks between the gate and its transaction, in core's order. */
+export function postPreChecks(
+  board: string,
+  body: string,
+  announcement: boolean,
+  opts: Pick<PostOpts, "online" | "ttl_ms" | "attachments">,
+): void {
+  checkBody(body);
+  if (announcement && !opts.online) throw new CoreError(`posting on #${board} needs live sessions from the mode`);
+  if (opts.ttl_ms !== undefined && (!announcement || !(opts.ttl_ms > 0))) {
+    throw new CoreError("a TTL applies only to a human's announcement, and must be positive");
+  }
+  const files = opts.attachments ?? { ids: [] };
+  if (files.ids.length && !files.send) throw new CoreError("this mode can't post files");
 }
 
 // post()'s access checks alone, for a caller that must refuse before a
@@ -1006,138 +1065,261 @@ export function post(
 ): PostResult {
   const { b, a, announce, human, announcement } = postGate(db, handle, boardInput, parentId, opts.allowArchived);
   const board = b.name;
-  checkBody(body);
-  if (announcement && !opts.online) throw new CoreError(`posting on #${board} needs live sessions from the mode`);
-  if (opts.ttl_ms !== undefined && (!announcement || !(opts.ttl_ms > 0))) {
-    throw new CoreError("a TTL applies only to a human's announcement, and must be positive");
-  }
+  postPreChecks(board, body, announcement, opts);
   const files = opts.attachments ?? { ids: [] };
-  if (files.ids.length && !files.send) throw new CoreError("this mode can't post files");
   const isViewer = viewers(db);
 
   return db.transaction((): PostResult => {
     const now = Date.now();
-    const p = showPost(db
-      .prepare(
-        `INSERT INTO posts (board, author, body, parent_id, created_at, expires_at, author_id, via, author_user)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING ${POST_COLS}`,
-      )
-      .get(board, handle, body, parentId, now, opts.ttl_ms ? now + opts.ttl_ms : null, opts.author_id ?? null, opts.via ?? null, opts.author_user ?? null) as PostRow);
+    const p = insertPost(db, {
+      board, author: handle, body, parentId, now, expiresAt: opts.ttl_ms ? now + opts.ttl_ms : null,
+      authorId: opts.author_id ?? null, via: opts.via ?? null, authorUser: opts.author_user ?? null,
+    });
     const { send } = files;
     const attachments = send ? bindAttachments(db, files.ids, { addresses: opts.addresses ?? [handle], principal: send.principal }, { post_id: p.id }, send.limits) : [];
     // Nobody is told of, or handed, their own post: the poster's address set,
     // and the writing session's own (its ID and holds; a child's root's, #523),
     // which a caller passing no address set (a claim announcement) leaves out.
-    const own = [...new Set([...(opts.addresses ?? [handle]), ...postAddresses(db, p.id)])];
+    const own = [...new Set([...(opts.addresses ?? [handle]), ...authorAddresses(db, handle, opts.author_id ?? null)])];
+    const strict = opts.strictIds === true;
+    const viewer = opts.author_id ?? handle;
+    const branch = postBranch(b, parentId, announcement);
+    const sees = (h: string) => a.canSee(h, b);
+    const facts: PostTargetFacts = {
+      board: b, handle, parentId, strict, gate: { announce, human, announcement }, own,
+      ackAddresses: opts.addresses ?? [handle], isViewer, isHuman: (h) => isHuman(db, h), sees,
+      mentions: { handles: [], unresolved: [] },
+    };
+    if (branch === "queue") {
+      facts.mentions = resolveMentions(db, body, handle, b, strict, viewer);
+      facts.seenMentioned = seenHandles(db, viewer, facts.mentions.handles);
+      if (needsRotation(facts.seenMentioned)) {
+        facts.lanes = orderLanes(queueLaneRows(db, board, own), isViewer, sees, opts.online);
+      }
+    } else {
+      facts.subs = subscriberRows(db, board);
+      if (branch === "announcement") {
+        facts.live = liveAddresses(db);
+        facts.online = opts.online;
+      } else if (branch === "thread") {
+        facts.thread = threadFacts(db, parentId!);
+        facts.reaches = (h) => !a.mayReach || a.mayReach(handle, h);
+      }
+      facts.mentions = resolveMentions(db, body, handle, b, strict, viewer);
+    }
+    const plan = planPostTargets(facts);
+    if (plan.claim) claimQueuePost(db, board, p.id, plan.claim.lane, now, { note: plan.claim.note, push: plan.claim.push });
+    if (plan.ack) ackQueueClaim(db, plan.ack.addresses, plan.ack.key, now);
+    insertOutbox(db, p.id, plan.targets);
+    return {
+      post: attachments.length ? { ...p, attachments } : p,
+      ...postWakes(plan.targets),
+      unresolved: plan.unresolved,
+    };
+  })();
+}
 
-    // Highest-priority reason wins per handle: mention > thread > subscription.
-    type Target = { reason: "mention" | "thread" | "subscription"; wake: boolean };
-    const targets = new Map<string, Target>();
+/** Who a post reaches and why. Highest-priority reason wins per handle: mention > thread > subscription. */
+export type PostTarget = { reason: "mention" | "thread" | "subscription"; wake: boolean };
+
+/** Which of post's four target rules a post follows. */
+export type PostBranch = "queue" | "announcement" | "thread" | "broadcast";
+
+/**
+ * A queue-kind board delivers each top-level post to exactly ONE subscriber: the claim IS the delivery. An archived
+ * queue board takes no new work (#635): a claim's [release] or [expired] post landing there is a broadcast, never a
+ * delivery. Replies follow thread semantics.
+ */
+export function postBranch(b: Board, parentId: number | null, announcement: boolean): PostBranch {
+  if (announcement) return "announcement";
+  if (parentId !== null) return "thread";
+  return !b.archived_at && (b.kind ?? "broadcast") === "queue" ? "queue" : "broadcast";
+}
+
+/** Whether a queue post goes to the rotation: no mention the author may see exists named anyone (#219, #871). */
+export const needsRotation = (seenMentioned: string[]): boolean => seenMentioned.length === 0;
+
+/**
+ * Everything post's targeting reads, read and judged already. Predicates may be lazy (core) or set lookups (a caller
+ * that read them first). The branch's own fields are required where `postBranch` says it runs: the queue branch needs
+ * `seenMentioned` and, when `needsRotation`, `lanes`; every other branch needs `subs`; an announcement `live` and
+ * `online`; a reply `thread` and `reaches`.
+ */
+export type PostTargetFacts = {
+  board: Board;
+  handle: string;
+  parentId: number | null;
+  strict: boolean;
+  gate: PostGate;
+  // The poster's address set and its writing session's (authorAddresses): never a target.
+  own: string[];
+  // Whose queue claim a reply acks: the caller's address set, not `own`.
+  ackAddresses: string[];
+  isViewer: (h: string) => boolean;
+  isHuman: (h: string) => boolean;
+  // May see the board (access canSee).
+  sees: (h: string) => boolean;
+  // resolveMentions' answer, token order: handles that may see the board, and tokens that matched nobody.
+  mentions: { handles: string[]; unresolved: string[] };
+  subs?: { handle: string; mode: SubMode }[];
+  live?: string[];
+  online?: (h: string) => boolean;
+  thread?: ThreadFacts;
+  // The poster may reach (access mayReach; always true where the mode has no such rule).
+  reaches?: (h: string) => boolean;
+  seenMentioned?: string[];
+  lanes?: string[];
+};
+
+/** What post writes once its row exists: outbox rows in this order, a queue claim, a queue ack. */
+export type PostPlan = {
+  targets: [string, PostTarget][];
+  claim: { lane: string; note: "queue post" | "queue post (mentioned)"; push: boolean } | null;
+  ack: { key: string; addresses: string[] } | null;
+  unresolved: string[];
+};
+
+function need<T>(v: T | undefined, what: string): T {
+  if (v === undefined) throw new Error(`planPostTargets: ${what} missing`);
+  return v;
+}
+
+/**
+ * post's targeting rules, over facts read first. Map order is load-bearing: it is the outbox's insert order and
+ * wake/deferred's, and `Map.set` on a present key keeps its slot (a mentioned subscriber stays where it was).
+ */
+export function planPostTargets(f: PostTargetFacts): PostPlan {
+  const { board: b, gate } = f;
+  const branch = postBranch(b, f.parentId, gate.announcement);
+  const targets = new Map<string, PostTarget>();
+  let claim: PostPlan["claim"] = null;
+  if (branch === "queue") {
+    // A resolved @mention is direct addressing (it bypasses the rotation); with none, the rotation picks the
+    // least-recently-woken eligible subscriber and claims the post (TTL takeover releases it to the next wake).
+    for (const m of f.mentions.handles) targets.set(m, { reason: "mention", wake: true });
+    // A mention the poster may not see exists routes as one that matched nobody (#871): a lane still gets
+    // the post, so whether a team's name exists shows neither in who was notified nor in a queue claim.
+    const seen = need(f.seenMentioned, "seenMentioned");
+    // One agent addressed by name holds the post like a rotated lane (#219): its reply acks, its decline or
+    // lapse redelivers through the rotation. Only an author's own words (strictIds): a system post's `cc @watcher`
+    // isn't work. Exactly one visible name, and it no human, viewer or poster's own address: one claim names
+    // one agent, and only agents hold queue work. Subscription and opt-out govern the rotation, not a name.
+    const agents = seen.filter((h) => !f.own.includes(h) && !f.isHuman(h) && !f.isViewer(h));
+    if (f.strict && seen.length === 1 && agents.length === 1) {
+      claim = { lane: agents[0]!, note: "queue post (mentioned)", push: false };
+    }
+    if (needsRotation(seen)) {
+      // Eligible lanes, least-recently-woken first, live lanes preferred: a
+      // post claimed by an offline lane would sit for the full TTL while
+      // live lanes idle (#192 review).
+      const picked = need(f.lanes, "lanes")[0];
+      if (picked) {
+        targets.set(picked, { reason: "subscription", wake: true });
+        claim = { lane: picked, note: "queue post", push: true };
+      }
+      // No eligible subscriber: the post sits on the board (readable there)
+      // until a lane subscribes; documented v1 behavior.
+    }
+  } else {
     // The announce board ignores agents' subscriptions (viewers like `tail`
     // still get it): an announcement reaches the sessions live now, as a
     // mention so it doesn't read as subscribed traffic, and an agent's ack
-    // reaches only the announcer, not every earlier acker.
-    const subs = (
-      db.prepare(`SELECT handle, mode FROM subscriptions WHERE board = ?`).all(board) as {
-        handle: string;
-        mode: SubMode;
-      }[]
-    ).filter((s) => a.canSee(s.handle, b) && (!announce || isViewer(s.handle)));
-    // A queue-kind board delivers each top-level post to exactly ONE
-    // subscriber: the claim IS the delivery. A resolved @mention is direct
-    // addressing (it bypasses the rotation; one named agent holds the claim,
-    // #219); with none, the rotation picks the
-    // least-recently-woken eligible subscriber and claims the post (TTL
-    // takeover releases it to the next wake). Replies follow thread semantics
-    // and release the claimer's claim.
-    // An archived queue board takes no new work (#635): a claim's [release]
-    // or [expired] post landing there is a broadcast, never a delivery.
-    const queue = !announcement && parentId === null && !b.archived_at && (b.kind ?? "broadcast") === "queue";
-    let unresolved: string[] = [];
-    if (queue) {
-      const { handles: mentioned, unresolved: u } = resolveMentions(db, body, handle, b, opts.strictIds === true, opts.author_id ?? handle);
-      unresolved = u;
-      for (const m of mentioned) targets.set(m, { reason: "mention", wake: true });
-      // A mention the poster may not see exists routes as one that matched nobody (#871): a lane still gets
-      // the post, so whether a team's name exists shows neither in who was notified nor in a queue claim.
-      const seen = seenHandles(db, opts.author_id ?? handle, mentioned);
-      // One agent addressed by name holds the post like a rotated lane (#219): its reply acks, its decline or
-      // lapse redelivers through the rotation. Only an author's own words (strictIds): a system post's `cc @watcher`
-      // isn't work. Exactly one visible name, and it no human, viewer or poster's own address: one claim names
-      // one agent, and only agents hold queue work. Subscription and opt-out govern the rotation, not a name.
-      const agents = seen.filter((h) => !own.includes(h) && !isHuman(db, h) && !isViewer(h));
-      if (opts.strictIds === true && seen.length === 1 && agents.length === 1) {
-        claimQueuePost(db, board, p, agents[0]!, now, { note: "queue post (mentioned)", push: false });
-      }
-      if (seen.length === 0) {
-        // Eligible lanes, least-recently-woken first, live lanes preferred: a
-        // post claimed by an offline lane would sit for the full TTL while
-        // live lanes idle (#192 review).
-        const picked = queueLanes(db, b, own, { online: opts.online })[0];
-        if (picked) {
-          targets.set(picked, { reason: "subscription", wake: true });
-          claimQueuePost(db, board, p, picked, now);
-        }
-        // No eligible subscriber: the post sits on the board (readable there)
-        // until a lane subscribes; documented v1 behavior.
-      }
-    } else {
-      // The announce board ignores agents' subscriptions (viewers like `tail`
-      // still get it): an announcement reaches the sessions live now, as a
-      // mention so it doesn't read as subscribed traffic, and an agent's ack
-      // reaches only the announcer, not every earlier acker. A queue board's
-      // subscribers are LANES, not audience: replies follow thread semantics
-      // only, so one lane's work chatter doesn't wake the whole fleet.
-      const queueBoard = (b.kind ?? "broadcast") === "queue";
-      for (const s of subs)
-        if (s.mode === "push" && !queueBoard) targets.set(s.handle, { reason: "subscription", wake: true });
-      if (announcement) {
-        for (const h of liveAddresses(db)) {
-          if (!isViewer(h) && opts.online!(h) && a.canSee(h, b)) targets.set(h, { reason: "mention", wake: true });
-        }
-      } else if (parentId !== null) {
-        const root = threadRoot(db, parentId);
-        const authors = announce && !human ? [getPost(db, root)!.author] : threadAuthors(db, root);
-        const direct = new Set([getPost(db, parentId)!.author, getPost(db, root)!.author]);
-        for (const author of authors) {
-          if (!a.canSee(author, b) || (a.mayReach && !a.mayReach(handle, author))) continue;
-          // Your user's replies wake the whole thread; a push-mode subscriber
-          // still gets every post as it lands.
-          const wake = human || direct.has(author) || isHuman(db, author) || targets.get(author)?.wake === true;
-          targets.set(author, { reason: "thread", wake });
-        }
-        // Muting drops thread and subscription pushes; the mention pass below
-        // runs after this, so an @mention still lands.
-        const muted = db.prepare(`SELECT handle FROM thread_mutes WHERE root_id = ?`).all(root) as { handle: string }[];
-        for (const m of muted) targets.delete(m.handle);
-      }
-      const { handles: mentioned, unresolved: u } = resolveMentions(db, body, handle, b, opts.strictIds === true, opts.author_id ?? handle);
-      unresolved = u;
-      for (const m of mentioned) targets.set(m, { reason: "mention", wake: true });
+    // reaches only the announcer, not every earlier acker. A queue board's
+    // subscribers are LANES, not audience: replies follow thread semantics
+    // only, so one lane's work chatter doesn't wake the whole fleet.
+    const queueBoard = (b.kind ?? "broadcast") === "queue";
+    for (const s of need(f.subs, "subs")) {
+      if (!f.sees(s.handle) || (gate.announce && !f.isViewer(s.handle))) continue;
+      if (s.mode === "push" && !queueBoard) targets.set(s.handle, { reason: "subscription", wake: true });
     }
-    // A queue-board reply by the claim holder acks the work: the claim
-    // releases with an ack note, so the handled post's audit chain ends in a
-    // release instead of an expire (#192 review). Another lane's reply leaves
-    // the holder on the hook. No redelivery: handled is handled.
-    if (parentId !== null && (b.kind ?? "broadcast") === "queue") {
-      ackQueueClaim(db, opts.addresses ?? [handle], `queue:${board}:${threadRoot(db, parentId)}`, now);
+    if (branch === "announcement") {
+      const online = need(f.online, "online");
+      for (const h of need(f.live, "live")) {
+        if (!f.isViewer(h) && online(h) && f.sees(h)) targets.set(h, { reason: "mention", wake: true });
+      }
+    } else if (branch === "thread") {
+      const t = need(f.thread, "thread");
+      const reaches = need(f.reaches, "reaches");
+      const authors = gate.announce && !gate.human ? [t.rootAuthor] : t.authors;
+      const direct = new Set([t.parentAuthor, t.rootAuthor]);
+      for (const author of authors) {
+        if (!f.sees(author) || !reaches(author)) continue;
+        // Your user's replies wake the whole thread; a push-mode subscriber
+        // still gets every post as it lands.
+        const wake = gate.human || direct.has(author) || f.isHuman(author) || targets.get(author)?.wake === true;
+        targets.set(author, { reason: "thread", wake });
+      }
+      // Muting drops thread and subscription pushes; the mention pass below
+      // runs after this, so an @mention still lands.
+      for (const m of t.muted) targets.delete(m);
     }
-    for (const a of own) targets.delete(a);
+    for (const m of f.mentions.handles) targets.set(m, { reason: "mention", wake: true });
+  }
+  // A queue-board reply by the claim holder acks the work: the claim
+  // releases with an ack note, so the handled post's audit chain ends in a
+  // release instead of an expire (#192 review). Another lane's reply leaves
+  // the holder on the hook. No redelivery: handled is handled.
+  const ack = f.parentId !== null && (b.kind ?? "broadcast") === "queue"
+    ? { key: `queue:${b.name}:${need(f.thread, "thread").root}`, addresses: f.ackAddresses }
+    : null;
+  for (const a of f.own) targets.delete(a);
+  return { targets: [...targets], claim, ack, unresolved: f.mentions.unresolved };
+}
 
-    const ins = db.prepare(
-      `INSERT INTO outbox (handle, post_id, reason, wake) VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING`,
-    );
-    for (const [h, t] of targets) ins.run(h, p.id, t.reason, t.wake ? 1 : 0);
+/** A plan's targets as post's result names them. Digest subscribers aren't woken: their notice rides with their next wake. */
+export function postWakes(targets: [string, PostTarget][]): { wake: string[]; deferred: string[] } {
+  return {
+    wake: targets.filter(([, t]) => t.wake).map(([h]) => h),
+    deferred: targets.filter(([, t]) => !t.wake).map(([h]) => h),
+  };
+}
 
-    // Digest subscribers aren't woken: their notice rides with their next wake.
-    const all = [...targets];
-    return {
-      post: attachments.length ? { ...p, attachments } : p,
-      wake: all.filter(([, t]) => t.wake).map(([h]) => h),
-      deferred: all.filter(([, t]) => !t.wake).map(([h]) => h),
-      unresolved,
-    };
-  })();
+/** Writes a post's row. */
+export function insertPost(
+  db: Database,
+  p: {
+    board: string; author: string; body: string; parentId: number | null; now: number; expiresAt: number | null;
+    authorId: string | null; via: string | null; authorUser: string | null;
+  },
+): Post {
+  return showPost(db
+    .prepare(
+      `INSERT INTO posts (board, author, body, parent_id, created_at, expires_at, author_id, via, author_user)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING ${POST_COLS}`,
+    )
+    .get(p.board, p.author, p.body, p.parentId, p.now, p.expiresAt, p.authorId, p.via, p.authorUser) as PostRow);
+}
+
+/** A board's subscriptions, unjudged, by handle. */
+export function subscriberRows(db: Database, board: string): { handle: string; mode: SubMode }[] {
+  return db.prepare(`SELECT handle, mode FROM subscriptions WHERE board = ? ORDER BY handle`).all(board) as {
+    handle: string;
+    mode: SubMode;
+  }[];
+}
+
+/** What a reply's targeting reads of its thread: the root, its authors (the reply's own among them once written),
+ * the parent's and root's authors, and who muted it. */
+export type ThreadFacts = { root: number; authors: string[]; parentAuthor: string; rootAuthor: string; muted: string[] };
+
+/** threadFacts of a reply to `parentId`, a post that exists. */
+export function threadFacts(db: Database, parentId: number): ThreadFacts {
+  const root = threadRoot(db, parentId);
+  return {
+    root,
+    authors: threadAuthors(db, root),
+    parentAuthor: getPost(db, parentId)!.author,
+    rootAuthor: getPost(db, root)!.author,
+    muted: (db.prepare(`SELECT handle FROM thread_mutes WHERE root_id = ?`).all(root) as { handle: string }[]).map((m) => m.handle),
+  };
+}
+
+/** A plan's outbox rows, in its order; a row already there stays as it is. */
+export function insertOutbox(db: Database, postId: number, targets: [string, PostTarget][]): void {
+  const ins = db.prepare(
+    `INSERT INTO outbox (handle, post_id, reason, wake) VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING`,
+  );
+  for (const [h, t] of targets) ins.run(h, postId, t.reason, t.wake ? 1 : 0);
 }
 
 function threadAuthors(db: Database, postId: number): string[] {
@@ -1149,7 +1331,7 @@ function threadAuthors(db: Database, postId: number): string[] {
            SELECT id, author FROM posts WHERE id = ?
            UNION ALL
            SELECT p.id, p.author FROM posts p JOIN t ON p.parent_id = t.id
-         ) SELECT DISTINCT author FROM t`,
+         ) SELECT author FROM t GROUP BY author ORDER BY MIN(id)`,
       )
       .all(rootId) as { author: string }[]
   ).map((r) => r.author);
