@@ -215,8 +215,11 @@ describe("a service session (D4)", () => {
     expect(await s.bind("w-1")).toMatchObject({ name: "w-1" });
     expect(await s.call("whoami")).toMatchObject({ principal: SVC, primary: `${SVC}/w-1` });
     expect(srv.app.db.query("SELECT scope_kind, scope_ref, name FROM aliases WHERE scope_ref = ?").all(SVC)).toEqual([{ scope_kind: "service", scope_ref: SVC, name: "w-1" }]);
-    for (const name of [`${A}/x`, "eng/x", "other/x"]) {
-      expect(await refusedText(s.call("bind", { name, create: true })), name).toContain(`${SVC} is a service; it acts only in its own scope; bind a bare name`);
+    expect(await refusedText(s.call("bind", { name: `${A}/x`, create: true }))).toContain(`${SVC} is a service; it acts only in its own scope; bind a bare name`);
+    // A team's or another service's scope reads as one that doesn't exist (#1240): the refusal names no existing scope.
+    for (const scope of ["eng", "other"]) {
+      expect(await refusedText(s.call("bind", { name: `${scope}/x`, create: true })), scope).toBe(await refusedText(s.call("bind", { name: "nosuch/x", create: true })).then(t => t.replaceAll("nosuch", scope)));
+      expect(await refusedText(s.call("bind", { name: `${scope}/human`, create: true })), scope).toBe(await refusedText(s.call("bind", { name: "nosuch/human", create: true })).then(t => t.replaceAll("nosuch", scope)));
     }
     expect(await refusedText(s.call("bind", { name: "human", create: true }))).toContain("reserved");
     await srv.app.revalidate();

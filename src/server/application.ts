@@ -484,7 +484,11 @@ async function bindTarget(hub: Hub, r: Read, authed: AuthedUser, input: string):
   if (!d.allow && d.rule === "alias.human_reserved") return { code: "forbidden", error: HUMAN_RESERVED, address, authz: { req, d } };
   // A team reads as missing to a non-member (#1020), and a service's scope to any user (#270 D1): the refusal
   // aliasScope gives a scope nobody owns.
-  if (!d.allow && (d.rule === "scope.team_member" || d.rule === "scope.service")) return { code: "not_found", error: `"${address}": no team or service is named "${t.scope_ref}"`, address, authz: { req, d } };
+  // A service outside its own scope gets the same for a team's or another service's (#1240): its refusal must not
+  // tell it which names exist. A person scope needs no such cover: aliasScope never checks that one exists.
+  if (!d.allow && (d.rule === "scope.team_member" || d.rule === "scope.service" || (d.rule === "scope.own_service" && t.scope_kind !== "person"))) {
+    return { code: "not_found", error: `"${address}": no team or service is named "${t.scope_ref}"`, address, authz: { req, d } };
+  }
   const hint = authed.kind === "service" ? "bind a bare name, which lands in your service's scope" : "bind a name in your own scope, or in a team's you belong to";
   if (!d.allow) return { code: "forbidden", error: `you can't act as "${address}": ${d.reason}; ${hint}`, address, authz: { req, d } };
   return { address, scope: t };
