@@ -737,7 +737,7 @@ async function adminRoleRevoke(req: Request, authed: AuthedUser, repo: Repo, con
   const spec = roleSpec(await parseBody(req));
   if (!("role" in spec)) return jsonErr(spec.code, spec.message, spec.status);
   await testPauseAsync("http:admin-role-revoke:before-write");
-  const bootstrap = config.admins.includes(spec.holder);
+  const bootstrap = bootstrapAdmins(config).includes(spec.holder);
   return repo.write(async tx => {
     const out = await revokeRole(repo, tx, spec, { email: authed.user_email, userId: authed.user_id, authority: authorityOf(gate) }, bootstrap);
     if ("refused" in out) return refusedResponse(out);
@@ -750,6 +750,10 @@ async function adminRoleRevoke(req: Request, authed: AuthedUser, repo: Repo, con
     return json({ revoked: out.binding, ...said });
   });
 }
+
+// The GRAYBOARD_ADMINS entries that can be admins: emails. An entry that isn't one names no user; a service's name
+// never is one, and the admin rule refuses a service before it reads the list (#270 D1), so neither is listed.
+const bootstrapAdmins = (config: Config): string[] => config.admins.filter(e => isValidEmail(e));
 
 // The bindings, filtered by role, holder and scope, a page at a time by id (principle 13). GRAYBOARD_ADMINS emails
 // are listed first, on the first page, with no id and source "bootstrap", whether or not they have signed in.
@@ -769,7 +773,7 @@ async function adminRoleList(url: URL, repo: Repo, config: Config): Promise<Resp
   const size = Math.min(Math.max(Number(limit ?? ROLE_PAGE), 1), ROLE_PAGE);
   const page = await repo.roles.list(repo.read, filter, Number(after ?? 0), size);
   const bootstrap = after === null && (filter.role ?? "org_admin") === "org_admin" && filter.scope === undefined
-    ? config.admins.filter(e => filter.principal === undefined || e === filter.principal).map(e => ({ id: null, principal: e, role: "org_admin", scope: null, source: "bootstrap" }))
+    ? bootstrapAdmins(config).filter(e => filter.principal === undefined || e === filter.principal).map(e => ({ id: null, principal: e, role: "org_admin", scope: null, source: "bootstrap" }))
     : [];
   return json({
     bindings: [...bootstrap, ...page.map(b => ({ ...b, source: "binding" }))],
@@ -815,6 +819,8 @@ async function adminServiceCreate(req: Request, authed: AuthedUser, repo: Repo, 
           throw e;
         }
         for (const owner of owners) {
+          // A disabled owner answers for nothing: a service created with one starts orphaned (what disable-user reports).
+          if ((await repo.users.findByEmail(sp, owner))?.disabled_at != null) throw new Refused(conflict(`${owner} is disabled; a service's owners must be enabled users`));
           const out = await grantRole(repo, sp, { holder: owner, role: "service_owner", scope: name }, granter);
           if ("refused" in out) throw new Refused(refusedResponse(out));
         }

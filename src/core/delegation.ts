@@ -158,19 +158,24 @@ function optField(raw: unknown, name: string, max: number): string | undefined {
 // locally, the declared human. Reachability decides the rest: on a server
 // that's real Slack reachability passed in from the mode (the hub knows; a
 // last_seen row isn't reachability); locally, having connected at least
-// once (the bridge is woken by the socket). null when there isn't one.
+// once (the bridge is woken by the socket). null when there isn't one, as for a
+// server's service principal (#270 D1): its name is no email, and it has no human.
 function humanFallbackHandle(
   facts: DelegationFacts,
   requester: string,
   principal: string | null,
   reachable: (h: string) => boolean,
 ): string | null {
+  if (principal !== null && !hasHuman(principal)) return null;
   const candidates = principal !== null ? [formatDirectAddress(principal, HUMAN_NAME)] : facts.humanHandles();
   for (const h of candidates) {
     if (h !== requester && reachable(h)) return h;
   }
   return null;
 }
+
+// A server principal with a human: a user, whose name is an email. A service's name never is (#270 D1).
+const hasHuman = (principal: string): boolean => principal.includes("@");
 
 export type Delegation = { to: string; body: string; humanFallback?: true };
 
@@ -258,6 +263,7 @@ export function resolveDelegationWith(
 
   const human = humanFallbackHandle(facts, requester, principal, (h) => (humanReachable ? humanReachable(h) : facts.lastSeen(h) !== null));
   if (human) return { to: human, body: humanFallbackBody(brief), humanFallback: true };
+  if (principal !== null && !hasHuman(principal)) throw new CoreError(`no live launcher session of service ${principal} (a session started with BUS_LAUNCHER=1), and a service has no human to fall back to; start one or pass to`);
   throw new CoreError("no live launcher session (a session started with BUS_LAUNCHER=1) and no reachable human to fall back to; start one or pass to");
 }
 

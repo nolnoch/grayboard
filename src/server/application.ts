@@ -1562,14 +1562,15 @@ async function resolvePeer(repo: Repo, r: Read, from: string, input: string, vie
   return fail("not_found", `${which}; peer_list shows exact handles`);
 }
 
-// Whether `address` is a team's alias that `viewer` (a session ID, else the acting address) may not see exists: to
-// anyone outside the team its names read as missing (alias.see, #348), for mail too (#1014). Only a team's: a
-// service's agents take mail from anyone in the org (vision.md principle 9).
-async function teamAliasHidden(repo: Repo, r: Read, viewer: string, address: string): Promise<boolean> {
+// Whether `address` is a team's or a service's alias that `viewer` (a session ID, else the acting address) may not
+// see exists: to anyone outside the team its names read as missing (alias.see, #348), for mail too (#1014); a
+// service's names are its own until #270's invocation step names who else sees them (D4), so a user's mail to one
+// reads like mail to a missing name. A person's names are an open directory.
+async function aliasHidden(repo: Repo, r: Read, viewer: string, address: string): Promise<boolean> {
   const a = await repo.aliases.find(r, address);
-  if (a?.scope_kind !== "team" || a.scope_ref === null) return false;
+  if (!a || a.scope_kind === "person" || a.scope_ref === null) return false;
   const vp = await repo.principals.of(r, viewer);
-  return vp === null || !(await authorize(repo, r, {}, { verb: "alias.see", principal: vp, scope: { scope_kind: "team", scope_ref: a.scope_ref } })).allow;
+  return vp === null || !(await authorize(repo, r, {}, { verb: "alias.see", principal: vp, scope: { scope_kind: a.scope_kind, scope_ref: a.scope_ref } })).allow;
 }
 
 // A send checked and resolved, ready to write: `from` the address it goes
@@ -1623,7 +1624,7 @@ async function prepareSend(
     const parent = await repo.messages.getById(r, parentId);
     return participant(parent, session.addresses) && replyPeer(parent, session.addresses) === address;
   }
-  if (to.kind === "alias" && (!(await repo.aliases.find(r, to.address)) || ((await teamAliasHidden(repo, r, session.sessionId || from, to.address)) && !(await replyingTo(to.address))))) {
+  if (to.kind === "alias" && (!(await repo.aliases.find(r, to.address)) || ((await aliasHidden(repo, r, session.sessionId || from, to.address)) && !(await replyingTo(to.address))))) {
     fail("not_found", `identity "${to.address}" not found; peer_list shows exact handles`);
   }
   const req: AuthzRequest = { verb: "msg.send", from, to: to.address };
@@ -1826,8 +1827,8 @@ async function handleDelegate(hub: Hub, tx: Tx, session: ApplicationSession, m: 
   const reachDecision = async (h: Tx, to: string, recheck = false): Promise<Reach> => {
     // A team's alias this session may not see reads as one nobody has (#1014), before any grant is judged. A replay
     // named it while it could: it says why it can't be replayed, not that the name never connected.
-    if (await teamAliasHidden(repo, h, session.sessionId || session.primary, to)) {
-      return { result: { refused: recheck ? `"${to}" is a team's alias this session may no longer see, so the first delegation can't be replayed` : neverConnected(to) } };
+    if (await aliasHidden(repo, h, session.sessionId || session.primary, to)) {
+      return { result: { refused: recheck ? `"${to}" is a team's or service's alias this session may no longer see, so the first delegation can't be replayed` : neverConnected(to) } };
     }
     // On a replay, a person's human is that person's, though no session holds it (the Slack bridge's connection has
     // none), so a human-fallback delegation is rechecked rather than refused as unheld (#1030). A fresh call naming a
