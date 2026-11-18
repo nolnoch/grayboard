@@ -25,7 +25,7 @@ import { authorize, recordDecision, type Actor, type AuthzRequest, type Decision
 import { serverAuditSink, writeAudit } from "./audit.ts";
 import type { AuthedUser } from "./auth.ts";
 import {
-  age, checkBody, checkPostAccess, parseAliasMeta, pendingKey, refOf,
+  age, checkBody, parseAliasMeta, pendingKey, refOf,
   cleanFact, idCollisionText, normalizeBoard, getBoard,
   type AliasMetaSet, type Board, type CoreDb, type PendingRef, type ReadResult, type SnapshotOptions, type UnboundPeer,
 } from "../core/boards.ts";
@@ -34,7 +34,8 @@ import { CoreError } from "../core/errors.ts";
 import { countRefusal } from "./metrics.ts";
 import type { Principal } from "../core/resolver.ts";
 import { coreRefusalCode, Undeliverable } from "../core/session_end.ts";
-import { callBoardTool as coreCallBoardTool, claimsInstruction, isBoardTool, type ToolContext, type BoardPostResult } from "../core/tools.ts";
+import { claimsInstruction, isBoardTool, type ToolContext, type BoardPostResult } from "../core/tools.ts";
+import { postGateOn, serverPost } from "./board_post.ts";
 import { attachmentIds, type Uploader } from "../core/attachments.ts";
 import type { AttachmentLimits } from "../shared/attachments.ts";
 import { expiryTimer } from "../core/claims.ts";
@@ -1990,11 +1991,12 @@ async function handleBoardPost(hub: Hub, tx: Tx, session: ApplicationSession, me
     const parentId = postArgs.parent_id ?? null;
     if (parentId !== null && typeof parentId !== "number") throw new CoreError("parent_id must be a number");
     // Before the write is deduplicated: access is re-checked on a repeat, so a caller who has lost the board is refused, not replayed (#296).
-    checkPostAccess(repo.coreOn(tx), me, postArgs.board, parentId);
+    // Its board is reused inside the savepoint: the same transaction, so the same row (b5b2 Decision 9).
+    const { board, gate } = await postGateOn(repo, hub.access, tx, me, postArgs.board, parentId);
     const fp = { board: normalizeBoard(postArgs.board), body: postArgs.body, parent_id: parentId, attachments: await repo.attachments.unsentDigests(tx, ids, uploaderOf(session)) };
-    out = await writeOnce(hub, tx, session, "board_post", me, fp, resend === true, ids, sp => {
-      const o = coreCallBoardTool(repo.coreOn(sp), me, "board_post", postArgs, ctx);
-      const r = o.result as BoardPostResult;
+    out = await writeOnce(hub, tx, session, "board_post", me, fp, resend === true, ids, async sp => {
+      const o = await serverPost(repo, hub.access, sp, me, board, gate, postArgs, ctx);
+      const r = o.result;
       for (const a of r.attachments ?? []) writeAudit(repo, sp, "attachment.bound", session.authed.user_email, `attachment:${a.id}`, { identity: me, post_id: r.post_id, board: r.board });
       return { payload: r, ref: { kind: "post", id: r.post_id } satisfies WriteRef, wake: o.wake };
     });

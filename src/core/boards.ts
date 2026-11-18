@@ -338,6 +338,13 @@ export function isHuman(db: Database, handle: string): boolean {
   return !!(db.prepare(`SELECT human FROM aliases WHERE address = ?`).get(handle) as { human: number | null } | undefined)?.human;
 }
 
+/** Of `handles`, those that are a declared human's (isHuman for each, one statement). */
+export function humansAmong(db: Database, handles: string[]): Set<string> {
+  if (!handles.length) return new Set();
+  return new Set((db.prepare(`SELECT address FROM aliases WHERE human = 1 AND address IN (SELECT value FROM json_each(?))`)
+    .all(JSON.stringify([...new Set(handles)])) as { address: string }[]).map((r) => r.address));
+}
+
 /** Declared human handles. */
 export function humanHandles(db: Database): string[] {
   return (db.prepare(`SELECT address FROM aliases WHERE human = 1 ORDER BY address`).all() as { address: string }[]).map((r) => r.address);
@@ -1043,13 +1050,6 @@ export function postPreChecks(
   if (files.ids.length && !files.send) throw new CoreError("this mode can't post files");
 }
 
-// post()'s access checks alone, for a caller that must refuse before a
-// deduplicated write replays a first answer (#296): a repeat to a board the
-// caller has since lost is refused, not replayed.
-export function checkPostAccess(db: Database, handle: string, boardInput: string, parentId: number | null): void {
-  postGate(db, handle, boardInput, parentId);
-}
-
 // Inserts the post and queues pushes for handles that can see the board.
 // Returns the handles that should be woken; delivery is the caller's job. A
 // reply wakes the author of the post it answers and the thread's starter;
@@ -1274,14 +1274,14 @@ export function postWakes(targets: [string, PostTarget][]): { wake: string[]; de
   };
 }
 
+/** A post's row before it's written. */
+export type NewPost = {
+  board: string; author: string; body: string; parentId: number | null; now: number; expiresAt: number | null;
+  authorId: string | null; via: string | null; authorUser: string | null;
+};
+
 /** Writes a post's row. */
-export function insertPost(
-  db: Database,
-  p: {
-    board: string; author: string; body: string; parentId: number | null; now: number; expiresAt: number | null;
-    authorId: string | null; via: string | null; authorUser: string | null;
-  },
-): Post {
+export function insertPost(db: Database, p: NewPost): Post {
   return showPost(db
     .prepare(
       `INSERT INTO posts (board, author, body, parent_id, created_at, expires_at, author_id, via, author_user)

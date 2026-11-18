@@ -6,9 +6,9 @@ import { mkdirSync } from "node:fs";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { dirname } from "node:path";
 
-import { acknowledge, aliasScopeRows, insertBoard, isHuman, readRows, setArchived, setMute, threadRoot, type AliasScopeRow, type ReadResult, ALIAS_SESSION_SQL, boardViewRows, openSummaryRows, setQueueParticipation, whoRows, writeStatus, type BoardSummary, type BoardView, type UnboundFacts, type WhoRow, ensureBoard, forgetHandle, isSubscribed, markHuman, prunePosts, setSubscription, unsubscribeScope, type SubMode, catalogPage, getBoard, getPost, HOLD_ORDER, lastSeen, pendingDigests, pendingPushes, snapshotPage, type Board, type BoardSnapshot, type DigestRow, type PendingRef, type PushRow, type SnapshotOptions, pruneEndedIds, registerId, setAccess, setAliasMeta, setIdFacts, setPlace, touchAlias, touchId, type AliasMetaSet, type CoreDb, type IdFacts, type IdSessionFacts, type ReusedId } from "../core/boards.ts";
+import { acknowledge, aliasScopeRows, authorAddresses, claimQueuePost, humansAmong, insertOutbox, insertPost, queueLaneRows, subscriberRows, threadFacts, type NewPost, type PostTarget, type ThreadFacts, insertBoard, isHuman, readRows, setArchived, setMute, threadRoot, type AliasScopeRow, type ReadResult, ALIAS_SESSION_SQL, boardViewRows, openSummaryRows, setQueueParticipation, whoRows, writeStatus, type BoardSummary, type BoardView, type UnboundFacts, type WhoRow, ensureBoard, forgetHandle, isSubscribed, markHuman, prunePosts, setSubscription, unsubscribeScope, type SubMode, catalogPage, getBoard, getPost, HOLD_ORDER, lastSeen, pendingDigests, pendingPushes, snapshotPage, type Board, type BoardSnapshot, type DigestRow, type PendingRef, type PushRow, type SnapshotOptions, pruneEndedIds, registerId, setAccess, setAliasMeta, setIdFacts, setPlace, touchAlias, touchId, type AliasMetaSet, type CoreDb, type IdFacts, type IdSessionFacts, type ReusedId } from "../core/boards.ts";
 import type { Post } from "../shared/notifications.ts";
-import { listClaims, sweepChanges, type Claim, type ClaimChanges } from "../core/claims.ts";
+import { ackQueueClaim, listClaims, sweepChanges, type Claim, type ClaimChanges } from "../core/claims.ts";
 import { addressSet, aliasUser, aliasUses, dropHold, holderOf, holdsOf, idRow, idStatuses, logBinding, unendedIds, type AliasUse, type BindingEvent, type IdRow } from "../core/bindings.ts";
 import type { AuditAction } from "./audit.ts";
 import { bindAttachments, blobNamed, dropAttachments, dropBlobEntry, dropUnsentUploads, getAttachment, insertUpload, pruneUnbound, removeUpload, unnamedBlobs, uploadDigests, withAttachments, type AttachmentRow, type BlobStore, type NewUpload, type Uploader } from "../core/attachments.ts";
@@ -306,6 +306,8 @@ export interface Repo {
     isHuman(r: Read, handle: string): Promise<boolean>;
     // Each of addresses' scope columns (core aliasScopeRows); an address with no aliases row is absent.
     scopesOf(r: Read, addresses: string[]): Promise<Map<string, AliasScopeRow>>;
+    // Of handles, those carrying the human mark (core humansAmong) (#807 P3 B5b2).
+    humansAmong(r: Read, handles: string[]): Promise<Set<string>>;
   };
   // Holds, session rows and presence (#807 P3 B1): every read returns a promise on the caller's handle (B1a), and every
   // write on the caller's Tx (B1c).
@@ -384,6 +386,9 @@ export interface Repo {
     nextExpiry(r: Read): Promise<number | null>;
     // Deletes the claims lapsed at now and announces them (core sweepChanges).
     sweep(tx: Tx, now: number): Promise<ClaimChanges>;
+    // A queue-board reply's ack (#807 P3 B5b2): releases `key` when one of `addresses` holds it, lapsed or not, with
+    // its watches and an "ack" or "ack (late)" release event (core ackQueueClaim); whether it did.
+    ackQueue(tx: Tx, addresses: string[], key: string, now: number): Promise<boolean>;
   };
   // Board reads and the delivery acknowledgement (#807 P3 B5a1), on the caller's handle. Visibility is the caller's
   // (BoardAccess, src/server/access.ts): nothing here filters by it. Board writes stay with callBoardTool (B5b).
@@ -431,6 +436,24 @@ export interface Repo {
     threadRoot(r: Read, postId: number): Promise<number>;
     // Mutes or unmutes the thread at `root` for `handle` (core setMute).
     mute(tx: Tx, handle: string, root: number, muted: boolean): Promise<void>;
+    // board_post's reads and writes (#807 P3 B5b2), its gate passed: the rows core post reads and writes, unjudged.
+    // Writes a post's row (core insertPost).
+    insertPost(tx: Tx, p: NewPost): Promise<Post>;
+    // Binds `from`'s unsent uploads `ids` to the post under the size caps; rejects with CoreError on an id that isn't
+    // one or a total over the cap (core bindAttachments).
+    bindAttachments(tx: Tx, ids: number[], from: Uploader, postId: number, limits: AttachmentLimits): Promise<AttachmentInfo[]>;
+    // An author's address set: itself, its writing session's ID and holds, and a child's root's (core authorAddresses).
+    authorAddresses(r: Read, author: string, authorId: string | null): Promise<string[]>;
+    // A board's subscriptions by handle (core subscriberRows).
+    subscribers(r: Read, board: string): Promise<{ handle: string; mode: SubMode }[]>;
+    // What a reply to parentId, a post that exists, reads of its thread (core threadFacts).
+    threadFacts(r: Read, parentId: number): Promise<ThreadFacts>;
+    // A queue board's lanes less `poster`, least-recently-woken first (core queueLaneRows).
+    laneRows(r: Read, board: string, poster: string[]): Promise<string[]>;
+    // Claims a queue post for `lane`, with its push unless `push` is false; whether the claim was taken (core claimQueuePost).
+    claimQueuePost(tx: Tx, board: string, postId: number, lane: string, now: number, o: { note: string; push: boolean }): Promise<boolean>;
+    // A post plan's outbox rows, in its order (core insertOutbox).
+    insertOutbox(tx: Tx, postId: number, targets: [string, PostTarget][]): Promise<void>;
   };
   // A session's end and its ID's deliverability (#807 P3 B4a), on the caller's handle.
   sessionEnd: {
@@ -1486,6 +1509,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       markHuman: async (tx, handle, human) => markHuman(sqliteOf(tx), handle, human),
       isHuman: async (r, handle) => isHuman(sqliteOf(r), handle),
       scopesOf: async (r, addresses) => aliasScopeRows(sqliteOf(r), addresses),
+      humansAmong: async (r, handles) => humansAmong(sqliteOf(r), handles),
     },
 
     bindings: {
@@ -1571,6 +1595,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       list: async (r, prefix) => listClaims(sqliteOf(r), prefix),
       nextExpiry: async (r) => sqliteOf(r).query<{ next: number | null }, []>(`SELECT MIN(expires_at) AS next FROM claims WHERE board IS NOT NULL`).get()!.next,
       sweep: async (tx, now) => sweepChanges(sqliteOf(tx), now),
+      ackQueue: async (tx, addresses, key, now) => ackQueueClaim(sqliteOf(tx), addresses, key, now),
     },
 
     delegation: {
@@ -1609,6 +1634,14 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       read: async (tx, board, handle, opts) => readRows(sqliteOf(tx), board, handle, opts),
       threadRoot: async (r, postId) => threadRoot(sqliteOf(r), postId),
       mute: async (tx, handle, root, muted) => setMute(sqliteOf(tx), handle, root, muted),
+      insertPost: async (tx, p) => insertPost(sqliteOf(tx), p),
+      bindAttachments: async (tx, ids, from, postId, limits) => bindAttachments(sqliteOf(tx), ids, from, { post_id: postId }, limits),
+      authorAddresses: async (r, author, authorId) => authorAddresses(sqliteOf(r), author, authorId),
+      subscribers: async (r, board) => subscriberRows(sqliteOf(r), board),
+      threadFacts: async (r, parentId) => threadFacts(sqliteOf(r), parentId),
+      laneRows: async (r, board, poster) => queueLaneRows(sqliteOf(r), board, poster),
+      claimQueuePost: async (tx, board, postId, lane, now, o) => claimQueuePost(sqliteOf(tx), board, postId, lane, now, o),
+      insertOutbox: async (tx, postId, targets) => insertOutbox(sqliteOf(tx), postId, targets),
     },
 
     sessionEnd: {
