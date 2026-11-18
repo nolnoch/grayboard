@@ -40,13 +40,13 @@ const BOOLEANS = new Set([
 ]);
 // SQLite TEXT columns that are jsonb in Postgres: queried by path or parsed on read (D6). Every other TEXT is text,
 // write_receipts.result_json among them: it holds '' while a write is in flight (not valid jsonb) and is replayed
-// byte for byte (jsonb would reorder its keys).
+// byte for byte (jsonb would reorder its keys); so is oauth_tokens.access_scopes until the OAuth group's port decides.
 const JSONB = new Set([
   "oauth_requests.data", "oauth_browsers.data", "oauth_codes.data", "oauth_grants.data", "access_log.detail",
   "ids.held_aliases_json", "slack_progress.progress",
 ]);
 
-type Column = { type: string; notNull: boolean; default: string | null; identity: boolean };
+type Column = { type: string; notNull: boolean; default: string | null; identity: string | null }; // identity: ALWAYS | BY DEFAULT
 type Fk = string; // "from_cols -> table(to_cols) ON DELETE action"
 type Index = { columns: string[]; unique: boolean; partial: boolean; predicate: string };
 type Table = {
@@ -55,7 +55,7 @@ type Table = {
   uniques: Map<string, string[]>; // constraint name (Postgres default form) → columns, in order
   fks: Map<string, Fk>; // constraint name (Postgres default form) → definition
   indexes: Map<string, Index>; // explicitly created indexes, by name
-  checks: number;
+  checks: string[]; // CHECK expressions; canonical (Postgres-deparsed) once canonicalize has run
 };
 type Schema = Map<string, Table>;
 
@@ -82,7 +82,7 @@ function sqliteSchema(db: SqliteDb): Schema {
     for (const c of cols) {
       columns.set(c.name, {
         type: c.type, notNull: c.notnull === 1, default: normDefault(c.dflt_value),
-        identity: autoincrement && c.pk === 1 && c.type === "INTEGER",
+        identity: autoincrement && c.pk === 1 && c.type === "INTEGER" ? "ALWAYS" : null, // D6: AUTOINCREMENT → ALWAYS
       });
     }
     const pk = cols.filter(c => c.pk > 0).sort((a, b) => a.pk - b.pk).map(c => c.name);
@@ -104,24 +104,24 @@ function sqliteSchema(db: SqliteDb): Schema {
       const from = parts.map(p => p.from);
       fks.set(fkName(name, from), `${from.join(",")} -> ${parts[0]!.table}(${parts.map(p => p.to).join(",")}) ON DELETE ${parts[0]!.on_delete}`);
     }
-    schema.set(name, { columns, pk, uniques, fks, indexes, checks: (sql.match(/\bCHECK\s*\(/gi) ?? []).length });
+    schema.set(name, { columns, pk, uniques, fks, indexes, checks: checkExprs(sql) });
   }
   return schema;
 }
 
 async function pgSchema(sql: PgDatabase["sql"]): Promise<Schema> {
   const schema: Schema = new Map();
-  const table = (name: string) => schema.get(name) ?? schema.set(name, { columns: new Map(), pk: [], uniques: new Map(), fks: new Map(), indexes: new Map(), checks: 0 }).get(name)!;
+  const table = (name: string) => schema.get(name) ?? schema.set(name, { columns: new Map(), pk: [], uniques: new Map(), fks: new Map(), indexes: new Map(), checks: [] }).get(name)!;
   const tables: { table_name: string }[] = await sql`SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE'`;
   for (const t of tables) table(t.table_name);
-  const cols: { table_name: string; column_name: string; data_type: string; is_nullable: string; column_default: string | null; is_identity: string }[] =
-    await sql`SELECT table_name, column_name, data_type, is_nullable, column_default, is_identity FROM information_schema.columns WHERE table_schema = 'public'`;
+  const cols: { table_name: string; column_name: string; data_type: string; is_nullable: string; column_default: string | null; identity_generation: string | null }[] =
+    await sql`SELECT table_name, column_name, data_type, is_nullable, column_default, identity_generation FROM information_schema.columns WHERE table_schema = 'public'`;
   for (const c of cols) {
-    table(c.table_name).columns.set(c.column_name, { type: c.data_type, notNull: c.is_nullable === "NO", default: normDefault(c.column_default), identity: c.is_identity === "YES" });
+    table(c.table_name).columns.set(c.column_name, { type: c.data_type, notNull: c.is_nullable === "NO", default: normDefault(c.column_default), identity: c.identity_generation });
   }
   // Constraints with their columns in key order, and FK targets with theirs.
-  const cons: { table: string; name: string; type: string; cols: string[]; ref_table: string | null; ref_cols: string[] | null; deltype: string }[] = await sql`
-    SELECT rel.relname AS table, c.conname AS name, c.contype AS type,
+  const cons: { table: string; name: string; type: string; cols: string[]; ref_table: string | null; ref_cols: string[] | null; deltype: string; def: string }[] = await sql`
+    SELECT rel.relname AS table, c.conname AS name, c.contype AS type, pg_get_constraintdef(c.oid) AS def,
       ARRAY(SELECT a.attname::text FROM unnest(c.conkey) WITH ORDINALITY k(n, o) JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k.n ORDER BY k.o) AS cols,
       ref.relname::text AS ref_table,
       CASE WHEN c.confkey IS NULL THEN NULL ELSE ARRAY(SELECT a.attname::text FROM unnest(c.confkey) WITH ORDINALITY k(n, o) JOIN pg_attribute a ON a.attrelid = c.confrelid AND a.attnum = k.n ORDER BY k.o) END AS ref_cols,
@@ -134,8 +134,9 @@ async function pgSchema(sql: PgDatabase["sql"]): Promise<Schema> {
     if (c.type === "p") t.pk = c.cols;
     else if (c.type === "u") t.uniques.set(c.name, c.cols);
     else if (c.type === "f") t.fks.set(c.name, `${c.cols.join(",")} -> ${c.ref_table}(${c.ref_cols!.join(",")}) ON DELETE ${onDelete[c.deltype]}`);
-    else if (c.type === "c") t.checks++;
+    else if (c.type === "c") t.checks.push(c.def);
   }
+  for (const t of schema.values()) t.checks.sort();
   // Indexes that back no constraint: the ones CREATE INDEX made.
   const idx: { table: string; name: string; cols: string[]; unique: boolean; predicate: string | null }[] = await sql`
     SELECT t.relname AS table, ic.relname AS name, i.indisunique AS unique,
@@ -147,8 +148,65 @@ async function pgSchema(sql: PgDatabase["sql"]): Promise<Schema> {
   return schema;
 }
 
-// The column names a partial index's predicate mentions, so a predicate moved to another column fails too.
-const predicateColumns = (predicate: string, columns: Iterable<string>) => [...columns].filter(c => new RegExp(`\\b${c}\\b`).test(predicate)).sort();
+// Each CHECK (...) body in a CREATE TABLE statement, parentheses balanced (a CHECK holds IN (...) lists).
+function checkExprs(createSql: string): string[] {
+  const out: string[] = [];
+  for (const m of createSql.matchAll(/\bCHECK\s*\(/gi)) {
+    let depth = 1, i = m.index! + m[0].length;
+    const start = i;
+    for (; i < createSql.length && depth > 0; i++) {
+      if (createSql[i] === "(") depth++;
+      else if (createSql[i] === ")") depth--;
+    }
+    if (depth !== 0) throw new Error(`unbalanced CHECK in ${createSql}`);
+    out.push(createSql.slice(start, i - 1).trim());
+  }
+  return out;
+}
+
+// A SQLite expression in Postgres's dialect: a D6 boolean is tested bare (`viewer = 1` → `viewer`, `= 0` → `NOT viewer`).
+// Anything else this schema writes (IS [NOT] NULL, = 'literal', IN (...), AND, OR) is valid in both.
+function toPg(table: string, expr: string): string {
+  let e = expr;
+  for (const key of BOOLEANS) {
+    const [t, col] = key.split(".");
+    if (t !== table) continue;
+    e = e.replace(new RegExp(`\\b${col}\\s*=\\s*1\\b`, "g"), col!).replace(new RegExp(`\\b${col}\\s*=\\s*0\\b`, "g"), `NOT ${col}`);
+  }
+  return e;
+}
+
+// SQLite's partial-index predicates and CHECKs, rewritten into what Postgres's own deparser makes of them: each is
+// attached to the Postgres table as a scratch index or NOT VALID constraint in a transaction that rolls back, and read
+// back with pg_get_expr / pg_get_constraintdef. Both sides then compare in one canonical spelling (parenthesisation,
+// IN → = ANY (ARRAY[...]), ::text casts), so an inverted predicate, AND ↔ OR or a narrowed IN list fails.
+async function canonicalize(sqlite: Schema, sql: PgDatabase["sql"]): Promise<void> {
+  const rollback = new Error("rollback");
+  try {
+    await sql.begin(async tx => {
+      let n = 0;
+      for (const [name, t] of sqlite) {
+        if (NOT_CARRIED.has(name)) continue;
+        for (const i of t.indexes.values()) {
+          if (!i.partial) continue;
+          const scratch = `parity_scratch_${n++}`;
+          await tx.unsafe(`CREATE INDEX ${scratch} ON ${name} (${i.columns[0]}) WHERE ${toPg(name, i.predicate)}`);
+          const [{ p }] = await tx`SELECT pg_get_expr(i.indpred, i.indrelid) AS p FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid WHERE c.relname = ${scratch}`;
+          i.predicate = p;
+        }
+        const checks: string[] = [];
+        for (const expr of t.checks) {
+          const scratch = `parity_scratch_${n++}`;
+          await tx.unsafe(`ALTER TABLE ${name} ADD CONSTRAINT ${scratch} CHECK (${toPg(name, expr)}) NOT VALID`);
+          const [{ d }] = await tx`SELECT pg_get_constraintdef(oid) AS d FROM pg_constraint WHERE conname = ${scratch}`;
+          checks.push(d.replace(/ NOT VALID$/, ""));
+        }
+        t.checks = checks.sort();
+      }
+      throw rollback;
+    });
+  } catch (e) { if (e !== rollback) throw e; }
+}
 
 let sqlite: Schema;
 let pg: Schema;
@@ -161,6 +219,7 @@ describePg("0001_init.sql mirrors the SQLite server schema", () => {
     try { sqlite = sqliteSchema(db); } finally { db.close(); rmSync(dirname(path), { recursive: true, force: true }); }
     pgDb = await pgDatabase({ max: 2 });
     pg = await pgSchema(pgDb.sql);
+    await canonicalize(sqlite, pgDb.sql);
   });
   afterAll(async () => { await pgDb?.[Symbol.asyncDispose](); });
 
@@ -197,13 +256,13 @@ describePg("0001_init.sql mirrors the SQLite server schema", () => {
       }
       for (const key of ADDED) {
         const [t, col] = key.split(".");
-        if (t === name) want[col!] = { type: "bigint", notNull: true, default: null, identity: true };
+        if (t === name) want[col!] = { type: "bigint", notNull: true, default: null, identity: "ALWAYS" };
       }
       expect(Object.fromEntries(p.columns), name).toEqual(want);
     }
   });
 
-  test("keys: primary keys, UNIQUE constraints by name, foreign keys by name with ON DELETE, CHECK counts", () => {
+  test("keys: primary keys, UNIQUE constraints by name, foreign keys by name with ON DELETE, CHECK expressions", () => {
     for (const [name, s] of sqlite) {
       if (NOT_CARRIED.has(name)) continue;
       const p = pg.get(name);
@@ -213,16 +272,16 @@ describePg("0001_init.sql mirrors the SQLite server schema", () => {
       for (const key of ADDED) if (key.startsWith(`${name}.`)) uniques.set(uniqueName(name, [key.split(".")[1]!]), [key.split(".")[1]!]);
       expect(Object.fromEntries(p.uniques), `${name} UNIQUE`).toEqual(Object.fromEntries(uniques));
       expect(Object.fromEntries(p.fks), `${name} foreign keys`).toEqual(Object.fromEntries(s.fks));
-      expect(p.checks, `${name} CHECK constraints`).toBe(s.checks);
+      expect(p.checks, `${name} CHECK constraints`).toEqual(s.checks);
     }
   });
 
-  test("indexes: by name, columns in order, uniqueness, partial-ness and the predicate's columns", () => {
+  test("indexes: by name, columns in order, uniqueness and the partial predicate's expression", () => {
     for (const [name, s] of sqlite) {
       if (NOT_CARRIED.has(name)) continue;
       const p = pg.get(name);
       if (!p) throw new Error(`${name}: no Postgres table`);
-      const shape = (t: Table) => Object.fromEntries([...t.indexes].map(([n, i]) => [n, { columns: i.columns, unique: i.unique, partial: i.partial, on: predicateColumns(i.predicate, s.columns.keys()) }]));
+      const shape = (t: Table) => Object.fromEntries([...t.indexes].map(([n, i]) => [n, { columns: i.columns, unique: i.unique, partial: i.partial, predicate: i.predicate }]));
       expect(shape(p), `${name} indexes`).toEqual(shape(s));
     }
   });
