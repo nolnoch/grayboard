@@ -119,7 +119,7 @@ Every local cell is n/a (`../vision.md` §1, `../parity.md` §Maintaining parity
 After P1c, each PR against the async store; DDL twice (SQLite, then P3) as role bindings did (#927) until P5.
 
 1. **#927** (role bindings) lands first: D1's owners and D6 need the table.
-2. **Principal**: the `service` rows, D1's site changes, `service_owner`, the admin routes and CLI.
+2. **Principal** (built: as-built facts in ../server-access.md §1, ../architecture.md §2 and ../handles.md): the `service` rows, D1's site changes, `service_owner`, the admin routes and CLI (`create|list|disable|enable|delete-alias`; `credential add|revoke` come with step 3). Until step 3 no token reaches a service: tests issue one in-process (`tests/helpers/oauth.ts`). Left for later steps: `peer_list`'s ID rows (`src/server/boards.ts`, `src/core/boards.ts`) still read a service's IDs as person-scope; `alias.see` for a service scope has no rule yet (a user is refused it, so service names are visible only to the service).
 3. **Credential**: `service_credentials`, `client_credentials`, source mapping, caps tier, revocation.
 4. **OpenCode V2**: the static credential mode and service enrollment (`adapters/opencode-v2/`, its own lane, `bun run test:opencode`).
 5. **Boards and invoke**: the scope, the lane hook, the verb, the wake rule. Closes #807's exit test on SQLite; P3 re-runs it on Postgres.
