@@ -17,11 +17,13 @@ export function failureDiagnostic(source: FailureSource, error?: unknown) {
 }
 
 const errorClass = /^([A-Z][A-Za-z0-9]{0,55})?(Error|Exception)$/;
-const errorCode = /^(SQLITE_[A-Z_]{1,48}|E[A-Z]{2,15})$/;
+const errorCode = /^(SQLITE_[A-Z_]{1,48}|E[A-Z]{2,15}|ERR_POSTGRES_[A-Z_]{1,40})$/;
+// A Postgres SQLSTATE, which Bun.SQL puts in `errno` (a Node system errno is a number).
+const sqlstate = /^[0-9A-Z]{5}$/;
 
-// The error's class and an allowlisted code (SQLite or errno), read from data
+// The error's class, an allowlisted code (SQLite, errno or Bun.SQL's) and a SQLSTATE, read from data
 // descriptors only: no getter, trap or toString runs, and nothing free-form leaves.
-export function errorDiagnostic(error: unknown): { class?: string; code?: string } {
+export function errorDiagnostic(error: unknown): { class?: string; code?: string; sqlstate?: string } {
   if (error === undefined) return {};
   try {
     if (typeof error !== "object" || error === null || !(error instanceof Error)) return { class: "non-error" };
@@ -30,9 +32,11 @@ export function errorDiagnostic(error: unknown): { class?: string; code?: string
       name = Object.getOwnPropertyDescriptor(o, "name")?.value;
     }
     const code = Object.getOwnPropertyDescriptor(error, "code")?.value;
+    const errno = Object.getOwnPropertyDescriptor(error, "errno")?.value;
     return {
       class: typeof name === "string" && errorClass.test(name) ? name : "[unrecognized]",
       ...(typeof code === "string" && errorCode.test(code) ? { code } : {}),
+      ...(typeof errno === "string" && sqlstate.test(errno) ? { sqlstate: errno } : {}),
     };
   } catch { return { class: "[unrecognized]" }; }
 }

@@ -1,7 +1,9 @@
 import { Database } from "bun:sqlite";
 import { readFileSync } from "node:fs";
 import { expect, test } from "bun:test";
+import { SQL } from "bun";
 import { diagnosticOrigin, errorDiagnostic, failureDiagnostic, type FailureSource } from "./diagnostics.ts";
+import { TxAborted } from "./store/pg/tx.ts";
 
 const thrown = (fn: () => unknown) => { try { fn(); } catch (e) { return e; } throw new Error("did not throw"); };
 
@@ -35,4 +37,19 @@ test("error diagnostics carry only the class and an allowlisted code, from data 
   expect(errorDiagnostic(new Proxy(new Error(), { get: trap, getOwnPropertyDescriptor: trap }))).toEqual({ class: "[unrecognized]" });
   expect(errorDiagnostic(new Proxy({}, { getPrototypeOf: trap }))).toEqual({ class: "[unrecognized]" });
   expect(reads).toBe(2);
+});
+
+// #807 P3 C2: Bun.SQL's class code and the SQLSTATE it keeps in `errno`, both bounded; a TxAborted carries its cause's.
+test("Postgres errors carry Bun's code and a bounded SQLSTATE; a forged errno doesn't", () => {
+  const unique = new SQL.PostgresError("duplicate key value violates unique constraint \"secret\"", { code: "ERR_POSTGRES_SERVER_ERROR", errno: "23505" });
+  expect(errorDiagnostic(unique)).toEqual({ class: "PostgresError", code: "ERR_POSTGRES_SERVER_ERROR", sqlstate: "23505" });
+  expect(errorDiagnostic(new SQL.PostgresError("x", { code: "ERR_POSTGRES_SERVER_ERROR", errno: "Bearer secret" })))
+    .toEqual({ class: "PostgresError", code: "ERR_POSTGRES_SERVER_ERROR" });
+  expect(errorDiagnostic(Object.assign(new Error(), { code: "ERR_POSTGRES_Bearer secret", errno: "235050" }))).toEqual({ class: "Error" });
+  // A Node system error's errno is a number: file errors keep today's shape.
+  expect(errorDiagnostic(thrown(() => readFileSync("/nonexistent/secret")))).toEqual({ class: "Error", code: "ENOENT" });
+  const aborted = new SQL.PostgresError("current transaction is aborted", { code: "ERR_POSTGRES_SERVER_ERROR", errno: "25P02" });
+  expect(errorDiagnostic(TxAborted.wrap(aborted))).toEqual({ class: "TxAbortedError", code: "ERR_POSTGRES_SERVER_ERROR", sqlstate: "25P02" });
+  const rolledBack = new SQL.PostgresError("COMMIT was rolled back", { code: "ERR_POSTGRES_COMMIT_ROLLED_BACK" });
+  expect(errorDiagnostic(TxAborted.wrap(rolledBack))).toEqual({ class: "TxAbortedError", code: "ERR_POSTGRES_COMMIT_ROLLED_BACK" });
 });

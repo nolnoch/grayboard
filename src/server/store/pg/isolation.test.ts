@@ -58,7 +58,7 @@ function pgModules(): string[] {
 test("no non-test module under src/server/store/pg/ reaches bun:sqlite or the SQLite store, even transitively", () => {
   const roots = pgModules();
   // The scan sees this directory's modules (a scan that read nothing would pass vacuously).
-  expect(roots.map(p => relative(import.meta.dir, p))).toEqual(expect.arrayContaining(["errors.ts", "migrate.ts", "sql.ts"]));
+  expect(roots.map(p => relative(import.meta.dir, p))).toEqual(expect.arrayContaining(["errors.ts", "migrate.ts", "sql.ts", "tx.ts"]));
   expect(forbiddenReach(roots)).toEqual([]);
 });
 
