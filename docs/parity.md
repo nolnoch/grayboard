@@ -46,10 +46,11 @@ The baseline every later change is measured against: as of v2.4.0, every cell is
 | 18 | Another user's item wakes only under a grant (`msg.wake`) | n/a | yes | n/a | yes | n/a | yes | n/a | yes |
 | 19 | Delegation to another user's launcher under a grant (`delegate.to`) | n/a | yes | n/a | yes | n/a | yes | n/a | yes |
 | 20 | Runtime role bindings (`org_admin`, `team_owner`) and `grayboard admin role` | n/a | yes | n/a | yes | n/a | yes | n/a | yes |
+| 21 | A service's agent signs in with a run token from a service credential (no browser) | n/a | gap (unfiled) | n/a | gap (unfiled) | n/a | gap (#270 step 4) | n/a | gap (unfiled) |
 
 ## Evidence by row
 
-Rows 1–8: `parity-delivery.md`. Rows 9–16: `parity-access.md`. Rows 17–20: §Not covered.
+Rows 1–8: `parity-delivery.md`. Rows 9–16: `parity-access.md`. Rows 17–21: §Not covered.
 
 ## Notes (known limits, not cells)
 
@@ -70,7 +71,7 @@ Rows 1–8: `parity-delivery.md`. Rows 9–16: `parity-access.md`. Rows 17–20:
 
 Harnesses without an adapter (any MCP client run with `BUS_PUSH=off`, tools only) and the Slack bridges themselves (slack-bridge.md) have no columns.
 
-The Rust client SDK (`sdk/rust`, #929) is a library for services, not a harness adapter: no column, no cell. Its envelope is proved equal to hosted-core's by `tests/integration/rust_fixtures.test.ts` and the Rust test `requests_match_the_reference_clients_recording`, and its round trip by `tests/integration/rust_sdk.test.ts` (`scripts/e2e.sh rust-sdk`); its push delivery stream (`sdk-rust.md` §2), a typed method per native tool (`sdk-rust.md` §3) and its conformance driver, which runs every hosted scenario of `tests/conformance/` as `hosted/rust` (`sdk-rust.md` §4), are built; the service credential is unbuilt (`future/rust-sdk.md`).
+The Rust client SDK (`sdk/rust`, #929) is a library for services, not a harness adapter: no column, no cell. Its envelope is proved equal to hosted-core's by `tests/integration/rust_fixtures.test.ts` and the Rust test `requests_match_the_reference_clients_recording`, and its round trip by `tests/integration/rust_sdk.test.ts` (`scripts/e2e.sh rust-sdk`); its push delivery stream (`sdk-rust.md` §2), a typed method per native tool (`sdk-rust.md` §3) and its conformance driver, which runs every hosted scenario of `tests/conformance/` as `hosted/rust` (`sdk-rust.md` §4), are built; the server's service credential is built (row 21), the SDK's use of it is not (`future/rust-sdk.md`).
 
 ### 17. Repo-name suggestion while unbound
 
@@ -97,3 +98,10 @@ The Rust client SDK (`sdk/rust`, #929) is a library for services, not a harness 
 
 - Local (all four): n/a. Local mode is single-user (`vision.md` §1): there is no authorization model to grant into.
 - Every hosted cell: server-side HTTP routes and the CLI, the same for every harness (server-access.md §1 Role bindings, #927); no MCP tool. Proof: `tests/integration/role_bindings.test.ts` (grant, revoke and list through the CLI against a server process; bootstrap admins; audit rows; `team_owner` scoping; stale authority), `tests/integration/authz_decision.test.ts`.
+
+### 21. A service's agent signs in with a run token from a service credential (no browser)
+
+- Local (all four): n/a. A service principal means something only with more than one principal (`vision.md` §1).
+- The server side is built for every hosted cell (#270 step 3; `server-oauth.md` §2 Service credentials, `server-access.md` §1): an admin adds a credential, the launcher mints a run token with `client_credentials`, and any client that sends it as a bearer on `/mcp` with a mapped session key is the service. Proof: `tests/integration/service_credentials.test.ts` (against a compiled server process: the CLI's credential, a token with no browser, bind and post, revoke and disable ending the session).
+- OC V2: gap until its static credential mode and service enrollment land (#270 step 4, `future/service-principals.md` D3).
+- pi H, omp H, CC H: gap, unfiled. Hosted core signs in through the browser as its user and has no static-token mode; no design asks for one yet (D3 names OpenCode and the Rust SDK).
