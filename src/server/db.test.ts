@@ -1321,6 +1321,77 @@ test("#807 P3 B5b1b1: the board tools' repo reads and writes run on the handle t
   expect(queueOff()).toBeNull();
 });
 
+// #807 P3 B5b1b2: the board tools' writes and the reads they add run on the handle they're given: a kept Tx and a
+// non-store handle are refused, a create, archive, read or mute rolls back with its body, and committed they land.
+test("#807 P3 B5b1b2: the board tools' repo writes and reads run on the handle they're given", async () => {
+  const { repo, db } = fresh();
+  const [be, fe, ghost] = ["a@example.com/be", "a@example.com/fe", "a@example.com/ghost"];
+  let root = 0, reply = 0;
+  const kept = await seed(repo, async tx => {
+    await repo.users.upsertByEmail(tx, "a@example.com", null);
+    for (const name of ["be", "fe"]) await repo.aliases.create(tx, person("a@example.com", name), "a@example.com");
+    const core = repo.coreOn(tx);
+    createBoard(core, be, "hall", "tests");
+    subscribe(core, fe, "hall", "push");
+    root = post(core, be, "hall", "root").post.id;
+    reply = post(core, be, "hall", "reply", root).post.id;
+    return tx;
+  });
+  await seed(repo, tx => repo.aliases.markHuman(tx, fe, true));
+  const settled = /used after its transaction settled/;
+  const stranger = /not a SQLite store handle/;
+  const [b, al] = [repo.boards, repo.aliases];
+  const nb = { name: "fresh", purpose: "p", scope: null, kind: "broadcast", createdBy: be, now: 900 };
+  for (const h of [kept, {} as Tx]) {
+    const want = h === kept ? settled : stranger;
+    await expect(b.create(h, nb)).rejects.toThrow(want);
+    await expect(b.setArchived(h, "hall", be, 1)).rejects.toThrow(want);
+    await expect(b.read(h, "hall", fe, {})).rejects.toThrow(want);
+    await expect(b.threadRoot(h, reply)).rejects.toThrow(want);
+    await expect(b.mute(h, fe, root, true)).rejects.toThrow(want);
+    await expect(al.isHuman(h, fe)).rejects.toThrow(want);
+    await expect(al.scopesOf(h, [be])).rejects.toThrow(want);
+  }
+  // The reads: a reply's root, the human mark, each address's scope columns (an address with no row absent).
+  expect(await b.threadRoot(repo.read, reply)).toBe(root);
+  expect(await b.threadRoot(repo.read, root)).toBe(root);
+  expect(await al.isHuman(repo.read, fe)).toBe(true);
+  expect(await al.isHuman(repo.read, be)).toBe(false);
+  expect(await al.scopesOf(repo.read, [be, ghost])).toEqual(new Map([[be, { scope_kind: "person", scope_ref: "a@example.com" }]]));
+  const cursor = () => db.query<{ cursor: number }, [string]>("SELECT cursor FROM subscriptions WHERE board = 'hall' AND handle = ?").get(fe)?.cursor;
+  const muted = () => db.query<{ n: number }, [string]>("SELECT count(*) AS n FROM thread_mutes WHERE handle = ?").get(fe)!.n;
+  const archivedAt = () => db.query<{ archived_at: number | null }, []>("SELECT archived_at FROM boards WHERE name = 'hall'").get()!.archived_at;
+  const before = cursor();
+  // Inside a body each write is seen by the body's reads, and all of it rolls back.
+  await expect(seed(repo, async tx => {
+    expect((await b.create(tx, nb))?.name).toBe("fresh");
+    expect(await b.create(tx, nb)).toBeNull();
+    expect(await b.get(tx, "fresh")).toMatchObject({ purpose: "p", created_by: be });
+    expect((await b.setArchived(tx, "hall", be, 1000))?.archived_by).toBe(be);
+    expect(await b.setArchived(tx, "hall", be, 1001)).toBeNull();
+    expect((await b.read(tx, "hall", fe, {})).posts.map(p => p.id)).toEqual([root, reply]);
+    await b.mute(tx, fe, root, true);
+    throw new Error("rolled back");
+  })).rejects.toThrow("rolled back");
+  expect(await b.get(repo.read, "fresh")).toBeUndefined();
+  expect(archivedAt()).toBeNull();
+  expect(cursor()).toBe(before);
+  expect(muted()).toBe(0);
+  // Committed: they land; a null-handle read (a peek) leaves the cursor; a reopen clears the stamp.
+  expect((await seed(repo, tx => b.read(tx, "hall", null, {}))).posts.length).toBe(2);
+  expect(cursor()).toBe(before);
+  await seed(repo, tx => b.read(tx, "hall", fe, {}));
+  expect(cursor()).toBe(reply);
+  await seed(repo, tx => b.mute(tx, fe, root, true));
+  expect(muted()).toBe(1);
+  await seed(repo, tx => b.mute(tx, fe, root, false));
+  expect(muted()).toBe(0);
+  expect((await seed(repo, tx => b.setArchived(tx, "hall", be, 1000)))?.archived_at).toBe(1000);
+  expect(archivedAt()).toBe(1000);
+  expect((await seed(repo, tx => b.setArchived(tx, "hall", null, 1100)))?.archived_at ?? null).toBeNull();
+  expect(archivedAt()).toBeNull();
+});
+
 // #807 P3 B5b1: a team's follow judges the board for the alias before subscribing it, as core's subscribe did: an
 // alias whose user isn't a member is refused as for a missing board, and its body rolls back.
 test("#807 P3 B5b1: a team follow refuses an alias that can't see the team board", async () => {

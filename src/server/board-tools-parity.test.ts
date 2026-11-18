@@ -4,7 +4,7 @@
 // bound and unbound, a cross-user writer and a read-only viewer.
 import { beforeEach, expect, test } from "bun:test";
 import { boardActor, holdAlias, idAddress } from "../core/bindings.ts";
-import { archiveBoard, createBoard, post, registerId, setStatus, setSubscription, subscribe, touchAlias, type CoreDb, type UnboundPeer } from "../core/boards.ts";
+import { archiveBoard, createBoard, markHuman, post, registerId, setStatus, setSubscription, subscribe, touchAlias, type CoreDb, type UnboundPeer } from "../core/boards.ts";
 import type { Principal } from "../core/resolver.ts";
 import { callBoardTool as coreCallBoardTool, type ToolContext } from "../core/tools.ts";
 import { boardAccess, principalCanSee } from "./access.ts";
@@ -66,13 +66,31 @@ beforeEach(async () => {
     subscribe(core, `${B}/qa`, "attic", "digest");
     post(core, `${W}/be`, "attic", "last");
     archiveBoard(core, `${W}/be`, "attic", true);
+    // B5b1b2: a board of bob's for his human to archive, a thread with a reply, a mention's pending push, and claims
+    // whose boards and holders some callers may not see (a team alias, and a deleted team name, #871).
+    createBoard(core, `${B}/be`, "bobs", "bob's");
+    markHuman(core, `${B}/human`, true);
+    ROOT = post(core, `${B}/be`, "general", "thread root").post.id;
+    REPLY = post(core, `${E}/be`, "general", "a reply", ROOT).post.id;
+    post(core, `${W}/be`, "general", "@qa look");
+    PLAN = post(core, `${W}/be`, "eng", "eng follow-up").post.id;
+    const claim = core.prepare(`INSERT INTO claims (key, holder, note, board, acquired_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)`);
+    for (const [key, holder, note, board] of [
+      ["ticket:1", "eng/deploy", "deploying", "eng"], ["ticket:2", `${E}/be`, "paging", "ops"], ["x:3", `${B}/be`, null, null],
+      ["ticket:4", "eng/ghost", "gone", "general"], ["ticket:5", `${W}/be`, "old", "attic"], ["ticket:6", `${D}/be`, "lapsed", "general"],
+    ] as const) claim.run(key, holder, note, board, T0, key === "ticket:6" ? T0 : T0 + 86_400_000);
   });
+  // Every seeded time is at or before T1 and every call's after it, so a time a call wrote reads as "now".
+  T1 = Date.now();
+  while (Date.now() <= T1) { /* the next millisecond */ }
 });
+let ROOT = 0, REPLY = 0, PLAN = 0;
+let T1 = 0;
 
 const ONLINE = new Set([`${W}/be`, "eng/deploy", `${E}/be`, "ops/deploy", WADE_ID]);
 const UNBOUND: UnboundPeer[] = [{ session_id: DAN_UNBOUND, unbound: true, online: true }, { session_id: GONE_ID, unbound: true, online: true }];
 
-type Caller = { label: string; addresses: string[]; session?: string; principal?: Principal };
+type Caller = { label: string; addresses: string[]; session?: string; principal?: Principal; human?: boolean; via?: string };
 const CALLERS: Caller[] = [
   { label: "wade", addresses: [`${W}/be`, "eng/deploy"], session: WADE_ID },
   { label: "wade, deploy first", addresses: ["eng/deploy", `${W}/be`], session: WADE_ID },
@@ -95,6 +113,8 @@ const coreCtx = (c: Caller): ToolContext => ({
   unbound: UNBOUND,
   ...(c.session ? { session: c.session } : {}),
   ...(c.principal ? { reader: b => principalCanSee(repo, c.principal!, b) } : {}),
+  ...(c.human ? { human: true } : {}),
+  ...(c.via ? { via: c.via } : {}),
 });
 const serverCtx = (c: Caller) => ({ ...coreCtx(c), ...(c.principal ? { principal: c.principal } : {}) });
 
@@ -196,3 +216,164 @@ test("callBoardTool's board_list, peer_list and peer_status give core's answers 
     expect(answer(() => true)).toContain(refused);
   }
 }, 60_000);
+
+// B5b1b2's callers beyond CALLERS: the Slack bridge's human (exempt from #254's answers, archiving as its user), a
+// handle marked human, and a child session (#523), whose board_read peeks.
+const WRITE_CALLERS: Caller[] = [
+  ...CALLERS,
+  { label: "wade via slack", addresses: [`${W}/be`], session: WADE_ID, human: true },
+  { label: "bob's human", addresses: [`${B}/human`] },
+  { label: "wade's child", addresses: [`${W}/be`, "eng/deploy"], session: WADE_ID, via: idAddress("5".repeat(64)) },
+];
+const WRITE_CALLS = (): [string, Record<string, unknown>][] => [
+  ["board_create", { name: "new", purpose: " fresh " }], ["board_create", { name: "general", purpose: "everyone" }], ["board_create", { name: "General", purpose: " everyone " }],
+  ["board_create", { name: "general", purpose: "different" }], ["board_create", { name: "attic", purpose: "old" }], ["board_create", { name: "eng", purpose: "eng work", team: "ENG" }],
+  ["board_create", { name: "t2", purpose: "x", team: "eng" }], ["board_create", { name: "t3", purpose: "x", team: "nope" }], ["board_create", { name: "q", purpose: "x", kind: "queue" }],
+  ["board_create", { name: "q", purpose: "x", kind: "bogus" }], ["board_create", { name: "!!", purpose: "x" }], ["board_create", { name: "n", purpose: " " }],
+  ["board_create", { name: "n", purpose: "x".repeat(501) }], ["board_create", { name: 7, purpose: "x" }], ["board_create", { name: "n" }], ["board_create", { name: "n", purpose: 3, kind: 4 }],
+  ["board_archive", { board: "general" }], ["board_archive", { board: "general", archived: false }], ["board_archive", { board: "attic" }], ["board_archive", { board: "#Attic", archived: false }],
+  ["board_archive", { board: "bobs" }], ["board_archive", { board: "eng" }], ["board_archive", { board: "ops" }], ["board_archive", { board: "nope" }],
+  ["board_archive", { board: "general", archived: "yes" }], ["board_archive", {}],
+  ["board_subscribe", { board: "general", mode: "push" }], ["board_subscribe", { board: "general", mode: "off" }], ["board_subscribe", { board: "#ENG", mode: "quiet" }],
+  ["board_subscribe", { board: "general", mode: "bogus" }], ["board_subscribe", { board: "nope", mode: "push" }], ["board_subscribe", { board: "attic", mode: "digest" }],
+  ["board_subscribe", { board: "general", mode: "off", thread: REPLY }], ["board_subscribe", { board: "#General", mode: "push", thread: ROOT }], ["board_subscribe", { board: "general", mode: "digest", thread: ROOT }],
+  ["board_subscribe", { board: "general", mode: "off", thread: PLAN }], ["board_subscribe", { board: "general", mode: "off", thread: 999 }], ["board_subscribe", { board: "nope", mode: "off", thread: PLAN }],
+  ["board_subscribe", { board: "general", mode: "off", thread: "x" }], ["board_subscribe", { board: "general" }],
+  ["board_read", { board: "general" }], ["board_read", { board: "general", limit: 1 }], ["board_read", { board: "general", before_id: REPLY }], ["board_read", { board: "general", thread: REPLY }],
+  ["board_read", { board: "attic" }], ["board_read", { board: "eng" }], ["board_read", { board: "ops" }], ["board_read", { board: "nope" }], ["board_read", { board: "general", limit: "x" }],
+  ["board_read", { board: "#ENG", limit: 500 }], ["board_read", { board: "eng", thread: ROOT }],
+  ["claim_list", {}], ["claim_list", { prefix: "ticket:" }], ["claim_list", { prefix: "%" }], ["claim_list", { prefix: 3 }],
+];
+
+// The rows B5b1b2's tools write, timestamps reduced to whether the call set them.
+const boardState = (tx: Read) => {
+  const c = repo.coreOn(tx);
+  return {
+    boards: c.prepare(`SELECT name, purpose, scope, created_by, kind, created_at > ? AS fresh, archived_at > ? AS archived_now, archived_at IS NOT NULL AS archived, archived_by FROM boards ORDER BY name`).all(T1, T1),
+    subscriptions: c.prepare(`SELECT board, handle, mode, cursor, notified_id FROM subscriptions ORDER BY board, handle`).all(),
+    mutes: c.prepare(`SELECT handle, root_id FROM thread_mutes ORDER BY handle, root_id`).all(),
+    outbox: c.prepare(`SELECT handle, post_id, delivered_at IS NOT NULL AS delivered FROM outbox ORDER BY handle, post_id`).all(),
+  };
+};
+async function inBodyBoards(f: (tx: Tx) => Promise<unknown>): Promise<unknown> {
+  try { await repo.write(async tx => { throw new Rollback({ out: await f(tx), rows: boardState(tx) }); }); }
+  catch (e) { if (e instanceof Rollback) return e.value; throw e; }
+  throw new Error("unreachable");
+}
+// A board this test's call made carries its own clock: compared as "now".
+const settled = (v: unknown) => JSON.parse(JSON.stringify(v, (k, x) => ((k === "created_at" || k === "archived_at") && typeof x === "number" && x > T1 ? "now" : x)));
+
+test("callBoardTool's board_create, board_archive, board_subscribe, board_read and claim_list give core's answers and leave its rows", async () => {
+  const access = boardAccess(repo);
+  const out: [string, unknown, unknown][] = [];
+  for (const c of WRITE_CALLERS) for (const [tool, args] of WRITE_CALLS()) {
+    const actor = boardActor(repo.coreOn(repo.read), tool, args, session(c));
+    const want = await inBodyBoards(async tx => outcome(() => coreCallBoardTool(repo.coreOn(tx), actor, tool, args, coreCtx(c))));
+    const got = await inBodyBoards(tx => outcomeAsync(() => callBoardTool(repo, access, tx, actor, tool, args, serverCtx(c))));
+    out.push([`${c.label} ${tool} ${JSON.stringify(args)}`, settled(want), settled(got)]);
+  }
+  expect(diverging(out)).toEqual([]);
+  // The fixture reaches each branch the port decides.
+  const text = (l: string) => JSON.stringify((out.find(([x]) => x === l)![1] as { out: unknown }).out);
+  const rows = (l: string) => JSON.stringify((out.find(([x]) => x === l)![1] as { rows: unknown }).rows);
+  const all = out.map(([, s]) => JSON.stringify(s)).join("\n");
+  expect(text(`wade board_create {"name":"general","purpose":"everyone"}`)).toContain("you created #general at");
+  expect(text(`wade via slack board_create {"name":"general","purpose":"everyone"}`)).toContain("already exists");
+  expect(text(`wade board_create {"name":"eng","purpose":"eng work","team":"ENG"}`)).toContain("you created #eng at");
+  expect(text(`wade board_create {"name":"attic","purpose":"old"}`)).toContain("already exists, archived");
+  expect(text(`dan, sessionless board_create {"name":"attic","purpose":"old"}`)).toContain("already exists, archived");
+  expect(text(`dan, sessionless board_create {"name":"t2","purpose":"x","team":"eng"}`)).toContain("error");
+  expect(rows(`wade board_create {"name":"new","purpose":" fresh "}`)).toContain(`{"board":"new","handle":"${W}/be","mode":"push"`);
+  expect(text(`wade board_archive {"board":"general"}`)).toContain(`"archived_at":"now","archived_by":"${W}/be"`);
+  expect(text(`wade board_archive {"board":"attic"}`)).toContain("was already archived at");
+  expect(text(`wade board_archive {"board":"general","archived":false}`)).toContain("isn't archived");
+  expect(rows(`wade board_archive {"board":"#Attic","archived":false}`)).toContain(`{"name":"attic","purpose":"old","scope":null,"created_by":"${W}/be","kind":"broadcast","fresh":0,"archived_now":null,"archived":0,"archived_by":null}`);
+  expect(text(`bob's human board_archive {"board":"bobs"}`)).toContain(`"archived_by":"${B}/human"`);
+  expect(text(`bob's human board_archive {"board":"general"}`)).toContain(`its user (${W}`);
+  expect(text(`wade via slack board_archive {"board":"general"}`)).toContain("\"archived_at\":\"now\"");
+  expect(text(`bob board_archive {"board":"eng"}`)).toContain("belongs to the bus itself");
+  expect(rows(`wade board_subscribe {"board":"general","mode":"off","thread":${REPLY}}`)).toContain(`{"handle":"${W}/be","root_id":${ROOT}}`);
+  expect(text(`wade board_subscribe {"board":"#General","mode":"push","thread":${ROOT}}`)).toContain(`#general thread ${ROOT} unmuted`);
+  expect(text(`wade board_subscribe {"board":"general","mode":"off","thread":${PLAN}}`)).toContain("is not a post on #general");
+  expect(text(`wade board_subscribe {"board":"#ENG","mode":"quiet"}`)).toContain("ok: #eng → quiet");
+  expect(text(`bob board_read {"board":"general"}`)).toContain("@qa look");
+  expect(rows(`bob board_read {"board":"general"}`)).toContain(`{"handle":"${B}/qa","post_id":`);
+  expect(rows(`bob board_read {"board":"general"}`)).not.toMatch(new RegExp(`"handle":"${B}/qa","post_id":\\d+,"delivered":0`));
+  expect(rows(`bob claim_list {}`)).toMatch(new RegExp(`"handle":"${B}/qa","post_id":\\d+,"delivered":0`));
+  expect(rows(`wade's child board_read {"board":"general"}`)).toEqual(rows(`wade's child claim_list {}`));
+  expect(text(`wade board_read {"board":"eng"}`)).toContain("active_claims");
+  expect(text(`wade board_read {"board":"general"}`)).toContain(`"holder":"eng/ghost"`);
+  expect(text(`dan, sessionless board_read {"board":"general"}`)).toContain(`"key":"ticket:4","holder":null,"note":null`);
+  expect(text(`dan, sessionless claim_list {}`)).toContain(`"key":"ticket:1","holder":null,"note":null,"board":null`);
+  expect(text(`dan unbound claim_list {}`)).toContain(`"key":"ticket:2","holder":"${E}/be","note":"paging","board":null`);
+  expect(text(`wade claim_list {}`)).toContain(`"key":"ticket:2","holder":"${E}/be","note":"paging","board":"ops"`);
+  expect(text(`wade claim_list {}`)).not.toContain("ticket:6");
+  expect(text(`wade claim_list {"prefix":"%"}`)).toBe(JSON.stringify({ value: { result: [], wake: [] } }));
+  for (const refused of ["purpose is required", "purpose must be at most", "kind must be", "name must be a string", "purpose must be a string", "archived must be a boolean", "board must be a string", "mode must be push", "with thread, mode is", "thread must be a number", "mode must be a string", "limit must be a number", "prefix must be a string", "no such board", "can archive or reopen it"]) {
+    expect(all).toContain(refused);
+  }
+}, 120_000);
+
+// What SQLite can't reach: on Postgres a concurrent first create commits between board_create's read and its insert
+// (C1), and the repo's subscription write needn't check the mode itself. A repo whose first read of a board misses
+// stands in for the first; one whose setSubscription records instead of checking, for the second.
+test("board_create answers a create that lost the insert to its own repeat as the repeat; board_subscribe checks the mode itself", async () => {
+  const access = boardAccess(repo);
+  const wade = CALLERS[0]!;
+  const lost = (): Repo => {
+    let missed = false;
+    return { ...repo, boards: { ...repo.boards, get: async (r, name) => (missed ? repo.boards.get(r, name) : ((missed = true), undefined)) } };
+  };
+  const create = (purpose: string) => inBodyBoards(tx => outcomeAsync(() => callBoardTool(lost(), access, tx, `${W}/be`, "board_create", { name: "general", purpose }, serverCtx(wade))));
+  expect(JSON.stringify(await create("everyone"))).toContain("you created #general at");
+  expect(JSON.stringify(await create("different"))).toContain("already exists");
+  const writes: string[] = [];
+  const recording: Repo = { ...repo, boards: { ...repo.boards, setSubscription: async (_tx, _h, _b, mode) => void writes.push(mode) } };
+  const sub = await inBodyBoards(tx => outcomeAsync(() => callBoardTool(recording, access, tx, `${W}/be`, "board_subscribe", { board: "general", mode: "bogus" }, serverCtx(wade))));
+  expect(JSON.stringify(sub)).toContain("mode must be push");
+  expect(writes).toEqual([]);
+});
+
+// A body that fails after board_create or board_archive leaves nothing: the insert, its subscription and the archive
+// stamp roll back with it.
+test("board_create and board_archive roll back with a body that throws after them", async () => {
+  const access = boardAccess(repo);
+  const wade = serverCtx(CALLERS[0]!);
+  const failing = (tool: string, args: Record<string, unknown>) =>
+    repo.write(async tx => { await callBoardTool(repo, access, tx, `${W}/be`, tool, args, wade); throw new Error("later step failed"); });
+  await expect(failing("board_create", { name: "doomed", purpose: "x" })).rejects.toThrow("later step failed");
+  expect(await repo.boards.get(repo.read, "doomed")).toBeUndefined();
+  expect(repo.coreOn(repo.read).prepare(`SELECT count(*) AS n FROM subscriptions WHERE board = 'doomed'`).get()).toEqual({ n: 0 });
+  await expect(failing("board_archive", { board: "general" })).rejects.toThrow("later step failed");
+  expect((await repo.boards.get(repo.read, "general"))!.archived_at ?? null).toBeNull();
+  await expect(failing("board_archive", { board: "attic", archived: false })).rejects.toThrow("later step failed");
+  expect((await repo.boards.get(repo.read, "attic"))!.archived_at).toBeGreaterThan(0);
+});
+
+// A1, which SQLite can't reach: board_archive's conditional update finds the board already changed by a concurrent
+// write. A stubbed setArchived stands in: one whose "concurrent" archive commits first, one whose third write flips the
+// board back before the re-read (the update is tried again), and one that never takes (refused after a bounded retry).
+test("board_archive answers a lost conditional update as the repeat it now is, retrying a flipped-back board a bounded number of times", async () => {
+  const access = boardAccess(repo);
+  const wade = serverCtx(CALLERS[0]!);
+  const stubbed = (setArchived: Repo["boards"]["setArchived"]): Repo => ({ ...repo, boards: { ...repo.boards, setArchived } });
+  const archive = (r: Repo) => inBodyBoards(tx => outcomeAsync(() => callBoardTool(r, access, tx, `${W}/be`, "board_archive", { board: "general" }, wade)));
+  // Eve's archive commits between wade's read and his update.
+  let calls = 0;
+  const lost = await archive(stubbed(async (tx, name, _by, now) => { calls++; await repo.boards.setArchived(tx, name, `${E}/be`, now); return null; }));
+  expect(calls).toBe(1);
+  expect(JSON.stringify(lost)).toContain(`was already archived at`);
+  expect(JSON.stringify(lost)).toContain(`by ${E}/be`);
+  expect((lost as { out: { value: Record<string, unknown> } }).out.value.boards).toBeUndefined();
+  // The first update loses to a write since undone; the second takes.
+  calls = 0;
+  const retried = await archive(stubbed(async (tx, name, by, now) => (++calls === 1 ? null : repo.boards.setArchived(tx, name, by, now))));
+  expect(calls).toBe(2);
+  expect((retried as { out: { value: Record<string, unknown> } }).out.value).toMatchObject({ boards: ["general"], result: { archived_by: `${W}/be` } });
+  // Never takes: refused, nothing written.
+  calls = 0;
+  const stuck = await archive(stubbed(async () => { calls++; return null; }));
+  expect(calls).toBe(3);
+  expect(JSON.stringify(stuck)).toContain("kept changing while it was archived; try again");
+  expect(JSON.stringify((stuck as { rows: unknown }).rows)).toContain(`"name":"general","purpose":"everyone","scope":null,"created_by":"${W}/be","kind":"broadcast","fresh":0,"archived_now":null,"archived":0`);
+});

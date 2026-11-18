@@ -15,6 +15,7 @@ import { DEFAULT_LAG_GATE, lagSampler, lagVerdict, lagWindows, type LagGate, typ
 import { authorize, decidePure, recordDecision, type AuthzRequest, type PureRequest } from "./policy.ts";
 import { HUMAN_NAME, HUMAN_RESERVED, isValidEmail, isValidIdentityName } from "../shared/addressing.ts";
 import { addressParts } from "../core/addresses.ts";
+import { seenScopeOf } from "../core/boards.ts";
 import { BlobMissing, CoreError, TooLargeError } from "../core/errors.ts";
 import { transferTimeoutMs } from "../shared/http.ts";
 import { testPauseAsync } from "../shared/testpause.ts";
@@ -166,10 +167,8 @@ async function claimList(url: URL, authed: AuthedUser, repo: Repo): Promise<Resp
   const prefix = url.searchParams.get("prefix") ?? undefined;
   const principal = { kind: "user" as const, name: authed.user_email };
   const sees = async (holder: string): Promise<boolean> => {
-    // A deleted team name (#347) keeps its claims and stays inside the team that had it.
-    const a = await repo.aliases.find(repo.read, holder);
-    const p = a ? null : addressParts(holder);
-    const scope = a ? { scope_kind: a.scope_kind, scope_ref: a.scope_ref } : p?.kind === "alias" && p.scopeKind === "principal" ? { scope_kind: "team" as const, scope_ref: p.scope } : null;
+    // A deleted team name (#347) keeps its claims and stays inside the team that had it (core seenScopeOf).
+    const scope = seenScopeOf(await repo.aliases.find(repo.read, holder), holder);
     return !scope || scope.scope_ref === null || (await authorize(repo, repo.read, {}, { verb: "alias.see", principal, scope: { scope_kind: scope.scope_kind, scope_ref: scope.scope_ref } })).allow;
   };
   const claims = await repo.claims.list(repo.read, prefix);

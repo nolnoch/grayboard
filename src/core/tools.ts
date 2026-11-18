@@ -453,9 +453,11 @@ export type ToolContext = {
   // The caller's signed-in user, on a server: recorded on its posts (author_user).
   user?: string;
   addresses?: string[];
-  // A reader with no address (an unbound hosted session): board_list,
-  // board_read, claim_list and peer_list judge board visibility by it
-  // instead of `handle`, and touch no cursor.
+  // A reader with no address: board_list, board_read, claim_list and
+  // peer_list judge board visibility by it instead of `handle`, and touch no
+  // cursor. Neither mode sets it now: the server judges an unbound hosted
+  // session by its principal in its own port (src/server/boards.ts, #807 P3
+  // B5b1b), and the port's parity test sets it as core's reference answer.
   reader?: BoardPredicate;
 };
 

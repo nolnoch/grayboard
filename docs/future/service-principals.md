@@ -33,7 +33,7 @@ Code facts that shape it:
 - Why not a synthetic email (`ingest@…`): it parses as a person scope. Why not a separate table: `oauth_grants`, `hosted_sessions`, `hosted_ownerships` and the `authGeneration` triggers key on `users.id`; a second table forks revocation.
 - The kind is `principals.kind`, read with the cached user row (`cachedUser`, on `authGeneration`): no `users.kind` column, one store.
 - **Sites that change** (each hardcodes "a user is a person"):
-  - `userPrincipal` (`src/server/application.ts`), `seer` beside it, and the `as` request in `ownAddress` (`src/server/http.ts`): the kind comes from the row.
+  - `userPrincipal` (`src/server/application.ts`) and the `as` request in `ownAddress` (`src/server/http.ts`): the kind comes from the row.
   - `actIn` (`src/server/policy.ts`): a service acts in its own service scope (`scope.own_service`) and nowhere else; a user never acts in a service scope, owners included (the names' mail is the service's). Principle 9.
   - `helloOkFields` and the hosted instruction text: a service has no `human` handle and no Slack link; the name stays reserved in its scope.
   - `users.signIn` and `upsertByEmail` refuse a service row, so no IdP subject links to one; `unlink-idp`, `team add` and the `admin` verb refuse kind service (role-bindings.md R1).

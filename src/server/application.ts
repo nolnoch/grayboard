@@ -12,7 +12,7 @@ import { testPause, testPauseAsync } from "../shared/testpause.ts";
 import { ALIAS_SCOPE_CAP, aliasCapRefusal } from "./alias_cap.ts";
 import { DELEGATE_LIMIT, DELEGATE_OPEN_CAP, crossUserRefusal, delegateOkFields, delegateThrottled, neverConnected, resolveDelegationWith, type DelegateReach } from "../core/delegation.ts";
 import {
-  MAX_CANDIDATES, MAX_HOLDS, actingAs, aliasHeldText, boardActor, childStateRefusal, closestNames,
+  MAX_CANDIDATES, MAX_HOLDS, actingAs, aliasHeldText, childStateRefusal, closestNames,
   orderCandidates, primaryOf, replyPeer, replyPeerError, replySender, replySenderError, tooManyHolds, unboundPeer, unknownNameError,
   type AliasUse, type Candidate,
 } from "../core/bindings.ts";
@@ -27,7 +27,7 @@ import type { AuthedUser } from "./auth.ts";
 import {
   age, snapshot, canSeeBoard, checkBody, checkPostAccess, parseAliasMeta, pendingKey, refOf,
   cleanFact, idCollisionText, normalizeBoard, getBoard,
-  type AliasMetaSet, type Board, type CoreDb, type Viewer, type PendingRef, type ReadResult, type SnapshotOptions, type UnboundPeer,
+  type AliasMetaSet, type Board, type CoreDb, type PendingRef, type ReadResult, type SnapshotOptions, type UnboundPeer,
 } from "../core/boards.ts";
 import { addressParts, aliasScope, type AliasScope, type ParsedAddress } from "../core/addresses.ts";
 import { CoreError } from "../core/errors.ts";
@@ -40,7 +40,7 @@ import type { AttachmentLimits } from "../shared/attachments.ts";
 import { expiryTimer } from "../core/claims.ts";
 import { detached } from "./request_context.ts";
 import { onAliasCreated } from "./teams.ts";
-import { boardAccess, ownScopeOn, principalCanSee, type BoardAccess } from "./access.ts";
+import { boardAccess, ownScopeOn, type BoardAccess } from "./access.ts";
 import { boardCatalog, boardSnapshot, pendingOf, visibleBoards } from "./board_reads.ts";
 import { callBoardTool, serverBoardActor } from "./boards.ts";
 import { PROMISE_DAYS, STALE_UNDELIVERED_MS, alreadyRetracted, historyLimit, inboxDays, promised, queuedNote, retractRefusal, showMessage, unanswered, undeliveredInstruction, type InboxItem, type PromiseItem } from "../shared/inbox.ts";
@@ -1439,16 +1439,6 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     const seen = addresses.length && names.length ? await visibleBoards(repo, hub.access, r, addresses, names) : new Map<string, Board>();
     return new Map(names.map((b) => [b, seen.has(b)]));
   }
-  // Who a board read is judged for: the first of the session's addresses that can see it (S14).
-  function reader(r: Read, session: ApplicationSession, board: string): Viewer {
-    if (session.readOnly) return seer(repo, session);
-    try {
-      return boardActor(repo.coreOn(r), "board_read", { board }, { addresses: session.addresses, asAddresses: asAddresses(session), ownScope: session.authed.user_email });
-    } catch (e) {
-      if (e instanceof CoreError) throw coreRefusal(e);
-      throw e;
-    }
-  }
   return application;
 }
 export type Application = ReturnType<typeof createApplication>;
@@ -1459,10 +1449,6 @@ export type Application = ReturnType<typeof createApplication>;
 // claim_list and peer_list) are judged by
 // its user's principal directly, never as an address in the user's scope
 // (`human` there is the bridge's reserved identity), #410.
-function seer(repo: Repo, session: ApplicationSession): (board: Board) => boolean {
-  const p = userOf(session);
-  return (board) => principalCanSee(repo, p, board);
-}
 const userOf = (session: ApplicationSession): Principal => ({ kind: "user", name: session.authed.user_email });
 
 // Where a name was last used: its session's cwd, else its place.
@@ -1954,7 +1940,6 @@ async function handleCall(hub: Hub, tx: Tx, session: ApplicationSession, tool: s
     ...(session.via ? { via: session.via } : {}),
     user: session.authed.user_email,
     addresses: session.addresses,
-    ...(session.readOnly ? { reader: seer(hub.repo, session) } : {}),
     ...(tool === "peer_list" ? { unbound: await unboundPeers(hub, tx, session) } : {}),
   };
   // `as`, else the first address that can see the board (#284 S3, S14).

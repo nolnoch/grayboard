@@ -427,18 +427,23 @@ export function createBoard(
   const c = createArgs(name, purpose, opts.kind);
   const denied = access(db).checkCreate(handle, scope);
   if (denied) throw new CoreError(denied);
-  const res = db
-    .prepare(
-      `INSERT INTO boards (name, purpose, scope, created_by, created_at, kind) VALUES (?, ?, ?, ?, ?, ?)
-       ON CONFLICT(name) DO NOTHING`,
-    )
-    .run(c.board, c.purpose, scope, handle, Date.now(), c.kind);
-  if (res.changes === 0) {
+  if (!insertBoard(db, { name: c.board, purpose: c.purpose, scope, kind: c.kind, createdBy: handle, now: Date.now() })) {
     const old = getBoard(db, c.board);
     throw new CoreError(boardExistsText(c.board, !!old?.archived_at && sees(db, handle, old)));
   }
   subscribe(db, handle, c.board, "push");
   return getBoard(db, c.board)!;
+}
+
+/** createBoard's insert, its arguments already checked: the new board, or null when the name is taken. */
+export function insertBoard(db: Database, b: { name: string; purpose: string; scope: string | null; kind: string; createdBy: string; now: number }): Board | null {
+  const row = db
+    .prepare(
+      `INSERT INTO boards (name, purpose, scope, created_by, created_at, kind) VALUES (?, ?, ?, ?, ?, ?)
+       ON CONFLICT(name) DO NOTHING RETURNING *`,
+    )
+    .get(b.name, b.purpose, b.scope, b.createdBy, b.now, b.kind) as Board | null;
+  return row ? showBoard(row) : null;
 }
 
 /** createBoard's argument checks, in its order: the name, then the purpose, then the kind. */
@@ -491,8 +496,20 @@ export function archiveBoard(
   }
   const note = archiveRepeat(b, archived);
   if (note) return { board: b, note };
-  db.prepare(`UPDATE boards SET archived_at = ?, archived_by = ? WHERE name = ?`).run(archived ? Date.now() : null, archived ? handle : null, b.name);
-  return { board: getBoard(db, b.name)! };
+  return { board: setArchived(db, b.name, archived ? handle : null, Date.now())! };
+}
+
+/**
+ * Archives the board as `by` at `now`, or with `by` null reopens it: the board after, or null when it was already
+ * in that state, so a repeat never overwrites who archived it or when.
+ */
+export function setArchived(db: Database, name: string, by: string | null, now: number): Board | null {
+  const row = db
+    .prepare(
+      `UPDATE boards SET archived_at = ?, archived_by = ? WHERE name = ? AND archived_at IS ${by === null ? "NOT NULL" : "NULL"} RETURNING *`,
+    )
+    .get(by === null ? null : now, by, name) as Board | null;
+  return row ? showBoard(row) : null;
 }
 
 /** Refuses to archive a mode's own board (#announce, a team's board). */
@@ -678,14 +695,19 @@ export function setSubscription(db: Database, handle: string, board: string, mod
     db.prepare(`DELETE FROM subscriptions WHERE board = ? AND handle = ?`).run(board, handle);
     return;
   }
-  if (!["push", "digest", "quiet"].includes(mode)) {
-    throw new CoreError(`mode must be push, digest, quiet, or off`);
-  }
+  checkSubMode(mode);
   const tip = tipOf(db, board);
   db.prepare(
     `INSERT INTO subscriptions (board, handle, mode, cursor, notified_id) VALUES (?, ?, ?, ?, ?)
      ON CONFLICT(board, handle) DO UPDATE SET mode = excluded.mode`,
   ).run(board, handle, mode, tip, tip);
+}
+
+/** A subscription's mode, checked after the board's visibility: push, digest or quiet ("off" deletes and isn't one). */
+export function checkSubMode(mode: string): asserts mode is SubMode {
+  if (!["push", "digest", "quiet"].includes(mode)) {
+    throw new CoreError(`mode must be push, digest, quiet, or off`);
+  }
 }
 
 // Mute or unmute one thread, named by any post in it. A muted thread's
@@ -1222,11 +1244,19 @@ export type Peer = {
 export function seenHandles(db: Database, viewer: string, handles: string[]): string[] {
   const acc = access(db);
   if (!acc.seesAlias) return handles;
-  const scopeOf = db.prepare(`SELECT scope_kind, scope_ref FROM aliases WHERE address = ?`);
+  const rows = aliasScopeRows(db, handles);
   return handles.filter((h) => {
-    const scope = seenScopeOf(scopeOf.get(h) as AliasScopeRow | null, h);
+    const scope = seenScopeOf(rows.get(h), h);
     return scope === null || acc.seesAlias!(viewer, scope);
   });
+}
+
+/** The aliases rows' scope columns of `addresses`; an address with no row is absent. */
+export function aliasScopeRows(db: Database, addresses: string[]): Map<string, AliasScopeRow> {
+  const rows = db
+    .prepare(`SELECT address, scope_kind, scope_ref FROM aliases WHERE address IN (SELECT value FROM json_each(?))`)
+    .all(JSON.stringify([...new Set(addresses)])) as (AliasScopeRow & { address: string })[];
+  return new Map(rows.map(({ address, ...scope }) => [address, scope]));
 }
 
 /** An aliases row's scope columns. */
