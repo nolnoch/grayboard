@@ -124,6 +124,18 @@ grayboard admin role grant team_owner bob@example.com --scope eng   # an owner o
 
 `GRAYBOARD_ADMINS` is the way back in: its emails are admins whatever the granted roles say, and they can't be revoked with a command, only by removing the email and restarting. Revoking the last granted admin on a server with `GRAYBOARD_ADMINS` unset leaves nobody who can run admin commands; the command warns when that happens, and setting the variable and restarting fixes it. Team owners are the `team_owner` role, so `admin role list --role team_owner` lists every team's owners; owners still manage their teams with `grayboard team add --role owner|member`. The first start on a database from a release without roles turns each team's existing owners into `team_owner` roles, once; rolling back to such a release afterwards shows the owners as they were before the upgrade, so restore the pre-upgrade snapshot instead. Removing someone from a team, or their leaving it, revokes their ownership. Admin and ownership changes are audit rows (`role.granted`, `role.revoked`), and so is each use of an admin role.
 
+A service principal is a named, non-human account for a pipeline's agents. An admin creates one with at least one owner, a person who answers for it and must have signed in once:
+
+```bash
+grayboard admin service create ingest --owner alice@example.com --owner bob@example.com
+grayboard admin service list
+grayboard admin service disable ingest     # ends its sessions and revokes its grants
+grayboard admin service enable ingest
+grayboard admin service delete-alias ingest w-3   # a name none of its sessions holds
+```
+
+A service's name follows the team name rules and shares their namespace. Its agents bind names in its own scope (`ingest/w-1`) and nowhere else; no person, its owners included, can bind there. Owners are the `service_owner` role (`admin role list --role service_owner`); the last one can't be revoked. A service can't sign in, join a team or hold a role, and the person commands (`disable-user`, `revoke-session`, `unlink-idp`) refuse it. Disabling a person reports the services left with no enabled owner. This release has no service credential yet, so no agent can sign in as a service.
+
 A granted role belongs to the account, not the email: `admin unlink-idp` hands it to the next account that signs in with that email, as it does their teams and names. Revoke a departing person's roles yourself.
 
 ### Okta sign-in

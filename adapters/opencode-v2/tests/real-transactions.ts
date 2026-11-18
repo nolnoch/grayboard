@@ -187,7 +187,7 @@ export async function transactionRace(f: TransactionRace) {
         await until(async () => await f.rootState(root) === "paused", 20_000, "The new grant latches receiving approval");
         const refresh = db.query<{ hash: string }, [string]>("SELECT hash FROM oauth_tokens WHERE grant_id = ? AND kind = 'refresh' LIMIT 1").get(g1)!.hash;
         const user = db.query<{ id: number }, [string]>("SELECT id FROM users WHERE email = ?").get("you@example.com")!.id;
-        const principal: OAuthPrincipal = { authed: { user_id: user, user_email: "you@example.com", session_id: 0 }, grantId: g1, clientId: OPENCODE_CLIENT, sourceKey: OPENCODE_SESSION_META, scopes: ["tools", "delivery"], accessHash: "", accessExpiry: 0 };
+        const principal: OAuthPrincipal = { authed: { user_id: user, user_email: "you@example.com", kind: "user", session_id: 0 }, grantId: g1, clientId: OPENCODE_CLIENT, sourceKey: OPENCODE_SESSION_META, scopes: ["tools", "delivery"], accessHash: "", accessExpiry: 0 };
         const releaseFile = join(f.pauses, "revoke-release");
         const revoker = transactionProcess("tests/support/hosted-operation.ts", [f.dbPath, f.blobDir, JSON.stringify({ principal, operation: "revoke", refreshHash: refresh, now: Date.now() })], f.boundary === "before" ? "" : "hosted:revoke:in-txn", releaseFile, "REVOKER");
         try {

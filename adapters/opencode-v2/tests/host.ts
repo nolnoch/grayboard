@@ -208,8 +208,8 @@ try {
     const ownUser = (await app.repo.users.findByEmail(app.repo.read, email))!;
     const foreignUser = await app.repo.write(tx => app.repo.users.upsertByEmail(tx, "other@example.com", "Other fixture"));
     const sink = { deliver() {}, probe: async () => true, closed() {} };
-    const ownHuman = await app.application.attachHuman({ user_id: ownUser.id, user_email: ownUser.email, session_id: 0 }, sink);
-    const foreignHuman = await app.application.attachHuman({ user_id: foreignUser.id, user_email: foreignUser.email, session_id: 0 }, sink);
+    const ownHuman = await app.application.attachHuman({ user_id: ownUser.id, user_email: ownUser.email, kind: "user", session_id: 0 }, sink);
+    const foreignHuman = await app.application.attachHuman({ user_id: foreignUser.id, user_email: foreignUser.email, kind: "user", session_id: 0 }, sink);
     const serverEvents = (): DeliveryEvent[] => reads.filter(r => r.uri === "grayboard://inbox" && r.text).flatMap(r => {
       const json = r.text!.startsWith("data:") ? r.text!.slice(5).trim() : r.text!;
       const response = JSON.parse(json) as { result?: { contents?: { text?: string }[] } };

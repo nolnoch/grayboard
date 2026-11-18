@@ -36,7 +36,7 @@ beforeEach(async () => {
   const user = async (tx: Tx, email: string): Promise<AuthedUser> => {
     const u = await store.repo.users.upsertByEmail(tx, email, null);
     // A session needs a live sign-in (#351).
-    return tokenSessionIn(store.repo, tx, { user_id: u.id, user_email: u.email });
+    return tokenSessionIn(store.repo, tx, { user_id: u.id, user_email: u.email, kind: u.kind });
   };
   [alice, bob] = await seed(store.repo, async tx => [await user(tx, "alice@example.com"), await user(tx, "bob@example.com")]);
 });
@@ -473,7 +473,7 @@ test("shared writes retain calling-session dedup, ID provenance and replay audit
 });
 
 test("a reply to anyone but the parent's other party is refused bad_request and writes nothing (#524, #530)", async () => {
-  const carol = await seed(store.repo, async tx => { const u = await store.repo.users.upsertByEmail(tx, "carol@example.com", null); return tokenSessionIn(store.repo, tx, { user_id: u.id, user_email: u.email }); });
+  const carol = await seed(store.repo, async tx => { const u = await store.repo.users.upsertByEmail(tx, "carol@example.com", null); return tokenSessionIn(store.repo, tx, { user_id: u.id, user_email: u.email, kind: u.kind }); });
   const a = await connect(alice, "be");
   const b = await connect(bob, "fe");
   await connect(carol, "sim");

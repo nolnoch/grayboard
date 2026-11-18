@@ -145,7 +145,7 @@ export function hostedBoundInstruction(info: IdentityInfo, declared?: DeclaredDe
       : [`You are "${info.identity_full}" on grayboard. Poll dm_inbox and board_list for pending work.`, declared ? POLL_NOTE : noLeaseNote(info.identity_full), ...COORDINATION_INSTRUCTIONS, OTHER_USER_NOTE]),
     ...(info.teams.length ? [TEAM_BOARDS_NOTE] : []),
     ...(launcher && push ? launcherInstruction() : []),
-    ...(info.human.linked ? ownHumanInstruction(info.human.handle) : []),
+    ...(info.human?.linked ? ownHumanInstruction(info.human.handle) : []),
   ].join(" ");
 }
 // A hosted child's `initialize` text (#523), in place of its root's: it acts as the root's primary, and
@@ -392,7 +392,7 @@ export function createHostedSessions(application: Application, options: { now?: 
     }
     return full ?? Promise.resolve();
   }
-  const authedOf = (user: { id: number; email: string }): AuthedUser => ({ user_id: user.id, user_email: user.email, session_id: 0 });
+  const authedOf = (user: { id: number; email: string; kind: AuthedUser["kind"] }): AuthedUser => ({ user_id: user.id, user_email: user.email, kind: user.kind, session_id: 0 });
   const matches = (row: HostedSession, holder: { row: HostedSession } | undefined) =>
     !!holder && row.ownership_id === holder.row.ownership_id && row.bind_gen === holder.row.bind_gen;
   // A row's facts on the committing Tx, in its beforeCommit hook (db.ts readFacts). `holders` is read here, before

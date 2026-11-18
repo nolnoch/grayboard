@@ -32,7 +32,7 @@ const pushed = (body: string) => board((i) => i.kind === "push" && i.post.body =
 
 async function human(email: string) {
   const user = (await srv.app.repo.users.findByEmail(srv.app.repo.read, email))!;
-  return (await srv.app.application.attachHuman({ user_id: user.id, user_email: email, session_id: 0 }, { deliver() {}, closed() {} })).session;
+  return (await srv.app.application.attachHuman({ user_id: user.id, user_email: email, kind: "user", session_id: 0 }, { deliver() {}, closed() {} })).session;
 }
 
 test("a DM from another user's session is marked; one from the same user's is not", async () => {

@@ -381,7 +381,7 @@ test("principals: a sign-in and a team create insert one; a team can't take anot
     const u = await repo.users.upsertByEmail(tx, "a@example.com", null);
     await repo.users.upsertByEmail(tx, "a@example.com", "A");
     const eng = await repo.teams.create(tx, "eng", u.id);
-    // Service principals arrive with #270; the namespace guard is here now.
+    // Teams and service principals share one namespace (#270): the guard refuses either name.
     db.prepare(`INSERT INTO principals (kind, name, created_at) VALUES ('service', 'ingest', 0)`).run();
     return { u, eng };
   });
@@ -771,7 +771,7 @@ test("#807 P1c-7: the users store runs on the handle it's given", async () => {
     const refused = h === kept ? settled : /not a SQLite store handle/;
     await expect(repo.users.findById(h, u.id)).rejects.toThrow(refused);
     await expect(repo.users.isDisabled(h, u.id)).rejects.toThrow(refused);
-    await expect(repo.users.activeEmail(h, u.id)).rejects.toThrow(refused);
+    await expect(repo.users.active(h, u.id).then((u) => u?.email)).rejects.toThrow(refused);
   }
 });
 

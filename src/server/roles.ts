@@ -45,8 +45,7 @@ async function authorityHolds(repo: Repo, tx: Tx, g: Granter, spec: RoleSpec): P
   return !!team && (await repo.roles.bindingOf(tx, g.userId, "team_owner", team.id)) !== undefined;
 }
 
-// The names' principals, or the 404 for the first missing one; a scope must be of the role's kind. With no service
-// principal, a service_invoke grant is refused here.
+// The names' principals, or the 404 for the first missing one; a scope must be of the role's kind.
 async function resolve(repo: Repo, tx: Tx, spec: RoleSpec): Promise<Refusal | null> {
   const kind = ROLES[spec.role].scope;
   if (!(await repo.principals.findByName(tx, spec.holder))) {
@@ -71,7 +70,7 @@ export async function grantRole(repo: Repo, tx: Tx, spec: RoleSpec, g: Granter, 
   if (missing) return { refused: missing };
   const holder = (await repo.principals.findByName(tx, spec.holder))!;
   if (!role.holders.includes(holder.kind)) {
-    return refuse(400, "bad_request", role.holders.length ? `${spec.role} is held by a ${role.holders.join(" or a ")}, and "${spec.holder}" is a ${holder.kind}` : `no principal may hold ${spec.role} yet: its holders arrive with #270`);
+    return refuse(400, "bad_request", role.holders.length ? `${spec.role} is held by a ${role.holders.join(" or a ")}, and "${spec.holder}" is a ${holder.kind}` : `no principal may hold ${spec.role} yet: its holders arrive with #270's invocation step`);
   }
   if (!(await authorityHolds(repo, tx, g, spec))) return refuse(403, "forbidden", `${g.email} no longer holds the role that allowed this grant`);
   const held = await repo.roles.find(tx, spec.holder, spec.role, spec.scope);

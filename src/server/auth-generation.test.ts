@@ -5,7 +5,7 @@ import { Database } from "bun:sqlite";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { openDatabase, type Repo } from "./db.ts";
+import { openDatabase, USER_BY_ID_SQL, type Repo } from "./db.ts";
 import { sqliteOf, type Tx } from "./store/tx.ts";
 import { scratchDbPath } from "../../tests/support/scratch_db.ts";
 import { createHash } from "node:crypto";
@@ -32,19 +32,19 @@ test("another task's generation stays the committed one while a holder's uncommi
   const user = await repo.write(tx => repo.users.upsertByEmail(tx, "a@example.com", null));
   const before = repo.authGeneration();
   expect(before).toBeDefined();
-  expect((await repo.users.activeEmail(repo.read, user.id))).toBe("a@example.com");
+  expect((await repo.users.active(repo.read, user.id).then((u) => u?.email))).toBe("a@example.com");
   let inside: string | undefined = "unset";
   const h = hold(repo, async tx => { await repo.users.setDisabled(tx, user.id, true); inside = repo.authGeneration(); });
   await h.wrote;
   expect(inside).toBeUndefined();
   // Outside the holder's transaction: the committed generation, and the committed (enabled) user.
   expect(repo.authGeneration()).toBe(before);
-  expect((await repo.users.activeEmail(repo.read, user.id))).toBe("a@example.com");
+  expect((await repo.users.active(repo.read, user.id).then((u) => u?.email))).toBe("a@example.com");
   expect(await repo.authRead(() => repo.authGeneration())).toBe(before);
   h.release();
   await h.done;
   expect(repo.authGeneration()).not.toBe(before);
-  expect((await repo.users.activeEmail(repo.read, user.id))).toBeUndefined();
+  expect((await repo.users.active(repo.read, user.id).then((u) => u?.email))).toBeUndefined();
 });
 
 test("a rolled-back holder leaves the generation and the cached user as committed", async () => {
@@ -53,11 +53,11 @@ test("a rolled-back holder leaves the generation and the cached user as committe
   const before = repo.authGeneration();
   const h = hold(repo, tx => repo.users.setDisabled(tx, user.id, true), true);
   await h.wrote;
-  expect((await repo.users.activeEmail(repo.read, user.id))).toBe("b@example.com");
+  expect((await repo.users.active(repo.read, user.id).then((u) => u?.email))).toBe("b@example.com");
   h.release();
   await h.done;
   expect(repo.authGeneration()).toBe(before);
-  expect((await repo.users.activeEmail(repo.read, user.id))).toBe("b@example.com");
+  expect((await repo.users.active(repo.read, user.id).then((u) => u?.email))).toBe("b@example.com");
 });
 
 test("a transaction's commit moves the generation too, a synchronous post's too", async () => {
@@ -127,8 +127,8 @@ test("work an authRead body starts reads afresh once the body is done: a disable
   const later = gate();
   // Boxed, so authRead settles without waiting for it: the continuation the body starts runs after it, with its store.
   const after = (await repo.authRead(async () => {
-    expect(await repo.users.activeEmail(repo.read, user.id)).toBe("p@example.com"); // fills the user cache at g0
-    return { seen: later.p.then(async () => { const g = repo.authGeneration(); return { g, email: await repo.users.activeEmail(repo.read, user.id) }; }) };
+    expect(await repo.users.active(repo.read, user.id).then((u) => u?.email)).toBe("p@example.com"); // fills the user cache at g0
+    return { seen: later.p.then(async () => { const g = repo.authGeneration(); return { g, email: await repo.users.active(repo.read, user.id).then((u) => u?.email) }; }) };
   })).seen;
   await repo.write(tx => repo.users.setDisabled(tx, user.id, true));
   later.open();
@@ -219,7 +219,7 @@ test("an older authRead body's lookup leaves a newer body's cache alone while bo
 // The users-by-id reads under the user cache, counted.
 function userReads() {
   const query = spyOn(Database.prototype, "query");
-  return { count: () => query.mock.calls.filter(([sql]) => String(sql) === "SELECT * FROM users WHERE id = ?").length, restore: () => query.mockRestore() };
+  return { count: () => query.mock.calls.filter(([sql]) => String(sql) === USER_BY_ID_SQL).length, restore: () => query.mockRestore() };
 }
 
 // #807 P3 A7u2: the user cache's read awaits too. A disable committed while a lookup is held moves the generation,
@@ -228,13 +228,13 @@ test("a disable committed while a user read is held is never cached: the next lo
   const repo = open();
   const user = await repo.write(tx => repo.users.upsertByEmail(tx, "u@example.com", null));
   const g0 = repo.authGeneration();
-  const held = await hostedPause("auth:user:read", () => repo.users.activeEmail(repo.read, user.id),
+  const held = await hostedPause("auth:user:read", () => repo.users.active(repo.read, user.id).then((u) => u?.email),
     () => repo.write(tx => repo.users.setDisabled(tx, user.id, true)));
   expect(held).toBe("u@example.com");
   expect(repo.authGeneration()).not.toBe(g0);
   const reads = userReads();
   try {
-    expect(await repo.users.activeEmail(repo.read, user.id)).toBeUndefined();
+    expect(await repo.users.active(repo.read, user.id).then((u) => u?.email)).toBeUndefined();
     expect(reads.count()).toBe(1);
     // That read filled the cache under the new generation: the next lookup hits.
     expect(await repo.users.isDisabled(repo.read, user.id)).toBe(true);
@@ -258,7 +258,7 @@ test("authPeek's user answers cache hits only and reads nothing", async () => {
     expect(peek.user(user.id + 1)).toBeUndefined();
     expect(reads.count()).toBe(0);
   } finally { reads.restore(); }
-  expect(await repo.users.activeEmail(repo.read, user.id + 1)).toBeUndefined(); // caches the absence
+  expect(await repo.users.active(repo.read, user.id + 1).then((u) => u?.email)).toBeUndefined(); // caches the absence
   await repo.write(tx => repo.users.setDisabled(tx, user.id, true));
   expect(await repo.users.isDisabled(repo.read, user.id)).toBe(true); // caches the disabled row under the new generation
   const peek = repo.authPeek()!;

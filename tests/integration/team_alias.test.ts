@@ -339,8 +339,8 @@ test("a bind of human in a team's scope is refused as reserved, and creates noth
   expect(rows(`SELECT address FROM aliases WHERE address = 'eng/human'`)).toEqual([]);
 });
 
-test("a bind in a service principal's scope is refused until #270, and creates nothing", async () => {
-  await seed(srv.app.repo, () => srv.app.db.prepare(`INSERT INTO principals (kind, name, created_at) VALUES ('service', 'ingest', 0)`).run());
-  await expect(srv.appSession(bob, "ingest/worker").connect()).rejects.toMatchObject({ code: "forbidden", message: expect.stringContaining("service principals arrive with #270") });
+test("a user's bind in a service principal's scope reads as a missing scope (#270), and creates nothing", async () => {
+  await seed(srv.app.repo, tx => srv.app.repo.services.create(tx, "ingest"));
+  await expect(srv.appSession(bob, "ingest/worker").connect()).rejects.toMatchObject({ code: "not_found", message: '"ingest/worker": no team or service is named "ingest"' });
   expect(rows(`SELECT address FROM aliases WHERE address = 'ingest/worker'`)).toEqual([]);
 });
