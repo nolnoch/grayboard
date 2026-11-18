@@ -295,7 +295,7 @@ export class SlackBridge implements SlackLinker {
     if (!user || user.disabled_at !== null || this.stopped) return;
     const prefix = `${link.email}/`;
     const handle = `${prefix}${HUMAN_NAME}`;
-    const authed: AuthedUser = { user_id: link.user_id, user_email: link.email, session_id: 0 };
+    const authed: AuthedUser = { user_id: link.user_id, user_email: link.email, kind: user.kind, session_id: 0 };
 
     let relay!: Relay;
     const application = this.o.application;

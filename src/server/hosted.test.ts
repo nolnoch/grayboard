@@ -8,7 +8,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createApplication } from "./application.ts";
-import { openDatabase } from "./db.ts";
+import { openDatabase, USER_BY_ID_SQL } from "./db.ts";
 import { createHostedSessions, deliveryDeclaration, hostedBoundInstruction, OTHER_USER_NOTE, sessionContext, withoutFacts } from "./hosted.ts";
 import { cleanFact } from "../core/boards.ts";
 import { createOAuthServer, type OAuthPrincipal } from "./oauth.ts";
@@ -39,7 +39,7 @@ beforeEach(async () => {
   database = openDatabase(scratchDbPath(), { blobDir });
   application = createApplication(database.repo);
   const user = await seed(database.repo, tx => database.repo.users.upsertByEmail(tx, "you@example.com", null));
-  principal = { authed: { user_id: user.id, user_email: user.email, session_id: 0 }, clientId: OPENCODE_CLIENT, sourceKey: OPENCODE_SESSION_META, grantId: "G1", accessHash: "test", accessExpiry: Number.MAX_SAFE_INTEGER, scopes: ["tools", "delivery"] };
+  principal = { authed: { user_id: user.id, user_email: user.email, kind: "user", session_id: 0 }, clientId: OPENCODE_CLIENT, sourceKey: OPENCODE_SESSION_META, grantId: "G1", accessHash: "test", accessExpiry: Number.MAX_SAFE_INTEGER, scopes: ["tools", "delivery"] };
   now = Date.now(); authorized = true;
   hosted = createHostedSessions(application, { now: () => now, isAuthorized: () => authorized }); await hosted.ready;
   delivery = createDelivery(hosted, { isAuthorized: () => authorized });
@@ -900,7 +900,7 @@ test("registration rejects invalid ownership graphs without moving an existing c
   await expect(hosted.end(principal, context("child"), rootContext.id)).rejects.toHaveProperty("code", "child_session");
   expect(await hosted.whoami(principal, context("child"))).toMatchObject({ primary: "you@example.com/fe", child: true });
   const foreign = await seed(database.repo, tx => database.repo.users.upsertByEmail(tx, "peer@example.com", null));
-  const outsider = { ...principal, authed: { user_id: foreign.id, user_email: foreign.email, session_id: 0 } };
+  const outsider = { ...principal, authed: { user_id: foreign.id, user_email: foreign.email, kind: "user" as const, session_id: 0 } };
   const outsiderContext = sessionContext(outsider, { [OPENCODE_SESSION_META]: "root" });
   expect(await hosted.whoami(outsider, outsiderContext)).toHaveProperty("unbound", true);
   await hosted.bind(outsider, outsiderContext, { name: "fe", create: true });
@@ -1940,7 +1940,7 @@ test("#881: a request reads its row once and skips its own user's disabled read;
   const query = spyOn(Database.prototype, "query");
   try {
     const count = (sql: string) => query.mock.calls.filter(([s]) => String(s) === sql).length;
-    const rowReads = () => count("SELECT * FROM hosted_sessions WHERE session_id = ?"), userReads = () => count("SELECT * FROM users WHERE id = ?");
+    const rowReads = () => count("SELECT * FROM hosted_sessions WHERE session_id = ?"), userReads = () => count(USER_BY_ID_SQL);
     query.mockClear();
     await hosted.whoami(principal, root);
     // withGate's before-gate read and settle's (rowFor reuses it); the call ends inside the touch window, so its end

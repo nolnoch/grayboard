@@ -58,7 +58,7 @@ test("decidePure refuses a verb whose rule reads storage", () => {
   const reading = { verb: "scope.act", principal: p, scope: { scope_kind: "team", scope_ref: "eng" } } as unknown as PureRequest;
   expect(() => decidePure({}, reading)).toThrow("scope.act asked for a storage read (principalByName)");
   // admin reads the caller's org_admin binding once the env list doesn't decide (#927): it isn't pure.
-  const admin = { verb: "admin", user: { id: 1, email: "a@example.com" } } as unknown as PureRequest;
+  const admin = { verb: "admin", user: { id: 1, email: "a@example.com", kind: "user" } } as unknown as PureRequest;
   expect(decidePure({ admins: ["a@example.com"] }, admin)).toEqual({ allow: true, rule: "admin.env" });
   expect(() => decidePure({}, admin)).toThrow("admin asked for a storage read (roleBinding)");
 });

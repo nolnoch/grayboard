@@ -192,7 +192,7 @@ test("seesAlias: a person scope to anyone signed in, a team's to its members and
   expect(access.seesAlias!(WADE_ID, { scope_kind: "team", scope_ref: null })).toBe(false);
 });
 
-test("mayActIn: a user acts in its own person scope and its teams' scopes; service scopes wait for #270", async () => {
+test("mayActIn: a user acts in its own person scope and its teams' scopes, a service in its own scope only (#270)", async () => {
   const bob = { kind: "user" as const, name: "bob@example.com" };
   const may = (p: Parameters<typeof mayActIn>[1], kind: "person" | "team" | "service", ref: string) => mayActIn(repo, p, { scope_kind: kind, scope_ref: ref });
   expect(may(bob, "person", "bob@example.com")).toBeNull();
@@ -200,8 +200,9 @@ test("mayActIn: a user acts in its own person scope and its teams' scopes; servi
   expect(may(bob, "team", "eng")).toBeNull();
   expect(may(bob, "team", "ops")).toBe("bob@example.com isn't a member of team ops");
   expect(may(bob, "team", "nosuch")).toBe("bob@example.com isn't a member of team nosuch");
-  expect(may(bob, "service", "ci")).toBe("service principals arrive with #270");
-  expect(may({ kind: "service", name: "ci" }, "team", "eng")).toBe("service principals arrive with #270");
+  expect(may(bob, "service", "ci")).toBe("no user acts in service ci's scope");
+  expect(may({ kind: "service", name: "ci" }, "team", "eng")).toBe("ci is a service; it acts only in its own scope");
+  expect(may({ kind: "service", name: "ci" }, "service", "ci")).toBeNull();
   expect(may({ kind: "team", name: "eng" }, "team", "eng")).toBe("eng is a team, not a user");
   await seed(repo, async (tx) => repo.teams.removeMember(tx, (await repo.teams.findByName(tx, "eng"))!.id, (await repo.users.findByEmail(tx, "bob@example.com"))!.id));
   expect(may(bob, "team", "eng")).toBe("bob@example.com isn't a member of team eng");

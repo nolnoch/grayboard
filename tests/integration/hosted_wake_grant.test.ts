@@ -185,7 +185,7 @@ test("the send result: an offline person alias says wakes:false; a team alias's 
   // A human reads it: reach is msg.send's call, not a wake.
   const bfe = await srv.hosted(B, "fe");
   const aliceHuman = (await srv.app.repo.users.findByEmail(srv.app.repo.read, A))!;
-  const human = (await srv.app.application.attachHuman({ user_id: aliceHuman.id, user_email: A, session_id: 0 }, { deliver() {}, closed() {} })).session;
+  const human = (await srv.app.application.attachHuman({ user_id: aliceHuman.id, user_email: A, kind: "user", session_id: 0 }, { deliver() {}, closed() {} })).session;
   expect(await bfe.call<{ wakes?: false }>("dm_send", { to: `${A}/human`, body: "to alice's phone" })).not.toHaveProperty("wakes");
   srv.app.application.close(human);
 });

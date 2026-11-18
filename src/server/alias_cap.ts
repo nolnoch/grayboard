@@ -20,6 +20,7 @@ export async function aliasCapRefusal(repo: Repo, r: Read, scope: { scope_kind: 
   if (n < cap) return null;
   const free = scope.scope_kind === "team"
     ? `a team owner frees one with grayboard team delete-alias ${scope.scope_ref} <name>`
+    : scope.scope_kind === "service" ? `an admin frees one with grayboard admin service delete-alias ${scope.scope_ref} <name>`
     : "free one with grayboard identity rm <name>";
-  return `${scope.scope_kind === "team" ? `team "${scope.scope_ref}"` : "your scope"} already has ${n} names, the server's cap of ${cap}; bind an existing name, or ${free}`;
+  return `${scope.scope_kind === "person" ? "your scope" : `${scope.scope_kind} "${scope.scope_ref}"`} already has ${n} names, the server's cap of ${cap}; bind an existing name, or ${free}`;
 }

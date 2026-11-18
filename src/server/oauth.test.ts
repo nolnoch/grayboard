@@ -8,7 +8,7 @@ import { createHash, randomBytes, randomInt } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { openDatabase } from "./db.ts";
+import { openDatabase, USER_BY_ID_SQL } from "./db.ts";
 import { queueFor } from "./store/queue.ts";
 import { until } from "../../tests/support/until.ts";
 import { createOAuthServer, type OAuthPrincipal } from "./oauth.ts";
@@ -184,7 +184,7 @@ test("peekAuthorized is a miss on a token hit whose user isn't cached, reads no 
   const p = await service.authenticate(new Request(service.resource, { headers: { Authorization: `Bearer ${grant.token}` } }));
   if (p instanceof Response) throw new Error("expected fixture principal");
   const query = spyOn(Database.prototype, "query");
-  const userReads = () => query.mock.calls.filter(([sql]) => String(sql) === "SELECT * FROM users WHERE id = ?").length;
+  const userReads = () => query.mock.calls.filter(([sql]) => String(sql) === USER_BY_ID_SQL).length;
   try {
     // authenticate filled the token and its user under one generation.
     expect(service.peekAuthorized(p, storage.repo.authPeek()!)).toBe(true);

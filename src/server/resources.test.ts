@@ -57,7 +57,7 @@ beforeEach(async () => {
   resources = createResources(application, { isCurrent: () => true, isAuthorized: s => !revoked.has(s) });
   const user = async (email: string): Promise<AuthedUser> => {
     const u = await seed(store.repo, tx => store.repo.users.upsertByEmail(tx, email, null));
-    return { user_id: u.id, user_email: email, session_id: 0 };
+    return { user_id: u.id, user_email: email, kind: "user", session_id: 0 };
   };
   alice = await user("alice@example.com");
   bob = await user("bob@example.com");

@@ -23,7 +23,7 @@ import { HUMAN_NAME, HUMAN_RESERVED, formatTeamAddress } from "../shared/address
 import { describeLocation } from "../shared/identity.ts";
 import { authorize, recordDecision, type Actor, type AuthzRequest, type Decision, type HumanReach } from "./policy.ts";
 import { serverAuditSink, writeAudit } from "./audit.ts";
-import type { AuthedUser } from "./auth.ts";
+import { principalOfAuthed, type AuthedUser } from "./auth.ts";
 import {
   age, checkBody, parseAliasMeta, pendingKey, refOf,
   cleanFact, idCollisionText, normalizeBoard, getBoard,
@@ -70,7 +70,9 @@ export type DeliverySink = {
 export type SessionFacts = {
   user_email: string;
   teams: string[];
-  human: { handle: string; linked: boolean };
+  // A person's own human (the Slack bridge's handle); a service has none (#270 D1), though the name stays reserved
+  // in its scope.
+  human?: { handle: string; linked: boolean };
   attachment_limits: AttachmentLimits;
 };
 export type IdentityInfo = SessionFacts & {
@@ -385,7 +387,8 @@ function setHolds(hub: Hub, session: ApplicationSession, holds: string[]): void 
 // bridge's human acts only as its handle.
 const asAddresses = (s: ApplicationSession): string[] => (s.human ? [s.primary] : s.addresses);
 
-const userPrincipal = (authed: AuthedUser): Principal => ({ kind: "user", name: authed.user_email });
+// The session's principal: a user's, or a service's (#270 D1), by its row's kind.
+const userPrincipal = principalOfAuthed;
 // Whose unsent uploads this session may send: its addresses' (#284 S5),
 // made by its user (#367).
 const uploaderOf = (s: ApplicationSession): Uploader => ({ addresses: s.addresses, principal: s.authed.user_email });
@@ -423,7 +426,7 @@ function helloFields(hub: Hub, authed: AuthedUser, f: HelloFacts): SessionFacts 
   return {
     user_email: authed.user_email,
     teams: f.teams,
-    human: { handle: `${authed.user_email}/${HUMAN_NAME}`, linked: hub.slackRunning() && f.linked },
+    ...(authed.kind === "user" ? { human: { handle: `${authed.user_email}/${HUMAN_NAME}`, linked: hub.slackRunning() && f.linked } } : {}),
     attachment_limits: hub.repo.attachmentLimits,
   };
 }
@@ -461,9 +464,11 @@ async function bindTarget(hub: Hub, r: Read, authed: AuthedUser, input: string):
   if (!p || p.kind === "id" || p.kind === "team") {
     return { code: "bad_request", error: `"${input}" isn't an alias: a name (a-z 0-9 _ -, 1-32 chars), or scope/name` };
   }
+  // A bare name is in the caller's own scope: a person's, or a service's (#270 D1), whose name has no "@".
   const address = p.kind === "bare" ? `${authed.user_email}/${p.name}` : p.address;
+  const a = addressParts(address);
   // aliasScope asks for a principal scope's kind only, and only for this address's scope: read it first.
-  const owner = p.kind === "alias" && p.scopeKind === "principal" ? (await repo.principals.findByName(r, p.scope))?.kind : undefined;
+  const owner = a?.kind === "alias" && a.scopeKind === "principal" ? (await repo.principals.findByName(r, a.scope))?.kind : undefined;
   let scope: AliasScope;
   try {
     scope = aliasScope(address, () => (owner === "team" || owner === "service" ? owner : null));
@@ -477,9 +482,11 @@ async function bindTarget(hub: Hub, r: Read, authed: AuthedUser, input: string):
   const req: AuthzRequest = { verb: "alias.bind", principal: userPrincipal(authed), scope: t, name: scope.name };
   const d = await authorize(repo, r, {}, req);
   if (!d.allow && d.rule === "alias.human_reserved") return { code: "forbidden", error: HUMAN_RESERVED, address, authz: { req, d } };
-  // A team reads as missing to a non-member (#1020): the refusal aliasScope gives a scope nobody owns.
-  if (!d.allow && d.rule === "scope.team_member") return { code: "not_found", error: `"${address}": no team or service is named "${t.scope_ref}"`, address, authz: { req, d } };
-  if (!d.allow) return { code: "forbidden", error: `you can't act as "${address}": ${d.reason}; bind a name in your own scope, or in a team's you belong to`, address, authz: { req, d } };
+  // A team reads as missing to a non-member (#1020), and a service's scope to any user (#270 D1): the refusal
+  // aliasScope gives a scope nobody owns.
+  if (!d.allow && (d.rule === "scope.team_member" || d.rule === "scope.service")) return { code: "not_found", error: `"${address}": no team or service is named "${t.scope_ref}"`, address, authz: { req, d } };
+  const hint = authed.kind === "service" ? "bind a bare name, which lands in your service's scope" : "bind a name in your own scope, or in a team's you belong to";
+  if (!d.allow) return { code: "forbidden", error: `you can't act as "${address}": ${d.reason}; ${hint}`, address, authz: { req, d } };
   return { address, scope: t };
 }
 
@@ -1453,7 +1460,7 @@ export type Application = ReturnType<typeof createApplication>;
 // claim_list and peer_list) are judged by
 // its user's principal directly, never as an address in the user's scope
 // (`human` there is the bridge's reserved identity), #410.
-const userOf = (session: ApplicationSession): Principal => ({ kind: "user", name: session.authed.user_email });
+const userOf = (session: ApplicationSession): Principal => principalOfAuthed(session.authed);
 
 // Where a name was last used: its session's cwd, else its place.
 function whereSeen(seen: { cwd: string | null; place: string | null } | undefined): string | null {
@@ -1466,7 +1473,8 @@ function whereSeen(seen: { cwd: string | null; place: string | null } | undefine
 async function candidates(hub: Hub, r: Read, authed: AuthedUser, suggestedInput: string | null): Promise<Candidate[]> {
   const { repo } = hub;
   const full = (n: string) => `${authed.user_email}/${n}`;
-  const all = (await repo.aliases.listForScope(r, "person", authed.user_email)).map((i) => i.name);
+  // The session's own scope: a person's, or a service's (#270 D1).
+  const all = (await repo.aliases.listForScope(r, authed.kind === "service" ? "service" : "person", authed.user_email)).map((i) => i.name);
   const seen = await repo.aliases.seen(r, all.map(full));
   const held = await repo.bindings.holdersOf(r, [...all, ...(suggestedInput !== null ? [suggestedInput] : [])].map(full));
   const free = (n: string) => n !== HUMAN_NAME && !held.has(full(n));
@@ -1554,14 +1562,15 @@ async function resolvePeer(repo: Repo, r: Read, from: string, input: string, vie
   return fail("not_found", `${which}; peer_list shows exact handles`);
 }
 
-// Whether `address` is a team's alias that `viewer` (a session ID, else the acting address) may not see exists: to
-// anyone outside the team its names read as missing (alias.see, #348), for mail too (#1014). Only a team's: a
-// service's agents take mail from anyone in the org (vision.md principle 9).
-async function teamAliasHidden(repo: Repo, r: Read, viewer: string, address: string): Promise<boolean> {
+// Whether `address` is a team's or a service's alias that `viewer` (a session ID, else the acting address) may not
+// see exists: to anyone outside the team its names read as missing (alias.see, #348), for mail too (#1014); a
+// service's names are its own until #270's invocation step names who else sees them (D4), so a user's mail to one
+// reads like mail to a missing name. A person's names are an open directory.
+async function aliasHidden(repo: Repo, r: Read, viewer: string, address: string): Promise<boolean> {
   const a = await repo.aliases.find(r, address);
-  if (a?.scope_kind !== "team" || a.scope_ref === null) return false;
+  if (!a || a.scope_kind === "person" || a.scope_ref === null) return false;
   const vp = await repo.principals.of(r, viewer);
-  return vp === null || !(await authorize(repo, r, {}, { verb: "alias.see", principal: vp, scope: { scope_kind: "team", scope_ref: a.scope_ref } })).allow;
+  return vp === null || !(await authorize(repo, r, {}, { verb: "alias.see", principal: vp, scope: { scope_kind: a.scope_kind, scope_ref: a.scope_ref } })).allow;
 }
 
 // A send checked and resolved, ready to write: `from` the address it goes
@@ -1615,7 +1624,7 @@ async function prepareSend(
     const parent = await repo.messages.getById(r, parentId);
     return participant(parent, session.addresses) && replyPeer(parent, session.addresses) === address;
   }
-  if (to.kind === "alias" && (!(await repo.aliases.find(r, to.address)) || ((await teamAliasHidden(repo, r, session.sessionId || from, to.address)) && !(await replyingTo(to.address))))) {
+  if (to.kind === "alias" && (!(await repo.aliases.find(r, to.address)) || ((await aliasHidden(repo, r, session.sessionId || from, to.address)) && !(await replyingTo(to.address))))) {
     fail("not_found", `identity "${to.address}" not found; peer_list shows exact handles`);
   }
   const req: AuthzRequest = { verb: "msg.send", from, to: to.address };
@@ -1818,8 +1827,8 @@ async function handleDelegate(hub: Hub, tx: Tx, session: ApplicationSession, m: 
   const reachDecision = async (h: Tx, to: string, recheck = false): Promise<Reach> => {
     // A team's alias this session may not see reads as one nobody has (#1014), before any grant is judged. A replay
     // named it while it could: it says why it can't be replayed, not that the name never connected.
-    if (await teamAliasHidden(repo, h, session.sessionId || session.primary, to)) {
-      return { result: { refused: recheck ? `"${to}" is a team's alias this session may no longer see, so the first delegation can't be replayed` : neverConnected(to) } };
+    if (await aliasHidden(repo, h, session.sessionId || session.primary, to)) {
+      return { result: { refused: recheck ? `"${to}" is a team's or service's alias this session may no longer see, so the first delegation can't be replayed` : neverConnected(to) } };
     }
     // On a replay, a person's human is that person's, though no session holds it (the Slack bridge's connection has
     // none), so a human-fallback delegation is rechecked rather than refused as unheld (#1030). A fresh call naming a

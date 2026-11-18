@@ -56,10 +56,14 @@ export type AuthzRequest =
   | { verb: "session.act"; user: string; session: string; row: SessionFacts | undefined }
   | { verb: "hosted.session"; session: string; user: number; client: string; row: { user: number; client: string } }
   | { verb: "attachment.read"; identity: string; attachment: string; reach: AttachmentReach | undefined }
-  | { verb: "team.read" | "team.manage" | "team.leave"; user: { id: number; email: string }; team: Team | undefined }
-  | { verb: "admin"; user: { id: number; email: string } }
+  | { verb: "team.read" | "team.manage" | "team.leave"; user: SignedIn; team: Team | undefined }
+  | { verb: "admin"; user: SignedIn }
   | { verb: "msg.wake" | "delegate.to"; from_user: string; to_user: string }
   | { verb: "alias.see"; principal: Principal; scope: ActScope };
+
+// The signed-in principal of a user-keyed verb: its users row's id and name, and its kind (#270 D1: a service is a
+// users row too, and holds no admin or team authority).
+export type SignedIn = { id: number; email: string; kind: "user" | "service" };
 
 // What session.act judges of an ID's row: whose it is, and whether it's a
 // viewer's or has ended.
@@ -74,13 +78,14 @@ export type Decision =
   | ({ allow: false; code: "forbidden" | "not_found"; reason: string; rule: string } & Omit<RoleFacts, "binding">);
 
 // The roles (#927): each fixes its scope's kind (null: the org) and the principal kinds that may hold it.
-// A row whose role isn't here grants nothing: every lookup names its role. service_invoke's holder kinds, verb and
-// check are #270's; until then no principal may hold it, and with no service principal every grant is refused on its
-// scope first.
-export type Role = "org_admin" | "team_owner" | "service_invoke";
+// A row whose role isn't here grants nothing: every lookup names its role. service_owner (#270 D1) is a service's
+// accountability record and carries no power yet: no rule reads it. service_invoke's holder kinds, verb and check
+// arrive with #270's invocation step (D6); until then no principal may hold it.
+export type Role = "org_admin" | "team_owner" | "service_owner" | "service_invoke";
 export const ROLES: Readonly<Record<Role, { scope: "team" | "service" | null; holders: readonly Principal["kind"][] }>> = {
   org_admin: { scope: null, holders: ["user"] },
   team_owner: { scope: "team", holders: ["user"] },
+  service_owner: { scope: "service", holders: ["user"] },
   service_invoke: { scope: "service", holders: [] },
 };
 export const isRole = (r: unknown): r is Role => typeof r === "string" && Object.hasOwn(ROLES, r);
@@ -342,7 +347,9 @@ function isAdmin(ctx: PolicyContext, email: string): boolean {
 
 // The org admin's allow, or null (#927): a GRAYBOARD_ADMINS email first, reading nothing, so a bootstrap admin
 // keeps its powers whatever the table holds; else the user's org_admin binding, one indexed lookup, never cached.
-function* orgAdmin(ctx: PolicyContext, user: { id: number; email: string }): Rule<Decision | null> {
+// A service is never an admin (#270 D1), even one whose name was put in GRAYBOARD_ADMINS: checked first.
+function* orgAdmin(ctx: PolicyContext, user: SignedIn): Rule<Decision | null> {
+  if (user.kind !== "user") return null;
   if (isAdmin(ctx, user.email)) return allow("admin.env");
   const b = yield* ask("roleBinding", user.id, "org_admin", null);
   return b === undefined ? null : allow("role.org_admin", { binding: b, role: "org_admin", scope: null });
@@ -350,11 +357,16 @@ function* orgAdmin(ctx: PolicyContext, user: { id: number; email: string }): Rul
 
 // Whether principal p may act in a scope: bind an alias there, or write as
 // one (#284 S9). Keyed by principal, not by email: a user acts in its own
-// person scope and in the teams it belongs to. Service scopes, and service
-// principals acting anywhere, wait for #270's grants.
+// person scope and in the teams it belongs to; a service acts in its own
+// service scope and nowhere else, and no user acts in a service's scope, its
+// owners included (#270 D1, principle 9): the names' mail is the service's.
 function* actIn(p: Principal, scope: ActScope): Rule<Decision> {
   const ref = scope.scope_ref;
-  if (scope.scope_kind === "service" || p.kind === "service") return deny("scope.service", "service principals arrive with #270");
+  if (p.kind === "service") {
+    return scope.scope_kind === "service" && ref === p.name ? allow("scope.own_service") : deny("scope.own_service", `${p.name} is a service; it acts only in its own scope`);
+  }
+  // Read as a missing scope by callers, as a team's is to a non-member: a refusal doesn't say a service exists.
+  if (scope.scope_kind === "service") return deny("scope.service", `no user acts in service ${ref}'s scope`);
   if (p.kind !== "user") return deny("scope.user_only", `${p.name} is a ${p.kind}, not a user`);
   if (scope.scope_kind === "person") return ref === p.name ? allow("scope.own_person") : deny("scope.own_person", `${ref}'s scope isn't ${p.name}'s`);
   const userId = (yield* ask("principalByName", p.name))?.user_id;
