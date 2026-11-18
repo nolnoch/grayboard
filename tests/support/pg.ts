@@ -57,7 +57,12 @@ const templates = new Map<string, Promise<{ name: string; built: boolean }>>();
 export function pgTemplate(migrations: readonly Migration[] = MIGRATIONS): Promise<{ name: string; built: boolean }> {
   const name = templateName(migrations);
   let t = templates.get(name);
-  if (!t) { t = buildTemplate(name, migrations); templates.set(name, t); }
+  if (!t) {
+    t = buildTemplate(name, migrations);
+    templates.set(name, t);
+    // A failed build isn't cached: the next caller retries it.
+    t.catch(() => templates.delete(name));
+  }
   return t;
 }
 
