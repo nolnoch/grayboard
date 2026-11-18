@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { describe, expect, test } from "bun:test";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -19,6 +19,8 @@ const addUser = (db: ReturnType<typeof open>["db"], email: string) => { db.run("
 // these tests need a body that finishes before its post or write returns.
 const putUser = (tx: Tx, email: string) => { sqliteOf(tx).run("INSERT INTO users (email, created_at) VALUES (?, 0)", [email]); };
 import { sqliteOf, type Tx } from "./tx.ts";
+import { txContract } from "./tx.contract.ts";
+import { sqliteBackend } from "./tx.contract.sqlite.ts";
 
 test("an idle queue runs a synchronous body before run() returns", async () => {
   const q = new WriteQueue();
@@ -485,3 +487,6 @@ test("a COMMIT that fails rolls the body back, drops its effects and releases th
   await repo.write(tx => repo.users.upsertByEmail(tx, "next@example.com", null));
   expect(repo.policyNow.userByEmail("next@example.com")).toBeDefined();
 });
+
+// The portable Repo-level rows above, as the backend-neutral contract every store runs (tx.contract.ts).
+describe("contract (SQLite)", () => txContract(sqliteBackend, "write-path"));

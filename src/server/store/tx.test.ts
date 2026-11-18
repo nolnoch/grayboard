@@ -1,11 +1,13 @@
 // The write queue's Tx/Read handles (#807 P1c-1, docs/future/postgres-server.md D8).
-import { expect, test } from "bun:test";
+import { describe, expect, test } from "bun:test";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDatabase, type Repo } from "../db.ts";
 import { scratchDbPath } from "../../../tests/support/scratch_db.ts";
 import { sqliteOf, type Read, type Tx } from "./tx.ts";
+import { txContract } from "./tx.contract.ts";
+import { sqliteBackend } from "./tx.contract.sqlite.ts";
 
 async function open(): Promise<Repo> {
   const { repo } = openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
@@ -445,3 +447,6 @@ test("a hook that re-registers its own key doesn't run again; a key from a hook'
   expect(seen).toEqual(["hook"]);
   expect(rows(repo.read)).toEqual(["hook"]);
 });
+
+// The portable rows above, as the backend-neutral contract every store runs (tx.contract.ts).
+describe("contract (SQLite)", () => txContract(sqliteBackend, "handles"));

@@ -2,6 +2,7 @@ import type { Database } from "bun:sqlite";
 import type { EndedChild, HostedStore, HostedSession, HostedEnd, LostReader, HostedLost } from "./hosted-types.ts";
 import { testPause, testPauseAsync } from "../shared/testpause.ts";
 import { queueFor } from "./store/queue.ts";
+import { isThenable } from "./store/tx_base.ts";
 import { mkdirSync } from "node:fs";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { dirname } from "node:path";
@@ -165,9 +166,6 @@ function withTx<T>(db: Database, fn: (tx: Tx) => T): () => T {
     try { return fn(tx); } finally { tx.close(); }
   };
 }
-
-const isThenable = (v: unknown): v is PromiseLike<unknown> =>
-  v !== null && (typeof v === "object" || typeof v === "function") && typeof (v as { then?: unknown }).then === "function";
 
 // Core's shared writes (attachment store/release/sweep, #807 D4) through repo's write queue, each body
 // given the connection its queued body's `Tx` resolves to (P1c-15c-2). Core's bodies are synchronous, so the cast
