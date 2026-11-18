@@ -164,8 +164,26 @@ function checkExprs(createSql: string): string[] {
   return out;
 }
 
+// The operators whose meaning SQLite and Postgres share for this schema's types. Canonicalizing through Postgres's
+// parser proves two expressions equal only in Postgres's semantics: LIKE, for one, ignores ASCII case in SQLite and not
+// in Postgres, so the same text would pass here and differ at runtime. A word outside this list and the table's own
+// columns stops the comparison until someone reviews its semantics on both sides and extends the list (or toPg).
+const SHARED_WORDS = new Set(["IS", "NOT", "NULL", "IN", "AND", "OR"]);
+function unreviewed(expr: string, columns: Set<string>): string | undefined {
+  const token = /\s+|'(?:[^']|'')*'|\d+|[A-Za-z_][A-Za-z0-9_]*|[=(),]/y;
+  for (let i = 0; i < expr.length;) {
+    token.lastIndex = i;
+    const m = token.exec(expr);
+    if (!m) return expr.slice(i);
+    const w = m[0];
+    if (/^[A-Za-z_]/.test(w) && !SHARED_WORDS.has(w.toUpperCase()) && !columns.has(w)) return w;
+    i = token.lastIndex;
+  }
+  return undefined;
+}
+
 // A SQLite expression in Postgres's dialect: a D6 boolean is tested bare (`viewer = 1` → `viewer`, `= 0` → `NOT viewer`).
-// Anything else this schema writes (IS [NOT] NULL, = 'literal', IN (...), AND, OR) is valid in both.
+// Anything else unreviewed() admits (IS [NOT] NULL, = 'literal', IN (...), AND, OR, NOT) is valid in both.
 function toPg(table: string, expr: string): string {
   let e = expr;
   for (const key of BOOLEANS) {
@@ -180,26 +198,39 @@ function toPg(table: string, expr: string): string {
 // attached to the Postgres table as a scratch index or NOT VALID constraint in a transaction that rolls back, and read
 // back with pg_get_expr / pg_get_constraintdef. Both sides then compare in one canonical spelling (parenthesisation,
 // IN → = ANY (ARRAY[...]), ::text casts), so an inverted predicate, AND ↔ OR or a narrowed IN list fails.
+// An expression Postgres can't take, or one with an unreviewed operator, becomes that entry's canonical form as a
+// named marker, so the keys or indexes test fails with the table, the expression and the reason in its diff (a throw
+// here would fail beforeAll unnamed and hide every other comparison).
 async function canonicalize(sqlite: Schema, sql: PgDatabase["sql"]): Promise<void> {
   const rollback = new Error("rollback");
   try {
     await sql.begin(async tx => {
       let n = 0;
+      const deparse = async (name: string, expr: string, columns: Set<string>, attach: (scratch: string, pgExpr: string) => string, read: (scratch: string) => Promise<string>) => {
+        const word = unreviewed(expr, columns);
+        if (word !== undefined) return `<unreviewed operator ${JSON.stringify(word)} in ${name}: ${expr}>`;
+        const scratch = `parity_scratch_${n++}`;
+        const stmt = attach(scratch, toPg(name, expr));
+        try {
+          return await tx.savepoint(async sp => { await sp.unsafe(stmt); return read(scratch); });
+        } catch (err) {
+          return `<unparseable in Postgres: ${(err as Error).message}: ${stmt}>`;
+        }
+      };
       for (const [name, t] of sqlite) {
         if (NOT_CARRIED.has(name)) continue;
+        const columns = new Set(t.columns.keys());
         for (const i of t.indexes.values()) {
           if (!i.partial) continue;
-          const scratch = `parity_scratch_${n++}`;
-          await tx.unsafe(`CREATE INDEX ${scratch} ON ${name} (${i.columns[0]}) WHERE ${toPg(name, i.predicate)}`);
-          const [{ p }] = await tx`SELECT pg_get_expr(i.indpred, i.indrelid) AS p FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid WHERE c.relname = ${scratch}`;
-          i.predicate = p;
+          i.predicate = await deparse(name, i.predicate, columns,
+            (scratch, e) => `CREATE INDEX ${scratch} ON ${name} (${i.columns[0]}) WHERE ${e}`,
+            async scratch => (await tx`SELECT pg_get_expr(i.indpred, i.indrelid) AS p FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid WHERE c.relname = ${scratch}`)[0].p);
         }
         const checks: string[] = [];
         for (const expr of t.checks) {
-          const scratch = `parity_scratch_${n++}`;
-          await tx.unsafe(`ALTER TABLE ${name} ADD CONSTRAINT ${scratch} CHECK (${toPg(name, expr)}) NOT VALID`);
-          const [{ d }] = await tx`SELECT pg_get_constraintdef(oid) AS d FROM pg_constraint WHERE conname = ${scratch}`;
-          checks.push(d.replace(/ NOT VALID$/, ""));
+          checks.push(await deparse(name, expr, columns,
+            (scratch, e) => `ALTER TABLE ${name} ADD CONSTRAINT ${scratch} CHECK (${e}) NOT VALID`,
+            async scratch => ((await tx`SELECT pg_get_constraintdef(oid) AS d FROM pg_constraint WHERE conname = ${scratch}`)[0].d as string).replace(/ NOT VALID$/, "")));
         }
         t.checks = checks.sort();
       }
@@ -284,6 +315,20 @@ describePg("0001_init.sql mirrors the SQLite server schema", () => {
       const shape = (t: Table) => Object.fromEntries([...t.indexes].map(([n, i]) => [n, { columns: i.columns, unique: i.unique, partial: i.partial, predicate: i.predicate }]));
       expect(shape(p), `${name} indexes`).toEqual(shape(s));
     }
+  });
+
+  test("every identity counts up from 1 by 1, uncached and non-cycling", async () => {
+    // A descending or cycling id breaks every `id > last_seen` cursor; a cache above 1 hands each connection its own
+    // block, so ids stop following commit order across sessions.
+    const rows: { col: string; start: string; increment: string; max: string; min: string; cycle: string; cache: string }[] = await pgDb!.sql`
+      SELECT c.table_name || '.' || c.column_name AS col, c.identity_start AS start, c.identity_increment AS increment,
+        c.identity_maximum AS max, c.identity_minimum AS min, c.identity_cycle AS cycle, s.seqcache::text AS cache
+      FROM information_schema.columns c
+      JOIN pg_sequence s ON s.seqrelid = pg_get_serial_sequence(quote_ident(c.table_name), c.column_name)::regclass
+      WHERE c.table_schema = 'public' AND c.is_identity = 'YES'`;
+    expect(rows.length).toBeGreaterThan(10);
+    const odd = rows.filter(r => `${r.start}/${r.increment}/${r.max}/${r.min}/${r.cycle}/${r.cache}` !== "1/1/9223372036854775807/1/NO/1");
+    expect(odd).toEqual([]);
   });
 
   test("every text column is COLLATE \"C\", and text orders byte-wise", async () => {
