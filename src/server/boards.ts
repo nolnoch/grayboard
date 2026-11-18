@@ -14,7 +14,7 @@ import { readableBoard } from "./board_reads.ts";
 import type { Repo } from "./db.ts";
 import type { Read, Tx } from "./store/tx.ts";
 
-// core's ToolContext, less `reader` (a sync predicate core's own tools still take), plus `principal`: an addressless
+// core's ToolContext (its `reader` a sync predicate the tools still on core take), plus `principal`: an addressless
 // caller's user (an unbound hosted session, #410), whose sight judges board_list, peer_list and the boards it reads.
 export type ServerToolContext = ToolContext & { principal?: Principal };
 

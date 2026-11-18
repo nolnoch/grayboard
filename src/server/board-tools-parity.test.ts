@@ -4,7 +4,7 @@
 // bound and unbound, a cross-user writer and a read-only viewer.
 import { beforeEach, expect, test } from "bun:test";
 import { boardActor, holdAlias, idAddress } from "../core/bindings.ts";
-import { createBoard, post, registerId, setStatus, setSubscription, subscribe, touchAlias, type CoreDb, type UnboundPeer } from "../core/boards.ts";
+import { archiveBoard, createBoard, post, registerId, setStatus, setSubscription, subscribe, touchAlias, type CoreDb, type UnboundPeer } from "../core/boards.ts";
 import type { Principal } from "../core/resolver.ts";
 import { callBoardTool as coreCallBoardTool, type ToolContext } from "../core/tools.ts";
 import { boardAccess, principalCanSee } from "./access.ts";
@@ -19,13 +19,14 @@ const BOB_ID = idAddress("c".repeat(64)), EVE_ID = idAddress("d".repeat(64)), TA
 const DAN_UNBOUND = idAddress("9".repeat(64)), DAN_WRITER = idAddress("8".repeat(64));
 const GONE_ID = idAddress("7".repeat(64));
 // Mid-minute, so a status age reads the same however many milliseconds apart the two sides run.
-const T0 = Date.now() - 10.5 * 60_000;
+let T0 = 0;
 
 let repo: Repo;
 let db: CoreDb;
 
 beforeEach(async () => {
   ({ repo, db } = await openBoardParity());
+  T0 = Date.now() - 10.5 * 60_000;
   await seed(repo, async tx => {
     const core = repo.coreOn(tx);
     registerId(core, { id: BOB_ID, principal: B, launcher: false, harness: "pi", model: "m1" });
@@ -60,6 +61,11 @@ beforeEach(async () => {
     subscribe(core, "eng/deploy", "general", "digest");
     post(core, `${B}/be`, "general", "again");
     post(core, `${W}/be`, "eng", "plan");
+    // An archived board: off board_list on every path, still picked by a read of it (#635).
+    createBoard(core, `${W}/be`, "attic", "old");
+    subscribe(core, `${B}/qa`, "attic", "digest");
+    post(core, `${W}/be`, "attic", "last");
+    archiveBoard(core, `${W}/be`, "attic", true);
   });
 });
 
@@ -117,7 +123,7 @@ async function inBody(f: (tx: Tx) => Promise<unknown>): Promise<unknown> {
 
 const ACTOR_TOOLS = ["board_read", "board_subscribe", "board_post", "board_list", "peer_list", "peer_status", "claim_take"];
 const ACTOR_ARGS = (c: Caller): Record<string, unknown>[] => [
-  {}, { board: "general" }, { board: "#ENG" }, { board: "ops" }, { board: "nope" }, { board: "!!" }, { board: 7 },
+  {}, { board: "general" }, { board: "attic" }, { board: "#ENG" }, { board: "ops" }, { board: "nope" }, { board: "!!" }, { board: 7 },
   { as: c.addresses.at(-1) }, { as: "nobody" }, { as: "deploy" }, { board: "eng", as: c.addresses[0] },
 ];
 const TOOL_CALLS: [string, Record<string, unknown>][] = [
@@ -125,7 +131,7 @@ const TOOL_CALLS: [string, Record<string, unknown>][] = [
   ["peer_list", {}], ["peer_list", { include_offline: true }], ["peer_list", { board: "general" }], ["peer_list", { board: "eng" }],
   ["peer_list", { board: "ops", include_offline: true }], ["peer_list", { board: "nope" }], ["peer_list", { match: { scope: W } }],
   ["peer_list", { match: { scope: "eng" }, include_offline: true }], ["peer_list", { match: { harness: "pi" } }], ["peer_list", { match: { task: "deploys" } }],
-  ["peer_list", { board: "general", match: { harness: "opencode" } }], ["peer_list", { match: { bogus: "x" } }], ["peer_list", { match: "x" }],
+  ["peer_list", { board: "general", match: { harness: "opencode" } }], ["peer_list", { match: { bogus: "x" } }], ["peer_list", { match: "x" }], ["peer_list", { board: 7, include_offline: "yes" }], ["peer_list", { include_offline: "yes", match: 3 }], ["peer_list", { board: "attic" }],
   ["peer_status", { text: "hello" }], ["peer_status", { text: "" }], ["peer_status", { text: "two\nlines", queue: "off" }], ["peer_status", { text: "x", queue: "on" }],
   ["peer_status", { queue: "maybe" }], ["peer_status", { text: "x".repeat(1000) }], ["peer_status", {}],
 ];
@@ -183,6 +189,7 @@ test("callBoardTool's board_list, peer_list and peer_status give core's answers 
   expect(text(l => l === "wade's tail peer_list {}")).not.toContain("\"you\"");
   expect(text(l => l.startsWith("dan unbound board_list"))).toContain("general");
   expect(text(l => l.startsWith("dan unbound board_list"))).not.toContain("\"eng\"");
+  for (const c of ["wade", "dan unbound", "wade unbound, no row"]) expect(text(l => l === `${c} board_list {}`)).not.toContain("attic");
   expect(rowsAfter("bob peer_status {\"text\":\"two\\nlines\",\"queue\":\"off\"}")).toContain(`{"address":"${B}/be","queue_off":1,"touched":1}`);
   expect(rowsAfter("wade peer_status {\"text\":\"hello\"}")).toContain("\"status\":\"hello\",\"restamped\":1");
   for (const refused of ["no live session holds", "match has no key", "must be an object", "must be at most", "queue must be", "queue opt-out is a name's", "no such board"]) {
