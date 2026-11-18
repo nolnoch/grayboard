@@ -5,7 +5,7 @@
 // transport and its hello are gone (#282): a hosted session's lifetime is the
 // hosted store's lease, not a connection's grace.
 import type { BindRequest, DelegateRequest, DelegateResult, ErrorCode, Replayed, SendResult as WireSendResult, WriteRef } from "../shared/protocol.ts";
-import { DEFAULT_HOSTED_CAPS } from "./config.ts";
+import { DEFAULT_HOSTED_CAPS, DEFAULT_SERVICE_LIMITS, type ServiceLimits } from "./config.ts";
 import { DEFAULT_HELLO_LIMIT, DEFAULT_HOSTED_REQUEST_LIMIT, DEFAULT_HOSTED_SUBSCRIBER_LIMIT, RateLimiter, retrySecs, type RateLimit, type Take } from "./rate_limit.ts";
 import { dedupWrite, type DedupOutcome, type DedupTool, type Written } from "./write_dedup.ts";
 import { testPause, testPauseAsync } from "../shared/testpause.ts";
@@ -95,6 +95,8 @@ export type ApplicationOptions = {
   hostedRequestLimit?: RateLimit;
   // Delivery upkeep (role=subscriber) has a bucket of its own (#845).
   hostedSubscriberLimit?: RateLimit;
+  // A service principal's buckets in place of those three (#270 D4).
+  serviceLimits?: ServiceLimits;
   // delegate's limits (#252): per user, and the open requests one launcher may hold.
   delegateLimit?: RateLimit;
   delegateOpenCap?: number;
@@ -219,6 +221,8 @@ type Hub = {
   access: BoardAccess;
   slackRunning: () => boolean;
   helloLimiter: RateLimiter;
+  // A service principal's bind bucket (#270 D4), in place of helloLimiter's per-user one.
+  serviceHelloLimiter: RateLimiter;
   // delegate's per-user bucket and the launcher cap (#252). A streak's
   // rows go to delegateRows while a delegate call runs, to be written where
   // its outcome keeps them, on that call's `Tx`; otherwise (a sweep, outside any body) posted.
@@ -549,6 +553,16 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     if (!streakAt) { repo.post(write, undefined, "bind rate-limit row"); return; }
     write(streakAt.tx); streakAt.afterRollback?.(write);
   };
+  const bindLimiter = (limit: RateLimit) => new RateLimiter(limit, {
+    start: (email, ctx, retryAfterMs) => {
+      console.error(`[grayboard] rate-limiting hellos from ${email}`);
+      streakRow(w => writeAudit(repo, w, "bind.rate_limited", email, null, { ...ctx, retry_after_ms: retryAfterMs }));
+    },
+    end: (email, refused) => {
+      console.error(`[grayboard] hellos from ${email} no longer rate-limited; ${refused} refused`);
+      streakRow(w => writeAudit(repo, w, "bind.rate_limit_ended", email, null, { refused }));
+    },
+  }, opts.now);
   const delegateRow = (write: SyncRow) => { if (hub.delegateRows) hub.delegateRows.push(write); else repo.post(write, undefined, "delegation throttle row"); };
   const hub: Hub = {
     repo,
@@ -561,16 +575,8 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     // Logged and audited once per run of refusals, so a loop floods neither.
     // Keyed by email, which is unique per user. A bind spends from the same
     // bucket (S2).
-    helloLimiter: new RateLimiter(opts.helloLimit ?? DEFAULT_HELLO_LIMIT, {
-      start: (email, ctx, retryAfterMs) => {
-        console.error(`[grayboard] rate-limiting hellos from ${email}`);
-        streakRow(w => writeAudit(repo, w, "bind.rate_limited", email, null, { ...ctx, retry_after_ms: retryAfterMs }));
-      },
-      end: (email, refused) => {
-        console.error(`[grayboard] hellos from ${email} no longer rate-limited; ${refused} refused`);
-        streakRow(w => writeAudit(repo, w, "bind.rate_limit_ended", email, null, { refused }));
-      },
-    }, opts.now),
+    helloLimiter: bindLimiter(opts.helloLimit ?? DEFAULT_HELLO_LIMIT),
+    serviceHelloLimiter: bindLimiter(opts.serviceLimits?.bind ?? DEFAULT_SERVICE_LIMITS.bind),
     delegateLimit: opts.delegateLimit ?? DELEGATE_LIMIT,
     // Keyed by user email, so a user's sessions, aliases and children share
     // one bucket and a fresh session can't reset it; capped like the
@@ -605,6 +611,9 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
   }, opts.now);
   const hostedRequestLimiter = hostedLimiter("native", opts.hostedRequestLimit ?? DEFAULT_HOSTED_REQUEST_LIMIT);
   const hostedSubscriberLimiter = hostedLimiter("subscriber", opts.hostedSubscriberLimit ?? DEFAULT_HOSTED_SUBSCRIBER_LIMIT);
+  // The service tier's (#270 D4), picked by the principal's kind, which the access read already carries.
+  const serviceRequestLimiter = hostedLimiter("native", opts.serviceLimits?.hostedRequest ?? DEFAULT_SERVICE_LIMITS.hostedRequest);
+  const serviceSubscriberLimiter = hostedLimiter("subscriber", opts.serviceLimits?.hostedSubscriber ?? DEFAULT_SERVICE_LIMITS.hostedSubscriber);
   type Observer = { session: ApplicationSession; board: string; hooks: BoardObserver };
   // Every observer, and the same ones indexed by board and by session, so a post's fan-out walks only its board's
   // observers and a close only its session's (#831, vision P13): neither grows with the server-wide watch cap.
@@ -739,7 +748,9 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     if (session.readOnly && !allowUnbound) fail("unbound", UNBOUND_ERROR);
   }
   function admitHosted(authed: AuthedUser, sessionId: string | null, role: "native" | "subscriber") {
-    const t = (role === "subscriber" ? hostedSubscriberLimiter : hostedRequestLimiter).take(authed.user_email, { session_id: sessionId, read_only: true, place: null });
+    const service = authed.kind === "service";
+    const limiter = role === "subscriber" ? (service ? serviceSubscriberLimiter : hostedSubscriberLimiter) : (service ? serviceRequestLimiter : hostedRequestLimiter);
+    const t = limiter.take(authed.user_email, { session_id: sessionId, read_only: true, place: null });
     if (!t.ok) fail("rate_limited", `too many connections for this user; retry in ${retrySecs(t.retryAfterMs)}s`, { retry_after_ms: t.retryAfterMs });
   }
 
@@ -969,7 +980,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     // re-bind loop spends it too.
     streakAt = { tx, afterRollback: session.afterRollback };
     let t: Take;
-    try { t = hub.helloLimiter.take(authed.user_email, { session_id: id, bind: m.alias }); } finally { streakAt = undefined; }
+    try { t = (authed.kind === "service" ? hub.serviceHelloLimiter : hub.helloLimiter).take(authed.user_email, { session_id: id, bind: m.alias }); } finally { streakAt = undefined; }
     if (!t.ok) fail("rate_limited", `too many binds for this user; retry in ${retrySecs(t.retryAfterMs)}s`, { retry_after_ms: t.retryAfterMs });
     const target = await bindTarget(hub, tx, authed, m.alias);
     await testPauseAsync("bind:target:decided");
@@ -1438,9 +1449,14 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
       for (const [i, id] of ids.entries()) if (disabled[i]) application.disconnectUser(id);
       return recheckAliases(null, null);
     },
-    sweepHellos: () => { hub.helloLimiter.sweep(); hostedRequestLimiter.sweep(); hostedSubscriberLimiter.sweep(); hub.delegateLimiter.sweep(); },
+    sweepHellos: () => {
+      hub.helloLimiter.sweep(); hub.serviceHelloLimiter.sweep(); hostedRequestLimiter.sweep(); hostedSubscriberLimiter.sweep();
+      serviceRequestLimiter.sweep(); serviceSubscriberLimiter.sweep(); hub.delegateLimiter.sweep();
+    },
     /** How many users have a bind or hosted-request bucket, for tests. */
-    limiterSizes: () => ({ bind: hub.helloLimiter.size, hosted: hostedRequestLimiter.size, subscriber: hostedSubscriberLimiter.size, delegate: hub.delegateLimiter.size }),
+    // Each tier's keys counted with its kind's (#270 D4): a service's bucket is a user's, sized apart.
+    limiterSizes: () => ({ bind: hub.helloLimiter.size + hub.serviceHelloLimiter.size, hosted: hostedRequestLimiter.size + serviceRequestLimiter.size,
+      subscriber: hostedSubscriberLimiter.size + serviceSubscriberLimiter.size, delegate: hub.delegateLimiter.size }),
     stopExpiry() {
       expiry.stop();
       unsubscribeEnds();

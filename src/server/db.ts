@@ -29,8 +29,8 @@ import { DEFAULT_ATTACHMENT_LIMITS, DEFAULT_ATTACHMENT_USER_QUOTA, type Attachme
 import { DiskBlobs } from "./blobs.ts";
 import { detached, inRequest, requestOrigin } from "./request_context.ts";
 import { GOOGLE_ISSUER } from "./idp_google.ts";
-import { LOGIN_SCOPE } from "./oauth-config.ts";
-import { OAUTH_TTL, type OAuthStore, type OAuthBinding, type OAuthAuthorization, type OAuthRequest, type OAuthBrowserSession, type OAuthCode, type OAuthGrant, type OAuthTokenPair, type OAuthAccess, type OAuthFailure } from "./oauth-types.ts";
+import { LOGIN_SCOPE, OAUTH_SCOPES } from "./oauth-config.ts";
+import { CREDENTIAL_SOURCES, OAUTH_TTL, SERVICE_TOKEN_MIN_SECONDS, type CredentialSource, type ServiceCredential, type OAuthStore, type OAuthBinding, type OAuthAuthorization, type OAuthRequest, type OAuthBrowserSession, type OAuthCode, type OAuthGrant, type OAuthTokenPair, type OAuthAccess, type OAuthFailure } from "./oauth-types.ts";
 import { LastOwner, PrincipalTaken } from "./store/errors.ts";
 
 // Row types
@@ -871,6 +871,29 @@ function initSchema(db: Database): void {
       revoked_at INTEGER, data TEXT NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_oauth_grants_user ON oauth_grants(user_id);
+    -- A service's OAuth client-credentials client (#270 D2): one per row, owned by the service (user_id), with its own
+    -- oauth_grants row, whose expires_at is the credential's expiry and whose revoked_at is its revocation. source
+    -- (D3) and user_id never change after insert: the access cache reads source through the grant and no trigger
+    -- covers this table. token_seconds: the run-token lifetime the admin set, clamped again at each mint.
+    CREATE TABLE IF NOT EXISTS service_credentials (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      client_id     TEXT    NOT NULL UNIQUE,
+      user_id       INTEGER NOT NULL REFERENCES users(id),
+      grant_id      TEXT    NOT NULL UNIQUE REFERENCES oauth_grants(id) ON DELETE CASCADE,
+      source        TEXT    NOT NULL CHECK (source IN ('opencode','generic')),
+      token_seconds INTEGER NOT NULL,
+      created_at    INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_service_credentials_user ON service_credentials(user_id);
+    -- A credential's secrets, SHA-256 only (D2): up to two live at once, for rotation.
+    CREATE TABLE IF NOT EXISTS service_credential_secrets (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      credential_id INTEGER NOT NULL REFERENCES service_credentials(id) ON DELETE CASCADE,
+      hash          TEXT    NOT NULL UNIQUE,
+      created_at    INTEGER NOT NULL,
+      revoked_at    INTEGER
+    );
+    CREATE INDEX IF NOT EXISTS idx_service_credential_secrets_credential ON service_credential_secrets(credential_id);
     CREATE TABLE IF NOT EXISTS oauth_tokens (
       hash TEXT PRIMARY KEY, grant_id TEXT NOT NULL REFERENCES oauth_grants(id) ON DELETE CASCADE,
       kind TEXT NOT NULL CHECK(kind IN ('access','refresh')), expires_at INTEGER NOT NULL,
@@ -1062,6 +1085,8 @@ function initSchema(db: Database): void {
     ["oauth_codes", "grant_id", "TEXT REFERENCES oauth_grants(id) ON DELETE CASCADE"],
     // The CLI session a login code was redeemed for (#928 D8): a session can't fill grant_id, a grants key.
     ["oauth_codes", "session_id", "INTEGER REFERENCES sessions(id) ON DELETE CASCADE"],
+    // The secret a client-credentials run token was minted with (#270 D2), so revoking that secret revokes its tokens.
+    ["oauth_tokens", "secret_id", "INTEGER REFERENCES service_credential_secrets(id) ON DELETE CASCADE"],
   ];
   // users.idp_subject (security audit F-13) and idp_issuer (#928 D3): unique as a pair among the users with a subject.
   const userColumns = db.query<{ name: string }, []>(`PRAGMA table_info(users)`).all();
@@ -1082,6 +1107,7 @@ function initSchema(db: Database): void {
     if (!columns.some(c => c.name === column)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
   }
   db.exec("CREATE INDEX IF NOT EXISTS idx_oauth_codes_grant ON oauth_codes(grant_id)");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_oauth_tokens_secret ON oauth_tokens(secret_id)");
   // dm_send pending: the sender owes a follow-up in the thread. sender_id:
   // the sending session's ID (#284), beside the address it sent as; null for
   // messages from before it, and for writers with no session. kind: 'bounce'
@@ -1502,7 +1528,9 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
     authGeneration,
     commitGeneration: () => ownsTx(db) ? undefined : readGeneration(),
 
-    oauth: { ...oauth, findActiveAccess, redeemCode: change(oauth.redeemCode), rotateRefresh: change(oauth.rotateRefresh), revokeToken: change(oauth.revokeToken) },
+    oauth: { ...oauth, findActiveAccess, redeemCode: change(oauth.redeemCode), rotateRefresh: change(oauth.rotateRefresh), revokeToken: change(oauth.revokeToken),
+      addServiceCredential: change(oauth.addServiceCredential), rotateServiceCredential: change(oauth.rotateServiceCredential),
+      revokeServiceCredential: change(oauth.revokeServiceCredential), revokeServiceSecret: change(oauth.revokeServiceSecret), mintServiceToken: change(oauth.mintServiceToken) },
     hosted: { ...hostedStore, insert: marks(hosted.insert, (_tx, row) => row.session_id), update: marks(hosted.update, (_tx, row) => row.session_id),
       end: marks(hosted.end, (_tx, session) => session), childEnd: marks(hosted.childEnd, (_tx, session) => session),
       park: marks(hosted.park, (_tx, session) => session), unpark: marks(hosted.unpark, (_tx, session) => session),
@@ -2366,6 +2394,12 @@ function makeOAuthStore(hosted: HostedStoreOf): OAuthStore {
     isGrantActive: async (r, ...a) => on(r).isGrantActive(...a),
     revokePreBuiltinGrants: async (tx, ...a) => on(tx).revokePreBuiltinGrants(...a),
     cleanup: async (tx, ...a) => on(tx).cleanup(...a),
+    addServiceCredential: async (tx, ...a) => on(tx).addServiceCredential(...a),
+    rotateServiceCredential: async (tx, ...a) => on(tx).rotateServiceCredential(...a),
+    revokeServiceCredential: async (tx, ...a) => on(tx).revokeServiceCredential(...a),
+    revokeServiceSecret: async (tx, ...a) => on(tx).revokeServiceSecret(...a),
+    findServiceCredential: async (r, ...a) => on(r).findServiceCredential(...a),
+    mintServiceToken: async (tx, ...a) => on(tx).mintServiceToken(...a),
   };
 }
 
@@ -2425,6 +2459,12 @@ function oauthOps(db: Database, hosted: HostedStoreOf): OAuthOps {
     db.run("UPDATE oauth_grants SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL", [now, id]);
     endHostedWhere(hosted, db, "revoked", now, row => row.grant_id === id);
   };
+  // A credential whose grant is live and whose service is enabled (#270 D2).
+  const liveCredential = (clientId: string, now: number) => typeof clientId !== "string" || !time(now) ? undefined :
+    db.query<{ id: number; userId: number; grantId: string; source: CredentialSource; tokenSeconds: number }, [string, number]>(`
+      SELECT c.id, c.user_id AS userId, c.grant_id AS grantId, c.source, c.token_seconds AS tokenSeconds FROM service_credentials c
+      JOIN oauth_grants g ON g.id = c.grant_id JOIN users u ON u.id = c.user_id
+      WHERE c.client_id = ? AND g.revoked_at IS NULL AND g.expires_at > ? AND u.disabled_at IS NULL`).get(clientId, now) ?? undefined;
   type Token = { hash: string; grant_id: string; kind: string; expires_at: number; spent_at: number | null; revoked_at: number | null; created_at: number };
   const token = (h: string) => db.query<Token, [string]>("SELECT * FROM oauth_tokens WHERE hash = ?").get(h);
   const browser = (h: string, now: number) => {
@@ -2650,9 +2690,10 @@ function oauthOps(db: Database, hosted: HostedStoreOf): OAuthOps {
     findActiveAccess(h, resource, requiredScopes, now) {
       if (!time(now) || !hash(h) || !Array.isArray(requiredScopes)) return undefined;
       // One read snapshot binds token, grant and user liveness.
-      const row = db.query<{ data: string; created_at: number; token_expiry: number; access_scopes: string | null; grant_expiry: number }, [string, number, number]>(`
-        SELECT g.data, t.created_at, t.expires_at AS token_expiry, t.access_scopes, g.expires_at AS grant_expiry FROM oauth_tokens t
-        JOIN oauth_grants g ON g.id = t.grant_id JOIN users u ON u.id = g.user_id
+      // A service credential's source rides the same join (#270 D3), so the cached access carries it.
+      const row = db.query<{ data: string; created_at: number; token_expiry: number; access_scopes: string | null; grant_expiry: number; source: CredentialSource | null }, [string, number, number]>(`
+        SELECT g.data, t.created_at, t.expires_at AS token_expiry, t.access_scopes, g.expires_at AS grant_expiry, c.source FROM oauth_tokens t
+        JOIN oauth_grants g ON g.id = t.grant_id JOIN users u ON u.id = g.user_id LEFT JOIN service_credentials c ON c.grant_id = g.id
         WHERE t.hash = ? AND t.kind = 'access' AND t.revoked_at IS NULL AND t.expires_at > ?
           AND g.revoked_at IS NULL AND g.expires_at > ? AND u.disabled_at IS NULL`).get(h, now, now);
       if (!row) return undefined;
@@ -2662,7 +2703,8 @@ function oauthOps(db: Database, hosted: HostedStoreOf): OAuthOps {
       if (!scopes(accessScopes) || !accessScopes.every(s => g.scopes.includes(s)) ||
           g.resource !== resource || !requiredScopes.every(s => accessScopes.includes(s))) return undefined;
       const a: OAuthAccess = { tokenHash: h, grantId: g.id, userId: g.userId, clientId: g.clientId,
-        resource: g.resource, scopes: accessScopes, createdAt: row.created_at, expiresAt: row.token_expiry, grantExpiresAt: row.grant_expiry };
+        resource: g.resource, scopes: accessScopes, createdAt: row.created_at, expiresAt: row.token_expiry, grantExpiresAt: row.grant_expiry,
+        source: row.source };
       return a;
     },
     isGrantActive(id, now) {
@@ -2696,8 +2738,99 @@ function oauthOps(db: Database, hosted: HostedStoreOf): OAuthOps {
         db.run(`DELETE FROM oauth_codes WHERE grant_id IS NULL AND expires_at <= ?
           AND (session_id IS NULL OR session_id NOT IN (SELECT id FROM sessions WHERE revoked_at IS NULL))`, [now]);
         db.run("DELETE FROM oauth_tokens WHERE kind = 'access' AND expires_at <= ?", [now]);
+        // A revoked service secret once its last token is gone (#270 D2); an expired credential goes with its grant.
+        db.run(`DELETE FROM service_credential_secrets WHERE revoked_at IS NOT NULL
+          AND NOT EXISTS (SELECT 1 FROM oauth_tokens t WHERE t.secret_id = service_credential_secrets.id)`);
         // Keep refresh tombstones until the absolute family deadline, including revoked families.
         db.run("DELETE FROM oauth_grants WHERE expires_at <= ?", [now]);
+      }).immediate();
+    },
+    addServiceCredential(input, now) {
+      const { userId, clientId, grantId, resource, source, tokenSeconds, expiresAt, secretHash } = input;
+      if (!time(now) || !hash(secretHash) || !/^svc_[a-f0-9]{32}$/.test(clientId) || !/^[A-Za-z0-9_-]{16,128}$/.test(grantId) ||
+          !(CREDENTIAL_SOURCES as readonly string[]).includes(source) || !Number.isSafeInteger(tokenSeconds) || tokenSeconds < SERVICE_TOKEN_MIN_SECONDS ||
+          !time(expiresAt) || expiresAt <= now || !binding({ clientId, resource, scopes: [...OAUTH_SCOPES] })) return invalid;
+      return db.transaction(() => {
+        // Only an enabled service holds a credential (D1): a person's grant comes from consent, never from here.
+        const svc = db.query("SELECT 1 FROM users u JOIN principals p ON p.user_id = u.id AND p.kind = 'service' WHERE u.id = ? AND u.disabled_at IS NULL").get(userId);
+        if (!svc) return invalid;
+        const g: OAuthGrant = { id: grantId, userId, clientId, resource, scopes: [...OAUTH_SCOPES], createdAt: now, expiresAt, revokedAt: null };
+        db.run("INSERT INTO oauth_grants(id, user_id, expires_at, data) VALUES (?, ?, ?, ?)", [g.id, g.userId, g.expiresAt, JSON.stringify(g)]);
+        const { id } = db.query<{ id: number }, [string, number, string, string, number, number]>(`INSERT INTO service_credentials(client_id, user_id, grant_id, source, token_seconds, created_at)
+          VALUES (?, ?, ?, ?, ?, ?) RETURNING id`).get(clientId, userId, grantId, source, tokenSeconds, now)!;
+        const secret = db.query<{ id: number }, [number, string, number]>("INSERT INTO service_credential_secrets(credential_id, hash, created_at) VALUES (?, ?, ?) RETURNING id").get(id, secretHash, now)!;
+        return ok({ secretId: secret.id });
+      }).immediate();
+    },
+    rotateServiceCredential({ clientId, secretHash }, now) {
+      if (!time(now) || !hash(secretHash) || typeof clientId !== "string") return invalid;
+      return db.transaction(() => {
+        const c = liveCredential(clientId, now);
+        if (!c) return missing;
+        // At most two live secrets (D2), checked in the insert.
+        const secret = db.query<{ id: number }, [number, string, number, number]>(`INSERT INTO service_credential_secrets(credential_id, hash, created_at)
+          SELECT ?1, ?2, ?3 WHERE (SELECT COUNT(*) FROM service_credential_secrets WHERE credential_id = ?1 AND revoked_at IS NULL) < ?4
+          RETURNING id`).get(c.id, secretHash, now, 2);
+        return secret ? ok({ secretId: secret.id, userId: c.userId }) : { status: "capacity" } as const;
+      }).immediate();
+    },
+    revokeServiceCredential(clientId, now) {
+      if (!time(now) || typeof clientId !== "string") return invalid;
+      return db.transaction(() => {
+        const c = db.query<{ grant_id: string; user_id: number }, [string]>(`SELECT c.grant_id, c.user_id FROM service_credentials c
+          JOIN oauth_grants g ON g.id = c.grant_id WHERE c.client_id = ? AND g.revoked_at IS NULL`).get(clientId);
+        if (!c) return missing;
+        // The grant's revocation ends every session attached to it here, in this transaction (D2, #226 §3.4).
+        revokeGrant(c.grant_id, now);
+        return ok({ userId: c.user_id });
+      }).immediate();
+    },
+    revokeServiceSecret(secretId, now) {
+      if (!time(now) || !Number.isSafeInteger(secretId)) return invalid;
+      return db.transaction(() => {
+        const s = db.query<{ credential_id: number; client_id: string; user_id: number; grant_revoked: number | null }, [number]>(`SELECT s.credential_id, c.client_id, c.user_id,
+          g.revoked_at AS grant_revoked FROM service_credential_secrets s JOIN service_credentials c ON c.id = s.credential_id
+          JOIN oauth_grants g ON g.id = c.grant_id WHERE s.id = ? AND s.revoked_at IS NULL`).get(secretId);
+        if (!s || s.grant_revoked !== null) return missing;
+        // The last live secret stays: revoking it would leave a live grant no one can mint under; revoke the credential.
+        const others = db.query<{ n: number }, [number, number]>("SELECT COUNT(*) AS n FROM service_credential_secrets WHERE credential_id = ? AND id <> ? AND revoked_at IS NULL").get(s.credential_id, secretId)!.n;
+        if (others === 0) return invalid;
+        db.run("UPDATE service_credential_secrets SET revoked_at = ? WHERE id = ?", [now, secretId]);
+        db.run("UPDATE oauth_tokens SET revoked_at = ? WHERE secret_id = ? AND revoked_at IS NULL", [now, secretId]);
+        return ok({ clientId: s.client_id, userId: s.user_id });
+      }).immediate();
+    },
+    findServiceCredential(clientId, now) {
+      const c = liveCredential(clientId, now);
+      if (!c) return undefined;
+      const secrets = db.query<{ id: number; hash: string }, [number]>("SELECT id, hash FROM service_credential_secrets WHERE credential_id = ? AND revoked_at IS NULL ORDER BY id").all(c.id);
+      const found: ServiceCredential = { clientId, userId: c.userId, grantId: c.grantId, source: c.source, tokenSeconds: c.tokenSeconds, secrets };
+      return found;
+    },
+    mintServiceToken({ clientId, secretId, tokenHash, scopes: selected, limits }, now) {
+      if (!time(now) || !hash(tokenHash) || !Number.isSafeInteger(secretId) || !scopes(selected) || !selected.every(s => (OAUTH_SCOPES as readonly string[]).includes(s)) ||
+          ![limits.maxSeconds, limits.mintsPerMinute, limits.unexpired].every(n => Number.isSafeInteger(n) && n > 0)) return invalid;
+      return db.transaction(() => {
+        // One statement (postgres-server.md D3): the credential, its grant, the secret and the service all live, the
+        // bucket (mints in the last minute, revoked ones included) and the cap (unexpired, unrevoked tokens) unspent.
+        // The expiry is the credential's lifetime, clamped to the ceiling and to the grant's expiry.
+        const row = db.query<{ expires_at: number }, [string, number, number, string, string, number, number, number]>(`
+          INSERT INTO oauth_tokens(hash, grant_id, kind, expires_at, created_at, access_scopes, secret_id)
+          SELECT ?1, g.id, 'access', MIN(?2 + MIN(c.token_seconds, ?3) * 1000, g.expires_at), ?2, ?4, s.id
+          FROM service_credentials c JOIN oauth_grants g ON g.id = c.grant_id JOIN users u ON u.id = c.user_id
+          JOIN service_credential_secrets s ON s.credential_id = c.id
+          WHERE c.client_id = ?5 AND s.id = ?6 AND s.revoked_at IS NULL AND g.revoked_at IS NULL AND g.expires_at > ?2 AND u.disabled_at IS NULL
+            AND (SELECT COUNT(*) FROM oauth_tokens t WHERE t.grant_id = g.id AND t.created_at > ?2 - 60000) < ?7
+            AND (SELECT COUNT(*) FROM oauth_tokens t WHERE t.grant_id = g.id AND t.revoked_at IS NULL AND t.expires_at > ?2) < ?8
+          RETURNING expires_at`).get(tokenHash, now, limits.maxSeconds, JSON.stringify(selected), clientId, secretId, limits.mintsPerMinute, limits.unexpired);
+        if (!row) {
+          const live = liveCredential(clientId, now);
+          const secret = live && db.query("SELECT 1 FROM service_credential_secrets WHERE id = ? AND credential_id = ? AND revoked_at IS NULL").get(secretId, live.id);
+          return secret ? { status: "capacity" } as const : invalid;
+        }
+        const g = grant(liveCredential(clientId, now)!.grantId)!;
+        audit("oauth.token_issued", g, now, { secret_id: secretId, expires_at: row.expires_at });
+        return ok({ expiresAt: row.expires_at });
       }).immediate();
     },
   };

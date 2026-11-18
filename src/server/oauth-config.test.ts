@@ -43,7 +43,7 @@ test("built-in clients are public loopback clients that map the generic key and 
   }
   // Mapped by code, not by the operator map: an empty map still maps them.
   expect(BUILTIN_CLIENT_IDS.map(id => sourceKeyFor(id, new Map()))).toEqual([GRAYBOARD_SESSION_META, GRAYBOARD_SESSION_META, GRAYBOARD_SESSION_META]);
-  expect(BUILTIN_CLIENT_IDS.map(harnessFor)).toEqual(["pi", "omp", "claude-code"]);
+  expect(BUILTIN_CLIENT_IDS.map(id => harnessFor(id))).toEqual(["pi", "omp", "claude-code"]);
   expect([harnessFor(OPENCODE_CLIENT), harnessFor("native")]).toEqual(["opencode", "native"]);
 });
 test("an operator client reusing a built-in ID is refused, so that server doesn't start", () => {
@@ -54,6 +54,21 @@ test("an operator client reusing a built-in ID is refused, so that server doesn'
   }
   // Exact IDs only: another spelling is an ordinary operator client.
   expect(parseOAuthClients(JSON.stringify([{ ...client, clientId: "grayboard-pi-fork" }]))).toHaveLength(1);
+});
+
+test("an operator client under the svc_ prefix is refused: it would shadow a service credential (#270 D2)", () => {
+  for (const clientId of ["svc_", `svc_${"a".repeat(32)}`, "svc_launcher"]) {
+    expect(() => parseOAuthClients(JSON.stringify([{ ...client, clientId }]))).toThrow(`OAuth client ID ${clientId} is under the prefix svc_, reserved for service credentials`);
+  }
+  expect(parseOAuthClients(JSON.stringify([{ ...client, clientId: "svc-launcher" }]))).toHaveLength(1);
+});
+
+test("a service credential's source decides its session key and harness alone (#270 D3)", () => {
+  const id = `svc_${"b".repeat(32)}`;
+  expect(sourceKeyFor(id, new Map(), "opencode")).toBe(OPENCODE_SESSION_META);
+  expect(sourceKeyFor(id, new Map(), "generic")).toBe(GRAYBOARD_SESSION_META);
+  expect(sourceKeyFor(id, new Map(), null)).toBeNull();
+  expect([harnessFor(id, "opencode"), harnessFor(id, "generic")]).toEqual(["opencode", id]);
 });
 test("redirect matching is exact except a registered loopback HTTP port", () => {
   for (const url of ["http://127.0.0.1:45678/callback?fixed=1", "http://[::1]:45678/callback", "https://client.example/callback"]) expect(matchesRedirect(client, url)).toBe(true);

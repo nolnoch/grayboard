@@ -92,6 +92,26 @@ CREATE TABLE oauth_grants (
 );
 CREATE INDEX idx_oauth_grants_user ON oauth_grants (user_id);
 
+CREATE TABLE service_credentials (
+  id            int8 GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  client_id     text COLLATE "C" NOT NULL CONSTRAINT service_credentials_client_id_key UNIQUE,
+  user_id       int8 NOT NULL CONSTRAINT service_credentials_user_id_fkey REFERENCES users (id),
+  grant_id      text COLLATE "C" NOT NULL CONSTRAINT service_credentials_grant_id_key UNIQUE CONSTRAINT service_credentials_grant_id_fkey REFERENCES oauth_grants (id) ON DELETE CASCADE,
+  source        text COLLATE "C" NOT NULL CHECK (source IN ('opencode', 'generic')),
+  token_seconds int8 NOT NULL,
+  created_at    int8 NOT NULL
+);
+CREATE INDEX idx_service_credentials_user ON service_credentials (user_id);
+
+CREATE TABLE service_credential_secrets (
+  id            int8 GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  credential_id int8 NOT NULL CONSTRAINT service_credential_secrets_credential_id_fkey REFERENCES service_credentials (id) ON DELETE CASCADE,
+  hash          text COLLATE "C" NOT NULL CONSTRAINT service_credential_secrets_hash_key UNIQUE,
+  created_at    int8 NOT NULL,
+  revoked_at    int8
+);
+CREATE INDEX idx_service_credential_secrets_credential ON service_credential_secrets (credential_id);
+
 CREATE TABLE oauth_tokens (
   hash          text COLLATE "C" PRIMARY KEY,
   grant_id      text COLLATE "C" NOT NULL CONSTRAINT oauth_tokens_grant_id_fkey REFERENCES oauth_grants (id) ON DELETE CASCADE,
@@ -100,9 +120,11 @@ CREATE TABLE oauth_tokens (
   spent_at      int8,
   revoked_at    int8,
   created_at    int8 NOT NULL,
-  access_scopes text COLLATE "C"
+  access_scopes text COLLATE "C",
+  secret_id     int8 CONSTRAINT oauth_tokens_secret_id_fkey REFERENCES service_credential_secrets (id) ON DELETE CASCADE
 );
 CREATE INDEX idx_oauth_tokens_grant ON oauth_tokens (grant_id);
+CREATE INDEX idx_oauth_tokens_secret ON oauth_tokens (secret_id);
 
 CREATE TABLE oauth_requests (
   hash         text COLLATE "C" PRIMARY KEY,

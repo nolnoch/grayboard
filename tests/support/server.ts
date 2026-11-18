@@ -7,7 +7,7 @@ import { join } from "node:path";
 import type { Subprocess } from "bun";
 import { DEFAULT_RETENTION_DAYS } from "../../src/core/boards.ts";
 import { startServer, type StartOptions } from "../../src/server/app.ts";
-import type { Config } from "../../src/server/config.ts";
+import { DEFAULT_SERVICE_LIMITS, type Config } from "../../src/server/config.ts";
 import { DEFAULT_AUTH_FAIL_LIMIT, DEFAULT_HELLO_LIMIT } from "../../src/server/rate_limit.ts";
 import { DEFAULT_TRUSTED_PROXIES } from "../../src/server/client_addr.ts";
 import { type AuthedUser, verifySessionToken } from "../../src/server/auth.ts";
@@ -37,6 +37,9 @@ function serverConfig(dir: string, overrides: Partial<Config>): Config {
     // A raised hostedRequestLimit raises the subscriber bucket too, unless the test sets that one:
     // HostedSession's inbox polling and receipts are delivery upkeep, charged there (#845).
     ...(overrides.hostedRequestLimit && !overrides.hostedSubscriberLimit ? { hostedSubscriberLimit: overrides.hostedRequestLimit } : {}),
+    // And a service's tier (#270 D4), unless the test sets it: a service session polls as a user's does.
+    ...(overrides.hostedRequestLimit && !overrides.serviceLimits
+      ? { serviceLimits: { ...DEFAULT_SERVICE_LIMITS, hostedRequest: overrides.hostedRequestLimit, hostedSubscriber: overrides.hostedRequestLimit } } : {}),
     ...overrides,
   };
 }

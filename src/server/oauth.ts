@@ -4,9 +4,10 @@ import { callbackPath, defaultProviders, DomainRefused, idpSignIn, type Identity
 import { checkIdpConfig, type Config } from "./config.ts";
 import type { AuthPeek, Repo } from "./db.ts";
 import type { Read, Tx } from "./store/tx.ts";
-import { BUILTIN_CLIENT_IDS, BUILTIN_CLIENTS, CLI_CLIENT, CLI_CLIENT_ID, LOGIN_SCOPE, matchesRedirect, oauthPublicUrl, OAUTH_SCOPES, OPENCODE_CLIENT, parseOAuthClients, sourceKeyFor, type OAuthClient } from "./oauth-config.ts";
-import { OAUTH_TTL, type OAuthRequest, type OAuthAccess } from "./oauth-types.ts";
+import { BUILTIN_CLIENT_IDS, BUILTIN_CLIENTS, CLI_CLIENT, CLI_CLIENT_ID, isServiceClientId, LOGIN_SCOPE, matchesRedirect, mcpResource, oauthPublicUrl, OAUTH_SCOPES, OPENCODE_CLIENT, parseOAuthClients, sourceKeyFor, type OAuthClient } from "./oauth-config.ts";
+import { DEFAULT_SERVICE_TOKEN_LIMITS, OAUTH_TTL, type CredentialSource, type OAuthRequest, type OAuthAccess } from "./oauth-types.ts";
 import { isValidEmail } from "../shared/addressing.ts";
+import { testPauseAsync } from "../shared/testpause.ts";
 import { CimdUnavailable, createCimdResolver, type CimdOptions } from "./oauth-cimd.ts";
 import { userAgent, writeAudit, type AuditAction } from "./audit.ts";
 import { RateLimiter, retrySecs, type RateLimit } from "./rate_limit.ts";
@@ -16,9 +17,11 @@ import { SITE_LIMIT_FACTOR } from "./auth_gate.ts";
 import { settleAll } from "./settle.ts";
 
 // `sourceKey` is the `_meta` key that maps this client's hosted session source, or null
-// (unmapped: reads only). A pure function of the client ID and the startup config.
+// (unmapped: reads only). A pure function of the client ID, the startup config and, for a service credential,
+// its source (#270 D3), which the access read carries; `source` is that, null (or absent) for any other client.
 export type OAuthPrincipal = {
   authed: AuthedUser; grantId: string; clientId: string; sourceKey: string | null; scopes: string[]; accessHash: string; accessExpiry: number;
+  source?: CredentialSource | null;
 };
 export type OAuthOptions = {
   now?: () => number;
@@ -118,7 +121,8 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
   const issuer = oauthPublicUrl(config.publicUrl, config.devAuth);
   const base = new URL(issuer);
   const prefix = base.pathname === "/" ? "" : base.pathname;
-  const resource = new URL(issuer + "/mcp").href;
+  const resource = mcpResource(config.publicUrl, config.devAuth);
+  const serviceTokens = config.serviceTokens ?? DEFAULT_SERVICE_TOKEN_LIMITS;
   const endpoint = (path: string) => issuer + path;
   const metadataPath = "/.well-known/oauth-protected-resource" + prefix + "/mcp";
   const resourceMetadata = base.origin + metadataPath;
@@ -150,6 +154,13 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
     const row = (r: Row) => { if (defer) defer(r); else writeAudit(repo, repo.read, r[0], null, null, r[1]); };
     const manual = clients.get(id);
     if (manual) return manual;
+    // A service credential (#270 D2): one indexed read, before CIMD; parseOAuthClients keeps svc_ out of the map.
+    if (isServiceClientId(id)) {
+      const credential = await repo.oauth.findServiceCredential(repo.read, id, now());
+      const client: OAuthClient | undefined = credential ? { clientId: id, name: "service credential", redirectUris: [], scopes: [...OAUTH_SCOPES],
+        tokenEndpointAuthMethod: "client_secret_basic", allowRefresh: false, credential } : undefined;
+      return client;
+    }
     if (!cimdClients.has(id)) { row(["oauth.cimd_refused", { reason: "not_allowed" }]); return undefined; }
     let client: OAuthClient | undefined;
     try { client = await cimd.resolve(id); }
@@ -291,6 +302,15 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
     if (!c) fail("invalid_client", 401);
     if (c!.tokenEndpointAuthMethod === "none") {
       if (auth !== null) fail("invalid_client", 401);
+    } else if (c!.credential) {
+      // Every live secret is compared, in constant time and without an early exit; the match names the secret the
+      // run token is minted with (#270 D2). Only the Basic header carries a secret here.
+      if (password === undefined || auth === null) fail("invalid_client", 401);
+      const presented = Buffer.from(hashToken(password!), "hex");
+      let secretId: number | undefined;
+      for (const s of c!.credential.secrets) if (timingSafeEqual(presented, Buffer.from(s.hash, "hex")) && secretId === undefined) secretId = s.id;
+      if (secretId === undefined) fail("invalid_client", 401);
+      return { ...c!, credential: { ...c!.credential, secretId } };
     } else {
       if (password === undefined || !timingSafeEqual(Buffer.from(hashToken(password), "hex"), Buffer.from(c!.clientSecretHash!, "hex"))) fail("invalid_client", 401);
     }
@@ -354,7 +374,7 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
     if (req.method === "GET" && (prm.includes(u.pathname) || prm.includes(path))) return json({ resource, authorization_servers: [issuer], scopes_supported: OAUTH_SCOPES, bearer_methods_supported: ["header"] });
     if (req.method === "GET" && (u.pathname === as || (prefix && path === as))) return json({ issuer,
       authorization_endpoint: endpoint("/oauth/authorize"), token_endpoint: endpoint("/oauth/token"), revocation_endpoint: endpoint("/oauth/revoke"),
-      response_types_supported: ["code"], grant_types_supported: ["authorization_code", "refresh_token"], scopes_supported: OAUTH_SCOPES,
+      response_types_supported: ["code"], grant_types_supported: ["authorization_code", "refresh_token", "client_credentials"], scopes_supported: OAUTH_SCOPES,
       code_challenge_methods_supported: ["S256"], token_endpoint_auth_methods_supported: ["none", "client_secret_basic"],
       revocation_endpoint_auth_methods_supported: ["none", "client_secret_basic"], client_id_metadata_document_supported: cimdClients.size > 0, authorization_response_iss_parameter_supported: true,
       // RFC 8414 §2 extensions: an adapter (#429) or the CLI (#991) tells an older server apart before it opens a browser.
@@ -384,6 +404,9 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
       const client = await resolveClient(required(p, "client_id"));
       if (closed) fail("temporarily_unavailable", 503);
       const redirectUri = required(p, "redirect_uri");
+      // A service credential never runs the browser flow (#270 D2): auth codes and refresh never reach it. It has no
+      // redirect to answer at, so the refusal is this page's.
+      if (client?.credential) fail("unauthorized_client");
       if (!client || !matchesRedirect(client, redirectUri)) fail();
       const state = required(p, "state");
       if (state.length > 1024) fail();
@@ -544,10 +567,30 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
         }
         const p = recognized(submitted, ["grant_type", "client_id", "code", "code_verifier", "redirect_uri", "resource", "scope", "refresh_token"]);
         const grantType = required(p, "grant_type");
-        if (!["authorization_code", "refresh_token"].includes(grantType)) fail("unsupported_grant_type");
-        const allowed = grantType === "authorization_code" ? ["grant_type", "client_id", "code", "code_verifier", "redirect_uri", "resource", "scope"] : ["grant_type", "client_id", "refresh_token", "resource", "scope"];
+        if (!["authorization_code", "refresh_token", "client_credentials"].includes(grantType)) fail("unsupported_grant_type");
+        // client_credentials is a service credential's grant and its only one (#270 D2): a startup or CIMD client
+        // never runs it, and a credential never runs a code or a refresh.
+        if ((grantType === "client_credentials") !== !!client.credential) fail("unauthorized_client");
+        const allowed = grantType === "authorization_code" ? ["grant_type", "client_id", "code", "code_verifier", "redirect_uri", "resource", "scope"]
+          : grantType === "refresh_token" ? ["grant_type", "client_id", "refresh_token", "resource", "scope"] : ["grant_type", "resource", "scope"];
         if ([...p].some(([k, v]) => v !== "" && !allowed.includes(k))) fail();
         if ((optional(p, "resource") ?? resource) !== resource) fail("invalid_grant");
+        if (grantType === "client_credentials") {
+          const selected = scopes(optional(p, "scope"), [...OAUTH_SCOPES]);
+          if (!selected.every(s => client.scopes.includes(s))) fail("invalid_scope");
+          const token = random();
+          // Between the secret's check and the mint: a revoke or disable here must still refuse (the insert re-checks).
+          await testPauseAsync("oauth:mint:before-write");
+          // A run token (RFC 6749 §4.4.3: no refresh token). The store checks the credential, its grant, the secret and
+          // the service live, and the bucket and cap, in its one insert; its row's expiry is the answer's.
+          const { t, minted } = await repo.write(async tx => {
+            const t = now();
+            return { t, minted: await repo.oauth.mintServiceToken(tx, { clientId: client.clientId, secretId: client.credential!.secretId!, tokenHash: hashToken(token), scopes: selected, limits: serviceTokens }, t) };
+          });
+          if (minted.status === "capacity") fail("slow_down", 429);
+          if (minted.status !== "ok") fail("invalid_client", 401);
+          return json({ access_token: token, token_type: "Bearer", expires_in: Math.floor((minted.value.expiresAt - t) / 1000), scope: selected.join(" ") });
+        }
         const access = random(), refresh = random();
         let result, t: number;
         const pair = (selected: string[], t: number) => ({ clientId: client.clientId, resource, scopes: selected, accessHash: hashToken(access), refreshHash: hashToken(refresh),
@@ -643,7 +686,7 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
     const { access, email, kind } = found;
     if (!requiredScopes.every(s => access.scopes.includes(s))) return bearerError(403, "insufficient_scope", requiredScopes);
     return { authed: { user_id: access.userId, user_email: email, kind, session_id: 0 }, grantId: access.grantId, clientId: access.clientId,
-      sourceKey: sourceKeyFor(access.clientId, clients), scopes: [...access.scopes], accessHash, accessExpiry: access.expiresAt };
+      sourceKey: sourceKeyFor(access.clientId, clients, access.source), source: access.source, scopes: [...access.scopes], accessHash, accessExpiry: access.expiresAt };
   }
   function authorizedBy(principal: OAuthPrincipal, a: OAuthAccess | undefined): boolean {
     return !!a && principal.scopes.every(s => a.scopes.includes(s)) && a.grantId === principal.grantId && a.userId === principal.authed.user_id && a.clientId === principal.clientId && a.expiresAt === principal.accessExpiry;

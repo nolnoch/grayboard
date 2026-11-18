@@ -1,6 +1,7 @@
 import { dirname, join } from "node:path";
 import { isLoopback, parseOAuthClients, type OAuthClient } from "./oauth-config.ts";
 import { parseCimdClients } from "./oauth-cimd.ts";
+import { DEFAULT_SERVICE_TOKEN_LIMITS, SERVICE_TOKEN_MIN_SECONDS, type ServiceTokenLimits } from "./oauth-types.ts";
 
 import type { HumanReach } from "./policy.ts";
 import { DEFAULT_LAG_GATE, LAG_HISTORY, type LagGate } from "./metrics.ts";
@@ -15,8 +16,14 @@ import { GOOGLE_ISSUER } from "./idp_google.ts";
 export type McpLimits = Record<"listen" | "legacy" | "post", { global: number; perUser: number }>;
 export const DEFAULT_MCP_LIMITS: McpLimits = { listen: { global: 128, perUser: 32 }, legacy: { global: 256, perUser: 32 }, post: { global: 256, perUser: 64 } };
 // Hosted session rows, delivery leases and resource watches (#805, F-06); docs/guide/server.md §Sizing the caps.
-export type HostedCaps = { sessions: { global: number; perUser: number }; leases: { global: number; perUser: number }; watches: { global: number; perSession: number } };
-export const DEFAULT_HOSTED_CAPS: HostedCaps = { sessions: { global: 4096, perUser: 256 }, leases: { global: 256, perUser: 32 }, watches: { global: 1024, perSession: 32 } };
+// perService (#270 D4): the tier a service principal's sessions and leases count against in place of perUser, clamped
+// under global like it; absent (a caller's own caps), a service gets perUser.
+export type HostedCaps = { sessions: { global: number; perUser: number; perService?: number }; leases: { global: number; perUser: number; perService?: number }; watches: { global: number; perSession: number } };
+export const DEFAULT_HOSTED_CAPS: HostedCaps = { sessions: { global: 4096, perUser: 256, perService: 1024 }, leases: { global: 256, perUser: 32, perService: 64 }, watches: { global: 1024, perSession: 32 } };
+// A service principal's buckets (#270 D4), in place of the per-user ones: hosted tool calls and delivery upkeep, and
+// binds. Keyed by the service's name as the user buckets are by email.
+export type ServiceLimits = { hostedRequest: RateLimit; hostedSubscriber: RateLimit; bind: RateLimit };
+export const DEFAULT_SERVICE_LIMITS: ServiceLimits = { hostedRequest: { burst: 480, perSec: 80 }, hostedSubscriber: { burst: 960, perSec: 160 }, bind: { burst: 240, perSec: 4 } };
 // Every cap may be raised to this: a guard against a typo, not a tested size.
 const CAP_CEILING = 1_000_000;
 
@@ -74,6 +81,10 @@ export type Config = {
   oauthGlobalLimit?: RateLimit;
   mcpLimits?: McpLimits;
   hostedCaps?: HostedCaps;
+  serviceLimits?: ServiceLimits;
+  // A service credential's run tokens (#270 D2): GRAYBOARD_SERVICE_TOKEN_MAX_SECONDS (the lifetime ceiling),
+  // GRAYBOARD_SERVICE_TOKEN_MINTS_PER_MINUTE and GRAYBOARD_SERVICE_TOKENS_UNEXPIRED (per credential).
+  serviceTokens?: ServiceTokenLimits;
   // How long an unbound, or bound but never-delivering, hosted session may idle (src/server/hosted.ts); default 900.
   hostedIdleSeconds?: number;
   // GRAYBOARD_METRICS_ADDR (#805): where the metrics listener binds; unset, there is none.
@@ -147,6 +158,16 @@ export function loadConfig(): Config {
     aliasScopeCap: positiveInt(process.env, "GRAYBOARD_ALIAS_SCOPE_CAP", ALIAS_SCOPE_CAP, CAP_CEILING, "names"),
     mcpLimits: parseMcpLimits(process.env),
     hostedCaps: parseHostedCaps(process.env),
+    serviceLimits: {
+      hostedRequest: parseRateLimit(process.env, "GRAYBOARD_HOSTED_REQUEST_SERVICE", DEFAULT_SERVICE_LIMITS.hostedRequest, "requests"),
+      hostedSubscriber: parseRateLimit(process.env, "GRAYBOARD_HOSTED_SUBSCRIBER_SERVICE", DEFAULT_SERVICE_LIMITS.hostedSubscriber, "requests"),
+      bind: parseRateLimit(process.env, "GRAYBOARD_HELLO_SERVICE", DEFAULT_SERVICE_LIMITS.bind, "hellos"),
+    },
+    serviceTokens: {
+      maxSeconds: serviceTokenCeiling(process.env),
+      mintsPerMinute: positiveInt(process.env, "GRAYBOARD_SERVICE_TOKEN_MINTS_PER_MINUTE", DEFAULT_SERVICE_TOKEN_LIMITS.mintsPerMinute, CAP_CEILING, "tokens"),
+      unexpired: positiveInt(process.env, "GRAYBOARD_SERVICE_TOKENS_UNEXPIRED", DEFAULT_SERVICE_TOKEN_LIMITS.unexpired, CAP_CEILING, "tokens"),
+    },
     ...(process.env.GRAYBOARD_HOSTED_IDLE_SECONDS ? { hostedIdleSeconds: positiveInt(process.env, "GRAYBOARD_HOSTED_IDLE_SECONDS", 0, Math.floor(Number.MAX_SAFE_INTEGER / 1000), "seconds") } : {}),
     trustedProxies: parseTrustedProxies(process.env.GRAYBOARD_TRUSTED_PROXIES),
     healthzLag: {
@@ -169,12 +190,23 @@ function parseMcpLimits(env: Record<string, string | undefined>): McpLimits {
   return limits;
 }
 
+// At least the mint bucket's window (SERVICE_TOKEN_MIN_SECONDS), at most a year.
+function serviceTokenCeiling(env: Record<string, string | undefined>): number {
+  const n = positiveInt(env, "GRAYBOARD_SERVICE_TOKEN_MAX_SECONDS", DEFAULT_SERVICE_TOKEN_LIMITS.maxSeconds, 366 * 24 * 60 * 60, "seconds");
+  if (n < SERVICE_TOKEN_MIN_SECONDS) throw new Error(`GRAYBOARD_SERVICE_TOKEN_MAX_SECONDS must be at least ${SERVICE_TOKEN_MIN_SECONDS} seconds`);
+  return n;
+}
+
 function parseHostedCaps(env: Record<string, string | undefined>): HostedCaps {
   const d = DEFAULT_HOSTED_CAPS;
   const sessions = globalAndScoped(env, "GRAYBOARD_HOSTED_SESSIONS", "PER_USER", d.sessions.global, d.sessions.perUser, "sessions");
   const leases = globalAndScoped(env, "GRAYBOARD_DELIVERY_LEASES", "PER_USER", d.leases.global, d.leases.perUser, "leases");
   const watches = globalAndScoped(env, "GRAYBOARD_RESOURCE_WATCHES", "PER_SESSION", d.watches.global, d.watches.perSession, "watches");
-  return { sessions: { global: sessions.global, perUser: sessions.scoped }, leases: { global: leases.global, perUser: leases.scoped }, watches: { global: watches.global, perSession: watches.scoped } };
+  // The service tier (#270 D4), clamped under the same global as the per-user value.
+  const sessionsPerService = globalAndScoped(env, "GRAYBOARD_HOSTED_SESSIONS", "PER_SERVICE", d.sessions.global, d.sessions.perService!, "sessions").scoped;
+  const leasesPerService = globalAndScoped(env, "GRAYBOARD_DELIVERY_LEASES", "PER_SERVICE", d.leases.global, d.leases.perService!, "leases").scoped;
+  return { sessions: { global: sessions.global, perUser: sessions.scoped, perService: sessionsPerService }, leases: { global: leases.global, perUser: leases.scoped, perService: leasesPerService },
+    watches: { global: watches.global, perSession: watches.scoped } };
 }
 
 // A server-wide cap and a narrower one (per user or per session), which can't exceed it. An unset narrower cap
