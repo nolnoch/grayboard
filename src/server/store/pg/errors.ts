@@ -1,7 +1,7 @@
 // SQLSTATE classification for the Postgres store (#807 P3 C1, docs/future/postgres-server.md D6). A classifier, not a
 // policy: the store group that catches an error decides what a constraint means, as db.ts does for SQLite's.
 // Bun.SQL puts the SQLSTATE in `errno`; `code` is Bun's own class (ERR_POSTGRES_SERVER_ERROR), so nothing here reads
-// `code`, and only a real PostgresError is classified.
+// `code` but for Bun's rolled-back COMMIT, which carries no SQLSTATE, and only a real PostgresError is classified.
 import { SQL } from "bun";
 import { PrincipalTaken } from "../errors.ts";
 
@@ -10,10 +10,13 @@ export type PgFailure =
   | { kind: "foreign_key"; constraint: string }     // 23503
   | { kind: "conflict"; sqlstate: "40001" | "40P01" } // serialization failure, deadlock
   | { kind: "lock_unavailable" }                    // 55P03
-  | { kind: "aborted" };                            // 25P02: a body swallowed an error without a savepoint
+  | { kind: "aborted" };                            // 25P02, or COMMIT rolled back: a body swallowed an error without a savepoint
 
 export function pgFailure(e: unknown): PgFailure | undefined {
   if (!(e instanceof SQL.PostgresError)) return undefined;
+  // A body that swallowed an error and ran nothing after it: the server answers COMMIT with ROLLBACK, and Bun rejects
+  // with its own code and no SQLSTATE.
+  if (e.code === "ERR_POSTGRES_COMMIT_ROLLED_BACK") return { kind: "aborted" };
   const constraint = e.constraint ?? "";
   switch (e.errno) {
     case "23505": return { kind: "unique", constraint };

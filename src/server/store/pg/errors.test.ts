@@ -16,6 +16,7 @@ test("each SQLSTATE the store handles classifies by errno", () => {
   expect(pgFailure(pgError("40P01"))).toEqual({ kind: "conflict", sqlstate: "40P01" });
   expect(pgFailure(pgError("55P03"))).toEqual({ kind: "lock_unavailable" });
   expect(pgFailure(pgError("25P02"))).toEqual({ kind: "aborted" });
+  expect(pgFailure(new SQL.PostgresError("rolled back", { code: "ERR_POSTGRES_COMMIT_ROLLED_BACK" }))).toEqual({ kind: "aborted" });
   expect(uniqueViolation(pgError("23505", "x_key"))).toBe("x_key");
   expect(foreignKeyViolation(pgError("23503", "y_fkey"))).toBe("y_fkey");
   expect(uniqueViolation(pgError("23503", "y_fkey"))).toBeUndefined();

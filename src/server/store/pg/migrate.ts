@@ -19,6 +19,14 @@ export const MIGRATIONS: readonly Migration[] = [];
 // pg_advisory_xact_lock's key: any constant; advisory locks are per database.
 export const MIGRATE_LOCK = 0x67626d6967726174n; // "gbmigrat"
 
+// The record table. Part of every migrated database's shape, so tests/support/pg.ts hashes it into the template name.
+export const RECORD_TABLE_SQL = `CREATE TABLE IF NOT EXISTS schema_migrations (
+  version int4 PRIMARY KEY,
+  name text COLLATE "C" NOT NULL,
+  checksum text COLLATE "C" NOT NULL,
+  applied_at int8 NOT NULL
+)`;
+
 export function checksum(m: Migration): string {
   return createHash("sha256").update(m.sql).digest("hex");
 }
@@ -45,12 +53,7 @@ export async function migrate(sql: SQL, migrations: readonly Migration[] = MIGRA
   const now = opts.now ?? Date.now;
   return sql.begin(async tx => {
     await tx`SELECT pg_advisory_xact_lock(${MIGRATE_LOCK.toString()}::int8)`;
-    await tx`CREATE TABLE IF NOT EXISTS schema_migrations (
-      version int4 PRIMARY KEY,
-      name text COLLATE "C" NOT NULL,
-      checksum text COLLATE "C" NOT NULL,
-      applied_at int8 NOT NULL
-    )`;
+    await tx.unsafe(RECORD_TABLE_SQL);
     const rows: { version: number; checksum: string }[] = await tx`SELECT version, checksum FROM schema_migrations ORDER BY version`;
     const known = new Map(migrations.map(m => [m.version, m]));
     const recorded = new Set<number>();
@@ -63,6 +66,11 @@ export async function migrate(sql: SQL, migrations: readonly Migration[] = MIGRA
         throw new Error(`migration ${m.name} was edited after this database applied it (recorded checksum ${r.checksum.slice(0, 12)}, file ${checksum(m).slice(0, 12)}); a development database: drop and recreate it`);
       }
     }
+    // A pending version below the highest recorded one would run out of order (recorded 1 and 3, this binary adds 2):
+    // migrations are written against every earlier one, so refuse rather than guess.
+    const highest = rows.length ? rows[rows.length - 1]!.version : 0;
+    const gap = migrations.find(m => !recorded.has(m.version) && m.version < highest);
+    if (gap) throw new Error(`migration ${gap.name} is not applied but version ${highest} is: refusing to apply it out of order`);
     const applied: number[] = [];
     for (const m of migrations) {
       if (recorded.has(m.version)) continue;

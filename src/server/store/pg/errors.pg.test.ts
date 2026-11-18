@@ -34,6 +34,12 @@ describePg("SQLSTATEs as Bun.SQL reports them", () => {
       await tx`SELECT 1`;
     });
     expect(await failure(swallowed)).toEqual({ kind: "aborted" });
+    // Nothing after the swallowed error: the COMMIT is answered with ROLLBACK, which Bun reports with no SQLSTATE.
+    const silent = db.sql.begin(async tx => {
+      try { await tx`INSERT INTO child (id, u) VALUES (2, 'a')`; } catch { /* swallowed */ }
+    });
+    expect(await failure(silent)).toEqual({ kind: "aborted" });
+    expect((await db.sql`SELECT count(*)::int4 AS n FROM child`)[0].n).toBe(1);
     const saved = await db.sql.begin(async tx => {
       try { await tx.savepoint(sp => sp`INSERT INTO child (id, u) VALUES (2, 'a')`); } catch { /* rolled back to the savepoint */ }
       const [r] = await tx`SELECT count(*)::int4 AS n FROM child`;

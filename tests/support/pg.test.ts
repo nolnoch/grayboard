@@ -12,6 +12,7 @@ test("the template's name follows every migration's version, name and text", () 
   expect(templateName([FIXTURES[0]!, { ...FIXTURES[1]!, sql: FIXTURES[1]!.sql + " " }, FIXTURES[2]!])).not.toBe(base);
   expect(templateName([FIXTURES[0]!, { ...FIXTURES[1]!, name: "0002_owt" }, FIXTURES[2]!])).not.toBe(base);
   expect(templateName(FIXTURES.slice(0, 2))).not.toBe(base);
+  expect(templateName(FIXTURES, "CREATE TABLE IF NOT EXISTS schema_migrations (version int8 PRIMARY KEY)")).not.toBe(base);
 });
 
 test("GRAYBOARD_TEST_PG_REQUIRED=1 without a URL fails the load instead of skipping", async () => {
@@ -62,6 +63,7 @@ describePg("pg.ts", () => {
     // A migration set no earlier run built, so this call takes the build path.
     const fresh = [{ ...FIXTURES[0]!, sql: `${FIXTURES[0]!.sql}\n-- ${crypto.randomUUID()}` }];
     const admin = new Bun.SQL(PG_URL!);
+    const name = templateName(fresh);
     try {
       const t = await pgTemplate(fresh);
       expect(t).toEqual({ name: templateName(fresh), built: true });
@@ -69,9 +71,13 @@ describePg("pg.ts", () => {
       const [row] = await admin`SELECT datistemplate, datallowconn FROM pg_database WHERE datname = ${t.name}`;
       expect(row).toEqual({ datistemplate: true, datallowconn: false });
       expect((await admin`SELECT 1 FROM pg_database WHERE datname = ${t.name + "_build"}`).length).toBe(0);
-      await admin.unsafe(`ALTER DATABASE "${t.name}" WITH IS_TEMPLATE false`);
-      await admin.unsafe(`DROP DATABASE "${t.name}" WITH (FORCE)`);
     } finally {
+      // The sweep drops only per-test databases: a template this test made is its to drop.
+      for (const db of [name, `${name}_build`]) {
+        if (!(await admin`SELECT 1 FROM pg_database WHERE datname = ${db}`).length) continue;
+        await admin.unsafe(`ALTER DATABASE "${db}" WITH IS_TEMPLATE false`);
+        await admin.unsafe(`DROP DATABASE "${db}" WITH (FORCE)`);
+      }
       await admin.close();
     }
   });
