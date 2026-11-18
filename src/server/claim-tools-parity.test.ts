@@ -234,10 +234,25 @@ const bob: ToolContext = { user: B, addresses: [`${B}/be`, `${B}/qa`], session: 
 test("a take whose [claim] post fails leaves no claim, no event and none of its sweep", async () => {
   const access = boardAccess(repo);
   const before = claimRows();
-  const spy = spyOn(repo.boards, "insertOutbox").mockImplementation((() => { throw new Error("outbox down"); }) as never);
+  // The fault fires on the [claim] post only, so the sweep's posts, the upsert and the take event all ran before it.
+  const real = repo.boards.insertOutbox.bind(repo.boards);
+  const seen: string[] = [];
+  let heldAtFault = false;
+  const spy = spyOn(repo.boards, "insertOutbox").mockImplementation((async (tx: Tx, postId: number, targets: never) => {
+    const body = (await repo.boards.post(tx, postId))?.body ?? "";
+    seen.push(body);
+    if (body.startsWith("[claim]")) {
+      heldAtFault = !!(await repo.claims.get(tx, "ticket:new"));
+      throw new Error("outbox down");
+    }
+    return real(tx, postId, targets);
+  }) as never);
   try {
     await expect(repo.write(tx => callClaimTool(repo, access, tx, `${W}/be`, "claim_take", { key: "ticket:new", board: "general" }, wade))).rejects.toThrow("outbox down");
   } finally { spy.mockRestore(); }
+  expect(seen.at(-1)).toStartWith("[claim]");
+  expect(seen.length).toBeGreaterThan(1);
+  expect(heldAtFault).toBe(true);
   expect(claimRows()).toEqual(before);
   // The lapsed rows are still there for the next sweep to announce.
   expect(JSON.stringify(before.claims)).toContain("ticket:watched");
