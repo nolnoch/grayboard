@@ -961,6 +961,19 @@ export function authorAddresses(db: Database, author: string, authorId: string |
 // its thread; null for a key that isn't a live queue post.
 export type Requeue = { lane: string } | { board: string; postId: number; held: number } | null;
 export function redeliverQueuePost(db: Database, key: string, prevHolder: string, now = Date.now()): Requeue {
+  const f = redeliveryFacts(db, key, prevHolder);
+  if (!f) return null;
+  const lane = requeuePick(queueLanes(db, f.board, postAddresses(db, f.postId)), f.held);
+  if (!lane) return { board: f.board.name, postId: f.postId, held: f.takers };
+  claimQueuePost(db, f.board.name, f.postId, lane, now, { note: REDELIVERED_NOTE });
+  return { lane };
+}
+
+export type RedeliveryFacts = { board: Board; postId: number; takers: number; held: Set<string> };
+
+/** What a queue post's redelivery reads (#807 B5b3a): its board and post, how many took it (the `[unclaimed]`
+ * reply's count), and every address that held it with each one's lane. Null when `key` names no queue post. */
+export function redeliveryFacts(db: Database, key: string, prevHolder: string): RedeliveryFacts | null {
   const m = /^queue:([^:]+):(\d+)$/.exec(key);
   if (!m) return null;
   const b = getBoard(db, m[1]!);
@@ -977,10 +990,12 @@ export function redeliverQueuePost(db: Database, key: string, prevHolder: string
   );
   const takers = held.size; // the `[unclaimed]` reply counts who held it, not their lanes twice
   for (const h of [...held]) held.add((laneOf.get(h) as { lane: string }).lane);
-  const lane = queueLanes(db, b, postAddresses(db, p.id)).find((h) => !held.has(h));
-  if (!lane) return { board: b.name, postId: p.id, held: takers };
-  claimQueuePost(db, b.name, p.id, lane, now, { note: REDELIVERED_NOTE });
-  return { lane };
+  return { board: b, postId: p.id, takers, held };
+}
+
+/** The lane a declined or lapsed queue post goes to next: the first of `lanes` (queueLanes' order) that hasn't held it. */
+export function requeuePick(lanes: string[], held: Set<string>): string | undefined {
+  return lanes.find((h) => !held.has(h));
 }
 
 // What decides whether `handle` may post (or reply) on a board now: it can see
