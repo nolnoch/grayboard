@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Glob } from "bun";
-import { ACCESS_LOG_LAST_SQL, mailPort, openDatabase, PrincipalTaken, QUEUED_TO_SQL, RETRACTABLE_SQL, SENT_PENDING_SQL, UNDELIVERED_FROM_SQL, type Repo } from "./db.ts";
+import { ACCESS_LOG_LAST_SQL, mailPort, openDatabase, QUEUED_TO_SQL, RETRACTABLE_SQL, SENT_PENDING_SQL, UNDELIVERED_FROM_SQL, type Repo } from "./db.ts";
 import type { Tx } from "./store/tx.ts";
 import { scratchDbPath } from "../../tests/support/scratch_db.ts";
 import { holdAlias } from "../core/bindings.ts";
@@ -16,6 +16,8 @@ import { onTeamJoined } from "./teams.ts";
 import { hashToken } from "./auth.ts";
 import { issueOAuth } from "../../tests/helpers/oauth.ts";
 import { grantOwner } from "../../tests/support/roles.ts";
+import { identityContract } from "./store/identity.contract.ts";
+import { sqliteIdentityBackend } from "./store/identity.contract.sqlite.ts";
 
 const person = (email: string, name: string) => ({ scope_kind: "person" as const, scope_ref: email, name });
 
@@ -184,33 +186,6 @@ describe("Repo", () => {
     repo = r;
   });
 
-  test("upsertByEmail creates user on first call", async () => {
-    const u = await seed(repo, tx => repo.users.upsertByEmail(tx, "wade@example.com", "Wade"));
-    expect(u.email).toBe("wade@example.com");
-    expect(u.display_name).toBe("Wade");
-    expect(u.disabled_at).toBeNull();
-  });
-
-  test("upsertByEmail updates display_name on collision", async () => {
-    await seed(repo, tx => repo.users.upsertByEmail(tx, "wade@example.com", "Wade"));
-    const u = await seed(repo, tx => repo.users.upsertByEmail(tx, "wade@example.com", "Wade B"));
-    expect(u.display_name).toBe("Wade B");
-  });
-
-  test("sessions: create, findByTokenHash, revoke", async () => {
-    const s = await seed(repo, async tx => {
-      const u = await repo.users.upsertByEmail(tx, "wade@example.com", null);
-      return repo.sessions.create(tx, u.id, "hash123", "test");
-    });
-    const found = await repo.sessions.findByTokenHash(repo.read, "hash123");
-    expect(found?.id).toBe(s.id);
-    await seed(repo, tx => repo.sessions.revoke(tx, s.id));
-    expect(await repo.sessions.findByTokenHash(repo.read, "hash123")).toBeUndefined();
-    // By row, a revoked one still reads, with its revoked_at.
-    expect((await repo.sessions.findById(repo.read, s.id))?.revoked_at).not.toBeNull();
-    expect(await repo.sessions.findById(repo.read, s.id + 100)).toBeUndefined();
-  });
-
   test("aliases: create, list, remove", async () => {
     const fe = await seed(repo, async tx => {
       await repo.users.upsertByEmail(tx, "you@example.com", null);
@@ -244,30 +219,6 @@ describe("Repo", () => {
     expect((await repo.aliases.listForScope(repo.read, "person", "you@example.com")).map((a) => a.address)).toEqual(["you@example.com/be"]);
     expect((await repo.aliases.listForScope(repo.read, "person", "eng"))).toEqual([]);
     expect((await repo.aliases.findAllByName(repo.read, "be")).map((a) => a.address)).toEqual(["eng/be", "you@example.com/be"]);
-  });
-
-  test("principals: findByName reads users and teams", async () => {
-    const { u, eng } = await seed(repo, async tx => {
-      const u = await repo.users.upsertByEmail(tx, "you@example.com", null);
-      return { u, eng: await repo.teams.create(tx, "eng", u.id) };
-    });
-    expect((await repo.principals.findByName(repo.read, "you@example.com"))).toMatchObject({ kind: "user", user_id: u.id, team_id: null });
-    expect((await repo.principals.findByName(repo.read, "eng"))).toMatchObject({ kind: "team", user_id: null, team_id: eng.id });
-    expect((await repo.principals.findByName(repo.read, "ops"))).toBeUndefined();
-  });
-
-  test("teams: create, join, leave, list members", async () => {
-    const { u2, t } = await seed(repo, async tx => {
-      const u1 = await repo.users.upsertByEmail(tx, "a@example.com", null);
-      const u2 = await repo.users.upsertByEmail(tx, "b@example.com", null);
-      const t  = await repo.teams.create(tx, "eng", u1.id);
-      await repo.teams.addMember(tx, t.id, u1.id);
-      await repo.teams.addMember(tx, t.id, u2.id);
-      return { u2, t };
-    });
-    expect((await repo.teams.listMembers(repo.read, t.id))).toHaveLength(2);
-    await seed(repo, (tx) => repo.teams.removeMember(tx, t.id, u2.id));
-    expect((await repo.teams.listMembers(repo.read, t.id))).toHaveLength(1);
   });
 
   test("messages: insert and thread", async () => {
@@ -374,149 +325,16 @@ describe("Repo", () => {
   });
 });
 
-// #284 decision 5: users, teams and service principals share one namespace.
-test("principals: a sign-in and a team create insert one; a team can't take another principal's name", async () => {
-  const { db, repo } = openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
-  const { u, eng } = await seed(repo, async tx => {
-    const u = await repo.users.upsertByEmail(tx, "a@example.com", null);
-    await repo.users.upsertByEmail(tx, "a@example.com", "A");
-    const eng = await repo.teams.create(tx, "eng", u.id);
-    // Teams and service principals share one namespace (#270): the guard refuses either name.
-    db.prepare(`INSERT INTO principals (kind, name, created_at) VALUES ('service', 'ingest', 0)`).run();
-    return { u, eng };
-  });
-  await expect(seed(repo, (tx) => repo.teams.create(tx, "ingest", u.id))).rejects.toThrow(PrincipalTaken);
-  expect((await repo.teams.findByName(repo.read, "ingest"))).toBeUndefined();
-  expect(db.prepare(`SELECT kind, name, user_id, team_id FROM principals ORDER BY id`).all()).toEqual([
-    { kind: "user", name: "a@example.com", user_id: u.id, team_id: null },
-    { kind: "team", name: "eng", user_id: null, team_id: eng.id },
-    { kind: "service", name: "ingest", user_id: null, team_id: null },
-  ]);
-});
+// The identity groups' rows (users, sessions, principals, teams, roles, services), shared with the Postgres store
+// (#807 P3 C3): the sign-in D4 branches, the name guards, the role refusals and the savepoint rows live there.
+describe("identity contract (SQLite)", () => identityContract(sqliteIdentityBackend));
 
-// #807 P2-3 (D3): teams.create reads nothing first; the UNIQUE names refuse a taken one. A trigger lands another
-// principal of the name inside the create, after any read it could have made, as a second Postgres pod could.
-test("#807 P2-3: teams.create refuses a name another principal takes mid-create, and maps only name violations", async () => {
-  const { db, repo } = openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
-  const u = await seed(repo, tx => repo.users.upsertByEmail(tx, "a@example.com", null));
-  db.run(`CREATE TEMP TRIGGER land_ingest AFTER INSERT ON teams WHEN NEW.name = 'ingest'
-    BEGIN INSERT INTO principals (kind, name, created_at) VALUES ('service', 'ingest', 0); END`);
-  await expect(seed(repo, tx => repo.teams.create(tx, "ingest", u.id))).rejects.toThrow(PrincipalTaken);
-  expect((await repo.teams.findByName(repo.read, "ingest"))).toBeUndefined();
-  expect(db.prepare(`SELECT COUNT(*) AS n FROM principals WHERE name = 'ingest'`).get()).toEqual({ n: 0 });
-  // Another team of the name: teams.name refuses it before the principal insert runs.
-  await seed(repo, tx => repo.teams.create(tx, "eng", u.id));
-  await expect(seed(repo, tx => repo.teams.create(tx, "eng", u.id))).rejects.toThrow(PrincipalTaken);
-  // Any other constraint is the caller's error, not a taken name.
-  const missing = seed(repo, tx => repo.teams.create(tx, "ops", 999_999));
-  await expect(missing).rejects.toThrow(/FOREIGN KEY/);
-  await expect(missing).rejects.not.toThrow(PrincipalTaken);
-  expect((await repo.teams.findByName(repo.read, "ops"))).toBeUndefined();
-});
-
-// Security audit F-13, #928 D4: users are matched by (issuer, subject) first,
-// so a reassigned email can't inherit an account, and one IdP's account never
-// signs into another IdP's by email.
+// Sign-in fixtures for the rows below (security audit F-13, #928 D4).
 const G = GOOGLE_ISSUER, OKTA = "https://example.okta.com";
 const fresh = () => openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
 // Each write in a queued body, as the OAuth sign-in and the admin route run them (#807 P1b-4f).
 const signIn = (repo: Repo, ...a: Parameters<Repo["users"]["signIn"]> extends [Tx, ...infer R] ? R : never) => seed(repo, tx => repo.users.signIn(tx, ...a));
 const upsert = (repo: Repo, email: string) => seed(repo, tx => repo.users.upsertByEmail(tx, email, null));
-
-test("signIn D4 branch 1: this (issuer, subject)'s user signs in, or is refused when its email changed", async () => {
-  const { repo } = fresh();
-  const u = await signIn(repo, G, "s-1", "a@example.com", "A");
-  expect(await signIn(repo, G, "s-1", "a@example.com", "A 2")).toMatchObject({ status: "ok", linked: false, user: { id: u.user.id, display_name: "A 2" } });
-  // The same IdP account reporting another email is refused, and no user is created.
-  expect(await signIn(repo, G, "s-1", "renamed@example.com", null)).toMatchObject({ status: "email_changed", user: { id: u.user.id } });
-  expect((await repo.users.findByEmail(repo.read, "renamed@example.com"))).toBeUndefined();
-});
-
-test("signIn D4 branch 2: another subject under the same issuer is subject_mismatch, and nothing changes", async () => {
-  const { repo } = fresh();
-  const u = (await signIn(repo, G, "s-1", "a@example.com", null)).user;
-  expect(await signIn(repo, G, "s-intruder", "a@example.com", null)).toEqual({ status: "subject_mismatch", user: u });
-  expect((await repo.users.findById(repo.read, u.id))).toEqual(u);
-});
-
-test("signIn D4 branch 3: an email another issuer holds, with or without a subject, is issuer_mismatch naming the holder", async () => {
-  const { db, repo } = fresh();
-  const linked = (await signIn(repo, G, "s-1", "a@example.com", null)).user;
-  expect(await signIn(repo, OKTA, "o-1", "a@example.com", null)).toEqual({ status: "issuer_mismatch", user: linked, issuer: G });
-  // A pre-F-13 row: Google's issuer, no subject. Reserved for Google.
-  const legacy = await upsert(repo, "old@example.com");
-  await seed(repo, () => { db.run("UPDATE users SET idp_issuer = ? WHERE id = ?", [G, legacy.id]); });
-  expect(await signIn(repo, OKTA, "o-2", "old@example.com", null)).toMatchObject({ status: "issuer_mismatch", user: { id: legacy.id, idp_subject: null }, issuer: G });
-  expect((await repo.users.findById(repo.read, legacy.id))).toMatchObject({ idp_issuer: G, idp_subject: null });
-});
-
-test("signIn D4 branch 4: this issuer's subjectless row links", async () => {
-  const { db, repo } = fresh();
-  const legacy = await upsert(repo, "old@example.com");
-  await seed(repo, () => { db.run("UPDATE users SET idp_issuer = ? WHERE id = ?", [G, legacy.id]); });
-  expect(await signIn(repo, G, "s-old", "old@example.com", "Old")).toMatchObject({ status: "ok", linked: true, user: { id: legacy.id, idp_issuer: G, idp_subject: "s-old", display_name: "Old" } });
-  expect((await repo.users.findById(repo.read, legacy.id))).toMatchObject({ idp_issuer: G, idp_subject: "s-old", display_name: "Old" });
-});
-
-test("signIn D4 branch 5: a row with neither links to whichever issuer signs in first, both columns set", async () => {
-  const { repo } = fresh();
-  const dev = await upsert(repo, "dev@example.com");
-  expect(dev).toMatchObject({ idp_issuer: null, idp_subject: null });
-  expect(await signIn(repo, OKTA, "o-1", "dev@example.com", null)).toMatchObject({ status: "ok", linked: true, user: { id: dev.id, idp_issuer: OKTA, idp_subject: "o-1" } });
-  expect((await repo.users.findById(repo.read, dev.id))).toMatchObject({ idp_issuer: OKTA, idp_subject: "o-1" });
-  expect(await signIn(repo, G, "s-1", "dev@example.com", null)).toMatchObject({ status: "issuer_mismatch", issuer: OKTA });
-});
-
-test("signIn D4 branch 6: no row creates the user with issuer and subject, and its principal", async () => {
-  const { db, repo } = fresh();
-  const r = await signIn(repo, G, "s-new", "new@example.com", "New");
-  expect(r).toMatchObject({ status: "ok", linked: false, user: { email: "new@example.com", idp_issuer: G, idp_subject: "s-new", display_name: "New" } });
-  expect((await repo.users.findByEmail(repo.read, "new@example.com"))).toMatchObject({ idp_issuer: G, idp_subject: "s-new" });
-  expect(db.query("SELECT kind FROM principals WHERE name = 'new@example.com'").all()).toEqual([{ kind: "user" }]);
-});
-
-test("signIn: the same sub under two issuers is two users; one issuer can't hold a sub twice", async () => {
-  const { db, repo } = fresh();
-  const a = (await signIn(repo, G, "same", "a@example.com", null)).user;
-  const b = (await signIn(repo, OKTA, "same", "b@example.com", null)).user;
-  expect(a.id).not.toBe(b.id);
-  expect(await signIn(repo, OKTA, "same", "b@example.com", null)).toMatchObject({ status: "ok", user: { id: b.id } });
-  expect(await signIn(repo, G, "same", "a@example.com", null)).toMatchObject({ status: "ok", user: { id: a.id } });
-  const c = await upsert(repo, "c@example.com");
-  await expect(seed(repo, () => { db.run("UPDATE users SET idp_issuer = ?, idp_subject = 'same' WHERE id = ?", [G, c.id]); })).rejects.toThrow(/UNIQUE/);
-});
-
-test("signIn: clearSubject clears issuer and subject, so the next sign-in from any issuer takes the email", async () => {
-  const { repo } = fresh();
-  const u = (await signIn(repo, G, "s-1", "a@example.com", null)).user;
-  await seed(repo, tx => repo.users.clearSubject(tx, u.id));
-  expect((await repo.users.findById(repo.read, u.id))).toMatchObject({ idp_issuer: null, idp_subject: null });
-  expect(await signIn(repo, OKTA, "o-1", "a@example.com", null)).toMatchObject({ status: "ok", linked: true, user: { id: u.id, idp_issuer: OKTA, idp_subject: "o-1" } });
-});
-
-// D3: the link is a conditional write. A trigger links the row to another
-// account between signIn's read and its write (what a concurrent sign-in does
-// on Postgres) and drops signIn's own update: signIn re-reads and refuses.
-for (const [winner, status] of [[OKTA, "issuer_mismatch"], [G, "subject_mismatch"]] as const) {
-  test(`signIn: a row linked between the read and the conditional write ends in ${status}, not a double link`, async () => {
-    const { db, repo } = fresh();
-    const u = await upsert(repo, "race@example.com");
-    db.run(`CREATE TRIGGER race BEFORE UPDATE OF idp_subject ON users WHEN NEW.idp_subject = 's-mine' BEGIN
-      UPDATE users SET idp_issuer = '${winner}', idp_subject = 's-theirs' WHERE id = OLD.id;
-      SELECT RAISE(IGNORE);
-    END`);
-    expect(await signIn(repo, G, "s-mine", "race@example.com", null)).toMatchObject({ status, user: { id: u.id, idp_issuer: winner, idp_subject: "s-theirs" } });
-    expect((await repo.users.findById(repo.read, u.id))).toMatchObject({ idp_issuer: winner, idp_subject: "s-theirs" });
-  });
-}
-
-test("signIn: a disabled account without a subject isn't bound to whoever signs in", async () => {
-  const { repo } = fresh();
-  const departed = await upsert(repo, "gone@example.com");
-  await seed(repo, tx => repo.users.setDisabled(tx, departed.id, true));
-  expect(await signIn(repo, G, "s-hire", "gone@example.com", null)).toMatchObject({ status: "ok", linked: false, user: { id: departed.id } });
-  expect((await repo.users.findById(repo.read, departed.id))).toMatchObject({ idp_issuer: null, idp_subject: null });
-});
 
 // #928 D3: the issuer column, its one-time stamp, the every-open repair and the index swap.
 const usersV1 = `CREATE TABLE users (id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT NOT NULL UNIQUE, display_name TEXT, created_at INTEGER NOT NULL, disabled_at INTEGER)`;

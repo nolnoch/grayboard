@@ -151,9 +151,12 @@ async function driveAsync<T>(g: Rule<T>, reads: PolicyReads): Promise<T> {
   }
 }
 
+// The store groups the decision reads: a Repo's, or another backend's without one (#807 P3 C3a).
+export type PolicyStores = Pick<Repo, "principals" | "teams" | "roles"> & { users: Pick<Repo["users"], "findByEmail"> };
+
 // Policy's reads on one handle: `r` is the caller's body's `Tx` inside a transaction, so the rule sees its writes,
 // else `repo.read`, committed state (#807 P3 A7e3).
-function policyReads(repo: Repo, r: Read): PolicyReads {
+function policyReads(repo: PolicyStores, r: Read): PolicyReads {
   return {
     principalByName: (name) => repo.principals.findByName(r, name),
     principalOf: (address) => repo.principals.of(r, address),
@@ -169,7 +172,7 @@ function policyReads(repo: Repo, r: Read): PolicyReads {
 
 // The decision, its reads on the caller's handle `r` (#807 P3 A7e3): the form every caller reaches by A7f. No
 // decision is recorded here, so nothing it returns depends on state an await could change underneath the caller.
-export function authorize(repo: Repo, r: Read, ctx: PolicyContext, req: AuthzRequest): Promise<Decision> {
+export function authorize(repo: PolicyStores, r: Read, ctx: PolicyContext, req: AuthzRequest): Promise<Decision> {
   return driveAsync(decide(ctx, req), policyReads(repo, r));
 }
 
