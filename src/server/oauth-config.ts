@@ -94,7 +94,7 @@ export function oauthPublicUrl(raw: string, devAuth: boolean): string {
   const normalizedPort = raw.replace(/^(https:\/\/[^/]+):443(?=\/|$)/, "$1").replace(/^(http:\/\/[^/]+):80(?=\/|$)/, "$1");
   const base = normalizedPort.replace(/\/$/, "");
   // `new URL` keeps an empty query out of `u.search`, so a bare `?` would ride into an issuer no client can match (#1338).
-  if (base.includes("?")) throw new Error("OAuth issuer must have no query");
+  if (base.includes("?")) throw new Error("GRAYBOARD_PUBLIC_URL must have no query, not even a bare ?");
   const u = safeURL(base + (new URL(base).pathname === "/" ? "/" : ""));
   if (u.search || (u.protocol !== "https:" && !(devAuth && u.protocol === "http:" && isLoopback(u.hostname)))) throw new Error("OAuth issuer requires HTTPS (or explicit loopback dev auth)");
   if (/%|\/\//.test(u.pathname)) throw new Error("invalid OAuth issuer path");
