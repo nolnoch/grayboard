@@ -227,6 +227,11 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
   // then its retries answer slow_down from here, with no write transaction, so a valid-secret loop costs a lookup;
   // a streak (refusals no more than STREAK_MS past that time) writes one request_refused row, not one per retry.
   const mintBackoff = new Map<string, number>();
+  // A credential whose probe (its first mint past a hold) is in the store, by client ID (#1282): set before the
+  // mint's await and cleared on every outcome, so requests that arrive during the probe's round trip (real network
+  // I/O on Postgres) answer slow_down here instead of each running its own write and, at a streak's start, its own row.
+  // A credential with no hold isn't single-flighted: a fleet's concurrent first mints all go to the store.
+  const probing = new Set<string>();
   const STREAK_MS = 60_000;
   let closed = false;
   const sweep = () => {
@@ -592,24 +597,33 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
           const selected = scopes(optional(p, "scope"), [...OAUTH_SCOPES]);
           if (!selected.every(s => client.scopes.includes(s))) fail("invalid_scope");
           const held = mintBackoff.get(client.clientId);
-          if (held !== undefined && now() < held) throw new OAuthError("slow_down", 429, false, false);
-          const token = random();
-          // Between the secret's check and the mint: a revoke or disable here must still refuse (the insert re-checks).
-          await testPauseAsync("oauth:mint:before-write");
-          // A run token (RFC 6749 §4.4.3: no refresh token). The store checks the credential, its grant, the secret and
-          // the service live, and the bucket and cap, in its one insert; its row's expiry is the answer's.
-          const { t, minted } = await repo.write(async tx => {
-            const t = now();
-            return { t, minted: await repo.oauth.mintServiceToken(tx, { clientId: client.clientId, secretId: client.credential!.secretId!, tokenHash: hashToken(token), scopes: selected, limits: serviceTokens }, t) };
-          });
-          if (minted.status === "capacity") {
-            const streak = held !== undefined && t <= held + STREAK_MS;
-            mintBackoff.set(client.clientId, t + 60_000 / serviceTokens.mintsPerMinute);
-            throw new OAuthError("slow_down", 429, false, !streak);
-          }
-          if (minted.status !== "ok") fail("invalid_client", 401);
-          mintBackoff.delete(client.clientId);
-          return json({ access_token: token, token_type: "Bearer", expires_in: Math.floor((minted.value.expiresAt - t) / 1000), scope: selected.join(" ") });
+          // A request during another's probe answers what the probe most likely will: the credential was at its bucket
+          // or cap, so slow_down, the RFC 8628 §3.5 rate answer, is true of it now. It is the hold's own answer, same
+          // status and body, uncharged and unaudited (inside the streak the hold's row began), so a caller can't tell a
+          // probe in flight from a hold. invalid_client would be false for a live credential, and waiting on the
+          // probe's result would hold one connection per retry for the length of a write.
+          if (probing.has(client.clientId) || (held !== undefined && now() < held)) throw new OAuthError("slow_down", 429, false, false);
+          const probe = held !== undefined;
+          if (probe) probing.add(client.clientId);
+          try {
+            const token = random();
+            // Between the secret's check and the mint: a revoke or disable here must still refuse (the insert re-checks).
+            await testPauseAsync("oauth:mint:before-write");
+            // A run token (RFC 6749 §4.4.3: no refresh token). The store checks the credential, its grant, the secret and
+            // the service live, and the bucket and cap, in its one insert; its row's expiry is the answer's.
+            const { t, minted } = await repo.write(async tx => {
+              const t = now();
+              return { t, minted: await repo.oauth.mintServiceToken(tx, { clientId: client.clientId, secretId: client.credential!.secretId!, tokenHash: hashToken(token), scopes: selected, limits: serviceTokens }, t) };
+            });
+            if (minted.status === "capacity") {
+              const streak = held !== undefined && t <= held + STREAK_MS;
+              mintBackoff.set(client.clientId, t + 60_000 / serviceTokens.mintsPerMinute);
+              throw new OAuthError("slow_down", 429, false, !streak);
+            }
+            if (minted.status !== "ok") fail("invalid_client", 401);
+            mintBackoff.delete(client.clientId);
+            return json({ access_token: token, token_type: "Bearer", expires_in: Math.floor((minted.value.expiresAt - t) / 1000), scope: selected.join(" ") });
+          } finally { if (probe) probing.delete(client.clientId); }
         }
         const access = random(), refresh = random();
         let result, t: number;
