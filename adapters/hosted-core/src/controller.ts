@@ -931,6 +931,8 @@ export class Controller<E extends Enrollment = Enrollment> {
             if (error instanceof AccessExpired && error.reason === "expired") { r.paused = true; r.awaiting = mark; awaiting(); return false; }
             // An outage now: restore's retry, on the outage backoff (#424 6).
             if (error instanceof ServerUnreachable && this.restorable(r, r.epoch)) { this.set(r, "retrying", UNREACHABLE_AT_RECOVER, "recover", failureCode(error)); this.retryRestore(r); return true; }
+            // A sign-out pauses the root, as every start's does (#1325).
+            if (this.signedOut(error)) r.paused = true;
             this.set(r, r.paused ? "paused" : "approved", failureMessage(error, this.hint), "recover", failureCode(error));
           }
           return true;

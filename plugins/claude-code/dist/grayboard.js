@@ -37584,6 +37584,8 @@ class Controller {
               this.retryRestore(r);
               return true;
             }
+            if (this.signedOut(error))
+              r.paused = true;
             this.set(r, r.paused ? "paused" : "approved", failureMessage(error, this.hint), "recover", failureCode(error));
           }
           return true;

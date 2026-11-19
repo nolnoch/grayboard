@@ -45,6 +45,7 @@ function runtime(mode: Mode) {
   // real failure and before its catch records it (#1309).
   let onRefused: (() => void) | undefined;
   let prepareHold: Promise<void> | undefined, admitHold: ((signal: AbortSignal) => Promise<void>) | undefined, beforeOpen: (() => void) | undefined;
+  let whoamiFault: (() => Error) | undefined;
   // The host's receipt hook (#441), when a test sets one.
   let receiptHook: ((sessionID: string, ids: readonly string[]) => void) | undefined;
   const loops: FakeWire[] = [];
@@ -75,6 +76,7 @@ function runtime(mode: Mode) {
       let row = rows.get(this.sessionID);
       if (name === "whoami") {
         if (!this.beforeRetry && prepareHold) await prepareHold;
+        if (!this.beforeRetry && whoamiFault) { const fault = whoamiFault; whoamiFault = undefined; throw fault(); }
         // The server reports each loss to the Controller until its next delivery_open (#453).
         const taken = lost.get(this.sessionID) ?? [];
         for (const l of taken) l.reported = true;
@@ -168,6 +170,8 @@ function runtime(mode: Mode) {
     onRefused: (hook: () => void) => { onRefused = hook; },
     // The next delivery_open runs `hook` first (a revocation landing between a whoami and the open).
     beforeOpen: (hook: () => void) => { beforeOpen = hook; },
+    // The next temporary wire's whoami (a start's prepare) throws `fault()` (the server refusing the access token).
+    failWhoami: (fault: () => Error) => { whoamiFault = fault; },
     holdAdmit: (hold: (signal: AbortSignal) => Promise<void>) => { admitHold = hold; },
     onReceipted: (hook: (sessionID: string, ids: readonly string[]) => void) => { receiptHook = hook; },
     drift: () => { grant++; for (const w of [...watchers]) w(); },
@@ -432,6 +436,22 @@ test.each(modes.flatMap(mode => (["enroll", "resume"] as const).flatMap(how => (
     // `expired` ran out the rotation grace first; a sign-out ends at once.
     if (reason === "expired") expect(waits).toBeGreaterThan(0); else expect(waits).toBe(0);
   } finally { await c.close(); }
+});
+// #1325: the recovery's own start is one more start path. Its stored token reads fresh, then the server refuses it on
+// prepare's whoami: `expired` goes back to waiting for the host's rotation (#661); a sign-out pauses the root.
+test.each(modes.flatMap(mode => (["expired", "login_required"] as const).map(reason => [mode, reason] as const)))("a recovery whose start ends on AccessExpired pauses on a sign-out, and waits again on `expired` (#1325, %s, %s)", async (mode, reason) => {
+  const o = await expiredPause(mode, (n, r) => {
+    if (n === 1) { r.expireAccess(); r.failWhoami(() => { r.expireAccess(reason); return new AccessExpired("pi", "run /grayboard login", reason); }); }
+  });
+  try {
+    if (reason === "expired") await until(() => o.recovering() >= 2);
+    else await until(() => o.r.root(o.c)?.operation === "recover" && o.r.root(o.c)?.state !== "retrying");
+    await o.c.close();
+    expect(o.r.root(o.c)?.state).toBe("paused");
+    expect(o.r.root(o.c)?.code).toBe(reason === "expired" ? "native_access_expired" : "login_required");
+    if (reason === "login_required") expect(o.recovering()).toBe(1);
+    expect(o.r.named("delivery_open")).toHaveLength(o.opened);
+  } finally { await o.c.close(); await o.r.controller.close(); }
 });
 // #1294 audit M-1: pi, omp and the Claude Code plugin stop through RootDelivery, which shuts the session down
 // (queued behind the start) before it closes: the shutdown itself ends the start's wire, and its release still runs.
