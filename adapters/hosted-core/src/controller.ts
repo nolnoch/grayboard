@@ -342,6 +342,9 @@ export class Controller<E extends Enrollment = Enrollment> {
     const wire = await this.wire(e, sessionID, stop && AbortSignal.any([AbortSignal.timeout(10_000), stop]));
     try { return await call(wire); } finally { await wire.close().catch(error => this.failure("wire_close", error)); }
   }
+  // A start's failure that only a sign-in (or, in static mode, a new run) fixes pauses its root, as the run loop's
+  // and restore's do (#1312); `expired`, a token the host rotates itself, isn't one.
+  private signedOut(error: unknown) { const e = this.expired(error); return e instanceof AccessExpired && e.reason !== "expired"; }
   // A 403 insufficient_scope needs a new sign-in exactly like an ended grant;
   // a refresh another process holds is retried, however deep the SDK wrapped it.
   private expired(error: unknown) {
@@ -393,6 +396,8 @@ export class Controller<E extends Enrollment = Enrollment> {
       // A drift during it (a guard saw the change) already said why every root paused.
       const what = this.port.approval ? (r.paused ? "Root approval unavailable" : "Root approval saved") : (r.paused ? "Root paused" : "Root enrolled");
       const stopped = this.stoppedBy(sessionID, error);
+      // Its message keeps what the enrollment did; the sign-out is its cause.
+      if (!stopped && this.signedOut(error)) r.paused = true;
       if (!this.drifted) this.set(r, r.paused ? "paused" : "approved", `${what}; ${stopped ? "stopped before delivery opened" : failureMessage(this.expired(error), this.hint)}`, bound ? "prepare" : "enroll", stopped ? undefined : failureCode(this.expired(error)));
     }
     await this.diagnostics.flush();
@@ -423,6 +428,7 @@ export class Controller<E extends Enrollment = Enrollment> {
         this.retryRestore(r);
       } else if (!this.drifted) {
         const stopped = this.stoppedBy(sessionID, error);
+        if (!stopped && this.signedOut(error)) r.paused = true;
         this.set(r, r.paused ? "paused" : "approved", stopped ? "Stopped before delivery opened" : failureMessage(error, this.hint), "enroll", stopped ? undefined : failureCode(error));
       }
     }
