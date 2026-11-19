@@ -96,6 +96,8 @@ test("the walk follows relative imports and skips type-only ones", () => {
   // The hosted group's interface (#807 P3 C8a) and its Postgres store and ports (C8b1), which restate core's session-end
   // and bindings SQL (or call the injected session end) and reach testpause.ts, which imports only node modules.
   expect(forbiddenReach([join(SRC, "server/store/hosted.ts")])).toEqual([]);
+  // The auth cache (#807 P3 C9a), which the Postgres Repo composes over its own generation source (C11).
+  expect(forbiddenReach([join(SRC, "server/store/auth_cache.ts")])).toEqual([]);
   for (const m of ["hosted.ts", "hosted_port.ts"]) expect(forbiddenReach([join(import.meta.dir, m)])).toEqual([]);
   expect(runtimeImports(`import type { X } from "../tx.ts";\nexport type { Y } from "../db.ts";`)).toEqual([]);
   expect(runtimeImports(`import {\n  a,\n  b,\n} from "../tx.ts";\nexport { c } from "./d.ts";\nimport "./e.ts";\nconst f = await import("../db.ts");`))
