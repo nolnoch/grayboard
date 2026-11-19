@@ -865,6 +865,22 @@ test.each(modes)("an unbound result from any tool rebinds the remembered name (%
   } finally { await r.controller.close(); }
 });
 
+// #1325 reverify: afterCall's delivery restart is one more start path. A native bind (whatever its status), or a tool
+// result that says unbound, restarts delivery through prepare; a sign-out there pauses the root rather than recording it approved.
+test.each(modes.flatMap(mode => (["bind", "dm_send"] as const).map(tool => [mode, tool] as const)))("afterCall's delivery restart pauses its root on a sign-out (#1325, %s, %s)", async (mode, tool) => {
+  const r = runtime(mode);
+  try {
+    await r.controller.enroll("R", ["be"], true);
+    await until(() => r.root(r.controller)?.state === "active");
+    const opens = r.named("delivery_open").length;
+    r.failWhoami(() => new AccessExpired("pi", "run /grayboard login", "login_required"));
+    const output = tool === "bind" ? { name: "be", ownership: r.rows.get("R")!.ownership, instructions: ["bound"] } : { unbound: true };
+    await r.controller.afterCall({ sessionID: "R", tool, result: { status: "completed", output } });
+    expect(r.root(r.controller)).toMatchObject({ state: "paused", operation: "after", code: "login_required" });
+    expect(r.named("delivery_open")).toHaveLength(opens);
+  } finally { await r.controller.close(); }
+});
+
 test.each(modes)("a receipt that fails once leaves the item admitted once and receipted on the next read (%s)", async mode => {
   const r = runtime(mode);
   try {

@@ -37660,8 +37660,11 @@ class Controller {
         }
         await this.rotated({ spent: 0 }, () => this.prepare(r, false));
       } catch (error) {
-        if (!this.drifted)
-          this.set(r, "approved", failureMessage(this.expired(error), this.hint), "after", failureCode(this.expired(error)));
+        if (this.drifted)
+          return;
+        if (this.signedOut(error))
+          r.paused = true;
+        this.set(r, r.paused ? "paused" : "approved", failureMessage(this.expired(error), this.hint), "after", failureCode(this.expired(error)));
       }
     });
   }

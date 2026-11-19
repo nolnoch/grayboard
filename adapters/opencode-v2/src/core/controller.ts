@@ -1001,7 +1001,12 @@ export class Controller<E extends Enrollment = Enrollment> {
           }
         }
         await this.rotated({ spent: 0 }, () => this.prepare(r, false));
-      } catch (error) { if (!this.drifted) this.set(r, "approved", failureMessage(this.expired(error), this.hint), "after", failureCode(this.expired(error))); }
+      } catch (error) {
+        if (this.drifted) return;
+        // A sign-out pauses the root, as every start's does (#1325).
+        if (this.signedOut(error)) r.paused = true;
+        this.set(r, r.paused ? "paused" : "approved", failureMessage(this.expired(error), this.hint), "after", failureCode(this.expired(error)));
+      }
     });
   }
   // A new top-level root binds the configured name; receiving still needs approval where the host keeps one.
