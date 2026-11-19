@@ -26,12 +26,13 @@ import { CallToolRequestSchema, ListToolsRequestSchema, type CallToolResult as S
 import type { CallToolResult } from "@modelcontextprotocol/client";
 import { channelParams } from "../../../adapters/hosted-core/src/channel.ts";
 import { HostedClient, message } from "../../../adapters/hosted-core/src/client.ts";
-import { Login, LoginFailed } from "../../../adapters/hosted-core/src/login.ts";
+import { Login, LoginFailed, type SignIn } from "../../../adapters/hosted-core/src/login.ts";
 import { accessExpiry } from "../../../adapters/hosted-core/src/model.ts";
 import * as signIns from "../../../adapters/hosted-core/src/offer.ts";
 import type { Flow, SignInState } from "../../../adapters/hosted-core/src/offer.ts";
 import { failure, hostTools, snapshotTools, type NativeTool } from "../../../adapters/hosted-core/src/proxy.ts";
 import { NotStarted, RootDelivery } from "../../../adapters/hosted-core/src/root.ts";
+import { NEW_RUN, StaticLogin, staticMode } from "../../../adapters/hosted-core/src/static.ts";
 import { CLAUDE_PLUGIN, claudeChannels, interactiveClaude, type ChannelsVerdict, type ClaudeFiles } from "../../../src/shared/claude_channels.ts";
 import { attachRoots } from "../../../src/shared/attachments.ts";
 import { dropCalled, dropSignIn, factReader, hasCalled, markCalled, ownDir, MISSING_TEXT, putSignIn, readFacts, sessionDir, takeCalled, takeEnded, takeRecord, TOOL_USE_META } from "../../../src/shared/claude_agents.ts";
@@ -92,10 +93,17 @@ export function pluginConfig(env: Record<string, string | undefined>): Config {
   if (!canonicalEndpoint(url)) return { error: `the grayboard plugin's server_url isn't canonical HTTPS (or HTTP loopback) without credentials, query or fragment; ${reconfigure}` };
   return { id, dataDir, url };
 }
+// Static mode (#1243) from the launcher's environment, refused when the
+// project's dotenv or `.claude/settings*.json` sets its variables: both reach
+// this process.
+// Both the project dir and cwd, when they differ: CLAUDE_PROJECT_DIR is itself an environment variable.
+export const pluginStaticMode = (env: Record<string, string | undefined>, cwd: string) => staticMode(env, cwd, [...(env.CLAUDE_PROJECT_DIR ? [env.CLAUDE_PROJECT_DIR] : []), cwd]);
+export const STATIC_LOGOUT = "This run uses a launcher-set grayboard run token: nothing to sign out here; the launcher revokes it.";
 export function createPlugin(o: PluginOptions): Plugin {
   const config = pluginConfig(o.env);
   const interactive = interactiveClaude(o.env, o.parentCmd);
-  const loginAction = interactive ? LOGIN_INTERACTIVE : LOGIN_ELSEWHERE;
+  const mode = "error" in config ? undefined : pluginStaticMode(o.env, o.cwd);
+  const loginAction = mode ? NEW_RUN : interactive ? LOGIN_INTERACTIVE : LOGIN_ELSEWHERE;
   // Unknown counts as off: a push Claude Code doesn't show would be receipted and lost.
   const verdict: ChannelsVerdict = claudeChannels({ env: o.env, parentCmd: o.parentCmd, entry: ENTRY, files: o.files });
   const push = verdict.state === "on";
@@ -132,7 +140,9 @@ export function createPlugin(o: PluginOptions): Plugin {
 
   // ---- sign-in ----
 
-  const login = "error" in config ? undefined : new Login({
+  const login: SignIn | undefined = "error" in config ? undefined
+    : mode ? new StaticLogin({ resource: config.url, clientId: CLIENT_ID, version: o.version, harness: HARNESS, mode })
+    : new Login({
     resource: config.url, clientId: CLIENT_ID, stateDir: config.dataDir, harness: HARNESS, loginAction,
     // Every grayboard call while the flow runs shows the URL under the call
     // (#497: Claude Code may never show the prompt, or show it only after the
@@ -248,7 +258,7 @@ export function createPlugin(o: PluginOptions): Plugin {
   // before the browser returns.
   const begin = (origin: "offer" | "startup"): Flow | undefined => {
     if (signins.flow) return signins.flow;
-    if (!login || !root || !interactive || closed || !initialized) return undefined;
+    if (!(login instanceof Login) || !root || !interactive || closed || !initialized) return undefined;
     const flow = signIns.start(signins, login, { origin, browser: false, ifSignedOut: true, ended: async (flow, outcome) => {
       const prompt = prompts.get(flow);
       try {
@@ -313,8 +323,9 @@ export function createPlugin(o: PluginOptions): Plugin {
   // Before each call: only a missing or expired sign-in offers one; a
   // transient failure (5xx, a refresh in progress) goes to the call, which
   // reports it.
+  // A static run offers no sign-in: its token is the launcher's to replace.
   const before = async (): Promise<string | undefined> =>
-    await signIns.offer(signins, login!, { interactive, begin: () => begin("offer"), notes }) ?? await unpause();
+    (mode ? undefined : await signIns.offer(signins, login!, { interactive, begin: () => begin("offer"), notes })) ?? await unpause();
 
   // ---- subagents (#551) ----
 
@@ -407,7 +418,7 @@ export function createPlugin(o: PluginOptions): Plugin {
       initialized = true;
       markInitialized();
       // A session without a grant offers the sign-in at once.
-      if (login && interactive) void login.token().catch(error => { if (accessExpiry(error)) begin("startup"); });
+      if (login && interactive && !mode) void login.token().catch(error => { if (accessExpiry(error)) begin("startup"); });
     };
     return s;
   };
@@ -425,6 +436,7 @@ export function createPlugin(o: PluginOptions): Plugin {
   // the declared delivery; Claude Code reads instructions only at initialize.
   const instructions = async (): Promise<string> => {
     if ("error" in config) return `Warning: grayboard is unavailable: ${config.error}. Tell the user.`;
+    if (mode && "refused" in mode) return `Warning: grayboard is unavailable: ${mode.refused}. Tell the user.`;
     let body: string;
     try {
       const text = await Promise.race([root!.instructions(), after(INSTRUCTIONS_MS).then(() => { throw new Error("timeout"); })]);

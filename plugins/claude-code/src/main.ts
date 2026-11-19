@@ -10,7 +10,7 @@ import { readJson } from "../../../adapters/hosted-core/src/storage.ts";
 import { hostFiles } from "../../../src/shared/claude_channels.ts";
 import { procStart } from "../../../src/shared/proc.ts";
 import { parentCommandLine } from "../../../src/shared/toolguard.ts";
-import { CLIENT_ID, createPlugin, HARNESS, LOGIN_INTERACTIVE } from "./plugin.ts";
+import { CLIENT_ID, createPlugin, HARNESS, LOGIN_INTERACTIVE, pluginStaticMode, STATIC_LOGOUT } from "./plugin.ts";
 
 const log = (message: string) => { process.stderr.write(`${message}\n`); };
 
@@ -18,6 +18,12 @@ async function logout(args: string[]): Promise<number> {
   const at = args.indexOf("--data");
   const dataDir = at >= 0 ? args[at + 1] : undefined;
   if (!dataDir) { log("grayboard logout: --data <plugin data dir> is required"); return 2; }
+  // A static run (or a refused one) never reads the grants: they are the
+  // person's whose machine the run borrowed, not the run's (#1243).
+  const mode = pluginStaticMode(process.env, process.cwd());
+  if (mode && !("refused" in mode)) { console.log(STATIC_LOGOUT); return 0; }
+  // A refused one (a repository's .env can cause it) mustn't read as signed out: the person's grants are live.
+  if (mode) { log(`grayboard logout: ${mode.refused}; no grant was signed out. Remove the static-mode variables from the environment (or the project's files) and run it again.`); return 1; }
   // The skill's shell carries no server URL, so every grant this plugin holds
   // signs out: each store names its own server.
   let names: string[];

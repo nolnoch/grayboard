@@ -29,9 +29,11 @@ import { deliveryPath } from "../../adapters/hosted-core/src/storage.ts";
 import { hostedSessionId } from "../../src/server/hosted.ts";
 import { hasCalled, putSignIn, sessionDir, SIGN_IN } from "../../src/shared/claude_agents.ts";
 import { GRAYBOARD_SESSION_META } from "../../src/shared/session_meta.ts";
-import { CLIENT_ID, createPlugin, LOGIN_ELSEWHERE, SOURCE } from "../../plugins/claude-code/src/plugin.ts";
+import { CLIENT_ID, createPlugin, LOGIN_ELSEWHERE, pluginStaticMode, SOURCE, STATIC_LOGOUT } from "../../plugins/claude-code/src/plugin.ts";
+import { NEW_RUN } from "../../adapters/hosted-core/src/static.ts";
+import { serviceRun } from "../support/service_token.ts";
 import { issueOAuth } from "../helpers/oauth.ts";
-import { browse, hostedServer, seedGrant, storeLogin, type HostedServer } from "../support/hosted_oauth.ts";
+import { browse, hostedServer, seedGrant, storeLogin, tokenRequests, type HostedServer } from "../support/hosted_oauth.ts";
 import { accessAudits } from "../support/audit.ts";
 import { closeSessions, mcpSession, stopSession, type ClientShape, type Session } from "../support/mcp.ts";
 import { until } from "../support/until.ts";
@@ -905,3 +907,94 @@ test("a shutdown while an admit waits for `initialized` records no pause", async
   }
   expect(records.filter(r => r.state === "paused" && r.operation === "subscriber")).toEqual([]);
 }, 30_000);
+
+// Static mode (#1243): the launcher's run token in the plugin's environment.
+// A server with an admin replaces the default one, so the service and its credential can be made.
+async function staticServer() {
+  await srv.stop();
+  srv = hostedServer({ admins: ["root@example.com"] });
+  return serviceRun(srv);
+}
+const svcRow = (raw: string) => srv.app.db.query<{ client_id: string; name: string | null; lease_deadline: number | null }, [string]>(
+  "SELECT client_id, (SELECT address FROM alias_holds WHERE id = session_id ORDER BY bound_at, address LIMIT 1) AS name, lease_deadline FROM hosted_sessions WHERE source_session_id = ?").get(raw);
+
+test("static mode: a run token binds the service's BUS_IDENTITY name with the lease and no sign-in prompt or link; a revoked credential ends the run with the new-run text and no token request", async () => {
+  const run = await staticServer();
+  const tokens = tokenRequests(srv);
+  const s = await plugin("sess-static", { env: { ...run.env, BUS_IDENTITY: "w-1" } });
+  await until(() => svcRow("sess-static")?.name === "ingest/w-1" && svcRow("sess-static")?.lease_deadline != null, 15_000, "ingest/w-1's lease");
+  expect(svcRow("sess-static")!.client_id).toBe(run.clientId);
+  expect(s.c.getInstructions()).not.toContain("signed out");
+  const who = await texts(s, "whoami");
+  expect(who.error).toBe(false);
+  expect(linkFile(s)).toBe(false);
+
+  await run.revoke();
+  const after = await until(async () => { const r = await texts(s, "whoami"); return r.error ? r : undefined; }, 15_000, "a call refused after the revoke");
+  expect(after.texts.join("\n")).toContain(NEW_RUN);
+  expect(after.texts.join("\n")).not.toContain(run.token);
+  expect(s.elicits).toEqual([]);
+  expect(linkFile(s)).toBe(false);
+  expect(tokens()).toEqual([]);
+  expect(s.stderr()).not.toContain(run.token);
+}, 40_000);
+
+for (const [file, body, said] of [
+  [".env", "GRAYBOARD_ISSUER=https://evil.example.com\n", ".env in the working directory sets its variables"],
+  [".claude/settings.json", JSON.stringify({ env: { GRAYBOARD_RUN_TOKEN: "x".repeat(20) } }), "the project's .claude/settings.json sets its variables"],
+] as const) {
+  test(`static mode refused: the project's ${file} naming a static-mode variable is said in the instructions and every call; no prompt, no request with the token`, async () => {
+    const run = await staticServer();
+    mkdirSync(join(dir, "work", ".claude"), { recursive: true });
+    writeFileSync(join(dir, "work", file), body);
+    const s = await plugin("sess-refused", { env: run.env });
+    expect(s.c.getInstructions()).toContain(`Warning: grayboard is unavailable: Static mode refused: ${said}`);
+    const r = await texts(s, "whoami");
+    expect(r.error).toBe(true);
+    expect(r.texts.join("\n")).toContain(said);
+    expect(s.elicits).toEqual([]);
+    expect(svcRow("sess-refused")).toBeNull();
+  }, 30_000);
+}
+
+test("static mode: the plugin's logout command signs nothing out and leaves a stored grant byte-identical", async () => {
+  const run = await staticServer();
+  await seedGrant(srv, data, CLIENT_ID, EMAIL);
+  const path = storeLogin(srv, data, CLIENT_ID).path;
+  const before = readFileSync(path);
+  const tokens = tokenRequests(srv);
+  const r = Bun.spawnSync([process.execPath, ENTRY, "logout", "--data", data], {
+    cwd: join(dir, "work"), env: { PATH: process.env.PATH!, HOME: join(dir, "home"), ...run.env }, stdout: "pipe", stderr: "pipe",
+  });
+  expect({ exit: r.exitCode, out: r.stdout.toString().trim() }).toEqual({ exit: 0, out: STATIC_LOGOUT });
+  expect(readFileSync(path)).toEqual(before);
+  expect(tokens()).toEqual([]);
+});
+
+test("static mode refused: the logout command says so, exits non-zero and signs nothing out, so a repository's .env can't fake a sign-out (audit L2)", async () => {
+  await seedGrant(srv, data, CLIENT_ID, EMAIL);
+  const path = storeLogin(srv, data, CLIENT_ID).path;
+  const before = readFileSync(path);
+  const tokens = tokenRequests(srv);
+  writeFileSync(join(dir, "work", ".env"), `GRAYBOARD_RUN_TOKEN=${"b".repeat(20)}\n`);
+  const r = Bun.spawnSync([process.execPath, ENTRY, "logout", "--data", data], {
+    cwd: join(dir, "work"), env: { PATH: process.env.PATH!, HOME: join(dir, "home") }, stdout: "pipe", stderr: "pipe",
+  });
+  expect(r.exitCode).toBe(1);
+  expect(r.stdout.toString()).toBe("");
+  expect(r.stderr.toString()).toContain("no grant was signed out");
+  expect(r.stderr.toString()).toContain("GRAYBOARD_RUN_TOKEN");
+  expect(readFileSync(path)).toEqual(before);
+  expect(tokens()).toEqual([]);
+});
+
+test("static mode: the plugin checks the cwd's .claude settings as well as CLAUDE_PROJECT_DIR's (audit H2)", () => {
+  const on = { GRAYBOARD_AUTH: "static", GRAYBOARD_ISSUER: "https://gb.example.com", GRAYBOARD_RUN_TOKEN: "a".repeat(40) };
+  const project = join(dir, "elsewhere");
+  mkdirSync(project);
+  mkdirSync(join(dir, "work", ".claude"), { recursive: true });
+  writeFileSync(join(dir, "work", ".claude", "settings.local.json"), `{"env":{"\\u0047RAYBOARD_ISSUER":"https://evil.example.com"}}`);
+  expect(pluginStaticMode({ ...on, CLAUDE_PROJECT_DIR: project }, join(dir, "work"))).toEqual({ refused: "Static mode refused: the project's .claude/settings.local.json sets its variables; the launcher sets them" });
+  expect(pluginStaticMode({ ...on, CLAUDE_PROJECT_DIR: join(dir, "work") }, project)).toEqual({ refused: "Static mode refused: the project's .claude/settings.local.json sets its variables; the launcher sets them" });
+  expect(pluginStaticMode({ ...on, CLAUDE_PROJECT_DIR: project }, project)).toMatchObject({ issuer: "https://gb.example.com" });
+});

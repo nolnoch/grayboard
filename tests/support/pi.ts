@@ -28,7 +28,7 @@ import { runCli } from "./cli.ts";
 import { mintSessionKey } from "../../src/core/bindings.ts";
 import { adapterChildren, grayboardChildren, grayboardChildPids, grayboardDescendants, processDescendants, sigkill, STOP_READING } from "./procs.ts";
 import { until } from "./until.ts";
-import { hostedCarryScenario, hostedRefreshLogoutScenario, loginNotice, named, withHosted, type HostedHarness } from "./hosted_harness.ts";
+import { hostedCarryScenario, hostedRefreshLogoutScenario, hostedStaticScenario, loginNotice, named, withHosted, type HostedHarness } from "./hosted_harness.ts";
 
 const ADAPTER = join(ROOT, "adapters/pi/grayboard.ts");
 const PI_PKG = join(ROOT, "node_modules/@earendil-works/pi-coding-agent/package.json");
@@ -1194,13 +1194,13 @@ function installHosted(dir: string, srv: HostedServer, modelPort: number): void 
 
 // `persist` keeps pi's session files (/fork, /new, /resume need them);
 // `session` opens one of them.
-function startHostedPi(dir: string, procs: ChildProcess[], { persist = false, session }: { persist?: boolean; session?: string } = {}): Pi {
+function startHostedPi(dir: string, procs: ChildProcess[], { persist = false, session, env = {} }: { persist?: boolean; session?: string; env?: Record<string, string> } = {}): Pi {
   const agentDir = agentDirOf(dir);
   const proc = spawn("node", [PI_CLI, ...PI_ARGS, ...(persist ? [] : ["--no-session"]), ...(session ? ["--session", session] : [])], {
     cwd: dir,
     env: cleanEnv({
       HOME: join(dir, "home"), GRAYBOARD_ATTACHMENTS_DIR: join(dir, "saved"), PATH: `${join(dir, "bin")}${delimiter}${process.env.PATH}`,
-      PI_CODING_AGENT_DIR: agentDir, PI_SKIP_VERSION_CHECK: "1", PI_TELEMETRY: "0",
+      PI_CODING_AGENT_DIR: agentDir, PI_SKIP_VERSION_CHECK: "1", PI_TELEMETRY: "0", ...env,
     }),
     stdio: ["pipe", "pipe", "pipe"],
   });
@@ -1238,6 +1238,27 @@ export async function hostedPeer(srv: HostedServer, dir: string): Promise<Peer> 
     await repo.teams.addMember(tx, team.id, bob.id);
     await repo.teams.setPolicy(tx, team.id, "collaborative");
   });
+  return { dir: home, reports, call, close: () => proxy.close() };
+}
+
+// A tool client on `token` (a service's run token, #1243) bound as `name`.
+export async function tokenPeer(srv: HostedServer, dir: string, token: string, name: string): Promise<Peer> {
+  const home = join(dir, `peer-${name}`);
+  mkdirSync(home, { recursive: true });
+  const reports: string[] = [];
+  const proxy = new ToolProxy({
+    wire: { url: srv.resource, sessionKey: GRAYBOARD_SESSION_META, client: { name: "grayboard-omp", version: "1.0.0" }, delivery: { mode: "poll", source: "grayboard" } },
+    harness: "omp", loginAction: "start a new run", auth: { token: async () => token },
+    roots: attachRoots({ BUS_ATTACH_ROOTS: home }, home), env: { GRAYBOARD_ATTACHMENTS_DIR: join(home, "saved") },
+    report: (operation, error) => { reports.push(`${operation}: ${String(error)}`); },
+  });
+  const call = async (tool: string, args: Record<string, unknown> = {}) => {
+    const result = await proxy.call(tool, args, `peer-${name}`);
+    const text = result.content.map((b) => (b.type === "text" ? b.text : "")).join("");
+    if (result.isError) throw new Error(`peer ${tool}: ${text}`);
+    return result.structuredContent ?? JSON.parse(text);
+  };
+  await call("bind", { name, create: true });
   return { dir: home, reports, call, close: () => proxy.close() };
 }
 
@@ -1517,6 +1538,7 @@ export function piHostedScenario(dir: string): Promise<void> {
 export const piHostedCarryScenario = (dir: string): Promise<void> => hostedCarryScenario(PI_HARNESS, dir);
 
 export const piHostedRefreshLogoutScenario = (dir: string): Promise<void> => hostedRefreshLogoutScenario(PI_HARNESS, dir);
+export const piHostedStaticScenario = (dir: string): Promise<void> => hostedStaticScenario(PI_HARNESS, dir);
 
 // The same session opened in a second pi process: it runs tools only behind
 // the first's delivery lock (its status and first tool result say so) and the
