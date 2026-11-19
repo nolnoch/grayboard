@@ -15,13 +15,15 @@
 //   refused call wrote. So does every statement whose 23505 is control flow (teams.create, services.create, the
 //   sign-in link), and the savepoint covers errors rethrown unmapped too: a raw error there would abort the caller's
 //   whole transaction.
-// - users.setDisabled and sessions.revokeAllForUser port with the hosted and OAuth stores (C8); users.isDisabled and
-//   users.active with the auth cache (C9).
+// - users.setDisabled and sessions.revokeAllForUser (C4b) end the user's OAuth rows and, through the injected hosted
+//   port (C8 fills it), their hosted sessions. Each locks the users row first, setDisabled by its UPDATE and
+//   revokeAllForUser by FOR NO KEY UPDATE, against every OAuth mint's FOR SHARE on it (pg/oauth.ts activeUser): a
+//   mint that read the user as enabled commits first and the revoke's later statements see its row, or it waits and
+//   finds the user disabled. users.isDisabled and users.active port with the auth cache (C9).
 //
 // Runtime imports stay off bun:sqlite and db.ts (pg/isolation.test.ts).
 import { addressParts } from "../../../core/addresses.ts";
 import type { Principal } from "../../../core/resolver.ts";
-import { requestOrigin } from "../../request_context.ts";
 import { AuthorityLost, LastOwner, PrincipalTaken } from "../errors.ts";
 import {
   DEV_SESSION_LABEL, TEAM_POLICIES,
@@ -29,8 +31,10 @@ import {
   type Session, type Team, type TeamMember, type TeamPolicy, type User,
 } from "../identity.ts";
 import type { Read, Tx } from "../tx_base.ts";
+import { insertAudit } from "./audit_row.ts";
 import { principalTaken, SERVICE_NAME_CONSTRAINTS, uniqueViolation } from "./errors.ts";
-import { int8, int8OrNull, type AuditDetail } from "./sql.ts";
+import type { PgHostedEnds } from "./hosted_port.ts";
+import { int8, int8OrNull } from "./sql.ts";
 import { pgOf, type PgFragment, type PgSql } from "./tx.ts";
 
 // pg_advisory_xact_lock's key for every role-binding write (#807 P3 C3 decision 1). One key serializes role writes
@@ -104,19 +108,24 @@ const bindingDetail = (b: RoleBinding) => ({
   granted_by: b.granted_by, granter: b.granter, granted_at: b.granted_at,
 });
 
-// An access_log row stamped with the request's origin (db.ts insertAudit). `detail` is the object itself: a string
-// bound to jsonb is stored as a JSON string, which every `detail->>` read misses, and a top-level scalar fails or
-// stores SQL NULL (AuditDetail refuses all three).
-async function insertAudit(sql: PgSql, at: number, actor: string | null, action: string, target: string | null, detail: AuditDetail): Promise<void> {
-  const o = requestOrigin();
-  await sql`INSERT INTO access_log (at, actor, action, target, detail, ip, ua, client_id)
-    VALUES (${at}, ${actor}, ${action}, ${target}, ${detail}, ${o?.ip ?? null}, ${o?.ua ?? null}, ${o?.client_id ?? null})`;
-}
-
 // A sign-in attempt's lost conditional link: thrown inside the attempt's savepoint so nothing the attempt wrote stays.
 class LostLink extends Error {}
 
-export function makePgIdentity({ now }: { now: () => number }): PgIdentity {
+export function makePgIdentity({ now, hosted }: { now: () => number; hosted: PgHostedEnds }): PgIdentity {
+  // What a disable and a revoke-all both end (db.ts setDisabled, revokeAllForUser): the CLI sessions, the OAuth grants,
+  // then the hosted sessions, and the unredeemed codes; a disable also the browser sessions. The users row is already
+  // locked (see the header), so each statement here sees every row a concurrent mint for the user committed.
+  const revokeUser = async (tx: Tx, userId: number, reason: "revoked" | "disabled", at: number) => {
+    const sql = pgOf(tx);
+    // CLI tokens too, so enable-user doesn't revive them (security audit F-14).
+    await sql`UPDATE sessions SET revoked_at = ${at} WHERE user_id = ${userId} AND revoked_at IS NULL`;
+    await sql`UPDATE oauth_grants SET revoked_at = ${at} WHERE user_id = ${userId} AND revoked_at IS NULL`;
+    // After the grants' revoke, as revokeGrant orders its own end (hosted_port.ts: the lock order).
+    await hosted.endForUser(tx, userId, reason, at);
+    if (reason === "disabled") await sql`DELETE FROM oauth_browsers WHERE user_id = ${userId}`;
+    await sql`DELETE FROM oauth_codes WHERE user_id = ${userId} AND grant_id IS NULL`;
+  };
+
   // A user row by email, created or renamed, with its principal (db.ts upsertUser). In a savepoint: the PrincipalTaken
   // for a service's name comes after the rename, so a caller that catches it commits no rename. That's the store's
   // guarantee; no caller catches it today (devLogin and the sign-in's new user propagate it). Three statements, not one
@@ -227,6 +236,13 @@ export function makePgIdentity({ now }: { now: () => number }): PgIdentity {
       },
       findByEmail: (r, email) => userByEmail(pgOf(r), email),
       findById: (r, userId) => userById(pgOf(r), userId),
+      // The UPDATE is the users row's lock: it waits for a mint holding FOR SHARE, and a mint after it waits, then finds
+      // the user disabled. Re-enabling revives nothing the disable revoked.
+      async setDisabled(tx, userId, disabled) {
+        const at = now();
+        await pgOf(tx)`UPDATE users SET disabled_at = ${disabled ? at : null} WHERE id = ${userId}`;
+        if (disabled) await revokeUser(tx, userId, "disabled", at);
+      },
     },
 
     sessions: {
@@ -241,6 +257,13 @@ export function makePgIdentity({ now }: { now: () => number }): PgIdentity {
       findById: (r, sessionId) => first(pgOf(r)`SELECT * FROM sessions WHERE id = ${sessionId}`, toSession),
       async revoke(tx, sessionId) {
         await pgOf(tx)`UPDATE sessions SET revoked_at = ${now()} WHERE id = ${sessionId}`;
+      },
+      // Writes no users row, so it locks it: FOR NO KEY UPDATE conflicts with a mint's FOR SHARE (a plain FK insert's
+      // KEY SHARE would not), so a CLI session, grant or code minted concurrently is either committed and revoked here
+      // or minted after this commits.
+      async revokeAllForUser(tx, userId) {
+        await pgOf(tx)`SELECT 1 FROM users WHERE id = ${userId} FOR NO KEY UPDATE`;
+        await revokeUser(tx, userId, "revoked", now());
       },
       async revokeDev(tx) {
         return (await pgOf(tx)`UPDATE sessions SET revoked_at = ${now()} WHERE label = ${DEV_SESSION_LABEL} AND revoked_at IS NULL RETURNING 1`).length;

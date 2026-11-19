@@ -2307,8 +2307,8 @@ function oauthOps(db: Database, hosted: HostedStoreOf): OAuthOps {
   // Whether the user exists and is enabled (and, for `service`, is a service principal). `lock` is true in every write
   // that mints for the user (a grant, a code, a browser session, a CLI session, a credential): on Postgres that read
   // takes FOR SHARE on the users row, so a concurrent disable or revoke-all waits for the mint and then sees its row
-  // (C4b adds that form to postgres-server.md D3). SQLite's single writer already orders the two, so here it only
-  // names the call sites.
+  // (postgres-server.md D3, the disable and revoke-all row; src/server/store/pg/oauth.ts). SQLite's single writer
+  // already orders the two, so here it only names the call sites.
   const activeUser = (id: number, lock: boolean, kind: "service" | null = null) => {
     void lock;
     return !!(kind === "service"
@@ -2587,7 +2587,7 @@ function oauthOps(db: Database, hosted: HostedStoreOf): OAuthOps {
       if (!time(now)) throw new RangeError("invalid OAuth cutover time");
       return db.transaction(() => {
         // The key is claimed first: a second run, or on Postgres a second pod booting at once, finds it taken and returns
-        // 0 without revoking or auditing anything (C4b adds this form to postgres-server.md D3, with its two-boot row).
+        // 0 without revoking or auditing anything (postgres-server.md D3, the boot cutover row; pg/oauth.pg.test.ts T-C4-10).
         // Its value is the time of the first run.
         if (!db.query("INSERT INTO server_state(key, value) VALUES (?, ?) ON CONFLICT(key) DO NOTHING RETURNING key").get(key, now)) return 0;
         const ids = JSON.stringify(clientIds);
@@ -2637,7 +2637,8 @@ function oauthOps(db: Database, hosted: HostedStoreOf): OAuthOps {
       return db.transaction(() => {
         const c = liveCredential(clientId, now);
         if (!c) return missing;
-        // At most two live secrets (D2), counted in the insert: on Postgres, after the credential row FOR UPDATE (D3).
+        // At most two live secrets (D2), counted in the insert: on Postgres, after the credential's secrets advisory lock
+        // (postgres-server.md D3, the OAuth caps row).
         const secret = db.query<{ id: number }, [number, string, number, number]>(`INSERT INTO service_credential_secrets(credential_id, hash, created_at)
           SELECT ?1, ?2, ?3 WHERE (SELECT COUNT(*) FROM service_credential_secrets WHERE credential_id = ?1 AND revoked_at IS NULL) < ?4
           RETURNING id`).get(c.id, secretHash, now, LIVE_SECRETS);
@@ -2682,8 +2683,9 @@ function oauthOps(db: Database, hosted: HostedStoreOf): OAuthOps {
       return db.transaction(() => {
         // One INSERT … SELECT: the credential, its grant, the secret and the service all live, the bucket (mints in the
         // last minute, revoked ones included) and the cap (unexpired, unrevoked tokens) unspent. That holds under
-        // SQLite's single writer; at Postgres's READ COMMITTED the counts and the secret check need the credential row
-        // FOR UPDATE first, as rotate and both revokes do (postgres-server.md D3).
+        // SQLite's single writer; at Postgres's READ COMMITTED the counts need the credential's mint advisory lock first,
+        // and a token minted past a secret's revoke is refused by findActiveAccess's secret join (postgres-server.md D3,
+        // the OAuth caps row).
         // The expiry is the credential's lifetime, clamped to the ceiling and to the grant's expiry.
         const row = db.query<{ expires_at: number }, [string, number, number, string, string, number, number, number, number]>(`
           INSERT INTO oauth_tokens(hash, grant_id, kind, expires_at, created_at, access_scopes, secret_id)

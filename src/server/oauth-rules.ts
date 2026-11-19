@@ -1,7 +1,7 @@
 // The OAuth store's input rules (#807 P3 C4a): the pure checks an OAuthStore backend runs before it touches a row,
-// the whitelists of what it stores, and the capacity limits its counts are held to. One copy, imported today by the
-// SQLite store (db.ts oauthOps); C4b's Postgres store adds the second import. A check missing from both backends is one
-// no contract row can catch, and two copies drift.
+// the whitelists of what it stores, and the capacity limits its counts are held to. One copy, imported by both stores
+// (db.ts oauthOps, store/pg/oauth.ts). A check missing from both backends is one no contract row can catch, and two
+// copies drift.
 // What stays in each backend's SQL, because it reads rows the statement itself locks or writes: user, grant, token and
 // secret liveness (the joins), the counts the limits below bound, and a run token's expiry clamp (mintServiceToken
 // computes it from the credential row inside its INSERT ... SELECT, so the clamp and the bucket see one snapshot).

@@ -1,6 +1,6 @@
 // The OAuth store's contract (#807 P3 C4, docs/future/postgres-server.md D9): every OAuthStore method, written once over
-// a harness so SQLite runs it today and the Postgres store (C4b) runs the same rows. Not a *.test.ts file, so Bun
-// doesn't discover it: a backend's test file registers it under a describe() (oauth-store.test.ts for SQLite).
+// a harness so both stores run the same rows. Not a *.test.ts file, so Bun doesn't discover it: a backend's test file
+// registers it under a describe() (oauth-store.test.ts for SQLite, pg/oauth.contract.pg.test.ts for Postgres).
 //
 // Portability rules the rows follow:
 // - Each row opens a fresh store and asserts no absolute id: ids are compared to the rows the row itself made.

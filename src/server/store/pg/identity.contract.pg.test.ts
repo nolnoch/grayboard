@@ -4,6 +4,7 @@
 // (tests/support/pg.ts).
 import { describePg, pgDatabase } from "../../../../tests/support/pg.ts";
 import { identityContract, type IdentityBackend, type IdentityStore } from "../identity.contract.ts";
+import { noHosted } from "./hosted_port.ts";
 import { makePgIdentity } from "./identity.ts";
 import { int8OrNull } from "./sql.ts";
 import { makePgTransactions } from "./tx.ts";
@@ -13,7 +14,7 @@ const pgIdentityBackend: IdentityBackend = {
   async open(): Promise<IdentityStore> {
     const db = await pgDatabase({ max: 2 });
     const s = makePgTransactions(db.url, { max: 4, applicationName: "gb-test-identity" });
-    const g = makePgIdentity({ now: Date.now });
+    const g = makePgIdentity({ now: Date.now, hosted: noHosted });
     // Fixture writes and raw reads on the database's own read-write pool, each its own transaction.
     const sql = db.sql;
     return {

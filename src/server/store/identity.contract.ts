@@ -12,7 +12,8 @@
 // - An error the store doesn't map is matched by a phrase both backends' messages carry (/unique/i, /foreign key/i).
 // - Fixture writes the groups don't offer (a disabled user, a pre-F-13 issuer-only row, a session's ids row, a
 //   policy no setter writes) and the raw reads (principal rows, audit rows) are the harness's, so no row touches a
-//   connection. users.setDisabled isn't used: Postgres ports it with the hosted store (C8).
+//   connection. users.setDisabled isn't used here: what it ends is OAuth state, so oauth.contract.ts covers it and
+//   sessions.revokeAllForUser on both backends.
 // - Rows that force an interleaving with a SQLite trigger are registered on SQLite only (`sqliteOnly`), with their
 //   reason. Postgres runs each as a two-connection race in pg/identity.pg.test.ts: T-C3-6 for the teams.create name
 //   race, T-C3-5b for the sign-in link race below.

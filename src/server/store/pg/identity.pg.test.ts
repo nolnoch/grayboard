@@ -10,6 +10,7 @@ import { grantRole, revokeRole, type Granter, type RoleSpec, type RoleStores } f
 import { AuthorityLost, LastOwner, PrincipalTaken } from "../errors.ts";
 import type { MemberAuthority, User } from "../identity.ts";
 import type { Tx } from "../tx_base.ts";
+import { noHosted } from "./hosted_port.ts";
 import { makePgIdentity, ROLE_WRITE_LOCK, type PgIdentity } from "./identity.ts";
 import { makePgTransactions, pgOf, TxAborted, type PgTransactions } from "./tx.ts";
 
@@ -25,7 +26,7 @@ async function pair(): Promise<Pair> {
   const a = makePgTransactions(db.url, { max: 2, applicationName: "gb-test-a" });
   const b = makePgTransactions(db.url, { max: 2, applicationName: "gb-test-b" });
   return {
-    db, a, b, g: makePgIdentity({ now: Date.now }),
+    db, a, b, g: makePgIdentity({ now: Date.now, hosted: noHosted }),
     async [Symbol.asyncDispose]() { await a.close(); await b.close(); await db[Symbol.asyncDispose](); },
   };
 }
