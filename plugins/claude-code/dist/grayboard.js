@@ -37505,12 +37505,14 @@ class Controller {
               expired = true;
               return false;
             }
-            if (!this.port.approval)
+            if (!this.port.approval) {
+              if (this.signedOut(error))
+                r.paused = true;
               this.set(r, r.paused ? "paused" : "approved", failureMessage(error, this.hint), "enroll", failureCode(error));
-            else {
+            } else {
               r.paused = true;
               await this.stop(r);
-              this.set(r, "degraded", `Saved root unavailable; approval retained, ${this.hint}`, "restore");
+              this.set(r, "degraded", `Saved root unavailable (${failureCode(error)}); approval retained, ${this.hint}`, "restore", failureCode(error));
             }
             return true;
           }

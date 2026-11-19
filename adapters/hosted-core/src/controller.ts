@@ -862,9 +862,11 @@ export class Controller<E extends Enrollment = Enrollment> {
               return false;
             }
             // A resumed root with no saved approval (pi, omp, Claude Code) ends as its
-            // resume would have without the outage: unpaused, with the cause (#895).
-            if (!this.port.approval) this.set(r, r.paused ? "paused" : "approved", failureMessage(error, this.hint), "enroll", failureCode(error));
-            else { r.paused = true; await this.stop(r); this.set(r, "degraded", `Saved root unavailable; approval retained, ${this.hint}`, "restore"); }
+            // resume would have without the outage: unpaused unless signed out, with the cause (#895, #1325).
+            if (!this.port.approval) {
+              if (this.signedOut(error)) r.paused = true;
+              this.set(r, r.paused ? "paused" : "approved", failureMessage(error, this.hint), "enroll", failureCode(error));
+            } else { r.paused = true; await this.stop(r); this.set(r, "degraded", `Saved root unavailable (${failureCode(error)}); approval retained, ${this.hint}`, "restore", failureCode(error)); }
             return true;
           }
         });

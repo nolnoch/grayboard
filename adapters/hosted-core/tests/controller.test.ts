@@ -331,6 +331,36 @@ test.each(modes)("a resume's outage retry that comes back to a refused name ends
     }
   } finally { await restarted.close(); }
 });
+// #1325 audit M-1: the server back, the resume's outage retry draws a 401 on prepare's whoami. A sign-out pauses the root,
+// as every start path's does: a root without a saved approval records it paused with the cause, an approval host's
+// saved root degrades with the cause's code (as its restore does). `expired` retries until the host rotates it.
+test.each(modes.flatMap(mode => (["expired", "login_required"] as const).map(reason => [mode, reason] as const)))("a resume's outage retry that comes back to AccessExpired pauses only on a sign-out (#1325, %s, %s)", async (mode, reason) => {
+  const r = runtime(mode);
+  await r.controller.enroll("R", ["be"], true);
+  await until(() => r.root(r.controller)?.state === "active");
+  await r.controller.close();
+  r.rows.delete("R");
+  const down = Promise.reject(new ServerUnreachable(new Error("down")));
+  down.catch(() => {});
+  r.holdPrepare(down);
+  let waits = 0;
+  const restarted: Controller = r.make({ wait: async () => {
+    if (++waits === 1) { r.holdPrepare(Promise.resolve()); r.failWhoami(() => new AccessExpired("pi", "run /grayboard login", reason)); }
+  } });
+  try {
+    await restarted.resume("R");
+    expect(r.root(restarted)?.state).toBe("retrying");
+    if (reason === "expired") {
+      await until(() => r.root(restarted)?.state === "active");
+      expect(waits).toBe(2);
+    } else {
+      await until(() => r.root(restarted)?.state !== "retrying");
+      expect(r.root(restarted)).toMatchObject(mode === "approval" ? { state: "degraded", operation: "restore", code: "login_required" } : { state: "paused", operation: "enroll", code: "login_required" });
+      expect(waits).toBe(1);
+      expect(r.named("delivery_open")).toHaveLength(1);
+    }
+  } finally { await restarted.close(); }
+});
 // Several processes sharing one grant store restart during an upgrade: one holds the refresh lock while the
 // server is slow, and the others' prepares find the refresh in progress. They retry, as the run loop does.
 test.each(modes)("a resume that finds the token refresh in another process retries on the outage backoff (#895, %s)", async mode => {
