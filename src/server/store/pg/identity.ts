@@ -16,7 +16,7 @@
 //   sign-in link), and the savepoint covers errors rethrown unmapped too: a raw error there would abort the caller's
 //   whole transaction.
 // - users.setDisabled and sessions.revokeAllForUser (C4b) end the user's OAuth rows and, through the injected hosted
-//   port (C8 fills it), their hosted sessions. Each locks the users row first, setDisabled by its UPDATE and
+//   port (makePgHostedEnds), their hosted sessions. Each locks the users row first, setDisabled by its UPDATE and
 //   revokeAllForUser by FOR NO KEY UPDATE, against every OAuth mint's FOR SHARE on it (pg/oauth.ts activeUser): a
 //   mint that read the user as enabled commits first and the revoke's later statements see its row, or it waits and
 //   finds the user disabled. users.isDisabled and users.active port with the auth cache (C9).

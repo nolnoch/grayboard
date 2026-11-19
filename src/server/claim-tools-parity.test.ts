@@ -101,7 +101,8 @@ beforeEach(async () => {
     OPSQ_QUIET = opsq("more ops work", "eng/idle");
     core.prepare(`UPDATE claims SET expires_at = 2 WHERE key = ?`).run(`queue:opsq:${OPSQ_QUIET}`);
     OPSQ_LIVE = opsq("live ops work", ENG_ID);
-    core.prepare(`INSERT INTO claim_watches (key, handle) VALUES (?, ?)`).run(`queue:opsq:${OPSQ_LIVE}`, `${E}/be`);
+    // eve sees ops; dan doesn't, so a reply may cc him but never tells him (#1306).
+    core.prepare(`INSERT INTO claim_watches (key, handle) VALUES (?, ?), (?, ?)`).run(`queue:opsq:${OPSQ_LIVE}`, `${E}/be`, `queue:opsq:${OPSQ_LIVE}`, `${D}/be`);
   });
   T1 = Date.now();
   while (Date.now() <= T1) { /* the next millisecond */ }
@@ -261,7 +262,7 @@ test("claim_take, claim_release and claim_watch give core's answers and leave it
   const declined = call("wade's eng-bound", "claim_release", { key: `queue:opsq:${OPSQ_LIVE}`, note: "secret" });
   const reply = (declined.rows.posts as { body: string; author_user: string | null; author_id: string | null; parent_id: number | null }[]).find(p => p.body.startsWith(`[unclaimed] queue:opsq:${OPSQ_LIVE}:`));
   expect(reply).toMatchObject({ author_user: W, author_id: null, parent_id: OPSQ_LIVE });
-  expect(reply!.body).toEndWith(` cc @${E}/be`);
+  expect(reply!.body).toEndWith(` cc @${D}/be @${E}/be`);
   expect(JSON.stringify(declined.rows.posts)).not.toContain("secret");
   expect(declined.out.value!.result).toBe(`released queue:opsq:${OPSQ_LIVE}`);
   // Watches: on, off, own, no board, a hidden board, absent.
@@ -288,6 +289,29 @@ test("a release posted for the claimant's user runs no caller hook; a holder's o
   expect(out.out).toBe("released ticket:confined-live");
   expect(out.rows.posts.map(p => p.body)).toContain(`[release] ticket:confined-live cc @${E}/be`);
   expect(hooked).toEqual([`${W}/be general`]);
+});
+
+// #1306: the server's ID end is core's endSession, whose release passes the ended session as ctx into core requeue.
+// Its [unclaimed] reply to the ops queue post is the one the port's decline posts: for wade, with no session, no note,
+// cc'ing dan, who can't see ops, but telling only eve, who can.
+test("a session end's requeue of a confined holder's queue post replies as the port's decline does", async () => {
+  const access = boardAccess(repo);
+  type Reply = { id: number; body: string; author: string; author_user: string | null; author_id: string | null; parent_id: number | null };
+  type R = { rows: { posts: Reply[]; outbox: { post_id: number; handle: string }[]; claims: { key: string }[] } };
+  const reply = (r: R) => {
+    const p = r.rows.posts.find(x => x.body.startsWith(`[unclaimed] queue:opsq:${OPSQ_LIVE}:`));
+    if (!p) throw new Error(`no [unclaimed] reply to ${OPSQ_LIVE}`);
+    const { id, ...rest } = p;
+    return { ...rest, told: r.rows.outbox.filter(o => o.post_id === id).map(o => o.handle) };
+  };
+  const ended = await inBody(tx => repo.sessionEnd.end(tx, ENG_ID, { why: "test", now: Date.now() })) as R;
+  const engBound: ToolContext = { user: W, addresses: ["eng/build", ENG_ID], session: ENG_ID };
+  const declined = await inBody(tx => callClaimTool(repo, access, tx, "eng/build", "claim_release", { key: `queue:opsq:${OPSQ_LIVE}` }, engBound)) as R;
+  expect(ended.rows.claims.map(c => c.key)).not.toContain(`queue:opsq:${OPSQ_LIVE}`);
+  expect(reply(ended)).toEqual(reply(declined));
+  expect(reply(ended)).toMatchObject({ author: ENG_ID, author_user: W, author_id: null, parent_id: OPSQ_LIVE, told: [`${E}/be`] });
+  expect(reply(ended).body).toEndWith(` cc @${D}/be @${E}/be`);
+  expect(JSON.stringify(ended.rows.posts)).not.toContain("session ended");
 });
 
 // #807 P3 B5b3c rollback: a take or a decline that throws after its writes leaves none of them, its sweep's included;
