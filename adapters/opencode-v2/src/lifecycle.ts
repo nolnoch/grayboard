@@ -19,12 +19,12 @@ import { attachmentTools } from "./transfer-tools.js";
 // `static`: the service-credential mode (#270 D3), from the launcher's environment only (`staticMode`), never from
 // plugin options, which any config layer, a repository's own included, can set.
 export type Options = { mcpName: string; issuer?: string; name?: string; create?: boolean; launcher?: boolean; static?: StaticMode };
-export const STATIC_AUTH = "GRAYBOARD_OPENCODE_AUTH", STATIC_ISSUER = "GRAYBOARD_OPENCODE_ISSUER", STATIC_PRINCIPAL = "GRAYBOARD_OPENCODE_PRINCIPAL";
-// Static service-credential mode, read from the launcher's environment: `GRAYBOARD_OPENCODE_AUTH=static` turns it on
-// and `GRAYBOARD_OPENCODE_ISSUER` pins the issuer, which it requires. Unset is OAuth mode; any other value, or a
+export const STATIC_AUTH = "GRAYBOARD_AUTH", STATIC_ISSUER = "GRAYBOARD_ISSUER", STATIC_PRINCIPAL = "GRAYBOARD_PRINCIPAL";
+// Static service-credential mode, read from the launcher's environment: `GRAYBOARD_AUTH=static` turns it on
+// and `GRAYBOARD_ISSUER` pins the issuer, which it requires. Unset is OAuth mode; any other value, or a
 // missing or malformed pin, is a refused static mode, never OAuth. Bun loads dotenv files from the working directory
 // into the environment at startup, so a repository's `.env` could set them: a dotenv file there that names either
-// variable refuses the mode. `GRAYBOARD_OPENCODE_PRINCIPAL`, optional, names the service whose run token may
+// variable refuses the mode. `GRAYBOARD_PRINCIPAL`, optional, names the service whose run token may
 // auto-enroll a root (whoami's `principal`, #270 audit F3); unset, any service's may.
 export function staticMode(env: Record<string, string | undefined>, cwd: string): StaticMode | undefined {
   const auth = env[STATIC_AUTH];

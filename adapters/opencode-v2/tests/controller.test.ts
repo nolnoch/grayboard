@@ -1339,7 +1339,7 @@ test.each([["user"], [undefined], ["SERVICE"]])("static mode: a run token whose 
   } finally { await s.restore(); }
 });
 test.each([
-  ["no pinned issuer", { refused: "Static mode needs a pinned issuer (GRAYBOARD_OPENCODE_ISSUER)" }, undefined],
+  ["no pinned issuer", { refused: "Static mode needs a pinned issuer (GRAYBOARD_ISSUER)" }, undefined],
   ["metadata naming another issuer", undefined, { resource: "https://grayboard.example.com/mcp", authorization_servers: ["https://elsewhere.example.com"] }],
 ] as const)("static mode with %s asks no whoami and enrolls nothing", async (_name, mode, metadata) => {
   const s = await staticRuntime("service", mode, metadata);
@@ -1350,7 +1350,7 @@ test.each([
     expect(rootRecord(s.r.controller, "R")).toMatchObject({ state: "unenrolled", operation: "enroll" });
   } finally { await s.restore(); }
 });
-// #270 audit F3: with GRAYBOARD_OPENCODE_PRINCIPAL set, only that service's run token enrolls a root by itself.
+// #270 audit F3: with GRAYBOARD_PRINCIPAL set, only that service's run token enrolls a root by itself.
 test.each([["svc", true], ["ingest", false]] as const)("static mode with the launcher's principal %j: whoami's principal \"svc\" enrolls: %j", async (principal, enrolls) => {
   const s = await staticRuntime("service", { issuer: "https://grayboard.example.com", principal });
   try {

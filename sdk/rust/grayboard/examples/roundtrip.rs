@@ -8,7 +8,7 @@
 //!   cargo run --example roundtrip -- w-1 work
 //! ```
 //!
-//! With `GRAYBOARD_TOKEN` in place of the issuer, client ID and secret, it uses that token as given (`StaticBearer`).
+//! With `GRAYBOARD_RUN_TOKEN` in place of the issuer, client ID and secret, it uses that token as given (`StaticBearer`).
 
 use futures_util::StreamExt;
 use grayboard::tools::{BindArgs, BoardPostArgs, BoardSubscribeArgs, DmAckArgs, SubscribeMode};
@@ -42,7 +42,7 @@ async fn main() -> Result<(), Error> {
             Some(credential),
         )
     } else {
-        let token = StaticBearer::new(env("GRAYBOARD_TOKEN"));
+        let token = StaticBearer::new(env("GRAYBOARD_RUN_TOKEN"));
         (Client::new(&url, token, info)?, None)
     };
     let session = client.session(
