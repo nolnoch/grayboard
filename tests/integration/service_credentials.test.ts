@@ -336,6 +336,8 @@ describe("the token route", () => {
     m = await overlapping(c);
     expect(m.reached).toBe(true);
     expect([m.a, m.b]).toEqual([slow, slow]);
+    // Two concurrent refusals, one streak: the first sets the hold, the second reads it and writes no row (#1287 L-1).
+    expect(rows()).toEqual([{ code: "slow_down", status: 429 }, { code: "slow_down", status: 429 }]);
   });
 
   test("a credential's secret only in the Basic header: a form secret or no secret is refused", async () => {

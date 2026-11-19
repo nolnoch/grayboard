@@ -616,7 +616,10 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
               return { t, minted: await repo.oauth.mintServiceToken(tx, { clientId: client.clientId, secretId: client.credential!.secretId!, tokenHash: hashToken(token), scopes: selected, limits: serviceTokens }, t) };
             });
             if (minted.status === "capacity") {
-              const streak = held !== undefined && t <= held + STREAK_MS;
+              // The entry as it is now, not `held`: in a wave of concurrent first mints, the first refusal sets it, so
+              // the rest of the wave is inside its streak and writes no row.
+              const last = mintBackoff.get(client.clientId);
+              const streak = last !== undefined && t <= last + STREAK_MS;
               mintBackoff.set(client.clientId, t + 60_000 / serviceTokens.mintsPerMinute);
               throw new OAuthError("slow_down", 429, false, !streak);
             }
