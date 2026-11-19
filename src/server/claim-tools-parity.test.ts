@@ -3,9 +3,9 @@
 // lapsed claims reaching every branch of the sweep: an announced lapse with a watcher, each of holderUser's fallbacks
 // (an ID, a held alias, an unheld person alias, an unheld team alias, a recorded user), a holder who lost the board, an
 // archived board, a regular claim on a queue board, no board, and queue posts with a lane left, none left, and none
-// left whose `[unclaimed]` reply the holder can no longer write.
+// left whose `[unclaimed]` reply the holder can no longer write, or writes for its user (#1296).
 import { beforeEach, expect, spyOn, test } from "bun:test";
-import { claimQueuePost, post, subscribe } from "../core/boards.ts";
+import { claimQueuePost, createBoard, post, subscribe } from "../core/boards.ts";
 import { boardActor } from "../core/bindings.ts";
 import { logEvent, sweepChanges } from "../core/claims.ts";
 import { CoreError } from "../core/errors.ts";
@@ -19,7 +19,7 @@ import { seed } from "../../tests/support/seed.ts";
 
 let repo: Repo;
 let T1 = 0;
-let QPOST = 0, ENGQ = 0, LOST = 0, TAILQ = 0, ENGQ2 = 0, QLIVE = 0;
+let QPOST = 0, ENGQ = 0, LOST = 0, TAILQ = 0, ENGQ2 = 0, QLIVE = 0, OPSQ = 0, OPSQ_QUIET = 0, OPSQ_LIVE = 0;
 
 beforeEach(async () => {
   const f = await openPostParity();
@@ -86,6 +86,22 @@ beforeEach(async () => {
     ENGQ2 = post(core, `${W}/be`, "engq", "more eng").post.id;
     // A live q post bob holds by mention: his decline leaves lanes, so it goes on, redelivered.
     QLIVE = post(core, `${E}/be`, "q", `@${B}/be live work`, null, { strictIds: true }).post.id;
+    // #1296: ops's queue board, eve's posts, no lane but the eng-bound session's ID, which can't see ops though wade
+    // can. Its lapse's [unclaimed] reply is posted for wade, cc'ing eve, who sees ops, and dan, who doesn't. A lapse of
+    // eng/idle's, held by nobody, names no user: quiet. A live one the eng-bound session declines.
+    createBoard(core, `${E}/be`, "opsq", "ops work", "team:ops", { kind: "queue" });
+    const opsq = (body: string, holder: string) => {
+      const id = post(core, `${E}/be`, "opsq", body).post.id;
+      claimQueuePost(core, "opsq", id, holder, Date.now());
+      return id;
+    };
+    OPSQ = opsq("ops work", ENG_ID);
+    core.prepare(`UPDATE claims SET expires_at = 2 WHERE key = ?`).run(`queue:opsq:${OPSQ}`);
+    core.prepare(`INSERT INTO claim_watches (key, handle) VALUES (?, ?), (?, ?)`).run(`queue:opsq:${OPSQ}`, `${E}/be`, `queue:opsq:${OPSQ}`, `${D}/be`);
+    OPSQ_QUIET = opsq("more ops work", "eng/idle");
+    core.prepare(`UPDATE claims SET expires_at = 2 WHERE key = ?`).run(`queue:opsq:${OPSQ_QUIET}`);
+    OPSQ_LIVE = opsq("live ops work", ENG_ID);
+    core.prepare(`INSERT INTO claim_watches (key, handle) VALUES (?, ?)`).run(`queue:opsq:${OPSQ_LIVE}`, `${E}/be`);
   });
   T1 = Date.now();
   while (Date.now() <= T1) { /* the next millisecond */ }
@@ -129,6 +145,14 @@ test("sweepClaims gives core sweepChanges' wakes and boards and leaves its rows"
   expect(body("[expired] ticket:q")!.body).toContain(`@${B}/be`);
   expect(body("[expired] ticket:watched")!.body).toContain(ENDED_ID);
   expect(body(`[unclaimed] queue:q:${TAILQ}`)).toBeDefined();
+  // #1296: the [unclaimed] reply of a holder who lost ops is posted for its user; only the watcher who sees ops is
+  // told. One whose holder names no user is quiet, its watches gone all the same.
+  const unclaimed = (want.rows.posts as { id: number; body: string; author: string; author_user: string | null; author_id: string | null; parent_id: number | null }[]).find(p => p.body.startsWith(`[unclaimed] queue:opsq:${OPSQ}:`))!;
+  expect(unclaimed).toMatchObject({ author: ENG_ID, author_user: W, author_id: null, parent_id: OPSQ });
+  expect(unclaimed.body).toEndWith(` cc @${D}/be @${E}/be`);
+  expect((want.rows.outbox as { post_id: number; handle: string }[]).filter(o => o.post_id === unclaimed.id).map(o => o.handle)).toEqual([`${E}/be`]);
+  expect(posts).not.toContain(`[unclaimed] queue:opsq:${OPSQ_QUIET}`);
+  expect(watches).not.toContain(`queue:opsq:${OPSQ}"`);
   expect(want.out.value.wake.length).toBeGreaterThan(0);
 });
 
@@ -166,7 +190,7 @@ const CALLS = (): Call[] => [
   ["claim_release", { key: "ticket:attic" }], ["claim_release", { key: "ticket:onq" }], ["claim_release", { key: "ticket:nob" }],
   ["claim_release", { key: "ticket:gone" }], ["claim_release", { key: "ticket:watched" }], ["claim_release", { key: "ticket:absent" }],
   ["claim_release", { key: `queue:q:${QPOST}` }], ["claim_release", { key: `queue:q:${QLIVE}` }], ["claim_release", { key: `queue:engq:${ENGQ2}` }], ["claim_release", { key: `queue:engq:${ENGQ2}`, note: "can't" }],
-  ["claim_release", { key: "ticket:confined-live", note: "secret" }],
+  ["claim_release", { key: "ticket:confined-live", note: "secret" }], ["claim_release", { key: `queue:opsq:${OPSQ_LIVE}`, note: "secret" }],
   ["claim_watch", { key: "ticket:live" }], ["claim_watch", { key: "ticket:live", off: true }], ["claim_watch", { key: "ticket:eng" }],
   ["claim_watch", { key: "ticket:nob" }], ["claim_watch", { key: "ticket:absent" }], ["claim_watch", { key: "ticket:watched" }], ["claim_watch", { key: "ticket:onq" }],
   ["claim_watch", { key: "" }],
@@ -232,6 +256,14 @@ test("claim_take, claim_release and claim_watch give core's answers and leave it
   const rel = (confined.rows.posts as { body: string; author_user: string | null; author_id: string | null }[]).find(p => p.body.startsWith("[release] ticket:confined-live"));
   expect(rel).toMatchObject({ body: `[release] ticket:confined-live cc @${E}/be`, author_user: W, author_id: null });
   expect(confined.out.value!.result).toBe("released ticket:confined-live");
+  // #1296: its decline of an ops queue post leaves no lane: the [unclaimed] reply is posted for wade, without its
+  // session or note, and answers as any decline.
+  const declined = call("wade's eng-bound", "claim_release", { key: `queue:opsq:${OPSQ_LIVE}`, note: "secret" });
+  const reply = (declined.rows.posts as { body: string; author_user: string | null; author_id: string | null; parent_id: number | null }[]).find(p => p.body.startsWith(`[unclaimed] queue:opsq:${OPSQ_LIVE}:`));
+  expect(reply).toMatchObject({ author_user: W, author_id: null, parent_id: OPSQ_LIVE });
+  expect(reply!.body).toEndWith(` cc @${E}/be`);
+  expect(JSON.stringify(declined.rows.posts)).not.toContain("secret");
+  expect(declined.out.value!.result).toBe(`released queue:opsq:${OPSQ_LIVE}`);
   // Watches: on, off, own, no board, a hidden board, absent.
   expect(text("bob", "claim_watch", { key: "ticket:live" })).toContain("watching");
   expect(text("wade", "claim_watch", { key: "ticket:live" })).toContain("error");

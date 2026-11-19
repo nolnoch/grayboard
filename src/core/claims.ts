@@ -1,6 +1,6 @@
 import type { Database } from "bun:sqlite";
 
-import { REDELIVERED_NOTE, canSeeBoard, getBoard, normalizeBoard, post, redeliverQueuePost, seenHandles, systemBody, userViewer, type BoardPredicate, type Viewer } from "./boards.ts";
+import { REDELIVERED_NOTE, canSeeBoard, getBoard, normalizeBoard, post, redeliverQueuePost, seenHandles, systemBody, userViewer, type BoardPredicate, type PostOpts, type Viewer } from "./boards.ts";
 import { addressParts } from "./addresses.ts";
 import { idRow } from "./bindings.ts";
 import { CoreError } from "./errors.ts";
@@ -392,17 +392,24 @@ export function claim(
 // the poster and the claim's watchers (#220). The reply's author shows that
 // last lane, as `[expired]` posts show a holder; its text counts the lanes
 // rather than naming them. A decline's reply is the declining session's
-// (`ctx`); a lapse's is the claimant's user (#855). Like a holder that lost
-// access, one that can't post there now ends it quietly.
+// (`ctx`); a lapse's is the claimant's user (#855). A holder that lost the
+// board ends it as release does (endReach, #1286): the reply is posted for the
+// claimant's user when that user still sees the board, never as the caller's
+// session, else quietly.
 function requeue(db: Database, c: ClaimRow, now: number, ctx: ClaimCtx = {}): ClaimChanges {
   const cc = takeClaimWatchers(db, c.key);
   const r = redeliverQueuePost(db, c.key, c.holder, now);
   if (!r) return { wake: [], boards: [] };
   if ("lane" in r) return { wake: [r.lane], boards: [] };
+  // Judged on the post's board, the key's, which claimQueuePost also recorded as the claim's.
+  const end = endReach(db, { ...c, board: r.board });
+  if (!end) return { wake: [], boards: [] };
+  // The system's reply for the claimant's user: no caller's session, via or name set reaches it.
+  const opts: PostOpts = end.user
+    ? { author_user: end.user.name, allowArchived: true, seenBy: end.user.sees }
+    : { author_id: ctx.session, via: ctx.via, addresses: ctx.addresses, author_user: ctx.user ?? holderUser(db, c), allowArchived: true };
   try {
-    const res = post(db, c.holder, r.board, systemBody(unclaimedText(c.key, r.held, cc)), r.postId, {
-      author_id: ctx.session, via: ctx.via, addresses: ctx.addresses, author_user: ctx.user ?? holderUser(db, c), allowArchived: true,
-    });
+    const res = post(db, c.holder, r.board, systemBody(unclaimedText(c.key, r.held, cc)), r.postId, opts);
     return { wake: res.wake, boards: [res.post.board] };
   } catch (e) {
     if (e instanceof CoreError) return { wake: [], boards: [] };
