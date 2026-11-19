@@ -104,9 +104,9 @@ test("a run token without GRAYBOARD_AUTH=static is hosted core's refusal, whatev
   }
 });
 
-test("static mode without a valid pinned issuer is refused, never OAuth, and no request or token read happens", async () => {
+test("static mode without a valid pinned issuer is refused, never OAuth, and no request or token read happens (a non-canonical one too, #1321)", async () => {
   const cwd = empty();
-  for (const env of [{ [STATIC_AUTH]: "static" }, { [STATIC_AUTH]: "static", [STATIC_ISSUER]: "" }, { [STATIC_AUTH]: "static", [STATIC_ISSUER]: "http://grayboard.example.com" }, { [STATIC_AUTH]: "static", [STATIC_ISSUER]: "https://u:p@grayboard.example.com" }, { [STATIC_AUTH]: "static", [STATIC_ISSUER]: "not a url" }, { [STATIC_AUTH]: "oauth", [STATIC_ISSUER]: ISSUER }, { [STATIC_AUTH]: "STATIC", [STATIC_ISSUER]: ISSUER }]) {
+  for (const env of [{ [STATIC_AUTH]: "static" }, { [STATIC_AUTH]: "static", [STATIC_ISSUER]: "" }, { [STATIC_AUTH]: "static", [STATIC_ISSUER]: "http://grayboard.example.com" }, { [STATIC_AUTH]: "static", [STATIC_ISSUER]: "https://u:p@grayboard.example.com" }, { [STATIC_AUTH]: "static", [STATIC_ISSUER]: "not a url" }, ...[` ${ISSUER}`, `${ISSUER}/?`, `${ISSUER}/#`, "https://grayboard.%65xample.com", "https:\\\\grayboard.example.com", `${ISSUER}/${"a".repeat(2048)}`].map(issuer => ({ [STATIC_AUTH]: "static", [STATIC_ISSUER]: issuer })), { [STATIC_AUTH]: "oauth", [STATIC_ISSUER]: ISSUER }, { [STATIC_AUTH]: "STATIC", [STATIC_ISSUER]: ISSUER }]) {
     const mode = staticMode(env, cwd);
     expect(mode).toEqual({ refused: expect.any(String) });
     const seen = server(), s = entry(mode);

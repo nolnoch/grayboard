@@ -15,7 +15,9 @@
 //   through the launcher's entry (`Bearer {env:GRAYBOARD_RUN_TOKEN}`), whose shape its Binding checks. Every static row
 //   carries a well-formed token, and hosted core's `token` field is dropped before comparing;
 // - V2 accepts only an HTTPS issuer, hosted core also HTTP loopback, and their issuer-shape texts differ: those rows
-//   are checked below for a refusal on both sides, not for the same text.
+//   are checked below for a refusal on both sides, not for the same text. Both run the issuer through the one endpoint
+//   rule (`canonicalEndpoint`, src/shared/endpoint.ts, vendored into V2), so no issuer one refuses passes the other
+//   (#1321).
 import { afterEach, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -75,6 +77,7 @@ const rows: Row[] = [
   // The pin.
   { name: "no issuer", env: { ...ON, GRAYBOARD_ISSUER: undefined }, mode: { refused: "Static mode needs a pinned issuer (GRAYBOARD_ISSUER)" } },
   { name: "empty issuer", env: { ...ON, GRAYBOARD_ISSUER: "" }, mode: { refused: "Static mode needs a pinned issuer (GRAYBOARD_ISSUER)" } },
+  { name: "an issuer `new URL` would rewrite (an uppercase scheme and host) is pinned as given", env: { ...ON, GRAYBOARD_ISSUER: "HTTPS://GRAYBOARD.example.com" }, mode: { issuer: "HTTPS://GRAYBOARD.example.com" } },
   { name: "a missing issuer is named before a bad principal", env: { ...ON, GRAYBOARD_ISSUER: undefined, GRAYBOARD_PRINCIPAL: "in gest" }, mode: { refused: "Static mode needs a pinned issuer (GRAYBOARD_ISSUER)" } },
   // The principal.
   ...["in gest", "ingest/w-1", "p".repeat(129)].map(principal => ({ name: `principal ${JSON.stringify(principal.slice(0, 16))}`, env: { ...ON, GRAYBOARD_PRINCIPAL: principal }, mode: { refused: "GRAYBOARD_PRINCIPAL must be a service name" } })),
@@ -113,7 +116,11 @@ test("V2 and hosted core agree: a missing working directory", () => {
 });
 
 // The issuer's shape: both refuse, in their own words (V2 is HTTPS-only; hosted core also takes HTTP loopback).
-test.each(["http://grayboard.example.com", "https://u:p@grayboard.example.com", "https://grayboard.example.com/?q=1", "https://grayboard.example.com/#f", "not a url"])("both refuse the issuer %s", issuer => {
+// The second line: what `new URL` reads past and the endpoint rule refuses (#1321).
+test.each([
+  "http://grayboard.example.com", "https://u:p@grayboard.example.com", "https://grayboard.example.com/?q=1", "https://grayboard.example.com/#f", "not a url",
+  ` ${ISSUER}`, `${ISSUER} `, `${ISSUER}/?`, `${ISSUER}/#`, "https://grayboard.%65xample.com", `${ISSUER}/%7Eops`, "https:\\\\grayboard.example.com", `${ISSUER}\\mcp`, `${ISSUER}/${"a".repeat(2048)}`,
+])("both refuse the issuer %s", issuer => {
   const env = { ...ON, GRAYBOARD_ISSUER: issuer }, dir = cwd();
   expect(hosted(env, dir)).toEqual({ refused: expect.stringMatching(/^GRAYBOARD_ISSUER must be an HTTPS URL/) });
   expect(v2(env, dir)).toEqual({ refused: expect.stringMatching(/^GRAYBOARD_ISSUER must be an HTTPS URL/) });
