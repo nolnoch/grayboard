@@ -46,5 +46,10 @@ function safe(v: unknown): number {
 }
 
 // A jsonb parameter. A string bound to `$1::jsonb` is stored as a JSON string scalar, not parsed (probed), so the type
-// refuses one: pass the value itself and let the driver serialize it.
-export type JsonParam = number | boolean | null | readonly JsonParam[] | { readonly [k: string]: JsonParam | undefined };
+// refuses one at the top: pass the value itself and let the driver serialize it. Strings inside an array or object
+// are values like any other.
+type JsonValue = string | number | boolean | null | readonly JsonValue[] | { readonly [k: string]: JsonValue | undefined };
+export type JsonParam = Exclude<JsonValue, string>;
+// An access_log row's detail: an object, never a top-level scalar. Bound uncast, a number or boolean fails the jsonb
+// column's type check (42804) and null stores SQL NULL, which no `detail->>` read tells from a missing row.
+export type AuditDetail = { readonly [k: string]: JsonValue | undefined };

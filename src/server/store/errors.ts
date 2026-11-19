@@ -16,3 +16,12 @@ export class PrincipalTaken extends Error {
     super(`the name "${name}" belongs to another team or service principal`);
   }
 }
+
+// A membership change whose actor no longer holds the authority the route's decision found (their team_owner or
+// org_admin binding), re-checked in the store under the role write (#807 P3 C3b): revocation is strict for
+// membership as for grants, so an owner revoked mid-request adds or removes no one.
+export class AuthorityLost extends Error {
+  constructor() {
+    super("the role that allowed this membership change is no longer held");
+  }
+}
