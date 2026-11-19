@@ -2710,16 +2710,18 @@ function makeHostedStore(db: Database): HostedStoreOf {
     return o;
   };
   const on = (tx: Tx): HostedWrites => writesOn(sqliteOf(tx));
+  const lockOn = (tx: Tx) => { const conn = sqliteOf(tx); if (!isTx(tx)) throw new Error("a hosted lock needs the body's Tx, not a pool Read"); return conn; };
   const store: HostedStoreOf = {
     writesOn,
     write: (fn, committed) => queued(db, fn, committed),
     subscribe: () => () => {},
     get: async (r, id) => hostedRow(sqliteOf(r), id),
     // The single writer serializes every body, so the three lock seams lock nothing here (#807 P3 C8 decision 1): `lock`
-    // reads the row on the Tx, `lockCapacity` only checks its handle, and `grantLive` reads the grant.
-    lock: async (tx, id) => hostedRow(sqliteOf(tx), id),
-    async lockCapacity(tx) { sqliteOf(tx); },
-    grantLive: async (tx, grantId, now) => sqliteOf(tx).query<{ n: number }, [string, number]>(
+    // reads the row on the Tx, `lockCapacity` only checks its handle, and `grantLive` reads the grant. Each refuses a
+    // pool Read (sqliteOf alone accepts one): on Postgres a lock outside a transaction would be released at once.
+    lock: async (tx, id) => hostedRow(lockOn(tx), id),
+    async lockCapacity(tx) { lockOn(tx); },
+    grantLive: async (tx, grantId, now) => lockOn(tx).query<{ n: number }, [string, number]>(
       "SELECT 1 AS n FROM oauth_grants WHERE id = ? AND revoked_at IS NULL AND expires_at > ?").get(grantId, now) !== null,
     owned: async (r, id) => sqliteOf(r).query<{ n: number }, [string, string]>(
       "SELECT 1 AS n WHERE EXISTS (SELECT 1 FROM hosted_ownerships WHERE session_id = ?1) OR EXISTS (SELECT 1 FROM hosted_sessions WHERE session_id = ?2)",

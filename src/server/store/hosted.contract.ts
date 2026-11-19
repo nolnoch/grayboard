@@ -263,6 +263,15 @@ function ends(it: It): void {
     expect(await h.ownership(r.ownership_id)).toMatchObject({ ended_at: T0 + 50, end_reason: "closed" });
   });
 
+  it("end ends children that started together in session_id order", async h => {
+    const u = await h.seedUser(ME);
+    const r = await root(h, "r", u);
+    // Inserted against the tiebreak's order, so neither insertion order nor a reversed tiebreak passes.
+    for (const c of ["c-b", "c-a"]) await child(h, c, r, { created_at: T0 + 10 });
+    expect(await h.write(tx => h.hosted.end(tx, "r", "closed", T0 + 50))).toBe(true);
+    expect(h.hosted.takeEnded().map(e => e.id)).toEqual(["c-a", "c-b"]);
+  });
+
   it("end refuses a child, a missing row, a deadline that moved and a row seen since the idle cutoff; an unleased root's end audits no lease_closed", async h => {
     const u = await h.seedUser(ME);
     const leased = await root(h, "leased", u, { lease_deadline: T0 + 10, last_seen_at: T0 + 5 });
@@ -440,6 +449,15 @@ function seams(it: It): void {
     // Inside a body, after its own write.
     expect(await h.write(async tx => { await h.hosted.update(tx, "r", { bind_gen: 5 }); return (await h.hosted.lock(tx, "r"))?.bind_gen; })).toBe(5);
     await h.write(tx => h.hosted.lockCapacity(tx));
+  });
+
+  it("the lock seams refuse the store's pool Read: a lock outside a transaction would hold nothing", async h => {
+    const u = await h.seedUser(ME);
+    await h.seedGrant("live", u, T0 + 10);
+    await root(h, "r", u);
+    const pool = h.read as Tx;
+    for (const [name, call] of [["lock", () => h.hosted.lock(pool, "r")], ["lockCapacity", () => h.hosted.lockCapacity(pool)], ["grantLive", () => h.hosted.grantLive(pool, "live", T0)]] as const)
+      expect(`${name}: ${await failure(call)}`).toMatch(new RegExp(`^${name}: .*(Tx|transaction)`));
   });
 
   // Moved from db.test.ts's P1c-11/P1c-12: every method resolves its handle before it reads an argument, so a kept Tx

@@ -565,10 +565,11 @@ export function createHostedSessions(application: Application, options: { now?: 
     const root = row.root_session_id ? await store.get(tx, row.root_session_id) : row;
     let ended = false;
     if (root && !root.root_session_id) {
-      const t = now();
-      if (root.user_id !== authed && await repo.users.isDisabled(tx, root.user_id)) { await store.end(tx, root.session_id, "disabled", t); ended = true; }
-      else if (root.lease_deadline !== null && root.lease_deadline <= t) { await store.end(tx, root.session_id, "expired", t, root.lease_deadline); ended = true; }
-      else if (root.lease_deadline === null && idleAt(root) && !(await application.hostedHolds(tx, root.session_id)).length) { await store.end(tx, root.session_id, "idle", t, undefined, t - idle); ended = true; }
+      // One idle cutoff for the judgement and the end's guard, so a root isn't judged idle by one and refused by the other.
+      const t = now(), cutoff = t - idle;
+      if (root.user_id !== authed && await repo.users.isDisabled(tx, root.user_id)) ended = await store.end(tx, root.session_id, "disabled", t);
+      else if (root.lease_deadline !== null && root.lease_deadline <= t) ended = await store.end(tx, root.session_id, "expired", t, root.lease_deadline);
+      else if (root.lease_deadline === null && root.last_seen_at < cutoff && !busy(root.session_id) && !(await application.hostedHolds(tx, root.session_id)).length) ended = await store.end(tx, root.session_id, "idle", t, undefined, cutoff);
     }
     // A root's end may have ended this child with it.
     const child = !row.root_session_id ? undefined : ended ? await store.get(tx, row.session_id) : row;
@@ -1042,6 +1043,10 @@ export function createHostedSessions(application: Application, options: { now?: 
           await authorized(p, tx);
           await grantLive(tx, p);
           testPause("hosted:register:in-txn");
+          // The root's row before the child's and before rowFor's or admit's capacity lock (#807 P3 C8 lock order):
+          // grant, root, child, capacity. attach's lock of it below is then re-entrant. A missing root has no row to lock
+          // yet; rowFor creates it under the capacity lock.
+          await store.lock(tx, context.id);
           const root = (await rowFor(tx, p, context, later.defer))!;
           if (root.root_session_id) throw new ApplicationError("root_is_child", `session ${root.session_id} is itself registered under ${root.root_session_id}; register ${childId} under ${root.root_session_id}.`);
           // An external end/recreate of the root while this waited refuses it (a convert is root_is_child above);
