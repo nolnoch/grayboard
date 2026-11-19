@@ -11,7 +11,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ROOT } from "./paths.ts";
 
-export async function buildCli(outfile: string, opts: { version?: string; keys?: Record<string, string> } = {}): Promise<string> {
+// `entry`: which binary; the server (src/server/main.ts) for a test that needs the compiled server process.
+export async function buildCli(outfile: string, opts: { version?: string; keys?: Record<string, string>; entry?: "cli" | "server" } = {}): Promise<string> {
   const cwd = mkdtempSync(join(tmpdir(), "grayboard-build-"));
   try {
     const p = Bun.spawn([process.execPath, import.meta.path, outfile, JSON.stringify(opts)], { cwd, stdout: "pipe", stderr: "pipe" });
@@ -25,9 +26,9 @@ export async function buildCli(outfile: string, opts: { version?: string; keys?:
 
 if (import.meta.main) {
   const [outfile, raw] = process.argv.slice(2);
-  const { version, keys } = JSON.parse(raw!) as { version?: string; keys?: Record<string, string> };
+  const { version, keys, entry = "cli" } = JSON.parse(raw!) as { version?: string; keys?: Record<string, string>; entry?: "cli" | "server" };
   const r = await Bun.build({
-    entrypoints: [join(ROOT, "src", "cli", "main.ts")],
+    entrypoints: [join(ROOT, "src", entry, "main.ts")],
     compile: { outfile: outfile! },
     plugins: [{
       name: "overrides",

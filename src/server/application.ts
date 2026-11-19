@@ -5,7 +5,7 @@
 // transport and its hello are gone (#282): a hosted session's lifetime is the
 // hosted store's lease, not a connection's grace.
 import type { BindRequest, DelegateRequest, DelegateResult, ErrorCode, Replayed, SendResult as WireSendResult, WriteRef } from "../shared/protocol.ts";
-import { DEFAULT_HOSTED_CAPS } from "./config.ts";
+import { DEFAULT_HOSTED_CAPS, DEFAULT_SERVICE_LIMITS, type ServiceLimits } from "./config.ts";
 import { DEFAULT_HELLO_LIMIT, DEFAULT_HOSTED_REQUEST_LIMIT, DEFAULT_HOSTED_SUBSCRIBER_LIMIT, RateLimiter, retrySecs, type RateLimit, type Take } from "./rate_limit.ts";
 import { dedupWrite, type DedupOutcome, type DedupTool, type Written } from "./write_dedup.ts";
 import { testPause, testPauseAsync } from "../shared/testpause.ts";
@@ -95,6 +95,8 @@ export type ApplicationOptions = {
   hostedRequestLimit?: RateLimit;
   // Delivery upkeep (role=subscriber) has a bucket of its own (#845).
   hostedSubscriberLimit?: RateLimit;
+  // A service principal's buckets in place of those three (#270 D4).
+  serviceLimits?: ServiceLimits;
   // delegate's limits (#252): per user, and the open requests one launcher may hold.
   delegateLimit?: RateLimit;
   delegateOpenCap?: number;
@@ -219,6 +221,8 @@ type Hub = {
   access: BoardAccess;
   slackRunning: () => boolean;
   helloLimiter: RateLimiter;
+  // A service principal's bind bucket (#270 D4), in place of helloLimiter's per-user one.
+  serviceHelloLimiter: RateLimiter;
   // delegate's per-user bucket and the launcher cap (#252). A streak's
   // rows go to delegateRows while a delegate call runs, to be written where
   // its outcome keeps them, on that call's `Tx`; otherwise (a sweep, outside any body) posted.
@@ -484,7 +488,11 @@ async function bindTarget(hub: Hub, r: Read, authed: AuthedUser, input: string):
   if (!d.allow && d.rule === "alias.human_reserved") return { code: "forbidden", error: HUMAN_RESERVED, address, authz: { req, d } };
   // A team reads as missing to a non-member (#1020), and a service's scope to any user (#270 D1): the refusal
   // aliasScope gives a scope nobody owns.
-  if (!d.allow && (d.rule === "scope.team_member" || d.rule === "scope.service")) return { code: "not_found", error: `"${address}": no team or service is named "${t.scope_ref}"`, address, authz: { req, d } };
+  // A service outside its own scope gets the same for a team's or another service's (#1240): its refusal must not
+  // tell it which names exist. A person scope needs no such cover: aliasScope never checks that one exists.
+  if (!d.allow && (d.rule === "scope.team_member" || d.rule === "scope.service" || (d.rule === "scope.own_service" && t.scope_kind !== "person"))) {
+    return { code: "not_found", error: `"${address}": no team or service is named "${t.scope_ref}"`, address, authz: { req, d } };
+  }
   const hint = authed.kind === "service" ? "bind a bare name, which lands in your service's scope" : "bind a name in your own scope, or in a team's you belong to";
   if (!d.allow) return { code: "forbidden", error: `you can't act as "${address}": ${d.reason}; ${hint}`, address, authz: { req, d } };
   return { address, scope: t };
@@ -545,6 +553,16 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     if (!streakAt) { repo.post(write, undefined, "bind rate-limit row"); return; }
     write(streakAt.tx); streakAt.afterRollback?.(write);
   };
+  const bindLimiter = (limit: RateLimit) => new RateLimiter(limit, {
+    start: (email, ctx, retryAfterMs) => {
+      console.error(`[grayboard] rate-limiting hellos from ${email}`);
+      streakRow(w => writeAudit(repo, w, "bind.rate_limited", email, null, { ...ctx, retry_after_ms: retryAfterMs }));
+    },
+    end: (email, refused) => {
+      console.error(`[grayboard] hellos from ${email} no longer rate-limited; ${refused} refused`);
+      streakRow(w => writeAudit(repo, w, "bind.rate_limit_ended", email, null, { refused }));
+    },
+  }, opts.now);
   const delegateRow = (write: SyncRow) => { if (hub.delegateRows) hub.delegateRows.push(write); else repo.post(write, undefined, "delegation throttle row"); };
   const hub: Hub = {
     repo,
@@ -557,16 +575,8 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     // Logged and audited once per run of refusals, so a loop floods neither.
     // Keyed by email, which is unique per user. A bind spends from the same
     // bucket (S2).
-    helloLimiter: new RateLimiter(opts.helloLimit ?? DEFAULT_HELLO_LIMIT, {
-      start: (email, ctx, retryAfterMs) => {
-        console.error(`[grayboard] rate-limiting hellos from ${email}`);
-        streakRow(w => writeAudit(repo, w, "bind.rate_limited", email, null, { ...ctx, retry_after_ms: retryAfterMs }));
-      },
-      end: (email, refused) => {
-        console.error(`[grayboard] hellos from ${email} no longer rate-limited; ${refused} refused`);
-        streakRow(w => writeAudit(repo, w, "bind.rate_limit_ended", email, null, { refused }));
-      },
-    }, opts.now),
+    helloLimiter: bindLimiter(opts.helloLimit ?? DEFAULT_HELLO_LIMIT),
+    serviceHelloLimiter: bindLimiter(opts.serviceLimits?.bind ?? DEFAULT_SERVICE_LIMITS.bind),
     delegateLimit: opts.delegateLimit ?? DELEGATE_LIMIT,
     // Keyed by user email, so a user's sessions, aliases and children share
     // one bucket and a fresh session can't reset it; capped like the
@@ -601,6 +611,9 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
   }, opts.now);
   const hostedRequestLimiter = hostedLimiter("native", opts.hostedRequestLimit ?? DEFAULT_HOSTED_REQUEST_LIMIT);
   const hostedSubscriberLimiter = hostedLimiter("subscriber", opts.hostedSubscriberLimit ?? DEFAULT_HOSTED_SUBSCRIBER_LIMIT);
+  // The service tier's (#270 D4), picked by the principal's kind, which the access read already carries.
+  const serviceRequestLimiter = hostedLimiter("native", opts.serviceLimits?.hostedRequest ?? DEFAULT_SERVICE_LIMITS.hostedRequest);
+  const serviceSubscriberLimiter = hostedLimiter("subscriber", opts.serviceLimits?.hostedSubscriber ?? DEFAULT_SERVICE_LIMITS.hostedSubscriber);
   type Observer = { session: ApplicationSession; board: string; hooks: BoardObserver };
   // Every observer, and the same ones indexed by board and by session, so a post's fan-out walks only its board's
   // observers and a close only its session's (#831, vision P13): neither grows with the server-wide watch cap.
@@ -735,7 +748,9 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     if (session.readOnly && !allowUnbound) fail("unbound", UNBOUND_ERROR);
   }
   function admitHosted(authed: AuthedUser, sessionId: string | null, role: "native" | "subscriber") {
-    const t = (role === "subscriber" ? hostedSubscriberLimiter : hostedRequestLimiter).take(authed.user_email, { session_id: sessionId, read_only: true, place: null });
+    const service = authed.kind === "service";
+    const limiter = role === "subscriber" ? (service ? serviceSubscriberLimiter : hostedSubscriberLimiter) : (service ? serviceRequestLimiter : hostedRequestLimiter);
+    const t = limiter.take(authed.user_email, { session_id: sessionId, read_only: true, place: null });
     if (!t.ok) fail("rate_limited", `too many connections for this user; retry in ${retrySecs(t.retryAfterMs)}s`, { retry_after_ms: t.retryAfterMs });
   }
 
@@ -965,7 +980,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     // re-bind loop spends it too.
     streakAt = { tx, afterRollback: session.afterRollback };
     let t: Take;
-    try { t = hub.helloLimiter.take(authed.user_email, { session_id: id, bind: m.alias }); } finally { streakAt = undefined; }
+    try { t = (authed.kind === "service" ? hub.serviceHelloLimiter : hub.helloLimiter).take(authed.user_email, { session_id: id, bind: m.alias }); } finally { streakAt = undefined; }
     if (!t.ok) fail("rate_limited", `too many binds for this user; retry in ${retrySecs(t.retryAfterMs)}s`, { retry_after_ms: t.retryAfterMs });
     const target = await bindTarget(hub, tx, authed, m.alias);
     await testPauseAsync("bind:target:decided");
@@ -1434,9 +1449,14 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
       for (const [i, id] of ids.entries()) if (disabled[i]) application.disconnectUser(id);
       return recheckAliases(null, null);
     },
-    sweepHellos: () => { hub.helloLimiter.sweep(); hostedRequestLimiter.sweep(); hostedSubscriberLimiter.sweep(); hub.delegateLimiter.sweep(); },
+    sweepHellos: () => {
+      hub.helloLimiter.sweep(); hub.serviceHelloLimiter.sweep(); hostedRequestLimiter.sweep(); hostedSubscriberLimiter.sweep();
+      serviceRequestLimiter.sweep(); serviceSubscriberLimiter.sweep(); hub.delegateLimiter.sweep();
+    },
     /** How many users have a bind or hosted-request bucket, for tests. */
-    limiterSizes: () => ({ bind: hub.helloLimiter.size, hosted: hostedRequestLimiter.size, subscriber: hostedSubscriberLimiter.size, delegate: hub.delegateLimiter.size }),
+    // Each tier's keys counted with its kind's (#270 D4): a service's bucket is a user's, sized apart.
+    limiterSizes: () => ({ bind: hub.helloLimiter.size + hub.serviceHelloLimiter.size, hosted: hostedRequestLimiter.size + serviceRequestLimiter.size,
+      subscriber: hostedSubscriberLimiter.size + serviceSubscriberLimiter.size, delegate: hub.delegateLimiter.size }),
     stopExpiry() {
       expiry.stop();
       unsubscribeEnds();
@@ -1716,9 +1736,25 @@ async function unwoken(repo: Repo, r: Read, session: ApplicationSession, live: A
   if (decision.allow) return { user: toUser, fields: {} };
   // Named only when the address already names them (a person alias): a team
   // alias's or an ID's holder is a handle, not a user (security audit F-12).
-  const whose = to.startsWith(`${toUser}/`) ? `${toUser}'s agent` : "its holder (another user's agent)";
+  const named = to.startsWith(`${toUser}/`);
+  // A service on either side (#1241): no team policy reaches it (a service is never a team member, #270 D1), so the
+  // person's remedy would mislead. A service's name is no secret here only when the address names it already.
+  if (live?.authed.kind === "service") {
+    const whose = named ? `service ${toUser}'s agent` : "its holder (another principal's agent)";
+    return { user: toUser, fields: { wakes: false, wake_note: `Delivered as mail: ${whose} isn't woken by a user's direct messages, and no team policy changes that (a service is never a team member).` } };
+  }
+  if (session.authed.kind === "service") {
+    const whose = named ? `${toUser}'s agent` : "its holder (a user's agent)";
+    return { user: toUser, fields: { wakes: false, wake_note: `Delivered as mail: ${whose} won't act on it until its user does; a service's direct messages don't wake a user's agents, and no team policy changes that (a service is never a team member).` } };
+  }
+  const whose = named ? `${toUser}'s agent` : "its holder (another user's agent)";
   return { user: toUser, fields: { wakes: false, wake_note: `Delivered as mail: ${whose} won't act on it until its user does (no shared collaborative team; \`grayboard team policy\`).` } };
 }
+
+// crossUserRefusal's twin when a service is the requester or the target's principal (#1241): no team policy reaches
+// a service (it is never a team member, #270 D1); delegation across a service and a user has no grant yet (#874).
+const serviceCrossRefusal = (to: string): string =>
+  `"${to}" belongs to another principal, and a service and a user can't delegate to each other: no team policy reaches a service, which is never a team member`;
 
 // Only after the outermost commit, never on a replay.
 function deliverSend(hub: Hub, msg: MessageRow): void {
@@ -1841,7 +1877,9 @@ async function handleDelegate(hub: Hub, tx: Tx, session: ApplicationSession, m: 
     const req: AuthzRequest = { verb: "delegate.to", from_user: authed.user_email, to_user: owner };
     const decision = await authorize(repo, h, {}, req);
     if (decision.allow) return { result: { ok: "granted" } };
-    return { result: { refused: crossUserRefusal(to) }, row: w => recordDecision(repo, w, sessionActor(session, session.primary), req, decision, { launcher: to }) };
+    // A service on either side (#1241): a team's delegating policy can't reach it, so the person's remedy would mislead.
+    const service = authed.kind === "service" || (await repo.principals.findByName(h, owner))?.kind === "service";
+    return { result: { refused: service ? serviceCrossRefusal(to) : crossUserRefusal(to) }, row: w => recordDecision(repo, w, sessionActor(session, session.primary), req, decision, { launcher: to }) };
   };
   const emit = (h: Tx, r: Reach): DelegateReach => {
     if (r.row) rowAfterRollback(session, h, r.row);

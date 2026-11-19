@@ -1,4 +1,7 @@
 import pkg from "../../package.json" with { type: "json" };
+import { randomBytes } from "node:crypto";
+import { mcpResource, SERVICE_CLIENT_PREFIX } from "./oauth-config.ts";
+import { CREDENTIAL_NO_EXPIRY, CREDENTIAL_SOURCES, DEFAULT_SERVICE_TOKEN_LIMITS, OAUTH_TTL, SERVICE_TOKEN_MIN_SECONDS, type CredentialSource } from "./oauth-types.ts";
 import { DEV_SESSION_LABEL, LastOwner, PrincipalTaken, TEAM_POLICIES, type Repo, type RoleFilter, type Team, type TeamPolicy, type User } from "./db.ts";
 import { DEFAULT_CLI_TOKEN_IDLE_DAYS, type Config } from "./config.ts";
 import {
@@ -802,6 +805,8 @@ async function adminServiceCreate(req: Request, authed: AuthedUser, repo: Repo, 
   const name = body.name.toLowerCase();
   // The team name rule (D1): no "@", so a service's name is never a person scope and never an email.
   if (!isValidIdentityName(name)) return badRequest(`invalid service name "${name.slice(0, 64)}": 1-32 chars of a-z 0-9 _ -`);
+  // The Slack bridge's name in every scope (#1241): a service called it would read as everyone's phone.
+  if (name === HUMAN_NAME) return badRequest(`"${HUMAN_NAME}" is reserved; no service may take it`);
   if (!Array.isArray(body.owners) || !body.owners.length || !body.owners.every(o => typeof o === "string" && o)) {
     return badRequest("owners required: one or more users' emails; every service has an owner");
   }
@@ -876,6 +881,85 @@ async function adminServiceDeleteAlias(req: Request, authed: AuthedUser, repo: R
     await repo.boards.forget(tx, existing.address);
     writeAudit(repo, tx, "alias.deleted", authed.user_email, existing.address, { service: svc.email });
     return json({ ok: true, deleted: existing.address });
+  });
+}
+
+// A service credential (#270 D2): an OAuth client-credentials client with its own grant. Add writes the credential,
+// its grant (expiry = the credential's) and its first secret; with `rotate` it adds a second secret to a live
+// credential instead, leaving its client ID, grant and sessions as they are. The secret is in this answer only:
+// stored as SHA-256, never in an audit row or a log.
+async function adminServiceCredentialAdd(req: Request, authed: AuthedUser, repo: Repo, config: Config): Promise<Response> {
+  const body = await parseBody<{ service?: unknown; source?: unknown; token_seconds?: unknown; expires_at?: unknown; rotate?: unknown }>(req);
+  const ceiling = (config.serviceTokens ?? DEFAULT_SERVICE_TOKEN_LIMITS).maxSeconds;
+  const rotate = body?.rotate;
+  if (rotate !== undefined && (typeof rotate !== "string" || !rotate.startsWith(SERVICE_CLIENT_PREFIX))) return badRequest("rotate must be a credential's client ID (svc_…)");
+  if (rotate !== undefined && [body?.source, body?.token_seconds, body?.expires_at].some(v => v !== undefined)) {
+    return badRequest("a rotation keeps the credential's source, lifetime and expiry; give only service and rotate");
+  }
+  const source = (body?.source ?? "generic") as CredentialSource;
+  if (!(CREDENTIAL_SOURCES as readonly unknown[]).includes(source)) return badRequest(`source must be one of ${CREDENTIAL_SOURCES.join(", ")}`);
+  // No lifetime given: the default, under a lower ceiling the ceiling (#270 audit L-2).
+  const tokenSeconds = body?.token_seconds ?? Math.min(OAUTH_TTL.access / 1000, ceiling);
+  if (!Number.isSafeInteger(tokenSeconds) || (tokenSeconds as number) < SERVICE_TOKEN_MIN_SECONDS || (tokenSeconds as number) > ceiling) {
+    return badRequest(`token_seconds must be a whole number from ${SERVICE_TOKEN_MIN_SECONDS} to ${ceiling} (GRAYBOARD_SERVICE_TOKEN_MAX_SECONDS)`);
+  }
+  const expiresAt = body?.expires_at;
+  if (expiresAt !== undefined && (!Number.isSafeInteger(expiresAt) || (expiresAt as number) <= Date.now() || (expiresAt as number) > CREDENTIAL_NO_EXPIRY)) {
+    return badRequest("expires_at must be a future time in epoch milliseconds");
+  }
+  const secret = randomBytes(32).toString("base64url");
+  const out = await repo.write(async tx => {
+    const svc = await serviceNamed(tx, repo, body?.service);
+    if (svc instanceof Response) return svc;
+    if (svc.disabled_at !== null) return conflict(`service ${svc.email} is disabled; enable it first`);
+    const now = Date.now();
+    if (typeof rotate === "string") {
+      // The credential must be this service's: a client ID names no other service's here.
+      const live = await repo.oauth.findServiceCredential(tx, rotate, now);
+      if (!live || live.userId !== svc.id) return jsonErr("not_found", `service ${svc.email} has no live credential ${rotate}`, 404);
+      const r = await repo.oauth.rotateServiceCredential(tx, { clientId: rotate, secretHash: hashToken(secret) }, now);
+      if (r.status === "capacity") return conflict(`credential ${rotate} already holds two live secrets; revoke one first (credential revoke --secret <id>)`);
+      if (r.status !== "ok") return jsonErr("not_found", `service ${svc.email} has no live credential ${rotate}`, 404);
+      writeAudit(repo, tx, "service.credential_added", authed.user_email, svc.email, { client_id: rotate, secret_id: r.value.secretId, rotation: true });
+      return { service: svc.email, client_id: rotate, client_secret: secret, secret_id: r.value.secretId, source: live.source, token_seconds: live.tokenSeconds };
+    }
+    const clientId = SERVICE_CLIENT_PREFIX + randomBytes(16).toString("hex");
+    const at = (expiresAt as number | undefined) ?? CREDENTIAL_NO_EXPIRY;
+    const r = await repo.oauth.addServiceCredential(tx, { userId: svc.id, clientId, grantId: randomBytes(32).toString("base64url"), resource: mcpResource(config.publicUrl, config.devAuth),
+      source, tokenSeconds: tokenSeconds as number, expiresAt: at, secretHash: hashToken(secret) }, now);
+    if (r.status !== "ok") return conflict(`service ${svc.email} can't take a credential now`);
+    writeAudit(repo, tx, "service.credential_added", authed.user_email, svc.email, { client_id: clientId, secret_id: r.value.secretId, source, token_seconds: tokenSeconds,
+      ...(expiresAt !== undefined ? { expires_at: at } : {}) });
+    return { service: svc.email, client_id: clientId, client_secret: secret, secret_id: r.value.secretId, source, token_seconds: tokenSeconds, ...(expiresAt !== undefined ? { expires_at: at } : {}) };
+  });
+  if (out instanceof Response) return out;
+  return new Response(JSON.stringify(out), { status: 201, headers: { "Content-Type": "application/json", "Cache-Control": "no-store" } });
+}
+
+// Revoke a credential (its grant: every session attached to it ends in this transaction, D2) or, with `secret`, one
+// of its secrets and that secret's tokens, leaving the grant and the sessions that present a token from the other.
+async function adminServiceCredentialRevoke(req: Request, authed: AuthedUser, repo: Repo): Promise<Response> {
+  const body = await parseBody<{ client_id?: unknown; secret?: unknown }>(req);
+  const byClient = typeof body?.client_id === "string" && body.client_id !== "";
+  if (byClient === (body?.secret !== undefined)) return badRequest("give client_id, or secret (a secret's id), not both");
+  if (!byClient && !Number.isSafeInteger(body?.secret)) return badRequest("secret must be a secret's id");
+  return repo.write(async tx => {
+    const now = Date.now();
+    if (byClient) {
+      const clientId = body!.client_id as string;
+      const r = await repo.oauth.revokeServiceCredential(tx, clientId, now);
+      if (r.status !== "ok") return jsonErr("not_found", `no live credential ${clientId}`, 404);
+      const svc = await repo.users.findById(tx, r.value.userId);
+      writeAudit(repo, tx, "service.credential_revoked", authed.user_email, svc?.email ?? null, { client_id: clientId });
+      return json({ ok: true, client_id: clientId });
+    }
+    const secretId = body!.secret as number;
+    const r = await repo.oauth.revokeServiceSecret(tx, secretId, now);
+    if (r.status === "invalid") return conflict(`secret ${secretId} is its credential's only live secret; revoke the credential instead`);
+    if (r.status !== "ok") return jsonErr("not_found", `no live secret ${secretId}`, 404);
+    const svc = await repo.users.findById(tx, r.value.userId);
+    writeAudit(repo, tx, "service.credential_revoked", authed.user_email, svc?.email ?? null, { client_id: r.value.clientId, secret_id: secretId });
+    return json({ ok: true, client_id: r.value.clientId, secret_id: secretId });
   });
 }
 
@@ -970,6 +1054,8 @@ export async function handleHttp(
   if (path === "/api/admin/services/disable" && method === "POST") return adminServiceSetDisabled(req, authed, repo, true, sessions.disconnectUser);
   if (path === "/api/admin/services/enable"  && method === "POST") return adminServiceSetDisabled(req, authed, repo, false, sessions.disconnectUser);
   if (path === "/api/admin/services/delete-alias" && method === "POST") return adminServiceDeleteAlias(req, authed, repo);
+  if (path === "/api/admin/services/credentials" && method === "POST") return adminServiceCredentialAdd(req, authed, repo, config);
+  if (path === "/api/admin/services/credentials/revoke" && method === "POST") return adminServiceCredentialRevoke(req, authed, repo);
 
   return notFound();
 }

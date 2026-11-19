@@ -17,11 +17,31 @@ export type OAuthCode = OAuthAuthorization & { codeHash: string; userId: number;
 export type OAuthGrant = OAuthBinding & {
   id: string; userId: number; createdAt: number; expiresAt: number; revokedAt: number | null;
 };
+// A service credential's session source (#270 D3): which `_meta` key carries its sessions' source.
+export const CREDENTIAL_SOURCES = ["opencode", "generic"] as const;
+export type CredentialSource = (typeof CREDENTIAL_SOURCES)[number];
 export type OAuthAccess = OAuthBinding & {
   tokenHash: string; grantId: string; userId: number; createdAt: number; expiresAt: number;
   // The grant's expiry: the access is live only while both are in the future (#853 caches on it).
   grantExpiresAt: number;
+  // A service credential's source (#270 D3), read in the same join; null for any other client. Immutable after
+  // insert, so the cache may hold it.
+  source: CredentialSource | null;
 };
+// A service credential's client (#270 D2): what client authentication and the mint need, read live.
+export type ServiceCredential = {
+  clientId: string; userId: number; grantId: string; source: CredentialSource; tokenSeconds: number;
+  // Live secrets only: one, or two during a rotation.
+  secrets: { id: number; hash: string }[];
+};
+// A credential's expiry when the admin gives none: past any token's lifetime, so the grant never lapses by time.
+export const CREDENTIAL_NO_EXPIRY = 253_402_300_799_000; // 9999-12-31T23:59:59Z
+// How a run token's mint is bounded (#270 D2, principle 13): its lifetime's ceiling, and per credential a bucket of
+// mints in the last minute and a cap on unexpired tokens, both checked in the insert.
+export type ServiceTokenLimits = { maxSeconds: number; mintsPerMinute: number; unexpired: number };
+export const DEFAULT_SERVICE_TOKEN_LIMITS: ServiceTokenLimits = { maxSeconds: 24 * 60 * 60, mintsPerMinute: 60, unexpired: 1000 };
+// The shortest run-token lifetime: the mint bucket's window, so cleanup never deletes a token the window still counts.
+export const SERVICE_TOKEN_MIN_SECONDS = 60;
 // scopes describes the access token only; refresh permission always remains the original grant scope.
 export type OAuthTokenPair = OAuthBinding & {
   accessHash: string; refreshHash: string; accessExpiresAt: number; refreshExpiresAt: number;
@@ -60,4 +80,18 @@ export interface OAuthStore {
   // `key` so grants those clients issue later survive restarts. Returns the grants revoked; 0 after the first run.
   revokePreBuiltinGrants(tx: Tx, clientIds: readonly string[], now: number, key?: "builtin_clients" | "builtin_clients_cli"): Promise<number>;
   cleanup(tx: Tx, now: number): Promise<void>;
+  // Service credentials (#270 D2). Each write is one transaction with its audit row where the store writes one.
+  // add: the credential, its grant (expiry = the credential's) and its first secret; invalid unless userId is an
+  // enabled service. rotate: a second live secret; not_found unless the credential is live, capacity at two.
+  // revoke: the grant, ending every session attached to it in the transaction. revokeSecret: the secret and its
+  // tokens, not the grant; invalid when it is the credential's only live secret. find: a live credential.
+  addServiceCredential(tx: Tx, input: { userId: number; clientId: string; grantId: string; resource: string; source: CredentialSource; tokenSeconds: number; expiresAt: number; secretHash: string }, now: number): Promise<OAuthResult<{ secretId: number }>>;
+  rotateServiceCredential(tx: Tx, input: { clientId: string; secretHash: string }, now: number): Promise<OAuthResult<{ secretId: number; userId: number }>>;
+  revokeServiceCredential(tx: Tx, clientId: string, now: number): Promise<OAuthResult<{ userId: number }>>;
+  revokeServiceSecret(tx: Tx, secretId: number, now: number): Promise<OAuthResult<{ clientId: string; userId: number }>>;
+  findServiceCredential(r: Read, clientId: string, now: number): Promise<ServiceCredential | undefined>;
+  // One run token under a live credential's grant, minted with a live secret, in one INSERT that also checks the
+  // bucket and the cap (capacity when either is spent); its expiry is the credential's lifetime clamped to
+  // limits.maxSeconds and to the grant's expiry. Audited oauth.token_issued (client, secret_id, expiry).
+  mintServiceToken(tx: Tx, input: { clientId: string; secretId: number; tokenHash: string; scopes: string[]; limits: ServiceTokenLimits }, now: number): Promise<OAuthResult<{ expiresAt: number }>>;
 }
