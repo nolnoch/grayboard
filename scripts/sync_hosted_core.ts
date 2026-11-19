@@ -3,7 +3,8 @@
 // (`::path:adapters/opencode-v2`), which can't reach a sibling directory, so it
 // carries a generated copy; tests/integration/hosted_core_sync.test.ts fails
 // when the copy drifts. Attachment transfers also carry their shared path,
-// digest and deadline helpers. Grant ownership and tool forwarding remain native.
+// digest and deadline helpers, and static mode the endpoint rule its issuer pin
+// shares with hosted core's (#1321). Grant ownership and tool forwarding remain native.
 import { readdirSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { join, resolve } from "node:path";
 
@@ -14,6 +15,7 @@ export const VENDORED = ["port", "wire", "model", "own-human", "sessions", "even
 const SHARED = {
   "../../../src/shared/addressing.ts": ["addressing", "src/shared/addressing.ts"],
   "../../../src/shared/attachments.ts": ["attachment-files", "src/shared/attachments.ts"],
+  "../../../src/shared/endpoint.ts": ["endpoint", "src/shared/endpoint.ts"],
   "../../../src/shared/http.ts": ["http", "src/shared/http.ts"],
   "../../../src/shared/naming.ts": ["naming", "src/shared/naming.ts"],
   "../core/errors.ts": ["attachment-errors", "src/core/errors.ts"],
