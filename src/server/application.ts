@@ -1971,11 +1971,16 @@ async function handleDelegate(hub: Hub, tx: Tx, session: ApplicationSession, m: 
 async function handleRetract(hub: Hub, tx: Tx, session: ApplicationSession, id: number): Promise<{ note?: string }> {
   const { repo, registry } = hub;
   const mine = session.addresses;
-  const m = await repo.messages.getById(tx, id);
-  if (!m) {
+  // When the caller's own retract of the message landed already: its audit row's time.
+  const retractedAt = async (): Promise<number | undefined> => {
     const done = await repo.audit.last(tx, "message.retracted", `message:${id}`);
     const by = done?.detail ? (JSON.parse(done.detail) as { sender?: string }).sender : undefined;
-    if (done && by !== undefined && mine.includes(by)) return { note: alreadyRetracted(done.at) };
+    return done && by !== undefined && mine.includes(by) ? done.at : undefined;
+  };
+  const m = await repo.messages.getById(tx, id);
+  if (!m) {
+    const at = await retractedAt();
+    if (at !== undefined) return { note: alreadyRetracted(at) };
   }
   // Retracted as the address that sent it (S8).
   if (!m || m.recipient_type !== "user" || !mine.includes(m.sender)) return fail("not_found", retractRefusal.notYours(id));
@@ -1983,7 +1988,12 @@ async function handleRetract(hub: Hub, tx: Tx, session: ApplicationSession, id: 
   // The store re-checks what the reads above saw (#807 P3 C5 decision 4): on Postgres a delivery, an ack or a reply can
   // commit after them, so its reason, not the pre-check, picks the refusal.
   const done = await repo.messages.retract(tx, m.sender, id, { actor: session.authed.user_email, session: session.sessionId });
-  if (done === "gone") return fail("not_found", retractRefusal.notYours(id));
+  // Gone since the read: on Postgres, a racing retract by the same sender that committed first answers as a repeat.
+  if (done === "gone") {
+    const at = await retractedAt();
+    if (at !== undefined) return { note: alreadyRetracted(at) };
+    return fail("not_found", retractRefusal.notYours(id));
+  }
   if (done === "read") return fail("bad_request", retractRefusal.reached(id, m.recipient));
   if (done === "replied") return fail("bad_request", retractRefusal.replied(id));
   tx.afterCommit(async () => { await sweepStoredBlobs(repo); });

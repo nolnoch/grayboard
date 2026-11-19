@@ -27,7 +27,11 @@ export interface MessagesStore {
   // parent_id naming no message throws MissingParent (store/errors.ts), each
   // leaving no message row and no bind even when the caller catches it and
   // commits: the store refuses before it writes, or undoes its own write, so a
-  // caller needs no savepoint (#807 P3 C5 decision 8). senderId: the sending
+  // caller needs no savepoint (#807 P3 C5 decision 8). A backend refuses a
+  // missing parent before it runs any statement that could abort the
+  // transaction (Postgres: lock the parent by primary key with FOR KEY SHARE
+  // first; a failed FK insert would leave the caller's commit to fail, so a
+  // classified 23503 is only a backstop; contract row M5). senderId: the sending
   // session's ID (#284); null for a writer with no session. via: the child
   // session that wrote it (#523), else null. senderUser: the writer's
   // signed-in user (security audit F-10), kept out of reads like sender_id.

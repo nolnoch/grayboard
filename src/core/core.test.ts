@@ -676,6 +676,25 @@ test("a lapsed claim is announced on its board once, by the first sweep or takeo
   expect(bodies().slice(-1)).toEqual(["[expired] dev:freeze: not released by be; check with them before relying on it"]);
 });
 
+// #807 P3 C5a F1: a claim key or note written before they refused NUL still announces, its NUL as U+FFFD; a sweep
+// that refused the body would refuse every later take, on any key.
+test("a lapsed claim whose key or note holds a NUL doesn't block a take: the sweep announces it with U+FFFD", () => {
+  subscribe(db, "sim", "e2e", "push");
+  db.prepare(`INSERT INTO claims (key, holder, note, board, acquired_at, expires_at) VALUES (?, 'be', ?, 'e2e', 1, 2)`).run("dev:a\0b", "n\0te");
+  expect(() => claim(db, "fe", "dev:a\0b")).toThrow("claim key contains a NUL character");
+  expect(() => claim(db, "fe", "other", { note: "x\0y" })).toThrow("claim note contains a NUL character");
+  const taken = claim(db, "fe", "unrelated");
+  expect(taken.ok).toBe(true);
+  expect(taken.wake).toContain("sim");
+  const bodies = () => read(db, "sim", "e2e", { before_id: 999 }).posts.map((p) => p.body);
+  expect(bodies().at(-1)).toBe("[expired] dev:a�b: not released by be; check with them before relying on it");
+  // The timer's sweep too.
+  db.prepare(`INSERT INTO claims (key, holder, note, board, acquired_at, expires_at) VALUES (?, 'be', ?, 'e2e', 1, 2)`).run("dev:c\0d", null);
+  expect(sweepExpired(db).wake).toEqual(["sim"]);
+  expect(bodies().at(-1)).toBe("[expired] dev:c�d: not released by be; check with them before relying on it");
+  expect(listClaims(db).map((c) => c.key)).toEqual(["unrelated"]);
+});
+
 test("a claim's watchers are mentioned on its release or expiry, in any mode, once", () => {
   subscribe(db, "sim", "e2e", "quiet"); // fe has no subscription at all
   claim(db, "be", "dev:env", { board: "e2e" });

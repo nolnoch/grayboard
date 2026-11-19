@@ -27,6 +27,11 @@ export function checkBody(body: unknown): string {
   }
   return body;
 }
+
+/** A body the system composed (a claim's announcement, expiry or `[unclaimed]` reply) with each NUL as U+FFFD: its
+ * key or note may come from a row written before claim keys and notes refused NUL, and it must still post, since a
+ * sweep that refused it would refuse every later take (#807 P3 C5a F1). Authors' bodies keep checkBody's refusal. */
+export const systemBody = (body: string): string => body.replaceAll("\0", "\uFFFD");
 // @id:<13 Crockford> (a session, #284), @name, @scope/name, @user@org.com/name.
 // Not preceded by a word char or @, so plain email addresses in prose aren't
 // mentions. A malformed @id:… is the alias "id", as before IDs.
