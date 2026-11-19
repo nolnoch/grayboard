@@ -1493,6 +1493,10 @@ test("a declared launcher is a delegation target, and only its own session's ini
   const info = { identity_full: "you@example.com/lead", teams: [], human: { linked: false } } as never;
   expect(hostedBoundInstruction(info, undefined, true, true)).toContain("You're a launcher session");
   expect(hostedBoundInstruction(info)).not.toContain("You're a launcher session");
+  // A service's launcher names its own service's handles, not "your own user's" (#1327); a person's keeps its text.
+  expect(hostedBoundInstruction(info, undefined, true, true, true)).toContain("from one of your own service's handles (never its owner's or an invoker's)");
+  expect(hostedBoundInstruction(info, undefined, true, true, true)).not.toContain("your own user's handle");
+  expect(hostedBoundInstruction(info, undefined, true, true)).toContain("from your own user's handle");
   // The requester is a third session of the same user: the declared launcher takes the request, the other is not a target.
   await hosted.bind(generic, ctx("req-root"), { name: "req", create: true });
   const result = await hosted.run(generic, ctx("req-root"), "delegate", (session, tx) => application.delegate(tx, session, { persona: "researcher", task: "inspect it" }));

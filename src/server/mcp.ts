@@ -610,7 +610,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
   // The bound text follows the ownership: its launcher flag, and (with no declaration) its lease (#531).
   function boundInstruction(context: Context): string {
     if (!("id" in context.sessionContext) || !context.instruction) return hostedBoundInstruction(context.info, context.declared);
-    return hostedBoundInstruction(context.info, context.declared, context.instruction.launcher, context.instruction.leased);
+    return hostedBoundInstruction(context.info, context.declared, context.instruction.launcher, context.instruction.leased, context.principal.authed.kind === "service");
   }
   function makeServer(context: Context, legacy?: Legacy) {
     const { role, info } = context;
