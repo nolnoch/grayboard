@@ -4,7 +4,7 @@
 // the credential's expiry is its grant's; a token is re-read on every call; revoke and disable end sessions in their
 // transaction; a principal's kind and a credential's source never change after insert.
 import { Database } from "bun:sqlite";
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -227,6 +227,117 @@ describe("the token route", () => {
     expect((await mint(srv.base, c.client_id, c.client_secret)).status).toBe(200);
     for (let i = 0; i < 5; i++) expect(await mint(srv.base, c.client_id, c.client_secret)).toEqual({ status: 429, body: { error: "slow_down" } });
     expect(accessAudits(srv.app.db, "oauth.request_refused").map(r => r.detail)).toEqual([{ code: "slow_down", status: 429 }]);
+  });
+
+  // The backoff's clock and sweep (#1282 L-3), under a test clock: the server's OAuth time is `clock`, and `tick` is the
+  // OAuth sweep's timer callback, run by hand.
+  let clock = 0;
+  const clocked = async (serviceTokens: Config["serviceTokens"]) => {
+    await srv?.stop();
+    clock = Date.now();
+    const interval = spyOn(globalThis, "setInterval");
+    try {
+      srv = new TestServer({ admins: [ROOT], hostedRequestLimit: LIMIT, serviceTokens }, { oauth: { now: () => clock } });
+      // The OAuth server's timer is the first minute-long one startServer sets (oauth.ts, before the hosted MCP's).
+      return interval.mock.calls.find(([, ms]) => ms === 60_000)![0] as () => void;
+    } finally { interval.mockRestore(); }
+  };
+  // A cap of one live token at a rate whose hold is 60 ms: refusals outlast any hold, so the clock alone moves a
+  // retry from a hold to a probe and from a streak to a new one.
+  const CAPPED = { maxSeconds: 86_400, mintsPerMinute: 1000, unexpired: 1 };
+  const slow = { status: 429, body: { error: "slow_down" } }, slowRow = { code: "slow_down", status: 429 };
+  const rows = () => accessAudits(srv.app.db, "oauth.request_refused").map(r => r.detail);
+  // Mint A paused inside its probe (at the store write's pause point), and mint B sent while it waits: `reached` says
+  // whether B got as far as the store's write too, or answered before it.
+  async function overlapping(c: Credential): Promise<{ a: Minted; b: Minted; reached: boolean }> {
+    const point = "oauth:mint:before-write", hit = `[grayboard] test pause hit: ${point}`;
+    const dir = mkdtempSync(join(tmpdir(), "gb-probe-")), file = join(dir, "release");
+    let hits = 0, settled = false;
+    const log = spyOn(console, "error").mockImplementation((m: unknown) => { if (m === hit) hits++; });
+    process.env.BUS_TEST_PAUSE = point; process.env.BUS_TEST_PAUSE_FILE = file;
+    const a = mint(srv.base, c.client_id, c.client_secret);
+    let b: Promise<Minted> | undefined;
+    try {
+      await until(() => hits === 1, 5000, "mint A reaches its store write");
+      b = mint(srv.base, c.client_id, c.client_secret);
+      void b.then(() => { settled = true; }, () => { settled = true; });
+      await until(() => settled || hits === 2, 5000, "mint B answers or reaches the store's write");
+      const reached = hits === 2;
+      writeFileSync(file, "release");
+      return { a: await a, b: await b, reached };
+    } finally {
+      writeFileSync(file, "release"); await Promise.allSettled([a, b]);
+      delete process.env.BUS_TEST_PAUSE; delete process.env.BUS_TEST_PAUSE_FILE;
+      log.mockRestore(); rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  test("a success ends a credential's hold: a new exhaustion within a minute writes its own row (#1282 L-3)", async () => {
+    await clocked({ maxSeconds: 86_400, mintsPerMinute: 1, unexpired: 1000 });
+    const root = await service();
+    const c = await credential(root);
+    expect((await mint(srv.base, c.client_id, c.client_secret)).status).toBe(200);
+    expect(await mint(srv.base, c.client_id, c.client_secret)).toEqual(slow);
+    // Past the hold and the bucket's minute: the probe mints, and the next mint exhausts the bucket afresh.
+    clock += 61_000;
+    expect((await mint(srv.base, c.client_id, c.client_secret)).status).toBe(200);
+    expect(await mint(srv.base, c.client_id, c.client_secret)).toEqual(slow);
+    // A new streak, not the old one's tail: it starts with its own row.
+    expect(rows()).toEqual([slowRow, slowRow]);
+  });
+
+  test("a streak ends a minute past its hold: a refusal after that writes a row (#1282 L-3)", async () => {
+    await clocked(CAPPED);
+    const root = await service();
+    const c = await credential(root);
+    expect((await mint(srv.base, c.client_id, c.client_secret)).status).toBe(200);
+    expect(await mint(srv.base, c.client_id, c.client_secret)).toEqual(slow);
+    // Within a minute of the hold: the same streak, no row.
+    clock += 30_000;
+    expect(await mint(srv.base, c.client_id, c.client_secret)).toEqual(slow);
+    expect(rows()).toEqual([slowRow]);
+    // More than a minute past the last hold: a new streak.
+    clock += 60_100;
+    expect(await mint(srv.base, c.client_id, c.client_secret)).toEqual(slow);
+    expect(rows()).toEqual([slowRow, slowRow]);
+  });
+
+  test("requests during a credential's probe answer slow_down from memory: one store write, one row (#1282 L-2)", async () => {
+    await clocked(CAPPED);
+    const root = await service();
+    const c = await credential(root);
+    const first = await token(srv.base, c);
+    expect(await mint(srv.base, c.client_id, c.client_secret)).toEqual(slow);
+    // Past the streak, so the probe starts a new one: each request that reached the store would write its own row.
+    clock += 61_000;
+    const { a, b, reached } = await overlapping(c);
+    expect(reached).toBe(false);
+    expect(b).toEqual(slow);
+    expect(a).toEqual(slow);
+    expect(rows()).toEqual([slowRow, slowRow]);
+    // The probe's refusal cleared its marker: with the cap freed and the hold ended, the next mint reaches the store.
+    const r = await fetch(`${srv.base}/oauth/revoke`, { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded", Authorization: `Basic ${btoa(`${c.client_id}:${c.client_secret}`)}` },
+      body: new URLSearchParams({ token: first }) });
+    expect(r.status).toBe(200);
+    expect((await mint(srv.base, c.client_id, c.client_secret)).status).toBe(200);
+  });
+
+  test("a first mint isn't single-flighted, and the sweep returns a credential to that once its streak is over (#1282 L-3)", async () => {
+    const tick = await clocked(CAPPED);
+    const root = await service();
+    const c = await credential(root);
+    // A credential with no hold: a fleet's concurrent mints each go to the store.
+    let m = await overlapping(c);
+    expect(m.reached).toBe(true);
+    expect([m.a.status, m.b.status].sort()).toEqual([200, 429]);
+    // A minute and more past its hold, the sweep drops the credential's entry, and its mints are first mints again.
+    clock += 61_000;
+    tick();
+    m = await overlapping(c);
+    expect(m.reached).toBe(true);
+    expect([m.a, m.b]).toEqual([slow, slow]);
+    // Two concurrent refusals, one streak: the first sets the hold, the second reads it and writes no row (#1287 L-1).
+    expect(rows()).toEqual([{ code: "slow_down", status: 429 }, { code: "slow_down", status: 429 }]);
   });
 
   test("a credential's secret only in the Basic header: a form secret or no secret is refused", async () => {
