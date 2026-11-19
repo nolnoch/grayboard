@@ -1,7 +1,8 @@
-// The Postgres stores' hosted port (src/server/store/pg/hosted_port.ts) as a recorder, for the OAuth store's tests
-// (#807 P3 C4b) until C8's implementation over hosted_sessions exists.
+// The Postgres stores' ports (src/server/store/pg/hosted_port.ts) as recorders: the hosted ends, for the OAuth and
+// identity stores' tests (#807 P3 C4b), which exercise their callers rather than the hosted store; and the session end
+// the hosted store ends a child's ID through (#807 P3 C8b1), until C10d2's.
 import type { Tx } from "../../src/server/store/tx_base.ts";
-import type { PgHostedEnds } from "../../src/server/store/pg/hosted_port.ts";
+import type { PgHostedEnds, PgSessionEndPort } from "../../src/server/store/pg/hosted_port.ts";
 import { pgOf } from "../../src/server/store/pg/tx.ts";
 
 // The hosted port as a recorder: each call checks, on the Tx it was handed, that it runs inside the body after the
@@ -39,4 +40,22 @@ export function hostedRecorder() {
     },
   };
   return { port, ended, problems, failNext() { fail = true; } };
+}
+
+// The session end as a recorder (#807 P3 C8 decision 4): marks the ID's `ids.ended_at` on the caller's Tx, as core
+// endSession does, and wakes nobody. An ID already ended isn't ended again; one with no ids row ends (endSession's
+// rule). `calls` lists every call, committed or not, in order.
+export function sessionEndRecorder() {
+  const calls: { id: string; why: string; now: number }[] = [];
+  const port: PgSessionEndPort = {
+    async end(tx, id, { why, now }) {
+      const sql = pgOf(tx);
+      calls.push({ id, why, now });
+      const [row] = await sql`SELECT ended_at FROM ids WHERE id = ${id} FOR UPDATE`;
+      if (row && row.ended_at !== null) return { ended: false, held: [], wake: [] };
+      await sql`UPDATE ids SET ended_at = ${now} WHERE id = ${id}`;
+      return { ended: true, held: [], wake: [] };
+    },
+  };
+  return { port, calls };
 }

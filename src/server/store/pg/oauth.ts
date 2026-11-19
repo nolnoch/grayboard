@@ -16,7 +16,7 @@
 //   OAuthFailure; oauth.ts's fail() throws and rolls the whole body back), so a store throw rolls back with the
 //   caller's transaction, which the SQLite savepoint gives only per method. A caller that ever catches and commits
 //   needs one here first.
-// - A revoked grant's hosted sessions end through the injected port (pg/hosted_port.ts; C8 implements it), after the
+// - A revoked grant's hosted sessions end through the injected port (pg/hosted_port.ts, makePgHostedEnds), after the
 //   UPDATE that revoked it.
 // - `data` columns are jsonb and take the object itself; oauth_tokens.access_scopes stays text (D6), written as
 //   JSON.stringify of the scopes and parsed on read.
@@ -99,7 +99,7 @@ export function makePgOAuth({ hosted }: { hosted: PgHostedEnds }): OAuthStore {
       VALUES (${p.accessHash}, ${id}, 'access', ${p.accessExpiresAt}, ${now}, ${JSON.stringify(p.scopes)}),
              (${p.refreshHash}, ${id}, 'refresh', ${p.refreshExpiresAt}, ${now}, NULL)`;
   };
-  // The grant's revoke, then its hosted sessions' end (C8's port), in the caller's transaction.
+  // The grant's revoke, then its hosted sessions' end (the hosted port), in the caller's transaction.
   const revokeGrant = async (tx: Tx, id: string, now: number) => {
     await pgOf(tx)`UPDATE oauth_grants SET revoked_at = ${now} WHERE id = ${id} AND revoked_at IS NULL`;
     await hosted.endForGrant(tx, id, now);
