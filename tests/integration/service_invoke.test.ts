@@ -533,6 +533,31 @@ describe("a claim's renewal and release announced on a service's board are invoc
       expect(eng, route).not.toBe(bindings.bob);
     }
   });
+  test("each announcement's invocation row names the post that exercised the grant, as board_post's does (#1261)", async () => {
+    await cast();
+    const bob = await srv.hosted(B, "fe");
+    sessions.push(bob);
+    const body = (id: unknown) => (srv.app.db.query("SELECT body FROM posts WHERE id = ?").get(id as number) as { body: string } | null)?.body;
+    const routes = {
+      mcp: (tool: string, args: Record<string, unknown>) => bob.call(tool, args).then(() => 200),
+      http: async (tool: string, args: Record<string, unknown>) => (await api(tokens[B]!, "POST", "/api/claims/call", { as: `${B}/fe`, tool, args })).status,
+    };
+    for (const [route, call] of Object.entries(routes)) {
+      const key = `ticket:POST-${route}`;
+      const steps: [string, Record<string, unknown>, string][] = [
+        ["claim_take", { key, board: "jobs", note: "start" }, `[claim] ${key}`],
+        ["claim_take", { key, note: "halfway" }, `[update] ${key}`],
+        ["claim_release", { key, note: "done" }, `[release] ${key}`],
+      ];
+      for (const [tool, args, prefix] of steps) {
+        const before = invokes().length;
+        expect(await call(tool, args), `${route} ${prefix}`).toBe(200);
+        const rows = invokes().slice(before);
+        expect(rows, `${route} ${prefix}`).toHaveLength(1);
+        expect(body(rows[0]!.detail.post_id), `${route} ${prefix}`).toStartWith(prefix);
+      }
+    }
+  });
 });
 
 describe("an ID is judged as its session's primary alike on every route (audit F5)", () => {

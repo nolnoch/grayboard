@@ -2015,9 +2015,9 @@ async function handleCall(hub: Hub, tx: Tx, session: ApplicationSession, tool: s
   }
   // Each claim announcement on a service's board is an invocation (#1259), recorded with its post for the address
   // it posts as: the take's decision above when that's the actor on the named board, else the poster's own.
-  const announced = async (sp: Tx, as: string, board: string) => {
+  const announced = async (sp: Tx, as: string, board: string, postId: number) => {
     const a = inv && as === actor && inv.req.board === board ? inv : await invocation(repo, sp, as, board);
-    if (a?.d.allow) recordDecision(repo, sp, sessionActor(session, as), a.req, a.d);
+    if (a?.d.allow) recordDecision(repo, sp, sessionActor(session, as), a.req, a.d, { post_id: postId });
   };
   let outcome;
   try { outcome = await callBoardTool(repo, hub.access, tx, actor, tool, rest, { ...ctx, ...(session.readOnly ? { principal: userOf(session) } : {}), announced }); }
