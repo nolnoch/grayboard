@@ -80,6 +80,12 @@ describe("an ID is judged as its session's primary on every scoped board (#1255)
     const listed = JSON.stringify(await build.call("peer_list", { include_offline: true }));
     expect(listed).toContain("qa/ops");
     for (const leak of ["qa-room", "qa task", "qa desc", "qa status"]) expect(listed, leak).not.toContain(leak);
+    // An eng sibling's labels and status stay visible to it: a team principal acts in its own team's scope.
+    const b2 = await hosted("eng/b2");
+    await b2.call("bind", { name: "eng/b2", meta: { task: "eng task", description: "eng desc" } });
+    await b2.call("peer_status", { text: "eng status" });
+    const eng = JSON.stringify(await build.call("peer_list", { include_offline: true }));
+    for (const label of ["eng task", "eng desc", "eng status"]) expect(eng, label).toContain(label);
     // The control: a person-scoped session of bob's sees them.
     const fe = await hosted("fe");
     const all = JSON.stringify(await fe.call("peer_list", { include_offline: true }));

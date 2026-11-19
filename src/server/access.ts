@@ -266,8 +266,12 @@ export function boardAccess(repo: Repo, humanReach: HumanReach = "team"): BoardA
     if (p === null || scope.scope_ref === null) return false;
     return (await authorize(repo, r, {}, { verb: "alias.see", principal: p, scope: { scope_kind: scope.scope_kind, scope_ref: scope.scope_ref } })).allow;
   };
-  const seesMetaOf = async (r: Read, p: Principal | null, scope: AliasScopeOf): Promise<boolean> =>
-    p !== null && scope.scope_ref !== null && actsIn(r, p, { scope_kind: scope.scope_kind, scope_ref: scope.scope_ref });
+  // A team principal acts in its own team's scope and no other (scope.act is a user's verb), as principalSees rules.
+  const seesMetaOf = async (r: Read, p: Principal | null, scope: AliasScopeOf): Promise<boolean> => {
+    if (p === null || scope.scope_ref === null) return false;
+    if (p.kind === "team") return scope.scope_kind === "team" && p.name === scope.scope_ref;
+    return actsIn(r, p, { scope_kind: scope.scope_kind, scope_ref: scope.scope_ref });
+  };
   // `primary`: which scope kinds judge an ID as its session's primary (seerIn) rather than its user.
   const byScope = (rule: (r: Read, p: Principal | null, s: AliasScopeOf) => Promise<boolean>, primary: (kind: AliasScopeOf["scope_kind"]) => boolean) =>
     async (r: Read, viewer: string, scopes: AliasScopeOf[]): Promise<Map<string, boolean>> => {
