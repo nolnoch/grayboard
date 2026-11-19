@@ -37,6 +37,11 @@ import { accessFits, accessLookup, BROWSER_SESSIONS, browserData, browserSession
 import { AuthorityLost, LastOwner, MissingParent, PrincipalTaken } from "./store/errors.ts";
 import type { Alias, AliasesStore } from "./store/aliases.ts";
 import type { MessageRow, MessagesStore, RetractResult } from "./store/messages.ts";
+import type { CursorsStore } from "./store/cursors.ts";
+import type { WriteReceipt, WriteReceiptsStore } from "./store/write_receipts.ts";
+import type { AccessLogRow, AuditStore } from "./store/audit.ts";
+import type { SlackLink, SlackStore, SlackThread } from "./store/slack.ts";
+import { jsonTextSafe, textSafeOrNull } from "./store/json_safe.ts";
 import { DEV_SESSION_LABEL, TEAM_POLICIES, type User, type IdpSignIn, type Session, type PrincipalRow, type Team, type TeamPolicy, type TeamMember, type RoleBinding, type InvokeBinding, type RoleAuthority, type RoleRevoke, type MemberAuthority, type MemberRemoval, type ServiceRow, type UsersStore, type SessionsStore, type PrincipalsStore, type TeamsStore, type RolesStore, type ServicesStore } from "./store/identity.ts";
 // The identity groups' row types and interfaces live in store/identity.ts for the Postgres store (#807 P3 C3a);
 // re-exported for every importer.
@@ -45,6 +50,11 @@ export type { User, IdpSignIn, Session, PrincipalRow, Team, TeamPolicy, TeamRole
 // The aliases and messages groups' row types and interfaces live in store/aliases.ts and store/messages.ts (#807 P3 C5a).
 export type { Alias, AliasTarget, AliasesStore, AliasScopeRow } from "./store/aliases.ts";
 export type { MessageRow, MessageFiles, ServicePost, RetractResult, MessagesStore } from "./store/messages.ts";
+// The cursors, write receipts, audit and Slack groups' in store/cursors.ts, write_receipts.ts, audit.ts and slack.ts (#807 P3 C67a).
+export type { CursorStream, CursorsStore } from "./store/cursors.ts";
+export type { WriteReceipt, WriteReceiptKey, WriteReceiptsStore } from "./store/write_receipts.ts";
+export type { AccessLogRow, AuditStore } from "./store/audit.ts";
+export type { SlackLink, SlackThread, SlackStore } from "./store/slack.ts";
 
 // Row types
 // Every read of a user row goes through this, so `kind` is never missing (a "SELECT *" would type-check without it).
@@ -60,20 +70,6 @@ export const USER_BY_ID_SQL = `${USER_SQL} WHERE u.id = ?`;
 export function participant(m: MessageRow | undefined, me: string[]): m is MessageRow {
   return !!m && m.recipient_type === "user" && (me.includes(m.sender) || me.includes(m.recipient));
 }
-// A user's Slack link: their member ID and their DM with the bridge's app.
-export type SlackLink = { user_id: number; email: string; slack_user: string; dm_channel: string; linked_at: number };
-// thread_ts: the Slack top-level message. root_id: the grayboard thread's root
-// (message id for dm, post id for board). peer: the other party in a dm.
-// last_id: the newest grayboard id in the thread, the parent for a reply.
-export type SlackThread = { thread_ts: string; kind: "dm" | "board"; board: string | null; root_id: number; peer: string | null; last_id: number };
-export type AccessLogRow = { at: number; actor: string | null; action: string; target: string | null; detail: string | null };
-// An append write's receipt (#254, src/server/write_dedup.ts): which row the
-// first call made and the result it answered, so a repeat replays it.
-export type WriteReceipt = {
-  session: string; sender: string; fp: string; tool: string;
-  ref_kind: "message" | "post"; ref_id: number; result_json: string; at: number;
-};
-export type WriteReceiptKey = Pick<WriteReceipt, "session" | "sender" | "fp">;
 
 // A message's columns as readers see them. sender_id (#284) is the sending
 // session's provenance, kept in the database and left out of reads and pushes;
@@ -443,64 +439,10 @@ export interface Repo {
   coreOn(h: Read): CoreDb;
   // Closes the database: the reader, then the writer (#807 P1c-15c-2: the server holds no raw connection to close).
   close(): void;
-  // Read points (#284), keyed by the reading address: how far it has
-  // received a stream (its direct messages, stream_ref = the address itself).
-  cursors: {
-    get(r: Read, address: string, streamType: "direct" | "team", streamRef: string): Promise<number>;
-    // How far an address has received its direct messages.
-    directFor(r: Read, address: string): Promise<number>;
-    advance(tx: Tx, address: string, streamType: "direct" | "team", streamRef: string, messageId: number): Promise<void>;
-  };
-  audit: {
-    // Synchronous on every store (#807 P3 A6h): writeAudit and recordDecision call it at ~100 sites, many in
-    // synchronous code inside a body. The row joins tx's transaction: it commits and rolls back with it (a savepoint's
-    // with the savepoint), and `last` on the same tx sees it. A store whose statements are async (Postgres) buffers
-    // the row on tx and inserts the buffer inside the transaction before COMMIT, never after; its `last` answers the
-    // newest row by (at, id) across the buffer and the table.
-    write(tx: Tx, row: AccessLogRow): void;
-    // The most recent row for this action+target, for dedup windows and
-    // "has this happened recently" checks. Undefined when none exists.
-    last(r: Read, action: string, target: string): Promise<AccessLogRow | undefined>;
-    prune(tx: Tx, olderThanMs: number): Promise<void>;
-  };
-  slack: {
-    links(r: Read): Promise<SlackLink[]>;
-    // application.helloFacts reads it on the caller's handle; delegate reads it before core's
-    // resolveDelegationWith decides (#807 P3 A7i).
-    linkFor(r: Read, userId: number): Promise<SlackLink | undefined>;
-    linkBySlackUser(r: Read, slackUser: string): Promise<SlackLink | undefined>;
-    // Replaces the user's earlier link, if any.
-    link(tx: Tx, userId: number, slackUser: string, dmChannel: string): Promise<void>;
-    // Also forgets the user's thread map.
-    unlink(tx: Tx, userId: number): Promise<void>;
-    thread(r: Read, userId: number, kind: "dm" | "board", board: string | null, rootId: number): Promise<SlackThread | undefined>;
-    threadByTs(r: Read, userId: number, threadTs: string): Promise<SlackThread | undefined>;
-    addThread(tx: Tx, userId: number, t: SlackThread): Promise<void>;
-    // Moves a thread's reply target forward, never back; a DM item's sender becomes its peer (#524).
-    advanceThread(tx: Tx, userId: number, threadTs: string, id: number, peer?: string): Promise<void>;
-    // How far an outbound item got in Slack, keyed by its grayboard ref
-    // ("dm:<message id>" or "post:<post id>"); cleared once it's done.
-    progress(r: Read, userId: number, ref: string): Promise<unknown>;
-    setProgress(tx: Tx, userId: number, ref: string, progress: unknown): Promise<void>;
-    clearProgress(tx: Tx, userId: number, ref: string): Promise<void>;
-  };
-  writeReceipts: {
-    // The receipt for (session, sender, fp) written after `since`.
-    find(r: Read, session: string, sender: string, fp: string, since: number): Promise<WriteReceipt | undefined>;
-    // Takes (session, sender, fp) for a write about to run, as a placeholder the write's `upsert` fills in the same
-    // transaction; false when a receipt for it exists (D3: one statement, so of two identical calls one claims it).
-    claim(tx: Tx, key: WriteReceiptKey, tool: string, at: number): Promise<boolean>;
-    // Takes over the receipt for `key` only while it still names `stale` (a row since retracted or pruned, #306);
-    // false when another call replaced it first.
-    reclaim(tx: Tx, key: WriteReceiptKey, stale: { ref_kind: "message" | "post"; ref_id: number }, at: number): Promise<boolean>;
-    // Replaces any receipt for the same (session, sender, fp).
-    upsert(tx: Tx, r: WriteReceipt): Promise<void>;
-    // Whether the row a receipt names still exists (a retract or retention removes it).
-    refExists(r: Read, kind: "message" | "post", id: number): Promise<boolean>;
-    // Deletes receipts written at or before `before`: one session's, or all. Returns how many.
-    pruneSession(tx: Tx, session: string, before: number): Promise<number>;
-    prune(tx: Tx, before: number): Promise<number>;
-  };
+  cursors: CursorsStore;
+  audit: AuditStore;
+  slack: SlackStore;
+  writeReceipts: WriteReceiptsStore;
   // The database file's free pages (#137).
   storage: {
     // Returns up to `maxPages` (> 0) free pages to the filesystem with
@@ -966,10 +908,13 @@ function initSchema(db: Database): void {
 /**
  * Every access_log row goes in here: it stamps the client address, user agent
  * and OAuth client of the request whose handling wrote it (security audit F-19).
+ * NUL and lone surrogates in actor, target and detail's strings are stored as U+FFFD (#807 P3 C7 decision 3), as
+ * the Postgres store's pg/audit_row.ts will store them (C67b).
  */
-function insertAudit(db: Database, at: number, actor: string | null, action: string, target: string | null, detail: string | null): void {
+export function insertAudit(db: Database, at: number, actor: string | null, action: string, target: string | null, detail: string | null): void {
   const o = requestOrigin();
-  db.run("INSERT INTO access_log (at, actor, action, target, detail, ip, ua, client_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", [at, actor, action, target, detail, o?.ip ?? null, o?.ua ?? null, o?.client_id ?? null]);
+  db.run("INSERT INTO access_log (at, actor, action, target, detail, ip, ua, client_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    [at, textSafeOrNull(actor), action, textSafeOrNull(target), detail === null ? null : jsonTextSafe(detail), o?.ip ?? null, o?.ua ?? null, o?.client_id ?? null]);
 }
 
 // #284's seeds, inside the schema transaction. Principals follow users and
@@ -2065,12 +2010,16 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       async last(r, action, target) {
         return sqliteOf(r).query<AccessLogRow, [string, string]>(ACCESS_LOG_LAST_SQL).get(action, target) ?? undefined;
       },
+      // The single writer serializes every body already.
+      async lock(tx) { sqliteOf(tx); },
       async prune(tx, olderThanMs) {
         sqliteOf(tx).run("DELETE FROM access_log WHERE at < ?", [olderThanMs]);
       },
     },
 
     slack: {
+      // The single writer serializes every body already.
+      async lock(tx) { sqliteOf(tx); },
       async links(r) {
         const db = sqliteOf(r);
         return db.query<SlackLink, []>(
@@ -2153,7 +2102,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
         db.run(
           `INSERT INTO slack_progress (user_id, ref, progress) VALUES (?, ?, ?)
            ON CONFLICT(user_id, ref) DO UPDATE SET progress = excluded.progress`,
-          [userId, ref, JSON.stringify(progress)],
+          [userId, ref, jsonTextSafe(JSON.stringify(progress))],
         );
       },
       async clearProgress(tx, userId, ref) {

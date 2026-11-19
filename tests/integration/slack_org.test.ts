@@ -660,6 +660,110 @@ test("#807 P1c-13: link and unlink read and write the human alias on their body'
   expect(checks.map(c => `${c.op}:${c.handle}:${c.inTxn}`)).toEqual(["create:tx:true", "forget:tx:true", "markHuman:tx:true", "lock.delete:tx:true", "remove:tx:true", "forget:tx:true"]);
 });
 
+// #807 P3 C7 decision 4: every link write takes the Slack link lock first in its body, before the reads it decides on
+// (on Postgres one advisory lock; a no-op on SQLite, so only the call order shows it). C67b's pg/slack.pg.test.ts runs
+// the races the lock closes.
+test("#807 P3 C7: link and unlink take the Slack link lock before their first Slack read in the body", async () => {
+  const repo = srv.app.repo;
+  const calls: string[] = [];
+  const spies = (["lock", "linkFor", "linkBySlackUser", "link", "unlink"] as const).map((name) => {
+    const original = (repo.slack[name] as (...a: unknown[]) => unknown).bind(repo.slack);
+    return spyOn(repo.slack, name).mockImplementation(((r: unknown, ...rest: unknown[]) => {
+      if (r !== repo.read) calls.push(name);
+      return original(r, ...rest);
+    }) as never);
+  });
+  try {
+    const alice = await login("alice@example.com");
+    let start = calls.length;
+    await link(alice);
+    // linkUser's write: the lock, then the account's and the user's link reads, then the link.
+    expect(calls.slice(start, start + 4)).toEqual(["lock", "linkBySlackUser", "linkFor", "link"]);
+    // The HTTP unlink.
+    start = calls.length;
+    expect((await api(alice, "POST", "/api/slack/unlink")).status).toBe(200);
+    expect(calls.slice(start)).toEqual(["lock", "linkFor", "unlink"]);
+    // The Slack `unlink` command, which names its account.
+    await link(alice);
+    start = calls.length;
+    slack.say("unlink");
+    await until(() => slack.posts().find((p) => p.markdown_text?.startsWith("Unlinked from `alice@example.com`")));
+    expect(calls.slice(start)).toEqual(["lock", "linkFor", "unlink"]);
+  } finally { for (const s of spies) s.mockRestore(); }
+});
+
+// #807 P3 C7 decision 5: the owed bridge notice locks its (action, target) only once it found a live, unsuppressed
+// stop, before it reads the last notice; the Slack stop takes the same lock per linked user before its own read.
+test("#807 P3 C7: the owed bridge notice and the bridge stop take the notice lock before reading the last notice", async () => {
+  const repo = srv.app.repo;
+  const calls: string[] = [];
+  const target = "alice@example.com/human";
+  const spies = (["lock", "last"] as const).map((name) => {
+    const original = (repo.audit[name] as (...a: unknown[]) => unknown).bind(repo.audit);
+    return spyOn(repo.audit, name).mockImplementation(((r: unknown, action: string, t: string, ...rest: unknown[]) => {
+      if (action.startsWith("bridge.") && t === target) calls.push(`${name} ${action}`);
+      return original(r, action, t, ...rest);
+    }) as never);
+  });
+  try {
+    const alice = await login("alice@example.com");
+    await link(alice);
+    // No stop: the bind reads it and locks nothing.
+    let start = calls.length;
+    await srv.appSession(alice, "be").connect();
+    expect(calls.slice(start)).toEqual(["last bridge.stopped"]);
+    // The stop: lock, then the last notice, per linked user.
+    start = calls.length;
+    srv.app.slack!.stop({ fatal: true, detail: "first fatal" });
+    await repo.write(() => {});
+    expect(calls.slice(start)).toEqual(["lock bridge.notified", "last bridge.notified"]);
+    // A live stop: the bind locks before it reads the last notice, delivers it; the next bind locks, reads it, and
+    // owes nothing.
+    for (const name of ["fe", "qa"]) {
+      start = calls.length;
+      await srv.appSession(alice, name).connect();
+      expect(calls.slice(start)).toEqual(["last bridge.stopped", "lock bridge.notified", "last bridge.stopped", "last bridge.notified"]);
+    }
+    expect(accessAudits(srv.app.db, "bridge.notified")).toHaveLength(1);
+    // A second stop inside the dedup window is suppressed: a bind reads it and locks nothing.
+    const { SlackBridge } = await import("../../src/server/slack.ts");
+    const second = new SlackBridge({ repo, application: srv.app.application, appToken: "xapp-1-t", botToken: "xoxb-t", apiUrl: slack.api });
+    await second.start();
+    second.stop({ fatal: true, detail: "second fatal" });
+    await repo.write(() => {});
+    start = calls.length;
+    await srv.appSession(alice, "sim").connect();
+    expect(calls.slice(start)).toEqual(["last bridge.stopped"]);
+  } finally { for (const s of spies) s.mockRestore(); }
+});
+
+// #807 P3 C7 decision 5: the owed notice re-reads the stop under the lock, so a stop written between its first read and
+// the lock (another bridge's, committed while this bind waited) is the one it reports and marks delivered.
+test("#807 P3 C7: the owed bridge notice reports the stop written before its lock, not the one it first read", async () => {
+  const repo = srv.app.repo;
+  const target = "alice@example.com/human";
+  const alice = await login("alice@example.com");
+  await link(alice);
+  srv.app.slack!.stop({ fatal: true, detail: "first fatal" });
+  await until(async () => !!(await repo.audit.last(repo.read, "bridge.stopped", target)), 5000, "the first stop's row");
+  const first = (await repo.audit.last(repo.read, "bridge.stopped", target))!;
+  const later = first.at + 1000;
+  const original = repo.audit.lock.bind(repo.audit);
+  const lock = spyOn(repo.audit, "lock").mockImplementation(async (tx, action, t) => {
+    if (action === "bridge.notified" && t === target) {
+      repo.audit.write(tx, { at: later, actor: null, action: "bridge.stopped", target, detail: JSON.stringify({ at: "2099-01-01T00:00:00.000Z", reason: "second fatal" }) });
+    }
+    return original(tx, action, t);
+  });
+  try {
+    const hello = await srv.appSession(alice, "be").connect();
+    const notices = (hello.bind?.notices ?? []).filter((n) => n.includes("your Slack bridge stopped"));
+    expect(notices).toEqual([expect.stringContaining("stopped at 2099-01-01T00:00:00.000Z (second fatal)")]);
+  } finally { lock.mockRestore(); }
+  const notified = await repo.audit.last(repo.read, "bridge.notified", target);
+  expect(JSON.parse(notified!.detail!).stopped_at).toBe("2099-01-01T00:00:00.000Z");
+});
+
 // #807 P1c-14b: the link's newest-message read (where the new human's cursor starts) and the Slack receipt's
 // message read run on their body's Tx.
 test("#807 P1c-14b: link and the Slack receipt read messages on their body's Tx", async () => {

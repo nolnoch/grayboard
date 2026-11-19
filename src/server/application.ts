@@ -401,9 +401,23 @@ const uploaderOf = (s: ApplicationSession): Uploader => ({ addresses: s.addresse
 
 // The audit log keeps an undelivered bridge death owed across restarts.
 // Selection reads and records delivery in one bind body, which holds the write queue across its awaits (#807 D4),
-// so only one agent gets it.
+// so only one agent gets it; on a store with more than one writer, the lock before the notified read does (#807 P3 C7
+// decision 5). It's taken only when a notice may be owed, so an ordinary bind locks nothing.
 async function owedBridgeNotice(repo: Repo, tx: Tx, email: string): Promise<string | undefined> {
   const target = `${email}/${HUMAN_NAME}`;
+  if (!await liveBridgeStop(repo, tx, target)) return undefined;
+  await repo.audit.lock(tx, "bridge.notified", target);
+  // Re-read under the lock: a stop written between the first read and the lock is the one owed.
+  const stop = await liveBridgeStop(repo, tx, target);
+  if (!stop) return undefined;
+  const notified = await repo.audit.last(tx, "bridge.notified", target);
+  if (notified && notified.at >= stop.at) return undefined;
+  writeAudit(repo, tx, "bridge.notified", null, target, { at: new Date().toISOString(), stopped_at: stop.detailAt });
+  return `your Slack bridge stopped at ${stop.detailAt} (${stop.reason}); linked humans are offline until it reconnects or the server restarts`;
+}
+
+// The last bridge stop for target, when it's live (not suppressed, with its time and reason).
+async function liveBridgeStop(repo: Repo, tx: Tx, target: string): Promise<{ at: number; detailAt: string; reason: string } | undefined> {
   const stop = await repo.audit.last(tx, "bridge.stopped", target);
   if (!stop) return undefined;
   let detail: { reason?: string; at?: string; suppressed?: boolean };
@@ -413,10 +427,7 @@ async function owedBridgeNotice(repo: Repo, tx: Tx, email: string): Promise<stri
     return undefined;
   }
   if (detail.suppressed || !detail.at || !detail.reason) return undefined;
-  const notified = await repo.audit.last(tx, "bridge.notified", target);
-  if (notified && notified.at >= stop.at) return undefined;
-  writeAudit(repo, tx, "bridge.notified", null, target, { at: new Date().toISOString(), stopped_at: detail.at });
-  return `your Slack bridge stopped at ${detail.at} (${detail.reason}); linked humans are offline until it reconnects or the server restarts`;
+  return { at: stop.at, detailAt: detail.at, reason: detail.reason };
 }
 
 // What a hello's fields read, split from building them (#807 P3 A7g): a caller reads these in its body, on its `Tx`
