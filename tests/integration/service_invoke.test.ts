@@ -80,7 +80,7 @@ const scopeOf = (board: string) => (srv.app.db.query("SELECT scope FROM boards W
 const holderOf = (board: string, id: number) => (srv.app.db.query("SELECT holder FROM claims WHERE key = ?").get(`queue:${board}:${id}`) as { holder: string } | null)?.holder;
 const invokes = () => accessAudits(srv.app.db, "authz.decision").filter(r => r.detail.verb === "service.invoke");
 const push = (body: string) => (e: DeliveryEvent) => e.kind === "board" && e.item.kind === "push" && e.item.post.body === body;
-const post = (s: HostedSession, board: string, body: string, extra: Record<string, unknown> = {}) => s.call<{ post_id: number; unresolved?: string[] }>("board_post", { board, body, ...extra });
+const post = (s: HostedSession, board: string, body: string, extra: Record<string, unknown> = {}) => s.call<{ post_id: number; notified: string[]; unresolved?: string[] }>("board_post", { board, body, ...extra });
 const refusal = async (p: Promise<unknown>): Promise<HostedToolError> => {
   const e = await p.then((v) => new Error(`not refused: ${JSON.stringify(v)}`), (x: unknown) => x);
   if (!(e instanceof HostedToolError)) throw e;
@@ -229,9 +229,29 @@ describe("Tests item 4: the pilot gate", () => {
       const next = holderOf("jobs", id);
       expect(next === undefined || lanes.has(next), `declined job ${id} went to ${next}`).toBe(true);
     }
-    // A post that @mentions the holder tells it, but doesn't hand it the work.
+    // An invoker's post that @mentions the holder tells it, but doesn't hand it the work, nor hold it back from a
+    // lane (#1256).
     const named = await post(carol, "jobs", `@${B}/fe please look`);
-    expect(holderOf("jobs", named.post_id)).not.toBe(`${B}/fe`);
+    expect(lanes.has(holderOf("jobs", named.post_id)!), `named job went to ${holderOf("jobs", named.post_id)}`).toBe(true);
+    expect(named.notified).toContain(`${B}/fe`);
+    // A lane's own top-level notice to an invoker answers, it isn't new work: no sibling lane holds it.
+    const notice = await post(w1, "jobs", `@${B}/fe your job is done`);
+    expect(notice.notified).toEqual([`${B}/fe`]);
+    expect(holderOf("jobs", notice.post_id)).toBeUndefined();
+    // Nor is a claim's system notice cc'ing a watcher (non-strict): only an author's own words rotate past a name.
+    await carol.call("claim_take", { key: "ticket:ENG-7", board: "jobs" });
+    await bob.call("claim_watch", { key: "ticket:ENG-7" });
+    const before = (srv.app.db.query("SELECT max(id) AS m FROM posts").get() as { m: number }).m;
+    await carol.call("claim_release", { key: "ticket:ENG-7" });
+    const ccs = srv.app.db.query("SELECT id FROM posts WHERE board = 'jobs' AND id > ? AND body LIKE ?").all(before, `%@${B}/fe%`) as { id: number }[];
+    expect(ccs.length).toBe(1);
+    expect(holderOf("jobs", ccs[0]!.id)).toBeUndefined();
+    // A post naming a lane among others is direct addressing: no rotation, and no claim (several names); one lane
+    // named alone holds it.
+    const direct = await post(carol, "jobs", `@${SVC}/w-2 @${B}/fe this one is yours`);
+    expect(holderOf("jobs", direct.post_id)).toBeUndefined();
+    const solo = await post(carol, "jobs", `@${SVC}/w-2 this one is yours`);
+    expect(holderOf("jobs", solo.post_id)).toBe(`${SVC}/w-2`);
     for (const id of [...ids, named.post_id]) expect(holderOf("jobs", id)).not.toBe(`${B}/fe`);
   });
 
