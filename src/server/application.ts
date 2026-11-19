@@ -43,7 +43,7 @@ import type { AttachmentLimits } from "../shared/attachments.ts";
 import { expiryTimer } from "../core/claims.ts";
 import { detached } from "./request_context.ts";
 import { onAliasCreated } from "./teams.ts";
-import { boardAccess, ownScopeOn, type BoardAccess } from "./access.ts";
+import { boardAccess, ownScopeOn, seerIn, type BoardAccess } from "./access.ts";
 import { boardCatalog, boardSnapshot, pendingOf, visibleBoards } from "./board_reads.ts";
 import { callBoardTool, serverBoardActor } from "./boards.ts";
 import { PROMISE_DAYS, STALE_UNDELIVERED_MS, alreadyRetracted, historyLimit, inboxDays, promised, queuedNote, retractRefusal, showMessage, unanswered, undeliveredInstruction, type InboxItem, type PromiseItem } from "../shared/inbox.ts";
@@ -1592,7 +1592,7 @@ async function resolvePeer(repo: Repo, r: Read, from: string, input: string, vie
 async function aliasHidden(repo: Repo, r: Read, viewer: string, address: string): Promise<boolean> {
   const a = await repo.aliases.find(r, address);
   if (!a || a.scope_kind === "person" || a.scope_ref === null) return false;
-  const vp = await repo.principals.of(r, viewer);
+  const vp = await seerIn(repo, r, viewer, a.scope_kind === "service");
   return vp === null || !(await authorize(repo, r, {}, { verb: "alias.see", principal: vp, scope: { scope_kind: a.scope_kind, scope_ref: a.scope_ref } })).allow;
 }
 
@@ -2007,7 +2007,7 @@ async function handleCall(hub: Hub, tx: Tx, session: ApplicationSession, tool: s
   const { as: _as, ...rest } = args;
   if (tool === "board_post") return handleBoardPost(hub, tx, session, actor, rest, ctx, publish);
   // A claim announced on a service's board is a post there too (#270 D6): decided as board_post's is.
-  const inv = tool === "claim_take" ? await invocation(repo, tx, actor, rest.board, session.primary || actor) : null;
+  const inv = tool === "claim_take" ? await invocation(repo, tx, actor, rest.board) : null;
   if (inv && !inv.d.allow) {
     rowAfterRollback(session, tx, w => recordDecision(repo, w, sessionActor(session, actor), inv.req, inv.d));
     throw coreRefusal(hiddenBoard(inv));
@@ -2053,7 +2053,7 @@ async function handleBoardPost(hub: Hub, tx: Tx, session: ApplicationSession, me
     // Before the write is deduplicated: access is re-checked on a repeat, so a caller who has lost the board is refused, not replayed (#296).
     // A post on a service's board is an invocation (#270 D6), decided here for the acting address's principal: a deny
     // is recorded after the rollback and answers as a missing board; an allow is recorded with the post it carries.
-    const inv = await invocation(repo, tx, me, postArgs.board, session.primary || me);
+    const inv = await invocation(repo, tx, me, postArgs.board);
     if (inv && !inv.d.allow) {
       rowAfterRollback(session, tx, w => recordDecision(repo, w, sessionActor(session, me), inv.req, inv.d));
       throw hiddenBoard(inv);

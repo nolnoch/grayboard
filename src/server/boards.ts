@@ -7,7 +7,7 @@ import {
   finishWho, normalizeBoard, noStatusText, parseMatch, pickView, statusText, threadNotOnBoard, unboundFrom,
   type Board, type BoardSummary, type WhoRow,
 } from "../core/boards.ts";
-import { claimView, type ClaimView } from "../core/claims.ts";
+import { claimView, isQueueKey, type ClaimView } from "../core/claims.ts";
 import { CoreError } from "../core/errors.ts";
 import type { Principal } from "../core/resolver.ts";
 import {
@@ -170,11 +170,14 @@ export async function callBoardTool(
 }
 
 // core's listClaims for a reader: live claims by key, each board named only when `viewer` sees it, each holder and note
-// only when `seer` (a session ID or handle) may see the holder exists (#348, #871).
+// only when `seer` (a session ID or handle) may see the holder exists (#348, #871). A queue post's claim is the
+// delivery machinery's and its key names its board and post, so one on a board `viewer` can't see isn't listed at all:
+// a hidden board's name and traffic stay hidden (#270 D5, principle 9).
 async function claimViews(repo: Repo, access: BoardAccess, r: Read, prefix: string | undefined, viewer: string | Principal, seer: string): Promise<ClaimView[]> {
-  const rows = await repo.claims.list(r, prefix);
-  if (!rows.length) return [];
-  const boards = await visibleBoards(repo, access, r, viewer, rows.flatMap((c) => (c.board ? [c.board] : [])));
+  const all = await repo.claims.list(r, prefix);
+  if (!all.length) return [];
+  const boards = await visibleBoards(repo, access, r, viewer, all.flatMap((c) => (c.board ? [c.board] : [])));
+  const rows = all.filter((c) => !isQueueKey(c.key) || (!!c.board && boards.has(c.board)));
   const seen = await seenAmong(repo, access, r, seer, rows.map((c) => c.holder));
   return rows.map((c) => claimView(c, !c.board || boards.has(c.board), seen.has(c.holder)));
 }

@@ -243,9 +243,8 @@ async function claimCall(req: Request, authed: AuthedUser, repo: Repo, access: B
     // its addresses are its own here (#360).
     const addresses = await repo.bindings.addressSet(tx, handle, authed.user_email);
     // A claim announced on a service's board is an invocation (#270 D6), decided as board_post's is; this answer
-    // commits, so a deny's row goes on the transaction, and an allow's only when the claim lands. An ID's session's
-    // primary is its oldest hold, addresses[1] (addressSet puts the ID first, then sessionAddresses' holds).
-    const inv = tool === "claim_take" ? await invocation(repo, tx, handle, args.board, addresses[1] ?? handle) : null;
+    // commits, so a deny's row goes on the transaction, and an allow's only when the claim lands.
+    const inv = tool === "claim_take" ? await invocation(repo, tx, handle, args.board) : null;
     if (inv && !inv.d.allow) {
       recordDecision(repo, tx, { user: authed.user_email, address: handle }, inv.req, inv.d);
       return badRequest(hiddenBoard(inv).message);

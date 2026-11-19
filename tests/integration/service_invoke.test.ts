@@ -8,6 +8,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { boardAccess, serverAccess } from "../../src/server/access.ts";
 import type { DeliveryEvent } from "../../src/server/application.ts";
+import { AppSession } from "../support/app_session.ts";
 import { accessAudits } from "../support/audit.ts";
 import { HostedSession, HostedToolError, type InboxItem } from "../support/hosted_session.ts";
 import { TestServer } from "../support/server.ts";
@@ -88,7 +89,7 @@ const refusal = async (p: Promise<unknown>): Promise<HostedToolError> => {
 // A refusal's text with the board's name taken out: a hidden board's and a missing one's must be the same.
 const unnamed = (e: Error, board: string) => e.message.replaceAll(`#${board}`, "#BOARD");
 async function missingBoardRefusal(s: HostedSession, tool = "board_post"): Promise<string> {
-  const args = tool === "board_post" ? { board: "no-such-thing", body: "x" } : { board: "no-such-thing" };
+  const args = tool === "board_post" ? { board: "no-such-thing", body: "x" } : tool === "claim_take" ? { key: "ticket:NONE-1", board: "no-such-thing" } : { board: "no-such-thing" };
   return unnamed(await refusal(s.call(tool, args)), "no-such-thing");
 }
 
@@ -175,8 +176,8 @@ describe("Tests item 4: the pilot gate", () => {
     sessions.push(build);
     const missing = await missingBoardRefusal(build);
     expect(unnamed(await refusal(post(build, "jobs", "as eng")), "jobs")).toBe(missing);
-    // The post fell back to the session's ID, which sees the board as bob; the invocation is still judged as eng.
-    expect(invokes().at(-1)).toMatchObject({ actor: B, detail: { address: expect.stringMatching(/^id:/), allow: false, rule: "role.service_invoke", principal: "eng", principal_kind: "team" } });
+    // No address of the session sees the board (its ID is judged as eng there too), so the post is eng/build's.
+    expect(invokes().at(-1)).toMatchObject({ actor: B, detail: { address: "eng/build", allow: false, rule: "role.service_invoke", principal: "eng", principal_kind: "team" } });
     const eng = await grant("eng");
     await post(build, "jobs", "as eng, granted");
     expect(invokes().at(-1)).toMatchObject({ actor: B, detail: { allow: true, rule: "role.service_invoke", binding: eng, principal: "eng", principal_kind: "team" } });
@@ -292,5 +293,197 @@ describe("a non-holder can't learn a service's board exists", () => {
     expect(await peers(bob)).toContain(`${SVC}/w-1`);
     // With the board named: the hidden board's roster refuses as a missing board's.
     expect(unnamed(await refusal(dave.call("peer_list", { board: "jobs" })), "jobs")).toBe(unnamed(await refusal(dave.call("peer_list", { board: "no-such-thing" })), "no-such-thing"));
+  });
+});
+
+// The ID a session bound to `address` acts through, as its alias hold names it.
+const idHolding = (address: string) => (srv.app.db.query("SELECT id FROM alias_holds WHERE address = ?").get(address) as { id: string }).id;
+// A refusal's text with `key` taken out: a hidden queue post's claim and a missing key must answer alike.
+const unkeyed = (e: Error, key: string) => e.message.replaceAll(key, "KEY");
+
+describe("a queue post's claim on a hidden board is no claim at all (audit F1)", () => {
+  test("claim_list leaves it out; claim_watch and claim_release answer it as a missing key, on a service's board and a team's", async () => {
+    await cast();
+    const bob = await srv.hosted(B, "fe"), dave = await srv.hosted(D, "fe"), carol = await srv.hosted(C, "fe");
+    sessions.push(bob, dave, carol);
+    const p = await post(bob, "jobs", "job for the service");
+    const key = `queue:jobs:${p.post_id}`;
+    expect(holderOf("jobs", p.post_id)).toBe(`${SVC}/w-1`);
+    // A team queue board: qa's (carol), its lane root's session; dave is in neither.
+    const rootS = await srv.hosted(ROOT, "fe");
+    sessions.push(rootS);
+    await carol.call("board_create", { name: "qaq", purpose: "qa's work", kind: "queue", team: "qa" });
+    await rootS.call("board_subscribe", { board: "qaq", mode: "push" });
+    const q = await post(carol, "qaq", "job for qa");
+    const teamKey = `queue:qaq:${q.post_id}`;
+    expect(holderOf("qaq", q.post_id)).toBe(`${ROOT}/fe`);
+    const keys = async (s: HostedSession) => (await s.call<{ key: string }[]>("claim_list", {})).map((c) => c.key);
+    expect(await keys(bob)).toContain(key);
+    expect(await keys(carol)).toContain(teamKey);
+    const daves = await keys(dave);
+    expect(daves.filter((k) => k.startsWith("queue:"))).toEqual([]);
+    expect(await dave.call("claim_list", { prefix: "queue:jobs" })).toEqual([]);
+    for (const k of [key, teamKey]) {
+      const missing = `queue:nope:${k.split(":")[2]}`;
+      for (const tool of ["claim_watch", "claim_release"]) {
+        const hidden = await refusal(dave.call(tool, { key: k }));
+        const none = await refusal(dave.call(tool, { key: missing }));
+        expect(unkeyed(hidden, k), `${tool} ${k}`).toBe(unkeyed(none, missing));
+        expect(hidden.code).toBe(none.code);
+        // The HTTP route answers alike.
+        const h = await api(tokens[D]!, "POST", "/api/claims/call", { as: `${D}/fe`, tool, args: { key: k } });
+        const n = await api(tokens[D]!, "POST", "/api/claims/call", { as: `${D}/fe`, tool, args: { key: missing } });
+        expect(h.status).toBe(n.status);
+        expect(JSON.stringify(h.body).replaceAll(k, "KEY")).toBe(JSON.stringify(n.body).replaceAll(missing, "KEY"));
+      }
+    }
+    // Nothing moved: the claims stand with their lanes, and dave watches nothing.
+    expect(holderOf("jobs", p.post_id)).toBe(`${SVC}/w-1`);
+    expect(holderOf("qaq", q.post_id)).toBe(`${ROOT}/fe`);
+    expect(srv.app.db.query("SELECT count(*) AS n FROM claim_watches").get()).toEqual({ n: 0 });
+  });
+});
+
+describe("a session bound to a team's name sees a service's board only by the team's binding (audit F2)", () => {
+  test("its ID can't list, read or subscribe to the board its user holds directly; with the team's grant it can", async () => {
+    await cast();
+    expect((await api(tokens[B]!, "POST", "/api/teams", { name: "eng" })).status).toBe(201);
+    const build = await srv.hosted(B, "eng/build");
+    sessions.push(build);
+    const id = idHolding("eng/build");
+    const listed = async () => (await build.call<{ name: string }[]>("board_list", {})).map((b) => b.name);
+    expect(await listed()).not.toContain("jobs");
+    expect(unnamed(await refusal(build.call("board_read", { board: "jobs" })), "jobs")).toBe(await missingBoardRefusal(build, "board_read"));
+    const sub = await refusal(build.call("board_subscribe", { board: "jobs", mode: "push", as: id }));
+    expect(unnamed(sub, "jobs")).toBe(unnamed(await refusal(build.call("board_subscribe", { board: "no-such-thing", mode: "push", as: id })), "no-such-thing"));
+    expect(srv.app.db.query("SELECT count(*) AS n FROM subscriptions WHERE board = 'jobs' AND handle = ?").get(id)).toEqual({ n: 0 });
+    // Nor its names: peer_list (judged for the session's ID) and a DM read them as missing.
+    const peers = async () => JSON.stringify(await build.call("peer_list", { include_offline: true }));
+    expect(await peers()).not.toContain(`${SVC}/w-1`);
+    const dm = (to: string) => refusal(build.call("dm_send", { to, body: "hi" }));
+    expect((await dm(`${SVC}/w-1`)).message.replaceAll(`${SVC}/w-1`, "NAME")).toBe((await dm(`${SVC}/w-404`)).message.replaceAll(`${SVC}/w-404`, "NAME"));
+    // The access rule itself: the ID is judged as eng on the service's board, as its user everywhere else.
+    const access = boardAccess(srv.app.repo), read = srv.app.repo.read;
+    const jobs = (await srv.app.repo.boards.get(read, "jobs"))!;
+    expect(await access.canSee(read, id, jobs)).toBe(false);
+    expect([...(await access.visibleTo(read, id, [jobs]))]).toEqual([]);
+    await grant("eng");
+    expect(await access.canSee(read, id, jobs)).toBe(true);
+    expect(await peers()).toContain(`${SVC}/w-1`);
+    expect(await listed()).toContain("jobs");
+    expect(await build.call("board_read", { board: "jobs" })).toBeDefined();
+  });
+});
+
+describe("claim_take on a service's board is an invocation, on every route (audit F3)", () => {
+  test("a holder's claim_take records exactly one allow; a non-holder's exactly one deny; over MCP and HTTP", async () => {
+    const { bindings } = await cast();
+    const bob = await srv.hosted(B, "fe"), dave = await srv.hosted(D, "fe");
+    sessions.push(bob, dave);
+    const routes = {
+      mcp: (s: HostedSession, _t: string, args: Record<string, unknown>) => s.call("claim_take", args).then(() => 200, (e: unknown) => { if (e instanceof HostedToolError) return 400; throw e; }),
+      http: async (_s: HostedSession, t: string, args: Record<string, unknown>, as: string) => (await api(t, "POST", "/api/claims/call", { as, tool: "claim_take", args })).status,
+    };
+    for (const [route, take] of Object.entries(routes)) {
+      let before = invokes().length;
+      expect(await take(bob, tokens[B]!, { key: `ticket:ENG-${route}`, board: "jobs" }, `${B}/fe`), route).toBe(200);
+      expect(invokes().slice(before), route).toEqual([expect.objectContaining({ actor: B, detail: expect.objectContaining({
+        address: `${B}/fe`, allow: true, rule: "role.service_invoke", binding: bindings.bob, principal: B, board: "jobs",
+      }) })]);
+      before = invokes().length;
+      expect(await take(dave, tokens[D]!, { key: `ticket:DAVE-${route}`, board: "jobs" }, `${D}/fe`), route).toBe(400);
+      expect(invokes().slice(before), route).toEqual([expect.objectContaining({ actor: D, detail: expect.objectContaining({
+        address: `${D}/fe`, allow: false, rule: "role.service_invoke", code: "not_found", principal: D, board: "jobs",
+      }) })]);
+    }
+    expect(srv.app.db.query("SELECT key FROM claims WHERE key LIKE 'ticket:%' ORDER BY key").all()).toEqual([{ key: "ticket:ENG-http" }, { key: "ticket:ENG-mcp" }]);
+  });
+
+  test("claim_take as the ID of a session bound to a team's name is judged as the team, over MCP and HTTP", async () => {
+    await cast();
+    expect((await api(tokens[B]!, "POST", "/api/teams", { name: "eng" })).status).toBe(201);
+    const build = await srv.hosted(B, "eng/build");
+    sessions.push(build);
+    const id = idHolding("eng/build");
+    const viaMcp = (key: string) => build.call("claim_take", { key, board: "jobs", as: id });
+    const viaHttp = (key: string) => api(tokens[B]!, "POST", "/api/claims/call", { as: id, tool: "claim_take", args: { key, board: "jobs" } });
+    let before = invokes().length;
+    expect(unnamed(await refusal(viaMcp("ticket:ENG-1")), "jobs")).toBe(await missingBoardRefusal(build, "claim_take"));
+    const h = await viaHttp("ticket:ENG-2");
+    expect(h.status).toBe(400);
+    expect(invokes().slice(before)).toEqual([0, 1].map(() => expect.objectContaining({ actor: B, detail: expect.objectContaining({
+      address: id, allow: false, rule: "role.service_invoke", principal: "eng", principal_kind: "team", board: "jobs",
+    }) })));
+    const eng = await grant("eng");
+    before = invokes().length;
+    await viaMcp("ticket:ENG-3");
+    expect((await viaHttp("ticket:ENG-4")).status).toBe(200);
+    expect(invokes().slice(before)).toEqual([0, 1].map(() => expect.objectContaining({ actor: B, detail: expect.objectContaining({
+      address: id, allow: true, binding: eng, principal: "eng", principal_kind: "team",
+    }) })));
+  });
+});
+
+describe("an ID is judged as its session's primary alike on every route (audit F5)", () => {
+  test("a tools-only session writing as a team's name: its ID invokes as the team over HTTP and MCP", async () => {
+    await cast();
+    expect((await api(tokens[B]!, "POST", "/api/teams", { name: "eng" })).status).toBe(201);
+    // Tools-only: it holds nothing and writes as eng/tool, so its primary is that name, not a hold.
+    const tool = await srv.connected(tokens[B]!, "eng/tool", { push: false });
+    expect(srv.app.db.query("SELECT count(*) AS n FROM alias_holds WHERE id = ?").get(tool.id)).toEqual({ n: 0 });
+    let before = invokes().length;
+    const h = await api(tokens[B]!, "POST", "/api/claims/call", { as: tool.id, tool: "claim_take", args: { key: "ticket:TOOL-1", board: "jobs" } });
+    expect(h.status).toBe(400);
+    expect(invokes().slice(before)).toEqual([expect.objectContaining({ actor: B, detail: expect.objectContaining({ address: tool.id, allow: false, principal: "eng", principal_kind: "team" }) })]);
+    const eng = await grant("eng");
+    before = invokes().length;
+    expect((await api(tokens[B]!, "POST", "/api/claims/call", { as: tool.id, tool: "claim_take", args: { key: "ticket:TOOL-2", board: "jobs" } })).status).toBe(200);
+    await tool.call("claim_take", { key: "ticket:TOOL-3", board: "jobs" });
+    expect(invokes().slice(before)).toEqual([
+      expect.objectContaining({ detail: expect.objectContaining({ address: tool.id, allow: true, binding: eng, principal: "eng" }) }),
+      expect.objectContaining({ detail: expect.objectContaining({ address: "eng/tool", allow: true, binding: eng, principal: "eng" }) }),
+    ]);
+  });
+});
+
+describe("wake.service_invoke judges each post by its own board and reader (audit F3)", () => {
+  test("one pull: a holder's request on the service's board is granted, the same user's post on an org board isn't", async () => {
+    const { w1 } = await cast();
+    // w-1 takes no rotations, so w-9 is the only lane; w-9 also follows an org board bob posts on.
+    await w1.call("peer_status", { text: "busy", queue: "off" });
+    // An application session of the service's own (a run token isn't an API session token).
+    const svc = srv.app.db.query("SELECT u.id, u.email FROM users u JOIN principals p ON p.user_id = u.id AND p.kind = 'service' WHERE p.name = ?").get(SVC) as { id: number; email: string };
+    const w9 = new AppSession(srv.app.application, srv.app.repo, { user_id: svc.id, user_email: svc.email, kind: "service", session_id: 0 }, "w-9");
+    await w9.connect();
+    await w9.call("board_subscribe", { board: "jobs", mode: "push" });
+    const bob = await srv.hosted(B, "fe");
+    sessions.push(bob);
+    await bob.call("board_create", { name: "lobby", purpose: "everyone" });
+    await w9.call("board_subscribe", { board: "lobby", mode: "push" });
+    const job = await post(bob, "jobs", "a request");
+    expect(holderOf("jobs", job.post_id)).toBe(`${SVC}/w-9`);
+    await post(bob, "lobby", "small talk");
+    // Both in one pull, so one writerMarks call judges them.
+    const items = await w9.pending();
+    const marked = (body: string) => items.find((e) => e.kind === "board" && e.item.kind === "push" && e.item.post.body === body) as { item: { post: { other_user?: true; ungranted?: true } } } | undefined;
+    expect(marked("a request")?.item.post).toMatchObject({ other_user: true });
+    expect(marked("a request")!.item.post.ungranted).toBeUndefined();
+    expect(marked("small talk")?.item.post).toMatchObject({ other_user: true, ungranted: true });
+    w9.close();
+  });
+
+  test("a reply is judged for the address it was read for, not the session's primary", async () => {
+    const { w1 } = await cast();
+    expect((await api(tokens[B]!, "POST", "/api/teams", { name: "eng" })).status).toBe(201);
+    // bob's session: eng/build first (its primary, which holds no grant), then bob's own fe (which does).
+    const bob = await srv.connected(tokens[B]!, "eng/build");
+    await bob.bind(`${B}/fe`);
+    const p = await bob.call<{ post_id: number }>("board_post", { board: "jobs", body: "bob's job", as: `${B}/fe` });
+    await w1.next(push("bob's job"));
+    await post(w1, "jobs", "bob's answer", { parent_id: p.post_id });
+    const items = await bob.pending();
+    const reply = items.find((e) => e.kind === "board" && e.item.kind === "push" && e.item.post.body === "bob's answer") as { item: { post: { other_user?: true; ungranted?: true } } } | undefined;
+    expect(reply?.item.post).toMatchObject({ other_user: true });
+    expect(reply!.item.post.ungranted).toBeUndefined();
   });
 });

@@ -384,6 +384,7 @@ export function release(
     const refuse = (cur: ClaimRow | undefined) => {
       const releasedAt = releasedByRule(recentClaimEvents(db, key), key, addresses);
       if (releasedAt !== undefined) return { wake: [], boards: [], releasedAt };
+      if (cur && hiddenQueue(cur, (b) => canSeeBoard(db, handle, b))) throw releaseRefusal(key, undefined, now, false);
       throw releaseRefusal(key, cur, now, !!cur && cur.expires_at > now && holderHidden(db, ctx.session ?? handle, cur.holder));
     };
     const cur = claimRow(db, key);
@@ -433,7 +434,7 @@ export function watch(db: Database, handle: string, keyInput: string, off = fals
     return notWatching(key);
   }
   const cur = liveClaim(db, key, Date.now());
-  if (!cur) throw watchNoClaim(key);
+  if (!cur || hiddenQueue(cur, (b) => canSeeBoard(db, handle, b))) throw watchNoClaim(key);
   if (addresses.includes(cur.holder)) throw watchOwn(key);
   if (!cur.board || !canSeeBoard(db, handle, cur.board)) throw watchNoBoard(key, holderHidden(db, seer, cur.holder) ? null : cur.holder);
   addClaimWatch(db, key, handle);
@@ -452,7 +453,20 @@ export function listClaims(db: Database, prefix?: string, viewer?: Viewer, seer?
     )
     .all(Date.now(), `${(prefix ?? "").replace(/[\\%_]/g, "\\$&")}%`) as Claim[];
   if (viewer === undefined) return rows;
-  return rows.map((c) => claimView(c, !c.board || canSeeBoard(db, viewer, c.board), seer === undefined || !holderHidden(db, seer, c.holder)));
+  return rows
+    .filter((c) => !isQueueKey(c.key) || (!!c.board && canSeeBoard(db, viewer, c.board)))
+    .map((c) => claimView(c, !c.board || canSeeBoard(db, viewer, c.board), seer === undefined || !holderHidden(db, seer, c.holder)));
+}
+
+/** A queue post's claim (claimQueuePost): its key names its board and post, so a reader who can't see the board
+ * isn't shown it, and claim_watch and claim_release answer it as no claim (#270 D5). */
+export function isQueueKey(key: string): boolean {
+  return key.startsWith("queue:");
+}
+
+/** Whether `c` is a queue post's claim on a board the caller (`sees`) can't see: it answers as no claim at all. */
+export function hiddenQueue(c: { key: string; board: string | null }, sees: (board: string) => boolean): boolean {
+  return isQueueKey(c.key) && !(c.board && sees(c.board));
 }
 
 /** A claim as a reader sees it: its board named only when `boardSeen`, its holder and note only when `holderSeen`. */
