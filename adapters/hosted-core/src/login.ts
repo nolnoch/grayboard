@@ -138,7 +138,8 @@ async function getJson(url: string, timeoutMs: number): Promise<unknown> {
   let response: Response;
   try { response = await fetch(url, { headers: { Accept: "application/json" }, redirect: "error", signal: AbortSignal.timeout(timeoutMs) }); }
   catch (error) { throw new ServerUnreachable(error); }
-  if (response.status >= 500) { await response.body?.cancel(); throw new ServerUnreachable(new Error(`${url} answered HTTP ${response.status}`)); }
+  // A 429 is the server shedding load (its auth gate answers one to every request from a drained address): an outage, not an answer.
+  if (response.status >= 500 || response.status === 429) { await response.body?.cancel(); throw new ServerUnreachable(new Error(`${url} answered HTTP ${response.status}`)); }
   if (response.status !== 200) { await response.body?.cancel(); throw new Error(`${url} answered HTTP ${response.status}`); }
   return response.json();
 }

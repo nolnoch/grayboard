@@ -5,13 +5,14 @@
 // receiving a push, a 401 ending the run with no retry, a stored browser grant
 // left untouched, and no file holding the token.
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { CallToolResult } from "@modelcontextprotocol/client";
 import { HostedClient, type Level } from "../../adapters/hosted-core/src/client.ts";
 import { AccessExpired, Refusal } from "../../adapters/hosted-core/src/model.ts";
 import { RootDelivery } from "../../adapters/hosted-core/src/root.ts";
+import { deliveryPath } from "../../adapters/hosted-core/src/storage.ts";
 import { NEW_RUN, StaticLogin, staticMode, type StaticMode } from "../../adapters/hosted-core/src/static.ts";
 import { ServerUnreachable } from "../../adapters/hosted-core/src/wire.ts";
 import { hostedRowCount } from "../support/hosted_rows.ts";
@@ -89,10 +90,55 @@ describe("staticMode: the launcher's environment only", () => {
     writeFileSync(join(dir, ".claude", "settings.json"), JSON.stringify({ env: { GRAYBOARD_RUN_TOKEN: "x".repeat(20) } }));
     // Only where the host names a settings dir (Claude Code's project).
     expect(staticMode(on, dir)).toMatchObject({ token: TOKEN });
-    expect(staticMode(on, dir, dir)).toEqual({ refused: "Static mode refused: the project's .claude/settings.json sets its variables; the launcher sets them" });
+    expect(staticMode(on, dir, [dir])).toEqual({ refused: "Static mode refused: the project's .claude/settings.json sets its variables; the launcher sets them" });
     rmSync(join(dir, ".claude", "settings.json"));
     writeFileSync(join(dir, ".claude", "settings.local.json"), JSON.stringify({ env: { GRAYBOARD_AUTH: "static" } }));
-    expect(staticMode(on, dir, dir)).toEqual({ refused: "Static mode refused: the project's .claude/settings.local.json sets its variables; the launcher sets them" });
+    expect(staticMode(on, dir, [dir])).toEqual({ refused: "Static mode refused: the project's .claude/settings.local.json sets its variables; the launcher sets them" });
+  });
+
+  test("every dotenv grammar Bun takes refuses: the colon form, export with a tab (audit H1)", () => {
+    for (const line of [`GRAYBOARD_RUN_TOKEN: ${"b".repeat(20)}`, "export\tGRAYBOARD_ISSUER=http://127.0.0.1:9", "  GRAYBOARD_AUTH : static"]) {
+      writeFileSync(join(dir, ".env"), `OTHER=1\n${line}\n`);
+      expect(staticMode(on, dir)).toEqual({ refused: "Static mode refused: .env in the working directory sets its variables; the launcher sets them" });
+    }
+  });
+
+  test("a variable set or changed after exec refuses, whatever set it; the exec-time environment is read from /proc in the process (audit H1)", async () => {
+    const changed = (name: string) => `Static mode refused: ${name} was set after the harness started (a dotenv file?); the launcher sets it`;
+    expect(staticMode(on, dir, [], { ...on })).toEqual({ issuer: "https://gb.example.com", token: TOKEN });
+    const { GRAYBOARD_RUN_TOKEN: _, ...noToken } = on;
+    expect(staticMode(on, dir, [], noToken)).toEqual({ refused: changed("GRAYBOARD_RUN_TOKEN") });
+    expect(staticMode(on, dir, [], { ...on, GRAYBOARD_ISSUER: "https://other.example.com" })).toEqual({ refused: changed("GRAYBOARD_ISSUER") });
+    expect(staticMode({ ...on, GRAYBOARD_PRINCIPAL: SVC }, dir, [], on)).toEqual({ refused: changed("GRAYBOARD_PRINCIPAL") });
+    // A token alone, from a file: the file is named, not the launcher.
+    expect(staticMode({ GRAYBOARD_RUN_TOKEN: TOKEN }, dir, [], {})).toEqual({ refused: changed("GRAYBOARD_RUN_TOKEN") });
+    // In a real process: the launcher's mode and pin at exec, the token added after (as Bun's dotenv autoload adds it).
+    const script = join(dir, "probe.ts");
+    writeFileSync(script, `import { staticMode } from ${JSON.stringify(join(import.meta.dir, "../../adapters/hosted-core/src/static.ts"))};
+const before = staticMode(process.env, process.cwd());
+process.env.GRAYBOARD_RUN_TOKEN = ${JSON.stringify(TOKEN)};
+console.log(JSON.stringify([before, staticMode(process.env, process.cwd())]));\n`);
+    const { GRAYBOARD_RUN_TOKEN: __, ...launcher } = on;
+    const r = Bun.spawnSync([process.execPath, script], { cwd: dir, env: { PATH: process.env.PATH!, ...launcher }, stdout: "pipe", stderr: "pipe", timeout: 20_000 });
+    expect(r.stderr.toString()).toBe("");
+    expect(JSON.parse(r.stdout.toString())).toEqual([{ refused: "Static mode needs the launcher's run token (GRAYBOARD_RUN_TOKEN)" }, { refused: changed("GRAYBOARD_RUN_TOKEN") }]);
+  });
+
+  test("Claude Code settings are read as JSON: an escaped key refuses, an unparseable file refuses, and every given project dir is checked (audit H2)", () => {
+    const other = join(dir, "project");
+    mkdirSync(join(dir, ".claude"));
+    mkdirSync(join(other, ".claude"), { recursive: true });
+    writeFileSync(join(dir, ".claude", "settings.json"), `{"env":{"\\u0047RAYBOARD_RUN_TOKEN":"${"b".repeat(20)}"}}`);
+    expect(staticMode(on, dir, [dir])).toEqual({ refused: "Static mode refused: the project's .claude/settings.json sets its variables; the launcher sets them" });
+    // The cwd's settings count even when the project dir names another directory.
+    expect(staticMode(on, dir, [other, dir])).toEqual({ refused: "Static mode refused: the project's .claude/settings.json sets its variables; the launcher sets them" });
+    expect(staticMode(on, dir, [other])).toMatchObject({ token: TOKEN });
+    writeFileSync(join(dir, ".claude", "settings.json"), `{"env": {"OTHER": 1}, "hooks": {"x": [{"GRAYBOARD_ISSUER": 1}]}}`);
+    expect(staticMode(on, dir, [dir])).toMatchObject({ refused: expect.stringContaining("settings.json sets its variables") });
+    writeFileSync(join(dir, ".claude", "settings.json"), `{"env": {"OTHER": 1}}`);
+    expect(staticMode(on, dir, [dir])).toMatchObject({ token: TOKEN });
+    writeFileSync(join(dir, ".claude", "settings.json"), `{"env": {"OTHER": 1},}`);
+    expect(staticMode(on, dir, [dir])).toEqual({ refused: "Static mode refused: the project's .claude/settings.json isn't JSON grayboard can check" });
   });
 });
 
@@ -114,18 +160,37 @@ describe("before the token is sent", () => {
     } finally { net.restore(); }
   });
 
-  test("an outage at the metadata is ServerUnreachable and isn't remembered: a later token() succeeds", async () => {
+  for (const status of [503, 429]) test(`an outage at the metadata (HTTP ${status}) is ServerUnreachable and isn't remembered: a later token() succeeds (audit M1)`, async () => {
     const run = await serviceRun(srv);
     const real = globalThis.fetch;
     let failures = 1;
     const spy = spyOn(globalThis, "fetch").mockImplementation(((input: RequestInfo | URL, init?: RequestInit) => {
-      if (String(input instanceof Request ? input.url : input).includes("/.well-known/oauth-protected-resource") && failures-- > 0) return Promise.resolve(new Response("down", { status: 503 }));
+      if (String(input instanceof Request ? input.url : input).includes("/.well-known/oauth-protected-resource") && failures-- > 0) return Promise.resolve(new Response("down", { status }));
       return real(input as RequestInfo, init);
     }) as typeof fetch);
     try {
       const s = signIn(mode(run.env));
       await expect(s.token()).rejects.toBeInstanceOf(ServerUnreachable);
       expect(await s.token()).toBe(run.token);
+    } finally { spy.mockRestore(); }
+  });
+
+  test("a whoami error that isn't an outage refuses with the server's code, not as a wrong principal (audit L5)", async () => {
+    const run = await serviceRun(srv);
+    const real = globalThis.fetch;
+    const spy = spyOn(globalThis, "fetch").mockImplementation((async (input: RequestInfo | URL, init?: RequestInit) => {
+      // The wire sends a Request; its body is read from a clone.
+      const body = input instanceof Request && input.method === "POST" ? await input.clone().text() : undefined;
+      let call: { id?: number; method?: string; params?: { name?: string } } | undefined;
+      try { call = body ? JSON.parse(body) : undefined; } catch {}
+      if (call?.method === "tools/call" && call.params?.name === "whoami") {
+        return new Response(JSON.stringify({ jsonrpc: "2.0", id: call.id, result: { resultType: "complete", isError: true, content: [{ type: "text", text: "no" }], structuredContent: { code: "bad_request" } } }), { headers: { "content-type": "application/json" } });
+      }
+      return real(input as RequestInfo, init);
+    }) as typeof fetch);
+    try {
+      const s = signIn(mode(run.env));
+      await expect(s.token()).rejects.toThrow("Static mode refused: the server's whoami answered bad_request");
     } finally { spy.mockRestore(); }
   });
 
@@ -257,6 +322,18 @@ describe("nothing else is touched", () => {
     walk(dir);
     expect(files.length).toBeGreaterThan(0);
     for (const f of files) expect(readFileSync(f, "utf8")).not.toContain(run.token);
-    expect(signIn(mode(run.env)).stateKey).toBe(`service-credential:${CLIENT}`);
+    // The delivery lock is keyed by the service credential, never by the built-in client a person's session uses (audit L3).
+    expect(existsSync(deliveryPath(dir, srv.resource, `service-credential:${CLIENT}`, "svc-files-1"))).toBe(true);
+    expect(existsSync(deliveryPath(dir, srv.resource, CLIENT, "svc-files-1"))).toBe(false);
+  }, 30_000);
+
+  test("nothing that prints the sign-in prints the token (audit L1)", async () => {
+    const run = await serviceRun(srv);
+    const s = signIn(mode(run.env));
+    expect(await s.token()).toBe(run.token);
+    expect(Bun.inspect(s)).not.toContain(run.token);
+    expect(JSON.stringify(s)).not.toContain(run.token);
+    const client = rig(s, "svc-print-1").client;
+    expect(Bun.inspect(client)).not.toContain(run.token);
   }, 30_000);
 });

@@ -32247,7 +32247,7 @@ async function getJson(url, timeoutMs) {
   } catch (error) {
     throw new ServerUnreachable(error);
   }
-  if (response.status >= 500) {
+  if (response.status >= 500 || response.status === 429) {
     await response.body?.cancel();
     throw new ServerUnreachable(new Error(`${url} answered HTTP ${response.status}`));
   }
@@ -38151,8 +38151,41 @@ var NEW_RUN = "the launcher must start a new run with a fresh run token";
 var SERVICE_CLIENT = "service-credential";
 var TOKEN = /^[\x21-\x7e]{16,512}$/;
 var PRINCIPAL = /^[^\s/]{1,128}$/;
-function repositorySets(cwd, settingsDir) {
-  const dotenv = new RegExp(`^\\s*(export\\s+)?(${NAMES.join("|")})\\s*=`, "m");
+function launchEnv() {
+  let raw;
+  try {
+    raw = readFileSync4("/proc/self/environ", "utf8");
+  } catch {
+    return;
+  }
+  const env = {};
+  for (const entry of raw.split("\x00")) {
+    const at = entry.indexOf("=");
+    if (at > 0)
+      env[entry.slice(0, at)] = entry.slice(at + 1);
+  }
+  return env;
+}
+function* keys(value) {
+  if (Array.isArray(value)) {
+    for (const v of value)
+      yield* keys(v);
+    return;
+  }
+  if (value === null || typeof value !== "object")
+    return;
+  for (const [k, v] of Object.entries(value)) {
+    yield k;
+    yield* keys(v);
+  }
+}
+function repositorySets(env, cwd, settingsDirs, launch) {
+  if (launch) {
+    const changed = NAMES.find((name) => (env[name] ?? undefined) !== launch[name]);
+    if (changed)
+      return `${changed} was set after the harness started (a dotenv file?); the launcher sets it`;
+  }
+  const dotenv = new RegExp(`^\\s*(export\\s+)?(${NAMES.join("|")})\\s*[=:]`, "m");
   let files = [];
   try {
     files = readdirSync2(cwd).filter((name) => /^\.env(\..+)?$/.test(name));
@@ -38167,34 +38200,39 @@ function repositorySets(cwd, settingsDir) {
     if (dotenv.test(text))
       return `${file} in the working directory sets its variables; the launcher sets them`;
   }
-  if (settingsDir === undefined)
-    return;
-  const key = new RegExp(`"(${NAMES.join("|")})"\\s*:`);
-  for (const file of ["settings.json", "settings.local.json"]) {
-    const path = join5(settingsDir, ".claude", file);
-    let text;
-    try {
-      text = readFileSync4(path, "utf8");
-    } catch (error) {
-      if (error.code === "ENOENT")
-        continue;
-      return `the project's .claude/${file} is unreadable`;
+  for (const dir of new Set(settingsDirs))
+    for (const file of ["settings.json", "settings.local.json"]) {
+      let text;
+      try {
+        text = readFileSync4(join5(dir, ".claude", file), "utf8");
+      } catch (error) {
+        if (error.code === "ENOENT")
+          continue;
+        return `the project's .claude/${file} is unreadable`;
+      }
+      let parsed;
+      try {
+        parsed = JSON.parse(text);
+      } catch {
+        return `the project's .claude/${file} isn't JSON grayboard can check`;
+      }
+      for (const k of keys(parsed))
+        if (NAMES.includes(k))
+          return `the project's .claude/${file} sets its variables; the launcher sets them`;
     }
-    if (key.test(text))
-      return `the project's .claude/${file} sets its variables; the launcher sets them`;
-  }
   return;
 }
-function staticMode(env, cwd, settingsDir) {
+function staticMode(env, cwd, settingsDirs = [], launch = env === process.env ? launchEnv() : undefined) {
   const auth = env[STATIC_AUTH];
-  if (auth === undefined || auth === "") {
-    return env[RUN_TOKEN] ? { refused: `${RUN_TOKEN} is set without ${STATIC_AUTH}=static` } : undefined;
-  }
-  if (auth !== "static")
-    return { refused: `${STATIC_AUTH} must be "static" or unset` };
-  const repository = repositorySets(cwd, settingsDir);
+  if ((auth === undefined || auth === "") && !env[RUN_TOKEN])
+    return;
+  const repository = repositorySets(env, cwd, settingsDirs, launch);
   if (repository)
     return { refused: `Static mode refused: ${repository}` };
+  if (auth === undefined || auth === "")
+    return { refused: `${RUN_TOKEN} is set without ${STATIC_AUTH}=static` };
+  if (auth !== "static")
+    return { refused: `${STATIC_AUTH} must be "static" or unset` };
   const issuer = env[STATIC_ISSUER];
   if (!issuer)
     return { refused: `Static mode needs a pinned issuer (${STATIC_ISSUER})` };
@@ -38215,22 +38253,21 @@ function staticMode(env, cwd, settingsDir) {
 var ended = new Set;
 
 class StaticLogin {
-  config;
   resource;
   stateKey;
   static;
+  #config;
   #token;
   #fingerprint;
   #verified;
   #refusal;
-  constructor(config) {
-    this.config = config;
+  constructor({ mode, ...config }) {
+    this.#config = config;
     const resource = canonicalEndpoint(config.resource);
     if (!resource)
       throw new Error("Grayboard resource must be canonical HTTPS (or HTTP loopback), without credentials, query or fragment");
     this.resource = resource.href;
     this.stateKey = `${SERVICE_CLIENT}:${config.clientId}`;
-    const mode = config.mode;
     if ("refused" in mode) {
       this.static = { refused: mode.refused };
       this.#refusal = new Refusal("identity", mode.refused);
@@ -38241,7 +38278,7 @@ class StaticLogin {
     }
   }
   expired() {
-    return new AccessExpired(this.config.harness, NEW_RUN, "login_required");
+    return new AccessExpired(this.#config.harness, NEW_RUN, "login_required");
   }
   get ended() {
     return this.#fingerprint !== undefined && ended.has(this.#fingerprint);
@@ -38290,7 +38327,7 @@ class StaticLogin {
   }
   async whoami() {
     const token = this.#token;
-    const wire = new NativeWire({ url: this.resource, sessionKey: GRAYBOARD_SESSION_META, client: { name: this.config.clientId, version: this.config.version } }, {
+    const wire = new NativeWire({ url: this.resource, sessionKey: GRAYBOARD_SESSION_META, client: { name: this.#config.clientId, version: this.#config.version } }, {
       token: async () => token,
       onUnauthorized: async () => this.unauthorized(token)
     }, AbortSignal.timeout(1e4));
@@ -38303,7 +38340,7 @@ class StaticLogin {
         const refused = subscriberError(value, false);
         if (refused.code === "rate_limited" || refused.code === "internal_error")
           throw new ServerUnreachable(refused);
-        return {};
+        throw new Refusal("identity", `Static mode refused: the server's whoami answered ${refused.code}`);
       }
       const fields = value;
       const text = (v) => typeof v === "string" ? v : undefined;
@@ -38343,7 +38380,7 @@ class StaticLogin {
       },
       check: async (e) => {
         if (e.configuration.configHash !== this.configuration().configHash)
-          throw new Refusal("binding", `Grayboard sign-in changed in ${this.config.harness}`);
+          throw new Refusal("binding", `Grayboard sign-in changed in ${this.#config.harness}`);
       },
       watch: async () => ({ dispose: async () => {} }),
       token: async () => this.token(),
@@ -38780,7 +38817,7 @@ function pluginConfig(env) {
     return { error: `the grayboard plugin's server_url isn't canonical HTTPS (or HTTP loopback) without credentials, query or fragment; ${reconfigure}` };
   return { id, dataDir, url };
 }
-var pluginStaticMode = (env, cwd) => staticMode(env, cwd, env.CLAUDE_PROJECT_DIR || cwd);
+var pluginStaticMode = (env, cwd) => staticMode(env, cwd, [...env.CLAUDE_PROJECT_DIR ? [env.CLAUDE_PROJECT_DIR] : [], cwd]);
 var STATIC_LOGOUT = "This run uses a launcher-set grayboard run token: nothing to sign out here; the launcher revokes it.";
 function createPlugin(o) {
   const config = pluginConfig(o.env);
@@ -39146,9 +39183,14 @@ async function logout(args) {
     log("grayboard logout: --data <plugin data dir> is required");
     return 2;
   }
-  if (pluginStaticMode(process.env, process.cwd())) {
+  const mode = pluginStaticMode(process.env, process.cwd());
+  if (mode && !("refused" in mode)) {
     console.log(STATIC_LOGOUT);
     return 0;
+  }
+  if (mode) {
+    log(`grayboard logout: ${mode.refused}; no grant was signed out. Remove the static-mode variables from the environment (or the project's files) and run it again.`);
+    return 1;
   }
   let names;
   try {

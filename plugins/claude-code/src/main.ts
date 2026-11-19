@@ -20,7 +20,10 @@ async function logout(args: string[]): Promise<number> {
   if (!dataDir) { log("grayboard logout: --data <plugin data dir> is required"); return 2; }
   // A static run (or a refused one) never reads the grants: they are the
   // person's whose machine the run borrowed, not the run's (#1243).
-  if (pluginStaticMode(process.env, process.cwd())) { console.log(STATIC_LOGOUT); return 0; }
+  const mode = pluginStaticMode(process.env, process.cwd());
+  if (mode && !("refused" in mode)) { console.log(STATIC_LOGOUT); return 0; }
+  // A refused one (a repository's .env can cause it) mustn't read as signed out: the person's grants are live.
+  if (mode) { log(`grayboard logout: ${mode.refused}; no grant was signed out. Remove the static-mode variables from the environment (or the project's files) and run it again.`); return 1; }
   // The skill's shell carries no server URL, so every grant this plugin holds
   // signs out: each store names its own server.
   let names: string[];

@@ -6,11 +6,13 @@
 // launcher's, when GRAYBOARD_PRINCIPAL names one), and a 401 ends the run.
 //
 // Inputs come from the launcher's environment only. A repository can reach a
-// harness's environment too, so the mode is refused when one tries: a dotenv
-// file in the working directory (Bun loads them into the Claude Code plugin's
-// and omp's process; omp loads the project's itself) or, for Claude Code, a
-// project `.claude/settings*.json` `env` block (it reaches the plugin's
-// process: .claude/briefs findings, verified on Claude Code 2.1.316).
+// harness's environment too, so the mode is refused when one tries: a
+// variable set after exec (Bun's dotenv autoload in the Claude Code plugin's
+// and omp's process, omp's own project .env loading: any grammar their
+// parsers accept), a dotenv file in the working directory that names one
+// (where the exec-time environment can't be read), or, for Claude Code, a
+// project `.claude/settings*.json` naming one (Claude Code puts its `env`
+// into the plugin's exec environment, verified on Claude Code 2.1.316).
 //
 // Not vendored to OpenCode V2 (scripts/sync_hosted_core.ts), whose static
 // mode (adapters/opencode-v2/src/lifecycle.ts staticMode) has its own names.
@@ -37,12 +39,40 @@ const PRINCIPAL = /^[^\s/]{1,128}$/;
 
 export type StaticMode = { issuer: string; token: string; principal?: string } | { refused: string };
 
-// The repository-reachable files that name a static-mode variable, if any:
-// dotenv files in `cwd`, and with `settingsDir` (Claude Code's project dir)
-// its `.claude/settings.json` and `settings.local.json`. An unreadable one
-// refuses too: it can't be shown not to set them.
-function repositorySets(cwd: string, settingsDir?: string): string | undefined {
-  const dotenv = new RegExp(`^\\s*(export\\s+)?(${NAMES.join("|")})\\s*=`, "m");
+// The process's environment as exec gave it (Linux's /proc/self/environ,
+// which nothing in the process rewrites; omp's readLaunchEnv reads it the
+// same way), or undefined where it can't be read.
+export function launchEnv(): Record<string, string> | undefined {
+  let raw: string;
+  try { raw = readFileSync("/proc/self/environ", "utf8"); } catch { return undefined; }
+  const env: Record<string, string> = {};
+  for (const entry of raw.split("\0")) {
+    const at = entry.indexOf("=");
+    if (at > 0) env[entry.slice(0, at)] = entry.slice(at + 1);
+  }
+  return env;
+}
+
+// Every key of a parsed JSON value, at any depth.
+function* keys(value: unknown): Generator<string> {
+  if (Array.isArray(value)) { for (const v of value) yield* keys(v); return; }
+  if (value === null || typeof value !== "object") return;
+  for (const [k, v] of Object.entries(value)) { yield k; yield* keys(v); }
+}
+
+// What the repository did to the static-mode variables, if anything: one set
+// or changed after exec (`launch`, the exec-time environment), a dotenv file
+// in `cwd` naming one, and for each of `settingsDirs` (Claude Code's project
+// dir and cwd) a `.claude/settings.json` or `settings.local.json` with one as
+// a key anywhere. An unreadable or unparseable file refuses too: it can't be
+// shown not to set them.
+function repositorySets(env: Record<string, string | undefined>, cwd: string, settingsDirs: string[], launch: Record<string, string> | undefined): string | undefined {
+  if (launch) {
+    const changed = NAMES.find(name => (env[name] ?? undefined) !== launch[name]);
+    if (changed) return `${changed} was set after the harness started (a dotenv file?); the launcher sets it`;
+  }
+  // Every separator and prefix Bun's dotenv parser takes: `=` or `:`, an optional `export`.
+  const dotenv = new RegExp(`^\\s*(export\\s+)?(${NAMES.join("|")})\\s*[=:]`, "m");
   let files: string[] = [];
   try { files = readdirSync(cwd).filter(name => /^\.env(\..+)?$/.test(name)); } catch {}
   for (const file of files) {
@@ -50,15 +80,15 @@ function repositorySets(cwd: string, settingsDir?: string): string | undefined {
     try { text = readFileSync(join(cwd, file), "utf8"); } catch { return `${file} in the working directory is unreadable`; }
     if (dotenv.test(text)) return `${file} in the working directory sets its variables; the launcher sets them`;
   }
-  if (settingsDir === undefined) return undefined;
-  // A key anywhere in the file, not only under `env`: the narrowest check that can't be fooled by JSON Claude Code reads differently.
-  const key = new RegExp(`"(${NAMES.join("|")})"\\s*:`);
-  for (const file of ["settings.json", "settings.local.json"]) {
-    const path = join(settingsDir, ".claude", file);
+  // Parsed, so an escaped key (`\u0047RAYBOARD_…`) reads as Claude Code reads it;
+  // a key anywhere in the file, not only under `env`.
+  for (const dir of new Set(settingsDirs)) for (const file of ["settings.json", "settings.local.json"]) {
     let text: string;
-    try { text = readFileSync(path, "utf8"); }
+    try { text = readFileSync(join(dir, ".claude", file), "utf8"); }
     catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") continue; return `the project's .claude/${file} is unreadable`; }
-    if (key.test(text)) return `the project's .claude/${file} sets its variables; the launcher sets them`;
+    let parsed: unknown;
+    try { parsed = JSON.parse(text); } catch { return `the project's .claude/${file} isn't JSON grayboard can check`; }
+    for (const k of keys(parsed)) if (NAMES.includes(k)) return `the project's .claude/${file} sets its variables; the launcher sets them`;
   }
   return undefined;
 }
@@ -69,14 +99,17 @@ function repositorySets(cwd: string, settingsDir?: string): string | undefined {
 // token set without the mode is a refused static mode, never OAuth.
 // GRAYBOARD_ISSUER and GRAYBOARD_PRINCIPAL alone, without the mode, are
 // ignored (a shell that exports the issuer for another client).
-export function staticMode(env: Record<string, string | undefined>, cwd: string, settingsDir?: string): StaticMode | undefined {
+// `settingsDirs`: Claude Code's project dirs to check (others pass none).
+// `launch`: the exec-time environment; read from /proc only when `env` is
+// this process's own (tests pass one).
+export function staticMode(env: Record<string, string | undefined>, cwd: string, settingsDirs: string[] = [], launch: Record<string, string> | undefined = env === process.env ? launchEnv() : undefined): StaticMode | undefined {
   const auth = env[STATIC_AUTH];
-  if (auth === undefined || auth === "") {
-    return env[RUN_TOKEN] ? { refused: `${RUN_TOKEN} is set without ${STATIC_AUTH}=static` } : undefined;
-  }
-  if (auth !== "static") return { refused: `${STATIC_AUTH} must be "static" or unset` };
-  const repository = repositorySets(cwd, settingsDir);
+  if ((auth === undefined || auth === "") && !env[RUN_TOKEN]) return undefined;
+  // The repository first, so a file that set the token alone is named.
+  const repository = repositorySets(env, cwd, settingsDirs, launch);
   if (repository) return { refused: `Static mode refused: ${repository}` };
+  if (auth === undefined || auth === "") return { refused: `${RUN_TOKEN} is set without ${STATIC_AUTH}=static` };
+  if (auth !== "static") return { refused: `${STATIC_AUTH} must be "static" or unset` };
   const issuer = env[STATIC_ISSUER];
   if (!issuer) return { refused: `Static mode needs a pinned issuer (${STATIC_ISSUER})` };
   if (!canonicalEndpoint(issuer)) return { refused: `${STATIC_ISSUER} must be an HTTPS URL (or HTTP loopback) without credentials, query or fragment` };
@@ -107,17 +140,19 @@ export class StaticLogin implements SignIn {
   readonly resource: string;
   readonly stateKey: string;
   readonly static: { issuer?: string; principal?: string; refused?: string };
+  // The config without its mode, so nothing that prints this object prints the token.
+  readonly #config: Omit<StaticConfig, "mode">;
   readonly #token: string | undefined;
   readonly #fingerprint: string | undefined;
   #verified: Promise<void> | undefined;
   #refusal: Refusal | undefined;
 
-  constructor(private readonly config: StaticConfig) {
+  constructor({ mode, ...config }: StaticConfig) {
+    this.#config = config;
     const resource = canonicalEndpoint(config.resource);
     if (!resource) throw new Error("Grayboard resource must be canonical HTTPS (or HTTP loopback), without credentials, query or fragment");
     this.resource = resource.href;
     this.stateKey = `${SERVICE_CLIENT}:${config.clientId}`;
-    const mode = config.mode;
     if ("refused" in mode) {
       this.static = { refused: mode.refused };
       this.#refusal = new Refusal("identity", mode.refused);
@@ -128,7 +163,7 @@ export class StaticLogin implements SignIn {
     }
   }
 
-  private expired() { return new AccessExpired(this.config.harness, NEW_RUN, "login_required"); }
+  private expired() { return new AccessExpired(this.#config.harness, NEW_RUN, "login_required"); }
   get ended(): boolean { return this.#fingerprint !== undefined && ended.has(this.#fingerprint); }
 
   // The run token once its issuer and principal checked out. Throws the
@@ -173,7 +208,7 @@ export class StaticLogin implements SignIn {
   }
   private async whoami(): Promise<{ kind?: string; principal?: string }> {
     const token = this.#token!;
-    const wire = new NativeWire({ url: this.resource, sessionKey: GRAYBOARD_SESSION_META, client: { name: this.config.clientId, version: this.config.version } }, {
+    const wire = new NativeWire({ url: this.resource, sessionKey: GRAYBOARD_SESSION_META, client: { name: this.#config.clientId, version: this.#config.version } }, {
       token: async () => token,
       onUnauthorized: async () => this.unauthorized(token),
     }, AbortSignal.timeout(10_000));
@@ -186,7 +221,7 @@ export class StaticLogin implements SignIn {
       if (result.isError) {
         const refused = subscriberError(value, false);
         if (refused.code === "rate_limited" || refused.code === "internal_error") throw new ServerUnreachable(refused);
-        return {};
+        throw new Refusal("identity", `Static mode refused: the server's whoami answered ${refused.code}`);
       }
       const fields = value as { principal_kind?: unknown; principal?: unknown } | undefined;
       const text = (v: unknown) => typeof v === "string" ? v : undefined;
@@ -214,7 +249,7 @@ export class StaticLogin implements SignIn {
   credential(): CredentialPort<Enrollment> {
     return {
       capture: async sessionID => { await this.token(); return { version: 2, sessionID, configuration: this.configuration() }; },
-      check: async e => { if (e.configuration.configHash !== this.configuration().configHash) throw new Refusal("binding", `Grayboard sign-in changed in ${this.config.harness}`); },
+      check: async e => { if (e.configuration.configHash !== this.configuration().configHash) throw new Refusal("binding", `Grayboard sign-in changed in ${this.#config.harness}`); },
       watch: async () => ({ dispose: async () => {} }),
       token: async () => this.token(),
       unauthorized: async (_e, token) => this.unauthorized(token),

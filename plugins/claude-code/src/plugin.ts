@@ -96,7 +96,8 @@ export function pluginConfig(env: Record<string, string | undefined>): Config {
 // Static mode (#1243) from the launcher's environment, refused when the
 // project's dotenv or `.claude/settings*.json` sets its variables: both reach
 // this process.
-export const pluginStaticMode = (env: Record<string, string | undefined>, cwd: string) => staticMode(env, cwd, env.CLAUDE_PROJECT_DIR || cwd);
+// Both the project dir and cwd, when they differ: CLAUDE_PROJECT_DIR is itself an environment variable.
+export const pluginStaticMode = (env: Record<string, string | undefined>, cwd: string) => staticMode(env, cwd, [...(env.CLAUDE_PROJECT_DIR ? [env.CLAUDE_PROJECT_DIR] : []), cwd]);
 export const STATIC_LOGOUT = "This run uses a launcher-set grayboard run token: nothing to sign out here; the launcher revokes it.";
 export function createPlugin(o: PluginOptions): Plugin {
   const config = pluginConfig(o.env);

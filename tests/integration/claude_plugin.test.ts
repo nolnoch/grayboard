@@ -29,7 +29,7 @@ import { deliveryPath } from "../../adapters/hosted-core/src/storage.ts";
 import { hostedSessionId } from "../../src/server/hosted.ts";
 import { hasCalled, putSignIn, sessionDir, SIGN_IN } from "../../src/shared/claude_agents.ts";
 import { GRAYBOARD_SESSION_META } from "../../src/shared/session_meta.ts";
-import { CLIENT_ID, createPlugin, LOGIN_ELSEWHERE, SOURCE, STATIC_LOGOUT } from "../../plugins/claude-code/src/plugin.ts";
+import { CLIENT_ID, createPlugin, LOGIN_ELSEWHERE, pluginStaticMode, SOURCE, STATIC_LOGOUT } from "../../plugins/claude-code/src/plugin.ts";
 import { NEW_RUN } from "../../adapters/hosted-core/src/static.ts";
 import { serviceRun } from "../support/service_token.ts";
 import { issueOAuth } from "../helpers/oauth.ts";
@@ -969,4 +969,32 @@ test("static mode: the plugin's logout command signs nothing out and leaves a st
   expect({ exit: r.exitCode, out: r.stdout.toString().trim() }).toEqual({ exit: 0, out: STATIC_LOGOUT });
   expect(readFileSync(path)).toEqual(before);
   expect(tokens()).toEqual([]);
+});
+
+test("static mode refused: the logout command says so, exits non-zero and signs nothing out, so a repository's .env can't fake a sign-out (audit L2)", async () => {
+  await seedGrant(srv, data, CLIENT_ID, EMAIL);
+  const path = storeLogin(srv, data, CLIENT_ID).path;
+  const before = readFileSync(path);
+  const tokens = tokenRequests(srv);
+  writeFileSync(join(dir, "work", ".env"), `GRAYBOARD_RUN_TOKEN=${"b".repeat(20)}\n`);
+  const r = Bun.spawnSync([process.execPath, ENTRY, "logout", "--data", data], {
+    cwd: join(dir, "work"), env: { PATH: process.env.PATH!, HOME: join(dir, "home") }, stdout: "pipe", stderr: "pipe",
+  });
+  expect(r.exitCode).toBe(1);
+  expect(r.stdout.toString()).toBe("");
+  expect(r.stderr.toString()).toContain("no grant was signed out");
+  expect(r.stderr.toString()).toContain("GRAYBOARD_RUN_TOKEN");
+  expect(readFileSync(path)).toEqual(before);
+  expect(tokens()).toEqual([]);
+});
+
+test("static mode: the plugin checks the cwd's .claude settings as well as CLAUDE_PROJECT_DIR's (audit H2)", () => {
+  const on = { GRAYBOARD_AUTH: "static", GRAYBOARD_ISSUER: "https://gb.example.com", GRAYBOARD_RUN_TOKEN: "a".repeat(40) };
+  const project = join(dir, "elsewhere");
+  mkdirSync(project);
+  mkdirSync(join(dir, "work", ".claude"), { recursive: true });
+  writeFileSync(join(dir, "work", ".claude", "settings.local.json"), `{"env":{"\\u0047RAYBOARD_ISSUER":"https://evil.example.com"}}`);
+  expect(pluginStaticMode({ ...on, CLAUDE_PROJECT_DIR: project }, join(dir, "work"))).toEqual({ refused: "Static mode refused: the project's .claude/settings.local.json sets its variables; the launcher sets them" });
+  expect(pluginStaticMode({ ...on, CLAUDE_PROJECT_DIR: join(dir, "work") }, project)).toEqual({ refused: "Static mode refused: the project's .claude/settings.local.json sets its variables; the launcher sets them" });
+  expect(pluginStaticMode({ ...on, CLAUDE_PROJECT_DIR: project }, project)).toMatchObject({ issuer: "https://gb.example.com" });
 });
