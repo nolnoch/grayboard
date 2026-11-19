@@ -499,7 +499,7 @@ test("#284: creating a team refuses a name another principal holds", async () =>
   await seed(srv.app.repo, () => srv.app.db.prepare(`INSERT INTO principals (kind, name, created_at) VALUES ('service', 'ingest', 0)`).run());
   const r = await srv.api(alice, "POST", "/api/teams", { name: "ingest" });
   expect(r.status).toBe(409);
-  expect(r.body.message).toContain(`"ingest" belongs to another team or service principal`);
+  expect(r.body.message).toBe(`the name "ingest" belongs to another user, team or service`);
 });
 
 test("13 (server): a hosted bind's result carries its name and instructions", async () => {

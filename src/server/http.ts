@@ -445,14 +445,17 @@ async function teamCreate(req: Request, authed: AuthedUser, repo: Repo): Promise
   const name = body.name.toLowerCase();
   if (!isValidIdentityName(name)) return badRequest("invalid team name");
   return repo.write(async (tx) => {
-    if (await repo.teams.findByName(tx, name)) return conflict(`team "${name}" already exists`);
+    // A taken name answers one way whatever holds it, a private team included (#1280): teams, users and services share
+    // one namespace, so create can say the name is taken (as board names are, #1257) and nothing about its holder.
+    const taken = conflict(`the name "${name}" belongs to another user, team or service`);
+    if (await repo.teams.findByName(tx, name)) return taken;
     // The team's board shares its name, so the name must be free as a board too.
     if (await repo.boards.get(tx, name)) return conflict(`a board named "#${name}" already exists`);
     let team: Team;
     try {
       team = await repo.teams.create(tx, name, authed.user_id);
     } catch (e) {
-      if (e instanceof PrincipalTaken) return conflict(e.message);
+      if (e instanceof PrincipalTaken) return taken;
       throw e;
     }
     await repo.teams.addMember(tx, team.id, authed.user_id);

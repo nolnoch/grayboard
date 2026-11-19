@@ -70,3 +70,16 @@ test("team create on a hidden board's name says only that the name is taken", as
   await ops.call("board_create", { name: "qa-room", purpose: "qa only", team: "qa" });
   expect(await srv.api(alice, "POST", "/api/teams", { name: "qa-room" })).toEqual({ status: 409, body: { code: "conflict", message: 'a board named "#qa-room" already exists' } });
 });
+
+// #1280: team create on a taken name answers the same whatever holds it, so it doesn't tell a private team (or a
+// service) from any other holder.
+test("team create on a taken name says only that it's taken, a private team's included", async () => {
+  const bob = await srv.login("bob@example.com");
+  const alice = await srv.login("alice@example.com");
+  expect((await srv.api(bob, "POST", "/api/teams", { name: "qa" })).status).toBe(201);
+  const taken = (name: string) => ({ status: 409, body: { code: "conflict", message: `the name "${name}" belongs to another user, team or service` } });
+  // A non-member can't see qa (its member routes answer 404), and gets the same answer a member does.
+  expect((await srv.api(alice, "GET", "/api/teams/qa/members")).status).toBe(404);
+  expect(await srv.api(alice, "POST", "/api/teams", { name: "qa" })).toEqual(taken("qa"));
+  expect(await srv.api(bob, "POST", "/api/teams", { name: "qa" })).toEqual(taken("qa"));
+});
