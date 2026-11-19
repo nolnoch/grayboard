@@ -1,5 +1,5 @@
 import pkg from "../../package.json" with { type: "json" };
-import { DEV_SESSION_LABEL, LastOwner, PrincipalTaken, TEAM_POLICIES, type Repo, type RoleFilter, type Team, type TeamPolicy, type User } from "./db.ts";
+import { AuthorityLost, DEV_SESSION_LABEL, LastOwner, PrincipalTaken, TEAM_POLICIES, type Repo, type RoleFilter, type Team, type TeamPolicy, type User } from "./db.ts";
 import { DEFAULT_CLI_TOKEN_IDLE_DAYS, type Config } from "./config.ts";
 import {
   verifySessionToken, extractBearer,
@@ -485,13 +485,17 @@ async function ownedTeam(h: Read, teamName: string, authed: AuthedUser, repo: Re
 }
 
 const lastOwner = (e: LastOwner): Response => jsonErr("conflict", e.message, 409);
+// The member routes' refusal when the binding their decision rested on was revoked before the write, which the store
+// re-checks under every role write (AuthorityLost): the 403 the decision gives a member who isn't an owner.
+const authorityLost = (team: Team): Response =>
+  forbidden(`only an owner of team "${team.name}" (or an admin) can add or remove members; \`grayboard team members ${team.name}\` lists its owners`);
 
 function teamLeave(teamName: string, authed: AuthedUser, repo: Repo, sessions: SessionHooks): Promise<Response> {
   return repo.write(async (tx) => {
     const team = await memberTeam(tx, teamName, authed, repo);
     if (!team) return notFound();
     try {
-      await repo.teams.removeMember(tx, team.id, authed.user_id, authed.user_email);
+      await repo.teams.removeMember(tx, team.id, authed.user_id, { byUser: null, authority: "none", actor: authed.user_email });
     } catch (e) {
       if (e instanceof LastOwner) return lastOwner(e);
       throw e;
@@ -529,7 +533,7 @@ async function teamAdd(teamName: string, req: Request, authed: AuthedUser, repo:
     const spec = { holder: email, role: "team_owner" as const, scope: team.name };
     try {
       return await tx.savepoint(async (sp) => {
-        if (await repo.teams.addMember(sp, team.id, user.id)) {
+        if (await repo.teams.addMember(sp, team.id, user.id, { byUser: granter.userId, authority: granter.authority })) {
           await onTeamJoined(repo, sp, team, email);
           writeAudit(repo, sp, "team.member_added", authed.user_email, team.name, { member: email, ...managed.audit });
         }
@@ -546,6 +550,7 @@ async function teamAdd(teamName: string, req: Request, authed: AuthedUser, repo:
       });
     } catch (e) {
       if (e instanceof Refused) return e.response;
+      if (e instanceof AuthorityLost) return authorityLost(team);
       throw e;
     }
   });
@@ -564,9 +569,10 @@ async function teamRemove(teamName: string, req: Request, authed: AuthedUser, re
       return jsonErr("not_found", `${email} is not a member of team "${team.name}"`, 404);
     }
     try {
-      await repo.teams.removeMember(tx, team.id, user.id, authed.user_email, managed.audit);
+      await repo.teams.removeMember(tx, team.id, user.id, { byUser: authed.user_id, authority: authorityOf(managed.decision), actor: authed.user_email, audit: managed.audit });
     } catch (e) {
       if (e instanceof LastOwner) return lastOwner(e);
+      if (e instanceof AuthorityLost) return authorityLost(team);
       throw e;
     }
     await onTeamLeft(repo, tx, team, email);

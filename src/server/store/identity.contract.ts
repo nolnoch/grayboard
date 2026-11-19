@@ -19,8 +19,8 @@
 import { expect, test } from "bun:test";
 import { grantRole, revokeRole, type Granter, type RoleSpec } from "../roles.ts";
 import { authorize, type AuthzRequest } from "../policy.ts";
-import { LastOwner, PrincipalTaken } from "./errors.ts";
-import type { IdentityGroups, User } from "./identity.ts";
+import { AuthorityLost, LastOwner, PrincipalTaken } from "./errors.ts";
+import type { IdentityGroups, MemberAuthority, User } from "./identity.ts";
 import type { Read, Tx } from "./tx_base.ts";
 
 // One store, fresh per row.
@@ -383,7 +383,7 @@ function teams(it: It, sqliteOnly: (name: string, why: string, fn: (h: IdentityS
       return { t, b, c };
     });
     const before = await h.roles.find(h.read, B, "team_owner", "eng");
-    const revoked = await h.write(tx => h.teams.removeMember(tx, t.id, b.id, A, { via: "test" }));
+    const revoked = await h.write(tx => h.teams.removeMember(tx, t.id, b.id, { byUser: null, authority: "none", actor: A, audit: { via: "test" } }));
     expect(revoked).toEqual(before!);
     expect(await h.roles.find(h.read, B, "team_owner", "eng")).toBeUndefined();
     expect((await h.teams.listMembers(h.read, t.id)).map(m => m.email)).toEqual([A, C]);
@@ -413,6 +413,51 @@ function teams(it: It, sqliteOnly: (name: string, why: string, fn: (h: IdentityS
     expect(await h.teams.isMember(h.read, t.id, a.id)).toBe(true);
     expect(await h.roles.find(h.read, A, "team_owner", "eng")).toBeDefined();
     expect(await h.audits("role.revoked")).toEqual([]);
+  });
+
+  // Revocation is strict for membership (#807 P3 C3b audit M-1): the route decides before the write, and the store
+  // re-checks the actor's binding in it. On Postgres T-C3-9 races the revoke against each.
+  const asOwner = (u: User): MemberAuthority => ({ byUser: u.id, authority: "owner_or_admin" });
+  const ownedEng = (h: IdentityStore) => h.write(async tx => {
+    const us: User[] = [];
+    for (const e of [A, B, C, D]) us.push(await h.users.upsertByEmail(tx, e, null));
+    const [a, b, c] = us as [User, User, User];
+    const t = await h.teams.create(tx, "eng", a.id);
+    for (const u of [a, b, c]) await h.teams.addMember(tx, t.id, u.id);
+    for (const e of [A, B]) await grantRole(h, tx, { holder: e, role: "team_owner", scope: "eng" }, { email: A, userId: a.id, authority: "none" });
+    return { t, us: us as [User, User, User, User] };
+  });
+
+  it("teams.addMember re-checks its actor's authority: an owner or an admin adds, one whose binding is gone is AuthorityLost and adds no one", async h => {
+    const { t, us: [a, b, c, d] } = await ownedEng(h);
+    expect(await h.write(tx => h.teams.addMember(tx, t.id, d.id, asOwner(b)))).toBe(true);
+    expect(await h.write(tx => h.teams.addMember(tx, t.id, d.id, asOwner(b)))).toBe(false);
+    await h.write(tx => revokeRole(h, tx, { holder: B, role: "team_owner", scope: "eng" }, { email: A, userId: a.id, authority: "none" }, false));
+    await h.write(tx => h.teams.removeMember(tx, t.id, d.id));
+    // Caught in the body, which commits: a new member and an existing one alike.
+    for (const u of [d, c]) expect(await h.write(tx => caught(() => h.teams.addMember(tx, t.id, u.id, asOwner(b))))).toBeInstanceOf(AuthorityLost);
+    expect(await h.teams.listMemberUserIds(h.read, t.id)).toEqual([a.id, b.id, c.id]);
+    // org_admin: refused while D holds none, then added once they do.
+    const asAdmin: MemberAuthority = { byUser: d.id, authority: "org_admin" };
+    expect(await h.write(tx => caught(() => h.teams.addMember(tx, t.id, d.id, asAdmin)))).toBeInstanceOf(AuthorityLost);
+    await h.write(tx => grantRole(h, tx, { holder: D, role: "org_admin", scope: null }, { email: D, userId: d.id, authority: "none" }));
+    expect(await h.write(tx => h.teams.addMember(tx, t.id, d.id, asAdmin))).toBe(true);
+    expect(await h.write(tx => h.teams.addMember(tx, t.id, d.id, { byUser: d.id, authority: "owner_or_admin" }))).toBe(false);
+  });
+
+  it("teams.removeMember re-checks its actor's authority before any write: an owner may remove themselves, then is AuthorityLost and removes no one", async h => {
+    const { t, us: [a, b, c] } = await ownedEng(h);
+    // The revoke deletes the binding the authority rests on: read before it, the removal goes through.
+    expect(await h.write(tx => h.teams.removeMember(tx, t.id, a.id, { ...asOwner(a), actor: A }))).toMatchObject({ principal: A, role: "team_owner" });
+    expect(await h.teams.isMember(h.read, t.id, a.id)).toBe(false);
+    for (const u of [b, c]) {
+      expect(await h.write(tx => caught(() => h.teams.removeMember(tx, t.id, u.id, { ...asOwner(a), actor: A })))).toBeInstanceOf(AuthorityLost);
+    }
+    expect(await h.teams.listMemberUserIds(h.read, t.id)).toEqual([b.id, c.id]);
+    expect(await h.roles.find(h.read, B, "team_owner", "eng")).toBeDefined();
+    expect((await h.audits("role.revoked")).map(r => r.target)).toEqual([A]);
+    expect(await h.write(tx => h.teams.removeMember(tx, t.id, c.id, { ...asOwner(b), actor: B }))).toBeNull();
+    expect(await h.teams.listMemberUserIds(h.read, t.id)).toEqual([b.id]);
   });
 }
 

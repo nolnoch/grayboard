@@ -3,15 +3,18 @@
 // through pgOf. The SQLite store (db.ts makeRepo) is the reference; what differs, and why:
 // - Under READ COMMITTED each statement sees a new snapshot, and a statement that waits on a row lock re-checks only
 //   that row's WHERE, not its subqueries. Every lock and savepoint below follows from that.
-// - Role-binding writes (roles.grant, roles.revoke, teams.removeMember) take one transaction-scoped advisory lock first
-//   (ROLE_WRITE_LOCK), outside any savepoint: ROLLBACK TO frees a lock taken inside one. It closes the last-owner
-//   counts, the mutual org_admin revoke (each DELETE re-checks its own revoker's binding, which the other's
-//   uncommitted DELETE leaves visible) and an owner grant racing a member removal, in one lock order, so no deadlock.
+// - Role-binding and membership writes (roles.grant, roles.revoke, teams.addMember, teams.removeMember) take one
+//   transaction-scoped advisory lock first (ROLE_WRITE_LOCK), outside the store's own savepoints: ROLLBACK TO frees a
+//   lock taken inside one. It closes the last-owner counts, the mutual org_admin revoke (each DELETE re-checks its own
+//   revoker's binding, which the other's uncommitted DELETE leaves visible), an owner grant racing a member removal,
+//   and a member added or removed by an owner whose binding is being revoked, in one lock order, so no deadlock.
 //   removeMember takes it unconditionally: revokeBinding returns early for a non-owner, the very case the grant race is.
+//   addMember takes it even for "none": the count a concurrent revoke of the last owner makes must see the new member.
 // - A refusal thrown after a write (revokeBinding's LastOwner, upsertUser's PrincipalTaken) runs in the store's own
-//   savepoint, since its callers catch it and commit the 409. So does every statement whose 23505 is control flow
-//   (teams.create, services.create, the sign-in link), and the savepoint covers errors rethrown unmapped too: a raw
-//   error there would abort the caller's whole transaction.
+//   savepoint: a caller that catches it, as revokeRole and the member routes catch LastOwner, commits nothing the
+//   refused call wrote. So does every statement whose 23505 is control flow (teams.create, services.create, the
+//   sign-in link), and the savepoint covers errors rethrown unmapped too: a raw error there would abort the caller's
+//   whole transaction.
 // - users.setDisabled and sessions.revokeAllForUser port with the hosted and OAuth stores (C8); users.isDisabled and
 //   users.active with the auth cache (C9).
 //
@@ -19,15 +22,15 @@
 import { addressParts } from "../../../core/addresses.ts";
 import type { Principal } from "../../../core/resolver.ts";
 import { requestOrigin } from "../../request_context.ts";
-import { LastOwner, PrincipalTaken } from "../errors.ts";
+import { AuthorityLost, LastOwner, PrincipalTaken } from "../errors.ts";
 import {
   DEV_SESSION_LABEL, TEAM_POLICIES,
-  type IdentityGroups, type IdpSignIn, type PrincipalRow, type RoleAuthority, type RoleBinding, type RoleRevoke,
+  type IdentityGroups, type IdpSignIn, type MemberAuthority, type MemberRemoval, type PrincipalRow, type RoleAuthority, type RoleBinding, type RoleRevoke,
   type Session, type Team, type TeamMember, type TeamPolicy, type User,
 } from "../identity.ts";
 import type { Read, Tx } from "../tx_base.ts";
 import { principalTaken, SERVICE_NAME_CONSTRAINTS, uniqueViolation } from "./errors.ts";
-import { int8, int8OrNull, type JsonParam } from "./sql.ts";
+import { int8, int8OrNull, type AuditDetail } from "./sql.ts";
 import { pgOf, type PgFragment, type PgSql } from "./tx.ts";
 
 // pg_advisory_xact_lock's key for every role-binding write (#807 P3 C3 decision 1). One key serializes role writes
@@ -89,14 +92,22 @@ function authority(sql: PgSql, a: RoleAuthority, byUser: number | null, scope: (
   return sql.fragment`(${admin()} OR EXISTS (SELECT 1 FROM role_bindings gt JOIN principals gp ON gp.id = gt.principal_id WHERE gp.kind = 'user' AND gp.user_id = ${byUser} AND gt.role = 'team_owner' AND gt.scope_id = ${scope()}))`;
 }
 
+// A membership change's authority on the team, as of this statement.
+const teamAuthority = (sql: PgSql, by: MemberAuthority, teamId: number): PgFragment =>
+  authority(sql, by.authority, by.byUser, () => sql.fragment`(SELECT id FROM principals WHERE kind = 'team' AND team_id = ${teamId})`);
+const authorityHolds = async (sql: PgSql, by: MemberAuthority, teamId: number): Promise<boolean> =>
+  (await sql`SELECT ${teamAuthority(sql, by, teamId)} AS ok`)[0]!.ok === true;
+const NO_AUTHORITY: MemberRemoval = { byUser: null, authority: "none", actor: null };
+
 const bindingDetail = (b: RoleBinding) => ({
   binding: b.id, role: b.role, principal: b.principal, principal_id: b.principal_id, scope: b.scope, scope_id: b.scope_id,
   granted_by: b.granted_by, granter: b.granter, granted_at: b.granted_at,
 });
 
-// An access_log row stamped with the request's origin (db.ts insertAudit). `detail` is the value itself: a string
-// bound to jsonb is stored as a JSON string, which every `detail->>` read misses (JsonParam refuses one).
-async function insertAudit(sql: PgSql, at: number, actor: string | null, action: string, target: string | null, detail: JsonParam): Promise<void> {
+// An access_log row stamped with the request's origin (db.ts insertAudit). `detail` is the object itself: a string
+// bound to jsonb is stored as a JSON string, which every `detail->>` read misses, and a top-level scalar fails or
+// stores SQL NULL (AuditDetail refuses all three).
+async function insertAudit(sql: PgSql, at: number, actor: string | null, action: string, target: string | null, detail: AuditDetail): Promise<void> {
   const o = requestOrigin();
   await sql`INSERT INTO access_log (at, actor, action, target, detail, ip, ua, client_id)
     VALUES (${at}, ${actor}, ${action}, ${target}, ${detail}, ${o?.ip ?? null}, ${o?.ua ?? null}, ${o?.client_id ?? null})`;
@@ -107,7 +118,8 @@ class LostLink extends Error {}
 
 export function makePgIdentity({ now }: { now: () => number }): PgIdentity {
   // A user row by email, created or renamed, with its principal (db.ts upsertUser). In a savepoint: the PrincipalTaken
-  // for a service's name comes after the rename, and callers catch it and commit. Three statements, not one
+  // for a service's name comes after the rename, so a caller that catches it commits no rename. That's the store's
+  // guarantee; no caller catches it today (devLogin and the sign-in's new user propagate it). Three statements, not one
   // conditional upsert: a NOT EXISTS in the upsert reads the snapshot from before it waited on a concurrent
   // services.create, and renames the service; the re-read is a new statement and sees it.
   const upsertUser = (tx: Tx, email: string, displayName: string | null): Promise<User> => tx.savepoint(async sp => {
@@ -126,9 +138,10 @@ export function makePgIdentity({ now }: { now: () => number }): PgIdentity {
   // concurrent sign-in linked first.
   async function signInAttempt(tx: Tx, issuer: string, subject: string, email: string, displayName: string | null): Promise<IdpSignIn> {
     const sql = pgOf(tx);
-    // Conditional on the row still being unlinked (D3): another sign-in may have linked it since the read.
+    // Conditional on the row still being unlinked and enabled (D3): another sign-in may have linked it, or an admin
+    // disabled it, since the read. Zero rows takes the lost-link path, whose re-read decides as a serial run would.
     const link = async (id: number) => (await sql`UPDATE users SET idp_issuer = ${issuer}, idp_subject = ${subject}, display_name = ${displayName}
-      WHERE id = ${id} AND idp_subject IS NULL AND (idp_issuer IS NULL OR idp_issuer = ${issuer}) RETURNING id`).length === 1;
+      WHERE id = ${id} AND idp_subject IS NULL AND (idp_issuer IS NULL OR idp_issuer = ${issuer}) AND disabled_at IS NULL RETURNING id`).length === 1;
     // 1. This IdP account's user.
     const bySubject = await first(sql`${userFrom(sql)} WHERE u.idp_issuer = ${issuer} AND u.idp_subject = ${subject}`, toUser);
     if (bySubject) {
@@ -156,7 +169,8 @@ export function makePgIdentity({ now }: { now: () => number }): PgIdentity {
 
   // One binding deleted by ids, if the revoker's authority holds, with its role.revoked row (db.ts revokeBinding). The
   // caller holds ROLE_WRITE_LOCK, taken outside this savepoint. The savepoint is what makes LastOwner a refusal: it
-  // comes after the DELETE, and the callers (revokeRole, teamLeave, member removal) catch it and commit.
+  // comes after the DELETE, and the callers (revokeRole, teamLeave, member removal) catch it and commit. The lock
+  // outlives the ROLLBACK TO, so a caller that goes on writing bindings still holds it.
   const revokeBinding = (tx: Tx, principalId: number, role: string, scopeId: number | null, r: Pick<RoleRevoke, "byUser" | "authority" | "actor" | "audit">): Promise<RoleBinding | null> =>
     tx.savepoint(async sp => {
       const sql = pgOf(sp);
@@ -275,23 +289,34 @@ export function makePgIdentity({ now }: { now: () => number }): PgIdentity {
       async listForUser(r, userId) {
         return (await pgOf(r)`SELECT t.* FROM teams t JOIN team_members tm ON tm.team_id = t.id WHERE tm.user_id = ${userId} ORDER BY t.id`).map(toTeam);
       },
-      // A missing team or user is the caller's 23503, rethrown: callers check both first.
-      async addMember(tx, teamId, userId) {
-        return (await pgOf(tx)`INSERT INTO team_members (team_id, user_id, joined_at) VALUES (${teamId}, ${userId}, ${now()})
+      // A missing team or user is the caller's 23503, rethrown: callers check both first. Under the role lock, and
+      // conditional on the actor's authority: an owner revoked after the route's decision adds no one, and one revoked
+      // after this commits finds the new member in its last-owner count. Zero rows is an existing member or the
+      // authority gone; under the lock a second statement reads the same bindings and says which.
+      async addMember(tx, teamId, userId, by = NO_AUTHORITY) {
+        const sql = pgOf(tx);
+        await roleLock(sql);
+        const added = (await sql`INSERT INTO team_members (team_id, user_id, joined_at)
+          SELECT ${teamId}::int8, ${userId}::int8, ${now()}::int8 WHERE ${teamAuthority(sql, by, teamId)}
           ON CONFLICT DO NOTHING RETURNING 1`).length > 0;
+        if (!added && !(await authorityHolds(sql, by, teamId))) throw new AuthorityLost();
+        return added;
       },
       // The role lock first and unconditionally: a removal racing a team_owner grant to the same user must serialize
       // with it even when the user isn't an owner yet (revokeBinding returns early then), or the grant commits an owner
-      // who is no longer a member.
-      async removeMember(tx, teamId, userId, actor = null, audit) {
+      // who is no longer a member. The actor's authority is read once under it, before any write: the revoke may
+      // delete the very binding it rests on (an owner removing themselves), so a re-check after it would refuse what
+      // the decision allowed. Only lock holders change bindings, so the read stays true until commit.
+      async removeMember(tx, teamId, userId, by = NO_AUTHORITY) {
         const sql = pgOf(tx);
         await roleLock(sql);
+        if (!(await authorityHolds(sql, by, teamId))) throw new AuthorityLost();
         const [ids] = await sql`SELECT (SELECT id FROM principals WHERE kind = 'user' AND user_id = ${userId}) AS pu,
           (SELECT id FROM principals WHERE kind = 'team' AND team_id = ${teamId}) AS pt`;
         const pu = int8OrNull(ids.pu), pt = int8OrNull(ids.pt);
         // An owner is a member (#927): their binding goes first, through revoke, with its row and the guard.
         const revoked = pu !== null && pt !== null
-          ? await revokeBinding(tx, pu, "team_owner", pt, { byUser: null, authority: "none", actor, audit })
+          ? await revokeBinding(tx, pu, "team_owner", pt, { byUser: by.byUser, authority: by.authority, actor: by.actor, audit: by.audit })
           : null;
         await sql`DELETE FROM team_members WHERE team_id = ${teamId} AND user_id = ${userId}`;
         return revoked;

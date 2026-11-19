@@ -50,3 +50,6 @@ function safe(v: unknown): number {
 // are values like any other.
 type JsonValue = string | number | boolean | null | readonly JsonValue[] | { readonly [k: string]: JsonValue | undefined };
 export type JsonParam = Exclude<JsonValue, string>;
+// An access_log row's detail: an object, never a top-level scalar. Bound uncast, a number or boolean fails the jsonb
+// column's type check (42804) and null stores SQL NULL, which no `detail->>` read tells from a missing row.
+export type AuditDetail = { readonly [k: string]: JsonValue | undefined };

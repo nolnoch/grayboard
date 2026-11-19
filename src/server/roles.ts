@@ -82,7 +82,8 @@ export async function grantRole(repo: RoleStores, tx: Tx, spec: RoleSpec, g: Gra
   if (held) return { binding: held, changed: false };
   // Every read above found the grant's preconditions met. On Postgres (READ COMMITTED) each read is a newer snapshot
   // than the grant's statement, so a precondition that committed in between (the holder's sign-in, the scope's
-  // creation, the membership) passes here though the statement missed it (#807 P3 C3 R6). One more attempt, a new
+  // creation; not a membership, whose write waits on the grant's role lock) passes here though the statement missed it
+  // (#807 P3 C3 R6). One more attempt, a new
   // statement, sees it; SQLite's single writer makes it a no-op repeat.
   const again = await repo.roles.grant(tx, grant);
   if (again) return { binding: again, changed: true };

@@ -7,11 +7,11 @@ import { expect, test } from "bun:test";
 import { describePg, pgDatabase, type PgDatabase } from "../../../../tests/support/pg.ts";
 import { until } from "../../../../tests/support/until.ts";
 import { grantRole, revokeRole, type Granter, type RoleSpec, type RoleStores } from "../../roles.ts";
-import { LastOwner, PrincipalTaken } from "../errors.ts";
-import type { User } from "../identity.ts";
+import { AuthorityLost, LastOwner, PrincipalTaken } from "../errors.ts";
+import type { MemberAuthority, User } from "../identity.ts";
 import type { Tx } from "../tx_base.ts";
-import { makePgIdentity, type PgIdentity } from "./identity.ts";
-import { makePgTransactions, TxAborted, type PgTransactions } from "./tx.ts";
+import { makePgIdentity, ROLE_WRITE_LOCK, type PgIdentity } from "./identity.ts";
+import { makePgTransactions, pgOf, TxAborted, type PgTransactions } from "./tx.ts";
 
 const G = "https://accounts.google.com", OKTA = "https://example.okta.com";
 const A = "a@example.com", B = "b@example.com", C = "c@example.com", D = "d@example.com";
@@ -132,7 +132,7 @@ describePg("identity races (Postgres)", () => {
       const [o, y] = await users(p, D, A);
       const t = await team(p, [o!, y!], 1);
       const grant = (tx: Tx) => grantRole(p.g, tx, spec(A, "team_owner", "eng"), NONE(o!));
-      const remove = (tx: Tx) => p.g.teams.removeMember(tx, t.id, y!.id, D);
+      const remove = (tx: Tx) => p.g.teams.removeMember(tx, t.id, y!.id, { byUser: null, authority: "none", actor: D });
       const r = grantFirst ? await race(p, grant, remove) : await race(p, remove, grant);
       const member = await p.g.teams.isMember(p.a.read, t.id, y!.id);
       const owner = (await holders(p, "team_owner", "eng")).includes(A);
@@ -149,6 +149,82 @@ describePg("identity races (Postgres)", () => {
       expect(r.waited).toBe(true);
     });
   }
+
+  // Audit M-1: O, the sole owner and member, adds Y while admin Z revokes O's team_owner. Either order, never a team
+  // with members and no owner: add first, Z's revoke counts Y and is LastOwner; revoke first, O's add re-checks the
+  // binding the route's decision found and is AuthorityLost.
+  for (const addFirst of [true, false]) {
+    test(`T-C3-9 an owner's addMember vs an admin revoking that owner (${addFirst ? "add" : "revoke"} first): never members without an owner`, async () => {
+      await using p = await pair();
+      const [o, y, z] = await users(p, A, B, D);
+      const t = await team(p, [o!], 1);
+      await p.a.write(tx => grantRole(p.g, tx, spec(D, "org_admin", null), NONE(z!)));
+      const add = (tx: Tx) => p.g.teams.addMember(tx, t.id, y!.id, { byUser: o!.id, authority: "owner_or_admin" });
+      const revoke = (tx: Tx) => revokeRole(p.g, tx, spec(A, "team_owner", "eng"), { email: D, userId: z!.id, authority: "org_admin" }, false);
+      const r = addFirst ? await race(p, add, revoke) : await race(p, revoke, add);
+      const owners = await holders(p, "team_owner", "eng");
+      const members = await p.g.teams.listMemberUserIds(p.a.read, t.id);
+      expect(owners.length > 0 || members.length <= 1).toBe(true);
+      const [ad, rv] = addFirst ? [r.a, r.b] : [r.b, r.a];
+      if (addFirst) {
+        expect(ad).toEqual({ ok: true, value: true });
+        expect(rv).toMatchObject({ ok: true, value: { refused: { status: 409, code: "conflict" } } });
+        expect({ owners, members }).toEqual({ owners: [A], members: [o!.id, y!.id] });
+      } else {
+        expect(rv).toMatchObject({ ok: true, value: { changed: true } });
+        expect(ad.ok ? ad.value : ad.error).toBeInstanceOf(AuthorityLost);
+        expect({ owners, members }).toEqual({ owners: [], members: [o!.id] });
+      }
+      expect(r.waited).toBe(true);
+    });
+  }
+
+  // Audit m-1: owner O removes member Y while admin Z revokes O's team_owner (P keeps the team owned). Removal first,
+  // Y goes and then O's binding; revoke first, O's removal re-checks under the lock and is AuthorityLost.
+  for (const removeFirst of [true, false]) {
+    test(`T-C3-9b an owner's removeMember vs an admin revoking that owner (${removeFirst ? "removal" : "revoke"} first): a just-revoked owner removes no one`, async () => {
+      await using p = await pair();
+      const [o, q, y, z] = await users(p, A, B, C, D);
+      const t = await team(p, [o!, q!, y!], 2);
+      await p.a.write(tx => grantRole(p.g, tx, spec(D, "org_admin", null), NONE(z!)));
+      const by: MemberAuthority = { byUser: o!.id, authority: "owner_or_admin" };
+      const remove = (tx: Tx) => p.g.teams.removeMember(tx, t.id, y!.id, { ...by, actor: A });
+      const revoke = (tx: Tx) => revokeRole(p.g, tx, spec(A, "team_owner", "eng"), { email: D, userId: z!.id, authority: "org_admin" }, false);
+      const r = removeFirst ? await race(p, remove, revoke) : await race(p, revoke, remove);
+      const [rm, rv] = removeFirst ? [r.a, r.b] : [r.b, r.a];
+      expect(rv).toMatchObject({ ok: true, value: { changed: true } });
+      expect(await holders(p, "team_owner", "eng")).toEqual([B]);
+      if (removeFirst) {
+        expect(rm).toEqual({ ok: true, value: null });
+        expect(await p.g.teams.listMemberUserIds(p.a.read, t.id)).toEqual([o!.id, q!.id]);
+      } else {
+        expect(rm.ok ? rm.value : rm.error).toBeInstanceOf(AuthorityLost);
+        expect(await p.g.teams.listMemberUserIds(p.a.read, t.id)).toEqual([o!.id, q!.id, y!.id]);
+      }
+      expect(r.waited).toBe(true);
+    });
+  }
+
+  // nit-1: ROLLBACK TO frees an advisory lock taken inside the savepoint. LastOwner rolls back revokeBinding's
+  // savepoint; the role lock, taken outside it, must still be held, caught in the transaction or in a caller's
+  // enclosing savepoint that then releases.
+  test("T-C3-L the role lock outlives a caught LastOwner, in the transaction and in an enclosing savepoint", async () => {
+    await using p = await pair();
+    const [a, b] = await users(p, A, B);
+    const t = await team(p, [a!, b!], 1);
+    const held = (tx: Tx) => pgOf(tx)`SELECT 1 FROM pg_locks
+      WHERE locktype = 'advisory' AND pid = pg_backend_pid() AND granted AND ((classid::int8 << 32) | objid::int8) = ${ROLE_WRITE_LOCK.toString()}::int8`;
+    const revoke = (tx: Tx) => caught(() => p.g.roles.revoke(tx, { holder: A, role: "team_owner", scope: "eng", byUser: null, authority: "none", actor: D }));
+    const remove = (tx: Tx) => caught(() => p.g.teams.removeMember(tx, t.id, a!.id));
+    for (const call of [revoke, remove]) {
+      const direct = await p.a.write(async tx => ({ e: await call(tx), locks: (await held(tx)).length }));
+      expect(direct).toMatchObject({ locks: 1 });
+      expect(direct.e).toBeInstanceOf(LastOwner);
+      const nested = await p.a.write(async tx => ({ e: await tx.savepoint(sp => call(sp)), locks: (await held(tx)).length }));
+      expect(nested).toMatchObject({ locks: 1 });
+      expect(nested.e).toBeInstanceOf(LastOwner);
+    }
+  });
 
   test("T-C3-5 two emails linking one (issuer, subject): the second gets email_changed and leaves no user or principal", async () => {
     await using p = await pair();
@@ -176,6 +252,20 @@ describePg("identity races (Postgres)", () => {
       expect(r.waited).toBe(true);
     });
   }
+
+  // Audit m-2: an admin disables the unlinked row between the sign-in's read and its link. The link waits on the
+  // disable's row lock, re-checks `disabled_at IS NULL` on the committed row and matches nothing; the re-read finds
+  // the account disabled and leaves it unlinked, so the caller refuses it.
+  test("T-C3-5c a row disabled between the sign-in's read and its link stays unlinked, and the sign-in sees it disabled", async () => {
+    await using p = await pair();
+    const [u] = await users(p, "gone@example.com");
+    const r = await race(p,
+      async tx => { await pgOf(tx)`UPDATE users SET disabled_at = ${Date.now()} WHERE id = ${u!.id}`; },
+      tx => p.g.users.signIn(tx, G, "s-hire", "gone@example.com", null));
+    expect(r.b).toMatchObject({ ok: true, value: { status: "ok", linked: false, user: { id: u!.id, idp_subject: null, disabled_at: expect.any(Number) } } });
+    expect(await p.g.users.findById(p.a.read, u!.id)).toMatchObject({ idp_issuer: null, idp_subject: null, disabled_at: expect.any(Number) });
+    expect(r.waited).toBe(true);
+  });
 
   test("T-C3-6 two teams.create of one name: the second is PrincipalTaken and its transaction goes on", async () => {
     await using p = await pair();
@@ -215,13 +305,13 @@ describePg("identity races (Postgres)", () => {
     expect(r.waited).toBe(true);
   });
 
-  // Decision 5 (R6): grantRole's follow-up reads run on newer snapshots than its grant statement. A membership that
-  // commits between them makes every read pass; the grant runs once more and writes, rather than answering a stale 409
-  // or throwing "wrote nothing, for no reason a read finds".
-  test("T-C3-R6 a membership committed between the grant's statement and its follow-up reads: the retry grants", async () => {
+  // Decision 5 (R6): grantRole's follow-up reads run on newer snapshots than its grant statement. A precondition that
+  // commits between them (here the scope's creation; a membership can't, since addMember waits on the grant's role
+  // lock) makes every read pass; the grant runs once more and writes, rather than throwing "wrote nothing, for no
+  // reason a read finds".
+  test("T-C3-R6 a scope created between the grant's statement and its follow-up reads: the retry grants", async () => {
     await using p = await pair();
-    const [o, y] = await users(p, D, A);
-    const t = await team(p, [o!], 1);
+    const [o] = await users(p, D);
     let landed = false;
     const stores: RoleStores = {
       ...p.g,
@@ -231,15 +321,15 @@ describePg("identity races (Postgres)", () => {
           const b = await p.g.roles.grant(tx, g);
           if (!b && !landed) {
             landed = true;
-            await p.b.write(tx2 => p.g.teams.addMember(tx2, t.id, y!.id));
+            await p.b.write(tx2 => p.g.services.create(tx2, "ingest"));
           }
           return b;
         },
       },
     };
-    const out = await p.a.write(tx => grantRole(stores, tx, spec(A, "team_owner", "eng"), NONE(o!)));
+    const out = await p.a.write(tx => grantRole(stores, tx, spec(D, "service_owner", "ingest"), NONE(o!)));
     expect(landed).toBe(true);
-    expect(out).toMatchObject({ changed: true, binding: { principal: A, role: "team_owner", scope: "eng" } });
-    expect(await holders(p, "team_owner", "eng")).toEqual([D, A]);
+    expect(out).toMatchObject({ changed: true, binding: { principal: D, role: "service_owner", scope: "ingest" } });
+    expect(await holders(p, "service_owner", "ingest")).toEqual([D]);
   });
 });

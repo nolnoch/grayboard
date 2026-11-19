@@ -2,7 +2,7 @@
 import { expect, test } from "bun:test";
 import { describePg, pgEmptyDatabase } from "../../../../tests/support/pg.ts";
 import type { AuditFields } from "../identity.ts";
-import { int8, int8OrNull, type JsonParam } from "./sql.ts";
+import { int8, int8OrNull, type AuditDetail, type JsonParam } from "./sql.ts";
 
 test("int8 maps strings, numbers and bigints to a safe integer and refuses the rest", () => {
   expect(int8("1")).toBe(1);
@@ -30,6 +30,20 @@ test("JsonParam refuses a string at the top, and takes strings inside", () => {
   const bad: JsonParam = JSON.stringify(ok);
   expect(typeof bad).toBe("string");
   expect(detail).toMatchObject({ via: "test" });
+});
+
+test("AuditDetail takes an object only: a top-level number, boolean, null or string can't reach the jsonb insert", () => {
+  const audit: AuditFields = { as_admin: true, via: "test" };
+  const detail: AuditDetail = { binding: 1, scope: null, nested: { a: [1, "x"] }, ...audit };
+  // @ts-expect-error bound uncast, a number fails jsonb's type check (42804)
+  const n: AuditDetail = 42;
+  // @ts-expect-error as does a boolean
+  const b: AuditDetail = true;
+  // @ts-expect-error null stores SQL NULL, not a JSON null
+  const z: AuditDetail = null;
+  // @ts-expect-error a string is stored as a JSON string scalar
+  const s: AuditDetail = JSON.stringify(detail);
+  expect([n, b, z, typeof s, detail.via]).toEqual([42, true, null, "string", "test"]);
 });
 
 describePg("Bun.SQL's int8 (the mappers exist for this)", () => {
