@@ -18,8 +18,8 @@ export function issueOAuth(repo: Repo, resource: string, email = "alice@example.
 export type IssuedOAuth = Awaited<ReturnType<typeof issueOAuth>>;
 
 async function issueNow(repo: Repo, tx: Tx, resource: string, email: string, scopes: string[], now: number, clientId: string) {
-  // A service principal (#270) has no sign-in, so upsertByEmail refuses its name: issue to the existing row, the
-  // test-only stand-in for the credential grant a later step adds.
+  // A service principal (#270) has no sign-in, so upsertByEmail refuses its name: issue to the existing row, an
+  // in-process shortcut for tests that don't exercise the client-credentials grant at /oauth/token itself.
   const existing = await repo.users.findByEmail(tx, email);
   const user = existing?.kind === "service" ? existing : await repo.users.upsertByEmail(tx, email, null);
   const binding = { clientId, resource, scopes: [...scopes].sort(), redirectUri: "http://127.0.0.1/callback", codeChallenge: random() };
