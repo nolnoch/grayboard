@@ -54,6 +54,17 @@ test("the mode is the launcher's environment only: plugin options from any confi
   expect(pluginOptions({ principal: "other" }, ON, cwd).static).toEqual({ issuer: ISSUER });
 });
 
+test("the variables are hosted core's names, and the pre-#1300 GRAYBOARD_OPENCODE_* names are not aliases", () => {
+  const cwd = empty();
+  expect([STATIC_AUTH, STATIC_ISSUER, STATIC_PRINCIPAL]).toEqual(["GRAYBOARD_AUTH", "GRAYBOARD_ISSUER", "GRAYBOARD_PRINCIPAL"]);
+  expect(staticMode({ GRAYBOARD_AUTH: "static", GRAYBOARD_ISSUER: ISSUER, GRAYBOARD_PRINCIPAL: "ingest" }, cwd)).toEqual({ issuer: ISSUER, principal: "ingest" });
+  const old = { GRAYBOARD_OPENCODE_AUTH: "static", GRAYBOARD_OPENCODE_ISSUER: ISSUER, GRAYBOARD_OPENCODE_PRINCIPAL: "ingest" };
+  expect(staticMode(old, cwd)).toBeUndefined();
+  expect(pluginOptions({}, old, cwd)).not.toHaveProperty("static");
+  // An old name beside the new ones changes nothing: no fallback, no override.
+  expect(staticMode({ ...old, GRAYBOARD_AUTH: "static", GRAYBOARD_ISSUER: ISSUER }, cwd)).toEqual({ issuer: ISSUER });
+});
+
 test("a repository's dotenv file naming either variable refuses the mode (Bun loads it into the environment)", () => {
   for (const [file, text] of [[".env", `${STATIC_AUTH}=static\n`], [".env.local", `export ${STATIC_ISSUER}=${ISSUER}\n`], [".env.production", `  ${STATIC_AUTH} = static`], [".env", `${STATIC_PRINCIPAL}=other\n`]]) {
     const cwd = empty();
