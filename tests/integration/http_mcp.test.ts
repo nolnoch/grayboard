@@ -474,3 +474,55 @@ for (const role of ["native", "subscriber"] as const) for (const outcome of ["re
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// #1324: the guards on #1312's 401 (`lostRefusal`) past its re-authenticate. A revoke at bind's post-commit check
+// makes the bearer's 401 the answer; the call is then held at `mcp:lost:authenticated`, after that 401 was computed,
+// while the MCP side closes (mcp.close directly, as app.stop runs it first, but with no `stop(true)` to reset the
+// connection) or the request aborts. The exchange goes through `app.mcp.fetch` in process, so the response the
+// server chose reaches the test whatever a socket would do: it must be the tool's `unauthenticated`, never the 401.
+for (const outcome of ["closing", "aborted"] as const) test(`HTTP native: a call ${outcome} past the lost-token re-authenticate keeps the tool error, never 401 (#1324)`, async () => {
+  const issued = await issueOAuth(app.repo, app.oauth.resource, "carol@example.com", ["grayboard:tools", "grayboard:delivery"], Date.now(), OPENCODE_CLIENT);
+  const statuses: number[] = [];
+  const abort = new AbortController();
+  let target = false;
+  const client = new Client({ name: "http-test", version: "1" }, { supportedProtocolVersions: ["2026-07-28"], versionNegotiation: { mode: { pin: "2026-07-28" } } });
+  clients.push(client);
+  await client.connect(new StreamableHTTPClientTransport(new URL(`${base}/mcp`), {
+    requestInit: { headers: { Authorization: `Bearer ${issued.token}` } },
+    fetch: async (input, init) => {
+      const req = await withMeta(new Request(input, init), OPENCODE_SESSION_META, `lost-${outcome}`);
+      const r = await app.mcp.fetch(target ? new Request(req, { signal: abort.signal }) : req, "127.0.0.1");
+      statuses.push(r.status);
+      return r;
+    },
+  }));
+  const dir = mkdtempSync(join(tmpdir(), "gb-1324-")), committed = join(dir, "committed"), authenticated = join(dir, "authenticated"), hits: string[] = [];
+  const said = spyOn(console, "error").mockImplementation((...args: unknown[]) => { hits.push(args.join(" ")); });
+  process.env.BUS_TEST_PAUSE = "hosted:bind:after-commit";
+  process.env.BUS_TEST_PAUSE_FILE = committed;
+  let closing: Promise<void> | undefined;
+  try {
+    const before = statuses.length;
+    target = true;
+    const call = client.callTool({ name: "bind", arguments: { name: `lost-${outcome}`, create: true } }).then(r => ({ result: r }), (error: unknown) => ({ error }));
+    await until(() => hits.some(h => h.includes("test pause hit: hosted:bind:after-commit")), 10_000, "bind's post-commit pause");
+    // The held point read its file already: the next point waits on its own.
+    process.env.BUS_TEST_PAUSE = "mcp:lost:authenticated";
+    process.env.BUS_TEST_PAUSE_FILE = authenticated;
+    await seed(app.repo, tx => app.repo.oauth.revokeToken(tx, issued.tokens.refreshHash, issued.binding.clientId, Date.now()));
+    writeFileSync(committed, "");
+    await until(() => hits.some(h => h.includes("test pause hit: mcp:lost:authenticated")), 10_000, "the lost-token pause past the re-authenticate");
+    if (outcome === "closing") closing = app.mcp.close();
+    else abort.abort();
+    writeFileSync(authenticated, "");
+    const settled = await call;
+    expect(statuses.slice(before)).toEqual([200]);
+    expect("result" in settled && settled.result.structuredContent).toEqual({ code: "unauthenticated" });
+  } finally {
+    said.mockRestore();
+    delete process.env.BUS_TEST_PAUSE;
+    delete process.env.BUS_TEST_PAUSE_FILE;
+    rmSync(dir, { recursive: true, force: true });
+    await closing;
+  }
+});
