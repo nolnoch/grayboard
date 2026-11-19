@@ -178,25 +178,26 @@ export const scopeKey = (s: AliasScopeOf): string => JSON.stringify([s.scope_kin
 
 // core's ownScope on the caller's handle: an alias's own scope, or the principal an ID acts for; null for anything
 // else. A bare name means this scope's alias of that name.
-// The address a session's ID acts as on a service's board (#270 D6): its session's primary, the oldest hold, else a
-// tools-only session's writes_as name, else the ID itself (its user). A session bound only to `eng/w-1` then holds a
-// service's right only by eng's binding, on every route (MCP, HTTP) and for seeing the board as for posting on it
-// (D5: one right). Any other board judges an ID as its user, as before.
+// The address a session's ID acts as on a scoped board (#270 D6, #1255) and for a service's names: its session's
+// primary, the oldest hold, else a tools-only session's writes_as name, else the ID itself (its user). A session bound
+// only to `eng/w-1` then sees eng's boards, not its binder's other teams', and holds a service's right only by eng's
+// binding, on every route (MCP, HTTP), as its ID or as its name alike, and for seeing a board as for posting on it
+// (D5: one right). An org board is everyone's; a team's or person's names are judged for the ID's user (#348).
 export async function idActsAs(repo: Repo, r: Read, id: string): Promise<string> {
   const holds = await repo.bindings.holdsOf(r, id);
   return holds[0] ?? (await repo.bindings.idRow(r, id))?.writes_as ?? id;
 }
 
-// The principal `handle` is judged as on `board`: an ID on a service's board as idActsAs's address, else its own.
-// Not async itself: a board that isn't a service's costs the one read it always did, with no added tick.
+// The principal `handle` is judged as on `board`: an ID on a scoped board as idActsAs's address, else its own.
+// Not async itself: an org board costs the one read it always did, with no added tick.
 function seerOn(repo: Repo, r: Read, handle: string, board: Board): Promise<Principal | null> {
-  return seerIn(repo, r, handle, serviceOfScope(board.scope) !== null);
+  return seerIn(repo, r, handle, board.scope !== null);
 }
 
-// The principal `handle` is judged as for a service's board or names (`service`: an ID as idActsAs's address), or
-// for anything else (its own). A service's names are seen as its board is (alias.see_service): one right.
-export function seerIn(repo: Repo, r: Read, handle: string, service: boolean): Promise<Principal | null> {
-  if (!service || addressParts(handle)?.kind !== "id") return repo.principals.of(r, handle);
+// The principal `handle` is judged as for a scoped board or a service's names (`scoped`: an ID as idActsAs's address,
+// #1255), or for anything else (its own). A service's names are seen as its board is (alias.see_service): one right.
+export function seerIn(repo: Repo, r: Read, handle: string, scoped: boolean): Promise<Principal | null> {
+  if (!scoped || addressParts(handle)?.kind !== "id") return repo.principals.of(r, handle);
   return idActsAs(repo, r, handle).then((a) => repo.principals.of(r, a));
 }
 
@@ -267,17 +268,18 @@ export function boardAccess(repo: Repo, humanReach: HumanReach = "team"): BoardA
   };
   const seesMetaOf = async (r: Read, p: Principal | null, scope: AliasScopeOf): Promise<boolean> =>
     p !== null && scope.scope_ref !== null && actsIn(r, p, { scope_kind: scope.scope_kind, scope_ref: scope.scope_ref });
-  const byScope = (rule: (r: Read, p: Principal | null, s: AliasScopeOf) => Promise<boolean>, serviceAsBoard = false) =>
+  const byScope = (rule: (r: Read, p: Principal | null, s: AliasScopeOf) => Promise<boolean>, asBoard = false) =>
     async (r: Read, viewer: string, scopes: AliasScopeOf[]): Promise<Map<string, boolean>> => {
       const out = new Map<string, boolean>();
       if (!scopes.length) return out;
       const p = await repo.principals.of(r, viewer);
-      // A service's names, to an ID, are judged as its board is (seerIn), read once and only when one is asked.
+      // A service's names, to an ID, are judged as its board is (seerIn), read once and only when one is asked. A
+      // team's names are judged for the ID's user, as #348 decided: name sight is the user's, board sight the primary's.
       let onService: Principal | null | undefined;
       for (const s of scopes) {
         const k = scopeKey(s);
         if (out.has(k)) continue;
-        const q = s.scope_kind === "service" && serviceAsBoard ? (onService === undefined ? (onService = await seerIn(repo, r, viewer, true)) : onService) : p;
+        const q = s.scope_kind === "service" && asBoard ? (onService === undefined ? (onService = await seerIn(repo, r, viewer, true)) : onService) : p;
         out.set(k, await rule(r, q, s));
       }
       return out;
@@ -315,14 +317,14 @@ export function boardAccess(repo: Repo, humanReach: HumanReach = "team"): BoardA
       const p = typeof viewer === "string" ? await repo.principals.of(r, viewer) : viewer;
       const out = new Set<string>();
       if (p === null) return out;
-      // An ID's principal on a service's board (seerOn), read once and only when one is among `boards`.
-      let onService: Principal | null | undefined;
+      // An ID's principal on a scoped board (seerOn), read once and only when one is among `boards`.
+      let scoped: Principal | null | undefined;
       const byScope = new Map<string | null, boolean>();
       for (const b of boards) {
         let v = byScope.get(b.scope);
         if (v === undefined) {
           let q: Principal | null = p;
-          if (typeof viewer === "string" && serviceOfScope(b.scope) !== null) q = onService === undefined ? (onService = await seerOn(repo, r, viewer, b)) : onService;
+          if (typeof viewer === "string" && b.scope !== null) q = scoped === undefined ? (scoped = await seerOn(repo, r, viewer, b)) : scoped;
           byScope.set(b.scope, v = q !== null && (await principalSees(r, q, b)));
         }
         if (v) out.add(b.name);
