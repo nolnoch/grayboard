@@ -6,8 +6,12 @@
 // the service and the principals holding service_invoke on it, directly or
 // through a team. A session bound to `eng/x` acts as eng: it sees eng's boards,
 // not its binder's other teams', and a service's only by eng's own binding.
-// Installed on the database by openDatabase, so every core call is checked.
+// Installed on the database by openDatabase, so every core call is checked: the
+// server still reaches core's synchronous checks through a session's end (core
+// endSession's claim releases and sweep, which post), so serverAccess keeps
+// boardAccess's rules, the ID-as-primary one included (#1273 L4).
 import { addressParts, type AliasScope } from "../core/addresses.ts";
+import { holdsOf, idRow } from "../core/bindings.ts";
 import type { Access, Board, CoreDb } from "../core/boards.ts";
 import { CoreError } from "../core/errors.ts";
 import { ownScope, type Principal } from "../core/resolver.ts";
@@ -74,8 +78,15 @@ export function serverAccess(repo: Repo, db: CoreDb, humanReach: HumanReach = "t
   const inTeam = (p: Principal, teamName: string): boolean =>
     p.kind === "team" ? p.name === teamName : actsIn(repo, p, { scope_kind: "team", scope_ref: teamName });
 
+  // seerIn's rule on the ambient connection (#1255, #1273 L4): for a scoped board or a service's names, an ID is
+  // judged as idActsAs's address (its primary, else its writes_as name, else itself); anything else as its own.
+  const seer = (handle: string, scoped: boolean): Principal | null => {
+    if (!scoped || addressParts(handle)?.kind !== "id") return repo.policyNow.principalOf(handle);
+    return repo.policyNow.principalOf(holdsOf(db, handle)[0] ?? idRow(db, handle)?.writes_as ?? handle);
+  };
+
   const canSee = (handle: string, board: Board): boolean => {
-    const p = repo.policyNow.principalOf(handle);
+    const p = seer(handle, board.scope !== null);
     return !!p && principalCanSee(repo, p, board);
   };
 
@@ -85,7 +96,8 @@ export function serverAccess(repo: Repo, db: CoreDb, humanReach: HumanReach = "t
   const seesAlias = (handle: string, scope: Omit<AliasScope, "name">): boolean => {
     // A person's names are listed to every caller, as before #348.
     if (scope.scope_kind === "person") return true;
-    const p = repo.policyNow.principalOf(handle);
+    // A service's names are seen as its board is; a team's are the ID's user's (#348).
+    const p = seer(handle, scope.scope_kind === "service");
     if (p === null || scope.scope_ref === null) return false;
     return authorizeNow(repo, {}, { verb: "alias.see", principal: p, scope: { scope_kind: scope.scope_kind, scope_ref: scope.scope_ref } }).allow;
   };
@@ -94,9 +106,10 @@ export function serverAccess(repo: Repo, db: CoreDb, humanReach: HumanReach = "t
     canSee,
 
     // An alias's labels reach only a principal that may act in its scope
-    // (#284 S13): a team's task or private board name stays inside the team.
+    // (#284 S13): a team's task or private board name stays inside the team. A scoped alias's labels can name a
+    // board, so an ID is judged as its primary, as for the board (#1255).
     seesAliasMeta(handle, scope) {
-      const p = repo.policyNow.principalOf(handle);
+      const p = seer(handle, scope.scope_kind !== "person");
       if (p === null || scope.scope_ref === null) return false;
       if (p.kind === "team") return scope.scope_kind === "team" && p.name === scope.scope_ref;
       return actsIn(repo, p, { scope_kind: scope.scope_kind, scope_ref: scope.scope_ref });
@@ -168,8 +181,9 @@ export function serverAccess(repo: Repo, db: CoreDb, humanReach: HumanReach = "t
 }
 
 // ── async board access (#807 P3 B5a0) ────────────────────────────────────────
-// serverAccess's decisions with every read on the caller's handle: a write body's `Tx` sees the body's own rows (a
-// member just added, D2), `repo.read` committed state. Core's synchronous `Access` stays for the paths still in core;
+// serverAccess's decisions (board-access-parity.test.ts holds them equal) with every read on the caller's handle: a
+// write body's `Tx` sees the body's own rows (a member just added, D2), `repo.read` committed state. Core's
+// synchronous `Access` stays for the paths still in core (a session's end: core endSession's releases and sweep);
 // the server's board ports (B5a1-B5b3) take this instead. The batch forms answer what core asks once per recipient
 // or scope (post's subscribers, who's rows): canSeeMany, visibleTo and the scope tables with one decision per distinct
 // principal or scope, mayReachMany per distinct address; resolveMentions still decides per token.

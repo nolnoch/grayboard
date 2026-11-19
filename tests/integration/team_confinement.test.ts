@@ -92,6 +92,22 @@ describe("an ID is judged as its session's primary on every scoped board (#1255)
     for (const label of ["qa-room", "qa task", "qa status"]) expect(all, label).toContain(label);
   });
 
+  test("a claim on qa's board shows its ID neither the board nor the note in a held answer (#1273 L1)", async () => {
+    const { ops, build, id } = await cast();
+    await ops.call("claim_take", { key: "ticket:QA-2", board: "qa-room", note: "qa note" });
+    type View = { key: string; board: string | null; note: string | null };
+    // claim_list takes no `as`: its viewer is the bound eng/build alias, the bound-actor control.
+    const row = (await build.call<View[]>("claim_list", { prefix: "ticket:QA-2" })).find((c) => c.key === "ticket:QA-2");
+    expect(row).toMatchObject({ board: null, note: null });
+    for (const as of [undefined, id]) {
+      const held = await build.call<{ ok: boolean; note: string | null }>("claim_take", { key: "ticket:QA-2", ...(as ? { as } : {}) });
+      expect(held, String(as)).toMatchObject({ ok: false, note: null });
+    }
+    // The control: a person-scoped session of bob's sees qa's board, so its view names both.
+    const fe = await hosted("fe");
+    expect((await fe.call<View[]>("claim_list", { prefix: "ticket:QA-2" })).find((c) => c.key === "ticket:QA-2")).toMatchObject({ board: "qa-room", note: "qa note" });
+  });
+
   test("over HTTP: /api/claims/call as the ID is refused qa's board like a missing one", async () => {
     const { id } = await cast();
     const call = (board: string) => srv.api(bob, "POST", "/api/claims/call", { as: id, tool: "claim_take", args: { key: `ticket:QA-${board}`, board } });
