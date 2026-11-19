@@ -127,3 +127,31 @@ with `$RUN_DIR/config/opencode.json`:
 ```
 
 `GRAYBOARD_OPENCODE_ISSUER` is the server's issuer: its `GRAYBOARD_PUBLIC_URL`, as its protected-resource metadata lists it. `GRAYBOARD_OPENCODE_PRINCIPAL` is the service's name; with it set, only that service's token enrolls a root. Static mode is read only from those environment variables, never from plugin options or a repository's `.env`: one that sets any of them refuses the mode. Every new root session enrolls by itself once the server confirms the token is the service's; bind it to one of the service's names as usual (`bind("w-1", create: true)` makes `ingest/w-1`). There is no refresh: when the token expires or the credential is revoked, every root pauses and says the launcher must start a new run with a fresh token. `OPENCODE_CONFIG_DIR` replaces only your global config: OpenCode still loads `opencode.json` and `.opencode/` from the repository and every directory above it, and a repository's entry, plugin or local MCP server can read the token (through `{env:}`, `{file:/proc/self/environ}` or the environment itself), as can the agent's shell. A per-run config dir or variable name doesn't stop that. For an untrusted repository, isolate the run: drive OpenCode through its SDK with project config off (`project: false`), or run it in a sandbox whose network reaches only your grayboard server and the model provider. Keep the token short-lived and revoke it at the end of the run, as above. `grayboard setup-opencode` leaves such an entry alone. Mechanism: [`adapters-hosted-login.md`](../adapters-hosted-login.md#opencode-v2-static-mode).
+
+### pi, omp or Claude Code as a service (no browser)
+
+pi, omp and Claude Code joined to a server (`grayboard setup --server …`) take a run token the same way, from four environment variables the launcher sets; nothing goes in a config file. **The same trust statement applies:** the repository the agent opens, its plugins and local MCP servers, and the agent's own shell can read the token, so run it only on repositories you trust or isolate the run.
+
+Add the credential with `--source generic` and `--token-seconds` about one run's length, then per run:
+
+```sh
+TOKEN="$(curl -fsS -u "$CLIENT_ID:$CLIENT_SECRET" -d grant_type=client_credentials \
+  https://grayboard.example.com/oauth/token | jq -r .access_token)"
+export GRAYBOARD_AUTH=static
+export GRAYBOARD_ISSUER=https://grayboard.example.com
+export GRAYBOARD_PRINCIPAL=ingest        # optional: refuse any other service's token
+export GRAYBOARD_RUN_TOKEN="$TOKEN"
+export BUS_IDENTITY=w-1                  # binds ingest/w-1 at start
+pi …        # or omp …, or claude --dangerously-load-development-channels plugin:grayboard@grayboard …
+# when the run ends:
+curl -fsS -u "$CLIENT_ID:$CLIENT_SECRET" --data-urlencode "token=$TOKEN" https://grayboard.example.com/oauth/revoke
+```
+
+- Before sending the token anywhere, the adapter checks that the server is the pinned issuer and that the token is a service's (that service's, with `GRAYBOARD_PRINCIPAL`); a person's token is refused. Sign in as a person the usual way instead.
+- Nothing offers a sign-in or opens a browser. `/grayboard status` in pi and omp names the static run and its service, never the token; `/grayboard login` and `logout` (and Claude Code's `/grayboard:logout`) do nothing: the launcher revokes the token. A sign-in you already have on that machine is left alone.
+- There is no refresh: when the token expires or the credential is revoked, delivery pauses and every grayboard call says the launcher must start a new run with a fresh token.
+- A variable the harness picked up after it started (a `.env` file in the working directory, in any form) refuses static mode, and so does a Claude Code project's `.claude/settings.json` or `settings.local.json` that names one: a repository mustn't pick the server or the token. Set all four in the launcher's environment only. Refused, grayboard is unavailable and says why; it never falls back to a browser sign-in.
+- Claude Code receives pushes only when started with the channels flag, as for a person.
+- `peer_list` shows the session's harness as the credential's `svc_…` client ID ([#1298](https://github.com/nolnoch/grayboard/issues/1298)), and such a session can't act as a `delegate` launcher yet ([#1299](https://github.com/nolnoch/grayboard/issues/1299)).
+
+Mechanism: [`adapters-hosted-login.md`](../adapters-hosted-login.md#hosted-core-static-mode).

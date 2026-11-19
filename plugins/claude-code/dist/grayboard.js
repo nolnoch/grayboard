@@ -6922,8 +6922,8 @@ var require_dist2 = __commonJS(function(exports, module) {
 });
 
 // plugins/claude-code/src/main.ts
-import { readdirSync as readdirSync3 } from "fs";
-import { join as join9 } from "path";
+import { readdirSync as readdirSync4 } from "fs";
+import { join as join10 } from "path";
 
 // node_modules/@modelcontextprotocol/sdk/dist/esm/server/stdio.js
 import process2 from "process";
@@ -32240,11 +32240,38 @@ function refusalOf(response, text) {
 var printable = (text) => /^[\x20-\x7e]{1,128}$/.test(text) ? text : "unprintable";
 var escapeHTML = (text) => text.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
 var form = (fields) => ({ method: "POST", redirect: "error", headers: { "Content-Type": "application/x-www-form-urlencoded", Accept: "application/json" }, body: new URLSearchParams(fields) });
+async function getJson(url, timeoutMs) {
+  let response;
+  try {
+    response = await fetch(url, { headers: { Accept: "application/json" }, redirect: "error", signal: AbortSignal.timeout(timeoutMs) });
+  } catch (error) {
+    throw new ServerUnreachable(error);
+  }
+  if (response.status >= 500 || response.status === 429) {
+    await response.body?.cancel();
+    throw new ServerUnreachable(new Error(`${url} answered HTTP ${response.status}`));
+  }
+  if (response.status !== 200) {
+    await response.body?.cancel();
+    throw new Error(`${url} answered HTTP ${response.status}`);
+  }
+  return response.json();
+}
+async function resourceMetadata(resource, timeoutMs) {
+  const r = new URL(resource);
+  const prm = ResourceMetadata.parse(await getJson(`${r.origin}/.well-known/oauth-protected-resource${r.pathname === "/" ? "" : r.pathname}`, timeoutMs));
+  if (prm.resource !== resource)
+    throw new Error(`Protected resource metadata names ${prm.resource}, expected ${resource}`);
+  return prm;
+}
 
 class Login {
   config;
   resource;
   path;
+  get stateKey() {
+    return this.config.clientId;
+  }
   refreshing;
   signingIn;
   constructor(config) {
@@ -32432,30 +32459,13 @@ ${config.clientId}`)}.json`);
     }
     return { remaining, cause: cause ?? "none" };
   }
-  async getJson(url, timeoutMs) {
-    let response;
-    try {
-      response = await fetch(url, { headers: { Accept: "application/json" }, redirect: "error", signal: AbortSignal.timeout(timeoutMs) });
-    } catch (error) {
-      throw new ServerUnreachable(error);
-    }
-    if (response.status >= 500) {
-      await response.body?.cancel();
-      throw new ServerUnreachable(new Error(`${url} answered HTTP ${response.status}`));
-    }
-    if (response.status !== 200) {
-      await response.body?.cancel();
-      throw new Error(`${url} answered HTTP ${response.status}`);
-    }
-    return response.json();
-  }
   async serverMetadata(issuer, timeoutMs) {
     const at = canonicalEndpoint(issuer), origin = new URL(this.resource).origin;
     if (!at)
       throw new Error("OAuth issuer must be canonical HTTPS (or HTTP loopback), without credentials, query or fragment");
     if (at.origin !== origin)
       throw new Error(`OAuth issuer ${issuer} is not on ${origin}`);
-    const meta = ServerMetadata.parse(await this.getJson(`${at.origin}/.well-known/oauth-authorization-server${at.pathname === "/" ? "" : at.pathname}`, timeoutMs));
+    const meta = ServerMetadata.parse(await getJson(`${at.origin}/.well-known/oauth-authorization-server${at.pathname === "/" ? "" : at.pathname}`, timeoutMs));
     if (meta.issuer !== issuer)
       throw new Error(`OAuth metadata names issuer ${meta.issuer}, expected ${issuer}`);
     for (const endpoint of [meta.authorization_endpoint, meta.token_endpoint, meta.revocation_endpoint]) {
@@ -32465,10 +32475,7 @@ ${config.clientId}`)}.json`);
     return meta;
   }
   async discover() {
-    const r = new URL(this.resource);
-    const prm = ResourceMetadata.parse(await this.getJson(`${r.origin}/.well-known/oauth-protected-resource${r.pathname === "/" ? "" : r.pathname}`, 1e4));
-    if (prm.resource !== this.resource)
-      throw new Error(`Protected resource metadata names ${prm.resource}, expected ${this.resource}`);
+    const prm = await resourceMetadata(this.resource, 1e4);
     const meta = await this.serverMetadata(prm.authorization_servers[0], 1e4);
     if (!meta.code_challenge_methods_supported.includes("S256"))
       throw new Error("OAuth server does not support PKCE S256");
@@ -33127,7 +33134,7 @@ function parentCommandLine() {
 // plugins/claude-code/src/plugin.ts
 import { randomUUID as randomUUID2 } from "crypto";
 import { mkdirSync as mkdirSync3, watch } from "fs";
-import { join as join8 } from "path";
+import { join as join9 } from "path";
 // node_modules/@modelcontextprotocol/sdk/dist/esm/server/zod-compat.js
 function isZ4Schema(s) {
   const schema = s;
@@ -37725,7 +37732,7 @@ class RootDelivery {
       this.client.options.log(text, level);
   }
   path() {
-    return deliveryPath(this.o.stateDir, this.client.login.resource, this.client.options.clientId, this.o.sessionID);
+    return deliveryPath(this.o.stateDir, this.client.login.resource, this.client.login.stateKey, this.o.sessionID);
   }
   async epoch() {
     try {
@@ -37894,7 +37901,7 @@ class RootDelivery {
       ...wire.launcher ? { launcher: true } : {},
       ...wire.facts ? { facts: wire.facts } : {},
       ...wire.suggested ? { suggested: wire.suggested } : {},
-      storage: new FileStorage(sessionPath(this.o.stateDir, this.client.login.resource, c.clientId, id)),
+      storage: new FileStorage(sessionPath(this.o.stateDir, this.client.login.resource, this.client.login.stateKey, id)),
       place: this.o.place,
       ancestry: async (sessionID) => {
         if (sessionID === id)
@@ -38131,10 +38138,261 @@ ${record.message}`;
   }
 }
 
-// src/shared/claude_agents.ts
-import { closeSync, constants as constants3, fstatSync, lstatSync, mkdirSync as mkdirSync2, openSync, readdirSync as readdirSync2, readFileSync as readFileSync4, readSync, renameSync, rmSync, statSync as statSync2, unlinkSync, writeFileSync } from "fs";
+// adapters/hosted-core/src/static.ts
 import { createHash as createHash7 } from "crypto";
-import { join as join5, resolve as resolve3 } from "path";
+import { readdirSync as readdirSync2, readFileSync as readFileSync4 } from "fs";
+import { join as join5 } from "path";
+var STATIC_AUTH = "GRAYBOARD_AUTH";
+var STATIC_ISSUER = "GRAYBOARD_ISSUER";
+var RUN_TOKEN = "GRAYBOARD_RUN_TOKEN";
+var STATIC_PRINCIPAL = "GRAYBOARD_PRINCIPAL";
+var NAMES = [STATIC_AUTH, STATIC_ISSUER, RUN_TOKEN, STATIC_PRINCIPAL];
+var NEW_RUN = "the launcher must start a new run with a fresh run token";
+var SERVICE_CLIENT = "service-credential";
+var TOKEN = /^[\x21-\x7e]{16,512}$/;
+var PRINCIPAL = /^[^\s/]{1,128}$/;
+function launchEnv() {
+  let raw;
+  try {
+    raw = readFileSync4("/proc/self/environ", "utf8");
+  } catch {
+    return;
+  }
+  const env = {};
+  for (const entry of raw.split("\x00")) {
+    const at = entry.indexOf("=");
+    if (at > 0)
+      env[entry.slice(0, at)] = entry.slice(at + 1);
+  }
+  return env;
+}
+function* keys(value) {
+  if (Array.isArray(value)) {
+    for (const v of value)
+      yield* keys(v);
+    return;
+  }
+  if (value === null || typeof value !== "object")
+    return;
+  for (const [k, v] of Object.entries(value)) {
+    yield k;
+    yield* keys(v);
+  }
+}
+function repositorySets(env, cwd, settingsDirs, launch) {
+  if (launch) {
+    const changed = NAMES.find((name) => (env[name] ?? undefined) !== launch[name]);
+    if (changed)
+      return `${changed} was set after the harness started (a dotenv file?); the launcher sets it`;
+  }
+  const dotenv = new RegExp(`^\\s*(export\\s+)?(${NAMES.join("|")})\\s*[=:]`, "m");
+  let files = [];
+  try {
+    files = readdirSync2(cwd).filter((name) => /^\.env(\..+)?$/.test(name));
+  } catch {}
+  for (const file of files) {
+    let text;
+    try {
+      text = readFileSync4(join5(cwd, file), "utf8");
+    } catch {
+      return `${file} in the working directory is unreadable`;
+    }
+    if (dotenv.test(text))
+      return `${file} in the working directory sets its variables; the launcher sets them`;
+  }
+  for (const dir of new Set(settingsDirs))
+    for (const file of ["settings.json", "settings.local.json"]) {
+      let text;
+      try {
+        text = readFileSync4(join5(dir, ".claude", file), "utf8");
+      } catch (error) {
+        if (error.code === "ENOENT")
+          continue;
+        return `the project's .claude/${file} is unreadable`;
+      }
+      let parsed;
+      try {
+        parsed = JSON.parse(text);
+      } catch {
+        return `the project's .claude/${file} isn't JSON grayboard can check`;
+      }
+      for (const k of keys(parsed))
+        if (NAMES.includes(k))
+          return `the project's .claude/${file} sets its variables; the launcher sets them`;
+    }
+  return;
+}
+function staticMode(env, cwd, settingsDirs = [], launch = env === process.env ? launchEnv() : undefined) {
+  const auth = env[STATIC_AUTH];
+  if ((auth === undefined || auth === "") && !env[RUN_TOKEN])
+    return;
+  const repository = repositorySets(env, cwd, settingsDirs, launch);
+  if (repository)
+    return { refused: `Static mode refused: ${repository}` };
+  if (auth === undefined || auth === "")
+    return { refused: `${RUN_TOKEN} is set without ${STATIC_AUTH}=static` };
+  if (auth !== "static")
+    return { refused: `${STATIC_AUTH} must be "static" or unset` };
+  const issuer = env[STATIC_ISSUER];
+  if (!issuer)
+    return { refused: `Static mode needs a pinned issuer (${STATIC_ISSUER})` };
+  if (!canonicalEndpoint(issuer))
+    return { refused: `${STATIC_ISSUER} must be an HTTPS URL (or HTTP loopback) without credentials, query or fragment` };
+  const token = env[RUN_TOKEN];
+  if (!token)
+    return { refused: `Static mode needs the launcher's run token (${RUN_TOKEN})` };
+  if (!TOKEN.test(token))
+    return { refused: `${RUN_TOKEN} isn't a run token` };
+  const principal = env[STATIC_PRINCIPAL];
+  if (principal === undefined || principal === "")
+    return { issuer, token };
+  if (!PRINCIPAL.test(principal))
+    return { refused: `${STATIC_PRINCIPAL} must be a service name` };
+  return { issuer, token, principal };
+}
+var ended = new Set;
+
+class StaticLogin {
+  resource;
+  stateKey;
+  static;
+  #config;
+  #token;
+  #fingerprint;
+  #verified;
+  #refusal;
+  constructor({ mode, ...config }) {
+    this.#config = config;
+    const resource = canonicalEndpoint(config.resource);
+    if (!resource)
+      throw new Error("Grayboard resource must be canonical HTTPS (or HTTP loopback), without credentials, query or fragment");
+    this.resource = resource.href;
+    this.stateKey = `${SERVICE_CLIENT}:${config.clientId}`;
+    if ("refused" in mode) {
+      this.static = { refused: mode.refused };
+      this.#refusal = new Refusal("identity", mode.refused);
+    } else {
+      this.static = { issuer: mode.issuer, ...mode.principal ? { principal: mode.principal } : {} };
+      this.#token = mode.token;
+      this.#fingerprint = createHash7("sha256").update(mode.token).digest("hex");
+    }
+  }
+  expired() {
+    return new AccessExpired(this.#config.harness, NEW_RUN, "login_required");
+  }
+  get ended() {
+    return this.#fingerprint !== undefined && ended.has(this.#fingerprint);
+  }
+  async token() {
+    if (this.#refusal)
+      throw this.#refusal;
+    if (this.ended)
+      throw this.expired();
+    this.#verified ??= this.verify().catch((error) => {
+      if (error instanceof Refusal && !(error instanceof AccessExpired))
+        this.#refusal = error;
+      this.#verified = undefined;
+      throw error;
+    });
+    await this.#verified;
+    if (this.ended)
+      throw this.expired();
+    return this.#token;
+  }
+  async unauthorized(_token) {
+    if (this.#fingerprint)
+      ended.add(this.#fingerprint);
+    throw this.#refusal ?? this.expired();
+  }
+  async verify() {
+    const { issuer, principal } = this.static;
+    const pin = canonicalEndpoint(issuer);
+    if (pin.origin !== new URL(this.resource).origin)
+      throw new Refusal("identity", `Static mode refused: the pinned issuer ${issuer} isn't on ${new URL(this.resource).origin}, where this harness's server is set up`);
+    let servers;
+    try {
+      servers = (await resourceMetadata(this.resource, 1e4)).authorization_servers;
+    } catch (error) {
+      if (error instanceof ServerUnreachable)
+        throw error;
+      throw new Refusal("identity", `Static mode refused: ${this.resource}'s protected-resource metadata couldn't be checked against the pinned issuer (${error.message?.slice(0, 200) ?? "invalid"})`);
+    }
+    if (!servers.includes(issuer))
+      throw new Refusal("identity", `Static mode refused: ${this.resource} doesn't name the pinned issuer ${issuer}`);
+    const who = await this.whoami();
+    if (who.kind !== "service")
+      throw new Refusal("identity", "Static mode refused: the run token isn't a service's; static mode runs only as a service");
+    if (principal !== undefined && who.principal !== principal)
+      throw new Refusal("identity", `Static mode refused: the run token is service ${who.principal ?? "unknown"}'s, not ${principal}'s (${STATIC_PRINCIPAL})`);
+  }
+  async whoami() {
+    const token = this.#token;
+    const wire = new NativeWire({ url: this.resource, sessionKey: GRAYBOARD_SESSION_META, client: { name: this.#config.clientId, version: this.#config.version } }, {
+      token: async () => token,
+      onUnauthorized: async () => this.unauthorized(token)
+    }, AbortSignal.timeout(1e4));
+    try {
+      await wire.connect();
+      const result = await wire.client.callTool({ name: "whoami", arguments: {} }, wire.options());
+      const content = result.content;
+      const value = result.structuredContent ?? (!result.isError && content?.length === 1 && content[0]?.type === "text" ? JSON.parse(content[0].text ?? "null") : undefined);
+      if (result.isError) {
+        const refused = subscriberError(value, false);
+        if (refused.code === "rate_limited" || refused.code === "internal_error")
+          throw new ServerUnreachable(refused);
+        throw new Refusal("identity", `Static mode refused: the server's whoami answered ${refused.code}`);
+      }
+      const fields = value;
+      const text = (v) => typeof v === "string" ? v : undefined;
+      return { kind: text(fields?.principal_kind), principal: text(fields?.principal) };
+    } catch (error) {
+      if (signOutCause(error)) {
+        if (this.#fingerprint)
+          ended.add(this.#fingerprint);
+        throw this.expired();
+      }
+      throw error;
+    } finally {
+      await wire.close().catch(() => {});
+    }
+  }
+  async read() {
+    return { epoch: "static" };
+  }
+  watch() {
+    return { dispose: () => {} };
+  }
+  async login() {
+    throw new Refusal("auth", "static mode: the launcher supplies the run token");
+  }
+  async logout() {
+    throw new Refusal("auth", "static mode: the launcher supplies the run token and revokes it");
+  }
+  configuration() {
+    const { issuer, principal } = this.static;
+    return { type: "remote", url: this.resource, issuer: issuer ?? "", clientID: SERVICE_CLIENT, scope: SCOPES, configHash: sha256(JSON.stringify(["static", this.resource, issuer ?? null, principal ?? null])) };
+  }
+  credential() {
+    return {
+      capture: async (sessionID) => {
+        await this.token();
+        return { version: 2, sessionID, configuration: this.configuration() };
+      },
+      check: async (e) => {
+        if (e.configuration.configHash !== this.configuration().configHash)
+          throw new Refusal("binding", `Grayboard sign-in changed in ${this.#config.harness}`);
+      },
+      watch: async () => ({ dispose: async () => {} }),
+      token: async () => this.token(),
+      unauthorized: async (_e, token) => this.unauthorized(token)
+    };
+  }
+}
+
+// src/shared/claude_agents.ts
+import { closeSync, constants as constants3, fstatSync, lstatSync, mkdirSync as mkdirSync2, openSync, readdirSync as readdirSync3, readFileSync as readFileSync5, readSync, renameSync, rmSync, statSync as statSync2, unlinkSync, writeFileSync } from "fs";
+import { createHash as createHash8 } from "crypto";
+import { join as join6, resolve as resolve3 } from "path";
 
 // src/shared/protocol.ts
 var SESSION_FACT_MAX = 64;
@@ -38164,8 +38422,8 @@ var LEFTOVER_TTL_MS = 10 * 60000;
 var TOOL_USE_META = "claudecode/toolUseId";
 var TOOL_USE_ID = /^toolu_[A-Za-z0-9_]{1,128}$/;
 var validToolUseId = (id) => typeof id === "string" && TOOL_USE_ID.test(id);
-var agentsRoot = (base) => join5(base, "claude-agents");
-var sessionDir = (base, claudePid) => join5(agentsRoot(base), String(claudePid));
+var agentsRoot = (base) => join6(base, "claude-agents");
+var sessionDir = (base, claudePid) => join6(agentsRoot(base), String(claudePid));
 var FACTS = ["model", "effort"];
 var HOOK_ERROR = "hook-error";
 var HOOK_ERROR_MAX = 1024;
@@ -38179,11 +38437,11 @@ function put(path, text) {
 function putSignIn(base, claudePid, url, now = Date.now()) {
   const dir = sessionDir(base, claudePid);
   mkdirSync2(dir, { recursive: true, mode: 448 });
-  put(join5(dir, SIGN_IN), JSON.stringify({ url, at: now }));
+  put(join6(dir, SIGN_IN), JSON.stringify({ url, at: now }));
 }
 var SIGN_IN_MAX = 16384;
 function dropSignIn(base, claudePid, url) {
-  const path = join5(sessionDir(base, claudePid), SIGN_IN);
+  const path = join6(sessionDir(base, claudePid), SIGN_IN);
   if (url !== undefined) {
     let text;
     try {
@@ -38219,20 +38477,20 @@ function takeRecord(base, claudePid, harnessStart, toolUseId) {
   const dir = sessionDir(base, claudePid);
   let start;
   try {
-    start = readFileSync4(join5(dir, "start"), "utf8");
+    start = readFileSync5(join6(dir, "start"), "utf8");
   } catch {
     return { missing: "no_session" };
   }
   if (harnessStart !== null && start !== "" && start !== harnessStart)
     return { missing: "recycled_pid" };
-  const taken = join5(dir, `${toolUseId}.taken.${process.pid}`);
+  const taken = join6(dir, `${toolUseId}.taken.${process.pid}`);
   try {
-    renameSync(join5(dir, toolUseId), taken);
+    renameSync(join6(dir, toolUseId), taken);
   } catch {
     return { missing: "absent" };
   }
   try {
-    const content = JSON.parse(readFileSync4(taken, "utf8"));
+    const content = JSON.parse(readFileSync5(taken, "utf8"));
     if (content.agent !== null && (!validSourceId(content.agent) || content.agent === ROOT))
       return { missing: "bad_record" };
     if (content.session !== undefined && !validSourceId(content.session))
@@ -38267,7 +38525,7 @@ function readFacts(base, claudePid, harnessStart, bad) {
   const dir = sessionDir(base, claudePid);
   let start;
   try {
-    start = readFileSync4(join5(dir, "start"), "utf8");
+    start = readFileSync5(join6(dir, "start"), "utf8");
   } catch {
     return;
   }
@@ -38277,10 +38535,10 @@ function readFacts(base, claudePid, harnessStart, bad) {
   for (const fact of FACTS) {
     let value;
     try {
-      value = readSmall(join5(dir, fact), SESSION_FACT_MAX + 1);
+      value = readSmall(join6(dir, fact), SESSION_FACT_MAX + 1);
     } catch (e) {
       if (e.code !== "ENOENT")
-        bad(fact, `couldn't read ${join5(dir, fact)}: ${e.message}`);
+        bad(fact, `couldn't read ${join6(dir, fact)}: ${e.message}`);
       continue;
     }
     if (value === "")
@@ -38288,11 +38546,11 @@ function readFacts(base, claudePid, harnessStart, bad) {
     else if (validFact(value))
       out[fact] = value;
     else
-      bad(fact, `${join5(dir, fact)} isn't a Claude Code ${fact}`);
+      bad(fact, `${join6(dir, fact)} isn't a Claude Code ${fact}`);
   }
   let failure;
   try {
-    failure = readSmall(join5(dir, HOOK_ERROR), HOOK_ERROR_MAX * 4).replace(CONTROLS, " ");
+    failure = readSmall(join6(dir, HOOK_ERROR), HOOK_ERROR_MAX * 4).replace(CONTROLS, " ");
   } catch {}
   if (failure !== undefined)
     bad("hook", failure);
@@ -38318,27 +38576,27 @@ function factReader(read, say) {
     return out;
   };
 }
-var calledPath = (base, claudePid, agent) => join5(sessionDir(base, claudePid), "called", createHash7("sha256").update(agent).digest("hex"));
+var calledPath = (base, claudePid, agent) => join6(sessionDir(base, claudePid), "called", createHash8("sha256").update(agent).digest("hex"));
 function markCalled(base, claudePid, agent) {
   const path = calledPath(base, claudePid, agent);
-  mkdirSync2(join5(path, ".."), { recursive: true, mode: 448 });
+  mkdirSync2(join6(path, ".."), { recursive: true, mode: 448 });
   writeFileSync(path, "", { mode: 384 });
 }
 function ownDir(base, claudePid, harnessStart) {
   let start;
   try {
-    start = readFileSync4(join5(sessionDir(base, claudePid), "start"), "utf8");
+    start = readFileSync5(join6(sessionDir(base, claudePid), "start"), "utf8");
   } catch {
     return false;
   }
   return harnessStart === null || start === "" || start === harnessStart;
 }
 function dropCalled(base, claudePid) {
-  rmSync(join5(sessionDir(base, claudePid), "called"), { recursive: true, force: true });
+  rmSync(join6(sessionDir(base, claudePid), "called"), { recursive: true, force: true });
 }
 function hasCalled(base, claudePid) {
   try {
-    return readdirSync2(join5(sessionDir(base, claudePid), "called")).length > 0;
+    return readdirSync3(join6(sessionDir(base, claudePid), "called")).length > 0;
   } catch {
     return false;
   }
@@ -38352,10 +38610,10 @@ function takeCalled(base, claudePid, agent) {
   }
 }
 function takeEnded(base, claudePid) {
-  const dir = join5(sessionDir(base, claudePid), "ended");
+  const dir = join6(sessionDir(base, claudePid), "ended");
   let names;
   try {
-    names = readdirSync2(dir);
+    names = readdirSync3(dir);
   } catch {
     return [];
   }
@@ -38363,14 +38621,14 @@ function takeEnded(base, claudePid) {
   for (const name of names) {
     if (name.includes(".tmp.") || name.includes(".taken."))
       continue;
-    const taken = join5(dir, `${name}.taken.${process.pid}`);
+    const taken = join6(dir, `${name}.taken.${process.pid}`);
     try {
-      renameSync(join5(dir, name), taken);
+      renameSync(join6(dir, name), taken);
     } catch {
       continue;
     }
     try {
-      const agent = readFileSync4(taken, "utf8");
+      const agent = readFileSync5(taken, "utf8");
       if (validSourceId(agent) && agent !== ROOT)
         out.push(agent);
     } catch {} finally {
@@ -38383,8 +38641,8 @@ function takeEnded(base, claudePid) {
 }
 
 // src/shared/identity.ts
-import { existsSync as existsSync3, readFileSync as readFileSync6, statSync as statSync4 } from "fs";
-import { basename as basename3, dirname as dirname5, join as join7, resolve as resolve5 } from "path";
+import { existsSync as existsSync3, readFileSync as readFileSync7, statSync as statSync4 } from "fs";
+import { basename as basename3, dirname as dirname5, join as join8, resolve as resolve5 } from "path";
 
 // src/core/session_id.ts
 var CROCKFORD = "0123456789abcdefghjkmnpqrstvwxyz";
@@ -38419,16 +38677,16 @@ function normalizeAliasName(raw) {
 }
 
 // src/shared/naming.ts
-import { existsSync as existsSync2, readFileSync as readFileSync5, statSync as statSync3 } from "fs";
-import { basename as basename2, dirname as dirname4, join as join6, resolve as resolve4 } from "path";
+import { existsSync as existsSync2, readFileSync as readFileSync6, statSync as statSync3 } from "fs";
+import { basename as basename2, dirname as dirname4, join as join7, resolve as resolve4 } from "path";
 var MAX_LEN = 32;
 function gitLocation(cwd) {
   for (let dir = cwd;; dir = dirname4(dir)) {
-    const dotGit = join6(dir, ".git");
+    const dotGit = join7(dir, ".git");
     if (existsSync2(dotGit)) {
       if (statSync3(dotGit).isDirectory())
         return { repo: dir, worktree: null };
-      const m = /^gitdir:\s*(.+)$/m.exec(readFileSync5(dotGit, "utf8"));
+      const m = /^gitdir:\s*(.+)$/m.exec(readFileSync6(dotGit, "utf8"));
       const gitdir = m ? resolve4(dir, m[1].trim()) : "";
       if (!/[\\/]worktrees[\\/][^\\/]+[\\/]?$/.test(gitdir))
         return { repo: dir, worktree: null };
@@ -38465,7 +38723,7 @@ function resolveIdentity(base, cwd = process.cwd()) {
 var PIN_FILES = [".mcp.json", ".omp/mcp.json"];
 function readPin(cwd, file) {
   try {
-    const pin = JSON.parse(readFileSync5(join6(gitLocation(cwd)?.repo ?? cwd, file), "utf8"))?.mcpServers?.grayboard?.env?.BUS_IDENTITY;
+    const pin = JSON.parse(readFileSync6(join7(gitLocation(cwd)?.repo ?? cwd, file), "utf8"))?.mcpServers?.grayboard?.env?.BUS_IDENTITY;
     return typeof pin === "string" && pin ? pin : undefined;
   } catch {
     return;
@@ -38496,16 +38754,16 @@ function sessionIdentity(env = process.env, cwd = process.cwd()) {
 // src/shared/identity.ts
 function gitBranch(cwd) {
   for (let dir = cwd;; dir = dirname5(dir)) {
-    const dotGit = join7(dir, ".git");
+    const dotGit = join8(dir, ".git");
     if (existsSync3(dotGit)) {
       let gitdir = dotGit;
       if (!statSync4(dotGit).isDirectory()) {
-        const m = /^gitdir:\s*(.+)$/m.exec(readFileSync6(dotGit, "utf8"));
+        const m = /^gitdir:\s*(.+)$/m.exec(readFileSync7(dotGit, "utf8"));
         if (!m)
           return null;
         gitdir = resolve5(dir, m[1].trim());
       }
-      const head = readFileSync6(join7(gitdir, "HEAD"), "utf8").trim();
+      const head = readFileSync7(join8(gitdir, "HEAD"), "utf8").trim();
       return head.startsWith("ref: refs/heads/") ? head.slice(16) : head.slice(0, 7);
     }
     if (dirname5(dir) === dir)
@@ -38559,10 +38817,13 @@ function pluginConfig(env) {
     return { error: `the grayboard plugin's server_url isn't canonical HTTPS (or HTTP loopback) without credentials, query or fragment; ${reconfigure}` };
   return { id, dataDir, url };
 }
+var pluginStaticMode = (env, cwd) => staticMode(env, cwd, [...env.CLAUDE_PROJECT_DIR ? [env.CLAUDE_PROJECT_DIR] : [], cwd]);
+var STATIC_LOGOUT = "This run uses a launcher-set grayboard run token: nothing to sign out here; the launcher revokes it.";
 function createPlugin(o) {
   const config = pluginConfig(o.env);
   const interactive = interactiveClaude(o.env, o.parentCmd);
-  const loginAction = interactive ? LOGIN_INTERACTIVE : LOGIN_ELSEWHERE;
+  const mode = "error" in config ? undefined : pluginStaticMode(o.env, o.cwd);
+  const loginAction = mode ? NEW_RUN : interactive ? LOGIN_INTERACTIVE : LOGIN_ELSEWHERE;
   const verdict = claudeChannels({ env: o.env, parentCmd: o.parentCmd, entry: ENTRY, files: o.files });
   const push = verdict.state === "on";
   const offNotice = verdict.state === "on" ? undefined : channelsOffNotice(verdict.reason);
@@ -38588,7 +38849,7 @@ function createPlugin(o) {
     if (initialized && !closed)
       server?.sendToolListChanged().catch(() => {});
   };
-  const login = "error" in config ? undefined : new Login({
+  const login = "error" in config ? undefined : mode ? new StaticLogin({ resource: config.url, clientId: CLIENT_ID, version: o.version, harness: HARNESS, mode }) : new Login({
     resource: config.url,
     clientId: CLIENT_ID,
     stateDir: config.dataDir,
@@ -38707,7 +38968,7 @@ function createPlugin(o) {
   const begin = (origin) => {
     if (signins.flow)
       return signins.flow;
-    if (!login || !root || !interactive || closed || !initialized)
+    if (!(login instanceof Login) || !root || !interactive || closed || !initialized)
       return;
     const flow = start(signins, login, {
       origin,
@@ -38768,7 +39029,7 @@ function createPlugin(o) {
     await root.resume();
     return `delivery was paused (${paused.message}); restarted: ${state()}`;
   };
-  const before = async () => await offer(signins, login, { interactive, begin: () => begin("offer"), notes }) ?? await unpause();
+  const before = async () => (mode ? undefined : await offer(signins, login, { interactive, begin: () => begin("offer"), notes })) ?? await unpause();
   const childOf = (agent) => `${config.id}/agent/${agent}`;
   let endWatch;
   const drainEnded = () => {
@@ -38784,7 +39045,7 @@ function createPlugin(o) {
   const watchEnded = () => {
     if (endWatch || "error" in config || closed)
       return;
-    const dir = join8(sessionDir(config.dataDir, o.claude.pid), "ended");
+    const dir = join9(sessionDir(config.dataDir, o.claude.pid), "ended");
     try {
       mkdirSync3(dir, { recursive: true, mode: 448 });
       const watcher = watch(dir, () => drainEnded());
@@ -38842,7 +39103,7 @@ function createPlugin(o) {
       s.ping().catch(() => {});
       initialized = true;
       markInitialized();
-      if (login && interactive)
+      if (login && interactive && !mode)
         login.token().catch((error) => {
           if (accessExpiry(error))
             begin("startup");
@@ -38858,6 +39119,8 @@ function createPlugin(o) {
   const instructions = async () => {
     if ("error" in config)
       return `Warning: grayboard is unavailable: ${config.error}. Tell the user.`;
+    if (mode && "refused" in mode)
+      return `Warning: grayboard is unavailable: ${mode.refused}. Tell the user.`;
     let body;
     try {
       const text = await Promise.race([root.instructions(), after(INSTRUCTIONS_MS).then(() => {
@@ -38920,9 +39183,18 @@ async function logout(args) {
     log("grayboard logout: --data <plugin data dir> is required");
     return 2;
   }
+  const mode = pluginStaticMode(process.env, process.cwd());
+  if (mode && !("refused" in mode)) {
+    console.log(STATIC_LOGOUT);
+    return 0;
+  }
+  if (mode) {
+    log(`grayboard logout: ${mode.refused}; no grant was signed out. Remove the static-mode variables from the environment (or the project's files) and run it again.`);
+    return 1;
+  }
   let names;
   try {
-    names = readdirSync3(join9(dataDir, "grants")).filter((n) => /^[0-9a-f]{64}\.json$/.test(n));
+    names = readdirSync4(join10(dataDir, "grants")).filter((n) => /^[0-9a-f]{64}\.json$/.test(n));
   } catch (error) {
     if (error.code !== "ENOENT")
       throw error;
@@ -38933,7 +39205,7 @@ async function logout(args) {
   for (const name of names) {
     let store;
     try {
-      store = await readJson(join9(dataDir, "grants", name));
+      store = await readJson(join10(dataDir, "grants", name));
     } catch (error) {
       unreadable.push(`${name}: ${error.message}`);
       continue;

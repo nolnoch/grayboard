@@ -24,7 +24,7 @@ import { accessAudits } from "./audit.ts";
 import { grayboardChildPids, grayboardDescendants, processDescendants, sigkill, STOP_READING } from "./procs.ts";
 import { CLI, REFUSING_MCP, ROOT } from "./paths.ts";
 import { until } from "./until.ts";
-import { hostedCarryScenario, hostedRefreshLogoutScenario, loginNotice, named, withHosted, type HostedHarness } from "./hosted_harness.ts";
+import { hostedCarryScenario, hostedRefreshLogoutScenario, hostedStaticScenario, loginNotice, named, withHosted, type HostedHarness } from "./hosted_harness.ts";
 
 type OmpPackage = { version: string; bin: { omp: string } };
 const OMP_PKG = join(ROOT, "node_modules/@oh-my-pi/pi-coding-agent/package.json");
@@ -79,12 +79,12 @@ function writeConfig(agentDir: string, modelPort: number, settings: Record<strin
   writeFileSync(join(agentDir, "config.yml"), JSON.stringify({ tools: { xdev: false }, ...settings }));
 }
 
-function startHostedOmp(dir: string, procs: ChildProcess[], { persist = false, session }: { persist?: boolean; session?: string } = {}): Pi {
+function startHostedOmp(dir: string, procs: ChildProcess[], { persist = false, session, env = {} }: { persist?: boolean; session?: string; env?: Record<string, string> } = {}): Pi {
   const proc = spawn(process.execPath, [OMP_CLI, ...OMP_ARGS, ...(persist ? [] : ["--no-session"]), ...(session ? ["--resume", session] : [])], {
     cwd: dir,
     env: cleanEnv({
       HOME: join(dir, "home"), GRAYBOARD_ATTACHMENTS_DIR: join(dir, "saved"), PATH: `${join(dir, "bin")}${delimiter}${process.env.PATH}`,
-      PI_CODING_AGENT_DIR: agentDirOf(dir),
+      PI_CODING_AGENT_DIR: agentDirOf(dir), ...env,
     }),
     stdio: ["pipe", "pipe", "pipe"],
   });
@@ -1301,3 +1301,4 @@ export function ompHostedManyChildrenScenario(dir: string): Promise<void> {
 }
 
 export const ompHostedRefreshLogoutScenario = (dir: string): Promise<void> => hostedRefreshLogoutScenario(OMP_HARNESS, dir);
+export const ompHostedStaticScenario = (dir: string): Promise<void> => hostedStaticScenario(OMP_HARNESS, dir);
