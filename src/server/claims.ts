@@ -1,9 +1,9 @@
 // The server's claim tools and steps (#807 P3 B5b3b, B5b3c): core's claim_take, claim_release, claim_watch, sweep and
 // queue requeue over the store's rows on the caller's Tx, judged by the async BoardAccess on that same Tx. Every rule and text is core's (expiredText, unclaimedText,
-// orderLanes, requeuePick, holderUserRule), so local and the server announce alike and only the reads differ.
+// orderLanes, requeuePick, holderUserRule, endReachRule), so local and the server announce alike and only the reads differ.
 import { orderLanes, REDELIVERED_NOTE, requeuePick } from "../core/boards.ts";
 import {
-  alreadyReleasedText, checkMove, isQueueKey, moves, checkRelease, checkTake, claimText, expiredText, heldAnswer, notWatching, releasable, releasedByRule,
+  alreadyReleasedText, checkMove, endReachRule, isQueueKey, moves, checkRelease, checkTake, claimText, expiredText, heldAnswer, notWatching, releasable, releasedByRule,
   releasedText, releaseRefusal, releaseText, renewAnnounces, takeDecision, unclaimedText, updateText, validKey, watching, watchNoBoard,
   watchNoClaim, watchOwn, type Claim, type ClaimChanges, type ClaimCtx, type ClaimResult, type ClaimRow, type TakeOpts,
 } from "../core/claims.ts";
@@ -17,7 +17,8 @@ import type { Read, Tx } from "./store/tx.ts";
 /**
  * The caller's hook for an announcement its own claim call wrote: a take's claim, a renewal's update or a release,
  * post `postId`, posted as `as` on `board` within `sp`. On a service's board that post is an invocation (#270 D6, #1259), which only the caller can
- * record, since it knows who asked. A lapse, a requeue's reply and a session end's release are the system's: no hook.
+ * record, since it knows who asked. A lapse, a requeue's reply, a session end's release and a release posted for the
+ * claimant's user (endReach, #1286) are the system's: no hook.
  */
 export type Announced = (sp: Tx, as: string, board: string, postId: number) => Promise<void>;
 type ServerClaimCtx = ClaimCtx & { announced?: Announced };
@@ -25,7 +26,8 @@ type ServerClaimCtx = ClaimCtx & { announced?: Announced };
 /**
  * core sweepChanges on `tx`: delete the claims lapsed at `now` and, per claim in lapse order, log its expiry, then
  * requeue a queue post's claim or announce the lapse on the claim's board, its watchers cc'd. The delete makes each
- * lapse announce once, however many sweep. A holder who lost the board lapses quietly; its watches go all the same.
+ * lapse announce once, however many sweep. A holder who lost the board lapses for its user, or quietly (core
+ * endReachRule, #1286); its watches go all the same.
  */
 export async function sweepClaims(repo: Repo, access: BoardAccess, tx: Tx, now: number): Promise<ClaimChanges> {
   const wake = new Set<string>();
@@ -37,9 +39,10 @@ export async function sweepClaims(repo: Repo, access: BoardAccess, tx: Tx, now: 
       changed = await requeue(repo, access, tx, c, now);
     } else {
       const cc = await repo.claims.takeWatchers(tx, c.key);
-      if (!c.board || !(await boardVisible(repo, access, tx, c.holder, c.board))) continue;
-      changed = await systemPost(repo, access, tx, c.holder, c.board, expiredText(c.key, c.holder, cc), null, {
-        allowArchived: true, user: await repo.claims.holderUser(tx, c),
+      const end = await endReach(repo, access, tx, c);
+      if (!end) continue;
+      changed = await systemPost(repo, access, tx, c.holder, end.board, expiredText(c.key, c.holder, cc), null, {
+        allowArchived: true, user: end.user ?? (await repo.claims.holderUser(tx, c)), seenBy: end.user,
       });
     }
     for (const h of changed.wake) wake.add(h);
@@ -75,6 +78,20 @@ export async function requeue(repo: Repo, access: BoardAccess, tx: Tx, c: ClaimR
     if (e instanceof CoreError) return { wake: [], boards: [] };
     throw e;
   }
+}
+
+/**
+ * core endReach on `r`: the board claim `c`'s end is announced on and, when its holder lost the board but the
+ * claimant's user (#855) still sees it, that user, for whom the end is posted in fixed text (core endReachRule, #1286).
+ * Null for a quiet end. Read from the claim row alone, never from a caller.
+ */
+async function endReach(repo: Repo, access: BoardAccess, r: Read, c: ClaimRow): Promise<{ board: string; user?: string } | null> {
+  const b = c.board ? await repo.boards.get(r, c.board) : undefined;
+  const holderSees = !!b && (await access.canSee(r, c.holder, b));
+  const user = b && !holderSees ? await repo.claims.holderUser(r, c) : undefined;
+  const via = endReachRule(c.board, holderSees, user, !!b && user !== undefined && (await access.userSees(r, user, b)));
+  if (via === null) return null;
+  return via === "holder" ? { board: c.board! } : { board: c.board!, user: user! };
 }
 
 /** core canSeeBoard on `r`: the board exists and `handle` may see it. */
@@ -188,13 +205,23 @@ export async function serverRelease(
     // A declined queue post goes to the next lane with the original post, unannounced (#192 review).
     if (key.startsWith("queue:")) return requeue(repo, access, sp, gone, now, ctx);
     const cc = await repo.claims.takeWatchers(sp, key);
-    // A holder who lost the board releases quietly; its watchers go too, since they're told through the board.
-    if (!gone.board || !(await boardVisible(repo, access, sp, as, gone.board))) return { wake: [], boards: [] };
+    // A holder who lost the board releases for its user, without the note, or quietly (core endReachRule, #1286);
+    // its watchers go either way, since they're told through the board.
+    const end = await endReach(repo, access, sp, gone);
+    if (!end) return { wake: [], boards: [] };
+    if (end.user) {
+      // The system's post for the claimant's user: no caller's note, session or hook reaches it, so the caller's
+      // answer and its own deliveries are a quiet release's.
+      const { postId: _, ...changed } = await systemPost(repo, access, sp, as, end.board, releaseText(key, undefined, cc), null, {
+        allowArchived: true, user: end.user, seenBy: end.user,
+      });
+      return changed;
+    }
     // A release with no signed-in caller posts as the claimant's user (#855).
-    const { postId, ...changed } = await systemPost(repo, access, sp, as, gone.board, releaseText(key, note, cc), null, {
+    const { postId, ...changed } = await systemPost(repo, access, sp, as, end.board, releaseText(key, note, cc), null, {
       allowArchived: true, session: ctx.session, via: ctx.via, user: ctx.user ?? (await repo.claims.holderUser(sp, gone)),
     });
-    await ctx.announced?.(sp, as, gone.board, postId);
+    await ctx.announced?.(sp, as, end.board, postId);
     return changed;
   });
 }

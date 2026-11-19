@@ -37,9 +37,10 @@ test("no source file outside policy.ts calls a pre-seam rule helper", () => {
 // #270 step 5 raised access.ts by 3: core's synchronous Access (still installed on the server's database) takes the
 // service board's visibility, create scope and lane rules, the twins of boardAccess's, so no core path is left open.
 // #1273 L4 lowered it by 1: canSee, seesAlias and seesAliasMeta read their principal through one `seer`.
+// #1286 raised it by 1: core Access.userSees, the twin of boardAccess.userSees, reads a claimant's user's principal.
 const SYNC_TWIN = /\bauthorizeNow\b|\bpolicyNow\b|\bdecide\(/g;
 const SYNC_TWIN_CEILING: Record<string, number> = {
-  "src/server/access.ts": 18,
+  "src/server/access.ts": 19,
   "src/server/db.ts": 2,
   "src/server/http.ts": 1,
   "src/server/policy.ts": 9,

@@ -7,7 +7,7 @@ import type { Principal } from "../core/resolver.ts";
 import { boardAccess, principalCanSee, scopeKey, serverAccess } from "./access.ts";
 import type { Repo } from "./db.ts";
 import type { Read, Tx } from "./store/tx.ts";
-import { AUTHORS, B, BOARDS, D, HANDLES, openBoardParity, SCOPES, TOKENS, W, WADE_ID } from "../../tests/support/board_parity.ts";
+import { AUTHORS, B, BOARDS, D, E, ENG_ID, HANDLES, openBoardParity, SCOPES, TOKENS, TOOLS_ID, W, WADE_ID } from "../../tests/support/board_parity.ts";
 
 let repo: Repo;
 let db: CoreDb;
@@ -40,6 +40,8 @@ async function rows(r: Read, tx: Tx | null, humanReach: "team" | "all"): Promise
     const want = BOARDS.filter(b => typeof v === "string" ? sync.canSee(v, b) : principalCanSee(repo, v, b)).map(b => b.name).sort();
     out.push([`visibleTo ${typeof v === "string" ? v : `${v.kind}:${v.name}`}`, want, sorted(await async.visibleTo(r, v, BOARDS))]);
   }
+  // A claimant's user by its principal's name (#1286): a person, a team, a service, and a name nobody has.
+  for (const u of [W, B, E, D, "nobody@example.com", "eng", "ops", "svc", ""]) for (const b of BOARDS) out.push([`userSees ${u} ${b.name}`, sync.userSees!(u, b), await async.userSees(r, u, b)]);
   for (const h of HANDLES) {
     for (const scope of [null, "team:eng", "team:ops", "team:nope", "weird"]) out.push([`checkCreate ${h} ${scope}`, sync.checkCreate(h, scope), await async.checkCreate(r, h, scope)]);
     for (const s of SCOPES) {
@@ -86,6 +88,12 @@ describe("boardAccess agrees with serverAccess", () => {
       // The fixture reaches every answer: some rows allow and some refuse, and resolveMention resolves and refuses.
       const values = new Set(inside.map(([, s]) => JSON.stringify(s)));
       for (const v of ["true", "false", "null"]) expect(values.has(v)).toBe(true);
+      // seer's fallbacks for an ID (#1286): a tools-only one as its writes_as name (eng/deploy, not wade) on ops; a
+      // bound one as its primary (eng, not wade) on a service's names. Wade's own session is the control for both.
+      const said = (l: string) => inside.find(([x]) => x === l)?.[1];
+      const svc = scopeKey({ scope_kind: "service", scope_ref: "svc" });
+      expect([said(`canSee ${TOOLS_ID} ops`), said(`canSee ${WADE_ID} ops`), said(`canSee ${TOOLS_ID} eng`)]).toEqual([false, true, true]);
+      expect([said(`seesAlias ${ENG_ID} ${svc}`), said(`seesAlias ${WADE_ID} ${svc}`)]).toEqual([false, true]);
       expect(inside.some(([l, s]) => l.startsWith("resolveMention ") && JSON.stringify(s).includes("isn't in your scope"))).toBe(true);
       expect(inside.some(([l, s]) => l.startsWith("resolveMention ") && JSON.stringify(s).includes("id_ended"))).toBe(true);
     }, 60_000);

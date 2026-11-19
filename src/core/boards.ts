@@ -125,6 +125,10 @@ export type Access = {
   // an address that names none; names who else may archive a board in a
   // refusal. Omitted: the refusal says "your user" (local mode has one).
   ownerOf?(address: string): string | null;
+  // Whether `user`, a claimant's user (claims.holder_user, #855) named by its principal's name, may see `board`
+  // itself, whatever its sessions are bound to: a claim's end is announced for it when its holder lost the board
+  // (#1286). Omitted (local mode: one user, and a holder sees every board there is): never.
+  userSees?(user: string, board: Board): boolean;
 };
 
 export const ANNOUNCE_BOARD = "announce";
@@ -598,6 +602,12 @@ function visibleBoard(db: Database, handle: Viewer, input: string): Board {
   return b;
 }
 
+// A claimant's user (#855) as a viewer: the boards Access.userSees gives it, none in local mode (#1286).
+export function userViewer(db: Database, user: string): BoardPredicate {
+  const a = access(db);
+  return (b) => a.userSees?.(user, b) ?? false;
+}
+
 export function canSeeBoard(db: Database, viewer: Viewer, name: string): boolean {
   const b = getBoard(db, name);
   return !!b && sees(db, viewer, b);
@@ -841,6 +851,9 @@ export type PostOpts = {
   // A system post ending something already announced on the board (a claim's
   // release, update or expiry) still lands once the board is archived (#635).
   allowArchived?: boolean;
+  // Whose sight passes the gate in the author's stead: only a claim's end post for the claimant's user, when the
+  // holder lost the board (#1286), derived from the claim row. No tool's arguments reach it.
+  seenBy?: BoardPredicate;
 };
 
 // Eligible lanes for a queue board's rotation, least-recently-woken first
@@ -1021,9 +1034,10 @@ export function requeuePick(lanes: string[], held: Set<string>): string | undefi
 // it, the parent is a post on it, only a human starts an announcement, and an
 // archived board takes replies only, unless the caller is the system ending
 // something already on it (`allowArchived`: a claim's release or expiry).
+// `viewer` is whose sight passes it: the poster's, but for PostOpts.seenBy.
 // Throws CoreError; writes nothing.
-function postGate(db: Database, handle: string, boardInput: string, parentId: number | null, allowArchived = false) {
-  const b = visibleBoard(db, handle, boardInput);
+function postGate(db: Database, handle: string, boardInput: string, parentId: number | null, allowArchived = false, viewer: Viewer = handle) {
+  const b = visibleBoard(db, viewer, boardInput);
   const a = access(db);
   const gate = postGateRule(
     b, parentId, allowArchived, a.announceBoard, () => getPost(db, parentId!), () => isHuman(db, handle),
@@ -1097,7 +1111,7 @@ export function post(
   parentId: number | null = null,
   opts: PostOpts = {},
 ): PostResult {
-  const { b, a, announce, human, announcement } = postGate(db, handle, boardInput, parentId, opts.allowArchived);
+  const { b, a, announce, human, announcement } = postGate(db, handle, boardInput, parentId, opts.allowArchived, opts.seenBy);
   const board = b.name;
   postPreChecks(board, body, announcement, opts);
   const files = opts.attachments ?? { ids: [] };

@@ -177,6 +177,12 @@ export function serverAccess(repo: Repo, db: CoreDb, humanReach: HumanReach = "t
       const p = repo.policyNow.principalOf(address);
       return p?.kind === "user" ? p.name : null;
     },
+
+    // A claimant's user (#1286), as its own principal: never a session's binding.
+    userSees(user, board) {
+      const row = repo.policyNow.principalByName(user);
+      return !!row && principalCanSee(repo, { kind: row.kind, name: row.name }, board);
+    },
   };
 }
 
@@ -248,6 +254,8 @@ export interface BoardAccess {
   seesAliasMetaScopes(r: Read, viewer: string, scopes: AliasScopeOf[]): Promise<Map<string, boolean>>;
   sameUser(r: Read, human: string, address: string): Promise<boolean>;
   ownerOf(r: Read, address: string): Promise<string | null>;
+  // core Access.userSees: whether a claimant's user, by its principal's name, may see `board` itself (#1286).
+  userSees(r: Read, user: string, board: Board): Promise<boolean>;
 }
 
 export function boardAccess(repo: Repo, humanReach: HumanReach = "team"): BoardAccess {
@@ -420,5 +428,17 @@ export function boardAccess(repo: Repo, humanReach: HumanReach = "team"): BoardA
       const p = await repo.principals.of(r, address);
       return p?.kind === "user" ? p.name : null;
     },
+
+    async userSees(r, user, board) {
+      const p = await userPrincipal(repo, r, user);
+      return p !== null && (await principalSees(r, p, board));
+    },
   };
+}
+
+// A claimant's user (#855) as its own principal, by name, for userSees and the gate of its end post (#1286); null
+// for a name no principal has.
+export async function userPrincipal(repo: Repo, r: Read, user: string): Promise<Principal | null> {
+  const row = await repo.principals.findByName(r, user);
+  return row ? { kind: row.kind, name: row.name } : null;
 }

@@ -8,8 +8,8 @@ import {
 import { CoreError } from "../core/errors.ts";
 import { attachmentIds, type FileSend } from "../core/attachments.ts";
 import { boardPostResult, optNum, str, type BoardPostResult, type ToolContext } from "../core/tools.ts";
-import { scopeKey, type AliasScopeOf, type BoardAccess } from "./access.ts";
-import { readableBoard } from "./board_reads.ts";
+import { scopeKey, userPrincipal, type AliasScopeOf, type BoardAccess } from "./access.ts";
+import { readableBoard, type BoardViewer } from "./board_reads.ts";
 import type { Repo } from "./db.ts";
 import type { Read, Tx } from "./store/tx.ts";
 import type { Post } from "../shared/notifications.ts";
@@ -20,8 +20,9 @@ import type { Post } from "../shared/notifications.ts";
  */
 export async function postGateOn(
   repo: Repo, access: BoardAccess, r: Read, actor: string, boardInput: string, parentId: number | null, allowArchived = false,
+  viewer: BoardViewer = actor,
 ): Promise<{ board: Board; gate: PostGate }> {
-  const board = await readableBoard(repo, access, r, actor, boardInput);
+  const board = await readableBoard(repo, access, r, viewer, boardInput);
   // Read before the rule needs them: reads have no effects, and the rule still throws in core's order.
   const parent = parentId === null ? undefined : await repo.boards.post(r, parentId);
   const human = await repo.aliases.isHuman(r, actor);
@@ -140,9 +141,12 @@ async function writePost(
  */
 export async function systemPost(
   repo: Repo, access: BoardAccess, tx: Tx, actor: string, board: string, body: string, parentId: number | null,
-  o: { allowArchived: boolean; session?: string; via?: string; user?: string; addresses?: string[] },
+  o: { allowArchived: boolean; session?: string; via?: string; user?: string; addresses?: string[]; seenBy?: string },
 ): Promise<{ wake: string[]; boards: string[]; postId: number }> {
-  const { board: b, gate } = await postGateOn(repo, access, tx, actor, board, parentId, o.allowArchived);
+  // core PostOpts.seenBy: a claim's end post for the claimant's user `seenBy`, whose sight passes the gate in the
+  // holder's stead (#1286). Only the claim paths pass it, from the claim row.
+  const viewer = o.seenBy === undefined ? actor : ((await userPrincipal(repo, tx, o.seenBy)) ?? []);
+  const { board: b, gate } = await postGateOn(repo, access, tx, actor, board, parentId, o.allowArchived, viewer);
   const text = systemBody(body);
   postPreChecks(b.name, text, gate.announcement, {});
   const { post, out } = await writePost(repo, access, tx, actor, b, gate, {

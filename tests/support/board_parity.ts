@@ -1,5 +1,6 @@
 // The server's board parity fixture (#807 P3 B5a0, B5b1b1): four users, two teams of different policies, person and
-// team aliases, a live and an ended session ID, and a live one bound to a team's name (#1273 L4). The async board access and the ported board tools are each compared
+// team aliases, a live and an ended session ID, a live one bound to a team's name (#1273 L4), a tools-only one writing
+// as a team's name, and a service one user may invoke (#1286). The async board access and the ported board tools are each compared
 // against the sync seam core still runs over it (src/server/board-access-parity.test.ts, board-tools-parity.test.ts).
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -25,8 +26,12 @@ export const ENDED_ID = idAddress("b".repeat(64));
 // wade's session bound only to `eng/build`: on a scoped board it acts as eng, not as wade (#1255), so it doesn't see
 // ops's board though wade does.
 export const ENG_ID = idAddress("7".repeat(64));
+// wade's tools-only session writing as eng/deploy, holding nothing: an ID with no primary is judged as its writes_as
+// name (seer's fallback), so it doesn't see ops's board either. On svc's names (seer's service branch) ENG_ID is
+// judged as eng, which holds no service_invoke on svc, though wade does (#1286).
+export const TOOLS_ID = idAddress("6".repeat(64));
 export const W = "wade@example.com", B = "bob@example.com", E = "eve@example.com", D = "dan@example.com";
-export const HANDLES = [`${W}/be`, `${B}/be`, `${B}/qa`, `${E}/be`, `${D}/be`, "eng/deploy", "ops/deploy", "team:eng", WADE_ID, ENDED_ID, ENG_ID, "nobody@example.com/be", "be", ""];
+export const HANDLES = [`${W}/be`, `${B}/be`, `${B}/qa`, `${E}/be`, `${D}/be`, "eng/deploy", "ops/deploy", "team:eng", WADE_ID, ENDED_ID, ENG_ID, TOOLS_ID, "nobody@example.com/be", "be", ""];
 export const SCOPES: AliasScopeOf[] = [
   { scope_kind: "person", scope_ref: W }, { scope_kind: "person", scope_ref: null }, { scope_kind: "team", scope_ref: "eng" },
   { scope_kind: "team", scope_ref: "ops" }, { scope_kind: "team", scope_ref: "nope" }, { scope_kind: "team", scope_ref: null },
@@ -38,7 +43,8 @@ export const AUTHORS = [`${W}/be`, `${B}/be`, `${E}/be`, `${D}/be`, WADE_ID, "en
 /**
  * A fresh server database holding the fixture: wade owns eng (collaborative, bob a member) and is a member of ops
  * (delegating, owned by eve); dan is in neither. WADE_ID is wade's live session, ENDED_ID bob's ended one, ENG_ID wade's
- * session holding only eng/build.
+ * session holding only eng/build, TOOLS_ID wade's tools-only session writing as eng/deploy. Service svc's
+ * service_invoke is wade's own.
  */
 export async function openBoardParity(): Promise<{ repo: Repo; db: CoreDb }> {
   const { repo, db } = openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
@@ -63,6 +69,10 @@ export async function openBoardParity(): Promise<{ repo: Repo; db: CoreDb }> {
     await repo.aliases.create(tx, team("eng", "build"), W);
     registerId(repo.coreOn(tx), { id: ENG_ID, principal: W, launcher: false });
     holdAlias(repo.coreOn(tx), "eng/build", ENG_ID, 1);
+    registerId(repo.coreOn(tx), { id: TOOLS_ID, principal: W, launcher: false, writesAs: "eng/deploy" });
+    await repo.services.create(tx, "svc");
+    repo.coreOn(tx).prepare(`INSERT INTO role_bindings (principal_id, role, scope_id, granted_by, granted_at)
+      SELECT h.id, 'service_invoke', s.id, NULL, 0 FROM principals h, principals s WHERE h.name = ? AND s.name = 'svc'`).run(W);
   });
   await seed(repo, tx => repo.sessionEnd.end(tx, ENDED_ID, { why: "test", now: 5 }));
   return { repo, db };

@@ -1,6 +1,6 @@
 import type { Database } from "bun:sqlite";
 
-import { REDELIVERED_NOTE, canSeeBoard, getBoard, normalizeBoard, post, redeliverQueuePost, seenHandles, systemBody, type Viewer } from "./boards.ts";
+import { REDELIVERED_NOTE, canSeeBoard, getBoard, normalizeBoard, post, redeliverQueuePost, seenHandles, systemBody, userViewer, type BoardPredicate, type Viewer } from "./boards.ts";
 import { addressParts } from "./addresses.ts";
 import { idRow } from "./bindings.ts";
 import { CoreError } from "./errors.ts";
@@ -44,6 +44,33 @@ export function holderUser(db: Database, c: ClaimRow): string | undefined {
   if (c.holder_user) return c.holder_user;
   const f = holderPrincipals(db, c.holder);
   return holderUserRule(c, f.idPrincipal, f.heldPrincipal);
+}
+
+/**
+ * Who a claim's end (a release or a lapse) is announced for on its board (#1286), judged in order:
+ * - `"holder"`: the holder can still see the board; a release carries its note.
+ * - `"user"`: the holder can't, but the claimant's user (holderUser, #855) can, as a session confined to its binder's
+ *   other team (#1255) whose user still sees the board. The post is written for that user, in fixed text: never the
+ *   caller's note, explicit claim_release or a session end's alike, so a confined holder's own words can't reach a
+ *   board outside its team. Its watchers keep the end post they were promised (principle 3).
+ * - `null`: neither can (or the claim has no board): a quiet end, its watches consumed all the same.
+ * The rule is pure; both modes read its facts, the user's only when the holder's fails.
+ */
+export function endReachRule(board: string | null, holderSees: boolean, user: string | undefined, userSees: boolean): "holder" | "user" | null {
+  if (!board) return null;
+  if (holderSees) return "holder";
+  return user !== undefined && userSees ? "user" : null;
+}
+
+/** endReachRule on `db` for claim `c`: the board and, on the user's path, the user and its sight for the post's gate. */
+function endReach(db: Database, c: ClaimRow): { board: string; user?: { name: string; sees: BoardPredicate } } | null {
+  const board = c.board;
+  const holderSees = !!board && canSeeBoard(db, c.holder, board);
+  const user = board && !holderSees ? holderUser(db, c) : undefined;
+  const sees = user === undefined ? undefined : userViewer(db, user);
+  const via = endReachRule(board, holderSees, user, !!board && !!sees && canSeeBoard(db, sees, board));
+  if (via === null) return null;
+  return via === "holder" ? { board: board! } : { board: board!, user: { name: user!, sees: sees! } };
 }
 
 // A claim as a reader sees it: a holder whose name the reader may not see (a team's alias, outside the team,
@@ -304,9 +331,10 @@ export function expireClaims(db: Database, now: number): ClaimRow[] {
 
 // A new claim can't announce on an archived board (#635); its update, release
 // or expiry, ending what's already there, can (`ending`).
-function announce(db: Database, handle: string, board: string | null, text: string, ctx: ClaimCtx = {}, ending = true): ClaimChanges {
+// `seenBy` passes the gate for a claimant's user whose holder lost the board (endReach, #1286).
+function announce(db: Database, handle: string, board: string | null, text: string, ctx: ClaimCtx = {}, ending = true, seenBy?: BoardPredicate): ClaimChanges {
   if (!board) return { wake: [], boards: [] };
-  const result = post(db, handle, board, systemBody(text), null, { author_id: ctx.session, via: ctx.via, author_user: ctx.user, allowArchived: ending });
+  const result = post(db, handle, board, systemBody(text), null, { author_id: ctx.session, via: ctx.via, author_user: ctx.user, allowArchived: ending, seenBy });
   return { wake: result.wake, boards: [result.post.board] };
 }
 
@@ -416,11 +444,14 @@ export function release(
       return requeue(db, gone, now, ctx);
     }
     const cc = takeClaimWatchers(db, key);
-    // If the holder lost access to the board since claiming, release quietly;
-    // watchers too, since they're told through the board.
-    const board = gone.board && canSeeBoard(db, as, gone.board) ? gone.board : null;
+    // A holder who lost the board releases for its user, without the note, or quietly (endReach, #1286); watchers
+    // are consumed either way, since they're told through the board.
+    const end = endReach(db, gone);
+    if (!end) return { wake: [], boards: [] };
+    // The system's post for the claimant's user: no caller's session, note or name set reaches it.
+    if (end.user) return announce(db, as, end.board, releaseText(key, undefined, cc), { user: end.user.name }, true, end.user.sees);
     // A release with no signed-in caller is the system's (a session end's): it posts as the claimant's user (#855).
-    return announce(db, as, board, releaseText(key, note, cc), { ...ctx, user: ctx.user ?? holderUser(db, gone) });
+    return announce(db, as, end.board, releaseText(key, note, cc), { ...ctx, user: ctx.user ?? holderUser(db, gone) });
   }).immediate();
 }
 
@@ -511,9 +542,10 @@ export function sweepChanges(db: Database, now: number): ClaimChanges {
       continue;
     }
     const cc = takeClaimWatchers(db, c.key);
-    // As in release(): a holder who lost access to the board lapses quietly.
-    if (!c.board || !canSeeBoard(db, c.holder, c.board)) continue;
-    const changed = announce(db, c.holder, c.board, expiredText(c.key, c.holder, cc), { user: holderUser(db, c) });
+    // As in release(): a holder who lost the board lapses for its user, or quietly (endReach, #1286).
+    const end = endReach(db, c);
+    if (!end) continue;
+    const changed = announce(db, c.holder, end.board, expiredText(c.key, c.holder, cc), { user: end.user?.name ?? holderUser(db, c) }, true, end.user?.sees);
     for (const h of changed.wake) wake.add(h);
     for (const board of changed.boards) boards.add(board);
   }
