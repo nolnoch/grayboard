@@ -1,28 +1,21 @@
 # Rust client SDK
 
 ```doc-meta
-owns: the unbuilt rest of the Rust client SDK for hosted MCP (#929): the service credential, CI wiring and release
+owns: the unbuilt rest of the Rust client SDK for hosted MCP (#929): release and versioning (crates.io after a pilot), and the CI wiring's rationale
 invariants: the SDK speaks only modern MCP (`2026-07-28`) as raw JSON-RPC over HTTP, never `rmcp` or the legacy sessionful transport; its requests equal hosted-core's reference wire, checked against a recorded fixture, not against the SDK's own idea of the envelope; only a body-driven 429 (`rate_limited`) and one credential-replaced 401 retry, and a `tools/call` that times out, loses its connection or gets a gateway status is `OutcomeUnknown`, never retried; the crate version equals package.json's; the workflow and Dependabot edits are the maintainer's PR (principle 14)
-code-pointers: sdk/rust/grayboard/src/ (session.rs, credential.rs, tools.rs), scripts/record_rust_fixtures.ts, scripts/e2e.sh (rust-sdk), tests/integration/rust_sdk.test.ts, rust_fixtures.test.ts, rust_sdk_version.test.ts, adapters/hosted-core/src/wire.ts, tests/conformance/driver.ts (rustDriver), tests/helpers/oauth.ts (issueOAuthIn)
-companions: ../sdk-rust.md (the as-built SDK), ../server-hosted-mcp.md §2 (the server contract), service-principals.md (#270: the credential and run tokens step 6 consumes), ../vision.md (principles 2, 3, 10, 12, 14), ../parity.md
-trigger: in progress under #929; step 6 waits on #270's token route
-last-verified: 2026-11-16 (origin/master acc2441f)
+code-pointers: sdk/rust/grayboard/Cargo.toml, scripts/e2e.sh (rust-sdk), tests/integration/rust_sdk_version.test.ts, .github/workflows/hosted.yml (rust-sdk)
+companions: ../sdk-rust.md (the as-built SDK, its service credential included), ../server-hosted-mcp.md §2 (the server contract), ../vision.md (principles 2, 3, 10, 12, 14), ../parity.md
+trigger: a pilot service proves the API (D9)
+last-verified: 2026-11-19 (origin/master c247412e)
 ```
 
 ## Problem
 
 Rust platform services must join the bus as service principals (#270, #807 Stage 3 exit test). The SDK must speak hosted-core's wire, carry push delivery (a queue board routes only to push subscribers, `queueLanes` in `src/core/boards.ts`; principle 3 forbids a poll-only path), fail CI when the tool surface moves, and take #270's credential without a redesign.
 
-## Built (steps 1 to 5)
+## Built (steps 1 to 6)
 
-The transport, raw calls, the delivery stream, the Stage 3 example, typed tools (a struct and method per native tool, and how a schema change fails CI) and the conformance driver: as-built in `../sdk-rust.md` (§4 for the driver) and the crate's docs.
-
-## D3. Service credential
-
-- `Credential` is two `BoxFuture` methods (`token`, `unauthorized`), so `Client` holds `Arc<dyn Credential>` and the delivery task can be spawned; same shape as hosted-core's `AuthProvider` (`client.ts`).
-- After #270's token route: `ClientCredentials { issuer, client_id, secret }` fetches authorization-server metadata once and refuses an issuer mismatch, posts `grant_type=client_credentials` (`client_secret_basic`, `resource` = the MCP endpoint), caches, re-mints at 80% of lifetime (the server closes listen streams at access expiry, so a token must never lapse under one), and re-mints once on `unauthorized`. The caller pins the issuer.
-- Not built: browser PKCE, refresh rotation, a grant store (no Rust caller is a person; principle 12).
-- Until then, tests register an operator client `rust-sdk-test` with `sessionSource: true` and seed its token (`issueOAuth`). The seed is SQLite-shaped; if #270 slips past the Postgres cutover (#807) the suite needs a Postgres seed.
+The transport, raw calls, the delivery stream, the Stage 3 example, typed tools (a struct and method per native tool, and how a schema change fails CI), the conformance driver and the service credential (`ClientCredentials`, the `generic` source, the example and the conformance run minting their own tokens): as-built in `../sdk-rust.md` (§4 for the driver, §5 for the credential) and the crate's docs.
 
 ## D8. CI
 
@@ -39,7 +32,7 @@ The transport, raw calls, the delivery stream, the Stage 3 example, typed tools 
 
 ## Sequence
 
-6. **After #270's token route**: `ClientCredentials`, the `generic` source, the example with a minted token.
+Steps 1 to 6 are built. What remains is D9's release after a pilot.
 
 ## Open questions, with defaults
 

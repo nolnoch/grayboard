@@ -1,6 +1,6 @@
 //! A client for grayboard's hosted MCP endpoint (#929).
 //!
-//! It speaks modern MCP (protocol `2026-07-28`) as raw JSON-RPC over HTTP: each request carries its session in `_meta`, and any response may arrive as JSON or as an event stream. This release has the transport, raw calls, the delivery stream (`Session::deliveries`) and a typed method for every native tool (`tools`).
+//! It speaks modern MCP (protocol `2026-07-28`) as raw JSON-RPC over HTTP: each request carries its session in `_meta`, and any response may arrive as JSON or as an event stream. This release has the transport, raw calls, the delivery stream (`Session::deliveries`), a typed method for every native tool (`tools`) and two credentials: a fixed token (`StaticBearer`) and a service credential that mints its own (`ClientCredentials`).
 //!
 //! ```no_run
 //! # async fn run() -> Result<(), grayboard::Error> {
@@ -29,7 +29,7 @@ mod sse;
 pub mod tools;
 mod transport;
 
-pub use credential::{Credential, StaticBearer};
+pub use credential::{ClientCredentials, Credential, StaticBearer};
 pub use delivery::{Delivery, DeliveryStream};
 pub use envelope::{CallToolResult, ClientInfo, ContentBlock, DeliveryMode, PROTOCOL_VERSION};
 pub use error::{AuthError, Error, SERVER_TEXT_LIMIT, server_text};
@@ -37,6 +37,8 @@ pub use session::{Client, Session};
 pub use tools::Reply;
 pub use transport::{Discovery, Notification, Subscription};
 
+#[cfg(test)]
+mod credential_tests;
 #[cfg(test)]
 mod delivery_tests;
 #[cfg(test)]
