@@ -11,13 +11,16 @@ import { join } from "node:path";
 import type { CallToolResult } from "@modelcontextprotocol/client";
 import { HostedClient, type Level } from "../../adapters/hosted-core/src/client.ts";
 import { Controller } from "../../adapters/hosted-core/src/controller.ts";
+import type { SignIn } from "../../adapters/hosted-core/src/login.ts";
 import { AccessExpired, Refusal } from "../../adapters/hosted-core/src/model.ts";
 import { RootDelivery } from "../../adapters/hosted-core/src/root.ts";
 import { deliveryPath } from "../../adapters/hosted-core/src/storage.ts";
 import { NEW_RUN, StaticLogin, staticMode, type StaticMode } from "../../adapters/hosted-core/src/static.ts";
 import { ServerUnreachable } from "../../adapters/hosted-core/src/wire.ts";
+import { hashToken } from "../../src/server/auth.ts";
 import { hostedRowCount } from "../support/hosted_rows.ts";
 import { hostedServer, seedGrant, storeLogin, tokenRequests, type HostedServer } from "../support/hosted_oauth.ts";
+import { seed } from "../support/seed.ts";
 import { serviceRun } from "../support/service_token.ts";
 import { until } from "../support/until.ts";
 
@@ -210,7 +213,7 @@ describe("before the token is sent", () => {
 });
 
 type Rig = { root: RootDelivery; client: HostedClient; logs: { message: string; level: Level }[] };
-function rig(login: StaticLogin, id: string, configured?: string): Rig {
+function rig(login: SignIn, id: string, configured?: string): Rig {
   const logs: Rig["logs"] = [];
   const client = new HostedClient({
     harness: "pi", clientId: CLIENT, version: "1.0.0", login, source: "grayboard",
@@ -298,8 +301,7 @@ describe("a run on a run token", () => {
   // back the name the first run held, and `prepare` rebinds it. The revoke lands at that step, after the proxy
   // connected and before the resume's first request, so the 401 meets the restore itself. The seam is a wrapper on
   // Controller.resume, not a testPause point: hosted core has none (its Node-only typecheck refuses
-  // src/shared/testpause.ts), and a server point past admission turns a revoke into a tool-level `unauthenticated`
-  // rather than a 401 (#1312).
+  // src/shared/testpause.ts). A revoke at a server point past admission is the next test's (#1312).
   test("a run token revoked at the restore step: the resume's 401 ends the run with the new-run text, unbound, and nothing retries", async () => {
     const run = await serviceRun(srv);
     const first = rig(signIn(mode(run.env)), "svc-restore-1", "w-1");
@@ -323,9 +325,9 @@ describe("a run on a run token", () => {
       await second.root.start();
       expect(revoked).toEqual(["svc-restore-1"]);
       await until(() => record(second, "svc-restore-1")?.code === "login_required", 15_000, "the restore's 401 recorded");
-      // A resumed root with no saved approval ends unpaused with the cause (#895); for a static run the cause is the run's end.
-      expect(record(second, "svc-restore-1")).toMatchObject({ state: "approved", message: ENDED, operation: "enroll" });
-      expect(second.logs).toEqual([{ level: "warning", message: `this session couldn't take back its name ${SVC}/w-1 (${ENDED}); it is unbound` }]);
+      // A sign-out at the resume pauses the root, as the run loop's does (#1312, L1 of #1303); the sink says it once.
+      expect(record(second, "svc-restore-1")).toMatchObject({ state: "paused", message: ENDED, operation: "enroll" });
+      expect(second.logs).toEqual([{ level: "warning", message: `delivery paused: ${ENDED}` }]);
       expect(srv.app.db.query("SELECT 1 FROM alias_holds h JOIN hosted_sessions s ON s.session_id = h.id WHERE s.source_session_id = 'svc-restore-1'").get()).toBeNull();
       // The 401 spent the token for the process: nothing carries it again.
       const net = outgoing();
@@ -338,6 +340,92 @@ describe("a run on a run token", () => {
       } finally { net.restore(); }
       expect(tokens()).toEqual([]);
     } finally { at.mockRestore(); }
+  }, 60_000);
+
+  // #1312: the restore's rebind held at the server's `hosted:bind:after-commit` point (past admission and the bind's
+  // commit, before its post-commit check; in-process server, so a testPauseAsync point), `during` run there, then
+  // released. The first run binds `w-1` and releases it, so the second's start resumes it.
+  async function atRebind(login: () => SignIn, id: string, held: string, during: () => Promise<unknown>): Promise<Rig> {
+    const first = rig(login(), id, "w-1");
+    await first.root.start();
+    await until(() => record(first, id)?.held?.[0] === held, 15_000, `the first run bound as ${held}`);
+    await first.root.shutdown("release");
+    roots.splice(roots.indexOf(first.root), 1);
+    await until(() => !srv.app.db.query("SELECT 1 FROM hosted_sessions WHERE source_session_id = ?").get(id), 10_000, "the first run's session ended");
+    const go = join(dir, "go"), hits: string[] = [];
+    const said = spyOn(console, "error").mockImplementation((...args: unknown[]) => { hits.push(args.join(" ")); });
+    process.env.BUS_TEST_PAUSE = "hosted:bind:after-commit";
+    process.env.BUS_TEST_PAUSE_FILE = go;
+    try {
+      const second = rig(login(), id);
+      const started = second.root.start();
+      await until(() => hits.some(h => h.includes("test pause hit: hosted:bind:after-commit")), 15_000, "the rebind held after its commit");
+      await during();
+      writeFileSync(go, "");
+      await started;
+      return second;
+    } finally {
+      said.mockRestore();
+      delete process.env.BUS_TEST_PAUSE;
+      delete process.env.BUS_TEST_PAUSE_FILE;
+    }
+  }
+
+  test("a run token revoked after the restore's rebind was admitted: the server's 401 ends the run, paused login_required, the token ended (#1312)", async () => {
+    const run = await serviceRun(srv);
+    const env = { ...run.env, GRAYBOARD_RUN_TOKEN: await run.mint() };
+    let login!: StaticLogin;
+    const second = await atRebind(() => (login = signIn(mode(env))), "svc-commit-1", `${SVC}/w-1`, () => run.revoke());
+    await until(() => record(second, "svc-commit-1")?.state === "paused", 15_000, "paused by the rebind's 401");
+    expect(record(second, "svc-commit-1")).toMatchObject({ state: "paused", message: ENDED, code: "login_required" });
+    expect(login.ended).toBe(true);
+    expect(second.logs).toEqual([{ level: "warning", message: `delivery paused: ${ENDED}` }]);
+  }, 60_000);
+
+  test("a run token revoked after a BUS_IDENTITY start's bind was admitted: the enroll pauses login_required too (#1312)", async () => {
+    const run = await serviceRun(srv);
+    const login = signIn(mode(run.env));
+    const go = join(dir, "go"), hits: string[] = [];
+    const said = spyOn(console, "error").mockImplementation((...args: unknown[]) => { hits.push(args.join(" ")); });
+    process.env.BUS_TEST_PAUSE = "hosted:bind:after-commit";
+    process.env.BUS_TEST_PAUSE_FILE = go;
+    let r: Rig;
+    try {
+      r = rig(login, "svc-enroll-1", "w-1");
+      const started = r.root.start();
+      await until(() => hits.some(h => h.includes("test pause hit: hosted:bind:after-commit")), 15_000, "the configured bind held after its commit");
+      await run.revoke();
+      writeFileSync(go, "");
+      await started;
+    } finally {
+      said.mockRestore();
+      delete process.env.BUS_TEST_PAUSE;
+      delete process.env.BUS_TEST_PAUSE_FILE;
+    }
+    await until(() => record(r, "svc-enroll-1")?.state === "paused", 15_000, "paused by the bind's 401");
+    expect(record(r, "svc-enroll-1")).toMatchObject({ state: "paused", code: "login_required", operation: "enroll" });
+    expect(login.ended).toBe(true);
+  }, 60_000);
+
+  test("a person's grant revoked at the same point signs the store out and pauses the root (#1312)", async () => {
+    const issued = await seedGrant(srv, dir, CLIENT, EMAIL);
+    const store = () => storeLogin(srv, dir, CLIENT, "pi", "run /grayboard login");
+    const second = await atRebind(store, "oauth-commit-1", `${EMAIL}/w-1`,
+      () => seed(srv.app.repo, tx => srv.app.repo.oauth.revokeToken(tx, hashToken(issued.refreshToken), CLIENT, Date.now())));
+    await until(() => record(second, "oauth-commit-1")?.state === "paused", 15_000, "paused by the rebind's 401");
+    expect((await store().read())?.loginRequired?.reason).toBe("invalid_grant");
+  }, 60_000);
+
+  test("a server stopping at the same point is an outage: the run isn't ended and nothing signs out (#1312)", async () => {
+    const run = await serviceRun(srv);
+    const env = { ...run.env, GRAYBOARD_RUN_TOKEN: await run.mint() };
+    let login!: StaticLogin, stopping: Promise<void> | undefined;
+    const second = await atRebind(() => (login = signIn(mode(env))), "svc-stop-1", `${SVC}/w-1`, async () => { stopping = srv.app.stop(); });
+    await stopping;
+    await until(() => record(second, "svc-stop-1")?.code !== undefined, 15_000, "the restore's failure recorded");
+    expect(record(second, "svc-stop-1")?.code).not.toBe("login_required");
+    expect(record(second, "svc-stop-1")?.state).not.toBe("paused");
+    expect(login.ended).toBe(false);
   }, 60_000);
 });
 

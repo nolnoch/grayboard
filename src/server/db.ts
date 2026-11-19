@@ -1,11 +1,11 @@
 import type { Database } from "bun:sqlite";
 import type { EndedChild, HostedSession, HostedEnd, LostReader, HostedLost } from "./hosted-types.ts";
 import type { HostedPatch, HostedStore } from "./store/hosted.ts";
-import { testPause, testPauseAsync } from "../shared/testpause.ts";
+import { testPause } from "../shared/testpause.ts";
+import { makeAuthCache, type AuthPeek } from "./store/auth_cache.ts";
 import { queueFor } from "./store/queue.ts";
 import { isThenable } from "./store/tx_base.ts";
 import { mkdirSync } from "node:fs";
-import { AsyncLocalStorage } from "node:async_hooks";
 import { dirname } from "node:path";
 
 import { acknowledge, redeliveryFacts, type RedeliveryFacts, aliasScopeRows, authorAddresses, claimQueuePost, humansAmong, insertOutbox, insertPost, queueLaneRows, subscriberRows, threadFacts, type NewPost, type PostTarget, type ThreadFacts, insertBoard, isHuman, readRows, setArchived, setMute, threadRoot, type AliasScopeRow, type ReadResult, ALIAS_SESSION_SQL, boardViewRows, openSummaryRows, setQueueParticipation, whoRows, writeStatus, type BoardSummary, type BoardView, type UnboundFacts, type WhoRow, ensureBoard, forgetHandle, isSubscribed, markHuman, prunePosts, setSubscription, unsubscribeScope, type SubMode, catalogPage, getBoard, getPost, HOLD_ORDER, lastSeen, pendingDigests, pendingPushes, snapshotPage, type Board, type BoardSnapshot, type DigestRow, type PendingRef, type PushRow, type SnapshotOptions, pruneEndedIds, registerId, setAccess, setAliasMeta, setIdFacts, setPlace, touchAlias, touchId, type AliasMetaSet, type CoreDb, type IdFacts, type IdSessionFacts, type ReusedId } from "../core/boards.ts";
@@ -96,14 +96,8 @@ export type RepoHosted = HostedStore & {
   // (#807 P3 A7g1); undefined when the read failed or the body was synchronous.
   subscribe<F>(fn: (changed: string | null, facts?: F) => void, read?: (tx: Tx, id: string) => Promise<F>): () => void;
 };
-// Repo.authPeek's answer: the auth cache's live-token and user hits under one generation (#807 P3 A7d, A7u2).
-// `user`: the user cache's entry under that generation (#807 P3 A7u2): the row, null when known absent, undefined on a
-// miss.
-export type AuthPeek = {
-  generation: string;
-  access(tokenHash: string, resource: string, now: number): OAuthAccess | undefined;
-  user(userId: number): User | null | undefined;
-};
+// Repo.authPeek's answer (store/auth_cache.ts), re-exported for its callers.
+export type { AuthPeek };
 
 // A top-level write transaction, through db's write queue. `committed` runs after the commit and before the queue's
 // next body (D4: in-memory state a transaction reads changes only inside one or right after its commit, never in
@@ -1167,19 +1161,13 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
   // on every cached auth read.
   const counter = db.query<{ n: number }, []>("SELECT n FROM temp.auth_generation");
   const dataVersion = db.query<{ data_version: number }, []>("PRAGMA data_version");
-  // Changes whenever a committed write touches oauth_tokens, oauth_grants or users, from this connection or
-  // another (#853). The counter's part is the value at this connection's last commit (#996), not the live one: while
-  // a write body holds a transaction open across an await, other tasks read committed rows (the reader) and must not
-  // key a cache entry on the holder's uncommitted bump, which its rollback would undo. Undefined to the holder inside
-  // its own transaction, whose reads see writes that may yet roll back, and after a failed counter read until the
-  // next commit reads it again (uncached rather than stale).
-  // `pin`: the generation authRead read for its body (#881), per async task rather than per module (#807 P3 A7b), so
-  // bodies that overlap once they await each keep their own. Work a body starts (a timer, a queued write, a
-  // continuation) inherits the store, but the pin is live only until the body settles: after that the work reads the
-  // generation afresh, so a cache filled under the body's generation can't answer it once a commit (a revoke, a
-  // disable) has moved the generation on.
-  const pin = new AsyncLocalStorage<{ g: string; live: boolean }>();
-  const pinned = () => { const p = pin.getStore(); return p?.live ? p.g : undefined; };
+  // SQLite's auth generation source (store/auth_cache.ts, #807 P3 C9a). It changes whenever a committed write touches
+  // oauth_tokens, oauth_grants or users, from this connection or another (#853). The counter's part is the value at
+  // this connection's last commit (#996), not the live one: while a write body holds a transaction open across an
+  // await, other tasks read committed rows (the reader) and must not key a cache entry on the holder's uncommitted
+  // bump, which its rollback would undo. The cache bypasses itself for the holder inside its own transaction, whose
+  // reads see writes that may yet roll back; the generation is undefined after a failed counter read until the next
+  // commit reads it again (uncached rather than stale).
   let committed: number | undefined;
   const readCommitted = () => { try { committed = counter.get()!.n; } catch (error) { committed = undefined; console.error("[grayboard] auth generation read failed:", error); } };
   readCommitted();
@@ -1191,72 +1179,12 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
     const n = db.inTransaction ? committed : counter.get()!.n;
     return n === undefined ? undefined : `${n}:${dataVersion.get()!.data_version}`;
   };
-  const authGeneration = () => ownsTx(db) ? undefined : pinned() ?? readGeneration();
   const userById = (c: Database, userId: number) => c.query<User, [number]>(USER_BY_ID_SQL).get(userId) ?? undefined;
-  // Caches of what the auth tables say, keyed on authGeneration: a live access token only (an unknown or dead one is
-  // re-read every time); a user row, or its absence, as read (#853). They sit here, under the store's own methods, so
-  // a test that replaces one of those methods replaces the cache behind it, except authPeek's: it reads the access
-  // and user caches directly, so a stubbed findActiveAccess, isDisabled or active changes only what a miss later fills.
-  // A lookup hits only when its generation is the cache's. A miss reads, then fills only if the generation is still
-  // its own once the read is done (#807 P3 A7b): a lookup pinned before a commit neither fills nor clears the cache a
-  // newer one keyed, so bodies with different pins don't thrash it, and generations need no order.
-  // A failed generation read fills nothing (the lookup's answer stands, uncached).
-  const fills = (g: string, cacheGen: string | undefined, clear: () => void): string | undefined => {
-    let now: string | undefined;
-    try { now = readGeneration(); } catch (error) { console.error("[grayboard] auth generation read failed:", error); return cacheGen; }
-    if (now !== g) return cacheGen;
-    if (g !== cacheGen) clear();
-    return g;
-  };
-  let userGeneration: string | undefined;
-  const users = new Map<number, User | null>();
-  const heldUser = (g: string, userId: number) => g === userGeneration ? users.get(userId) : undefined;
-  // The read may await (#807 P3 A7u2; pause auth:user:read): a commit meanwhile (a disable) moves the generation, so
-  // the fill check stores nothing and the next lookup reads again. The answer stands, linearized before that commit.
-  // Inside the caller's own transaction (generation undefined) it reads on the caller's Tx, uncached. The handle is
-  // resolved first, so a kept Tx is refused on a hit too.
-  const cachedUser = async (r: Read, userId: number): Promise<User | undefined> => {
-    const c = sqliteOf(r);
-    const g = authGeneration();
-    if (g === undefined) return userById(c, userId);
-    const hit = heldUser(g, userId);
-    if (hit !== undefined) return hit ?? undefined;
-    const u = userById(c, userId) ?? null;
-    await testPauseAsync("auth:user:read");
-    const kept = fills(g, userGeneration, () => users.clear());
-    if (kept === g) { userGeneration = g; users.set(userId, u); }
-    return u ?? undefined;
-  };
-  // A live access token by hash: held while the generation is unchanged and both the token and its grant
-  // are unexpired, the join's own time conditions; required scopes are checked against the held scopes.
-  let accessGeneration: string | undefined;
-  const accesses = new Map<string, OAuthAccess>();
-  // Inside a transaction (authGeneration undefined) it reads on the caller's handle, uncached. The handle is
-  // resolved first, so a kept Tx is refused on a cache hit too.
-  // The async form's read may await (#807 P3 A7c): a commit that lands meanwhile moves the generation, and the fill
-  // check then stores nothing, so a token revoked mid-read is never cached as live.
-  const scoped = (a: OAuthAccess | undefined, requiredScopes: string[]) => a && requiredScopes.every(s => a.scopes.includes(s)) ? a : undefined;
-  const fillAccess = (g: string, key: string, a: OAuthAccess | undefined) => {
-    const kept = fills(g, accessGeneration, () => accesses.clear());
-    if (kept === g) { accessGeneration = g; if (a) accesses.set(key, a); else accesses.delete(key); }
-  };
-  const heldAccess = (g: string, key: string, now: number) => {
-    const a = g === accessGeneration ? accesses.get(key) : undefined;
-    return a && now < a.expiresAt && now < a.grantExpiresAt ? a : undefined;
-  };
-  const findActiveAccess: OAuthStore["findActiveAccess"] = async (r, h, resource, requiredScopes, now) => {
-    sqliteOf(r);
-    const g = authGeneration();
-    if (g === undefined || !Array.isArray(requiredScopes)) return oauth.findActiveAccess(r, h, resource, requiredScopes, now);
-    const key = `${resource}\n${h}`;
-    let a = heldAccess(g, key, now);
-    if (!a) {
-      a = await oauth.findActiveAccess(r, h, resource, [], now);
-      await testPauseAsync("auth:access:read");
-      fillAccess(g, key, a);
-    }
-    return scoped(a, requiredScopes);
-  };
+  const auth = makeAuthCache(
+    { read: readGeneration, ownsTx: () => ownsTx(db), commit: () => ownsTx(db) ? undefined : readGeneration() },
+    // The store's uncached read: Repo's oauth.findActiveAccess is the cache's wrapper over it.
+    { findActiveAccess: (...a) => oauth.findActiveAccess(...a), userById: async (r, userId) => userById(sqliteOf(r), userId), check: r => { sqliteOf(r); } },
+  );
   // One SQL statement per read, on whichever connection the caller gives: a store read's sqliteOf(r), or policyNow's
   // routed `db` (#807 P3 A7e1).
   const aliasAt = (c: Database, address: string): Alias | undefined =>
@@ -1302,24 +1230,12 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
     write: <T, R = T>(fn: (tx: Tx) => T | Promise<T>, committed?: (value: T) => R) => queued(db, fn, committed),
     post: <T>(fn: (tx: Tx) => T | Promise<T>, committed?: (value: T) => unknown, what = "write") => posted(db, fn, committed, what),
     read: sqliteRead(db),
-    async authRead<T>(fn: () => T | Promise<T>): Promise<T> {
-      if (pinned() !== undefined || ownsTx(db)) return fn();
-      const g = readGeneration();
-      if (g === undefined) return fn();
-      const p = { g, live: true };
-      try { return await pin.run(p, fn); } finally { p.live = false; }
-    },
-    authPeek() {
-      let g: string | undefined;
-      try { g = authGeneration(); } catch (error) { console.error("[grayboard] auth generation read failed:", error); return undefined; }
-      if (g === undefined) return undefined;
-      const generation = g;
-      return { generation, access: (h, resource, now) => heldAccess(generation, `${resource}\n${h}`, now), user: (userId) => heldUser(generation, userId) };
-    },
-    authGeneration,
-    commitGeneration: () => ownsTx(db) ? undefined : readGeneration(),
+    authRead: auth.authRead,
+    authPeek: auth.authPeek,
+    authGeneration: auth.authGeneration,
+    commitGeneration: auth.commitGeneration,
 
-    oauth: { ...oauth, findActiveAccess, redeemCode: change(oauth.redeemCode), rotateRefresh: change(oauth.rotateRefresh), revokeToken: change(oauth.revokeToken),
+    oauth: { ...oauth, findActiveAccess: auth.findActiveAccess, redeemCode: change(oauth.redeemCode), rotateRefresh: change(oauth.rotateRefresh), revokeToken: change(oauth.revokeToken),
       // A service credential's add, rotate and mint only add authority: no session's shrinks, so they send no change
       // notice (each null notice is a full hosted re-check pass, and mints come per run, #270 audit M-1). The
       // generation trigger on oauth_tokens still clears the access cache. Only the revokes notify.
@@ -1380,13 +1296,8 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       },
       async findByEmail(r, email) { return userByEmail(sqliteOf(r), email); },
       async findById(r, userId) { return userById(sqliteOf(r), userId); },
-      async isDisabled(r, userId) {
-        return (await cachedUser(r, userId))?.disabled_at != null;
-      },
-      async active(r, userId) {
-        const u = await cachedUser(r, userId);
-        return u && u.disabled_at === null ? { email: u.email, kind: u.kind } : undefined;
-      },
+      isDisabled: auth.isDisabled,
+      active: auth.active,
       async setDisabled(tx, userId, disabled) {
         const db = sqliteOf(tx);
         db.transaction(() => {

@@ -101,6 +101,8 @@ export function registerHostedResources(server: McpServer, context: {
   issuer: string; resource: string; resources: Resources; delivery: Delivery; hosted: HostedSessions;
   authorize(): Promise<{ row: HostedSession | undefined }>;
   leaseHooks?: () => { changed(): void; closed(): void; bind(capability: string): void };
+  // A tool's refusal, before it becomes the result: an `unauthenticated` one may answer the exchange's 401 (#1312).
+  refused?: (error: unknown) => void;
 }) {
   const { role, resources, delivery, hosted } = context;
   const authorize = async (signal?: AbortSignal) => {
@@ -157,6 +159,7 @@ export function registerHostedResources(server: McpServer, context: {
     }
   });
   if (role !== "subscriber") return;
+  const refused = (error: unknown) => { context.refused?.(error); return toolError(error); };
   // `call` runs synchronously up to its first await, so it may use `checked` there (#881): `checked` was awaited
   // just before it.
   const run = async (ctx: ServerContext, call: (checked: { row: HostedSession | undefined }) => unknown | Promise<unknown>) => {
@@ -165,7 +168,7 @@ export function registerHostedResources(server: McpServer, context: {
       const value = await call(await authorize(ctx.mcpReq.signal));
       return { content: [{ type: "text" as const, text: JSON.stringify(value ?? { ok: true }) }] };
     } catch (error) {
-      return toolError(error);
+      return refused(error);
     }
   };
   server.registerTool("whoami", { description: "Current session binding and ownership.", inputSchema: EMPTY_INPUT }, (_, ctx) => run(ctx, () => hosted.whoami(context.current().principal, context.current().sessionContext)));
@@ -174,13 +177,13 @@ export function registerHostedResources(server: McpServer, context: {
     inputSchema: HOSTED_BIND_INPUT,
   }, async (args, ctx) => {
     try { context.current(ctx); await authorize(ctx.mcpReq.signal); return await hosted.bind(context.current().principal, context.current().sessionContext, args); }
-    catch (error) { return toolError(error); }
+    catch (error) { return refused(error); }
   });
   server.registerTool("unbind", {
     description: "Release one of this root's holds.", inputSchema: HOSTED_UNBIND_INPUT,
   }, async (args, ctx) => {
     try { context.current(ctx); await authorize(ctx.mcpReq.signal); return await hosted.unbind(context.current().principal, context.current().sessionContext, args); }
-    catch (error) { return toolError(error); }
+    catch (error) { return refused(error); }
   });
   server.registerTool("session_register", {
     description: "Register a descendant under this top-level root before its native calls.",
