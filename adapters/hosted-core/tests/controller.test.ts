@@ -40,7 +40,7 @@ function runtime(mode: Mode) {
   let registerHold: Promise<void> | undefined;
   const ancestries: string[] = [];
   // While set, a temporary wire's connect waits for its signal's abort, as a server that never answers (#1294).
-  let connectHold = false, connecting = 0;
+  let connectHold = 0, connecting = 0;
   let prepareHold: Promise<void> | undefined, admitHold: ((signal: AbortSignal) => Promise<void>) | undefined, beforeOpen: (() => void) | undefined;
   // The host's receipt hook (#441), when a test sets one.
   let receiptHook: ((sessionID: string, ids: readonly string[]) => void) | undefined;
@@ -56,8 +56,8 @@ function runtime(mode: Mode) {
     // Only the run loop's wire has beforeRetry. The SDK reads the token while
     // connecting and wraps a token() failure in its version-negotiation error.
     async connect() {
-      if (!this.beforeRetry && connectHold) {
-        connecting++;
+      if (!this.beforeRetry && connectHold > 0) {
+        connectHold--; connecting++;
         await new Promise<never>((_, reject) => this.signal.addEventListener("abort", () => reject(this.signal.reason), { once: true }));
       }
       if (this.beforeRetry && refreshBusy > 0) { refreshBusy--; throw new Error("Version negotiation probe failed", { cause: new RefreshInProgress("pi") }); }
@@ -156,8 +156,8 @@ function runtime(mode: Mode) {
     holdRegister: (gate?: Promise<void>) => { registerHold = gate; },
     // Every prepare's whoami waits on `gate` from now on.
     holdPrepare: (gate: Promise<void>) => { prepareHold = gate; },
-    // Every temporary wire's connect hangs until its signal aborts from now on.
-    hangConnect: () => { connectHold = true; },
+    // The next `n` temporary wires' connects hang until their signals abort.
+    hangConnect: (n = Infinity) => { connectHold = n; },
     get connecting() { return connecting; },
     // The next delivery_open runs `hook` first (a revocation landing between a whoami and the open).
     beforeOpen: (hook: () => void) => { beforeOpen = hook; },
@@ -373,6 +373,27 @@ test.each(modes.flatMap(mode => (["enroll", "enroll with a name", "resume"] as c
   expect((await starting).state).not.toBe("retrying");
   expect(r.calls.length).toBe(calls);
   expect(r.connecting).toBe(1);
+  // A stop, not a failure: no code, and nothing the next start restores as one.
+  expect(r.root(c)).toMatchObject({ message: expect.stringMatching(/stopped before delivery opened/i) });
+  expect(r.root(c)?.code).toBeUndefined();
+  expect(r.root(c)?.failure).toBeUndefined();
+});
+// #1294 audit M-1: pi, omp and the Claude Code plugin stop through RootDelivery, which shuts the session down
+// (queued behind the start) before it closes: the shutdown itself ends the start's wire, and its release still runs.
+test.each(modes.flatMap(mode => (["enroll", "enroll with a name", "resume"] as const).map(how => [mode, how] as const)))("shutdown then close ends a start's wire still connecting at once and still releases (#1294, %s, %s)", async (mode, how) => {
+  const r = runtime(mode);
+  if (how === "resume") { await r.controller.enroll("R", ["be"], true); await until(() => r.root(r.controller)?.state === "active"); await r.controller.close(); }
+  const c = how === "resume" ? r.make() : r.controller;
+  r.hangConnect(1);
+  const starting = how === "resume" ? c.resume("R") : c.enroll("R", how === "enroll" ? [] : ["be"], true);
+  await until(() => r.connecting === 1);
+  const began = performance.now();
+  await c.shutdown("R", "release");
+  await c.close();
+  expect(performance.now() - began).toBeLessThan(1000);
+  expect((await starting).state).not.toBe("retrying");
+  expect(r.named("session_end").length).toBe(1);
+  expect(r.named("delivery_open")).toHaveLength(how === "resume" ? 1 : 0);
 });
 
 test.each(modes)("resume rebinds only the remembered holds the server lost, and skips one it now refuses (%s)", async mode => {

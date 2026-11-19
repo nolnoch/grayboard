@@ -1611,6 +1611,22 @@ test("static mode: close during a retry's prepare connect aborts it", async () =
     expect(rootRecord(s.r.controller, "R")).not.toMatchObject({ state: "retrying" });
   } finally { await s.restore(); }
 });
+// #1294 audit L-2: an enroll's bind wire, still connecting, ends at close too; the root's record says it stopped.
+test("close during an enroll's bind connect aborts it and records a stop, not a failure", async () => {
+  const r = runtime();
+  let connecting = 0;
+  r.observe(async (operation, signal) => { if (operation === "connect") { connecting++; await hung(signal); } });
+  const enrolling = r.controller.enroll("R", ["be"], true);
+  await until(() => connecting === 1, 5000, "the enroll's bind connects");
+  const began = performance.now();
+  await r.controller.close();
+  expect(performance.now() - began).toBeLessThan(500);
+  await enrolling;
+  expect(r.calls).toEqual([]);
+  const record = rootRecord(r.controller, "R");
+  expect(record?.message).toContain("stopped before delivery opened");
+  expect(record?.code).toBeUndefined();
+});
 // #1285 audit: close never calls a root enrolled during the retry "not enrolled"; nor does it overwrite the record
 // of an attempt that answered before close stopped it.
 const whoamiAnswer = (kind: string) => ({ content: [{ type: "text", text: JSON.stringify({ id: null, principal: "svc", principal_kind: kind, held: [] }) }] });

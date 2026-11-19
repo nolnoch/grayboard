@@ -36663,6 +36663,19 @@ class Controller {
   stopped = false;
   ending = new Set;
   closing = new AbortController;
+  ends = new Map;
+  endOf(sessionID) {
+    let end = this.ends.get(sessionID);
+    if (!end)
+      this.ends.set(sessionID, end = new AbortController);
+    return end;
+  }
+  startStop(sessionID) {
+    return AbortSignal.any([this.closing.signal, this.endOf(sessionID).signal]);
+  }
+  stopping(sessionID) {
+    return this.stopped || this.ending.has(sessionID);
+  }
   drifted = false;
   controls = Promise.resolve();
   state;
@@ -36935,14 +36948,15 @@ class Controller {
             for (const name of names)
               await w.call("bind", { name, create, where: this.port.place() });
             await this.guard(r, epoch, signal);
-          }, sessionID, this.closing.signal);
+          }, sessionID, this.startStop(sessionID));
           bound = true;
         }
         await this.rotated({ spent: 0 }, () => this.prepare(r, !!previous?.paused && !names.length));
       } catch (error) {
         const what = this.port.approval ? r.paused ? "Root approval unavailable" : "Root approval saved" : r.paused ? "Root paused" : "Root enrolled";
+        const stopped = this.stopping(sessionID);
         if (!this.drifted)
-          this.set(r, r.paused ? "paused" : "approved", `${what}; ${failureMessage(this.expired(error), this.hint)}`, bound ? "prepare" : "enroll", failureCode(this.expired(error)));
+          this.set(r, r.paused ? "paused" : "approved", `${what}; ${stopped ? "stopped before delivery opened" : failureMessage(this.expired(error), this.hint)}`, bound ? "prepare" : "enroll", stopped ? undefined : failureCode(this.expired(error)));
       }
       await this.diagnostics.flush();
       return { ...r.status, roots: this.status().roots };
@@ -36971,8 +36985,10 @@ class Controller {
         if ((error instanceof ServerUnreachable || error instanceof RefreshInProgress) && this.restorable(r, r.epoch)) {
           this.retrying(r, error);
           this.retryRestore(r);
-        } else if (!this.drifted)
-          this.set(r, r.paused ? "paused" : "approved", failureMessage(error, this.hint), "enroll", failureCode(error));
+        } else if (!this.drifted) {
+          const stopped = this.stopping(sessionID);
+          this.set(r, r.paused ? "paused" : "approved", stopped ? "Stopped before delivery opened" : failureMessage(error, this.hint), "enroll", stopped ? undefined : failureCode(error));
+        }
       }
       await this.diagnostics.flush();
       return { ...r.status, roots: this.status().roots };
@@ -37072,7 +37088,7 @@ class Controller {
         if (waitForStart)
           await started;
       }
-    }, r.e.sessionID, this.closing.signal);
+    }, r.e.sessionID, this.startStop(r.e.sessionID));
   }
   start(r) {
     if (r.task || r.paused || this.stopped || this.ending.has(r.e.sessionID))
@@ -37314,6 +37330,7 @@ class Controller {
   }
   shutdown(sessionID, mode, o = {}) {
     this.ending.add(sessionID);
+    this.endOf(sessionID).abort();
     this.roots.get(sessionID)?.abort?.abort();
     return this.serial(async () => {
       const r = this.roots.get(sessionID);
