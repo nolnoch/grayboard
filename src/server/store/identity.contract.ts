@@ -560,6 +560,22 @@ function roles(it: It): void {
     expect(await h.roles.invokeBinding(h.read, user(A), "nope")).toBeUndefined();
   });
 
+  it("roles.invokeBinding: the lowest team name is the bytewise lowest, on every backend", async h => {
+    const { alice, asAdmin } = await cast(h);
+    // Bytewise '-' (0x2d) < '_' (0x5f), so qa-z sorts before qa_b; a locale collation that skips punctuation
+    // compares "qaz" with "qab" and picks qa_b.
+    await h.write(async tx => {
+      await h.services.create(tx, "ingest");
+      for (const name of ["qa_b", "qa-z"]) {
+        const t = await h.teams.create(tx, name, alice.id);
+        await h.teams.addMember(tx, t.id, alice.id);
+        expect(await grantRole(h, tx, spec(name, "service_invoke", "ingest"), asAdmin)).toMatchObject({ changed: true });
+      }
+    });
+    const want = (await h.roles.find(h.read, "qa-z", "service_invoke", "ingest"))!.id;
+    expect(await h.roles.invokeBinding(h.read, { kind: "user", name: A }, "ingest")).toEqual({ id: want, team: "qa-z" });
+  });
+
   it("roles.revoke deletes the binding and writes a role.revoked row carrying all of it", async h => {
     const { bob, eng, asAdmin } = await cast(h);
     await h.write(async tx => {

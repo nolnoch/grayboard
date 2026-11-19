@@ -388,7 +388,9 @@ export function makePgIdentity({ now }: { now: () => number }): PgIdentity {
           WHERE b.role = ${role} AND ${teamId === null ? sql.fragment`b.scope_id IS NULL` : sql.fragment`b.scope_id = (SELECT id FROM principals WHERE kind = 'team' AND team_id = ${teamId})`}`,
         row => int8(row.id));
       },
-      // The SQLite store's statement (#270 D6): the holder's own binding, then its teams', each an index probe.
+      // The SQLite store's statement (#270 D6): the holder's own binding, then its teams', each an index probe. The
+      // team name sorts COLLATE "C", SQLite's bytewise order: a locale collation orders '-' and '_' differently, and
+      // the decision row must name the same binding on both backends.
       async invokeBinding(r, holder, service) {
         const sql = pgOf(r);
         return first(sql`SELECT id, team FROM (
@@ -403,7 +405,7 @@ export function makePgIdentity({ now }: { now: () => number }): PgIdentity {
               JOIN principals s ON s.name = ${service} AND s.kind = 'service'
               JOIN role_bindings b ON b.principal_id = pt.id AND b.role = 'service_invoke' AND b.scope_id = s.id
              WHERE ${holder.kind} = 'user' AND h.name = ${holder.name} AND h.kind = 'user') x
-          ORDER BY team IS NOT NULL, team LIMIT 1`,
+          ORDER BY team IS NOT NULL, team COLLATE "C" LIMIT 1`,
         row => ({ id: int8(row.id), team: strOrNull(row.team) }));
       },
       async list(r, f, after, limit) {
