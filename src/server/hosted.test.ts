@@ -9,6 +9,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createApplication } from "./application.ts";
 import { openDatabase, USER_BY_ID_SQL } from "./db.ts";
+import { CLIENT_INFO_META_KEY } from "@modelcontextprotocol/server";
 import { createHostedSessions, deliveryDeclaration, hostedBoundInstruction, OTHER_USER_NOTE, sessionContext, withoutFacts } from "./hosted.ts";
 import { cleanFact } from "../core/boards.ts";
 import { createOAuthServer, type OAuthPrincipal } from "./oauth.ts";
@@ -2678,4 +2679,14 @@ test("#807 P3 C8a: a bind's end of an idle or lapsed contender passes the cutoff
   expect(idleArgs).toContainEqual([idleHolder, "idle", now, undefined, now - 900_000]);
   const leaseArgs = await endArgsOf(() => hosted.bind(principal, context("seam-taker"), { name: "seam-lease-name" }));
   expect(leaseArgs).toContainEqual([leased, "expired", now, deadline, undefined]);
+});
+
+// #1298: only a generic-source principal's request has its declared MCP client read; any other principal's is ignored.
+test("#1298: sessionContext reads the declared client for a generic source only", () => {
+  const meta = { [GRAYBOARD_SESSION_META]: "declared-1298", [CLIENT_INFO_META_KEY]: { name: "grayboard-omp" } };
+  const svc: OAuthPrincipal = { ...principal, clientId: `svc_${"c".repeat(32)}`, sourceKey: GRAYBOARD_SESSION_META };
+  expect(sessionContext({ ...svc, source: "generic" }, meta)).toHaveProperty("client", "grayboard-omp");
+  for (const source of [null, undefined, "opencode"] as const) expect(sessionContext({ ...svc, source }, meta)).not.toHaveProperty("client");
+  expect(sessionContext({ ...principal, clientId: "grayboard-pi", sourceKey: GRAYBOARD_SESSION_META }, meta)).not.toHaveProperty("client");
+  expect(sessionContext({ ...svc, source: "generic" }, { ...meta, [CLIENT_INFO_META_KEY]: { name: 7 } })).not.toHaveProperty("client");
 });
