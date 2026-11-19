@@ -183,7 +183,8 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     if (closed || request.signal.aborted) return undefined;
     const refusal = await oauth.authenticate(request, roleScopes(role));
     await testPauseAsync("mcp:lost:authenticated");
-    return refusal instanceof Response && !closed && !request.signal.aborted ? refusal : undefined;
+    // The fetch-level guard after this await is the one close/abort check past it; this function adds none (#1324).
+    return refusal instanceof Response ? refusal : undefined;
   }
   const refuse = (response: Response): never => {
     const exchange = exchanges.getStore();
