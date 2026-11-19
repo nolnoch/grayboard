@@ -116,12 +116,14 @@ export function authCacheContract(backend: AuthCacheBackend): void {
     let inside: string | undefined = "unset";
     const held = hold(h, async tx => { await h.users.setDisabled(tx, user, true); inside = h.auth.authGeneration(); });
     await held.wrote;
-    expect(inside).toBeUndefined();
-    // Outside the holder's transaction: the committed generation, and the committed (enabled) user.
-    expect(h.auth.authGeneration()).toBe(before);
-    expect(await email(h, h.read, user)).toBe("a@example.com");
-    expect(await h.auth.authRead(() => h.auth.authGeneration())).toBe(before);
-    held.release();
+    // Released even when a check fails, so the row fails on it and not on the held transaction at close.
+    try {
+      expect(inside).toBeUndefined();
+      // Outside the holder's transaction: the committed generation, and the committed (enabled) user.
+      expect(h.auth.authGeneration()).toBe(before);
+      expect(await email(h, h.read, user)).toBe("a@example.com");
+      expect(await h.auth.authRead(() => h.auth.authGeneration())).toBe(before);
+    } finally { held.release(); }
     await held.done;
     expect(h.auth.authGeneration()).not.toBe(before);
     expect(await email(h, h.read, user)).toBeUndefined();
@@ -133,8 +135,9 @@ export function authCacheContract(backend: AuthCacheBackend): void {
     const before = h.auth.authGeneration();
     const held = hold(h, tx => h.users.setDisabled(tx, user, true), true);
     await held.wrote;
-    expect(await email(h, h.read, user)).toBe("b@example.com");
-    held.release();
+    try {
+      expect(await email(h, h.read, user)).toBe("b@example.com");
+    } finally { held.release(); }
     await held.done;
     expect(h.auth.authGeneration()).toBe(before);
     expect(await email(h, h.read, user)).toBe("b@example.com");

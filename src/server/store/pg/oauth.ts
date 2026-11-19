@@ -435,7 +435,8 @@ export function makePgOAuth({ hosted }: { hosted: PgHostedEnds }): OAuthStore {
       // The last live secret stays: revoking it would leave a live grant no one can mint under; revoke the credential.
       if (await count(sql`SELECT count(*) AS n FROM service_credential_secrets WHERE credential_id = ${s.credential_id} AND id <> ${secretId} AND revoked_at IS NULL`) === 0) return invalid;
       await sql`UPDATE service_credential_secrets SET revoked_at = ${now} WHERE id = ${secretId}`;
-      // A mint racing this commits a token this UPDATE can't see; findActiveAccess's secret join refuses it (D3).
+      // A mint racing this commits a token this UPDATE can't see; findActiveAccess's secret join refuses it (D3), and
+      // the secret UPDATE above moves every process's auth generation (0001's triggers, D5), so no cache keeps it live.
       await sql`UPDATE oauth_tokens SET revoked_at = ${now} WHERE secret_id = ${secretId} AND revoked_at IS NULL`;
       return ok({ clientId: s.client_id as string, userId: int8(s.user_id) });
     },
