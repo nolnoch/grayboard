@@ -254,7 +254,8 @@ export function hostedStaticScenario(h: HostedHarness, dir: string): Promise<voi
     // The subagent sends, then holds its run open (a bash gate) until the scenario has looked at its child row.
     ...h.subagent(dir, "delegate", [
       { tool: `${h.prefix}dm_send`, args: { to: SENDER, body: "from the subagent" } },
-      { tool: "bash", args: { command: `while [ ! -f '${gate}' ]; do sleep 0.1; done` } },
+      // Bounded: a failed scenario deletes dir and orphans this shell, which must then exit, not spin.
+      { tool: "bash", args: { command: `i=0; while [ ! -f '${gate}' ] && [ -d '${dir}' ] && [ $i -lt 1200 ]; do sleep 0.1; i=$((i+1)); done; [ -f '${gate}' ] || { echo 'subagent gate never opened within 120 s' >&2; exit 1; }` } },
     ], () => rootSession),
   ], async ({ srv, start }) => {
     const run = await serviceRun(srv, { admin: "root@example.com" });
