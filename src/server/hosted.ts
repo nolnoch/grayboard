@@ -1045,8 +1045,10 @@ export function createHostedSessions(application: Application, options: { now?: 
           testPause("hosted:register:in-txn");
           // The root's row before the child's and before rowFor's or admit's capacity lock (#807 P3 C8 lock order):
           // grant, root, child, capacity. attach's lock of it below is then re-entrant. A missing root has no row to lock
-          // yet; rowFor creates it under the capacity lock.
+          // yet; rowFor creates it under the capacity lock, so the child's row, when it has one, is locked here too, before
+          // that lock (#807 P3 C8b2); the child's lock below is then re-entrant.
           await store.lock(tx, context.id);
+          await store.lock(tx, childId);
           const root = (await rowFor(tx, p, context, later.defer))!;
           if (root.root_session_id) throw new ApplicationError("root_is_child", `session ${root.session_id} is itself registered under ${root.root_session_id}; register ${childId} under ${root.root_session_id}.`);
           // An external end/recreate of the root while this waited refuses it (a convert is root_is_child above);
