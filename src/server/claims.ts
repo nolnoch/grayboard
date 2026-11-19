@@ -15,11 +15,11 @@ import type { Repo } from "./db.ts";
 import type { Read, Tx } from "./store/tx.ts";
 
 /**
- * The caller's hook for an announcement its own claim call wrote: a renewal's update or a release, posted as `as` on
- * `board` within `sp`. On a service's board that post is an invocation (#270 D6, #1259), which only the caller can
+ * The caller's hook for an announcement its own claim call wrote: a take's claim, a renewal's update or a release,
+ * post `postId`, posted as `as` on `board` within `sp`. On a service's board that post is an invocation (#270 D6, #1259), which only the caller can
  * record, since it knows who asked. A lapse, a requeue's reply and a session end's release are the system's: no hook.
  */
-export type Announced = (sp: Tx, as: string, board: string) => Promise<void>;
+export type Announced = (sp: Tx, as: string, board: string, postId: number) => Promise<void>;
 type ServerClaimCtx = ClaimCtx & { announced?: Announced };
 
 /**
@@ -144,12 +144,14 @@ export async function serverClaim(
     let changed: ClaimChanges = { wake: [], boards: [] };
     if (!d.renewed) {
       if (row.board) {
-        changed = await say(claimText(key, row.note), false);
-        await opts.announced?.(sp, d.as, row.board);
+        const said = await say(claimText(key, row.note), false);
+        await opts.announced?.(sp, d.as, row.board, said.postId);
+        changed = said;
       }
     } else if (renewAnnounces(opts.note, cur) && row.board && (await boardVisible(repo, access, sp, d.as, row.board))) {
-      changed = await say(updateText(key, opts.note!, await repo.claims.watchers(sp, key)), true);
-      await opts.announced?.(sp, d.as, row.board);
+      const said = await say(updateText(key, opts.note!, await repo.claims.watchers(sp, key)), true);
+      await opts.announced?.(sp, d.as, row.board, said.postId);
+      changed = said;
     }
     return {
       ok: true, claim: row, renewed: d.renewed,
@@ -187,10 +189,10 @@ export async function serverRelease(
     // A holder who lost the board releases quietly; its watchers go too, since they're told through the board.
     if (!gone.board || !(await boardVisible(repo, access, sp, as, gone.board))) return { wake: [], boards: [] };
     // A release with no signed-in caller posts as the claimant's user (#855).
-    const changed = await systemPost(repo, access, sp, as, gone.board, releaseText(key, note, cc), null, {
+    const { postId, ...changed } = await systemPost(repo, access, sp, as, gone.board, releaseText(key, note, cc), null, {
       allowArchived: true, session: ctx.session, via: ctx.via, user: ctx.user ?? (await repo.claims.holderUser(sp, gone)),
     });
-    await ctx.announced?.(sp, as, gone.board);
+    await ctx.announced?.(sp, as, gone.board, postId);
     return changed;
   });
 }
