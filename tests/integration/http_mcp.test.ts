@@ -531,7 +531,7 @@ for (const outcome of ["closing", "aborted"] as const) test(`HTTP native: a call
 // token is revoked right after the boundary's authenticate passes, so selection's authenticate draws the 401; the call
 // is held at `mcp:select:refused` with that 401 in hand while the MCP side closes or the request aborts, then
 // `refuse()` stores it and throws into fetch's catch. In process, as #1324's: the answer must be the catch's
-// fall-through (an internal error), never the stored 401.
+// fall-through (503 on a closing endpoint, else an internal error), never the stored 401.
 for (const outcome of ["closing", "aborted"] as const) test(`HTTP native: a call ${outcome} while selection's refusal is held falls through, never 401 (#1332)`, async () => {
   const issued = await issueOAuth(app.repo, app.oauth.resource, "carol@example.com", ["grayboard:tools", "grayboard:delivery"], Date.now(), OPENCODE_CLIENT);
   const statuses: number[] = [];
@@ -573,7 +573,8 @@ for (const outcome of ["closing", "aborted"] as const) test(`HTTP native: a call
     else abort.abort();
     writeFileSync(go, "");
     const settled = await call;
-    expect(statuses.slice(before)).toEqual([500]);
+    // A closing endpoint answers 503, as it does a call arriving after close (#1336); an aborted call's 500 nobody reads.
+    expect(statuses.slice(before)).toEqual([outcome === "closing" ? 503 : 500]);
     expect("error" in settled).toBe(true);
   } finally {
     app.oauth.authenticate = authenticate;

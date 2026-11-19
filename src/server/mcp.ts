@@ -1148,6 +1148,8 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
             releaseListen?.();
             releasePost();
             if (exchange.refusal && !closed && !req.signal.aborted) return exchange.refusal;
+            // A call in flight when the endpoint closes gets the same answer as one arriving after (#1336).
+            if (closed) return new Response("MCP endpoint is closed", { status: 503 });
             if (error instanceof ApplicationError && error.code !== "internal" || error instanceof CoreError) {
               const badRequest = error instanceof ApplicationError && error.code === "bad_request";
               return Response.json({ code: badRequest ? "bad_request" : "not_found", message: badRequest ? "invalid resource request" : "resource not found" }, { status: badRequest ? 400 : 404 });
