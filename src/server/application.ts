@@ -403,7 +403,7 @@ const uploaderOf = (s: ApplicationSession): Uploader => ({ addresses: s.addresse
 // Selection reads and records delivery in one bind body, which holds the write queue across its awaits (#807 D4),
 // so only one agent gets it; on a store with more than one writer, the lock before the notified read does (#807 P3 C7
 // decision 5). It's taken only when a notice may be owed, so an ordinary bind locks nothing.
-async function owedBridgeNotice(repo: Repo, tx: Tx, email: string): Promise<string | undefined> {
+export async function owedBridgeNotice(repo: Repo, tx: Tx, email: string): Promise<string | undefined> {
   const target = `${email}/${HUMAN_NAME}`;
   if (!await liveBridgeStop(repo, tx, target)) return undefined;
   await repo.audit.lock(tx, "bridge.notified", target);

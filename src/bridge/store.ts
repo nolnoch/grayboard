@@ -101,7 +101,8 @@ export class Store {
     return r?.progress ? JSON.parse(r.progress) : undefined;
   }
 
-  setProgress(id: number, progress: unknown): void {
+  // A JSON object (the relay's Progress), as the server's store keeps it (server/store/slack.ts SlackProgress).
+  setProgress(id: number, progress: Record<string, unknown>): void {
     this.db.prepare(`UPDATE outbox SET progress = ? WHERE id = ?`).run(JSON.stringify(progress), id);
   }
 

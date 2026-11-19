@@ -59,7 +59,7 @@ function pgModules(): string[] {
 test("no non-test module under src/server/store/pg/ reaches bun:sqlite or the SQLite store, even transitively", () => {
   const roots = pgModules();
   // The scan sees this directory's modules (a scan that read nothing would pass vacuously).
-  expect(roots.map(p => relative(import.meta.dir, p))).toEqual(expect.arrayContaining(["aliases.ts", "attachment_rows.ts", "audit_row.ts", "errors.ts", "hosted_port.ts", "identity.ts", "messages.ts", "migrate.ts", "oauth.ts", "sql.ts", "tx.ts"]));
+  expect(roots.map(p => relative(import.meta.dir, p))).toEqual(expect.arrayContaining(["aliases.ts", "attachment_rows.ts", "audit.ts", "audit_row.ts", "cursors.ts", "errors.ts", "hosted_port.ts", "identity.ts", "messages.ts", "migrate.ts", "oauth.ts", "slack.ts", "sql.ts", "tx.ts", "write_receipts.ts"]));
   expect(forbiddenReach(roots)).toEqual([]);
 });
 
@@ -90,6 +90,9 @@ test("the walk follows relative imports and skips type-only ones", () => {
   // The Postgres aliases and messages stores and the attachment rows they share with C10c (#807 P3 C5b), which restate
   // core/boards.ts's and core/attachments.ts's SQL (those take a bun:sqlite Database and go with local mode).
   for (const m of ["aliases.ts", "messages.ts", "attachment_rows.ts"]) expect(forbiddenReach([join(import.meta.dir, m)])).toEqual([]);
+  // The Postgres cursors, write receipts, audit and Slack stores (#807 P3 C67b), and the audit row they share with the
+  // other groups, which now reaches json_safe.ts.
+  for (const m of ["cursors.ts", "write_receipts.ts", "audit.ts", "slack.ts", "audit_row.ts"]) expect(forbiddenReach([join(import.meta.dir, m)])).toEqual([]);
   expect(runtimeImports(`import type { X } from "../tx.ts";\nexport type { Y } from "../db.ts";`)).toEqual([]);
   expect(runtimeImports(`import {\n  a,\n  b,\n} from "../tx.ts";\nexport { c } from "./d.ts";\nimport "./e.ts";\nconst f = await import("../db.ts");`))
     .toEqual(["../tx.ts", "./d.ts", "./e.ts", "../db.ts"]);

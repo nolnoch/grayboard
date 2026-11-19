@@ -22,7 +22,7 @@ import { endSession, undeliverableId, type EndedSession, type MailPort, type Und
 import type { AuditSink } from "../core/audit.ts";
 import { afterCommit, type Boundary, onCommit, openBoundary, openReader, openSqlite, ownsTx, ownWriter, reclaimFreePages, routeReads } from "../core/sqlite.ts";
 import type { WriteTx } from "../core/write_tx.ts";
-import { type Read, type Tx, sqliteOf, sqliteRead, sqliteTx } from "./store/tx.ts";
+import { isTx, type Read, type Tx, sqliteOf, sqliteRead, sqliteTx } from "./store/tx.ts";
 import { serverAccess } from "./access.ts";
 import type { AccessReadsSync, HumanReach, PolicyReadsSync } from "./policy.ts";
 import { DEFAULT_ATTACHMENT_LIMITS, DEFAULT_ATTACHMENT_USER_QUOTA, type AttachmentInfo, type AttachmentLimits } from "../shared/attachments.ts";
@@ -39,8 +39,8 @@ import type { Alias, AliasesStore } from "./store/aliases.ts";
 import type { MessageRow, MessagesStore, RetractResult } from "./store/messages.ts";
 import type { CursorsStore } from "./store/cursors.ts";
 import type { WriteReceipt, WriteReceiptsStore } from "./store/write_receipts.ts";
-import type { AccessLogRow, AuditStore } from "./store/audit.ts";
-import type { SlackLink, SlackStore, SlackThread } from "./store/slack.ts";
+import { AUDIT_WRITE_ON_READ, type AccessLogRow, type AuditStore } from "./store/audit.ts";
+import type { SlackLink, SlackProgress, SlackStore, SlackThread } from "./store/slack.ts";
 import { jsonTextSafe, textSafeOrNull } from "./store/json_safe.ts";
 import { DEV_SESSION_LABEL, TEAM_POLICIES, type User, type IdpSignIn, type Session, type PrincipalRow, type Team, type TeamPolicy, type TeamMember, type RoleBinding, type InvokeBinding, type RoleAuthority, type RoleRevoke, type MemberAuthority, type MemberRemoval, type ServiceRow, type UsersStore, type SessionsStore, type PrincipalsStore, type TeamsStore, type RolesStore, type ServicesStore } from "./store/identity.ts";
 // The identity groups' row types and interfaces live in store/identity.ts for the Postgres store (#807 P3 C3a);
@@ -53,8 +53,8 @@ export type { MessageRow, MessageFiles, ServicePost, RetractResult, MessagesStor
 // The cursors, write receipts, audit and Slack groups' in store/cursors.ts, write_receipts.ts, audit.ts and slack.ts (#807 P3 C67a).
 export type { CursorStream, CursorsStore } from "./store/cursors.ts";
 export type { WriteReceipt, WriteReceiptKey, WriteReceiptsStore } from "./store/write_receipts.ts";
-export type { AccessLogRow, AuditStore } from "./store/audit.ts";
-export type { SlackLink, SlackThread, SlackStore } from "./store/slack.ts";
+export { AUDIT_WRITE_ON_READ, type AccessLogRow, type AuditStore } from "./store/audit.ts";
+export type { SlackLink, SlackProgress, SlackThread, SlackStore } from "./store/slack.ts";
 
 // Row types
 // Every read of a user row goes through this, so `kind` is never missing (a "SELECT *" would type-check without it).
@@ -909,7 +909,7 @@ function initSchema(db: Database): void {
  * Every access_log row goes in here: it stamps the client address, user agent
  * and OAuth client of the request whose handling wrote it (security audit F-19).
  * NUL and lone surrogates in actor, target and detail's strings are stored as U+FFFD (#807 P3 C7 decision 3), as
- * the Postgres store's pg/audit_row.ts will store them (C67b).
+ * the Postgres store's pg/audit_row.ts stores them.
  */
 export function insertAudit(db: Database, at: number, actor: string | null, action: string, target: string | null, detail: string | null): void {
   const o = requestOrigin();
@@ -2005,7 +2005,10 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
 
     audit: {
       write(tx, row) {
-        insertAudit(sqliteOf(tx), row.at, row.actor, row.action, row.target, row.detail);
+        const db = sqliteOf(tx);
+        // sqliteOf takes a Read: refused here, as on Postgres, before the D4 guard refuses the insert in its own words.
+        if (!isTx(tx)) throw new Error(AUDIT_WRITE_ON_READ);
+        insertAudit(db, row.at, row.actor, row.action, row.target, row.detail);
       },
       async last(r, action, target) {
         return sqliteOf(r).query<AccessLogRow, [string, string]>(ACCESS_LOG_LAST_SQL).get(action, target) ?? undefined;
@@ -2095,7 +2098,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       async progress(r, userId, ref) {
         const db = sqliteOf(r);
         const row = db.query<{ progress: string }, [number, string]>("SELECT progress FROM slack_progress WHERE user_id = ? AND ref = ?").get(userId, ref);
-        return row ? JSON.parse(row.progress) : undefined;
+        return row ? JSON.parse(row.progress) as SlackProgress : undefined;
       },
       async setProgress(tx, userId, ref, progress) {
         const db = sqliteOf(tx);

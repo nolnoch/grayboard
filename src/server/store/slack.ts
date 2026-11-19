@@ -9,6 +9,9 @@ export type SlackLink = { user_id: number; email: string; slack_user: string; dm
 // (message id for dm, post id for board). peer: the other party in a dm.
 // last_id: the newest grayboard id in the thread, the parent for a reply.
 export type SlackThread = { thread_ts: string; kind: "dm" | "board"; board: string | null; root_id: number; peer: string | null; last_id: number };
+// An outbound item's progress: a JSON object, as the relay's Progress is (bridge/relay.ts). Never a scalar or null:
+// Postgres's jsonb column is NOT NULL, and a bare number or boolean doesn't bind to it (42804).
+export type SlackProgress = Record<string, unknown>;
 
 export interface SlackStore {
   // Every link, by user_id.
@@ -34,9 +37,9 @@ export interface SlackStore {
   // Moves a thread's reply target forward, never back; a DM item's sender becomes its peer (#524).
   advanceThread(tx: Tx, userId: number, threadTs: string, id: number, peer?: string): Promise<void>;
   // How far an outbound item got in Slack, keyed by its grayboard ref
-  // ("dm:<message id>" or "post:<post id>"); cleared once it's done. A JSON value: progress returns what setProgress
-  // was given (key order aside), with NUL and lone surrogates in its strings as U+FFFD (jsonSafe).
-  progress(r: Read, userId: number, ref: string): Promise<unknown>;
-  setProgress(tx: Tx, userId: number, ref: string, progress: unknown): Promise<void>;
+  // ("dm:<message id>" or "post:<post id>"); cleared once it's done. A JSON object (SlackProgress): progress returns
+  // what setProgress was given (key order aside), with NUL and lone surrogates in its strings as U+FFFD (jsonSafe).
+  progress(r: Read, userId: number, ref: string): Promise<SlackProgress | undefined>;
+  setProgress(tx: Tx, userId: number, ref: string, progress: SlackProgress): Promise<void>;
   clearProgress(tx: Tx, userId: number, ref: string): Promise<void>;
 }
