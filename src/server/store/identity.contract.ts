@@ -517,8 +517,8 @@ function roles(it: It): void {
     await refused(spec("eng", "team_owner", "eng"), 400, "bad_request", /held by a user, and "eng" is a team/);
     // An org role has no membership precondition, so only the holder-kind check in the grant's statement refuses this.
     await refused(spec("eng", "org_admin", null), 400, "bad_request", /"eng" is a team/);
-    // service_invoke's holder list is empty: no principal matches it.
-    await refused(spec(A, "service_invoke", "ingest"), 400, "bad_request", /no principal may hold service_invoke/);
+    // service_invoke is held on a service, by a user, a team or a service (#270 D6).
+    await refused(spec(A, "service_invoke", "eng"), 404, "not_found", /no service named "eng"/);
     await refused(spec(A, "org_admin", null), 403, "forbidden", /no longer holds/, { email: B, userId: bob.id, authority: "org_admin" });
     await refused(spec(A, "team_owner", "eng"), 403, "forbidden", /no longer holds/, { email: B, userId: bob.id, authority: "owner_or_admin" });
     await refused(spec(B, "team_owner", "eng"), 409, "conflict", /isn't a member of team "eng"/);
@@ -529,6 +529,52 @@ function roles(it: It): void {
     const alice = (await h.users.findByEmail(h.read, A))!;
     await h.write(async tx => h.teams.addMember(tx, (await h.teams.findByName(tx, "eng"))!.id, bob.id));
     expect(await grant(spec(B, "team_owner", "eng"), { email: A, userId: alice.id, authority: "owner_or_admin" })).toMatchObject({ changed: true });
+  });
+
+  it("roles.invokeBinding: a principal's own service_invoke binding first, else a user's team's, read live", async h => {
+    const { alice, bob, eng, asAdmin } = await cast(h);
+    await h.write(async tx => {
+      for (const s of ["ingest", "ci"]) await h.services.create(tx, s);
+      const ops = await h.teams.create(tx, "ops", alice.id);
+      await h.teams.addMember(tx, ops.id, alice.id);
+      await h.teams.addMember(tx, eng.id, bob.id);
+      for (const holder of ["ops", "eng", "ci"]) expect(await grantRole(h, tx, spec(holder, "service_invoke", "ingest"), asAdmin)).toMatchObject({ changed: true });
+    });
+    const id = async (holder: string) => (await h.roles.find(h.read, holder, "service_invoke", "ingest"))!.id;
+    const user = (name: string) => ({ kind: "user" as const, name });
+    // alice is in eng and ops: the lowest team name decides, every time.
+    expect(await h.roles.invokeBinding(h.read, user(A), "ingest")).toEqual({ id: await id("eng"), team: "eng" });
+    expect(await h.roles.invokeBinding(h.read, { kind: "team", name: "ops" }, "ingest")).toEqual({ id: await id("ops"), team: null });
+    expect(await h.roles.invokeBinding(h.read, { kind: "service", name: "ci" }, "ingest")).toEqual({ id: await id("ci"), team: null });
+    // A direct binding comes first.
+    await h.write(tx => grantRole(h, tx, spec(A, "service_invoke", "ingest"), asAdmin));
+    expect(await h.roles.invokeBinding(h.read, user(A), "ingest")).toEqual({ id: await id(A), team: null });
+    // Membership is read live: bob's right ends with his membership.
+    expect(await h.roles.invokeBinding(h.read, user(B), "ingest")).toEqual({ id: await id("eng"), team: "eng" });
+    await h.write(tx => h.teams.removeMember(tx, eng.id, bob.id));
+    expect(await h.roles.invokeBinding(h.read, user(B), "ingest")).toBeUndefined();
+    // Another service's scope, a team name read as a user, a service read as a user, and the admin: nothing.
+    expect(await h.roles.invokeBinding(h.read, user(A), "ci")).toBeUndefined();
+    expect(await h.roles.invokeBinding(h.read, user("eng"), "ingest")).toBeUndefined();
+    expect(await h.roles.invokeBinding(h.read, user("ci"), "ingest")).toBeUndefined();
+    expect(await h.roles.invokeBinding(h.read, user(D), "ingest")).toBeUndefined();
+    expect(await h.roles.invokeBinding(h.read, user(A), "nope")).toBeUndefined();
+  });
+
+  it("roles.invokeBinding: the lowest team name is the bytewise lowest, on every backend", async h => {
+    const { alice, asAdmin } = await cast(h);
+    // Bytewise '-' (0x2d) < '_' (0x5f), so qa-z sorts before qa_b; a locale collation that skips punctuation
+    // compares "qaz" with "qab" and picks qa_b.
+    await h.write(async tx => {
+      await h.services.create(tx, "ingest");
+      for (const name of ["qa_b", "qa-z"]) {
+        const t = await h.teams.create(tx, name, alice.id);
+        await h.teams.addMember(tx, t.id, alice.id);
+        expect(await grantRole(h, tx, spec(name, "service_invoke", "ingest"), asAdmin)).toMatchObject({ changed: true });
+      }
+    });
+    const want = (await h.roles.find(h.read, "qa-z", "service_invoke", "ingest"))!.id;
+    expect(await h.roles.invokeBinding(h.read, { kind: "user", name: A }, "ingest")).toEqual({ id: want, team: "qa-z" });
   });
 
   it("roles.revoke deletes the binding and writes a role.revoked row carrying all of it", async h => {

@@ -20,7 +20,8 @@ type Fixture = { repo: Repo; db: CoreDb; a: User; b: User; c: User; d: User; svc
 
 // Users a, b, c, d; eng collaborative (a owner, b), ops delegating (a owner, c), x open (d owner); an ID registered
 // by a; aliases a@example.com/x and eng/bot; a service principal, svc, owned by a (#270), and another, ci;
-// c holds org_admin by a binding (#927).
+// c holds org_admin by a binding (#927); service_invoke on svc is held by b directly, by team x (d's) and by
+// the service ci (#270 D6).
 async function fixture(): Promise<Fixture> {
   const { repo, db } = openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
   const id = idAddress("a".repeat(64));
@@ -54,6 +55,9 @@ async function fixture(): Promise<Fixture> {
   await seed(db, () => {
     registerId(db, { id, principal: "a@example.com", launcher: false });
     db.run("INSERT INTO role_bindings (principal_id, role, scope_id, granted_by, granted_at) SELECT id, 'org_admin', NULL, NULL, 0 FROM principals WHERE name = 'c@example.com'");
+    for (const h of ["b@example.com", "x", "ci"]) {
+      db.run("INSERT INTO role_bindings (principal_id, role, scope_id, granted_by, granted_at) SELECT h.id, 'service_invoke', s.id, NULL, 0 FROM principals h, principals s WHERE h.name = ? AND s.name = 'svc'", [h]);
+    }
   });
   return { repo, db, id, ...rows };
 }
@@ -156,9 +160,30 @@ function rows(f: Fixture): Row[] {
     { name: "member sees a team's", req: { verb: "alias.see", principal: user(B), scope: teamScope("eng") }, allow: true, rule: "scope.team_member" },
     { name: "stranger sees a team's", req: { verb: "alias.see", principal: user(D), scope: teamScope("eng") }, allow: false, rule: "scope.team_member" },
     { name: "service sees its own", req: { verb: "alias.see", principal: svc, scope: serviceScope("svc") }, allow: true, rule: "scope.own_service" },
-    { name: "owner sees a service's", req: { verb: "alias.see", principal: user(A), scope: serviceScope("svc") }, allow: false, rule: "scope.service" },
+    { name: "owner sees a service's", req: { verb: "alias.see", principal: user(A), scope: serviceScope("svc") }, allow: false, rule: "alias.see_service" },
+    { name: "invoker sees a service's", req: { verb: "alias.see", principal: user(B), scope: serviceScope("svc") }, allow: true, rule: "alias.see_service" },
+    { name: "holding team's member sees a service's", req: { verb: "alias.see", principal: user(D), scope: serviceScope("svc") }, allow: true, rule: "alias.see_service" },
+    { name: "service sees another's", req: { verb: "alias.see", principal: { kind: "service", name: "ci" }, scope: serviceScope("svc") }, allow: true, rule: "alias.see_service" },
+    { name: "service sees one it can't invoke", req: { verb: "alias.see", principal: svc, scope: serviceScope("ci") }, allow: false, rule: "alias.see_service" },
+    // service.invoke (#270 D6)
+    { name: "service posts on its own board", req: { verb: "service.invoke", principal: svc, service: "svc", board: "jobs" }, allow: true, rule: "service.own" },
+    { name: "direct holder invokes", req: { verb: "service.invoke", principal: user(B), service: "svc", board: "jobs" }, allow: true, rule: "role.service_invoke" },
+    { name: "holding team's member invokes", req: { verb: "service.invoke", principal: user(D), service: "svc", board: "jobs" }, allow: true, rule: "role.service_invoke" },
+    { name: "holding team invokes", req: { verb: "service.invoke", principal: { kind: "team", name: "x" }, service: "svc", board: "jobs" }, allow: true, rule: "role.service_invoke" },
+    { name: "a holder's team doesn't invoke", req: { verb: "service.invoke", principal: { kind: "team", name: "eng" }, service: "svc", board: "jobs" }, allow: false, rule: "role.service_invoke" },
+    { name: "holding service invokes", req: { verb: "service.invoke", principal: { kind: "service", name: "ci" }, service: "svc", board: "jobs" }, allow: true, rule: "role.service_invoke" },
+    { name: "owner doesn't invoke", req: { verb: "service.invoke", principal: user(A), service: "svc", board: "jobs" }, allow: false, rule: "role.service_invoke" },
+    { name: "admin doesn't invoke", ctx: { admins: [C] }, req: { verb: "service.invoke", principal: user(C), service: "svc", board: "jobs" }, allow: false, rule: "role.service_invoke" },
+    { name: "no principal invokes", req: { verb: "service.invoke", principal: null, service: "svc", board: "jobs" }, allow: false, rule: "role.service_invoke" },
+    { name: "another service's board", req: { verb: "service.invoke", principal: svc, service: "ci", board: "ci-jobs" }, allow: false, rule: "role.service_invoke" },
     { name: "service sees a person's", req: { verb: "alias.see", principal: svc, scope: personScope(A) }, allow: true, rule: "alias.see_person" },
     { name: "service wakes a user", req: { verb: "msg.wake", from_user: "svc", to_user: A }, allow: false, rule: "wake.cross_user" },
+    { name: "service's board post wakes an invoker", req: { verb: "msg.wake", from_user: "svc", to_user: B, post: { board: "jobs", scope: "service:svc", from: svc, to: user(B) } }, allow: true, rule: "wake.service_invoke" },
+    { name: "invoker's post wakes the service", req: { verb: "msg.wake", from_user: D, to_user: "svc", post: { board: "jobs", scope: "service:svc", from: user(D), to: svc } }, allow: true, rule: "wake.service_invoke" },
+    { name: "service's board post to a non-invoker", req: { verb: "msg.wake", from_user: "svc", to_user: A, post: { board: "jobs", scope: "service:svc", from: svc, to: user(A) } }, allow: false, rule: "wake.cross_user" },
+    { name: "a team name's post judged as the team", req: { verb: "msg.wake", from_user: B, to_user: "svc", post: { board: "jobs", scope: "service:svc", from: { kind: "team", name: "eng" }, to: svc } }, allow: false, rule: "wake.cross_user" },
+    { name: "an org board's post isn't the service's", req: { verb: "msg.wake", from_user: "svc", to_user: B, post: { board: "open", scope: null, from: svc, to: user(B) } }, allow: false, rule: "wake.cross_user" },
+    { name: "two invokers on a service's board", req: { verb: "msg.wake", from_user: B, to_user: D, post: { board: "jobs", scope: "service:svc", from: user(B), to: user(D) } }, allow: false, rule: "wake.cross_user" },
     { name: "service's alias reaches a human", req: { verb: "msg.send", from: "svc/w-1", to: `${A}/human` }, allow: false, rule: "human.teammates" },
   ];
 }
@@ -166,7 +191,7 @@ function rows(f: Fixture): Row[] {
 const READS: Record<string, Record<string, string>> = {
   principals: { findByName: "principalByName", of: "principalOf" },
   teams: { findByName: "teamByName", isMember: "isMember", shareAny: "shareAny", shareCollaborative: "shareCollaborative", shareDelegating: "shareDelegating", listForUser: "teamsOf" },
-  roles: { bindingOf: "roleBinding" },
+  roles: { bindingOf: "roleBinding", invokeBinding: "invokeBinding" },
   users: { findByEmail: "userByEmail" },
 };
 

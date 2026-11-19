@@ -7,7 +7,7 @@ import {
   finishWho, normalizeBoard, noStatusText, parseMatch, pickView, statusText, threadNotOnBoard, unboundFrom,
   type Board, type BoardSummary, type WhoRow,
 } from "../core/boards.ts";
-import { claimView, type ClaimView } from "../core/claims.ts";
+import { claimView, isQueueKey, type ClaimView } from "../core/claims.ts";
 import { CoreError } from "../core/errors.ts";
 import type { Principal } from "../core/resolver.ts";
 import {
@@ -17,7 +17,7 @@ import {
 import { scopeKey, type AliasScopeOf, type BoardAccess } from "./access.ts";
 import { seenAmong } from "./board_post.ts";
 import { callClaimTool } from "./claims.ts";
-import { readableBoard, visibleBoards } from "./board_reads.ts";
+import { readableBoard, visibleBoards, type BoardViewer } from "./board_reads.ts";
 import type { Repo } from "./db.ts";
 import type { Read, Tx } from "./store/tx.ts";
 
@@ -60,8 +60,10 @@ export async function callBoardTool(
   switch (tool) {
     case "board_create": {
       const team = optStr(a, "team");
-      const scope = team ? `team:${team.toLowerCase()}` : null;
       const kind = optStr(a, "kind");
+      // A team's when named; a service's queue board is the service's, implicitly (#270 D5); else org-open. Read
+      // before the repeat check, which compares it.
+      const scope = await access.createScope(tx, actor, team, kind);
       const name = normalizeBoard(str(a, "name"));
       // A repeat whose first answer was lost (#254), answered from state; never for the Slack bridge's human.
       const repeat = async (mine: Board | undefined) =>
@@ -168,13 +170,24 @@ export async function callBoardTool(
 }
 
 // core's listClaims for a reader: live claims by key, each board named only when `viewer` sees it, each holder and note
-// only when `seer` (a session ID or handle) may see the holder exists (#348, #871).
+// only when `seer` (a session ID or handle) may see the holder exists (#348, #871). A queue post's claim is the
+// delivery machinery's and its key names its board and post, so one on a board `viewer` can't see isn't listed at all:
+// a hidden board's name and traffic stay hidden (#270 D5, principle 9).
 async function claimViews(repo: Repo, access: BoardAccess, r: Read, prefix: string | undefined, viewer: string | Principal, seer: string): Promise<ClaimView[]> {
-  const rows = await repo.claims.list(r, prefix);
+  const { rows, boards } = await claimsSeen(repo, access, r, viewer, await repo.claims.list(r, prefix));
   if (!rows.length) return [];
-  const boards = await visibleBoards(repo, access, r, viewer, rows.flatMap((c) => (c.board ? [c.board] : [])));
   const seen = await seenAmong(repo, access, r, seer, rows.map((c) => c.holder));
   return rows.map((c) => claimView(c, !c.board || boards.has(c.board), seen.has(c.holder)));
+}
+
+// Of `all`, the claims `viewer` is shown, with the boards among theirs it sees: a queue post's claim only on a board it
+// sees, since its key names the board and post (#270 D5, principle 9). claim_list and a session's notices share it.
+export async function claimsSeen<C extends { key: string; board: string | null }>(
+  repo: Repo, access: BoardAccess, r: Read, viewer: BoardViewer, all: C[],
+): Promise<{ rows: C[]; boards: Map<string, Board> }> {
+  if (!all.length) return { rows: [], boards: new Map() };
+  const boards = await visibleBoards(repo, access, r, viewer, all.flatMap((c) => (c.board ? [c.board] : [])));
+  return { rows: all.filter((c) => !isQueueKey(c.key) || (!!c.board && boards.has(c.board))), boards };
 }
 
 // core's listBoards: each open board's row is the view of the address a read without `as` acts as (S14); a principal

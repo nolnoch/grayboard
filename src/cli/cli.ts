@@ -1162,7 +1162,7 @@ const roleCmd = adminCmd.command("role").description("Grant, revoke and list rol
 for (const verb of ["grant", "revoke"] as const) {
   roleCmd
     .command(`${verb} <role> <principal>`)
-    .description(verb === "grant" ? "Grant a role to a user (by email)" : "Revoke a role binding")
+    .description(verb === "grant" ? "Grant a role to a user (by email), or service_invoke to a user, team or service (by name)" : "Revoke a role binding")
     .option("--scope <name>", "The team or service the role is held on")
     .action(async (role: string, principal: string, opts: { scope?: string }) => {
       try {

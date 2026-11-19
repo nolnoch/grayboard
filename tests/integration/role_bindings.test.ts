@@ -85,6 +85,15 @@ describe("acceptance 1: granted at runtime, revoked with no restart", () => {
       const r = await cli(alice, "revoke", "org_admin", A);
       expect(r.code, r.err).toBe(0);
       expect(JSON.parse(r.out)).toMatchObject({ revoked: { principal: A, role: "org_admin" } });
+      // service_invoke goes to a team by name (#270 D6).
+      const run = (token: string, ...args: string[]) => runCli(["--json", ...args], { cwd: dir, env: cleanEnv({ GRAYBOARD_CREDENTIALS: as[token]! }) });
+      for (const [token, ...args] of [[alice, "team", "create", "eng"], [root, "admin", "service", "create", "ingest", "--owner", A]]) {
+        const c = await run(token!, ...args);
+        expect(c.code, c.err).toBe(0);
+      }
+      const t = await cli(root, "grant", "service_invoke", "eng", "--scope", "ingest");
+      expect(t.code, t.err).toBe(0);
+      expect(JSON.parse(t.out)).toMatchObject({ created: true, binding: { principal: "eng", role: "service_invoke", scope: "ingest" } });
       const after = await cli(alice, "list");
       expect(after.code).toBe(1);
       expect(after.err).toContain("not an org admin");
@@ -234,20 +243,22 @@ describe("acceptance 4: team_owner on that team only", () => {
 });
 
 describe("holder kinds", () => {
-  // The grant's WHERE admits only the role table's holder kinds: a team never holds org_admin or team_owner, and
-  // nothing holds service_invoke until #270 names its holders (an empty list, so the clause alone refuses it).
-  test("org_admin or team_owner to a team, and service_invoke to anyone, is refused 400 with nothing written", async () => {
+  // The grant's WHERE admits only the role table's holder kinds: a team never holds org_admin or team_owner. A user,
+  // a team or a service holds service_invoke, on a service only (#270 D6).
+  test("org_admin or team_owner to a team is refused 400 with nothing written; service_invoke goes to a user or a team", async () => {
     const [root, alice] = [await srv.login(ROOT), await srv.login(A)];
     expect((await api(alice, "POST", "/api/teams", { name: "eng" })).status).toBe(201);
     await seed(srv.app.repo, () => srv.app.db.run("INSERT INTO principals (kind, name, created_at) VALUES ('service', 'ingest', 0)"));
     const before = bindings();
     expect(await grant(root, "org_admin", "eng")).toMatchObject({ status: 400, body: { message: expect.stringContaining('"eng" is a team') } });
     expect(await grant(root, "team_owner", "eng", "eng")).toMatchObject({ status: 400, body: { message: expect.stringContaining('"eng" is a team') } });
-    expect(await grant(root, "service_invoke", A, "ingest")).toMatchObject({ status: 400, body: { message: expect.stringContaining("no principal may hold service_invoke yet") } });
-    expect(await grant(root, "service_invoke", "eng", "ingest")).toMatchObject({ status: 400 });
+    expect(await grant(root, "service_invoke", A, "eng")).toMatchObject({ status: 404, body: { message: 'no service named "eng"' } });
     expect(bindings()).toEqual(before);
     // Only the creator's ownership was granted.
     expect(accessAudits(srv.app.db, "role.granted")).toHaveLength(1);
+    expect((await grant(root, "service_invoke", A, "ingest")).status).toBe(201);
+    expect((await grant(root, "service_invoke", "eng", "ingest")).status).toBe(201);
+    expect(accessAudits(srv.app.db, "role.granted").map(r => r.target)).toEqual([A, A, "eng"]);
   });
 });
 

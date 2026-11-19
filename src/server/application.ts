@@ -21,7 +21,7 @@ import { sweepStoredBlobs } from "./attachments.ts";
 import { afterCommitOf, isTx, type Read, type Tx } from "./store/tx.ts";
 import { HUMAN_NAME, HUMAN_RESERVED, formatTeamAddress } from "../shared/addressing.ts";
 import { describeLocation } from "../shared/identity.ts";
-import { authorize, recordDecision, type Actor, type AuthzRequest, type Decision, type HumanReach } from "./policy.ts";
+import { authorize, recordDecision, type Actor, type AuthzRequest, type Decision, type HumanReach, type WakePost } from "./policy.ts";
 import { serverAuditSink, writeAudit } from "./audit.ts";
 import { principalOfAuthed, type AuthedUser } from "./auth.ts";
 import {
@@ -36,15 +36,16 @@ import type { Principal } from "../core/resolver.ts";
 import { coreRefusalCode, Undeliverable } from "../core/session_end.ts";
 import { claimsInstruction, isBoardTool, type ToolContext, type BoardPostResult } from "../core/tools.ts";
 import { postGateOn, serverPost } from "./board_post.ts";
+import { hiddenBoard, invocation } from "./invoke.ts";
 import { sweepClaims } from "./claims.ts";
 import { attachmentIds, type Uploader } from "../core/attachments.ts";
 import type { AttachmentLimits } from "../shared/attachments.ts";
 import { expiryTimer } from "../core/claims.ts";
 import { detached } from "./request_context.ts";
 import { onAliasCreated } from "./teams.ts";
-import { boardAccess, ownScopeOn, type BoardAccess } from "./access.ts";
+import { boardAccess, ownScopeOn, seerIn, type BoardAccess } from "./access.ts";
 import { boardCatalog, boardSnapshot, pendingOf, visibleBoards } from "./board_reads.ts";
-import { callBoardTool, serverBoardActor } from "./boards.ts";
+import { callBoardTool, claimsSeen, serverBoardActor } from "./boards.ts";
 import { PROMISE_DAYS, STALE_UNDELIVERED_MS, alreadyRetracted, historyLimit, inboxDays, promised, queuedNote, retractRefusal, showMessage, unanswered, undeliveredInstruction, type InboxItem, type PromiseItem } from "../shared/inbox.ts";
 import type { Pending } from "../shared/notifications.ts";
 
@@ -441,7 +442,8 @@ async function noticesFor(hub: Hub, r: Read, addresses: string[], first: string[
   const undelivered = await hub.repo.messages.undeliveredFrom(r, addresses, hub.now() - STALE_UNDELIVERED_MS);
   // Read before the synchronous helper (#807 P3 B1a), which asks per stale recipient.
   const seen = await hub.repo.bindings.lastSeen(r, undelivered.map((u) => u.recipient));
-  const claims = await hub.repo.claims.list(r);
+  // A queue post's claim on a board none of `addresses` sees isn't named (claimsSeen, as claim_list's).
+  const { rows: claims } = await claimsSeen(hub.repo, hub.access, r, addresses, await hub.repo.claims.list(r));
   return [
     ...first,
     ...undeliveredInstruction(undelivered, (h) => seen.get(h) ?? null),
@@ -1322,15 +1324,17 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
       const messages = (await repo.messages.unreadSince(r, streams)).slice(0, limit);
       const seen = new Set<string>();
       const all: Pending[] = [];
+      // Each item's post and the address it was read for: a service board's wake rule judges that address (#270 D6).
+      const readers = new Map<number, string>();
       for (const a of session.addresses) {
         for (const item of await pendingOf(repo, hub.access, r, a, true, lostAck(hub, r, a))) {
           const key = pendingKey(refOf(item));
-          if (!seen.has(key)) { seen.add(key); all.push(item); }
+          if (!seen.has(key)) { seen.add(key); all.push(item); readers.set((item.kind === "push" ? item.post : item.latest).id, a); }
         }
       }
       const boards = all.slice(0, limit - messages.length);
       // A digest's latest post never wakes, so it carries other_user only.
-      const marks = await writerMarks(repo, r, session, messages.map(m => m.id), boards.map(i => (i.kind === "push" ? i.post : i.latest).id));
+      const marks = await writerMarks(repo, r, session, messages.map(m => m.id), boards.map(i => (i.kind === "push" ? i.post : i.latest).id), readers);
       return [
         ...messages.map((m): DeliveryEvent => ({ kind: "direct", message: { ...showMessage(m), ...marks.message(m.id) } })),
         ...boards.map((item): DeliveryEvent => ({ kind: "board", item: item.kind === "push"
@@ -1584,12 +1588,12 @@ async function resolvePeer(repo: Repo, r: Read, from: string, input: string, vie
 
 // Whether `address` is a team's or a service's alias that `viewer` (a session ID, else the acting address) may not
 // see exists: to anyone outside the team its names read as missing (alias.see, #348), for mail too (#1014); a
-// service's names are its own until #270's invocation step names who else sees them (D4), so a user's mail to one
-// reads like mail to a missing name. A person's names are an open directory.
+// service's names are its own and its service_invoke holders' (alias.see_service, #270 D4), so anyone else's mail to
+// one reads like mail to a missing name. A person's names are an open directory.
 async function aliasHidden(repo: Repo, r: Read, viewer: string, address: string): Promise<boolean> {
   const a = await repo.aliases.find(r, address);
   if (!a || a.scope_kind === "person" || a.scope_ref === null) return false;
-  const vp = await repo.principals.of(r, viewer);
+  const vp = await seerIn(repo, r, viewer, a.scope_kind === "service");
   return vp === null || !(await authorize(repo, r, {}, { verb: "alias.see", principal: vp, scope: { scope_kind: a.scope_kind, scope_ref: a.scope_ref } })).allow;
 }
 
@@ -2003,6 +2007,12 @@ async function handleCall(hub: Hub, tx: Tx, session: ApplicationSession, tool: s
   }
   const { as: _as, ...rest } = args;
   if (tool === "board_post") return handleBoardPost(hub, tx, session, actor, rest, ctx, publish);
+  // A claim announced on a service's board is a post there too (#270 D6): decided as board_post's is.
+  const inv = tool === "claim_take" ? await invocation(repo, tx, actor, rest.board) : null;
+  if (inv && !inv.d.allow) {
+    rowAfterRollback(session, tx, w => recordDecision(repo, w, sessionActor(session, actor), inv.req, inv.d));
+    throw coreRefusal(hiddenBoard(inv));
+  }
   let outcome;
   try { outcome = await callBoardTool(repo, hub.access, tx, actor, tool, rest, { ...ctx, ...(session.readOnly ? { principal: userOf(session) } : {}) }); }
   catch (e) {
@@ -2010,6 +2020,7 @@ async function handleCall(hub: Hub, tx: Tx, session: ApplicationSession, tool: s
     console.error(`[grayboard] ${tool} failed:`, e);
     return fail("internal", `${tool} failed`);
   }
+  if (inv) recordDecision(repo, tx, sessionActor(session, actor), inv.req, inv.d);
   // board_read's posts carry the writer marks every read path does (#825).
   if (tool === "board_read") {
     const r = outcome.result as ReadResult;
@@ -2041,12 +2052,20 @@ async function handleBoardPost(hub: Hub, tx: Tx, session: ApplicationSession, me
     const parentId = postArgs.parent_id ?? null;
     if (parentId !== null && typeof parentId !== "number") throw new CoreError("parent_id must be a number");
     // Before the write is deduplicated: access is re-checked on a repeat, so a caller who has lost the board is refused, not replayed (#296).
+    // A post on a service's board is an invocation (#270 D6), decided here for the acting address's principal: a deny
+    // is recorded after the rollback and answers as a missing board; an allow is recorded with the post it carries.
+    const inv = await invocation(repo, tx, me, postArgs.board);
+    if (inv && !inv.d.allow) {
+      rowAfterRollback(session, tx, w => recordDecision(repo, w, sessionActor(session, me), inv.req, inv.d));
+      throw hiddenBoard(inv);
+    }
     // Its board is reused inside the savepoint: the same transaction, so the same row (b5b2 Decision 9).
     const { board, gate } = await postGateOn(repo, hub.access, tx, me, postArgs.board, parentId);
     const fp = { board: normalizeBoard(postArgs.board), body: postArgs.body, parent_id: parentId, attachments: await repo.attachments.unsentDigests(tx, ids, uploaderOf(session)) };
     out = await writeOnce(hub, tx, session, "board_post", me, fp, resend === true, ids, async sp => {
       const o = await serverPost(repo, hub.access, sp, me, board, gate, postArgs, ctx);
       const r = o.result;
+      if (inv) recordDecision(repo, sp, sessionActor(session, me), inv.req, inv.d, { post_id: r.post_id });
       for (const a of r.attachments ?? []) writeAudit(repo, sp, "attachment.bound", session.authed.user_email, `attachment:${a.id}`, { identity: me, post_id: r.post_id, board: r.board });
       return { payload: r, ref: { kind: "post", id: r.post_id } satisfies WriteRef, wake: o.wake };
     });
@@ -2086,10 +2105,30 @@ async function handleBoardPost(hub: Hub, tx: Tx, session: ApplicationSession, me
 type WriterMark = { other_user?: true; ungranted?: true; delegated?: true };
 // Decided up front (#807 P3 A7f2), one await per (verb, writer): msg.wake for every foreign writer, delegate.to for
 // the writers of delegation requests; the marks are then read synchronously.
-async function writerMarks(repo: Repo, r: Read, session: ApplicationSession, messageIds: number[], postIds: number[]) {
+// A post on a service's board (#270 D6) is judged with its facts too: the board, its author address's principal and
+// the reading address's (`readers`: the address a pending item was read for; else the session's primary), keyed with
+// the board so one board's grant never marks another's post (wake.service_invoke).
+async function writerMarks(repo: Repo, r: Read, session: ApplicationSession, messageIds: number[], postIds: number[], readers?: Map<number, string>) {
   const writers = await repo.messages.writerUsers(r, messageIds, postIds);
   const me = session.authed.user_email;
   const decided = new Map<string, boolean>();
+  const principals = new Map<string, Principal | null>();
+  // Only a service's board's posts ask: an ID there, author or reader, is judged as its session's primary (seerIn), as
+  // its post was invoked and its board is seen.
+  const principalAt = async (address: string): Promise<Principal | null> => {
+    if (!principals.has(address)) principals.set(address, address ? await seerIn(repo, r, address, true) : null);
+    return principals.get(address)!;
+  };
+  const pkey = (p: Principal | null) => (p ? `${p.kind}:${p.name}` : "-");
+  const postWakes = new Map<number, boolean>();
+  for (const [id, f] of writers.servicePosts) {
+    const user = writers.posts.get(id);
+    if (user === undefined || user === me) continue;
+    const post: WakePost = { board: f.board, scope: f.scope, from: await principalAt(f.author), to: await principalAt(readers?.get(id) ?? (session.primary || session.sessionId)) };
+    const key = `msg.wake ${user}\0${f.board}\0${pkey(post.from)}\0${pkey(post.to)}`;
+    if (!decided.has(key)) decided.set(key, (await authorize(repo, r, {}, { verb: "msg.wake", from_user: user, to_user: me, post })).allow);
+    postWakes.set(id, decided.get(key)!);
+  }
   const settle = async (verb: "msg.wake" | "delegate.to", user: string) => {
     const key = `${verb} ${user}`;
     if (!decided.has(key)) decided.set(key, (await authorize(repo, r, {}, { verb, from_user: user, to_user: me })).allow);
@@ -2097,16 +2136,17 @@ async function writerMarks(repo: Repo, r: Read, session: ApplicationSession, mes
   const may = (verb: "msg.wake" | "delegate.to", user: string) => decided.get(`${verb} ${user}`)!;
   const foreign = messageIds.filter((id) => { const u = writers.messages.get(id); return u !== undefined && u !== me; });
   const delegations = foreign.length ? await repo.messages.delegationIds(r, foreign) : new Set<number>();
-  for (const u of new Set([...writers.messages.values(), ...writers.posts.values()])) if (u !== undefined && u !== me) await settle("msg.wake", u);
+  const plain = [...writers.posts].filter(([id]) => !postWakes.has(id)).map(([, u]) => u);
+  for (const u of new Set([...writers.messages.values(), ...plain])) if (u !== undefined && u !== me) await settle("msg.wake", u);
   for (const id of delegations) await settle("delegate.to", writers.messages.get(id)!);
-  const mark = (user: string | undefined, judged: boolean): WriterMark =>
-    user === undefined || user === me ? {} : { other_user: true, ...(judged && !may("msg.wake", user) ? { ungranted: true as const } : {}) };
+  const mark = (user: string | undefined, judged: boolean, wakes?: boolean): WriterMark =>
+    user === undefined || user === me ? {} : { other_user: true, ...(judged && !(wakes ?? may("msg.wake", user)) ? { ungranted: true as const } : {}) };
   return {
     message: (id: number): WriterMark => {
       const m = mark(writers.messages.get(id), true);
       return m.other_user && delegations.has(id) && may("delegate.to", writers.messages.get(id)!) ? { ...m, delegated: true } : m;
     },
-    post: (id: number, judged = true): WriterMark => mark(writers.posts.get(id), judged),
+    post: (id: number, judged = true): WriterMark => mark(writers.posts.get(id), judged, postWakes.get(id)),
   };
 }
 

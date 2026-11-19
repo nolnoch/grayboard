@@ -25,7 +25,9 @@ import { transferTimeoutMs } from "../shared/http.ts";
 import { testPauseAsync } from "../shared/testpause.ts";
 import { aliasHeldText } from "../core/bindings.ts";
 import { callClaimTool } from "./claims.ts";
+import { hiddenBoard, invocation } from "./invoke.ts";
 import type { BoardAccess } from "./access.ts";
+import { claimsSeen } from "./boards.ts";
 import { SizeTally, checkFile, contentDisposition, reprDigest, sanitizeFilename } from "../shared/attachments.ts";
 import { ALIAS_SCOPE_CAP, aliasCapRefusal } from "./alias_cap.ts";
 import { ensureTeamBoard, onAliasCreated, onTeamJoined, onTeamLeft } from "./teams.ts";
@@ -167,8 +169,9 @@ async function whoami(authed: AuthedUser, repo: Repo): Promise<Response> {
 // For `grayboard claims`. Signed in as a user, not one handle, so a claim's
 // board, which a handle may not be able to see, is left out, and a holder
 // whose name the user may not see (a team's alias, outside the team) is
-// withheld with its note, as claim_list does (#871).
-async function claimList(url: URL, authed: AuthedUser, repo: Repo): Promise<Response> {
+// withheld with its note, as claim_list does (#871). A queue post's claim on a board the user can't see isn't listed
+// (claimsSeen, #270 D5).
+async function claimList(url: URL, authed: AuthedUser, repo: Repo, access: BoardAccess): Promise<Response> {
   const prefix = url.searchParams.get("prefix") ?? undefined;
   const principal = principalOfAuthed(authed);
   const sees = async (holder: string): Promise<boolean> => {
@@ -176,7 +179,7 @@ async function claimList(url: URL, authed: AuthedUser, repo: Repo): Promise<Resp
     const scope = seenScopeOf(await repo.aliases.find(repo.read, holder), holder);
     return !scope || scope.scope_ref === null || (await authorize(repo, repo.read, {}, { verb: "alias.see", principal, scope: { scope_kind: scope.scope_kind, scope_ref: scope.scope_ref } })).allow;
   };
-  const claims = await repo.claims.list(repo.read, prefix);
+  const { rows: claims } = await claimsSeen(repo, access, repo.read, principal, await repo.claims.list(repo.read, prefix));
   // One decision per distinct holder.
   const seen = new Map<string, boolean>();
   for (const c of claims) if (!seen.has(c.holder)) seen.set(c.holder, await sees(c.holder));
@@ -241,9 +244,18 @@ async function claimCall(req: Request, authed: AuthedUser, repo: Repo, access: B
     // As the session the address is or is held by: its claims under any of
     // its addresses are its own here (#360).
     const addresses = await repo.bindings.addressSet(tx, handle, authed.user_email);
+    // A claim announced on a service's board is an invocation (#270 D6), decided as board_post's is; this answer
+    // commits, so a deny's row goes on the transaction, and an allow's only when the claim lands.
+    const inv = tool === "claim_take" ? await invocation(repo, tx, handle, args.board) : null;
+    if (inv && !inv.d.allow) {
+      recordDecision(repo, tx, { user: authed.user_email, address: handle }, inv.req, inv.d);
+      return badRequest(hiddenBoard(inv).message);
+    }
     try {
       // The tool's own savepoint rolls back a refusal's writes, so answering it here commits none (#807 P3 B5b3c).
-      return await callClaimTool(repo, access, tx, handle, tool as ClaimTool, args, { addresses, user: authed.user_email });
+      const out = await callClaimTool(repo, access, tx, handle, tool as ClaimTool, args, { addresses, user: authed.user_email });
+      if (inv) recordDecision(repo, tx, { user: authed.user_email, address: handle }, inv.req, inv.d);
+      return out;
     } catch (e) {
       if (e instanceof CoreError) return badRequest(e.message);
       throw e;
@@ -1004,7 +1016,7 @@ export async function handleHttp(
   if (path === "/api/auth/logout" && method === "POST") return authLogout(authed, repo);
   if (path === "/api/whoami"      && method === "GET")  return whoami(authed, repo);
 
-  if (path === "/api/claims" && method === "GET") return claimList(url, authed, repo);
+  if (path === "/api/claims" && method === "GET") return claimList(url, authed, repo, access);
   if (path === "/api/claims/call" && method === "POST") return claimCall(req, authed, repo, access, wake, onBoardsChanged);
 
   if (path === "/api/identities" && method === "GET")  return identityList(authed, repo);

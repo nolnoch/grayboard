@@ -47,10 +47,11 @@ The baseline every later change is measured against: as of v2.4.0, every cell is
 | 19 | Delegation to another user's launcher under a grant (`delegate.to`) | n/a | yes | n/a | yes | n/a | yes | n/a | yes |
 | 20 | Runtime role bindings (`org_admin`, `team_owner`) and `grayboard admin role` | n/a | yes | n/a | yes | n/a | yes | n/a | yes |
 | 21 | A service's agent signs in with a run token from a service credential (no browser) | n/a | gap (#1243) | n/a | gap (#1243) | n/a | yes | n/a | gap (#1243) |
+| 22 | Invoke a service by posting on its board under a `service_invoke` grant; the service's reply wakes the invoker | n/a | yes | n/a | yes | n/a | yes | n/a | yes |
 
 ## Evidence by row
 
-Rows 1–8: `parity-delivery.md`. Rows 9–16: `parity-access.md`. Rows 17–21: §Not covered.
+Rows 1–8: `parity-delivery.md`. Rows 9–16: `parity-access.md`. Rows 17–22: §Not covered.
 
 ## Notes (known limits, not cells)
 
@@ -102,6 +103,11 @@ The Rust client SDK (`sdk/rust`, #929) is a library for services, not a harness 
 ### 21. A service's agent signs in with a run token from a service credential (no browser)
 
 - Local (all four): n/a. A service principal means something only with more than one principal (`vision.md` §1).
-- The server side is built for every hosted cell (#270 step 3; `server-oauth.md` §2 Service credentials, `server-access.md` §1): an admin adds a credential, the launcher mints a run token with `client_credentials`, and any client that sends it as a bearer on `/mcp` with a mapped session key is the service. Proof: `tests/integration/service_credentials.test.ts` (against a compiled server process: the CLI's credential, a token with no browser, bind and post, revoke and disable ending the session).
+- The server side is built for every hosted cell (#270 step 3; `server-oauth.md` §2 Service credentials, `server-services.md` §1): an admin adds a credential, the launcher mints a run token with `client_credentials`, and any client that sends it as a bearer on `/mcp` with a mapped session key is the service. Proof: `tests/integration/service_credentials.test.ts` (against a compiled server process: the CLI's credential, a token with no browser, bind and post, revoke and disable ending the session).
 - OC V2: supported by its static credential mode (#270 step 4; `adapters-hosted-login.md` §OpenCode V2 static mode): the launcher sets the mode, the pinned issuer and the native entry's bearer header from its environment, and a root enrolls itself only when the server's `whoami` reports a service. Proof: `adapters/opencode-v2/tests/static-host.ts` (`test:native-host`: a real OpenCode host and server, a token minted by `client_credentials`, two roots auto-enroll, bind, post and receive a push, in direct and code mode; revoke pauses both with no OAuth fallback, and no file holds the token), `adapters/opencode-v2/tests/static.test.ts`.
 - pi H, omp H, CC H: gap (#1243). Hosted core signs in through the browser as its user and has no static-token mode; no design asks for one yet (D3 names OpenCode and the Rust SDK).
+
+### 22. Invoke a service by posting on its board under a `service_invoke` grant; the service's reply wakes the invoker
+
+- Local (all four): n/a. A grant means something only with more than one principal (`vision.md` §1).
+- Every hosted cell: server-side, through the shared `board_post` and `claim_take` and the pull's writer marks, the same for every harness (#270 step 5; `server-services.md` §2, `boards.md` §3 Service boards). The service's own side needs its run token (row 21). Proof: `tests/integration/service_invoke.test.ts` (hosted-core wire sessions: one service lane, actionable; the reply wakes a direct and a team holder; a team-bound session, a non-holder and a removed member refused as a missing board with deny rows; no invoker lane on rotation, decline or mention; `ungranted` after a revoke; hidden on every listing and read), `tests/integration/role_bindings.test.ts` (the CLI grants a team).

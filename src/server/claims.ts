@@ -3,7 +3,7 @@
 // orderLanes, requeuePick, holderUserRule), so local and the server announce alike and only the reads differ.
 import { orderLanes, REDELIVERED_NOTE, requeuePick } from "../core/boards.ts";
 import {
-  alreadyReleasedText, checkMove, checkRelease, checkTake, claimText, expiredText, heldAnswer, notWatching, releasable, releasedByRule,
+  alreadyReleasedText, checkMove, isQueueKey, checkRelease, checkTake, claimText, expiredText, heldAnswer, notWatching, releasable, releasedByRule,
   releasedText, releaseRefusal, releaseText, renewAnnounces, takeDecision, unclaimedText, updateText, validKey, watching, watchNoBoard,
   watchNoClaim, watchOwn, type Claim, type ClaimChanges, type ClaimCtx, type ClaimResult, type ClaimRow, type TakeOpts,
 } from "../core/claims.ts";
@@ -52,7 +52,8 @@ export async function requeue(repo: Repo, access: BoardAccess, tx: Tx, c: ClaimR
   const rows = await repo.boards.laneRows(tx, f.board.name, f.poster);
   const viewers = await repo.bindings.viewerIds(tx);
   const sees = rows.length ? await access.canSeeMany(tx, rows, f.board) : new Set<string>();
-  const lane = requeuePick(orderLanes(rows, (h) => viewers.has(h), (h) => sees.has(h)), f.held);
+  const lanes = rows.length ? await access.lanesAmong(tx, rows, f.board) : new Set<string>();
+  const lane = requeuePick(orderLanes(rows, (h) => viewers.has(h), (h) => sees.has(h), (h) => lanes.has(h)), f.held);
   if (lane) {
     await repo.boards.claimQueuePost(tx, f.board.name, f.postId, lane, now, { note: REDELIVERED_NOTE, push: true });
     return { wake: [lane], boards: [] };
@@ -155,6 +156,8 @@ export async function serverRelease(
     const refuse = async (cur: ClaimRow | undefined) => {
       const releasedAt = releasedByRule(await repo.claims.recentEvents(sp, key), key, addresses);
       if (releasedAt !== undefined) return { wake: [], boards: [], releasedAt };
+      // A queue post's claim on a board the caller can't see answers as no claim: its key names the board (#270 D5).
+      if (cur && isQueueKey(key) && !(cur.board && (await boardVisible(repo, access, sp, handle, cur.board)))) throw releaseRefusal(key, undefined, now, false);
       const live = !!cur && cur.expires_at > now;
       throw releaseRefusal(key, cur, now, live && (await holderHidden(repo, access, sp, ctx.session ?? handle, cur!.holder)));
     };
@@ -186,7 +189,8 @@ export async function serverWatch(
     return notWatching(key);
   }
   const cur = await repo.claims.liveForWatch(tx, key, Date.now());
-  if (!cur) throw watchNoClaim(key);
+  // A queue post's claim on a board the caller can't see answers as no claim: its key names the board (#270 D5).
+  if (!cur || (isQueueKey(key) && !(cur.board && (await boardVisible(repo, access, tx, handle, cur.board))))) throw watchNoClaim(key);
   if (addresses.includes(cur.holder)) throw watchOwn(key);
   if (!cur.board || !(await boardVisible(repo, access, tx, handle, cur.board))) {
     throw watchNoBoard(key, (await holderHidden(repo, access, tx, seer, cur.holder)) ? null : cur.holder);

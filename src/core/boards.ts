@@ -106,6 +106,9 @@ export type Access = {
   // at all (peer_list rows, name suggestions): a team's names only inside the
   // team (#348). Omitted: always.
   seesAlias?(handle: string, scope: Omit<AliasScope, "name">): boolean;
+  // Whether `handle` may be a lane on `board`, taking its queue work (#270 D5: on a service's board only the
+  // service's own addresses consume). Omitted (local mode): anyone who may see the board.
+  mayLane?(handle: string, board: Board): boolean;
   // The board only a human handle can start posts on, or null for none.
   announceBoard: string | null;
   // Whether `human` acts for the same user as `address`, so may archive a board
@@ -853,17 +856,25 @@ export function queueLanes(
   opts: { online?: (handle: string) => boolean } = {},
 ): string[] {
   const a = access(db);
-  return orderLanes(queueLaneRows(db, b.name, poster), viewers(db), (h) => a.canSee(h, b), opts.online);
+  return orderLanes(queueLaneRows(db, b.name, poster), viewers(db), (h) => a.canSee(h, b), laneHook(a, b), opts.online);
 }
 
-/** queueLanes' judgment over its rows, kept in their rotation order: no viewers, only lanes that may see the board, live first. */
+/** Access.mayLane for `b` as a predicate: everyone when the mode has no such rule. */
+export const laneHook = (a: Access, b: Board): ((h: string) => boolean) => (a.mayLane ? (h) => a.mayLane!(h, b) : () => true);
+
+/**
+ * queueLanes' judgment over its rows, kept in their rotation order: no viewers, only lanes that may see the board and
+ * may be its lanes (Access.mayLane, #270 D5), live first. Every rotation and redelivery goes through here, so none
+ * skips the lane rule.
+ */
 export function orderLanes(
   rows: string[],
   isViewer: (h: string) => boolean,
   sees: (h: string) => boolean,
+  mayLane: (h: string) => boolean,
   online?: (h: string) => boolean,
 ): string[] {
-  const lanes = rows.filter((h) => !isViewer(h) && sees(h));
+  const lanes = rows.filter((h) => !isViewer(h) && sees(h) && mayLane(h));
   if (!online) return lanes;
   return [...lanes.filter((h) => online(h)), ...lanes.filter((h) => !online(h))];
 }
@@ -1101,16 +1112,17 @@ export function post(
     const viewer = opts.author_id ?? handle;
     const branch = postBranch(b, parentId, announcement);
     const sees = (h: string) => a.canSee(h, b);
+    const mayLane = laneHook(a, b);
     const facts: PostTargetFacts = {
       board: b, handle, parentId, strict, gate: { announce, human, announcement }, own,
-      ackAddresses: opts.addresses ?? [handle], isViewer, isHuman: (h) => isHuman(db, h), sees,
+      ackAddresses: opts.addresses ?? [handle], isViewer, isHuman: (h) => isHuman(db, h), sees, mayLane,
       mentions: { handles: [], unresolved: [] },
     };
     if (branch === "queue") {
       facts.mentions = resolveMentions(db, body, handle, b, strict, viewer);
       facts.seenMentioned = seenHandles(db, viewer, facts.mentions.handles);
       if (needsRotation(facts.seenMentioned)) {
-        facts.lanes = orderLanes(queueLaneRows(db, board, own), isViewer, sees, opts.online);
+        facts.lanes = orderLanes(queueLaneRows(db, board, own), isViewer, sees, mayLane, opts.online);
       }
     } else {
       facts.subs = subscriberRows(db, board);
@@ -1175,6 +1187,8 @@ export type PostTargetFacts = {
   isHuman: (h: string) => boolean;
   // May see the board (access canSee).
   sees: (h: string) => boolean;
+  // May be a lane on the board (access mayLane, #270 D5): a queue claim, rotated or by name, goes only to one.
+  mayLane: (h: string) => boolean;
   // resolveMentions' answer, token order: handles that may see the board, and tokens that matched nobody.
   mentions: { handles: string[]; unresolved: string[] };
   subs?: { handle: string; mode: SubMode }[];
@@ -1219,8 +1233,10 @@ export function planPostTargets(f: PostTargetFacts): PostPlan {
     // One agent addressed by name holds the post like a rotated lane (#219): its reply acks, its decline or
     // lapse redelivers through the rotation. Only an author's own words (strictIds): a system post's `cc @watcher`
     // isn't work. Exactly one visible name, and it no human, viewer or poster's own address: one claim names
-    // one agent, and only agents hold queue work. Subscription and opt-out govern the rotation, not a name.
-    const agents = seen.filter((h) => !f.own.includes(h) && !f.isHuman(h) && !f.isViewer(h));
+    // one agent, and only agents hold queue work. Subscription and opt-out govern the rotation, not a name. On a
+    // service's board the name must also be one of the service's lanes (#270 D5): an invoker named there is told,
+    // not handed the service's work, and the post waits on the board.
+    const agents = seen.filter((h) => !f.own.includes(h) && !f.isHuman(h) && !f.isViewer(h) && f.mayLane(h));
     if (f.strict && seen.length === 1 && agents.length === 1) {
       claim = { lane: agents[0]!, note: "queue post (mentioned)", push: false };
     }
