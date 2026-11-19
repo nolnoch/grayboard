@@ -1374,7 +1374,7 @@ test("an unbind stops only its own session's listen, through the per-row notice 
     const userId = (await store.repo.users.findByEmail(store.repo.read, email))!.id;
     await seed(store.repo, async tx => {
       const row = (await store.repo.hosted.all(tx)).find(r => r.user_id === userId)!;
-      return store.repo.hosted.update(tx, { ...row, bind_gen: row.bind_gen + 1 });
+      return store.repo.hosted.update(tx, row.session_id, { bind_gen: row.bind_gen + 1 });
     });
   };
   await rebind("bob@example.com");
@@ -1403,12 +1403,12 @@ test("#807 P3 B1b: a notice that keeps a bound root's generation keeps its liste
   } as typeof query);
   try {
     // A commit to the root's row that leaves its generation: its notice carries the row, and the judge keeps the live.
-    await seed(store.repo, async tx => { const r = await root(tx); return store.repo.hosted.update(tx, { ...r, last_seen_at: r.last_seen_at + 1 }); });
+    await seed(store.repo, async tx => { const r = await root(tx); return store.repo.hosted.update(tx, r.session_id, { last_seen_at: r.last_seen_at + 1 }); });
     expect(hosted.activeListens).toBe(1);
     expect(pooled).toEqual([]);
   } finally { spy.mockRestore(); }
   // The same path still stops it once the generation moves.
-  await seed(store.repo, async tx => { const r = await root(tx); return store.repo.hosted.update(tx, { ...r, bind_gen: r.bind_gen + 1 }); });
+  await seed(store.repo, async tx => { const r = await root(tx); return store.repo.hosted.update(tx, r.session_id, { bind_gen: r.bind_gen + 1 }); });
   await untilHosted(() => hosted.activeListens === 0);
   await listen.close();
 });
@@ -1458,7 +1458,7 @@ const ends: [string, (f: Awaited<ReturnType<typeof stampedListen>>) => unknown][
   ["sign-out everywhere", () => seed(store.repo, tx => store.repo.sessions.revokeAllForUser(tx, user.user_id))],
   ["disable", () => seed(store.repo, tx => store.repo.users.setDisabled(tx, user.user_id, true))],
   ["access expiry", ({ time }) => { time.now += OAUTH_TTL.access + 1; }],
-  ["binding change", () => seed(store.repo, async tx => { const r = await aliceRoot(tx); return store.repo.hosted.update(tx, { ...r, bind_gen: r.bind_gen + 1 }); })],
+  ["binding change", () => seed(store.repo, async tx => { const r = await aliceRoot(tx); return store.repo.hosted.update(tx, r.session_id, { bind_gen: r.bind_gen + 1 }); })],
 ];
 // Only the stream timer ticks (the hosted sweep would end an expired session's row itself), and the backstop sits
 // past the access TTL, so the expiry case reaches phase A's auth check with a fresh stamp.
@@ -1513,7 +1513,7 @@ test("#899: a stamped listen ends within a tick of its root's lease lapsing, a d
   const f = await stampedListen();
   const root = (await aliceRoot()).session_id;
   // The update's notice makes the next tick a full check, which stamps the new deadline.
-  await seed(store.repo, async tx => { const r = await aliceRoot(tx); return store.repo.hosted.update(tx, { ...r, lease_deadline: f.time.now + 5_000 }); });
+  await seed(store.repo, async tx => { const r = await aliceRoot(tx); return store.repo.hosted.update(tx, r.session_id, { lease_deadline: f.time.now + 5_000 }); });
   await f.tick(); await f.tick();
   expect(hosted.activeListens).toBe(1);
   f.time.now += 4_999; await f.tick();
@@ -1532,7 +1532,7 @@ test("#899: a stamped listen ends within a tick of its root's lease lapsing, a d
 test("a lapsed root's settle from a board commit's hint, inside the write queue's holder, ends the root", async () => {
   const f = await stampedListen();
   const root = (await aliceRoot()).session_id;
-  await seed(store.repo, async tx => { const r = await aliceRoot(tx); return store.repo.hosted.update(tx, { ...r, lease_deadline: f.time.now + 5_000 }); });
+  await seed(store.repo, async tx => { const r = await aliceRoot(tx); return store.repo.hosted.update(tx, r.session_id, { lease_deadline: f.time.now + 5_000 }); });
   f.time.now += 5_000;
   token = (await issueOAuth(store.repo, oauth.resource, "bob@example.com", ["grayboard:tools"], f.time.now, OPENCODE_CLIENT)).token;
   const bob = await connect();
@@ -1664,7 +1664,7 @@ test("#807 P3 A7d: a held phase-B check whose live stopped meanwhile acts on not
   f.time.now += 10_000;
   const { failures } = await heldCheck(f.tickStream, async () => {
     // A binding change stops the live, unaudited; the revoke then refuses the released check.
-    await seed(store.repo, async tx => { const r = await aliceRoot(tx); return store.repo.hosted.update(tx, { ...r, bind_gen: r.bind_gen + 1 }); });
+    await seed(store.repo, async tx => { const r = await aliceRoot(tx); return store.repo.hosted.update(tx, r.session_id, { bind_gen: r.bind_gen + 1 }); });
     expect(hosted.activeListens).toBe(0);
     await revokeAccess(token, f.time.now);
   });
@@ -1748,7 +1748,7 @@ test("#807 P3 A7h2: a legacy GET whose binding moves while its check awaits re-r
   expect((await raw.post("resources/subscribe", { uri: "grayboard://boards/moved", _meta: meta })).text).not.toContain("\"error\"");
   const abort = new AbortController();
   const { value: get } = await held("mcp:legacy:get-checked", () => raw.get(abort.signal), async () => {
-    await seed(store.repo, async tx => { const r = await aliceRoot(tx); return store.repo.hosted.update(tx, { ...r, bind_gen: r.bind_gen + 1 }); });
+    await seed(store.repo, async tx => { const r = await aliceRoot(tx); return store.repo.hosted.update(tx, r.session_id, { bind_gen: r.bind_gen + 1 }); });
   });
   expect(get.status).toBe(200);
   await untilHosted(() => hosted.activeGetStreams === 0);

@@ -1,5 +1,6 @@
 import type { Database } from "bun:sqlite";
-import type { EndedChild, HostedStore, HostedSession, HostedEnd, LostReader, HostedLost } from "./hosted-types.ts";
+import type { EndedChild, HostedSession, HostedEnd, LostReader, HostedLost } from "./hosted-types.ts";
+import type { HostedPatch, HostedStore } from "./store/hosted.ts";
 import { testPause, testPauseAsync } from "../shared/testpause.ts";
 import { queueFor } from "./store/queue.ts";
 import { isThenable } from "./store/tx_base.ts";
@@ -55,6 +56,8 @@ export type { CursorStream, CursorsStore } from "./store/cursors.ts";
 export type { WriteReceipt, WriteReceiptKey, WriteReceiptsStore } from "./store/write_receipts.ts";
 export type { AccessLogRow, AuditStore } from "./store/audit.ts";
 export type { SlackLink, SlackThread, SlackStore } from "./store/slack.ts";
+// The hosted group's in store/hosted.ts (#807 P3 C8a); its row types in hosted-types.ts.
+export type { HostedPatch, HostedStore } from "./store/hosted.ts";
 
 // Row types
 // Every read of a user row goes through this, so `kind` is never missing (a "SELECT *" would type-check without it).
@@ -81,6 +84,18 @@ const ALIAS_COLS = `id, address, scope_kind, scope_ref, name, created_at`;
 // A synchronous callback's result: a promise is refused at compile time, so
 // nothing can await between a transaction's reads and its writes.
 export type Sync<T> = T extends PromiseLike<unknown> ? never : T;
+// The hosted group as Repo composes it (#807 P3 C8a): the store's members, with its write queue and change notices.
+export type RepoHosted = HostedStore & {
+  // One IMMEDIATE transaction through the server's write queue, for a transaction's outermost caller (Repo.write): `committed` runs
+  // after the commit, before the queue's next body. fn may be async: `committed` gets its resolved value.
+  write<T, R = T>(fn: (tx: Tx) => Promise<T>, committed?: (value: T) => R): Promise<Awaited<R>>;
+  write<T, R = T>(fn: (tx: Tx) => Sync<T>, committed?: (value: T) => R): Promise<Awaited<R>>;
+  // Told after each commit that changed a row (#399): its session ID, or null when any row may have (a grant or
+  // user change). A touch (`touch`) tells nothing: nothing that observes rows reads `last_seen_at`.
+  // With `read`, a named row's notice carries `read`'s answer on the committing transaction, just before its COMMIT
+  // (#807 P3 A7g1); undefined when the read failed or the body was synchronous.
+  subscribe<F>(fn: (changed: string | null, facts?: F) => void, read?: (tx: Tx, id: string) => Promise<F>): () => void;
+};
 // Repo.authPeek's answer: the auth cache's live-token and user hits under one generation (#807 P3 A7d, A7u2).
 // `user`: the user cache's entry under that generation (#807 P3 A7u2): the row, null when known absent, undefined on a
 // miss.
@@ -224,7 +239,7 @@ export interface Repo {
   // (#807 P3 A7d2b), which only this contract makes sound; authGeneration's equality (#899) promises less.
   commitGeneration(): string | undefined;
   oauth: OAuthStore;
-  hosted: HostedStore;
+  hosted: RepoHosted;
   users: UsersStore;
   sessions: SessionsStore;
   principals: PrincipalsStore;
@@ -1309,7 +1324,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       // notice (each null notice is a full hosted re-check pass, and mints come per run, #270 audit M-1). The
       // generation trigger on oauth_tokens still clears the access cache. Only the revokes notify.
       revokeServiceCredential: change(oauth.revokeServiceCredential), revokeServiceSecret: change(oauth.revokeServiceSecret) },
-    hosted: { ...hostedStore, insert: marks(hosted.insert, (_tx, row) => row.session_id), update: marks(hosted.update, (_tx, row) => row.session_id),
+    hosted: { ...hostedStore, insert: marks(hosted.insert, (_tx, row) => row.session_id), update: marks(hosted.update, (_tx, id) => id),
       end: marks(hosted.end, (_tx, session) => session), childEnd: marks(hosted.childEnd, (_tx, session) => session),
       park: marks(hosted.park, (_tx, session) => session), unpark: marks(hosted.unpark, (_tx, session) => session),
       subscribe(fn, read) {
@@ -2681,7 +2696,7 @@ export function mailPort(db: Database): MailPort {
 // The writes take the body's `Tx` (#807 P1c-11), resolved to its connection before any argument is read, so a
 // kept `Tx` is refused whatever the call; the reads take a `Read` the same way (P1c-12).
 // `writesOn`: the writes bound to a connection a store already resolved from its caller's handle (the users, sessions and OAuth stores).
-type HostedStoreOf = HostedStore & { writesOn(c: Database): HostedWrites };
+type HostedStoreOf = RepoHosted & { writesOn(c: Database): HostedWrites };
 function makeHostedStore(db: Database): HostedStoreOf {
   // The child IDs ended since the last take, queued at commit by whichever connection ended them (#475 item 1).
   const ended: { list: EndedChild[] } = { list: [] };
@@ -2697,6 +2712,12 @@ function makeHostedStore(db: Database): HostedStoreOf {
     write: (fn, committed) => queued(db, fn, committed),
     subscribe: () => () => {},
     get: async (r, id) => hostedRow(sqliteOf(r), id),
+    // The single writer serializes every body, so the three lock seams lock nothing here (#807 P3 C8 decision 1): `lock`
+    // reads the row on the Tx, `lockCapacity` only checks its handle, and `grantLive` reads the grant.
+    lock: async (tx, id) => hostedRow(sqliteOf(tx), id),
+    async lockCapacity(tx) { sqliteOf(tx); },
+    grantLive: async (tx, grantId, now) => sqliteOf(tx).query<{ n: number }, [string, number]>(
+      "SELECT 1 AS n FROM oauth_grants WHERE id = ? AND revoked_at IS NULL AND expires_at > ?").get(grantId, now) !== null,
     owned: async (r, id) => sqliteOf(r).query<{ n: number }, [string, string]>(
       "SELECT 1 AS n WHERE EXISTS (SELECT 1 FROM hosted_ownerships WHERE session_id = ?1) OR EXISTS (SELECT 1 FROM hosted_sessions WHERE session_id = ?2)",
     ).get(id, id) !== null,
@@ -2748,6 +2769,8 @@ function makeHostedStore(db: Database): HostedStoreOf {
 
 const launcherOf = (db: Database, id: string) => db.query<{ launcher: number | null }, [string]>("SELECT launcher FROM ids WHERE id = ?").get(id)?.launcher === 1;
 const hostedRow = (db: Database, id: string) => db.query<HostedSession, [string]>("SELECT * FROM hosted_sessions WHERE session_id = ?").get(id) ?? undefined;
+// The columns a hosted row's update may write (HostedPatch), in a fixed order.
+const PATCH_COLUMNS = ["grant_id", "bind_gen", "place", "lease_deadline", "last_seen_at"] as const satisfies readonly (keyof HostedPatch)[];
 // The hosted_alias_lost column each reader's take marks (#453).
 const LOST_READ: Record<LostReader, string> = { agent: "told_at", controller: "seen_at" };
 const hostedLostOf = (db: Database) => (session: string, where: string): HostedLost[] => db.query<{ alias: string; reason: string; was_primary: number }, [string]>(
@@ -2779,17 +2802,20 @@ function hostedWrites(db: Database, ended: { list: EndedChild[] }): HostedWrites
     afterCommit(db, () => { ended.list.push({ id: child, at: now, wake: end.wake, bounces }); });
   };
   const lostOf = hostedLostOf(db);
-  // Marks `where`'s rows' `column` and deletes the rows both readers took.
-  const takeLost = (session: string, where: string, column: string, now: number) => {
-    const lost = lostOf(session, where);
-    if (!lost.length) return lost;
-    db.run(`UPDATE hosted_alias_lost SET ${column} = ? WHERE session_id = ? AND ${where}`, [now, session]);
+  // Marks `where`'s rows' `column` in one statement and returns what it marked, oldest first, so two takers get each row
+  // once between them (#807 P3 C8); then deletes the rows both readers took.
+  const takeLost = (session: string, where: string, column: string, now: number): HostedLost[] => {
+    const taken = db.query<{ alias: string; reason: string; was_primary: number; at: number; seq: number }, [number, string]>(
+      `UPDATE hosted_alias_lost SET ${column} = ? WHERE session_id = ? AND ${where} RETURNING alias, reason, was_primary, at, rowid AS seq`,
+    ).all(now, session).sort((a, b) => a.at - b.at || a.seq - b.seq);
+    if (!taken.length) return [];
     db.run("DELETE FROM hosted_alias_lost WHERE session_id = ? AND told_at IS NOT NULL AND seen_at IS NOT NULL", [session]);
-    return lost;
+    return taken.map(r => ({ alias: r.alias, reason: r.reason, primary: r.was_primary === 1 }));
   };
   return {
-    park(session, now) {
-      db.run("UPDATE hosted_sessions SET parked_at = ? WHERE session_id = ? AND root_session_id IS NOT NULL AND parked_at IS NULL", [now, session]);
+    park(session, now, idleBefore) {
+      return db.run("UPDATE hosted_sessions SET parked_at = ? WHERE session_id = ? AND root_session_id IS NOT NULL AND parked_at IS NULL AND last_seen_at < ?",
+        [now, session, idleBefore]).changes > 0;
     },
     unpark(session, grant, now) {
       db.run("UPDATE hosted_sessions SET parked_at = NULL, grant_id = ?, last_seen_at = ? WHERE session_id = ?", [grant, now, session]);
@@ -2804,25 +2830,32 @@ function hostedWrites(db: Database, ended: { list: EndedChild[] }): HostedWrites
       db.run("INSERT INTO hosted_sessions(session_id, ownership_id, user_id, client_id, grant_id, source_session_id, writes_as, bind_gen, root_session_id, place, lease_deadline, created_at, last_seen_at, suggested) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         [row.session_id, row.ownership_id, row.user_id, row.client_id, row.grant_id, row.source_session_id, row.writes_as, row.bind_gen, row.root_session_id, row.place, row.lease_deadline, row.created_at, row.last_seen_at, row.suggested]);
     },
-    update(row) {
-      db.run("UPDATE hosted_sessions SET grant_id = ?, bind_gen = ?, root_session_id = ?, ownership_id = ?, place = ?, lease_deadline = ?, last_seen_at = ? WHERE session_id = ?",
-        [row.grant_id, row.bind_gen, row.root_session_id, row.ownership_id, row.place, row.lease_deadline, row.last_seen_at, row.session_id]);
+    update(id, patch) {
+      // The column names come from this fixed list, never from the patch's keys.
+      const cols = PATCH_COLUMNS.filter(c => patch[c] !== undefined);
+      if (!cols.length) return;
+      db.run(`UPDATE hosted_sessions SET ${cols.map(c => `${c} = ?`).join(", ")} WHERE session_id = ?`, [...cols.map(c => patch[c]!), id]);
     },
     touch(session, now) {
       db.run("UPDATE hosted_sessions SET last_seen_at = ? WHERE session_id = ?", [now, session]);
     },
     childEnd(session, now, reason) {
       const row = get(session);
-      if (!row?.root_session_id) return;
+      // An eviction re-checks the row it ends: a request that woke the child since the sweep's read keeps it (#807 P3 C8).
+      if (!row?.root_session_id || (reason === "evicted" && row.parked_at === null)) return;
       db.run("DELETE FROM hosted_sessions WHERE session_id = ?", [session]);
       audit(row.root_session_id, "hosted.child_released", { child: session, reason }, now);
       endChild(session, reason, now);
     },
-    end(session, reason, now, deadline) {
+    end(session, reason, now, deadline, idleBefore) {
       const row = get(session);
       if (!row || row.root_session_id || (deadline !== undefined && row.lease_deadline !== deadline)) return false;
+      // An idle end re-checks idleness on the row it ends: a touch since the sweep's read keeps it (#807 P3 C8).
+      if (idleBefore !== undefined && !(row.last_seen_at < idleBefore)) return false;
       testPause(reason === "expired" ? "hosted:lease-expire:in-txn" : "hosted:release:in-txn");
-      const children = db.query<HostedSession, [number]>("DELETE FROM hosted_sessions WHERE ownership_id = ? RETURNING *").all(row.ownership_id);
+      // The children in start order, whatever order the DELETE returns them in.
+      const children = db.query<HostedSession, [number]>("DELETE FROM hosted_sessions WHERE ownership_id = ? RETURNING *").all(row.ownership_id)
+        .sort((a, b) => a.created_at - b.created_at || (a.session_id < b.session_id ? -1 : a.session_id > b.session_id ? 1 : 0));
       db.run("UPDATE hosted_ownerships SET ended_at = ?, end_reason = ? WHERE id = ? AND ended_at IS NULL", [now, reason, row.ownership_id]);
       // A hosted root's ID row is never ended (the ID is the store's), so a tools-only root's writes_as would keep the
       // alias in use (aliasUser, aliasUses) after its ownership ends; the next ownership restates it. The

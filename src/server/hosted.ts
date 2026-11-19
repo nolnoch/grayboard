@@ -18,7 +18,7 @@ import { writeAudit, type AuditAction } from "./audit.ts";
 import { hostedFailure } from "./hosted-diagnostics.ts";
 import { decidePure, recordDecision, type PureRequest } from "./policy.ts";
 import { countRefusal } from "./metrics.ts";
-import type { Read, Tx } from "./store/tx.ts";
+import { isTx, type Read, type Tx } from "./store/tx.ts";
 
 // `facts`: the model and effort the request reports (#364); a key the request leaves out keeps the stored value, and
 // an empty string clears it (#558).
@@ -231,10 +231,14 @@ export function createHostedSessions(application: Application, options: { now?: 
     try { await sweep(true, "nested", tx); } finally { for (const id of own) { const n = inflight.get(id)! - 1; if (n) inflight.set(id, n); else inflight.delete(id); } }
     return await over();
   };
+  // Each takes the capacity lock before its first count (#807 P3 C8 R1): on Postgres two admissions otherwise both
+  // count room for one and both insert.
   async function admitChild(tx: Tx, root: string, own: string[]) {
+    await store.lockCapacity(tx);
     if (await full(tx, async () => (await store.children(tx, root)).filter(r => r.parked_at === null).length >= limits.children, own)) { countRefusal("hosted_child"); throw new ApplicationError("bad_request", childCapacity(root)); }
   }
   async function admit(tx: Tx, authed: AuthedUser, own: string[], root?: string) {
+    await store.lockCapacity(tx);
     const mine = authed.kind === "service" ? limits.service : limits.user;
     if (await full(tx, async () => { const n = await store.counts(tx, authed.user_id); return n.total >= limits.global || n.user >= mine; }, own)) {
       countRefusal("hosted_session");
@@ -283,6 +287,13 @@ export function createHostedSessions(application: Application, options: { now?: 
   async function authorized(p: OAuthPrincipal, r?: Read) {
     if (stopped || !await options.isAuthorized(p, r) || stopped) throw new ApplicationError("unauthenticated", "unauthenticated");
   }
+  // The request's grant, read in a write body that may write a hosted row under it (a root's insert, an unpark, an
+  // attach, a child's insert) before any hosted lock that body takes: on Postgres its revoke then waits for the body, or the
+  // body for the revoke and refuses, so no session outlives its grant's revoke (#807 P3 C8 R4, decision 3). Not inside
+  // `authorized`, which also runs on the pool and in the auth cache.
+  async function grantLive(tx: Tx, p: OAuthPrincipal) {
+    if (!await store.grantLive(tx, p.grantId, now())) throw new ApplicationError("unauthenticated", "unauthenticated");
+  }
   // `later`: a refusal's row, handed to the caller's `refusalRows` (the throw rolls back a row written inside, #452).
   // `wake`: a parked child's request makes it active again; an exchange's selection (`snapshot`) and session_end
   // don't, so ending one is never refused for capacity.
@@ -303,6 +314,12 @@ export function createHostedSessions(application: Application, options: { now?: 
   async function rowFor(tx: Tx, p: OAuthPrincipal, context: SessionContext, later: (write: RefusalRow) => void, create = true, wake = true, declare = true, settled?: { row: HostedSession | undefined }): Promise<HostedSession | undefined> {
     if (!("id" in context)) return undefined;
     let row = settled ? settled.row : await store.get(tx, context.id);
+    // A first request reads its row again under the capacity lock (#807 P3 C8 R1): a racer that created this ID since is
+    // found, not inserted twice (or refused id_collision by hostedRegister).
+    if (!row && create) {
+      await store.lockCapacity(tx);
+      row = await store.get(tx, context.id);
+    }
     if (row) ownRow(p, row, later);
     if (row && row.parked_at !== null && wake) row = await unpark(tx, p, row);
     if (!row && create) {
@@ -505,7 +522,7 @@ export function createHostedSessions(application: Application, options: { now?: 
       if (full) for (const row of await store.disabled(tx)) await store.end(tx, row.session_id, "disabled", t);
       for (const row of await store.expired(tx, t)) await store.end(tx, row.session_id, "expired", t, row.lease_deadline!);
       if (!full) return;
-      for (const row of await store.idle(tx, t - idle)) if (!row.root_session_id && !busy(row.session_id)) await store.end(tx, row.session_id, "idle", t);
+      for (const row of await store.idle(tx, t - idle)) if (!row.root_session_id && !busy(row.session_id)) await store.end(tx, row.session_id, "idle", t, undefined, t - idle);
       // A child idle past the window is parked (#566): it stops counting against its root's capacity and the
       // user's rows, and its next request makes it active again. Roots ended above took their children with them.
       const parkedUnder = new Set<string>();
@@ -519,8 +536,9 @@ export function createHostedSessions(application: Application, options: { now?: 
     // rolls this sweep back. A catch added around either would commit a half-done sweep.
     return body(outer);
   }
+  // The store parks it only if it is still idle (#807 P3 C8 R6): a touch committed since the read keeps it active.
   async function park(tx: Tx, row: HostedSession, parkedUnder: Set<string>) {
-    await store.park(tx, row.session_id, now());
+    if (!await store.park(tx, row.session_id, now(), now() - idle)) return;
     await audit(tx, row.root_session_id!, "hosted.child_parked", { child: row.session_id, ownership: row.ownership_id, idle_ms: now() - row.last_seen_at });
     parkedUnder.add(row.root_session_id!);
   }
@@ -541,7 +559,8 @@ export function createHostedSessions(application: Application, options: { now?: 
   async function settle(tx: Tx, id: string, authed?: number): Promise<{ row: HostedSession | undefined } | undefined> {
     if (stopped) return undefined;
     // No savepoint of its own (#807 P3 A1b): its caller's write body doesn't catch, so a throw fails that whole body.
-    const row = await store.get(tx, id);
+    // Locked (a child's root with it) before the reads its ends and park judge (#807 P3 C8 R2).
+    const row = await store.lock(tx, id);
     if (!row) return { row };
     const root = row.root_session_id ? await store.get(tx, row.root_session_id) : row;
     let ended = false;
@@ -549,7 +568,7 @@ export function createHostedSessions(application: Application, options: { now?: 
       const t = now();
       if (root.user_id !== authed && await repo.users.isDisabled(tx, root.user_id)) { await store.end(tx, root.session_id, "disabled", t); ended = true; }
       else if (root.lease_deadline !== null && root.lease_deadline <= t) { await store.end(tx, root.session_id, "expired", t, root.lease_deadline); ended = true; }
-      else if (root.lease_deadline === null && idleAt(root) && !(await application.hostedHolds(tx, root.session_id)).length) { await store.end(tx, root.session_id, "idle", t); ended = true; }
+      else if (root.lease_deadline === null && idleAt(root) && !(await application.hostedHolds(tx, root.session_id)).length) { await store.end(tx, root.session_id, "idle", t, undefined, t - idle); ended = true; }
     }
     // A root's end may have ended this child with it.
     const child = !row.root_session_id ? undefined : ended ? await store.get(tx, row.session_id) : row;
@@ -580,14 +599,17 @@ export function createHostedSessions(application: Application, options: { now?: 
       if (alive !== undefined && downtime !== null && downtime > LIVE_STALENESS_MS) {
         // Disabled users' roots, by the sweep's query: no users read per row (#807 P3 A7u2).
         const disabled = new Set((await store.disabled(tx)).map(r => r.session_id));
-        for (const row of await store.all(tx)) {
-          if (row.root_session_id || disabled.has(row.session_id)) continue;
+        for (const listed of await store.all(tx)) {
+          if (listed.root_session_id || disabled.has(listed.session_id)) continue;
+          // Locked and read again, so the credit is computed from the row it writes (#807 P3 C8 R2).
+          const row = await store.lock(tx, listed.session_id);
+          if (!row || row.root_session_id || row.parked_at !== null) continue;
           let credit: { field: "lease_deadline" | "last_seen_at"; before: number; after: number } | undefined;
           if (row.lease_deadline !== null) {
             if (row.lease_deadline > alive) credit = { field: "lease_deadline", before: row.lease_deadline, after: Math.min(row.lease_deadline + downtime, t + leaseTtl) };
           } else if (row.last_seen_at > alive - idle) credit = { field: "last_seen_at", before: row.last_seen_at, after: Math.min(row.last_seen_at + downtime, t) };
           if (!credit || credit.after <= credit.before) continue;
-          await store.update(tx, { ...row, [credit.field]: credit.after });
+          await store.update(tx, row.session_id, credit.field === "lease_deadline" ? { lease_deadline: credit.after } : { last_seen_at: credit.after });
           await audit(tx, row.session_id, "hosted.lease_restart_credit", { ownership: row.ownership_id, field: credit.field, downtime_ms: downtime, before: credit.before, after: credit.after });
           credited++;
         }
@@ -661,6 +683,7 @@ export function createHostedSessions(application: Application, options: { now?: 
         // current when rowFor reads it.
         const pending = store.write(async tx => {
           if (waited || stale) await authorized(p, tx);
+          await grantLive(tx, p);
           // authorized(p) passed with no commit to the auth tables since: settle skips p's own disabled read (#881).
           const settled = await settle(tx, context.id, p.authed.user_id);
           try { return { row: await tx.savepoint(async sp => { const r = await rowFor(sp, p, context, later.defer, create, wake, declare, settled); return r && { r, seen: await touch(sp, r) }; }) }; }
@@ -721,14 +744,15 @@ export function createHostedSessions(application: Application, options: { now?: 
   }
   async function attach(tx: Tx, p: OAuthPrincipal, row: HostedSession): Promise<HostedSession> {
     await authorized(p, tx);
-    const fresh = await store.get(tx, row.session_id);
+    // The root, locked before it is read (#807 P3 C8 R2, R3): an end can't delete it under a child this body registers.
+    const fresh = await store.lock(tx, row.session_id);
     if (!fresh) throw new ApplicationError("unbound", "unbound; bind again");
     rootOnly(fresh);
     await fence(tx, p, row, row);
     if (fresh.grant_id === p.grantId) return fresh;
     testPause("hosted:attach:in-txn");
     await authorized(p, tx);
-    for (const child of await store.ofOwnership(tx, fresh.ownership_id)) await store.update(tx, { ...child, grant_id: p.grantId });
+    for (const child of await store.ofOwnership(tx, fresh.ownership_id)) await store.update(tx, child.session_id, { grant_id: p.grantId });
     await audit(tx, row.session_id, "hosted.grant_attached", { from: fresh.grant_id, to: p.grantId, ownership: fresh.ownership_id });
     // The lease is tied to the grant (delivery.ts), so a reattach closes one only if it was open.
     if (fresh.lease_deadline !== null) await audit(tx, row.session_id, "hosted.lease_closed", { reason: "reattached" });
@@ -752,7 +776,9 @@ export function createHostedSessions(application: Application, options: { now?: 
   async function fence(r: Read, p: OAuthPrincipal, row: HostedSession | undefined, root: HostedSession | undefined) {
     await authorized(p, r);
     if (!row || !root) return;
-    const fresh = await store.get(r, row.session_id);
+    // In a body (a Tx) the row is locked, its root first, so what the body then writes is judged on the current row
+    // (#807 P3 C8 R2); on the pool it is only read.
+    const fresh = isTx(r) ? await store.lock(r, row.session_id) : await store.get(r, row.session_id);
     const current = fresh ? await rootOf(r, fresh) : undefined;
     if (!fresh || fresh.ownership_id !== row.ownership_id || fresh.root_session_id !== row.root_session_id || !current || current.session_id !== root.session_id || current.ownership_id !== root.ownership_id || current.bind_gen !== root.bind_gen || (current.lease_deadline !== null && current.lease_deadline <= now())) throw new ApplicationError("unbound", "session binding changed; select the current binding again");
   }
@@ -883,7 +909,7 @@ export function createHostedSessions(application: Application, options: { now?: 
         // every open's cap check); its own failure isn't a rollback, so it flushes no refusal rows.
         let done = false;
         try {
-          return await store.write(async tx => fn(await attach(tx, p, row), late.defer, tx), (result: T) => { done = true; return committed ? committed(result) : result as unknown as R; });
+          return await store.write(async tx => { await grantLive(tx, p); return fn(await attach(tx, p, row), late.defer, tx); }, (result: T) => { done = true; return committed ? committed(result) : result as unknown as R; });
         } catch (error) { if (!done) await late.flushQueued(); throw error; }
       });
     },
@@ -931,7 +957,8 @@ export function createHostedSessions(application: Application, options: { now?: 
         const holder = address ? await application.aliasHolderId(tx, address) : null;
         const other = holder && holder !== row.session_id ? await store.get(tx, holder) : undefined;
         if (other && !other.root_session_id && ((other.lease_deadline !== null && other.lease_deadline <= now()) || (other.lease_deadline === null && idleAt(other)))) {
-          await store.end(tx, other.session_id, other.lease_deadline === null ? "idle" : "expired", now());
+          // The guard the end re-checks on the row it locks: the lease it saw lapse, or the idleness it saw.
+          await (other.lease_deadline === null ? store.end(tx, other.session_id, "idle", now(), undefined, now() - idle) : store.end(tx, other.session_id, "expired", now(), other.lease_deadline));
         }
         const selected = await application.hostedSession(tx, p.authed, row.session_id, before, row.writes_as, row, quietSink);
         selected.session.afterRollback = defer;
@@ -939,7 +966,8 @@ export function createHostedSessions(application: Application, options: { now?: 
           const ok = await application.bindNow(tx, selected.session, { alias: normalized.name, create: args.create === true, ...(args.meta === undefined ? {} : { meta: args.meta }) });
           const added = ok.held.length !== before.length;
           // `where` restates the place even when the name was already held (a re-bind), as on the other surfaces.
-          if (added || args.where !== undefined) await store.update(tx, { ...row, bind_gen: row.bind_gen + (added ? 1 : 0), place: args.where ?? row.place });
+          // Only the columns it changes (#807 P3 C8 decision 2), on attach's locked read of the row.
+          if (added || args.where !== undefined) await store.update(tx, row.session_id, { ...(added ? { bind_gen: row.bind_gen + 1 } : {}), ...(args.where !== undefined ? { place: args.where } : {}) });
           if (args.where !== undefined) await application.hostedPlace(tx, row.session_id, args.where);
           if (added && row.lease_deadline !== null) await audit(tx, row.session_id, "hosted.lease_closed", { reason: "rebound" });
           // A lost hold bound again is no longer lost: neither reader is told it, and the Controller keeps it (#453).
@@ -976,7 +1004,7 @@ export function createHostedSessions(application: Application, options: { now?: 
           const ok = await application.unbind(tx, selected.session, args.name);
           if (ok.released) {
             // Its last hold gone, the root is unbound but owning: no lease, so the sweep doesn't expire it.
-            await store.update(tx, { ...row, bind_gen: row.bind_gen + 1, lease_deadline: ok.held.length ? row.lease_deadline : null });
+            await store.update(tx, row.session_id, { bind_gen: row.bind_gen + 1, ...(ok.held.length ? {} : { lease_deadline: null }) });
             if (row.lease_deadline !== null) await audit(tx, row.session_id, "hosted.lease_closed", { reason: "unbound" });
           }
           return { ok, before, ownership: row.ownership_id, suggested: row.suggested };
@@ -1012,13 +1040,15 @@ export function createHostedSessions(application: Application, options: { now?: 
         const later = refusalRows();
         try { return await store.write(async tx => {
           await authorized(p, tx);
+          await grantLive(tx, p);
           testPause("hosted:register:in-txn");
           const root = (await rowFor(tx, p, context, later.defer))!;
           if (root.root_session_id) throw new ApplicationError("root_is_child", `session ${root.session_id} is itself registered under ${root.root_session_id}; register ${childId} under ${root.root_session_id}.`);
           // An external end/recreate of the root while this waited refuses it (a convert is root_is_child above);
           // a rebind of the same ownership (bind_gen) is what the gate made it wait for, not a change.
           if (before && root.ownership_id !== before.ownership_id) throw new ApplicationError("unbound", "session binding changed; select the current binding again");
-          const existing = await store.get(tx, childId);
+          // Locked (its root first, when it is a child) before it is judged and ended or re-registered (#807 P3 C8 R2).
+          const existing = await store.lock(tx, childId);
           if (existing) ownRow(p, existing, later.defer, root.session_id);
           const childHolds = existing ? await application.hostedHolds(tx, childId) : [];
           if (existing && (childHolds.length || existing.writes_as)) throw new ApplicationError("child_bound", `session ${childId} holds ${childHolds.length ? childHolds.map(h => `"${h}"`).join(", ") : `nothing, writing as "${existing.writes_as}",`} as its own root (bound ${new Date(existing.created_at).toISOString()}${existing.place ? `, in ${existing.place}` : ""}); end it with session_end from that session, or leave it as its own root.`);

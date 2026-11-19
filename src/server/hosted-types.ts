@@ -1,5 +1,6 @@
-import type { Read, Tx } from "./store/tx.ts";
-import type { MessageRow, Sync } from "./db.ts";
+// The hosted rows' types. The group's interface is store/hosted.ts's (#807 P3 C8a), re-exported here for its callers.
+import type { MessageRow } from "./store/messages.ts";
+export type { HostedPatch, HostedStore } from "./store/hosted.ts";
 export type HostedSession = {
   session_id: string; ownership_id: number; user_id: number; client_id: string; grant_id: string;
   source_session_id: string; writes_as: string | null; bind_gen: number; root_session_id: string | null;
@@ -20,74 +21,3 @@ export type HostedLost = { alias: string; reason: string; primary: boolean };
 // Who reads a lost hold: the agent (the notice, taken once) and the root's Controller (reported by every
 // subscriber whoami until its next delivery_open acknowledges it, so a lost response can't lose it).
 export type LostReader = "agent" | "controller";
-export interface HostedStore {
-  // One IMMEDIATE transaction through the server's write queue, for a transaction's outermost caller (Repo.write): `committed` runs
-  // after the commit, before the queue's next body. fn may be async: `committed` gets its resolved value.
-  write<T, R = T>(fn: (tx: Tx) => Promise<T>, committed?: (value: T) => R): Promise<Awaited<R>>;
-  write<T, R = T>(fn: (tx: Tx) => Sync<T>, committed?: (value: T) => R): Promise<Awaited<R>>;
-  // Told after each commit that changed a row (#399): its session ID, or null when any row may have (a grant or
-  // user change). A touch (`touch`) tells nothing: nothing that observes rows reads `last_seen_at`.
-  // With `read`, a named row's notice carries `read`'s answer on the committing transaction, just before its COMMIT
-  // (#807 P3 A7g1); undefined when the read failed or the body was synchronous.
-  subscribe<F>(fn: (changed: string | null, facts?: F) => void, read?: (tx: Tx, id: string) => Promise<F>): () => void;
-  // The store's reads all return promises, on the caller's handle (#807 P3 A7h1).
-  get(r: Read, id: string): Promise<HostedSession | undefined>;
-  // Whether the session ID is a hosted session's: a root's ownership row
-  // stays after it ends; a child's row only while it is registered.
-  owned(r: Read, id: string): Promise<boolean>;
-  // Every row but parked children (#566): the row set the limits count (`counts`) and the sweeps scan. `get` still returns a
-  // parked row, and `children` lists a root's children, parked or not.
-  all(r: Read): Promise<HostedSession[]>;
-  // What admission counts, without loading rows (#805): unparked rows on the server and the user's. The user's is
-  // O(own rows) on idx_hosted_user; the server's walks idx_hosted_parked, bounded by the global row cap.
-  counts(r: Read, user: number): Promise<{ total: number; user: number }>;
-  // An ownership's unparked rows (idx_hosted_ownership): what a grant re-attach moves.
-  ofOwnership(r: Read, ownership: number): Promise<HostedSession[]>;
-  children(r: Read, root: string): Promise<HostedSession[]>;
-  // A user's live roots, oldest first (#475): peer_list's unbound sessions are those holding nothing.
-  roots(r: Read, user: number): Promise<HostedSession[]>;
-  // Park an idle child, or make a parked one active again under its root's current grant (#566).
-  park(tx: Tx, session: string, now: number): Promise<void>;
-  unpark(tx: Tx, session: string, grant: string, now: number): Promise<void>;
-  insert(tx: Tx, row: HostedSession): Promise<void>;
-  update(tx: Tx, row: HostedSession): Promise<void>;
-  // Activity only: `last_seen_at`, observed by no one (#399).
-  touch(tx: Tx, session: string, now: number): Promise<void>;
-  // The sweep's candidates by query, not by scanning every row (#399): roots whose lease lapsed by `now`; idle
-  // unparked rows (children, and roots with no lease and no hold) last seen before `cutoff`; disabled users' roots.
-  expired(r: Read, now: number): Promise<HostedSession[]>;
-  idle(r: Read, cutoff: number): Promise<HostedSession[]>;
-  disabled(r: Read): Promise<HostedSession[]>;
-  // `suggested`: the ownership's suggested name (#443), recorded in its `hosted.ownership_started` audit (#522).
-  start(tx: Tx, session: string, user: number, client: string, now: number, suggested?: string | null): Promise<number>;
-  end(tx: Tx, session: string, reason: HostedEnd, now: number, deadline?: number): Promise<boolean>;
-  // A child's release, or a root's end (each of its children), ends the child's ID in the same transaction.
-  childEnd(tx: Tx, session: string, now: number, reason: ChildEnd): Promise<void>;
-  // The child IDs ended since the last take: the application's post-commit wakes and bounce deliveries.
-  takeEnded(): EndedChild[];
-  // A root's lost holds `reader` hasn't taken, oldest first (#453). `lose` records one in the revocation's
-  // transaction (restating an alias already pending, for both readers); `lost` reads them; `tellLost` takes the
-  // agent's; `reportLost` returns the Controller's, marking them reported; `seeLost` takes the reported ones (its
-  // delivery_open: the Controller applied them before opening); `forgetLost` drops an alias the root bound again.
-  // A hold both readers took is deleted.
-  lose(tx: Tx, session: string, lost: HostedLost, now: number): Promise<void>;
-  lost(r: Read, session: string, reader: LostReader): Promise<HostedLost[]>;
-  tellLost(tx: Tx, session: string, now: number): Promise<HostedLost[]>;
-  reportLost(tx: Tx, session: string, now: number): Promise<HostedLost[]>;
-  seeLost(tx: Tx, session: string, now: number): Promise<HostedLost[]>;
-  forgetLost(tx: Tx, session: string, alias: string): Promise<void>;
-  // The server's last recorded liveness (epoch ms), absent before the first
-  // heartbeat on this schema. A restart credits leases with the downtime (#423).
-  aliveAt(r: Read): Promise<number | undefined>;
-  heartbeat(tx: Tx, now: number): Promise<void>;
-  // The hosted facts on a session's `ids` row (#807 P1c-15a): a child's root (#523), an ended ID live again (#475 item 7a),
-  // a tools-only root's writes_as (A4) and its ownership's launcher flag (#473, #520). `declareLauncher`: whether it turned
-  // the flag on.
-  setRoot(tx: Tx, id: string, root: string | null): Promise<void>;
-  reopenId(tx: Tx, id: string): Promise<void>;
-  restateWritesAs(tx: Tx, id: string, writesAs: string): Promise<void>;
-  declareLauncher(tx: Tx, id: string): Promise<boolean>;
-  launcher(r: Read, id: string): Promise<boolean>;
-  // Every session's holds, oldest first: the hosted sweep's and reconcile's.
-  holds(r: Read): Promise<{ id: string; address: string }[]>;
-}
