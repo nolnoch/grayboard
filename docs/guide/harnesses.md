@@ -88,3 +88,42 @@ bun src/cli/main.ts setup-opencode \
 Supply the HTTPS URL, selected config and full Git revision; the helper never invents a self-referential or unpublished pin. Alternatively replace `--revision` with `--plugin /absolute/installed/grayboard-opencode`. No client ID or name is required. An existing Grayboard plugin entry's `mcpName` option names the native server it writes (default `grayboard`). Optional `--name fe` (lowercased, like every other name) configures that new-root binding with `create:false`; only `--name fe --create` permits creation, and neither enrolls delivery. `--launcher` declares the root a delegation launcher (plugin option `launcher: true`) and `--no-launcher` removes it; with neither, an existing declaration is kept. The dry run says whether the config would change and how many carried adapters it would disable; then remove `--dry-run` to apply; no implicit global config selection, package installation, login or connection attempt occurs. Add `--migrate` only to change recognized Grayboard registrations (re-pinning `--revision` on an already configured scope counts) or disable an exactly recognized carried adapter. Config and moved adapters use unique, non-overwriting `.grayboard-backup` (then numbered) backups, whose actual paths are printed. Older backups never block a later migration or retry. Only exact carried or released adapter sources are recognized; custom code is not. Intentional adapter symlinks are left unchanged and require explicitly removing the link before hosted migration, never deleting its target. Custom commands/files, conflicting JSON/JSONC definitions, symlinked config targets and a config with other hard links (writing it would detach them) require manual resolution. Concurrent user replacements are never overwritten during rollback. A failed migration retains every newly created config-backup pathname without deleting or rewriting it—even if another process edited or replaced it—and requests manual recovery; inspect the selected config and backups before retrying. The helper checks only the selected file and its sibling, not every ancestor/managed scope; the plugin independently revalidates effective host configuration.
 
 Delivery is at-least-once admission, not exactly-once processing. A hosted session's bind owns the name, even without a delivery lease; `delivery_open` only attaches the bound root as its push target. The subscriber listens before reconciling pending items and receipts only after durable root-inbox acceptance with a stable ID. A receipt is not `dm_ack`. Digests use `resume:false` to avoid waking an idle model, but may be evaluated when a later actionable item runs. Public binding checks and host admission are not atomic: an already-authorized in-flight call may still write or wake that same approved root after pause, bind, unbind, revocation or drift. The subscriber stops new admission after observed drift, never retargets that call, and suppresses stale receipts; it cannot recall a committed write or wake. OpenCode 2.1.4's native refresh-concurrency limitation remains; the plugin cannot fix or take over native refresh. OpenCode 2.1.4 refreshes a native token only when a request is refused, so an idle root's token can expire unrefreshed: after a grace of up to 10 seconds `/grayboard-status` shows the root paused with `native_access_expired`, the plugin asks OpenCode to reconnect the `grayboard` entry once (never during a native grayboard call, which a reconnect would cut off), and delivery resumes on its own once the refreshed token is stored, with the root's names taken back where nobody else holds them. A changed account, a sign-out or `/grayboard-pause` during that wait stops it; after an hour of waiting it stays paused until a reload or `/grayboard-enroll`. The reconnect changes only the entry's catalog timeout, by one millisecond, and changes it back on the next one. Explicit pause releases ownership promptly; shutdown may rely on the bounded server lease expiry. See the [package guide](../../adapters/opencode-v2/README.md) for binding and recovery details and [development gates](../../CONTRIBUTING.md) for verification boundaries.
+
+### OpenCode V2 as a service (no browser)
+
+A launcher (a CI step, a broker) can run OpenCode as a [service](server.md#admins-and-roles) with a run token instead of a person's sign-in. **Static mode trusts the repository OpenCode opens, and the agent itself, as much as the launcher:** either can read the run token and act as the service until it expires. Run it only on repositories you trust, or isolate the run (below).
+
+Add the credential with `--source opencode` and `--token-seconds` set to about one run's length, mint a token per run, and start OpenCode with a per-run global config directory the launcher writes:
+
+```sh
+TOKEN="$(curl -fsS -u "$CLIENT_ID:$CLIENT_SECRET" -d grant_type=client_credentials \
+  https://grayboard.example.com/oauth/token | jq -r .access_token)"
+export GRAYBOARD_OPENCODE_AUTH=static
+export GRAYBOARD_OPENCODE_ISSUER=https://grayboard.example.com
+export GRAYBOARD_OPENCODE_PRINCIPAL=ingest
+export GRAYBOARD_RUN_TOKEN="$TOKEN"
+OPENCODE_CONFIG_DIR="$RUN_DIR/config" opencode …
+# when the run ends:
+curl -fsS -u "$CLIENT_ID:$CLIENT_SECRET" --data-urlencode "token=$TOKEN" https://grayboard.example.com/oauth/revoke
+```
+
+with `$RUN_DIR/config/opencode.json`:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugins": [{ "package": "github:nolnoch/grayboard#<reviewed full commit>::path:adapters/opencode-v2" }],
+  "mcp": {
+    "servers": {
+      "grayboard": {
+        "type": "remote",
+        "url": "https://grayboard.example.com/mcp",
+        "oauth": false,
+        "headers": { "Authorization": "Bearer {env:GRAYBOARD_RUN_TOKEN}" }
+      }
+    }
+  }
+}
+```
+
+`GRAYBOARD_OPENCODE_ISSUER` is the server's issuer: its `GRAYBOARD_PUBLIC_URL`, as its protected-resource metadata lists it. `GRAYBOARD_OPENCODE_PRINCIPAL` is the service's name; with it set, only that service's token enrolls a root. Static mode is read only from those environment variables, never from plugin options or a repository's `.env`: one that sets any of them refuses the mode. Every new root session enrolls by itself once the server confirms the token is the service's; bind it to one of the service's names as usual (`bind("w-1", create: true)` makes `ingest/w-1`). There is no refresh: when the token expires or the credential is revoked, every root pauses and says the launcher must start a new run with a fresh token. `OPENCODE_CONFIG_DIR` replaces only your global config: OpenCode still loads `opencode.json` and `.opencode/` from the repository and every directory above it, and a repository's entry, plugin or local MCP server can read the token (through `{env:}`, `{file:/proc/self/environ}` or the environment itself), as can the agent's shell. A per-run config dir or variable name doesn't stop that. For an untrusted repository, isolate the run: drive OpenCode through its SDK with project config off (`project: false`), or run it in a sandbox whose network reaches only your grayboard server and the model provider. Keep the token short-lived and revoke it at the end of the run, as above. `grayboard setup-opencode` leaves such an entry alone. Mechanism: [`adapters-hosted-login.md`](../adapters-hosted-login.md#opencode-v2-static-mode).

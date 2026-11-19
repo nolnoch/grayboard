@@ -910,7 +910,8 @@ export function createHostedSessions(application: Application, options: { now?: 
         // An await after `held` (#807 P3 A7g2; `root` was read before takeLost's): candidates are hints, so a bind
         // landing meanwhile only makes them a moment newer than `held`.
         const offered = !(root && named(root, held)) && !row?.root_session_id ? await application.hostedCandidates(repo.read, p.authed, root?.suggested ?? null) : undefined;
-        return { id: row?.session_id ?? null, principal: p.authed.user_email, held, primary: root?.writes_as ?? held[0] ?? null, ownership: root?.ownership_id ?? null, ...(lost.length ? { alias_lost: lost } : {}),
+        // `principal_kind` (#270 D3): OpenCode V2's static mode enrolls a root without a human only for a service.
+        return { id: row?.session_id ?? null, principal: p.authed.user_email, principal_kind: p.authed.kind, held, primary: root?.writes_as ?? held[0] ?? null, ownership: root?.ownership_id ?? null, ...(lost.length ? { alias_lost: lost } : {}),
           ...(root?.writes_as ? { writes_as: root.writes_as } : {}),
           ...(row?.root_session_id ? { root: root?.session_id, child: true } : {}),
           // A child binds nothing, so it isn't offered names to bind (#523).

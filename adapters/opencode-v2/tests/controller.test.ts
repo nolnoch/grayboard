@@ -2,7 +2,7 @@ import { expect, spyOn, test } from "bun:test";
 import assert from "node:assert/strict";
 import { Client } from "@modelcontextprotocol/client";
 import type { Context } from "@opencode/plugin/promise/plugin";
-import { OpenCodeController as Controller, OPENCODE_SESSION } from "../src/lifecycle.js";
+import { OpenCodeController as Controller, OPENCODE_SESSION, setup as setupPlugin, STATIC_AUTH, STATIC_ISSUER } from "../src/lifecycle.js";
 import { Controller as CoreController } from "../src/core/controller.js";
 import { Diagnostics, failureCode, failureMessage as failureMessageWith } from "../src/core/diagnostics.js";
 const failureMessage = (error: unknown) => failureMessageWith(error, "explicitly enroll again");
@@ -10,7 +10,7 @@ import { observeEvents } from "../src/core/events.js";
 import { Wire, LAUNCHER_META, SUGGESTED_META, LeaseUnavailable, ServerUnreachable, SubscriberError } from "../src/core/wire.js";
 import { Approval, METADATA, enrollmentHash, type OpenCodeEnrollment as Enrollment } from "../src/approval.js";
 import { AccessExpired, type Item } from "../src/core/model.js";
-import { SIGN_IN } from "../src/binding.js";
+import { NEW_RUN, SIGN_IN, type StaticMode } from "../src/binding.js";
 class NativeAccessExpired extends AccessExpired { constructor() { super("OpenCode", SIGN_IN); } }
 import { fixture } from "./native-fixture.js";
 import { until } from "./until.ts";
@@ -20,7 +20,7 @@ import { barrier, bounded } from "./reload-state.js";
 import { afterProducers } from "./causal.js";
 
 type Row = { held: string[]; ownership: number; generation: number; capability?: string };
-function runtime(options: { name?: string; create?: boolean } = {}, wait?: (ms: number, signal: AbortSignal) => Promise<void>) {
+function runtime(options: { name?: string; create?: boolean; static?: StaticMode } = {}, wait?: (ms: number, signal: AbortSignal) => Promise<void>) {
   const f = fixture(), rows = new Map<string, Row>(), nodes = new Map<string, { id: string; parentID?: string; time: { archived?: number }; metadata: Record<string, unknown> }>();
   const storage = new Map<string, unknown>(), calls: { sessionID: string; name: string; args: Record<string, unknown> }[] = [], admissions: { sessionID: string; id: string; resume: boolean }[] = [];
   const batches = new Map<string, Item[]>();
@@ -1289,4 +1289,98 @@ test("outer CodeMode execute and malformed native output never open a lease", as
     await r.controller.after({ sessionID: "R", tool: "grayboard_bind", id: "call", status: "completed", result: { output: { name: "be" } } });
     expect(r.calls.filter(c => c.name === "delivery_open")).toHaveLength(0);
   } finally { await r.controller.close(); }
+});
+
+// Static service-credential mode (#270 D3): a new root enrolls itself only when the pinned issuer vouches for the
+// entry and the server's whoami calls the run token's principal a service. principalKind's whoami goes over a real
+// NativeWire, whose client's connect and callTool are stubbed here; the delivery wires are the runtime's FakeWire.
+async function staticRuntime(kind: unknown, mode: StaticMode = { issuer: "https://grayboard.example.com" }, metadata: unknown = { resource: "https://grayboard.example.com/mcp", authorization_servers: ["https://grayboard.example.com"] }, answered: (f: ReturnType<typeof runtime>["f"]) => void = () => {}) {
+  const token = "run-token-CANARY-0123456789abcdef";
+  const r = runtime({ static: mode });
+  r.f.config.oauth = false;
+  r.f.config.headers.Authorization = `Bearer ${token}`;
+  const fetch0 = globalThis.fetch, asked: { name: string; meta: unknown }[] = [];
+  globalThis.fetch = (async () => Response.json(metadata)) as unknown as typeof fetch;
+  const connect = spyOn(Client.prototype, "connect").mockResolvedValue(undefined);
+  const close = spyOn(Client.prototype, "close").mockResolvedValue(undefined);
+  const callTool = spyOn(Client.prototype, "callTool").mockImplementation((async (params: { name: string; _meta?: unknown }) => {
+    asked.push({ name: params.name, meta: params._meta });
+    answered(r.f);
+    return { content: [{ type: "text", text: JSON.stringify({ id: null, principal: "svc", principal_kind: kind, held: [] }) }] };
+  }) as unknown as Client["callTool"]);
+  const restore = async () => { await r.controller.close(); globalThis.fetch = fetch0; connect.mockRestore(); close.mockRestore(); callTool.mockRestore(); };
+  return { r, token, asked, restore };
+}
+const rootRecord = (c: Controller, id: string) => c.status().roots.find(root => root.sessionID === id);
+test("static mode: a root whose run token is a service's enrolls itself on creation; its whoami starts no hosted session", async () => {
+  const s = await staticRuntime("service");
+  try {
+    await s.r.controller.observe("session.created", { sessionID: "R" });
+    expect(s.asked).toEqual([{ name: "whoami", meta: undefined }]);
+    expect(savedRoots(s.r.storage)).toHaveLength(1);
+    expect(s.r.controller.enrollment("R")).toMatchObject({ integrationID: "static", connectionID: "static", configuration: { issuer: "https://grayboard.example.com" } });
+    // A subagent never enrolls on its own: its root's enrollment covers it.
+    await s.r.controller.observe("session.created", { sessionID: "C" });
+    expect(s.asked).toHaveLength(1);
+    const written = JSON.stringify([...s.r.storage.entries()]) + JSON.stringify([...s.r.nodes.values()]) + JSON.stringify(s.r.controller.status());
+    expect(written).not.toContain(s.token);
+  } finally { await s.restore(); }
+});
+test.each([["user"], [undefined], ["SERVICE"]])("static mode: a run token whose principal_kind is %j never enrolls a root by itself", async kind => {
+  const s = await staticRuntime(kind);
+  try {
+    await s.r.controller.observe("session.created", { sessionID: "R" });
+    expect(s.asked).toHaveLength(1);
+    expect(savedRoots(s.r.storage)).toEqual([]);
+    expect(s.r.controller.enrollment("R")).toBeUndefined();
+    expect(s.r.calls).toEqual([]);
+    expect(rootRecord(s.r.controller, "R")).toMatchObject({ state: "unenrolled", operation: "enroll", code: "refused" });
+  } finally { await s.restore(); }
+});
+test.each([
+  ["no pinned issuer", { refused: "Static mode needs a pinned issuer (GRAYBOARD_OPENCODE_ISSUER)" }, undefined],
+  ["metadata naming another issuer", undefined, { resource: "https://grayboard.example.com/mcp", authorization_servers: ["https://elsewhere.example.com"] }],
+] as const)("static mode with %s asks no whoami and enrolls nothing", async (_name, mode, metadata) => {
+  const s = await staticRuntime("service", mode, metadata);
+  try {
+    await s.r.controller.observe("session.created", { sessionID: "R" });
+    expect(s.asked).toEqual([]);
+    expect(savedRoots(s.r.storage)).toEqual([]);
+    expect(rootRecord(s.r.controller, "R")).toMatchObject({ state: "unenrolled", operation: "enroll" });
+  } finally { await s.restore(); }
+});
+// #270 audit F3: with GRAYBOARD_OPENCODE_PRINCIPAL set, only that service's run token enrolls a root by itself.
+test.each([["svc", true], ["ingest", false]] as const)("static mode with the launcher's principal %j: whoami's principal \"svc\" enrolls: %j", async (principal, enrolls) => {
+  const s = await staticRuntime("service", { issuer: "https://grayboard.example.com", principal });
+  try {
+    await s.r.controller.observe("session.created", { sessionID: "R" });
+    expect(s.asked).toHaveLength(1);
+    expect(savedRoots(s.r.storage)).toHaveLength(enrolls ? 1 : 0);
+    if (!enrolls) {
+      expect(s.r.controller.enrollment("R")).toBeUndefined();
+      expect(rootRecord(s.r.controller, "R")).toMatchObject({ state: "unenrolled", operation: "enroll", code: "refused" });
+    }
+  } finally { await s.restore(); }
+});
+// #270 audit F4: the enrollment's capture must read the entry whose token whoami checked; a token swapped in between
+// (a config reload) is refused, never enrolled unchecked.
+test("static mode refuses to enroll when the entry's run token changed between the kind check and the enrollment", async () => {
+  const s = await staticRuntime("service", undefined, undefined, f => { f.config.headers.Authorization = "Bearer run-token-SWAPPED-0123456789abcdef"; });
+  try {
+    await s.r.controller.observe("session.created", { sessionID: "R" });
+    expect(s.asked).toHaveLength(1);
+    expect(savedRoots(s.r.storage)).toEqual([]);
+    expect(s.r.controller.enrollment("R")).toBeUndefined();
+    expect(rootRecord(s.r.controller, "R")).toMatchObject({ state: "unenrolled", operation: "enroll", message: "Native binding changed during enrollment; explicitly enroll again" });
+    // The expectation doesn't outlive the attempt: a later explicit enroll reads the entry afresh.
+    await s.r.controller.enroll("R");
+    expect(s.r.controller.enrollment("R")).toBeDefined();
+  } finally { await s.restore(); }
+});
+test("static mode tells the person to start a new run, not to sign in through OpenCode", async () => {
+  const r = runtime({ static: { issuer: "https://grayboard.example.com" } }), oauth = runtime();
+  try {
+    expect(r.controller.port.loginAction).toBe(NEW_RUN);
+    expect(oauth.controller.port.loginAction).toBe(SIGN_IN);
+  } finally { await r.controller.close(); await oauth.controller.close(); }
 });
