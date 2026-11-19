@@ -36,13 +36,13 @@ export const outcome = (s: Settled<unknown>) => s.ok ? s.value : `threw ${s.erro
 // this message rather than on bun's bare timeout.
 export const BLOCK_WAIT_MS = 3000;
 
-// Polls until store B is blocked on a lock in this pair's database, or `settled()` says B finished. Returns the lock's
-// kind (`transactionid`, `advisory`, `tuple`…), or null when B settled without being seen blocked.
-export async function blockedOrSettled(p: PgPair, settled: () => boolean, what = "B blocked on a lock, or settled"): Promise<string | null> {
+// Polls until store B (or `side`'s store) is blocked on a lock in this pair's database, or `settled()` says it finished.
+// Returns the lock's kind (`transactionid`, `advisory`, `tuple`…), or null when it settled without being seen blocked.
+export async function blockedOrSettled(p: PgPair, settled: () => boolean, what = "B blocked on a lock, or settled", side: "a" | "b" = "b"): Promise<string | null> {
   let waitEvent: string | null = null;
   await until(async () => {
     const [w] = await p.db.sql`SELECT wait_event FROM pg_stat_activity
-      WHERE datname = ${p.db.name} AND application_name = 'gb-test-b' AND wait_event_type = 'Lock'`;
+      WHERE datname = ${p.db.name} AND application_name = ${`gb-test-${side}`} AND wait_event_type = 'Lock'`;
     if (w) waitEvent = w.wait_event as string;
     return waitEvent !== null || settled();
   }, BLOCK_WAIT_MS, what);
@@ -50,24 +50,26 @@ export async function blockedOrSettled(p: PgPair, settled: () => boolean, what =
 }
 
 // `first` runs on store A and holds its transaction open after its body; `second` runs on store B. `waited`: B was
-// seen blocked on a lock while A held, and `waitEvent` the lock's kind.
-export async function race<TA, TB>(p: PgPair, first: (tx: Tx) => Promise<TA>, second: (tx: Tx) => Promise<TB>):
-  Promise<{ a: Settled<TA>; b: Settled<TB>; waited: boolean; waitEvent: string | null }> {
+// seen blocked on a lock while A held, and `waitEvent` the lock's kind. `whileHeld`: run once B is blocked or settled,
+// before A is released (a third connection's look at what B holds while it waits); its result is `seen`.
+export async function race<TA, TB, TS = undefined>(p: PgPair, first: (tx: Tx) => Promise<TA>, second: (tx: Tx) => Promise<TB>, whileHeld?: () => Promise<TS>):
+  Promise<{ a: Settled<TA>; b: Settled<TB>; waited: boolean; waitEvent: string | null; seen?: TS }> {
   const held = gate(), release = gate();
   const a = settle(p.a.write(async tx => { const v = await first(tx); held.open(); await release.wait; return v; }));
-  let b: Promise<Settled<TB>>, waitEvent: string | null;
+  let b: Promise<Settled<TB>>, waitEvent: string | null, seen: TS | undefined;
   try {
     // A body that fails before holding settles A instead.
     await Promise.race([held.wait, a]);
     let done = false;
     b = settle(p.b.write(second)).finally(() => { done = true; });
     waitEvent = await blockedOrSettled(p, () => done);
+    if (whileHeld) seen = await whileHeld();
   } finally {
     // Even when the poll times out: A's transaction must not stay open into the pair's dispose, which would wait on it
     // past bun's timeout and lose the poll's message.
     release.open();
   }
-  return { a: await a, b: await b, waited: waitEvent !== null, waitEvent };
+  return { a: await a, b: await b, waited: waitEvent !== null, waitEvent, seen };
 }
 
 // The race's A side must have committed: its failure is the test's, not the race's.
