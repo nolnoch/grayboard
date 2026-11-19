@@ -69,7 +69,7 @@ impl AuthError {
 #[non_exhaustive]
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// The server can't be reached right now: a connect error, a timeout before the request was sent, a gateway status (502, 503, 504) on a request that is safe to repeat, or a transient credential failure before anything was sent (`AuthError::retryable`, or the credential giving no token within the request timeout).
+    /// The server can't be reached right now: a connect error, a timeout before the request was sent, a gateway status (502, 503, 504) on a request that is safe to repeat, or a transient credential failure before the server acted (`AuthError::retryable`, or the credential giving no token or replacement within the request timeout): either nothing was sent, or the server refused the request with a 401.
     #[error("server unreachable: {0}")]
     Unreachable(String),
     /// A `tools/call` timed out or lost its connection after it was sent: the call may or may not have taken effect, and it is never retried (a repeated `board_post` would post twice).

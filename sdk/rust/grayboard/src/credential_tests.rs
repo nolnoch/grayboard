@@ -528,6 +528,37 @@ async fn a_failed_revoke_takes_the_token_out_of_service_and_a_retry_sends_it_aga
     );
 }
 
+// #929 R2: a revoke answered 429 or 5xx is transient (`Unreachable`), any other non-2xx is terminal (`Auth`); either way the token stays pending and a later `revoke` sends it again.
+#[tokio::test]
+async fn a_revoke_answered_429_or_5xx_is_unreachable_and_another_refusal_auth() {
+    for (status, transient) in [(429, true), (503, true), (500, true), (400, false)] {
+        let auth = Auth::start(standard, |n| issued(&format!("tok-{n}"), 3600)).await;
+        auth.revoke
+            .lock()
+            .unwrap()
+            .push_back(refused(status, "refused"));
+        let c = auth.credential();
+        c.token().await.unwrap();
+        let m = match (c.revoke().await, transient) {
+            (Err(Error::Unreachable(m)), true) => m,
+            (Err(Error::Auth(e)), false) if !e.retryable => e.message,
+            (other, _) => panic!("{status}: expected transient={transient}, got {other:?}"),
+        };
+        assert!(m.contains(&status.to_string()), "{status}: {m}");
+        c.revoke().await.unwrap();
+        let bodies: Vec<String> = auth
+            .seen("/oauth/revoke")
+            .into_iter()
+            .map(|r| r.body)
+            .collect();
+        assert_eq!(
+            bodies,
+            ["token=tok-0", "token=tok-0"],
+            "{status}: still pending"
+        );
+    }
+}
+
 /// A token or revocation endpoint that redirects to another origin: refused, and the redirect not followed.
 #[tokio::test]
 async fn a_redirect_from_the_token_or_revocation_endpoint_is_not_followed() {

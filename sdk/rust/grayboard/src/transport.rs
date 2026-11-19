@@ -570,7 +570,7 @@ async fn limited_text(response: reqwest::Response, limit: usize) -> String {
     String::from_utf8_lossy(&buf).into_owned()
 }
 
-/// A credential failure before anything was sent: a transient one is `Unreachable`, so the delivery stream backs off and reopens rather than stopping; a terminal one is `Auth`.
+/// A credential failure before the server acted (nothing sent, or a 401): a transient one is `Unreachable`, so the delivery stream backs off and reopens rather than stopping; a terminal one is `Auth`.
 fn credential_error(e: AuthError) -> Error {
     if e.retryable {
         Error::Unreachable(format!("credential: {}", e.message))
