@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { CLIENT_INFO_META_KEY } from "@modelcontextprotocol/server";
 import { z } from "zod";
 import { BindGate } from "../shared/bindgate.ts";
 import { testPause, testPauseAsync } from "../shared/testpause.ts";
@@ -28,7 +29,8 @@ export type SessionFacts = { model?: string; effort?: string };
 // words the bind and initialize text afterwards.
 // The rows an exchange's selection read for its request (#907): the row and its root.
 export type Verdict = { row: HostedSession; root: HostedSession };
-export type SessionContext = { id: string; raw: string; writesAs?: string; facts?: SessionFacts; suggested?: string; launcher?: true } | { missing: string };
+// `client`: the name the request's MCP client info declares (#1298), read only for a generic service credential's harness label.
+export type SessionContext = { id: string; raw: string; writesAs?: string; facts?: SessionFacts; suggested?: string; launcher?: true; client?: string } | { missing: string };
 export function hostedSessionId(user: number, client: string, raw: string): string {
   const hash = createHash("sha256");
   for (const value of [String(user), client, raw]) {
@@ -50,7 +52,8 @@ export function sessionContext(principal: OAuthPrincipal, meta: unknown): Sessio
   const key = principal.sourceKey;
   const base = sourceContext(principal, key !== null && meta && typeof meta === "object" ? (meta as Record<string, unknown>)[key] : undefined);
   if (!("id" in base)) return base;
-  const context = { ...base, ...sessionFacts(meta), ...suggestedName(meta), ...([...BUILTIN_CLIENT_IDS, OPENCODE_CLIENT].includes(principal.clientId) ? launcherDeclaration(meta) : {}) };
+  const context = { ...base, ...sessionFacts(meta), ...suggestedName(meta), ...([...BUILTIN_CLIENT_IDS, OPENCODE_CLIENT].includes(principal.clientId) ? launcherDeclaration(meta) : {}),
+    ...(principal.source === "generic" ? declaredClient(meta) : {}) };
   // A generic-key poll root's tools-only declaration (#451); other clients' are never read.
   if (principal.sourceKey !== GRAYBOARD_SESSION_META || !meta || typeof meta !== "object" || !(GRAYBOARD_WRITES_AS_META in meta)) return context;
   const raw = (meta as Record<string, unknown>)[GRAYBOARD_WRITES_AS_META];
@@ -80,6 +83,14 @@ function suggestedName(meta: unknown): { suggested?: string } {
   if (typeof raw !== "string") throw new ApplicationError("bad_request", `_meta["${GRAYBOARD_SUGGESTED_META}"] must be a string`);
   const normalized = normalizeIdentityName(raw);
   return normalized.ok && normalized.name !== HUMAN_NAME ? { suggested: normalized.name } : {};
+}
+// The client name a modern request's envelope declares (`clientInfo.name`, #1298), a generic service credential's only:
+// harnessFor bounds it to the built-in IDs, so anything else (absent, not a string, unknown) is no declaration.
+function declaredClient(meta: unknown): { client?: string } {
+  if (!meta || typeof meta !== "object") return {};
+  const info = (meta as Record<string, unknown>)[CLIENT_INFO_META_KEY];
+  const name = info && typeof info === "object" ? (info as Record<string, unknown>).name : undefined;
+  return typeof name === "string" ? { client: name } : {};
 }
 // A launcher declaration (#473), a built-in client's only (it attracts the user's delegation requests, task text included, so a
 // third-party client can't claim it): `true` marks the session a delegation launcher, `false` and absence are
@@ -329,7 +340,7 @@ export function createHostedSessions(application: Application, options: { now?: 
       row = { session_id: context.id, ownership_id: await store.start(tx, context.id, p.authed.user_id, p.clientId, t, context.suggested), user_id: p.authed.user_id,
         client_id: p.clientId, grant_id: p.grantId, source_session_id: context.raw, writes_as: writesAs, bind_gen: 0,
         root_session_id: null, place: null, lease_deadline: null, created_at: t, last_seen_at: t, suggested: context.suggested ?? null, parked_at: null };
-      await application.hostedRegister(tx, p.authed, row.session_id, harnessFor(p.clientId, p.source ?? null), writesAs, why => later(w => application.hostedCollided(w, p.authed, context.id, why)), context.facts);
+      await application.hostedRegister(tx, p.authed, row.session_id, harnessFor(p.clientId, p.source ?? null, context.client), writesAs, why => later(w => application.hostedCollided(w, p.authed, context.id, why)), context.facts);
       // An ID that was a child (its source row ended) starts as a root: an address again (#523).
       await application.hostedRoot(tx, row.session_id, null);
       await store.insert(tx, row);
@@ -1071,7 +1082,7 @@ export function createHostedSessions(application: Application, options: { now?: 
             return { message: "already registered" };
           }
           if (existing) await store.end(tx, existing.session_id, "closed", now());
-          await application.hostedRegister(tx, p.authed, childId, harnessFor(p.clientId, p.source ?? null));
+          await application.hostedRegister(tx, p.authed, childId, harnessFor(p.clientId, p.source ?? null, context.client));
           await application.hostedRoot(tx, childId, root.session_id);
           await store.insert(tx, { session_id: childId, ownership_id: attached.ownership_id, user_id: p.authed.user_id, client_id: p.clientId, grant_id: p.grantId,
             source_session_id: child, writes_as: null, bind_gen: 0, root_session_id: root.session_id, place: null, lease_deadline: null, created_at: now(), last_seen_at: now(), suggested: null, parked_at: null });

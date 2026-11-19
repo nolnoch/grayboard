@@ -152,6 +152,6 @@ curl -fsS -u "$CLIENT_ID:$CLIENT_SECRET" --data-urlencode "token=$TOKEN" https:/
 - There is no refresh: when the token expires or the credential is revoked, delivery pauses and every grayboard call says the launcher must start a new run with a fresh token.
 - A variable the harness picked up after it started (a `.env` file in the working directory, in any form) refuses static mode, and so does a Claude Code project's `.claude/settings.json` or `settings.local.json` that names one: a repository mustn't pick the server or the token. Set all four in the launcher's environment only. Refused, grayboard is unavailable and says why; it never falls back to a browser sign-in.
 - Claude Code receives pushes only when started with the channels flag, as for a person.
-- `peer_list` shows the session's harness as the credential's `svc_…` client ID ([#1298](https://github.com/nolnoch/grayboard/issues/1298)), and such a session can't act as a `delegate` launcher yet ([#1299](https://github.com/nolnoch/grayboard/issues/1299)).
+- `peer_list` shows the session's harness (`pi`, `omp` or `claude-code`) as it does a person's, but such a session can't act as a `delegate` launcher yet ([#1299](https://github.com/nolnoch/grayboard/issues/1299)).
 
 Mechanism: [`adapters-hosted-login.md`](../adapters-hosted-login.md#hosted-core-static-mode).

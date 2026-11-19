@@ -87,11 +87,12 @@ async function grant(clientId: string): Promise<string> {
   expect(issued.scope).toBe(SCOPES);
   return issued.access_token;
 }
-async function connect(token: string, meta: [key: string, value: unknown][], opts: { role?: "subscriber"; version?: string } = {}): Promise<Conn> {
+// `name`: the MCP client info name the client declares.
+async function connect(token: string, meta: [key: string, value: unknown][], opts: { role?: "subscriber"; version?: string; name?: string } = {}): Promise<Conn> {
   const headers = new Headers({ Authorization: `Bearer ${token}` });
   if (opts.role) headers.set("X-Grayboard-Client", opts.role);
   const version = opts.version ?? MCP_PROTOCOL_VERSIONS[0]!;
-  const client = new Client({ name: "brokered-client", version: "1" }, { supportedProtocolVersions: [version], versionNegotiation: { mode: version === "2026-07-28" ? { pin: version } : "legacy" } });
+  const client = new Client({ name: opts.name ?? "brokered-client", version: "1" }, { supportedProtocolVersions: [version], versionNegotiation: { mode: version === "2026-07-28" ? { pin: version } : "legacy" } });
   clients.push(client);
   await client.connect(new StreamableHTTPClientTransport(new URL(`${base}/hosted/mcp`), {
     fetch: async (input, init) => {
@@ -262,10 +263,11 @@ test("one raw source under two clients of one user is two hosted sessions", asyn
   expect(new Set(rows.map(r => r.session_id)).size).toBe(2);
 });
 
+// Each declares a built-in client's name, which only a generic service credential's session reads (#1298).
 test("peer_list shows an opted-in client's sessions under its client ID and OpenCode's as opencode", async () => {
   start([operator(BROKER, true)]);
-  const broker = await connect(await grant(BROKER), [[GRAYBOARD_SESSION_META, "broker root"]]);
-  const opencode = await connect(await grant(OPENCODE_CLIENT), [[OPENCODE_SESSION_META, "opencode root"]]);
+  const broker = await connect(await grant(BROKER), [[GRAYBOARD_SESSION_META, "broker root"]], { name: "grayboard-omp" });
+  const opencode = await connect(await grant(OPENCODE_CLIENT), [[OPENCODE_SESSION_META, "opencode root"]], { name: "grayboard-omp" });
   await bind(broker, "broker-run");
   await bind(opencode, "oc-run");
   const peers = json(await call(broker, "peer_list", { include_offline: true })).peers as { handle: string; harness?: string }[];

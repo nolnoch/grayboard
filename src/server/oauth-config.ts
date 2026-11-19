@@ -68,9 +68,13 @@ export function sourceKeyFor(clientId: string, clients: ReadonlyMap<string, OAut
 }
 // Only a mapped client registers sessions; a built-in shows its harness, and the parser
 // keeps an opted-in operator ID within SESSION_FACT_MAX, so that label is the exact ID. A service credential's
-// opencode source shows opencode; its generic one, its client ID (svc_ and 32 hex digits, within the limit).
-export const harnessFor = (clientId: string, source: CredentialSource | null = null) =>
-  clientId === OPENCODE_CLIENT || source === "opencode" ? "opencode" : builtinHarness.get(clientId) ?? clientId;
+// opencode source shows opencode. Its generic one names no harness, so its session shows the built-in client its
+// MCP client info declares (`declared`, hosted core's wire sends the built-in ID, #1298): a display label that grants
+// nothing, bounded to the built-in IDs; any other name, or none, shows the client ID (svc_ and 32 hex digits). No
+// other client's declaration is read, so a person's client can't relabel itself.
+export const harnessFor = (clientId: string, source: CredentialSource | null = null, declared?: string) =>
+  clientId === OPENCODE_CLIENT || source === "opencode" ? "opencode"
+    : builtinHarness.get(clientId) ?? (source === "generic" && declared !== undefined ? builtinHarness.get(declared) : undefined) ?? clientId;
 const httpsId = (id: string) => { try { return new URL(id).protocol === "https:"; } catch { return false; } };
 
 const unsafe = /[\x00-\x20\x7f\\]/;
