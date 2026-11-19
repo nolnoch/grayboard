@@ -196,10 +196,37 @@ describe("the token route", () => {
     expect((await mint(srv.base, c.client_id, c.client_secret)).status).toBe(200);
     // A fleet behind one address retrying past its mint bucket: every retry is the credential's slow_down, never the address's 429.
     for (let i = 0; i < 6; i++) expect(await mint(srv.base, c.client_id, c.client_secret)).toEqual({ status: 429, body: { error: "slow_down" } });
-    expect(accessAudits(srv.app.db, "oauth.request_refused").map(r => r.detail)).toEqual(Array(6).fill({ code: "slow_down", status: 429 }));
+    // The streak writes one row: its retries answer from memory, with no write transaction and no row (M-1).
+    const slow = { code: "slow_down", status: 429 }, bad = { code: "invalid_client", status: 401 };
+    expect(accessAudits(srv.app.db, "oauth.request_refused").map(r => r.detail)).toEqual([slow]);
     // The address's whole bucket is left: three unauthenticated refusals spend it, and only then does the address wait.
     for (let i = 0; i < 3; i++) expect(await mint(srv.base, c.client_id, `${c.client_secret}x`)).toEqual({ status: 401, body: { error: "invalid_client" } });
+    // A wrong secret's refusal still writes its row: the streak's quiet is the credential's, not the route's.
+    expect(accessAudits(srv.app.db, "oauth.request_refused").map(r => r.detail)).toEqual([slow, bad, bad, bad]);
     expect(await mint(srv.base, c.client_id, `${c.client_secret}x`)).toMatchObject({ status: 429, body: { error: "temporarily_unavailable" } });
+  });
+
+  test("a credential's retries inside its slow_down answer from memory, never the store's mint (#1244 M-1)", async () => {
+    const tokens = { maxSeconds: 86_400, mintsPerMinute: 1, unexpired: 1000 };
+    await fresh({ serviceTokens: tokens });
+    const root = await service();
+    const c = await credential(root);
+    expect((await mint(srv.base, c.client_id, c.client_secret)).status).toBe(200);
+    expect(await mint(srv.base, c.client_id, c.client_secret)).toEqual({ status: 429, body: { error: "slow_down" } });
+    // The store would mint now (its window allows 1000), so a 200 here means the retry reached it.
+    tokens.mintsPerMinute = 1000;
+    expect(await mint(srv.base, c.client_id, c.client_secret)).toEqual({ status: 429, body: { error: "slow_down" } });
+    expect(accessAudits(srv.app.db, "oauth.token_issued")).toHaveLength(1);
+  });
+
+  test("a streak that reaches the store again past its backoff still writes one row", async () => {
+    // A cap refusal at a rate whose backoff is under a millisecond: retries go to the store, which refuses each.
+    await fresh({ serviceTokens: { maxSeconds: 86_400, mintsPerMinute: 60_000_000, unexpired: 1 } });
+    const root = await service();
+    const c = await credential(root);
+    expect((await mint(srv.base, c.client_id, c.client_secret)).status).toBe(200);
+    for (let i = 0; i < 5; i++) expect(await mint(srv.base, c.client_id, c.client_secret)).toEqual({ status: 429, body: { error: "slow_down" } });
+    expect(accessAudits(srv.app.db, "oauth.request_refused").map(r => r.detail)).toEqual([{ code: "slow_down", status: 429 }]);
   });
 
   test("a credential's secret only in the Basic header: a form secret or no secret is refused", async () => {
@@ -256,6 +283,7 @@ describe("the token route", () => {
   // The secret is checked on a read before the mint's write: a revoke, a secret's revoke or a disable that lands
   // between them is the insert's to refuse, which re-checks the credential, its grant, the secret and the service.
   for (const revoke of ["credential", "secret", "disable", "user row"] as const) test(`a ${revoke} revoke between the secret's check and the mint refuses the mint`, async () => {
+    await fresh({ oauthLimit: { burst: 1, perSec: 0.001 } });
     const root = await service();
     const c = await credential(root);
     const rotated = await credential(root, { rotate: c.client_id });
@@ -273,7 +301,8 @@ describe("the token route", () => {
     });
     expect(m).toEqual({ status: 401, body: { error: "invalid_client" } });
     expect(srv.app.db.query("SELECT count(*) AS n FROM oauth_tokens").get()).toEqual({ n: 0 });
-    void rotated;
+    // The refusal is no longer the credential's own, so it spends the address bucket as any invalid_client does.
+    expect(await mint(srv.base, rotated.client_id, rotated.client_secret)).toMatchObject({ status: 429, body: { error: "temporarily_unavailable" } });
   });
 
   test("the lifetime is clamped to the server's ceiling at each mint and to the grant's expiry", async () => {
