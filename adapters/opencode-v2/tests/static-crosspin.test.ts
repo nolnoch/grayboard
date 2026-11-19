@@ -16,8 +16,8 @@
 //   carries a well-formed token, and hosted core's `token` field is dropped before comparing;
 // - V2 accepts only an HTTPS issuer, hosted core also HTTP loopback, and their issuer-shape texts differ: those rows
 //   are checked below for a refusal on both sides, not for the same text. Both run the issuer through the one endpoint
-//   rule (`canonicalEndpoint`, src/shared/endpoint.ts, vendored into V2), so no issuer one refuses passes the other
-//   (#1321).
+//   rule (`canonicalEndpoint`, src/shared/endpoint.ts, vendored into V2), so apart from HTTP loopback no
+//   issuer one refuses passes the other (#1321).
 import { afterEach, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
