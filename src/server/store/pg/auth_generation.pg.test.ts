@@ -12,7 +12,8 @@ import { describePg, pgDatabase } from "../../../../tests/support/pg.ts";
 import { pgAuthPod, within, type PgAuthPod } from "../../../../tests/support/pg_auth.ts";
 import { commitCutProxy } from "../../../../tests/support/pg_proxy.ts";
 import { until } from "../../../../tests/support/until.ts";
-import { OAUTH_TTL, type OAuthAuthorization } from "../../oauth-types.ts";
+import { OAUTH_SCOPES } from "../../oauth-config.ts";
+import { OAUTH_TTL, type OAuthAuthorization, type ServiceTokenLimits } from "../../oauth-types.ts";
 import type { Tx } from "../tx_base.ts";
 import { AUTH_CHANNEL } from "./auth_generation.ts";
 import { pgOf } from "./tx.ts";
@@ -44,6 +45,27 @@ async function issue(pod: PgAuthPod, userId: number): Promise<string> {
   return tokens.accessHash;
 }
 
+// A service with a credential and `secrets` live secrets on `pod`; returns the secret IDs.
+const SVC = `svc_${"a".repeat(32)}`;
+const LIMITS: ServiceTokenLimits = { maxSeconds: 600, mintsPerMinute: 100, unexpired: 100 };
+async function service(pod: PgAuthPod, now: number, secrets: number): Promise<number[]> {
+  return pod.tx.write(async tx => {
+    const svc = await pod.identity.services.create(tx, "ingest");
+    const r = await pod.oauth.addServiceCredential(tx, { userId: svc.id, clientId: SVC, grantId: "svcgrant_0123456789", resource: RESOURCE, source: "generic",
+      tokenSeconds: 3600, expiresAt: now + OAUTH_TTL.grant, secretHash: sha("secret-1") }, now);
+    if (r.status !== "ok") throw new Error(`addServiceCredential answered ${r.status}`);
+    const ids = [r.value.secretId];
+    for (let i = 2; i <= secrets; i++) {
+      const s = await pod.oauth.rotateServiceCredential(tx, { clientId: SVC, secretHash: sha(`secret-${i}`) }, now);
+      if (s.status !== "ok") throw new Error(`rotateServiceCredential answered ${s.status}`);
+      ids.push(s.value.secretId);
+    }
+    return ids;
+  });
+}
+const mint = (pod: PgAuthPod, tx: Tx, secretId: number, tokenHash: string, now: number) =>
+  pod.oauth.mintServiceToken(tx, { clientId: SVC, secretId, tokenHash, scopes: [...OAUTH_SCOPES], limits: LIMITS }, now);
+
 // Holds a write body on `pod` open until release(); `wrote` resolves once the body holds the queue.
 function hold(pod: PgAuthPod) {
   const g = gate(), wrote = gate();
@@ -72,17 +94,19 @@ describePg("Postgres auth generation", () => {
     } finally { for (const p of pods.reverse()) await p.close(); }
   }, timeout);
 
-  // 0001's triggers: four per auth table, the three row events through a transition table, TRUNCATE without one.
-  withPods("the auth tables carry statement triggers with transition tables for INSERT, UPDATE and DELETE, and one for TRUNCATE", 0, async db => {
-    const rows = await db.sql`SELECT c.relname, t.tgname, pg_get_triggerdef(t.oid) AS def FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid
-      WHERE NOT t.tgisinternal ORDER BY c.relname, t.tgname`;
+  // 0001's triggers: four per auth table, the three row events through a transition table, TRUNCATE without one, each
+  // ENABLE ALWAYS ('A': it fires under session_replication_role = replica too).
+  withPods("the auth tables carry ENABLE ALWAYS statement triggers with transition tables for INSERT, UPDATE and DELETE, and one for TRUNCATE", 0, async db => {
+    const rows = await db.sql`SELECT c.relname, t.tgname, t.tgenabled::text AS enabled, pg_get_triggerdef(t.oid) AS def FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid
+      WHERE NOT t.tgisinternal AND t.tgname LIKE ${"%\\_auth\\_%"} ORDER BY c.relname, t.tgname`;
     const want = (t: string) => [
       `CREATE TRIGGER ${t}_auth_del AFTER DELETE ON public.${t} REFERENCING OLD TABLE AS changed FOR EACH STATEMENT EXECUTE FUNCTION gb_auth_rows_touched()`,
       `CREATE TRIGGER ${t}_auth_ins AFTER INSERT ON public.${t} REFERENCING NEW TABLE AS changed FOR EACH STATEMENT EXECUTE FUNCTION gb_auth_rows_touched()`,
       `CREATE TRIGGER ${t}_auth_trunc AFTER TRUNCATE ON public.${t} FOR EACH STATEMENT EXECUTE FUNCTION gb_auth_touched()`,
       `CREATE TRIGGER ${t}_auth_upd AFTER UPDATE ON public.${t} REFERENCING NEW TABLE AS changed FOR EACH STATEMENT EXECUTE FUNCTION gb_auth_rows_touched()`,
     ];
-    expect(rows.map((r: { def: string }) => r.def)).toEqual([...want("oauth_grants"), ...want("oauth_tokens"), ...want("users")]);
+    expect(rows.map((r: { def: string }) => r.def)).toEqual([...want("oauth_grants"), ...want("oauth_tokens"), ...want("service_credential_secrets"), ...want("users")]);
+    expect(rows.map((r: { enabled: string }) => r.enabled)).toEqual(Array(16).fill("A"));
   });
 
   // settle() and seen() (tests/support/pg_auth.ts) end only on their own marker: an earlier notification, delivered
@@ -107,7 +131,7 @@ describePg("Postgres auth generation", () => {
     expect(resolved).toBe(true);
   });
 
-  withPods("T-C9-1 own write: the generation moves, and the disable is refused, inside `committed` and while the queue's next body holds", 1, async (_db, a) => {
+  withPods("T-C9-1 own write: the generation moves, and the disable is refused, inside an afterCommit effect, inside `committed` and while the queue's next body holds", 1, async (_db, a) => {
     const u = await seed(a, "u1@example.com");
     const t = await issue(a, u);
     await a.settle();
@@ -117,7 +141,18 @@ describePg("Postgres auth generation", () => {
     const g0 = a.auth.authGeneration();
     // Deaf: only the write path's own bump can move the generation, not the disable's NOTIFY.
     a.listener.deaf = true;
-    const disabled = a.tx.write(tx => a.identity.users.setDisabled(tx, u, true), async () => {
+    // The effect records the generation, and the generation isDisabled reads synchronously (its cache lookup) before
+    // its first await: the bump must come before the effects, not only before `committed`.
+    const effect: { g?: string; firstRead: (string | undefined)[]; disabled?: Promise<boolean> } = { firstRead: [] };
+    const disabled = a.tx.write(async tx => {
+      tx.afterCommit(() => {
+        effect.g = a.auth.authGeneration();
+        const read = a.gen.read;
+        a.gen.read = () => { const v = read(); effect.firstRead.push(v); return v; };
+        try { effect.disabled = a.auth.isDisabled(a.tx.read, u); } finally { a.gen.read = read; }
+      });
+      await a.identity.users.setDisabled(tx, u, true);
+    }, async () => {
       const g = a.auth.authGeneration();
       return { g, disabled: await a.auth.isDisabled(a.tx.read, u), token: await a.auth.findActiveAccess(a.tx.read, t, RESOURCE, [], now) };
     });
@@ -129,6 +164,11 @@ describePg("Postgres auth generation", () => {
     } finally { next.release(); }
     const inCommitted = await disabled;
     await next.done;
+    expect(await within(effect.disabled!, MOVE_MS, "the effect's isDisabled")).toBe(true);
+    expect(effect.g).toBeDefined();
+    expect(effect.g).not.toBe(g0);
+    expect(effect.firstRead[0]).toBeDefined();
+    expect(effect.firstRead[0]).not.toBe(g0);
     expect(inCommitted.disabled).toBe(true);
     expect(inCommitted.token).toBeUndefined();
     expect(during.disabled).toBe(true);
@@ -137,7 +177,7 @@ describePg("Postgres auth generation", () => {
     expect(during.g).not.toBe(g0);
   });
 
-  withPods("T-C9-2 an outside INSERT, UPDATE or DELETE on each auth table, and a TRUNCATE, moves the pod's generation; its next check reads afresh", 1, async (db, a) => {
+  withPods("T-C9-2 an outside INSERT, UPDATE or DELETE on each auth table, a TRUNCATE, and a replica-mode write moves the pod's generation; its next check reads afresh", 1, async (db, a) => {
     const u = await seed(a, "u2@example.com");
     const t = await issue(a, u);
     const far = Date.now() + OAUTH_TTL.grant;
@@ -146,13 +186,30 @@ describePg("Postgres auth generation", () => {
       ["users INSERT", () => sql`INSERT INTO users (email, created_at) VALUES ('z@example.com', 0)`],
       ["users UPDATE", () => sql`UPDATE users SET display_name = 'Z' WHERE email = 'z@example.com'`],
       ["users DELETE", () => sql`DELETE FROM users WHERE email = 'z@example.com'`],
-      ["oauth_grants INSERT", () => sql`INSERT INTO oauth_grants (id, user_id, expires_at, data) VALUES ('grant_scratch', ${u}, ${far}, '{}'::jsonb)`],
+      // With a service credential under it (no trigger of its own: its rows never change once written), for the secrets.
+      ["oauth_grants INSERT", async () => {
+        const r = await sql`INSERT INTO oauth_grants (id, user_id, expires_at, data) VALUES ('grant_scratch', ${u}, ${far}, '{}'::jsonb)`;
+        await sql`INSERT INTO service_credentials (client_id, user_id, grant_id, source, token_seconds, created_at) VALUES ('scratch', ${u}, 'grant_scratch', 'generic', 60, 0)`;
+        return r;
+      }],
+      ["service_credential_secrets INSERT", () => sql`INSERT INTO service_credential_secrets (credential_id, hash, created_at)
+        SELECT id, 'scratch-secret', 0 FROM service_credentials WHERE client_id = 'scratch'`],
+      ["service_credential_secrets UPDATE", () => sql`UPDATE service_credential_secrets SET revoked_at = 1 WHERE hash = 'scratch-secret'`],
+      // No token under it: no cascade fires oauth_tokens' trigger.
+      ["service_credential_secrets DELETE", () => sql`DELETE FROM service_credential_secrets WHERE hash = 'scratch-secret'`],
       ["oauth_tokens INSERT", () => sql`INSERT INTO oauth_tokens (hash, grant_id, kind, expires_at, created_at) VALUES ('scratch', 'grant_scratch', 'refresh', ${far}, 0)`],
       ["oauth_tokens UPDATE", () => sql`UPDATE oauth_tokens SET revoked_at = 1 WHERE hash = 'scratch'`],
       ["oauth_tokens DELETE", () => sql`DELETE FROM oauth_tokens WHERE hash = 'scratch'`],
       ["oauth_grants UPDATE", () => sql`UPDATE oauth_grants SET revoked_at = 1 WHERE id = 'grant_scratch'`],
       // No token or code left under it: no cascade fires another table's trigger.
       ["oauth_grants DELETE", () => sql`DELETE FROM oauth_grants WHERE id = 'grant_scratch'`],
+      // A restore or replication apply: ENABLE ALWAYS triggers fire in replica mode too.
+      ["users UPDATE under session_replication_role = replica", () => sql.begin(async t => {
+        await t`SET LOCAL session_replication_role = replica`;
+        const r = await t`UPDATE users SET display_name = 'R' WHERE id = ${u}`;
+        return { count: r.count };
+      })],
+      // Last: it removes the token each case checks.
       ["oauth_tokens TRUNCATE", async () => { await sql`TRUNCATE oauth_tokens`; return { count: 1 }; }],
     ];
     const ran: string[] = [];
@@ -171,7 +228,7 @@ describePg("Postgres auth generation", () => {
       expect(await a.auth.isDisabled(a.tx.read, u)).toBe(false);
       expect(a.counts.users).toBe(reads + 1);
     }
-    expect(ran).toHaveLength(10);
+    expect(ran).toHaveLength(14);
   });
 
   withPods("T-C9-3 pod A revokes a token: pod B moves and refuses it, by lookup and by peek", 2, async (_db, a, b) => {
@@ -232,9 +289,12 @@ describePg("Postgres auth generation", () => {
   withPods("T-C9-5 a user read that straddles an outside disable answers as read but caches nothing; the next lookup refuses", 1, async (db, a) => {
     const u = await seed(a, "u5@example.com");
     await a.settle();
-    const reached = gate(), release = gate();
+    const reached = gate(), release = gate(), looked = gate();
     a.afterUserRead = async () => { a.afterUserRead = undefined; reached.open(); await release.p; };
     const g0 = a.auth.authGeneration();
+    // A body pinned at g0, before the disable, peeks once the read has answered: a fill under g0 (the read's own
+    // generation, no longer current) would show here; under the new generation it couldn't have been filled at all.
+    const atG0 = a.auth.authRead(async () => { await looked.p; const p = a.auth.authPeek(); return { g: p?.generation, user: p?.user(u) }; });
     const look = a.auth.isDisabled(a.tx.read, u);
     let answered: boolean;
     try {
@@ -245,9 +305,12 @@ describePg("Postgres auth generation", () => {
     } finally {
       release.open();
       answered = await look;
+      looked.open();
     }
     expect(answered).toBe(false); // read before the disable: linearized before it
-    expect(a.auth.authPeek()?.user(u)).toBeUndefined(); // and not cached
+    const peek = await within(atG0, MOVE_MS, "the body pinned at g0 to peek");
+    expect(peek.g).toBe(g0);
+    expect(peek.user).toBeUndefined(); // and not cached under the generation it read at
     const reads = a.counts.users;
     expect(await a.auth.isDisabled(a.tx.read, u)).toBe(true);
     expect(a.counts.users).toBe(reads + 1);
@@ -258,12 +321,12 @@ describePg("Postgres auth generation", () => {
     await a.settle();
     expect(await a.auth.isDisabled(a.tx.read, u)).toBe(false); // cached
     const g0 = a.auth.authGeneration();
-    // A disable whose notification is lost: replica mode skips the triggers, so no NOTIFY at all.
-    await db.sql.begin(async t => {
-      await t`SET LOCAL session_replication_role = replica`;
-      await t`UPDATE users SET disabled_at = ${Date.now()} WHERE id = ${u}`;
-    });
-    await a.settle();
+    // A disable whose notification is lost: the listener drops it (deaf); markers still pass.
+    a.listener.deaf = true;
+    try {
+      await db.sql`UPDATE users SET disabled_at = ${Date.now()} WHERE id = ${u}`;
+      await a.settle();
+    } finally { a.listener.deaf = false; }
     expect(a.auth.authGeneration()).toBe(g0);
     expect(await a.auth.isDisabled(a.tx.read, u)).toBe(false); // the stale entry: nothing told the pod
     const atClose: (string | undefined)[] = [];
@@ -286,6 +349,57 @@ describePg("Postgres auth generation", () => {
     expect(g1).toBeDefined();
     expect(g1).not.toBe(g0);
     expect(await a.auth.isDisabled(a.tx.read, u)).toBe(true);
+  });
+
+  // The secret join is all that refuses a run token minted while its secret's revoke ran (store/pg/oauth.ts
+  // revokeServiceSecret, D3): the revoke's token UPDATE can't see the uncommitted mint and matches no row, so only
+  // service_credential_secrets' trigger tells pod A the token it cached is dead.
+  withPods("T-C9-11 a run token pod A minted while pod B revoked its secret, cached on A between the commits, is refused from A's cache once B commits", 2, async (_db, a, b) => {
+    const now = Date.now();
+    const [s1] = await service(a, now, 2);
+    await a.settle();
+    await b.settle();
+    const t = sha("run-token");
+    const mintIn = gate(), mintGo = gate(), revokeIn = gate(), revokeGo = gate();
+    const minted = a.tx.write(async tx => { const r = await mint(a, tx, s1!, t, now); mintIn.open(); await mintGo.p; return r.status; });
+    let revoked: Promise<string> | undefined;
+    try {
+      await within(mintIn.p, MOVE_MS, "pod A's mint to insert its token, uncommitted");
+      revoked = b.tx.write(async tx => { const r = await b.oauth.revokeServiceSecret(tx, s1!, now); revokeIn.open(); await revokeGo.p; return r.status; });
+      await within(revokeIn.p, MOVE_MS, "pod B's revoke to update the secret (and match no token), uncommitted");
+      mintGo.open();
+      expect(await minted).toBe("ok");
+      await a.settle();
+      expect(await a.auth.findActiveAccess(a.tx.read, t, RESOURCE, [], now)).toBeDefined(); // B's revoke not yet committed
+      expect(a.auth.authPeek()?.access(t, RESOURCE, now)).toBeDefined(); // cached
+    } finally {
+      mintGo.open();
+      revokeGo.open();
+    }
+    const gA = a.auth.authGeneration();
+    expect(await revoked).toBe("ok");
+    await a.settle();
+    expect(await a.oauth.findActiveAccess(a.tx.read, t, RESOURCE, [], now)).toBeUndefined(); // the database refuses it
+    expect(a.auth.authGeneration()).not.toBe(gA);
+    expect(a.auth.authPeek()?.access(t, RESOURCE, now)).toBeUndefined();
+    expect(await a.auth.findActiveAccess(a.tx.read, t, RESOURCE, [], now)).toBeUndefined();
+  });
+
+  withPods("T-C9-12 an outside UPDATE of a service secret's revoked_at refuses the run token a pod cached under it", 1, async (db, a) => {
+    const now = Date.now();
+    const [s1] = await service(a, now, 1);
+    const t = sha("run-token-outside");
+    expect((await a.tx.write(tx => mint(a, tx, s1!, t, now))).status).toBe("ok");
+    await a.settle();
+    expect(await a.auth.findActiveAccess(a.tx.read, t, RESOURCE, [], now)).toBeDefined();
+    expect(a.auth.authPeek()?.access(t, RESOURCE, now)).toBeDefined(); // cached
+    const g = a.auth.authGeneration();
+    expect((await db.sql`UPDATE service_credential_secrets SET revoked_at = ${now} WHERE id = ${s1!}`).count).toBe(1);
+    await moved(a, g, "the outside secret revoke");
+    expect(a.auth.authPeek()?.access(t, RESOURCE, now)).toBeUndefined();
+    const reads = a.counts.accesses;
+    expect(await a.auth.findActiveAccess(a.tx.read, t, RESOURCE, [], now)).toBeUndefined();
+    expect(a.counts.accesses).toBe(reads + 1);
   });
 
   for (const mode of ["dropped", "ack lost"] as const) test(`T-C9-10 COMMIT ${mode} on a body that wrote users: the generation moves anyway`, async () => {

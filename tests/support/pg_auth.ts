@@ -150,6 +150,9 @@ export async function pgAuthPod(db: PgDatabase, name = "a", { txUrl = db.url }: 
     check: r => { pgOf(r); },
   });
   await gen.start();
-  if (gen.read() === undefined) throw new Error(`pod ${name}: the auth cache is off after start()`);
+  if (gen.read() === undefined) {
+    await pod.close();
+    throw new Error(`pod ${name}: the auth cache is off after start()`);
+  }
   return pod;
 }

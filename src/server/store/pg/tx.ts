@@ -211,8 +211,8 @@ export type PgTransactions = {
 // (psql, a seeding script) holds: one queue serves every write, so an unbounded wait would stall them all (55P03).
 // Isolation is READ COMMITTED on every BEGIN, whatever the database default (D3, D6). No retries.
 //
-// `ownAuthCommit` (postgres-server.md D5; #807 P3 C9b): called once a transaction that wrote users, oauth_grants or
-// oauth_tokens has committed (0001's triggers mark it gb.auth_touched; ROLLBACK TO undoes the mark), before the effects,
+// `ownAuthCommit` (postgres-server.md D5; #807 P3 C9b): called once a transaction that wrote an auth table (users,
+// oauth_grants, oauth_tokens, service_credential_secrets) has committed (0001's triggers mark it gb.auth_touched; ROLLBACK TO undoes the mark), before the effects,
 // `committed` and the queue's next body; also when such a COMMIT's outcome is unknown, since a bump is always safe.
 // Set, it costs each write one round trip before COMMIT to read the mark.
 export function makePgTransactions(url: string, { ownAuthCommit, ...opts }: Omit<PgOptions, "connection"> & { ownAuthCommit?: () => void } = {}): PgTransactions {
@@ -238,7 +238,8 @@ export function makePgTransactions(url: string, { ownAuthCommit, ...opts }: Omit
           try {
             const v = await fn(root as unknown as Tx);
             if (root.hasBeforeCommit) await root.runBeforeCommit();
-            // After the beforeCommit hooks, whose writes (an audit flush) count too.
+            // After the beforeCommit hooks, defensively: no hook writes an auth table today, but one that did would
+            // count.
             if (ownAuthCommit) touched = (await conn`SELECT current_setting('gb.auth_touched', true) = '1' AS t`)[0].t === true;
             fulfilled = true;
             // Boxed: Bun's handling of a callback's array result can't touch the body's value.
