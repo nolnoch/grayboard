@@ -337,6 +337,24 @@ describePg("hosted store races (Postgres)", () => {
     expect(w.ends.calls.map(c => c.id)).toEqual(["c"]);
   });
 
+  // An alias hold ends with its root, so a capped end also skips a held alias_holds row (an alias bind or release
+  // holding it). Mutation: the hold's SKIP LOCKED shortfall never refusing (B waits on the hold, then acts).
+  test("T-C8-10d: under the capacity lock, with only the root's alias hold held elsewhere, the root's end returns false at once and writes nothing", async () => {
+    await using p = await pgPair();
+    const w = await world(p);
+    const r = await sweepWorld(w);
+    await p.db.sql`INSERT INTO alias_holds (address, id, bound_at) VALUES ('x', 'r', 0)`;
+    const holds = async () => (await p.db.sql`SELECT address, id FROM alias_holds`).map((x: Row) => `${x.address}/${x.id}`);
+    const res = await race(p, async tx => { await pgOf(tx)`SELECT 1 FROM alias_holds WHERE id = 'r' FOR UPDATE`; }, cappedOne(w.hb, idleEnd(w.hb)));
+    committed(res.a);
+    expect(outcome(res.b)).toBe(false);
+    await untouched(w, r);
+    expect(await holds()).toEqual(["x/r"]);
+    expect(res.waited).toBe(false);
+    expect(await p.b.write(cappedOne(w.hb, idleEnd(w.hb)))).toBe(true);
+    expect(await holds()).toEqual([]);
+  });
+
   // `lock(child)` locks the child's root first (store/hosted.ts's order), so a body waiting on a root holds none of its
   // children meanwhile. A third connection asks for the child with NOWAIT while B waits. Mutation: lock(child) locking
   // the child before its root (the probe meets B's lock: 55P03).
@@ -358,10 +376,11 @@ describePg("hosted store races (Postgres)", () => {
   //   other call (ORDER BY) takes r1 first. Catches either call without ORDER BY.
   // - `plans differ`: r1 inserted first, then HOT-updated, which moves it past r2 in the heap but not in the index; the
   //   grant's call runs an index scan (r1, r2), the user's a sequential one (r2, r1). Catches both without ORDER BY.
-  // A third connection holds both roots until both calls wait on them, then lets go: each wakes holding its first row
-  // and wanting the other's. The real revokes also serialize on the grant row first (both revoke g); these calls skip
-  // that UPDATE, so what is tested is the ends' own order, which also stands against any other locker of many roots.
-  // Mutation: no ORDER BY session_id (the two cross: 40P01).
+  // A third connection holds both roots until both calls wait on them, then lets go. The real revokes also serialize on
+  // the grant row first (both revoke g); these calls skip that UPDATE, so what is run is the ends' own order, which also
+  // stands against any other locker of many roots. An end-to-end smoke test: after the holder lets go, whether the two
+  // actually cross depends on wake-up timing, so it catches a missing ORDER BY only some runs. T-C8-12c is the
+  // deterministic check of each call's order.
   const seqScan = async (tx: Tx) => { await pgOf(tx)`SET LOCAL enable_indexscan = off`; await pgOf(tx)`SET LOCAL enable_bitmapscan = off`; };
   const indexScan = async (tx: Tx) => { await pgOf(tx)`SET LOCAL enable_seqscan = off`; await pgOf(tx)`SET LOCAL enable_bitmapscan = off`; };
   for (const shape of ["inserted r2 first", "plans differ"] as const) test(`T-C8-12a (${shape}): a grant's and a user's revoke ending the same roots at once lock them in one order: no deadlock, each root ends once`, async () => {
@@ -400,6 +419,46 @@ describePg("hosted store races (Postgres)", () => {
     const ended = (await p.db.sql`SELECT session_id, end_reason FROM hosted_ownerships ORDER BY session_id`).map((x: Row) => x.session_id);
     expect(ended).toEqual(["r1", "r2"]);
     expect(int8((await p.db.sql`SELECT count(*) AS n FROM hosted_ownerships WHERE ended_at IS NULL`)[0].n)).toBe(0);
+  });
+
+  // Each revoke end's lock order on its own, in T-C8-11's style. Roots inserted r2 first, so a sequential scan meets r2
+  // before r1, the reverse of session_id order. A third connection holds only r2; the call, on that plan, waits on it.
+  // Sorted (ORDER BY session_id), it locked r1 before reaching r2, so a NOWAIT probe of r1 meets its lock (55P03).
+  // Mutation: endForGrant or endForUser without ORDER BY session_id (it waits on r2 holding nothing: the probe is "free").
+  for (const call of ["endForGrant", "endForUser"] as const) test(`T-C8-12c (${call}): its ends lock the roots in session_id order, whatever the plan meets first`, async () => {
+    await using p = await pgPair();
+    const w = await world(p);
+    for (const id of ["r2", "r1"]) await root(w, id, { lease_deadline: T0 + 1_000 });
+    // What the plan meets the roots in, without ORDER BY.
+    const met = await p.a.write(async tx => {
+      await seqScan(tx);
+      const sql = pgOf(tx);
+      const rows = call === "endForGrant" ? await sql`SELECT session_id FROM hosted_sessions WHERE grant_id = 'g' AND root_session_id IS NULL`
+        : await sql`SELECT session_id FROM hosted_sessions WHERE user_id = ${w.user} AND root_session_id IS NULL`;
+      return rows.map((x: Row) => x.session_id);
+    });
+    expect(met).toEqual(["r2", "r1"]);
+    const holder = await p.db.sql.reserve();
+    let a: Promise<Settled<void>> | undefined, seen: string | undefined;
+    try {
+      await holder`BEGIN`;
+      await holder`SELECT 1 FROM hosted_sessions WHERE session_id = 'r2' FOR UPDATE`;
+      let done = false;
+      const ends = makePgHostedEnds(w.ha);
+      a = settle(p.a.write(async tx => {
+        await seqScan(tx);
+        if (call === "endForGrant") await ends.endForGrant(tx, "g", T0 + 10);
+        else await ends.endForUser(tx, w.user, "disabled", T0 + 10);
+      })).finally(() => { done = true; });
+      expect(await blockedOrSettled(p, () => done, `${call} blocked on r2`, "a")).not.toBeNull();
+      seen = await probeRow(w, "r1");
+    } finally {
+      await holder`ROLLBACK`;
+      holder.release();
+    }
+    expect(outcome((await a)!)).toBeUndefined();
+    expect(int8((await p.db.sql`SELECT count(*) AS n FROM hosted_sessions`)[0].n)).toBe(0);
+    expect(seen).toBe("55P03");
   });
 
   // A grant re-attach (attach: grantLive on the new grant, the root locked, every row of the ownership moved to it)
