@@ -1402,6 +1402,42 @@ test("a restore that fails outside the expiry branches records a degraded root w
     } finally { await restarted.close(); }
   } finally { await o.c.close(); await o.r.controller.close(); }
 });
+// #1334 audit L-1: a restore's prepare finds another process holding the token refresh (processes sharing one grant
+// store restarting together): it retries on the outage backoff, as resume's does, rather than degrading.
+test("a restore whose prepare finds the token refresh in another process retries on the outage backoff (#1334)", async () => {
+  const r = runtime("approval");
+  await r.controller.enroll("R", ["be"], true);
+  await until(() => r.root(r.controller)?.state === "active");
+  await r.controller.close();
+  const busy = Promise.reject(new RefreshInProgress("pi"));
+  busy.catch(() => {});
+  r.holdPrepare(busy);
+  const waits: number[] = [];
+  const restarted: Controller = r.make({ wait: async ms => { waits.push(ms); if (waits.length === 2) r.holdPrepare(Promise.resolve()); } });
+  try {
+    await restarted.restore();
+    expect(r.root(restarted)).toMatchObject({ state: "retrying", operation: "restore", code: "refresh_in_progress" });
+    await until(() => r.root(restarted)?.state === "active");
+    expect(waits).toEqual([500, 1000]);
+  } finally { await restarted.close(); }
+});
+// The same for restore's check after an expiry pause: a refresh in progress there retries too, rather than degrading.
+test("a restore check that finds the token refresh in another process after an expiry pause retries (#1334)", async () => {
+  const o = await expiredPause("approval", () => {});
+  try {
+    await until(() => o.recovering() >= 1);
+    await o.c.close();
+    o.r.expireAccess(); o.r.failCheck(() => new RefreshInProgress("pi"));
+    const states: string[] = [];
+    const restarted = o.r.make({ wait: async () => { o.r.failCheck(); }, sink: record => { states.push(`${record.state}:${record.code ?? ""}`); } });
+    try {
+      await restarted.restore();
+      expect(o.r.root(restarted)).toMatchObject({ state: "retrying", operation: "restore", code: "refresh_in_progress" });
+      await until(() => o.r.root(restarted)?.state === "active");
+      expect(states.filter(s => s.startsWith("degraded") || s.startsWith("paused"))).toEqual([]);
+    } finally { await restarted.close(); }
+  } finally { await o.c.close(); await o.r.controller.close(); }
+});
 // #481 item 15: a close during a restore's rotation poll ends the restore: no credential watch (which nothing would
 // dispose) and no prepare after it.
 test("a close during a restore's rotation wait refuses the retry: no watch, no prepare (#481)", async () => {

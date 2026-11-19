@@ -807,7 +807,8 @@ export class Controller<E extends Enrollment = Enrollment> {
         await this.rotated(grace, () => this.prepare(r, true, true));
       } catch (caught) {
         const r = this.roots.get(id), error = this.expired(caught);
-        if (r && error instanceof ServerUnreachable && this.restorable(r, r.epoch)) {
+        // An outage, or another process holding the token refresh: retry on the outage backoff (#424 6, #895, #1334).
+        if (r && (error instanceof ServerUnreachable || error instanceof RefreshInProgress) && this.restorable(r, r.epoch)) {
           this.retrying(r, error);
           this.retryRestore(r);
         } else if (r && error instanceof AccessExpired && error.reason === "expired" && this.restorable(r, r.epoch)) {
