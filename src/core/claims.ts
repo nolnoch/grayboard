@@ -151,10 +151,20 @@ export function heldAnswer(cur: Claim, hidden: boolean, boardHidden = false): { 
   return { ok: false, held_by: hidden ? null : cur.holder, note: hidden || boardHidden ? null : cur.note, expires_at: cur.expires_at };
 }
 
+/** Whether a renewal moves the claim onto a board it wasn't on. */
+export function moves(renewed: boolean, row: Claim, cur: Claim | undefined): boolean {
+  return renewed && !!row.board && row.board !== cur?.board;
+}
+
 /** A renewal that moves the claim onto an archived board would start new business there (#635), like a fresh
- * [claim]; it rolls back instead. `archived` is whether `row.board` is archived. */
-export function checkMove(renewed: boolean, row: Claim, cur: Claim | undefined, archived: boolean): void {
-  if (renewed && row.board && row.board !== cur?.board && archived) throw new CoreError(`#${row.board} is archived; a claim can't move onto it`);
+ * [claim]; it rolls back instead. So does one moving it onto a board its holder can't see (#1269): the caller saw the
+ * board, but a renewal through another of its addresses keeps that address as holder, which would then hold a claim on
+ * a board it can't read and announce nothing there. `archived` is whether `row.board` is archived; `holderSees` whether
+ * `row.holder` may see it. */
+export function checkMove(renewed: boolean, row: Claim, cur: Claim | undefined, archived: boolean, holderSees: boolean): void {
+  if (!moves(renewed, row, cur)) return;
+  if (archived) throw new CoreError(`#${row.board} is archived; a claim can't move onto it`);
+  if (!holderSees) throw new CoreError(`${row.holder}, which holds ${row.key}, can't see #${row.board}; a claim can't move onto it`);
 }
 
 /** Whether a renewal announces: its note changed. The caller also needs the board, seen by the holder. */
@@ -329,7 +339,8 @@ export function claim(
     if (d.held) return held(cur!);
     const row = takeClaim(db, { key, as: d.as, note: opts.note ?? null, board, now, expires: d.expires, user: opts.user ?? null });
     if (!row) return held(claimRow(db, key)!);
-    checkMove(d.renewed, row, cur, !!(row.board && getBoard(db, row.board)?.archived_at));
+    const moved = moves(d.renewed, row, cur);
+    checkMove(d.renewed, row, cur, moved && !!getBoard(db, row.board!)?.archived_at, !moved || row.holder === handle || canSeeBoard(db, row.holder, row.board!));
     logEvent(db, d.renewed ? "renew" : "take", d.as, row, now);
     const changed = !d.renewed
       ? announce(db, d.as, row.board, claimText(key, row.note), opts, false)

@@ -38,7 +38,11 @@ const challenge = (s: string) => createHash("sha256").update(s).digest("base64ur
 const escapeHTML = (s: string) => s.replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]!);
 const secret = (s: string | null): s is string => s !== null && /^[A-Za-z0-9_-]{43}$/.test(s);
 class OAuthError extends Error {
-  constructor(readonly error: string, readonly status = 400) { super(error); }
+  // `charged`: whether the token route spends the caller's address bucket on it. Only a refusal of an authenticated
+  // credential's mint for its own bucket or cap isn't (#1244): the secret was right, and a fleet behind one NAT
+  // retrying through it would otherwise drain the address and block other users' refreshes from it.
+  // `audited`: whether it writes an oauth.request_refused row; a credential's slow_down streak writes only its first.
+  constructor(readonly error: string, readonly status = 400, readonly charged = true, readonly audited = true) { super(error); }
 }
 function fail(error = "invalid_request", status = 400): never { throw new OAuthError(error, status); }
 // error_description texts for a refusal after the request is bound (#928): fixed, since they reach any client.
@@ -219,11 +223,17 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
   // answers as usual but writes no row, and the streak's end row counts them.
   // Past the address limiter's key cap this is the only bound on those writes.
   const refusalRows = limiter(config.oauthGlobalLimit ?? { burst: 600, perSec: 10 }, "token_refusal", 1);
+  // A credential its mint bucket or cap refused, by client ID: when its next mint may go to the store (#1244). Until
+  // then its retries answer slow_down from here, with no write transaction, so a valid-secret loop costs a lookup;
+  // a streak (refusals no more than STREAK_MS past that time) writes one request_refused row, not one per retry.
+  const mintBackoff = new Map<string, number>();
+  const STREAK_MS = 60_000;
   let closed = false;
   const sweep = () => {
     const t = now();
     for (const [h, f] of flows) if (f.expiresAt <= t) { flows.delete(h); if (f.upstream) upstream.delete(f.upstream.stateHash); }
     globalLimit.sweep(); addressLimit.sweep(); tokenAddressLimit.sweep(); siteLimit.sweep(); tokenSiteLimit.sweep(); refusalRows.sweep();
+    for (const [id, at] of mintBackoff) if (at + STREAK_MS < t) mintBackoff.delete(id);
     // The store's cleanup is async (#807 P3 A6c), so its failure arrives as a rejection: caught here, as the timer
     // catches a synchronous one, so neither reaches a log that prints the error itself.
     repo.write(tx => repo.oauth.cleanup(tx, t)).catch(e => hostedFailure("oauth.sweep", e));
@@ -563,6 +573,8 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
           const p = recognized(submitted, ["token", "token_type_hint"]);
           const token = hashToken(required(p, "token"));
           await repo.write(tx => repo.oauth.revokeToken(tx, token, client.clientId, now()));
+          // A revoke can free the cap a slow_down answered for, so the credential's next mint asks the store again.
+          mintBackoff.delete(client.clientId);
           writeAudit(repo, repo.read, "oauth.revoke_requested", null, null, { client_id: client.clientId });
           return new Response(null, { status: 200, headers });
         }
@@ -579,6 +591,8 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
         if (grantType === "client_credentials") {
           const selected = scopes(optional(p, "scope"), [...OAUTH_SCOPES]);
           if (!selected.every(s => client.scopes.includes(s))) fail("invalid_scope");
+          const held = mintBackoff.get(client.clientId);
+          if (held !== undefined && now() < held) throw new OAuthError("slow_down", 429, false, false);
           const token = random();
           // Between the secret's check and the mint: a revoke or disable here must still refuse (the insert re-checks).
           await testPauseAsync("oauth:mint:before-write");
@@ -588,8 +602,13 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
             const t = now();
             return { t, minted: await repo.oauth.mintServiceToken(tx, { clientId: client.clientId, secretId: client.credential!.secretId!, tokenHash: hashToken(token), scopes: selected, limits: serviceTokens }, t) };
           });
-          if (minted.status === "capacity") fail("slow_down", 429);
+          if (minted.status === "capacity") {
+            const streak = held !== undefined && t <= held + STREAK_MS;
+            mintBackoff.set(client.clientId, t + 60_000 / serviceTokens.mintsPerMinute);
+            throw new OAuthError("slow_down", 429, false, !streak);
+          }
           if (minted.status !== "ok") fail("invalid_client", 401);
+          mintBackoff.delete(client.clientId);
           return json({ access_token: token, token_type: "Bearer", expires_in: Math.floor((minted.value.expiresAt - t) / 1000), scope: selected.join(" ") });
         }
         const access = random(), refresh = random();
@@ -640,7 +659,9 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
         const refused = e instanceof OAuthError && e.status < 500;
         // A listed client's document unavailable is charged as a refusal (#933): retrying posts spend their address,
         // so an office NAT's clients retrying through a long outage can drain it for that address's other token posts.
-        if (refused || e instanceof CimdUnavailable) spend(checks, path);
+        if ((refused && (e as OAuthError).charged) || e instanceof CimdUnavailable) spend(checks, path);
+        // A slow_down inside a credential's streak: no row, and no spend of the org-wide row bucket.
+        if (refused && !(e as OAuthError).audited && !deferred.length) return refusal(e as OAuthError);
         if (refused || deferred.length) {
           // One decision per refusal, after every await, for all its rows; the CIMD rows go with it. Only a refusal or
           // an outage answers here without a row; any other error (the shutdown 503) keeps fetch's own row.

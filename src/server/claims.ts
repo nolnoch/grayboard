@@ -3,7 +3,7 @@
 // orderLanes, requeuePick, holderUserRule), so local and the server announce alike and only the reads differ.
 import { orderLanes, REDELIVERED_NOTE, requeuePick } from "../core/boards.ts";
 import {
-  alreadyReleasedText, checkMove, isQueueKey, checkRelease, checkTake, claimText, expiredText, heldAnswer, notWatching, releasable, releasedByRule,
+  alreadyReleasedText, checkMove, isQueueKey, moves, checkRelease, checkTake, claimText, expiredText, heldAnswer, notWatching, releasable, releasedByRule,
   releasedText, releaseRefusal, releaseText, renewAnnounces, takeDecision, unclaimedText, updateText, validKey, watching, watchNoBoard,
   watchNoClaim, watchOwn, type Claim, type ClaimChanges, type ClaimCtx, type ClaimResult, type ClaimRow, type TakeOpts,
 } from "../core/claims.ts";
@@ -136,7 +136,9 @@ export async function serverClaim(
     if (d.held) return held(cur!);
     const row = await repo.claims.take(sp, { key, as: d.as, note: opts.note ?? null, board, now, expires: d.expires, user: opts.user ?? null });
     if (!row) return held((await repo.claims.get(sp, key))!);
-    checkMove(d.renewed, row, cur, !!(row.board && (await repo.boards.get(sp, row.board))?.archived_at));
+    const moved = moves(d.renewed, row, cur);
+    const archived = moved && !!(await repo.boards.get(sp, row.board!))?.archived_at;
+    checkMove(d.renewed, row, cur, archived, !moved || row.holder === handle || (await boardVisible(repo, access, sp, row.holder, row.board!)));
     await repo.claims.logEvent(sp, d.renewed ? "renew" : "take", d.as, row, now);
     const say = (text: string, ending: boolean) => systemPost(repo, access, sp, d.as, row.board!, text, null, {
       allowArchived: ending, session: opts.session, via: opts.via, user: opts.user,
