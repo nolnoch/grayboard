@@ -401,7 +401,8 @@ const uploaderOf = (s: ApplicationSession): Uploader => ({ addresses: s.addresse
 
 // The audit log keeps an undelivered bridge death owed across restarts.
 // Selection reads and records delivery in one bind body, which holds the write queue across its awaits (#807 D4),
-// so only one agent gets it.
+// so only one agent gets it; on a store with more than one writer, the lock before the notified read does (#807 P3 C7
+// decision 5). It's taken only when a notice may be owed, so an ordinary bind locks nothing.
 async function owedBridgeNotice(repo: Repo, tx: Tx, email: string): Promise<string | undefined> {
   const target = `${email}/${HUMAN_NAME}`;
   const stop = await repo.audit.last(tx, "bridge.stopped", target);
@@ -413,6 +414,7 @@ async function owedBridgeNotice(repo: Repo, tx: Tx, email: string): Promise<stri
     return undefined;
   }
   if (detail.suppressed || !detail.at || !detail.reason) return undefined;
+  await repo.audit.lock(tx, "bridge.notified", target);
   const notified = await repo.audit.last(tx, "bridge.notified", target);
   if (notified && notified.at >= stop.at) return undefined;
   writeAudit(repo, tx, "bridge.notified", null, target, { at: new Date().toISOString(), stopped_at: detail.at });

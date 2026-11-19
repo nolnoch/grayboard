@@ -137,7 +137,10 @@ export class SlackBridge implements SlackLinker {
         // Dedup against the last DELIVERED notice, not the last death: the
         // unsuppressed row itself is what's owed, so a notice armed but not
         // yet delivered survives a restart. `last()` before the insert and
-        // the clamp ride out clock skew in both directions.
+        // the clamp ride out clock skew in both directions. The lock owedBridgeNotice takes too (#807 P3 C7
+        // decision 5): a notice it delivers meanwhile is read here, and suppresses this row. links is by user_id, so
+        // two stops lock in one order.
+        await repo.audit.lock(tx, "bridge.notified", target);
         const last = await repo.audit.last(tx, "bridge.notified", target);
         const prior = last && at - last.at >= 0 && at - last.at < BRIDGE_NOTIFY_DEDUP_MS;
         writeAudit(repo, tx, "bridge.stopped", null, target, {
@@ -168,6 +171,8 @@ export class SlackBridge implements SlackLinker {
   unlink(userId: number, slackUser?: string): Promise<boolean> {
     const { repo } = this.o;
     return repo.write(async (tx: Tx): Promise<boolean> => {
+      // Every link write's lock, before the read it decides on (#807 P3 C7 decision 4).
+      await repo.slack.lock(tx);
       const link = await repo.slack.linkFor(tx, userId);
       if (!link || (slackUser !== undefined && link.slack_user !== slackUser)) return false;
       await repo.slack.unlink(tx, userId);
@@ -231,6 +236,9 @@ export class SlackBridge implements SlackLinker {
     // concurrent unlink can't leave it attached without its link.
     type Linked = { taken: SlackLink } | { moved: SlackLink | undefined; link: SlackLink };
     const done = await repo.write(async (tx: Tx): Promise<Linked> => {
+      // Every link write's lock, before its reads (#807 P3 C7 decision 4): of two links of one Slack account, the
+      // second reads the first's row and answers taken.
+      await repo.slack.lock(tx);
       const taken = await repo.slack.linkBySlackUser(tx, slackUser);
       if (taken && taken.user_id !== user.id) return { taken };
       const previous = await repo.slack.linkFor(tx, user.id);

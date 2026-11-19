@@ -44,22 +44,4 @@ test("#807 A2: a settled Tx is refused; a Read posts the row", async () => {
   expect(await repo.audit.last(repo.read, "auth.login", "posted")).toBeDefined();
 });
 
-// #807 P3 A6h: audit.write stays synchronous on every store, so its contract is what a buffering store (Postgres)
-// must keep: `last` on the writing Tx sees the row before the commit, and a savepoint's rows roll back with it alone.
-test("#807 A6h: last on the writing Tx sees its row; a rolled-back savepoint's row is gone, its parent's kept", async () => {
-  const { repo } = setup();
-  const seen = await repo.write(async (tx) => {
-    writeAudit(repo, tx, "auth.login", "a@example.com", "in-body");
-    const before = await repo.audit.last(tx, "auth.login", "in-body");
-    await expect(tx.savepoint(async (sp) => {
-      writeAudit(repo, sp, "auth.login", "a@example.com", "in-savepoint");
-      expect((await repo.audit.last(sp, "auth.login", "in-savepoint"))?.actor).toBe("a@example.com");
-      throw new Error("savepoint failed");
-    })).rejects.toThrow("savepoint failed");
-    return { before, after: await repo.audit.last(tx, "auth.login", "in-savepoint") };
-  });
-  expect(seen.before?.actor).toBe("a@example.com");
-  expect(seen.after).toBeUndefined();
-  expect((await repo.audit.last(repo.read, "auth.login", "in-body"))?.actor).toBe("a@example.com");
-  expect(await repo.audit.last(repo.read, "auth.login", "in-savepoint")).toBeUndefined();
-});
+// #807 P3 A6h's store contract (last on the writing Tx, a rolled-back savepoint's rows) is audit.contract.ts U1/U2.

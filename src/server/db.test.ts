@@ -22,6 +22,14 @@ import { aliasesContract } from "./store/aliases.contract.ts";
 import { sqliteAliasesBackend } from "./store/aliases.contract.sqlite.ts";
 import { messagesContract } from "./store/messages.contract.ts";
 import { sqliteMessagesBackend } from "./store/messages.contract.sqlite.ts";
+import { cursorsContract } from "./store/cursors.contract.ts";
+import { sqliteCursorsBackend } from "./store/cursors.contract.sqlite.ts";
+import { writeReceiptsContract } from "./store/write_receipts.contract.ts";
+import { sqliteWriteReceiptsBackend } from "./store/write_receipts.contract.sqlite.ts";
+import { auditContract } from "./store/audit.contract.ts";
+import { sqliteAuditBackend } from "./store/audit.contract.sqlite.ts";
+import { slackContract } from "./store/slack.contract.ts";
+import { sqliteSlackBackend } from "./store/slack.contract.sqlite.ts";
 
 const person = (email: string, name: string) => ({ scope_kind: "person" as const, scope_ref: email, name });
 
@@ -190,14 +198,6 @@ describe("Repo", () => {
     repo = r;
   });
 
-  test("cursors: advance is idempotent and takes MAX", async () => {
-    await seed(repo, tx => repo.cursors.advance(tx, "you@example.com/fe", "direct", "you@example.com/fe", 10));
-    await seed(repo, tx => repo.cursors.advance(tx, "you@example.com/fe", "direct", "you@example.com/fe", 5));  // lower — should not regress
-    expect(await repo.cursors.get(repo.read, "you@example.com/fe", "direct", "you@example.com/fe")).toBe(10);
-    await seed(repo, tx => repo.cursors.advance(tx, "you@example.com/fe", "direct", "you@example.com/fe", 20));
-    expect(await repo.cursors.directFor(repo.read, "you@example.com/fe")).toBe(20);
-  });
-
   // #284 S5: the MailPort core endSession runs on the server (repo.sessionEnd.end's, #807 P3 B4a).
   test("mail: unread is the ID's unread direct mail from others; bounce and dropReader", async () => {
     const [id, peer] = ["id:s1", "b@example.com/be"];
@@ -226,14 +226,6 @@ describe("Repo", () => {
     expect((await repo.messages.receivedUnacked(repo.read, [id], 0)).map((m) => m.id)).toEqual([read.id, unread.id]);
     expect((await repo.messages.receivedUnacked(repo.read, [peer], 0))).toEqual([]);
   });
-
-  test("audit.write and prune", async () => {
-    const oldTs = Date.now() - 100;
-    await seed(repo, (tx) => repo.audit.write(tx, { at: oldTs, actor: "wade@example.com", action: "auth.login", target: "prune-me", detail: null }));
-    expect((await repo.audit.last(repo.read, "auth.login", "prune-me"))?.at).toBe(oldTs);
-    await seed(repo, (tx) => repo.audit.prune(tx, Date.now())); // prune everything older than now
-    expect(await repo.audit.last(repo.read, "auth.login", "prune-me")).toBeUndefined();
-  });
 });
 
 // The identity groups' rows (users, sessions, principals, teams, roles, services), shared with the Postgres store
@@ -242,6 +234,11 @@ describe("identity contract (SQLite)", () => identityContract(sqliteIdentityBack
 // The aliases and messages groups' rows, shared with the Postgres store (#807 P3 C5).
 describe("aliases contract (SQLite)", () => aliasesContract(sqliteAliasesBackend));
 describe("messages contract (SQLite)", () => messagesContract(sqliteMessagesBackend));
+// The cursors, write receipts, audit and Slack groups' rows, shared with the Postgres store (#807 P3 C67a).
+describe("cursors contract (SQLite)", () => cursorsContract(sqliteCursorsBackend));
+describe("write receipts contract (SQLite)", () => writeReceiptsContract(sqliteWriteReceiptsBackend));
+describe("audit contract (SQLite)", () => auditContract(sqliteAuditBackend));
+describe("slack contract (SQLite)", () => slackContract(sqliteSlackBackend));
 
 // Sign-in fixtures for the rows below (security audit F-13, #928 D4).
 const G = GOOGLE_ISSUER, OKTA = "https://example.okta.com";
@@ -444,34 +441,17 @@ test("audit.last searches access_log by (action, target), never a scan or a sort
   expect((await repo.audit.last(repo.read, "dm.retract", "7"))?.detail).toBe("row 3");
 });
 
-// #807 P1c-5: a leaf store runs its statements on the handle it's given, so a Tx kept past its body (D4) is refused
-// rather than writing into whichever transaction is open by then, and a value that isn't a SQLite store handle is refused.
-test("#807 P1c-5: cursors and writeReceipts run on the handle they're given", async () => {
+// #807 P1c-5: a leaf store refuses a value that isn't a SQLite store handle. A settled Tx's refusal is a contract row
+// on every backend (cursors.contract.ts K4, write_receipts.contract.ts), as are the store's answers.
+test("#807 P1c-5: cursors and writeReceipts refuse a handle from another store", async () => {
   const { repo } = openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
-  const kept = await seed(repo, async tx => {
-    await repo.cursors.advance(tx, "a@example.com/fe", "direct", "a@example.com/fe", 3);
-    await repo.writeReceipts.upsert(tx, { session: "s1", sender: "a@example.com/fe", fp: "f", tool: "dm_send", ref_kind: "message", ref_id: 1, result_json: "{}", at: 5 });
-    return tx;
-  });
-  expect(await repo.cursors.directFor(repo.read, "a@example.com/fe")).toBe(3);
-  expect((await repo.writeReceipts.find(repo.read, "s1", "a@example.com/fe", "f", 0))?.at).toBe(5);
-  const settled = /used after its transaction settled/;
-  await expect(repo.cursors.advance(kept, "a@example.com/fe", "direct", "a@example.com/fe", 4)).rejects.toThrow(settled);
-  await expect(repo.writeReceipts.prune(kept, 10)).rejects.toThrow(settled);
-  await expect(repo.cursors.get(kept, "a@example.com/fe", "direct", "a@example.com/fe")).rejects.toThrow(settled);
-  await expect(repo.cursors.directFor(kept, "a@example.com/fe")).rejects.toThrow(settled);
-  await expect(repo.writeReceipts.find(kept, "s1", "a@example.com/fe", "f", 0)).rejects.toThrow(settled);
-  await expect(repo.writeReceipts.refExists(kept, "message", 1)).rejects.toThrow(settled);
-  await expect(repo.writeReceipts.upsert(kept, { session: "s2", sender: "a@example.com/fe", fp: "g", tool: "dm_send", ref_kind: "message", ref_id: 2, result_json: "{}", at: 6 })).rejects.toThrow(settled);
-  await expect(repo.writeReceipts.pruneSession(kept, "s1", 10)).rejects.toThrow(settled);
-  await expect(repo.writeReceipts.claim(kept, { session: "s3", sender: "a@example.com/fe", fp: "h" }, "dm_send", 7)).rejects.toThrow(settled);
-  await expect(repo.writeReceipts.reclaim(kept, { session: "s1", sender: "a@example.com/fe", fp: "f" }, { ref_kind: "message", ref_id: 1 }, 7)).rejects.toThrow(settled);
   const foreign = {} as typeof repo.read;
   await expect(repo.cursors.directFor(foreign, "a@example.com/fe")).rejects.toThrow("not a SQLite store handle");
+  await expect(repo.cursors.advance(foreign as Tx, "a@example.com/fe", "direct", "a@example.com/fe", 1)).rejects.toThrow("not a SQLite store handle");
   await expect(repo.writeReceipts.refExists(foreign, "message", 1)).rejects.toThrow("not a SQLite store handle");
-  expect(await repo.cursors.directFor(repo.read, "a@example.com/fe")).toBe(3);
-  expect((await repo.writeReceipts.find(repo.read, "s1", "a@example.com/fe", "f", 0))?.at).toBe(5);
-  expect(await repo.writeReceipts.find(repo.read, "s2", "a@example.com/fe", "g", 0)).toBeUndefined();
+  await expect(repo.writeReceipts.claim(foreign as Tx, { session: "s", sender: "a@example.com/fe", fp: "f" }, "dm_send", 1)).rejects.toThrow("not a SQLite store handle");
+  await expect(repo.audit.lock(foreign as Tx, "bridge.notified", "a@example.com/human")).rejects.toThrow("not a SQLite store handle");
+  expect(() => repo.audit.write(foreign as Tx, { at: 1, actor: null, action: "auth.login", target: null, detail: null })).toThrow("not a SQLite store handle");
 });
 
 // #807 P1c-6: the sessions store runs on the handle it's given, as P1c-5's leaf stores do.
@@ -594,7 +574,9 @@ test("#807 P1c-9: the Slack store runs on the handle it's given", async () => {
   await expect(s.thread(kept, u.id, "dm", null, 1)).rejects.toThrow(settled);
   await expect(s.threadByTs(kept, u.id, "1.1")).rejects.toThrow(settled);
   await expect(s.progress(kept, u.id, "dm:1")).rejects.toThrow(settled);
+  await expect(s.lock(kept)).rejects.toThrow(settled);
   await expect(s.linkFor({} as Tx, u.id)).rejects.toThrow("not a SQLite store handle");
+  await expect(s.lock({} as Tx)).rejects.toThrow("not a SQLite store handle");
   expect(await s.links(repo.read)).toMatchObject([{ user_id: u.id, slack_user: "U1", dm_channel: "D1" }]);
   expect(await s.linkBySlackUser(repo.read, "U2")).toBeUndefined();
   expect((await s.threadByTs(repo.read, u.id, "1.1"))?.last_id).toBe(1);

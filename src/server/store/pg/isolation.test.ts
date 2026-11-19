@@ -84,6 +84,9 @@ test("the walk follows relative imports and skips type-only ones", () => {
   expect(forbiddenReach([join(SRC, "server/store/aliases.ts")])).toEqual([]);
   expect(forbiddenReach([join(SRC, "server/store/messages.ts")])).toEqual([]);
   expect(forbiddenReach([join(SRC, "server/alias_cap.ts")])).toEqual([]);
+  // The cursors, write receipts, audit and Slack groups' types, and the NUL and surrogate replacement both stores' audit
+  // and progress writes run (#807 P3 C67a): the Postgres stores and their contract runners import them.
+  for (const m of ["cursors.ts", "write_receipts.ts", "audit.ts", "slack.ts", "json_safe.ts"]) expect(forbiddenReach([join(SRC, "server/store", m)])).toEqual([]);
   // The Postgres aliases and messages stores and the attachment rows they share with C10c (#807 P3 C5b), which restate
   // core/boards.ts's and core/attachments.ts's SQL (those take a bun:sqlite Database and go with local mode).
   for (const m of ["aliases.ts", "messages.ts", "attachment_rows.ts"]) expect(forbiddenReach([join(import.meta.dir, m)])).toEqual([]);
