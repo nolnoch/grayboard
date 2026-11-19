@@ -66,6 +66,17 @@ jobs:
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    # The Postgres store's tests (#807) create and drop their own databases here. Actions can't skip a service, so
+    # docs-only and pin-only runs start it too (~10s).
+    services:
+      postgres:
+        image: postgres:18.7@sha256:2ea8630df176ad090ec92136dee850397c5af8781e4bcf2e4162593691c61bbc
+        env:
+          POSTGRES_PASSWORD: gb
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s --health-timeout 5s --health-retries 15
     env:
       PIN_ONLY: ${{ needs.scope.outputs.pin-only }}
       SUITES: ${{ needs.scope.outputs.pin-only != 'true' && needs.scope.outputs.docs-only != 'true' }}
@@ -93,6 +104,8 @@ jobs:
         if: env.SUITES == 'true'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}   # the upgrade tests list releases; lifts the anonymous rate limit
+          GRAYBOARD_TEST_PG_URL: postgres://postgres:gb@127.0.0.1:5432/postgres
+          GRAYBOARD_TEST_PG_REQUIRED: '1'   # a missing database fails the Postgres tests instead of skipping them
         run: bun run test
 
       - name: Doc links
