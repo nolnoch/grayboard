@@ -177,11 +177,16 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
   };
   // The 401 admission would answer, for a call whose tool refused `unauthenticated` (#1312), so a client signs out
   // whichever request met the revoke: only when the bearer no longer authenticates. A closing server (mcp closes before
-  // oauth does, app.ts) or a cancelled request keeps the tool's refusal: a restart never reads as a sign-out.
+  // oauth does, app.ts) or a cancelled request keeps the tool's refusal: a restart never reads as a sign-out. The
+  // `mcp:lost:authenticated` point holds a call past the re-authenticate, where a close or abort must still win (#1324).
   async function lostRefusal(request: Request, role: HostedRole): Promise<Response | undefined> {
+    // Not for the 401 decision (the fetch guard decides that): it keeps a closing server off oauth.authenticate, which
+    // app.stop closes right after mcp.close without waiting for pending requests (#1324 audit L1).
     if (closed || request.signal.aborted) return undefined;
     const refusal = await oauth.authenticate(request, roleScopes(role));
-    return refusal instanceof Response && !closed && !request.signal.aborted ? refusal : undefined;
+    await testPauseAsync("mcp:lost:authenticated");
+    // The fetch-level guard after this await is the one close/abort check past it; this function adds none (#1324).
+    return refusal instanceof Response ? refusal : undefined;
   }
   const refuse = (response: Response): never => {
     const exchange = exchanges.getStore();

@@ -52,7 +52,7 @@ export function sessionContext(principal: OAuthPrincipal, meta: unknown): Sessio
   const key = principal.sourceKey;
   const base = sourceContext(principal, key !== null && meta && typeof meta === "object" ? (meta as Record<string, unknown>)[key] : undefined);
   if (!("id" in base)) return base;
-  const context = { ...base, ...sessionFacts(meta), ...suggestedName(meta), ...([...BUILTIN_CLIENT_IDS, OPENCODE_CLIENT].includes(principal.clientId) ? launcherDeclaration(meta) : {}),
+  const context = { ...base, ...sessionFacts(meta), ...suggestedName(meta), ...(launcherClient(principal) ? launcherDeclaration(meta) : {}),
     ...(principal.source === "generic" ? declaredClient(meta) : {}) };
   // A generic-key poll root's tools-only declaration (#451); other clients' are never read.
   if (principal.sourceKey !== GRAYBOARD_SESSION_META || !meta || typeof meta !== "object" || !(GRAYBOARD_WRITES_AS_META in meta)) return context;
@@ -92,9 +92,14 @@ function declaredClient(meta: unknown): { client?: string } {
   const name = info && typeof info === "object" ? (info as Record<string, unknown>).name : undefined;
   return typeof name === "string" ? { client: name } : {};
 }
-// A launcher declaration (#473), a built-in client's only (it attracts the user's delegation requests, task text included, so a
-// third-party client can't claim it): `true` marks the session a delegation launcher, `false` and absence are
-// the same (a session that never declared one). It grants nothing beyond receiving the session's own user's requests.
+// Whose requests' launcher declaration is read (#473): a built-in client's, OpenCode's, and a service credential's of
+// either source (#1299). A launcher attracts its principal's delegation requests, task text included, so a third-party
+// client a person consented to can't claim it; a service's credential is the org's, and its launcher only receives
+// that service's own requests (routing scopes by the requester's principal; no team grant reaches a service).
+const launcherClient = (principal: OAuthPrincipal) => [...BUILTIN_CLIENT_IDS, OPENCODE_CLIENT].includes(principal.clientId) || (principal.source ?? null) !== null;
+// A launcher declaration (#473), a launcherClient's only: `true` marks the session a delegation launcher, `false` and
+// absence are the same (a session that never declared one). It grants nothing beyond receiving the session's own
+// principal's requests.
 function launcherDeclaration(meta: unknown): { launcher?: true } {
   if (!meta || typeof meta !== "object" || !(GRAYBOARD_LAUNCHER_META in meta)) return {};
   const raw = (meta as Record<string, unknown>)[GRAYBOARD_LAUNCHER_META];

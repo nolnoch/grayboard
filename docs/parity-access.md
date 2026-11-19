@@ -48,7 +48,7 @@ companions: parity.md (the matrix and the maintaining-parity rule), parity-deliv
 ## 15. Delegation launcher declaration
 
 - Local (all four): `BUS_LAUNCHER=1` in the push-mode session's env (delegation.md). Proof: `tests/integration/delegation.test.ts` (local cases).
-- pi H, omp H, CC H: declared in request `_meta` from `BUS_LAUNCHER` (delegation.md). Proof: `tests/integration/hosted_core_root.test.ts` ("a launcher client gives the Controller's port its launcher flag").
+- pi H, omp H, CC H: declared in request `_meta` from `BUS_LAUNCHER` (delegation.md). Proof: `tests/integration/hosted_core_root.test.ts` ("a launcher client gives the Controller's port its launcher flag"). A service run's session declares it the same way, and the server reads it from a service credential of either source (#1299). Proof: `tests/integration/service_credentials.test.ts` (#1299 case), `src/server/hosted.test.ts` (#1299 case: a third-party client's declaration ignored).
 - OC V2: plugin option `launcher: true` (#520), written by `setup-opencode --launcher` (#564). Proof: `adapters/opencode-v2/tests/controller.test.ts` (#520 case), `adapters/opencode-v2/tests/host.ts` (REAL_INSTRUCTIONS_DELEGATION_OK).
 
 ## 16. Update
