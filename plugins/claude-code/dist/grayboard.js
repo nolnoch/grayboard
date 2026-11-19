@@ -31655,6 +31655,15 @@ function unreachable(error) {
   }
   return false;
 }
+function abortOf(error, signal) {
+  if (!signal.aborted)
+    return false;
+  for (let e = error, depth = 0;e && depth < 8; e = e.cause, depth++) {
+    if (e === signal.reason || e instanceof SdkError && e.code === SdkErrorCode.RequestTimeout && e.message === String(signal.reason))
+      return true;
+  }
+  return false;
+}
 var connectMethods = new Set(["server/discover", "initialize"]);
 async function methodOf(request) {
   if (request.method !== "POST")
@@ -36673,8 +36682,10 @@ class Controller {
   startStop(sessionID) {
     return AbortSignal.any([this.closing.signal, this.endOf(sessionID).signal]);
   }
-  stopping(sessionID) {
-    return this.stopped || this.ending.has(sessionID);
+  stoppedBy(sessionID, error) {
+    if (!this.stopped && !this.ending.has(sessionID))
+      return false;
+    return abortOf(error, this.closing.signal) || abortOf(error, this.endOf(sessionID).signal) || error instanceof Refusal && error.code === "paused";
   }
   drifted = false;
   controls = Promise.resolve();
@@ -36954,7 +36965,7 @@ class Controller {
         await this.rotated({ spent: 0 }, () => this.prepare(r, !!previous?.paused && !names.length));
       } catch (error) {
         const what = this.port.approval ? r.paused ? "Root approval unavailable" : "Root approval saved" : r.paused ? "Root paused" : "Root enrolled";
-        const stopped = this.stopping(sessionID);
+        const stopped = this.stoppedBy(sessionID, error);
         if (!this.drifted)
           this.set(r, r.paused ? "paused" : "approved", `${what}; ${stopped ? "stopped before delivery opened" : failureMessage(this.expired(error), this.hint)}`, bound ? "prepare" : "enroll", stopped ? undefined : failureCode(this.expired(error)));
       }
@@ -36986,7 +36997,7 @@ class Controller {
           this.retrying(r, error);
           this.retryRestore(r);
         } else if (!this.drifted) {
-          const stopped = this.stopping(sessionID);
+          const stopped = this.stoppedBy(sessionID, error);
           this.set(r, r.paused ? "paused" : "approved", stopped ? "Stopped before delivery opened" : failureMessage(error, this.hint), "enroll", stopped ? undefined : failureCode(error));
         }
       }

@@ -41,6 +41,9 @@ function runtime(mode: Mode) {
   const ancestries: string[] = [];
   // While set, a temporary wire's connect waits for its signal's abort, as a server that never answers (#1294).
   let connectHold = 0, connecting = 0;
+  // The next connect whose token() refuses runs this as the refusal lands: a stop that begins after a start's
+  // real failure and before its catch records it (#1309).
+  let onRefused: (() => void) | undefined;
   let prepareHold: Promise<void> | undefined, admitHold: ((signal: AbortSignal) => Promise<void>) | undefined, beforeOpen: (() => void) | undefined;
   // The host's receipt hook (#441), when a test sets one.
   let receiptHook: ((sessionID: string, ids: readonly string[]) => void) | undefined;
@@ -61,7 +64,10 @@ function runtime(mode: Mode) {
         await new Promise<never>((_, reject) => this.signal.addEventListener("abort", () => reject(this.signal.reason), { once: true }));
       }
       if (this.beforeRetry && refreshBusy > 0) { refreshBusy--; throw new Error("Version negotiation probe failed", { cause: new RefreshInProgress("pi") }); }
-      try { await this.auth.token(); } catch (error) { throw new Error("Version negotiation probe failed", { cause: error }); }
+      try { await this.auth.token(); } catch (error) {
+        if (onRefused) { const hook = onRefused; onRefused = undefined; hook(); }
+        throw new Error("Version negotiation probe failed", { cause: error });
+      }
     }
     async close() {}
     async call(name: string, args: Record<string, unknown> = {}) {
@@ -159,6 +165,7 @@ function runtime(mode: Mode) {
     // The next `n` temporary wires' connects hang until their signals abort.
     hangConnect: (n = Infinity) => { connectHold = n; },
     get connecting() { return connecting; },
+    onRefused: (hook: () => void) => { onRefused = hook; },
     // The next delivery_open runs `hook` first (a revocation landing between a whoami and the open).
     beforeOpen: (hook: () => void) => { beforeOpen = hook; },
     holdAdmit: (hold: (signal: AbortSignal) => Promise<void>) => { admitHold = hold; },
@@ -377,6 +384,24 @@ test.each(modes.flatMap(mode => (["enroll", "enroll with a name", "resume"] as c
   expect(r.root(c)).toMatchObject({ message: expect.stringMatching(/stopped before delivery opened/i) });
   expect(r.root(c)?.code).toBeUndefined();
   expect(r.root(c)?.failure).toBeUndefined();
+});
+// #1309: a stop is decided by cause, not timing: a sign-in refusal that lands just before close (or the session's
+// shutdown) begins keeps its failure and code, rather than reading as "stopped before delivery opened".
+test.each(modes.flatMap(mode => (["enroll", "enroll with a name", "resume"] as const).flatMap(how => (["close", "shutdown"] as const).map(stop => [mode, how, stop] as const))))("a start's real failure that races a stop keeps its code (#1309, %s, %s, %s)", async (mode, how, stop) => {
+  const r = runtime(mode);
+  if (how === "resume") { await r.controller.enroll("R", ["be"], true); await until(() => r.root(r.controller)?.state === "active"); await r.controller.close(); }
+  const c = how === "resume" ? r.make() : r.controller;
+  r.expireAccess("login_required");
+  // The refusal lands, then the stop begins before the start's catch records it.
+  let stopping: Promise<unknown> | undefined;
+  r.onRefused(() => { stopping = stop === "close" ? c.close() : c.shutdown("R", "release"); });
+  const status = await (how === "resume" ? c.resume("R") : c.enroll("R", how === "enroll" ? [] : ["be"], true));
+  expect(stopping).toBeDefined();
+  expect(status.state).not.toBe("retrying");
+  expect(r.root(c)?.message).not.toMatch(/stopped before delivery opened/i);
+  expect(r.root(c)?.code).toBe("login_required");
+  await stopping;
+  await c.close();
 });
 // #1294 audit M-1: pi, omp and the Claude Code plugin stop through RootDelivery, which shuts the session down
 // (queued behind the start) before it closes: the shutdown itself ends the start's wire, and its release still runs.
