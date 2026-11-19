@@ -80,7 +80,7 @@ const scopeOf = (board: string) => (srv.app.db.query("SELECT scope FROM boards W
 const holderOf = (board: string, id: number) => (srv.app.db.query("SELECT holder FROM claims WHERE key = ?").get(`queue:${board}:${id}`) as { holder: string } | null)?.holder;
 const invokes = () => accessAudits(srv.app.db, "authz.decision").filter(r => r.detail.verb === "service.invoke");
 const push = (body: string) => (e: DeliveryEvent) => e.kind === "board" && e.item.kind === "push" && e.item.post.body === body;
-const post = (s: HostedSession, board: string, body: string, extra: Record<string, unknown> = {}) => s.call<{ post_id: number; unresolved?: string[] }>("board_post", { board, body, ...extra });
+const post = (s: HostedSession, board: string, body: string, extra: Record<string, unknown> = {}) => s.call<{ post_id: number; notified: string[]; unresolved?: string[] }>("board_post", { board, body, ...extra });
 const refusal = async (p: Promise<unknown>): Promise<HostedToolError> => {
   const e = await p.then((v) => new Error(`not refused: ${JSON.stringify(v)}`), (x: unknown) => x);
   if (!(e instanceof HostedToolError)) throw e;
@@ -229,9 +229,29 @@ describe("Tests item 4: the pilot gate", () => {
       const next = holderOf("jobs", id);
       expect(next === undefined || lanes.has(next), `declined job ${id} went to ${next}`).toBe(true);
     }
-    // A post that @mentions the holder tells it, but doesn't hand it the work.
+    // An invoker's post that @mentions the holder tells it, but doesn't hand it the work, nor hold it back from a
+    // lane (#1256).
     const named = await post(carol, "jobs", `@${B}/fe please look`);
-    expect(holderOf("jobs", named.post_id)).not.toBe(`${B}/fe`);
+    expect(lanes.has(holderOf("jobs", named.post_id)!), `named job went to ${holderOf("jobs", named.post_id)}`).toBe(true);
+    expect(named.notified).toContain(`${B}/fe`);
+    // A lane's own top-level notice to an invoker answers, it isn't new work: no sibling lane holds it.
+    const notice = await post(w1, "jobs", `@${B}/fe your job is done`);
+    expect(notice.notified).toEqual([`${B}/fe`]);
+    expect(holderOf("jobs", notice.post_id)).toBeUndefined();
+    // Nor is a claim's system notice cc'ing a watcher (non-strict): only an author's own words rotate past a name.
+    await carol.call("claim_take", { key: "ticket:ENG-7", board: "jobs" });
+    await bob.call("claim_watch", { key: "ticket:ENG-7" });
+    const before = (srv.app.db.query("SELECT max(id) AS m FROM posts").get() as { m: number }).m;
+    await carol.call("claim_release", { key: "ticket:ENG-7" });
+    const ccs = srv.app.db.query("SELECT id FROM posts WHERE board = 'jobs' AND id > ? AND body LIKE ?").all(before, `%@${B}/fe%`) as { id: number }[];
+    expect(ccs.length).toBe(1);
+    expect(holderOf("jobs", ccs[0]!.id)).toBeUndefined();
+    // A post naming a lane among others is direct addressing: no rotation, and no claim (several names); one lane
+    // named alone holds it.
+    const direct = await post(carol, "jobs", `@${SVC}/w-2 @${B}/fe this one is yours`);
+    expect(holderOf("jobs", direct.post_id)).toBeUndefined();
+    const solo = await post(carol, "jobs", `@${SVC}/w-2 this one is yours`);
+    expect(holderOf("jobs", solo.post_id)).toBe(`${SVC}/w-2`);
     for (const id of [...ids, named.post_id]) expect(holderOf("jobs", id)).not.toBe(`${B}/fe`);
   });
 
@@ -341,6 +361,24 @@ describe("a queue post's claim on a hidden board is no claim at all (audit F1)",
     expect(holderOf("jobs", p.post_id)).toBe(`${SVC}/w-1`);
     expect(holderOf("qaq", q.post_id)).toBe(`${ROOT}/fe`);
     expect(srv.app.db.query("SELECT count(*) AS n FROM claim_watches").get()).toEqual({ n: 0 });
+  });
+
+  test("a claim announced on a hidden board shows no board or note to an outsider: claim_list, the held take, HTTP (#1257)", async () => {
+    await cast();
+    const dave = await srv.hosted(D, "fe"), carol = await srv.hosted(C, "fe");
+    sessions.push(dave, carol);
+    await carol.call("board_create", { name: "qa-room", purpose: "qa only", team: "qa" });
+    await carol.call("claim_take", { key: "ticket:QA-1", board: "qa-room", note: "the secret plan" });
+    type Row = { key: string; holder: string | null; board: string | null; note: string | null };
+    const row = async (s: HostedSession) => (await s.call<Row[]>("claim_list", { prefix: "ticket:QA-1" }))[0];
+    expect(await row(carol)).toMatchObject({ holder: `${C}/fe`, board: "qa-room", note: "the secret plan" });
+    expect(await row(dave)).toMatchObject({ key: "ticket:QA-1", holder: `${C}/fe`, board: null, note: null });
+    expect(await dave.call("claim_take", { key: "ticket:QA-1" })).toMatchObject({ ok: false, held_by: `${C}/fe`, note: null });
+    const h = await api(tokens[D]!, "GET", "/api/claims?prefix=ticket:QA-1");
+    expect(JSON.stringify(h.body)).not.toContain("secret plan");
+    expect(JSON.stringify(h.body)).toContain("ticket:QA-1");
+    const t = await api(tokens[D]!, "POST", "/api/claims/call", { as: `${D}/fe`, tool: "claim_take", args: { key: "ticket:QA-1" } });
+    expect(JSON.stringify(t.body)).not.toContain("secret plan");
   });
 });
 
@@ -521,6 +559,31 @@ describe("a claim's renewal and release announced on a service's board are invoc
       expect(row(key), route).toEqual({ holder: "eng/build", board: null, note: "start" });
       // The refused move rolls back with its savepoint and records nothing.
       expect(invokes().length, route).toBe(before);
+      }
+    });
+  test("each announcement's invocation row names the post that exercised the grant, as board_post's does (#1261)", async () => {
+    await cast();
+    const bob = await srv.hosted(B, "fe");
+    sessions.push(bob);
+    const body = (id: unknown) => (srv.app.db.query("SELECT body FROM posts WHERE id = ?").get(id as number) as { body: string } | null)?.body;
+    const routes = {
+      mcp: (tool: string, args: Record<string, unknown>) => bob.call(tool, args).then(() => 200),
+      http: async (tool: string, args: Record<string, unknown>) => (await api(tokens[B]!, "POST", "/api/claims/call", { as: `${B}/fe`, tool, args })).status,
+    };
+    for (const [route, call] of Object.entries(routes)) {
+      const key = `ticket:POST-${route}`;
+      const steps: [string, Record<string, unknown>, string][] = [
+        ["claim_take", { key, board: "jobs", note: "start" }, `[claim] ${key}`],
+        ["claim_take", { key, note: "halfway" }, `[update] ${key}`],
+        ["claim_release", { key, note: "done" }, `[release] ${key}`],
+      ];
+      for (const [tool, args, prefix] of steps) {
+        const before = invokes().length;
+        expect(await call(tool, args), `${route} ${prefix}`).toBe(200);
+        const rows = invokes().slice(before);
+        expect(rows, `${route} ${prefix}`).toHaveLength(1);
+        expect(body(rows[0]!.detail.post_id), `${route} ${prefix}`).toStartWith(prefix);
+      }
     }
   });
 });

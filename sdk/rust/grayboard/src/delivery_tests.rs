@@ -3,9 +3,11 @@
 use crate::tests::{Fake, Reply, Req, event, fast, hint};
 use crate::transport::Timeouts;
 use crate::{
-    Client, ClientInfo, Delivery, DeliveryMode, DeliveryStream, Error, Session, StaticBearer,
+    AuthError, Client, ClientInfo, Credential, Delivery, DeliveryMode, DeliveryStream, Error,
+    Session, StaticBearer,
 };
 use futures_util::StreamExt;
+use futures_util::future::BoxFuture;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
@@ -287,6 +289,14 @@ impl World {
     }
 
     async fn with(bus: Bus, tune: impl FnOnce(&mut Timeouts)) -> Self {
+        Self::with_credential(bus, tune, StaticBearer::new("tok-1")).await
+    }
+
+    async fn with_credential(
+        bus: Bus,
+        tune: impl FnOnce(&mut Timeouts),
+        credential: impl Credential,
+    ) -> Self {
         let bus = Arc::new(Mutex::new(bus));
         let shared = Arc::clone(&bus);
         let fake = Fake::start(false, move |req, _| shared.lock().unwrap().handle(req)).await;
@@ -294,7 +304,7 @@ impl World {
         tune(&mut t);
         let session = Client::new(
             &fake.url,
-            StaticBearer::new("tok-1"),
+            credential,
             ClientInfo::new("rust-sdk-test", "0.0.1"),
         )
         .unwrap()
@@ -1481,4 +1491,82 @@ async fn a_re_read_keeps_the_items_ahead_of_the_accepted_item() {
     assert_eq!(next(&mut stream).await.unwrap().id, "push:5");
     assert_eq!(w.count("read"), reads, "handed over from the kept batch");
     assert_eq!(w.count("sub:delivery_receipt"), 2);
+}
+
+/// A credential that fails `failures` times once `failing` is set, transiently or terminally, then serves `tok-1` again.
+struct Flaky {
+    failing: Arc<std::sync::atomic::AtomicBool>,
+    failures: Mutex<usize>,
+    retryable: bool,
+}
+
+impl Credential for Flaky {
+    fn token(&self) -> BoxFuture<'_, Result<String, AuthError>> {
+        use std::sync::atomic::Ordering;
+        let fail = self.failing.load(Ordering::SeqCst) && {
+            let mut left = self.failures.lock().unwrap();
+            let fail = *left > 0;
+            *left = left.saturating_sub(1);
+            fail
+        };
+        let retryable = self.retryable;
+        Box::pin(async move {
+            match (fail, retryable) {
+                (false, _) => Ok("tok-1".into()),
+                (true, true) => Err(AuthError::transient(
+                    "the authorization server answered 503",
+                )),
+                (true, false) => Err(AuthError::terminal("invalid_client")),
+            }
+        })
+    }
+    fn unauthorized<'a>(&'a self, _: &'a str) -> BoxFuture<'a, Result<(), AuthError>> {
+        Box::pin(async { Err(AuthError::terminal("no")) })
+    }
+}
+
+fn flaky(failures: usize, retryable: bool) -> (Flaky, Arc<std::sync::atomic::AtomicBool>) {
+    let failing = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let c = Flaky {
+        failing: Arc::clone(&failing),
+        failures: Mutex::new(failures),
+        retryable,
+    };
+    (c, failing)
+}
+
+// Decision (#929 F1): a transient credential failure at a reopen (the authorization server down around the token's expiry) is an outage like the server's own: the stream backs off and reopens without limit, then delivers.
+#[tokio::test]
+async fn a_transient_credential_failure_at_a_reopen_backs_off_then_delivers() {
+    // More failures than the failure limit: an outage is not counted against it.
+    let (credential, failing) = flaky(12, true);
+    let w = World::with_credential(Bus::new(&["a"]), |_| {}, credential).await;
+    let mut stream = w.s().deliveries();
+    w.until("the lease listens", |b| ops_count(b, "listen") == 1)
+        .await;
+    failing.store(true, std::sync::atomic::Ordering::SeqCst);
+    w.bus().close_streams();
+    w.until("the lease listens again", |b| ops_count(b, "listen") == 2)
+        .await;
+    w.bus().direct(1);
+    w.bus().hint();
+    assert_eq!(next(&mut stream).await.unwrap().id, "direct:1");
+}
+
+// A terminal credential failure at a reopen stops the stream with `Error::Auth`.
+#[tokio::test]
+async fn a_terminal_credential_failure_at_a_reopen_stops_the_stream() {
+    let (credential, failing) = flaky(1, false);
+    let w = World::with_credential(Bus::new(&["a"]), |_| {}, credential).await;
+    let mut stream = w.s().deliveries();
+    w.until("the lease listens", |b| ops_count(b, "listen") == 1)
+        .await;
+    failing.store(true, std::sync::atomic::Ordering::SeqCst);
+    w.bus().close_streams();
+    match next(&mut stream).await {
+        Err(Error::Auth(e)) => assert!(!e.retryable, "{e}"),
+        other => panic!("expected Auth, got {other:?}"),
+    }
+    ended(&mut stream).await;
+    assert_eq!(w.count("listen"), 1);
 }

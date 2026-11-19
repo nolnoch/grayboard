@@ -145,8 +145,10 @@ export function takeDecision(cur: Claim | undefined, addresses: string[], handle
 }
 
 /** A held take's answer: a holder the caller may not see reads as nobody named, its note withheld with it (#871). */
-export function heldAnswer(cur: Claim, hidden: boolean): { ok: false; held_by: string | null; note: string | null; expires_at: number } {
-  return { ok: false, held_by: hidden ? null : cur.holder, note: hidden ? null : cur.note, expires_at: cur.expires_at };
+/** A held claim's answer: no holder or note for a holder the caller can't see, and no note for a claim on a board it
+ * can't see, since the note was written for that board's room (#1257). */
+export function heldAnswer(cur: Claim, hidden: boolean, boardHidden = false): { ok: false; held_by: string | null; note: string | null; expires_at: number } {
+  return { ok: false, held_by: hidden ? null : cur.holder, note: hidden || boardHidden ? null : cur.note, expires_at: cur.expires_at };
 }
 
 /** Whether a renewal moves the claim onto a board it wasn't on. */
@@ -330,7 +332,7 @@ export function claim(
     const lapsed = sweepChanges(db, now);
     const held = (cur: Claim): ClaimResult => {
       logEvent(db, "refused", handle, { key, note: opts.note, board }, now, cur.holder);
-      return { ...heldAnswer(cur, holderHidden(db, opts.session ?? handle, cur.holder)), ...lapsed };
+      return { ...heldAnswer(cur, holderHidden(db, opts.session ?? handle, cur.holder), !!cur.board && !canSeeBoard(db, handle, cur.board)), ...lapsed };
     };
     const cur = claimRow(db, key);
     const d = takeDecision(cur, addresses, handle, now, opts);
@@ -482,7 +484,8 @@ export function hiddenQueue(c: { key: string; board: string | null }, sees: (boa
 
 /** A claim as a reader sees it: its board named only when `boardSeen`, its holder and note only when `holderSeen`. */
 export function claimView(c: Claim, boardSeen: boolean, holderSeen: boolean): ClaimView {
-  const v: ClaimView = boardSeen ? c : { ...c, board: null };
+  // A claim on a board the viewer can't see shows neither the board nor its note, written for that room (#1257).
+  const v: ClaimView = boardSeen ? c : { ...c, board: null, note: null };
   return holderSeen ? v : { ...v, holder: null, note: null };
 }
 

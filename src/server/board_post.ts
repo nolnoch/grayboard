@@ -101,7 +101,10 @@ async function writePost(
     facts.isHuman = prefetched(facts.seenMentioned, await repo.aliases.humansAmong(tx, facts.seenMentioned), "isHuman");
     // A claim by name asks the lane rule too (#270 D5).
     facts.mayLane = prefetched(facts.seenMentioned, await access.lanesAmong(tx, facts.seenMentioned, b), "mayLane");
-    if (needsRotation(facts.seenMentioned)) {
+    // Whether the poster may be a lane matters only when every visible name may not be one (needsRotation).
+    facts.lanesOnly = strict && facts.seenMentioned.length > 0 && !facts.seenMentioned.some(facts.mayLane)
+      && (await access.lanesAmong(tx, own, b)).size === 0;
+    if (needsRotation(facts.seenMentioned, facts.mayLane, facts.lanesOnly)) {
       const rows = await repo.boards.laneRows(tx, b.name, own);
       const sees = rows.length ? await access.canSeeMany(tx, rows, b) : new Set<string>();
       const lanes = rows.length ? await access.lanesAmong(tx, rows, b) : new Set<string>();
@@ -133,17 +136,18 @@ async function writePost(
  * core post as the system writes it for a claim (announce, requeue's `[unclaimed]`): the gate on `tx` (allowArchived for
  * a post ending a claim), core's pre-checks with no files or live sessions, and the write with mentions non-strict, so
  * a watcher's ended `@id:` goes unresolved rather than refusing. Throws the gate's and the pre-checks' refusals.
+ * `postId` is the post written, for an invocation row to name (#1261).
  */
 export async function systemPost(
   repo: Repo, access: BoardAccess, tx: Tx, actor: string, board: string, body: string, parentId: number | null,
   o: { allowArchived: boolean; session?: string; via?: string; user?: string; addresses?: string[] },
-): Promise<{ wake: string[]; boards: string[] }> {
+): Promise<{ wake: string[]; boards: string[]; postId: number }> {
   const { board: b, gate } = await postGateOn(repo, access, tx, actor, board, parentId, o.allowArchived);
   postPreChecks(b.name, body, gate.announcement, {});
   const { post, out } = await writePost(repo, access, tx, actor, b, gate, {
     body, parentId, strict: false, addresses: o.addresses, session: o.session, via: o.via, user: o.user,
   });
-  return { wake: out.wake, boards: [post.board] };
+  return { wake: out.wake, boards: [post.board], postId: post.id };
 }
 
 // core viewers on `r`.

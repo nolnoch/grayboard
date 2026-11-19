@@ -179,11 +179,15 @@ async function claimList(url: URL, authed: AuthedUser, repo: Repo, access: Board
     const scope = seenScopeOf(await repo.aliases.find(repo.read, holder), holder);
     return !scope || scope.scope_ref === null || (await authorize(repo, repo.read, {}, { verb: "alias.see", principal, scope: { scope_kind: scope.scope_kind, scope_ref: scope.scope_ref } })).allow;
   };
-  const { rows: claims } = await claimsSeen(repo, access, repo.read, principal, await repo.claims.list(repo.read, prefix));
+  const { rows: claims, boards } = await claimsSeen(repo, access, repo.read, principal, await repo.claims.list(repo.read, prefix));
   // One decision per distinct holder.
   const seen = new Map<string, boolean>();
   for (const c of claims) if (!seen.has(c.holder)) seen.set(c.holder, await sees(c.holder));
-  return json(claims.map(({ board: _b, ...c }) => (seen.get(c.holder) ? c : { ...c, holder: null, note: null })));
+  // A claim on a board the caller can't see keeps its note, written for that room, to itself (#1257).
+  return json(claims.map(({ board, ...c }) => {
+    const v = !board || boards.has(board) ? c : { ...c, note: null };
+    return seen.get(c.holder) ? v : { ...v, holder: null, note: null };
+  }));
 }
 
 // An address the caller may act as (#284 S11), in full, or the refusal: a
@@ -255,9 +259,9 @@ async function claimCall(req: Request, authed: AuthedUser, repo: Repo, access: B
       // The tool's own savepoint rolls back a refusal's writes, so answering it here commits none (#807 P3 B5b3c).
       // Each claim announcement on a service's board is an invocation (#1259), recorded with its post for the
       // address it posts as: the take's decision above when that's the caller on the named board, else the poster's.
-      const announced = async (sp: Tx, as: string, board: string) => {
+      const announced = async (sp: Tx, as: string, board: string, postId: number) => {
         const a = inv && as === handle && inv.req.board === board ? inv : await invocation(repo, sp, as, board);
-        if (a?.d.allow) recordDecision(repo, sp, { user: authed.user_email, address: as }, a.req, a.d);
+        if (a?.d.allow) recordDecision(repo, sp, { user: authed.user_email, address: as }, a.req, a.d, { post_id: postId });
       };
       return await callClaimTool(repo, access, tx, handle, tool as ClaimTool, args, { addresses, user: authed.user_email, announced });
     } catch (e) {
