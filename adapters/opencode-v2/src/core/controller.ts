@@ -119,8 +119,20 @@ export class Controller<E extends Enrollment = Enrollment> {
   // Sessions a shutdown has begun for: treated like `stopped`, per session,
   // since one Controller may run several roots (OpenCode V2).
   private readonly ending = new Set<string>();
-  // Aborted by close: ends a wait outside any root's run loop (a restore's rotation grace).
-  private readonly closing = new AbortController();
+  // Aborted by close: ends a wait outside any root's run loop (a restore's rotation grace) and an
+  // enroll's or prepare's wire (#1294). A subclass whose close waits on its own work first aborts it then.
+  protected readonly closing = new AbortController();
+  // Per session, aborted by its shutdown (which queues behind a start in flight): ends that session's
+  // enroll and prepare wires, as close does every session's (#1294). Never a release's or session end's.
+  private readonly ends = new Map<string, AbortController>();
+  private endOf(sessionID: string) {
+    let end = this.ends.get(sessionID);
+    if (!end) this.ends.set(sessionID, end = new AbortController());
+    return end;
+  }
+  private startStop(sessionID: string) { return AbortSignal.any([this.closing.signal, this.endOf(sessionID).signal]); }
+  // A start that fails once close or the session's shutdown began was stopped: say so, with no failure code.
+  private stopping(sessionID: string) { return this.stopped || this.ending.has(sessionID); }
   private drifted = false;
   private controls: Promise<unknown> = Promise.resolve();
   private state: Status;
@@ -320,8 +332,9 @@ export class Controller<E extends Enrollment = Enrollment> {
     await wire.connect();
     return wire;
   }
-  private async temporary<T>(e: E, call: (wire: Wire) => Promise<T>, sessionID = e.sessionID) {
-    const wire = await this.wire(e, sessionID);
+  // `stop` ends the wire before its timeout: close, for a start's wire; a release's or session end's has none.
+  private async temporary<T>(e: E, call: (wire: Wire) => Promise<T>, sessionID = e.sessionID, stop?: AbortSignal) {
+    const wire = await this.wire(e, sessionID, stop && AbortSignal.any([AbortSignal.timeout(10_000), stop]));
     try { return await call(wire); } finally { await wire.close().catch(error => this.failure("wire_close", error)); }
   }
   // A 403 insufficient_scope needs a new sign-in exactly like an ended grant;
@@ -367,14 +380,15 @@ export class Controller<E extends Enrollment = Enrollment> {
           await this.guard(r, epoch, signal);
           for (const name of names) await w.call("bind", { name, create, where: this.port.place() });
           await this.guard(r, epoch, signal);
-        });
+        }, sessionID, this.startStop(sessionID));
         bound = true;
       }
       await this.rotated({ spent: 0 }, () => this.prepare(r, !!previous?.paused && !names.length));
     } catch (error) {
       // A drift during it (a guard saw the change) already said why every root paused.
       const what = this.port.approval ? (r.paused ? "Root approval unavailable" : "Root approval saved") : (r.paused ? "Root paused" : "Root enrolled");
-      if (!this.drifted) this.set(r, r.paused ? "paused" : "approved", `${what}; ${failureMessage(this.expired(error), this.hint)}`, bound ? "prepare" : "enroll", failureCode(this.expired(error)));
+      const stopped = this.stopping(sessionID);
+      if (!this.drifted) this.set(r, r.paused ? "paused" : "approved", `${what}; ${stopped ? "stopped before delivery opened" : failureMessage(this.expired(error), this.hint)}`, bound ? "prepare" : "enroll", stopped ? undefined : failureCode(this.expired(error)));
     }
     await this.diagnostics.flush();
     return { ...r.status, roots: this.status().roots };
@@ -402,7 +416,10 @@ export class Controller<E extends Enrollment = Enrollment> {
       if ((error instanceof ServerUnreachable || error instanceof RefreshInProgress) && this.restorable(r, r.epoch)) {
         this.retrying(r, error);
         this.retryRestore(r);
-      } else if (!this.drifted) this.set(r, r.paused ? "paused" : "approved", failureMessage(error, this.hint), "enroll", failureCode(error));
+      } else if (!this.drifted) {
+        const stopped = this.stopping(sessionID);
+        this.set(r, r.paused ? "paused" : "approved", stopped ? "Stopped before delivery opened" : failureMessage(error, this.hint), "enroll", stopped ? undefined : failureCode(error));
+      }
     }
     await this.diagnostics.flush();
     return { ...r.status, roots: this.status().roots };
@@ -494,7 +511,7 @@ export class Controller<E extends Enrollment = Enrollment> {
         const started = this.start(r);
         if (waitForStart) await started;
       }
-    });
+    }, r.e.sessionID, this.startStop(r.e.sessionID));
   }
   private start(r: Root<E>) {
     if (r.task || r.paused || this.stopped || this.ending.has(r.e.sessionID)) return;
@@ -689,7 +706,7 @@ export class Controller<E extends Enrollment = Enrollment> {
   // one that fails, a sign-out included, is recorded: the lease then stays
   // until it lapses.
   shutdown(sessionID: string, mode: "release" | "detach", o: { carry?: boolean } = {}): Promise<string[] | undefined> {
-    this.ending.add(sessionID);
+    this.ending.add(sessionID); this.endOf(sessionID).abort();
     this.roots.get(sessionID)?.abort?.abort();
     return this.serial(async () => {
       const r = this.roots.get(sessionID);

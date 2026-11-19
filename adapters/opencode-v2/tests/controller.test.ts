@@ -27,7 +27,7 @@ function runtime(options: { name?: string; create?: boolean; static?: StaticMode
   let holdRegister: (() => Promise<void>) | undefined, admit: (() => Promise<void>) | undefined, holdReceipt = false, refuseBind = false;
   let ownership = 0, throttledReads = 0;
   let readFailure: (() => void) | undefined;
-  let observation: ((operation: string) => Promise<void>) | undefined;
+  let observation: ((operation: string, signal: AbortSignal) => Promise<void>) | undefined;
   let subscription: (() => Promise<void> | undefined) | undefined;
   const node = (id: string, parentID?: string) => { nodes.set(id, { id, parentID, time: {}, metadata: {} }); };
   node("R"); node("B"); node("C", "R"); node("G", "C");
@@ -37,7 +37,7 @@ function runtime(options: { name?: string; create?: boolean; static?: StaticMode
     admissionRetryAfterMs?: number;
     client = { setNotificationHandler: () => {} };
     constructor(_config: unknown, _auth: unknown, readonly signal: AbortSignal, readonly sessionID: string) {}
-    async connect() { await observation?.("connect"); }
+    async connect() { await observation?.("connect", this.signal); }
     async close() {}
     async call(name: string, args: Record<string, unknown> = {}) {
       calls.push({ sessionID: this.sessionID, name, args });
@@ -90,7 +90,7 @@ function runtime(options: { name?: string; create?: boolean; static?: StaticMode
   const controller = new Controller(ctx, { mcpName: "grayboard", ...options }, FakeWire as unknown as typeof Wire, wait);
   const before = (sessionID: string, tool = "grayboard_dm_send") => controller.before({ sessionID, tool, id: "call" });
   const after = (sessionID: string, name: string) => controller.after({ sessionID, tool: "grayboard_bind", id: "call", status: "completed", result: { output: { name, ownership: rows.get(sessionID)?.ownership, instructions: ["bound"] } } });
-  return { ctx, controller, observe: (call: (operation: string) => Promise<void>) => { observation = call; }, subscriptions: (call: () => Promise<void> | undefined) => { subscription = call; }, readFailure: (call: () => void) => { readFailure = call; }, restart: (restartWait?: (ms: number, signal: AbortSignal) => Promise<void>) => new Controller(ctx, { mcpName: "grayboard", ...options }, FakeWire as unknown as typeof Wire, restartWait), rows, storage, nodes, calls, admissions, batches, bind, before, after, f, throttle: (count: number) => { throttledReads = count; }, holdRegistration: (call: () => Promise<void>) => { holdRegister = call; }, admission: (call: () => Promise<void>) => { admit = call; }, rejectReceipt: () => { holdReceipt = true; }, refuse: () => { refuseBind = true; } };
+  return { ctx, controller, observe: (call: (operation: string, signal: AbortSignal) => Promise<void>) => { observation = call; }, subscriptions: (call: () => Promise<void> | undefined) => { subscription = call; }, readFailure: (call: () => void) => { readFailure = call; }, restart: (restartWait?: (ms: number, signal: AbortSignal) => Promise<void>) => new Controller(ctx, { mcpName: "grayboard", ...options }, FakeWire as unknown as typeof Wire, restartWait), rows, storage, nodes, calls, admissions, batches, bind, before, after, f, throttle: (count: number) => { throttledReads = count; }, holdRegistration: (call: () => Promise<void>) => { holdRegister = call; }, admission: (call: () => Promise<void>) => { admit = call; }, rejectReceipt: () => { holdReceipt = true; }, refuse: () => { refuseBind = true; } };
 }
 test("diagnostic failures never inspect hostile error properties and retain cleanup classification", async () => {
   let reads = 0; const error = new Error();
@@ -1591,6 +1591,41 @@ test("static mode: close during a retry's whoami aborts it and ends the retrying
   try {
     await closeDuringAttempt(s, () => calls === 2);
   } finally { await s.restore(); }
+});
+// #1294: close aborts a retry attempt's enroll whose prepare wire is still connecting before it waits for the retry,
+// rather than waiting out the wire's 10 s timeout. The root enrolled before its prepare: that record stands.
+test("static mode: close during a retry's prepare connect aborts it", async () => {
+  let calls = 0, connecting = 0;
+  const s = await staticRuntime("service", undefined, undefined, () => { if (++calls === 1) throw unavailable(); });
+  (s.r.controller as unknown as { enrollRetryFirstMs: number }).enrollRetryFirstMs = 1;
+  s.r.observe(async (operation, signal) => { if (operation === "connect") { connecting++; await hung(signal); } });
+  try {
+    await s.r.controller.observe("session.created", { sessionID: "R" });
+    await until(() => connecting === 1, 5000, "the retry's prepare connects");
+    const began = performance.now();
+    await s.r.controller.close();
+    expect(performance.now() - began).toBeLessThan(500);
+    expect(calls).toBe(2);
+    expect(connecting).toBe(1);
+    expect(s.r.calls).toEqual([]);
+    expect(rootRecord(s.r.controller, "R")).not.toMatchObject({ state: "retrying" });
+  } finally { await s.restore(); }
+});
+// #1294 audit L-2: an enroll's bind wire, still connecting, ends at close too; the root's record says it stopped.
+test("close during an enroll's bind connect aborts it and records a stop, not a failure", async () => {
+  const r = runtime();
+  let connecting = 0;
+  r.observe(async (operation, signal) => { if (operation === "connect") { connecting++; await hung(signal); } });
+  const enrolling = r.controller.enroll("R", ["be"], true);
+  await until(() => connecting === 1, 5000, "the enroll's bind connects");
+  const began = performance.now();
+  await r.controller.close();
+  expect(performance.now() - began).toBeLessThan(500);
+  await enrolling;
+  expect(r.calls).toEqual([]);
+  const record = rootRecord(r.controller, "R");
+  expect(record?.message).toContain("stopped before delivery opened");
+  expect(record?.code).toBeUndefined();
 });
 // #1285 audit: close never calls a root enrolled during the retry "not enrolled"; nor does it overwrite the record
 // of an attempt that answered before close stopped it.

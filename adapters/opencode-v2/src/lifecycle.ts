@@ -226,7 +226,8 @@ export class OpenCodeController extends Controller<OpenCodeEnrollment> {
   // A static run has no person to enroll by hand (#1250): an attempt that fails on an outage (unreachable, a
   // 5xx, a timeout, a rate limit or the server's internal error) is retried on a capped backoff, ENROLL_RETRIES times;
   // any other answer stands. A retry stops when the controller closes, the session ends or the root is enrolled.
-  // Close aborts an attempt's pin check and whoami (`enrollStop`, #1285) as well as a retry's wait.
+  // Close aborts an attempt's pin check and whoami (`enrollStop`, #1285), its enroll and prepare (`closing`, #1294)
+  // and a retry's wait.
   async serviceEnroll(sessionID: string) {
     if (this.stopped || !this.options.static) return;
     let error = await this.autoEnroll(sessionID);
@@ -265,7 +266,8 @@ export class OpenCodeController extends Controller<OpenCodeEnrollment> {
   private enrollRetryFirstMs = ENROLL_RETRY_FIRST_MS;
   private readonly enrollRetries = new Set<Promise<void>>();
   override async close() {
-    this.stopped = true; this.enrollStop.abort();
+    // `closing` too: an attempt's enroll or prepare wire (#1294) stops now, not after its timeout.
+    this.stopped = true; this.enrollStop.abort(); this.closing.abort();
     while (this.enrollRetries.size) await Promise.all(this.enrollRetries);
     await super.close();
   }

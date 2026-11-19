@@ -310,6 +310,34 @@ test("detach keeps the lease and name for the next runtime; release ends the ses
   expect([...a.logs, ...b.logs]).toEqual([]);
 });
 
+// #1294 audit M-1: pi, omp and the Claude Code plugin shut down through RootDelivery, which shuts the session down
+// (queued behind a start in flight) and only then closes the Controller. A start whose wire still connects to a
+// server that never answers ends at the shutdown, not at the wire's 10 s timeout, and the release still runs.
+test("a release while a start's prepare is still connecting ends it at once and still ends the session", async () => {
+  await (await live("hung-1", "hung")).root.shutdown("detach");
+  const real = globalThis.fetch;
+  let armed = true;
+  const { promise: holding, resolve: hit } = Promise.withResolvers<void>();
+  const fetchSpy = spyOn(globalThis, "fetch").mockImplementation((async (input: RequestInfo | URL, init?: RequestInit) => {
+    const signal = init?.signal;
+    if (armed && signal && new Headers(init?.headers).get("X-Grayboard-Client") === "subscriber") {
+      armed = false; hit();
+      return new Promise<never>((_, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }));
+    }
+    return real(input, init);
+  }) as typeof fetch);
+  try {
+    const b = rig("hung-1");
+    const started = b.root.start();
+    await holding;
+    const began = performance.now();
+    await b.root.shutdown("release");
+    expect(performance.now() - began).toBeLessThan(5000);
+    expect(row("hung-1")).toBeNull();
+    await started;
+  } finally { fetchSpy.mockRestore(); }
+}, 30_000);
+
 // The Controller's wires (subscriber, temporary, child registration) declare a launcher client's flag too, not only
 // its proxy wire (#520): the port root.ts builds carries it.
 test.each([true, false])("a launcher client (%p) gives the Controller's port its launcher flag", launcher => {
