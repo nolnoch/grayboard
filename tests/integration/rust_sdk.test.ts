@@ -64,7 +64,7 @@ test.skipIf(!example)("the Rust roundtrip example mints its own token as a servi
   const invoker = await s.hosted(EMAIL, "ts-peer");
 
   const env: Record<string, string | undefined> = { ...process.env, GRAYBOARD_URL: s.resource, GRAYBOARD_ISSUER: s.issuer, GRAYBOARD_CLIENT_ID: rust.client_id, GRAYBOARD_CLIENT_SECRET: rust.client_secret, GRAYBOARD_SESSION: SESSION };
-  delete env.GRAYBOARD_TOKEN;
+  delete env.GRAYBOARD_RUN_TOKEN;
   const run = Bun.spawn([example!, "w-1", "work"], { env, stdout: "pipe", stderr: "pipe" });
   const killer = setTimeout(() => run.kill(), 60_000);
   const output = Promise.all([run.exited, new Response(run.stdout).text(), new Response(run.stderr).text()]);

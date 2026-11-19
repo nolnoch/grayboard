@@ -47,9 +47,9 @@ assert.equal(minted.status, 200); assert(runToken);
 const digest = (s: string | null) => s ? createHash("sha256").update(s).digest("hex") : null;
 // What the launcher sets, and the entry it writes: the token only through `{env:…}`, never in the file.
 process.env.GRAYBOARD_RUN_TOKEN = runToken;
-process.env.GRAYBOARD_OPENCODE_AUTH = "static";
-process.env.GRAYBOARD_OPENCODE_ISSUER = issuer;
-process.env.GRAYBOARD_OPENCODE_PRINCIPAL = SERVICE;
+process.env.GRAYBOARD_AUTH = "static";
+process.env.GRAYBOARD_ISSUER = issuer;
+process.env.GRAYBOARD_PRINCIPAL = SERVICE;
 mkdirSync(join(root, "static-home/config"), { recursive: true }); mkdirSync(join(root, "project"), { recursive: true });
 writeFileSync(join(root, "static-home/config/opencode.json"), JSON.stringify({ mcp: { servers: { grayboard: { type: "remote", url: resource, oauth: false, codemode: codeMode, headers: { Authorization: "Bearer {env:GRAYBOARD_RUN_TOKEN}" } } } } }));
 
