@@ -20,8 +20,9 @@ function runtimeImports(text: string): string[] {
   return specs;
 }
 
-// Every path from `roots` that reaches bun:sqlite or the SQLite store, as "a -> b -> spec" chains.
-function forbiddenReach(roots: string[]): string[] {
+// Every path from `roots` that reaches bun:sqlite or a `forbidden` module (by default the SQLite store), as
+// "a -> b -> spec" chains.
+function forbiddenReach(roots: string[], forbidden: ReadonlySet<string> = new Set([SQLITE_STORE])): string[] {
   const offenders: string[] = [];
   const seen = new Set<string>();
   const visit = (file: string, chain: string[]) => {
@@ -33,7 +34,7 @@ function forbiddenReach(roots: string[]): string[] {
       if (!spec.startsWith(".")) continue;
       const target = resolve(dirname(file), spec);
       const path = existsSync(target) ? target : `${target}.ts`;
-      if (path === SQLITE_STORE) { offenders.push([...here, relative(SRC, path)].join(" -> ")); continue; }
+      if (forbidden.has(path)) { offenders.push([...here, relative(SRC, path)].join(" -> ")); continue; }
       if (!existsSync(path)) throw new Error(`${relative(SRC, file)}: unresolved import ${spec}`);
       visit(path, here);
     }
@@ -58,7 +59,7 @@ function pgModules(): string[] {
 test("no non-test module under src/server/store/pg/ reaches bun:sqlite or the SQLite store, even transitively", () => {
   const roots = pgModules();
   // The scan sees this directory's modules (a scan that read nothing would pass vacuously).
-  expect(roots.map(p => relative(import.meta.dir, p))).toEqual(expect.arrayContaining(["audit_row.ts", "errors.ts", "hosted_port.ts", "identity.ts", "migrate.ts", "oauth.ts", "sql.ts", "tx.ts"]));
+  expect(roots.map(p => relative(import.meta.dir, p))).toEqual(expect.arrayContaining(["aliases.ts", "attachment_rows.ts", "audit_row.ts", "errors.ts", "hosted_port.ts", "identity.ts", "messages.ts", "migrate.ts", "oauth.ts", "sql.ts", "tx.ts"]));
   expect(forbiddenReach(roots)).toEqual([]);
 });
 
@@ -83,7 +84,19 @@ test("the walk follows relative imports and skips type-only ones", () => {
   expect(forbiddenReach([join(SRC, "server/store/aliases.ts")])).toEqual([]);
   expect(forbiddenReach([join(SRC, "server/store/messages.ts")])).toEqual([]);
   expect(forbiddenReach([join(SRC, "server/alias_cap.ts")])).toEqual([]);
+  // The Postgres aliases and messages stores and the attachment rows they share with C10c (#807 P3 C5b), which restate
+  // core/boards.ts's and core/attachments.ts's SQL (those take a bun:sqlite Database and go with local mode).
+  for (const m of ["aliases.ts", "messages.ts", "attachment_rows.ts"]) expect(forbiddenReach([join(import.meta.dir, m)])).toEqual([]);
   expect(runtimeImports(`import type { X } from "../tx.ts";\nexport type { Y } from "../db.ts";`)).toEqual([]);
   expect(runtimeImports(`import {\n  a,\n  b,\n} from "../tx.ts";\nexport { c } from "./d.ts";\nimport "./e.ts";\nconst f = await import("../db.ts");`))
     .toEqual(["../tx.ts", "./d.ts", "./e.ts", "../db.ts"]);
+});
+
+// #807 P3 C5 decision 11: the Postgres stores restate core's board and attachment SQL. core/boards.ts and
+// core/attachments.ts run statements on a bun:sqlite Database (type-only, so the walk above passes them); a pg module
+// importing one at runtime, directly or through a module that re-exports it, would be calling SQLite code with a
+// Postgres handle.
+test("no non-test module under src/server/store/pg/ reaches core/boards.ts or core/attachments.ts at runtime, even transitively", () => {
+  const core = new Set(["core/boards.ts", "core/attachments.ts"].map(p => join(SRC, p)));
+  expect(forbiddenReach(pgModules(), core)).toEqual([]);
 });

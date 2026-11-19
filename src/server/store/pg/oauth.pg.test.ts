@@ -6,9 +6,9 @@
 // grant minted for a disabled user), not on a timeout. Without GRAYBOARD_TEST_PG_URL they skip.
 import { expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { describePg, pgDatabase, type PgDatabase } from "../../../../tests/support/pg.ts";
+import { describePg } from "../../../../tests/support/pg.ts";
 import { hostedRecorder, type HostedRecorder } from "../../../../tests/support/pg_hosted.ts";
-import { until } from "../../../../tests/support/until.ts";
+import { blockedOrSettled, gate, pgPair, race, settle, type PgPair, type Settled } from "../../../../tests/support/pg_race.ts";
 import { OAUTH_SCOPES } from "../../oauth-config.ts";
 import { BROWSER_SESSIONS, REQUESTS_PER_BROWSER, REQUESTS_TOTAL } from "../../oauth-rules.ts";
 import { OAUTH_TTL, type OAuthAuthorization, type OAuthCode, type OAuthRequest, type OAuthStore, type OAuthTokenPair, type ServiceTokenLimits } from "../../oauth-types.ts";
@@ -16,7 +16,7 @@ import type { Tx } from "../tx_base.ts";
 import type { PgHostedEnds } from "./hosted_port.ts";
 import { makePgIdentity, type PgIdentity } from "./identity.ts";
 import { makePgOAuth } from "./oauth.ts";
-import { makePgTransactions, pgOf, type PgTransactions } from "./tx.ts";
+import { pgOf } from "./tx.ts";
 
 const start = 1_800_000_000_000;
 const sha = (s: string) => createHash("sha256").update(s).digest("hex");
@@ -25,47 +25,20 @@ const loginAuth: OAuthAuthorization = { ...grantAuth, scopes: ["grayboard:login"
 const pairOf = (tag: string, auth = grantAuth, now = start): OAuthTokenPair => ({ ...auth, accessHash: sha(`access-${tag}`), refreshHash: sha(`refresh-${tag}`),
   accessExpiresAt: now + OAUTH_TTL.access, refreshExpiresAt: now + OAUTH_TTL.refresh });
 
-type Pair = { db: PgDatabase; a: PgTransactions; b: PgTransactions; o: OAuthStore; g: PgIdentity; rec: HostedRecorder; [Symbol.asyncDispose](): Promise<void> };
+type Pair = PgPair & { o: OAuthStore; g: PgIdentity; rec: HostedRecorder };
 
 // `hosted` replaces the recorder's port in both stores (the lock-order race's C8-shaped port).
 async function pair(hosted?: PgHostedEnds): Promise<Pair> {
-  const db = await pgDatabase({ max: 2 });
-  const a = makePgTransactions(db.url, { max: 2, applicationName: "gb-test-a" });
-  const b = makePgTransactions(db.url, { max: 2, applicationName: "gb-test-b" });
+  const base = await pgPair();
   const rec = hostedRecorder();
   const port = hosted ?? rec.port;
   return {
-    db, a, b, rec, o: makePgOAuth({ hosted: port }), g: makePgIdentity({ now: Date.now, hosted: port }),
+    ...base, rec, o: makePgOAuth({ hosted: port }), g: makePgIdentity({ now: Date.now, hosted: port }),
     async [Symbol.asyncDispose]() {
-      await a.close(); await b.close(); await db[Symbol.asyncDispose]();
+      await base[Symbol.asyncDispose]();
       expect(rec.problems).toEqual([]);
     },
   };
-}
-
-function gate(): { wait: Promise<void>; open(): void } {
-  let open!: () => void;
-  const wait = new Promise<void>(r => { open = r; });
-  return { wait, open };
-}
-
-type Settled<T> = { ok: true; value: T } | { ok: false; error: any };
-const settle = <T>(p: Promise<T>): Promise<Settled<T>> => p.then(value => ({ ok: true as const, value }), error => ({ ok: false as const, error }));
-
-// `first` runs on store A and holds its transaction open after its body; `second` runs on store B. `waited`: B was
-// seen blocked on a lock while A held.
-async function race<TA, TB>(p: Pair, first: (tx: Tx) => Promise<TA>, second: (tx: Tx) => Promise<TB>): Promise<{ a: Settled<TA>; b: Settled<TB>; waited: boolean }> {
-  const held = gate(), release = gate();
-  const a = settle(p.a.write(async tx => { const v = await first(tx); held.open(); await release.wait; return v; }));
-  await Promise.race([held.wait, a]);
-  let done = false, waited = false;
-  const b = settle(p.b.write(second)).finally(() => { done = true; });
-  await until(async () => {
-    if ((await p.db.sql`SELECT 1 FROM pg_stat_activity WHERE application_name = 'gb-test-b' AND wait_event_type = 'Lock'`).length > 0) waited = true;
-    return waited || done;
-  }, 5000, "B blocked on a lock, or settled");
-  release.open();
-  return { a: await a, b: await b, waited };
 }
 
 // A settled store call's status, or its error's message.
@@ -415,11 +388,11 @@ describePg("OAuth races (Postgres)", () => {
     await Promise.race([atGate.wait, a]);
     let done = false, waited = false;
     const b = settle(p.b.write(tx => p.g.users.setDisabled(tx, w.userId, true))).finally(() => { done = true; });
-    await until(async () => {
-      if ((await p.db.sql`SELECT 1 FROM pg_stat_activity WHERE application_name = 'gb-test-b' AND wait_event_type = 'Lock'`).length > 0) waited = true;
-      return waited || done;
-    }, 5000, "the disable blocked on a lock, or settled");
-    release.open();
+    try {
+      waited = await blockedOrSettled(p, () => done, "the disable blocked on a lock, or settled") !== null;
+    } finally {
+      release.open();
+    }
     const out = (s: Settled<unknown>) => s.ok ? "ok" : `threw ${s.error?.message}`;
     expect([out(await a), out(await b)]).toEqual(["ok", "ok"]);
     expect((await p.db.sql`SELECT ended FROM hosted_scratch`)[0].ended).toBe(true);

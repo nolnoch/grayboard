@@ -309,7 +309,7 @@ describePg("Postgres transactions", () => {
       await locked.wait;
       const bw = b.write(async tx => { await pgOf(tx)`UPDATE t SET v = v || '+b' WHERE seq = 1`; }, () => { order.push("b"); });
       await until(async () => (await x.db.sql`SELECT 1 FROM pg_stat_activity
-        WHERE application_name = 'gb-test-b' AND wait_event_type = 'Lock'`).length > 0, 5000, "B's UPDATE to wait on A's row lock");
+        WHERE datname = ${x.db.name} AND application_name = 'gb-test-b' AND wait_event_type = 'Lock'`).length > 0, 5000, "B's UPDATE to wait on A's row lock");
       expect(order).toEqual([]);
       release.open();
       await Promise.all([a, bw]);

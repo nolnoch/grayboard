@@ -329,7 +329,8 @@ function reads(it: It): void {
     expect(await h.messages.queuedTo(h.read, [])).toEqual(new Map());
   });
 
-  // M13.
+  // M13. On Postgres the planner's GroupAggregate sorts this small fixture by recipient on its own, so dropping the
+  // store's ORDER BY passes here: recipient order is unpinned there.
   it("undeliveredFrom: per recipient in byte order, numeric counts, past the read point, undelivered, older than the bound", async h => {
     const lower = "a@example.com/a_b", upper = "a@example.com/aB", cap = "A@example.com/x";
     h.setNow(T0);
