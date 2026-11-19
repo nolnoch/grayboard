@@ -1,7 +1,6 @@
 import { randomBytes } from "node:crypto";
 import { hashToken, type AuthedUser } from "../../src/server/auth.ts";
-import { join, dirname } from "node:path";
-import { openDatabase, type Repo } from "../../src/server/db.ts";
+import type { Repo } from "../../src/server/db.ts";
 import { OAUTH_TTL, type OAuthResult } from "../../src/server/oauth-types.ts";
 import { seed } from "../support/seed.ts";
 import type { Tx } from "../../src/server/store/tx.ts";
@@ -19,8 +18,8 @@ export function issueOAuth(repo: Repo, resource: string, email = "alice@example.
 export type IssuedOAuth = Awaited<ReturnType<typeof issueOAuth>>;
 
 async function issueNow(repo: Repo, tx: Tx, resource: string, email: string, scopes: string[], now: number, clientId: string) {
-  // A service principal (#270) has no sign-in, so upsertByEmail refuses its name: issue to the existing row, the
-  // test-only stand-in for the credential grant a later step adds.
+  // A service principal (#270) has no sign-in, so upsertByEmail refuses its name: issue to the existing row, an
+  // in-process shortcut for tests that don't exercise the client-credentials grant at /oauth/token itself.
   const existing = await repo.users.findByEmail(tx, email);
   const user = existing?.kind === "service" ? existing : await repo.users.upsertByEmail(tx, email, null);
   const binding = { clientId, resource, scopes: [...scopes].sort(), redirectUri: "http://127.0.0.1/callback", codeChallenge: random() };
@@ -45,14 +44,4 @@ export async function rotateOAuth(repo: Repo, grant: Pick<IssuedOAuth, "binding"
     ...grant.tokens, accessHash: hashToken(access), refreshHash: hashToken(refresh), accessExpiresAt: now + OAUTH_TTL.access, refreshExpiresAt: now + OAUTH_TTL.refresh,
   } }, now)).status);
   return { access, refresh, status };
-}
-
-/** `issueOAuth` into the server database at `dbPath`, opened and closed here, for a server process started on it afterwards. */
-export async function issueOAuthIn(dbPath: string, ...args: Parameters<typeof issueOAuth> extends [Repo, ...infer Rest] ? Rest : never) {
-  const { db, repo } = openDatabase(dbPath, { blobDir: join(dirname(dbPath), "blobs") });
-  try {
-    return await issueOAuth(repo, ...args);
-  } finally {
-    db.close();
-  }
 }

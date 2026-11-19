@@ -1,6 +1,6 @@
 //! The conformance suite's Rust driver (#929; `docs/sdk-rust.md` §4): `tests/conformance/driver.ts` `rustDriver()` runs one of these per bus and speaks JSON lines with it on stdio.
 //!
-//! - `{"id","op":"peer","peer","url","token","session"}` opens a session in push mode, binds `peer` with `create: true` and opens its delivery lease; it answers `{"id","result":<the bind's CallToolResult>}`.
+//! - `{"id","op":"peer","peer","url","issuer","client_id","secret","session"}` opens a session in push mode as the service whose credential that is, binds `peer` with `create: true` and opens its delivery lease; it answers `{"id","result":<the bind's CallToolResult>}`. Every peer shares one `ClientCredentials`, made from the first peer's fields, so the driver mints one run token per bus.
 //! - `{"id","op":"call","peer","tool","args"}` makes a native tool call through `Session::call_raw` and answers `{"id","result":<raw CallToolResult>}`, refusals included.
 //! - `{"op":"close"}` (or end of input) waits for calls in flight, ends every session and exits 0; 1 if an end failed.
 //!
@@ -8,7 +8,7 @@
 //!
 //! The lease follows the TS hosted driver (`hostedDriver()`): a successful `bind` or `unbind` whose answer's `name` isn't null reopens it with `delivery_open`. The SDK reopens a lease itself only under a delivery stream (`Session::deliveries`), which this driver doesn't open: a stream renews and reads the inbox, and its release ends the session, none of which the TS driver does.
 
-use grayboard::{Client, ClientInfo, DeliveryMode, Error, Session, StaticBearer};
+use grayboard::{Client, ClientCredentials, ClientInfo, DeliveryMode, Error, Session};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -25,6 +25,25 @@ struct Peer {
 }
 
 type Peers = Arc<Mutex<HashMap<String, Arc<Peer>>>>;
+
+/// The bus's one credential, made by the first peer: its clones share one cached token.
+static CREDENTIAL: Mutex<Option<ClientCredentials>> = Mutex::new(None);
+
+fn credential(req: &Value) -> Result<ClientCredentials, String> {
+    let mut slot = CREDENTIAL.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(c) = &*slot {
+        return Ok(c.clone());
+    }
+    let c = ClientCredentials::new(
+        field(req, "url")?,
+        field(req, "issuer")?,
+        field(req, "client_id")?,
+        field(req, "secret")?,
+    )
+    .map_err(|e| e.to_string())?;
+    *slot = Some(c.clone());
+    Ok(c)
+}
 
 fn field<'a>(req: &'a Value, name: &str) -> Result<&'a str, String> {
     req.get(name)
@@ -79,7 +98,7 @@ async fn open_peer(peers: &Peers, req: &Value) -> Result<Value, String> {
     }
     let client = Client::new(
         field(req, "url")?,
-        StaticBearer::new(field(req, "token")?),
+        credential(req)?,
         ClientInfo::new(SOURCE, env!("CARGO_PKG_VERSION")),
     )
     .map_err(|e| e.to_string())?;

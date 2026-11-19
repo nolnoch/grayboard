@@ -305,7 +305,7 @@ test("callBoardTool's board_create, board_archive, board_subscribe, board_read a
   expect(text(`wade board_read {"board":"general"}`)).toContain(`"holder":"eng/ghost"`);
   expect(text(`dan, sessionless board_read {"board":"general"}`)).toContain(`"key":"ticket:4","holder":null,"note":null`);
   expect(text(`dan, sessionless claim_list {}`)).toContain(`"key":"ticket:1","holder":null,"note":null,"board":null`);
-  expect(text(`dan unbound claim_list {}`)).toContain(`"key":"ticket:2","holder":"${E}/be","note":"paging","board":null`);
+  expect(text(`dan unbound claim_list {}`)).toContain(`"key":"ticket:2","holder":"${E}/be","note":null,"board":null`); // #1257: a hidden board's note stays there
   expect(text(`wade claim_list {}`)).toContain(`"key":"ticket:2","holder":"${E}/be","note":"paging","board":"ops"`);
   expect(text(`wade claim_list {}`)).not.toContain("ticket:6");
   expect(text(`wade claim_list {"prefix":"%"}`)).toBe(JSON.stringify({ value: { result: [], wake: [] } }));

@@ -5,7 +5,6 @@ import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
-import { issueOAuthIn } from "../helpers/oauth.ts";
 import { freePort } from "../support/hosted_oauth.ts";
 import { closeSessions, localSession } from "../support/mcp.ts";
 import { ServerProcess, TestServer } from "../support/server.ts";
@@ -107,13 +106,15 @@ export function hostedDriver(): Driver {
   };
 }
 
-// The Rust SDK (#929; docs/sdk-rust.md §4): each bus is a compiled server process with the operator client the
-// SDK's tests use, and one conformance-driver process (sdk/rust/conformance-driver) speaking JSON lines on stdio,
-// whose peers are Rust sessions of one user. It answers each call's raw CallToolResult, so outcome() reads it as it
-// reads hostedDriver's; the lease rule matches hostedDriver's, in the binary. Joins DRIVERS only when
-// GRAYBOARD_RUST_DRIVER names the built binary (scripts/e2e.sh rust-sdk builds it and the server).
-const RUST_CLIENT = "rust-sdk-test";
-const RUST_SCOPES = ["grayboard:delivery", "grayboard:tools"];
+// The Rust SDK (#929; docs/sdk-rust.md §4): each bus is a compiled server process with a service an admin created
+// through the admin routes and one credential of it, and one conformance-driver process
+// (sdk/rust/conformance-driver) speaking JSON lines on stdio, whose peers are Rust sessions of that service, each
+// authenticated by the SDK's ClientCredentials minting its own run token (no seeded token, so nothing here depends on
+// the store's shape). It answers each call's raw CallToolResult, so outcome() reads it as it reads hostedDriver's; the
+// lease rule matches hostedDriver's, in the binary. Joins DRIVERS only when GRAYBOARD_RUST_DRIVER names the built
+// binary (scripts/e2e.sh rust-sdk builds it and the server).
+const RUST_ADMIN = "root@example.com";
+const RUST_SERVICE = "conformance";
 const SERVER_BIN = join(import.meta.dir, "../../dist/grayboard-server");
 
 function spawnDriver(bin: string) {
@@ -132,21 +133,28 @@ export function rustDriver(bin: string): Driver {
       const port = freePort();
       const issuer = `http://127.0.0.1:${port}`;
       const url = `${issuer}/mcp`;
-      const email = "you@example.com";
-      const prefix = `${email}/`;
+      const prefix = `${RUST_SERVICE}/`;
       const strip = (s: string) => s.split(prefix).join("");
-      // Seeded before the server opens the database, so the two never write it at once.
       // scenario.ts opens a bus outside its try: a failed start stops what it started and removes the dir itself.
-      let token: string, server: ServerProcess | undefined, proc: ReturnType<typeof spawnDriver>;
+      let credential: { client_id: string; client_secret: string }, server: ServerProcess | undefined, proc: ReturnType<typeof spawnDriver>;
       try {
-        token = (await issueOAuthIn(dbPath, url, email, RUST_SCOPES, Date.now(), RUST_CLIENT)).token;
         server = await ServerProcess.start(SERVER_BIN, dbPath, {
           GRAYBOARD_PUBLIC_URL: issuer,
           GRAYBOARD_HTTP_PORT: String(port),
-          GRAYBOARD_OAUTH_CLIENTS: JSON.stringify([{ clientId: RUST_CLIENT, name: "Rust SDK test", redirectUris: ["http://127.0.0.1/callback"], scopes: RUST_SCOPES, tokenEndpointAuthMethod: "none", sessionSource: true }]),
-          GRAYBOARD_HOSTED_REQUEST_BURST: "10000", GRAYBOARD_HOSTED_REQUEST_PER_SEC: "10000",
-          GRAYBOARD_HOSTED_SUBSCRIBER_BURST: "10000", GRAYBOARD_HOSTED_SUBSCRIBER_PER_SEC: "10000",
+          GRAYBOARD_ADMINS: RUST_ADMIN,
+          GRAYBOARD_HOSTED_REQUEST_SERVICE_BURST: "10000", GRAYBOARD_HOSTED_REQUEST_SERVICE_PER_SEC: "10000",
+          GRAYBOARD_HOSTED_SUBSCRIBER_SERVICE_BURST: "10000", GRAYBOARD_HOSTED_SUBSCRIBER_SERVICE_PER_SEC: "10000",
+          GRAYBOARD_HELLO_SERVICE_BURST: "10000", GRAYBOARD_HELLO_SERVICE_PER_SEC: "10000",
         });
+        const admin = await server.login(RUST_ADMIN);
+        const post = async (path: string, body: unknown) => {
+          const r = await fetch(`${server!.base}${path}`, { method: "POST", headers: { Authorization: `Bearer ${admin}` }, body: JSON.stringify(body) });
+          const text = await r.text();
+          if (r.status !== 201) throw new Error(`${path} answered ${r.status}: ${text}`);
+          return JSON.parse(text);
+        };
+        await post("/api/admin/services", { name: RUST_SERVICE, owners: [RUST_ADMIN] });
+        credential = await post("/api/admin/services/credentials", { service: RUST_SERVICE });
         proc = spawnDriver(bin);
       } catch (e) {
         await server?.stop();
@@ -197,7 +205,7 @@ export function rustDriver(bin: string): Driver {
       let session = 0;
       return {
         async peer(name) {
-          await send({ op: "peer", peer: name, url, token, session: `rust-conformance-${++session}` });
+          await send({ op: "peer", peer: name, url, issuer, client_id: credential.client_id, secret: credential.client_secret, session: `rust-conformance-${++session}` });
           return { name, call: async (tool, args = {}) => outcome(await send({ op: "call", peer: name, tool, args }), strip) };
         },
         async close() {

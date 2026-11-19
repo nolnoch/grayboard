@@ -452,6 +452,51 @@ async fn a_401_lets_the_credential_replace_its_token_once() {
     assert_eq!(r.texts().collect::<Vec<_>>(), ["ok"]);
 }
 
+/// A credential whose replacement after a 401 fails, transiently or terminally.
+struct Unreplaceable {
+    retryable: bool,
+}
+
+impl Credential for Unreplaceable {
+    fn token(&self) -> BoxFuture<'_, Result<String, AuthError>> {
+        Box::pin(async { Ok("t".into()) })
+    }
+    fn unauthorized<'a>(&'a self, _: &'a str) -> BoxFuture<'a, Result<(), AuthError>> {
+        let retryable = self.retryable;
+        Box::pin(async move {
+            Err(if retryable {
+                AuthError::transient("the authorization server answered 503")
+            } else {
+                AuthError::terminal("invalid_client")
+            })
+        })
+    }
+}
+
+// #929 R1: a 401 whose replacement fails transiently (the token expired while the authorization server is down) is `Unreachable`, so a delivery stream backs off and reopens; a terminal failure stays `Unauthorized`. The server refused the request, so neither is `OutcomeUnknown`.
+#[tokio::test]
+async fn a_401_whose_replacement_fails_transiently_is_unreachable_and_terminally_unauthorized() {
+    for (retryable, want) in [(true, "Unreachable"), (false, "Unauthorized")] {
+        let fake = Fake::start(false, |_, _| Reply::status(401, "")).await;
+        let err = Client::new(
+            &fake.url,
+            Unreplaceable { retryable },
+            ClientInfo::new("t", "0"),
+        )
+        .unwrap()
+        .with_timeouts(fast())
+        .session("s-1", DeliveryMode::push("t").unwrap())
+        .call_raw("board_post", json!({}))
+        .await
+        .unwrap_err();
+        match (&err, retryable) {
+            (Error::Unreachable(m), true) => assert!(m.contains("503"), "{m}"),
+            (Error::Unauthorized(m), false) => assert!(m.contains("invalid_client"), "{m}"),
+            _ => panic!("expected {want}, got {err:?}"),
+        }
+    }
+}
+
 #[tokio::test]
 async fn forbidden_is_insufficient_scope() {
     let fake = Fake::start(false, |_, _| Reply::status(403, "")).await;
@@ -797,7 +842,7 @@ impl Credential for Hanging {
 }
 
 #[tokio::test]
-async fn a_credential_that_never_answers_is_bounded_by_the_request_timeout() {
+async fn a_credential_that_never_answers_is_bounded_by_the_request_timeout_and_unreachable() {
     let fake = Fake::start(true, |req, _| ok_text(req)).await;
     let s = Client::new(
         &fake.url,
@@ -811,7 +856,8 @@ async fn a_credential_that_never_answers_is_bounded_by_the_request_timeout() {
         .await
         .expect("the credential's token call is bounded")
         .unwrap_err();
-    assert!(matches!(err, Error::Auth(_)), "{err:?}");
+    // Transient: nothing was sent, and a delivery stream backs off and reopens rather than stopping.
+    assert!(matches!(err, Error::Unreachable(_)), "{err:?}");
 }
 
 #[derive(Default)]
@@ -825,7 +871,7 @@ impl Credential for Counting {
         Box::pin(async { Ok("t".into()) })
     }
     fn unauthorized<'a>(&'a self, _: &'a str) -> BoxFuture<'a, Result<(), AuthError>> {
-        Box::pin(async { Err(AuthError("no".into())) })
+        Box::pin(async { Err(AuthError::terminal("no")) })
     }
 }
 
