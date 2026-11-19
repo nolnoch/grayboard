@@ -32145,6 +32145,13 @@ function canonicalEndpoint(raw) {
     return;
   return u;
 }
+function issuerEndpoint(raw) {
+  const u = canonicalEndpoint(raw);
+  if (!u || u.pathname.includes("//"))
+    return;
+  const portless = raw.replace(/^(https:\/\/[^/]+):443(?=\/|$)/, "$1").replace(/^(http:\/\/[^/]+):80(?=\/|$)/, "$1");
+  return u.href === portless || u.pathname === "/" && u.href === `${portless}/` ? u : undefined;
+}
 
 // src/shared/signin.ts
 var SIGN_IN_FLOW_MS = 10 * 60000;
@@ -38272,8 +38279,8 @@ function staticMode(env, cwd, settingsDirs = [], launch = env === process.env ? 
   const issuer = env[STATIC_ISSUER];
   if (!issuer)
     return { refused: `Static mode needs a pinned issuer (${STATIC_ISSUER})` };
-  if (!canonicalEndpoint(issuer))
-    return { refused: `${STATIC_ISSUER} must be an HTTPS URL (or HTTP loopback) without credentials, query or fragment` };
+  if (!issuerEndpoint(issuer))
+    return { refused: `${STATIC_ISSUER} must be an HTTPS URL (or HTTP loopback) without credentials, query or fragment, written as the server lists its issuer` };
   const token = env[RUN_TOKEN];
   if (!token)
     return { refused: `Static mode needs the launcher's run token (${RUN_TOKEN})` };
@@ -38342,7 +38349,7 @@ class StaticLogin {
   }
   async verify() {
     const { issuer, principal } = this.static;
-    const pin = canonicalEndpoint(issuer);
+    const pin = issuerEndpoint(issuer);
     if (pin.origin !== new URL(this.resource).origin)
       throw new Refusal("identity", `Static mode refused: the pinned issuer ${issuer} isn't on ${new URL(this.resource).origin}, where this harness's server is set up`);
     let servers;

@@ -15,7 +15,7 @@ import { Binding, NEW_RUN, SIGN_IN, timedOut, type StaticMode } from "./binding.
 import { Grayboard } from "./rpc.js";
 import { RootInstructions, rewrite, type Fetcher, type Plan } from "./instructions.js";
 import { attachmentTools } from "./transfer-tools.js";
-import { canonicalEndpoint } from "./core/endpoint.js";
+import { issuerEndpoint } from "./core/endpoint.js";
 
 // `static`: the service-credential mode (#270 D3), from the launcher's environment only (`staticMode`), never from
 // plugin options, which any config layer, a repository's own included, can set.
@@ -45,10 +45,11 @@ export function staticMode(env: Record<string, string | undefined>, cwd: string)
   if (auth !== "static") return { refused: `${STATIC_AUTH} must be "static" or unset` };
   const issuer = env[STATIC_ISSUER];
   if (!issuer) return { refused: `Static mode needs a pinned issuer (${STATIC_ISSUER})` };
-  // Hosted core's endpoint rule first (#1321): an issuer `new URL` would read past (a space, an empty `?` or `#`,
-  // percent-encoding, a backslash, over 2048 characters) is refused here, not later as a pin mismatch. Then V2's own
-  // rule: HTTPS only, never hosted core's HTTP loopback. The pin is the string that passed, as hosted core's is.
-  if (canonicalEndpoint(issuer)?.protocol !== "https:") return { refused: `${STATIC_ISSUER} must be an HTTPS URL without credentials, query or fragment` };
+  // Hosted core's issuer rule first (#1321, #1326): an issuer `new URL` would read past (a space, an empty `?` or `#`,
+  // percent-encoding, a backslash, over 2048 characters) or rewrite (case, `https:host`, empty userinfo, a numeric or
+  // IDN host) is refused here, not later as a pin mismatch. Then V2's own rule: HTTPS only, never hosted core's HTTP
+  // loopback. The pin is the string that passed, as hosted core's is.
+  if (issuerEndpoint(issuer)?.protocol !== "https:") return { refused: `${STATIC_ISSUER} must be an HTTPS URL without credentials, query or fragment, written as the server lists its issuer` };
   const principal = env[STATIC_PRINCIPAL];
   if (principal === undefined || principal === "") return { issuer };
   if (!/^[^\s/]{1,128}$/.test(principal)) return { refused: `${STATIC_PRINCIPAL} must be a service name` };

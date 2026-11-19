@@ -25,7 +25,7 @@ import type { Configuration, CredentialPort, Enrollment } from "./port.js";
 import { signOutCause } from "./proxy.js";
 import { sha256 } from "./storage.js";
 import { NativeWire, ServerUnreachable, subscriberError } from "./wire.js";
-import { canonicalEndpoint } from "../../../src/shared/endpoint.ts";
+import { canonicalEndpoint, issuerEndpoint } from "../../../src/shared/endpoint.ts";
 import { GRAYBOARD_SESSION_META } from "../../../src/shared/session_meta.ts";
 
 export const STATIC_AUTH = "GRAYBOARD_AUTH", STATIC_ISSUER = "GRAYBOARD_ISSUER", RUN_TOKEN = "GRAYBOARD_RUN_TOKEN", STATIC_PRINCIPAL = "GRAYBOARD_PRINCIPAL";
@@ -112,7 +112,7 @@ export function staticMode(env: Record<string, string | undefined>, cwd: string,
   if (auth !== "static") return { refused: `${STATIC_AUTH} must be "static" or unset` };
   const issuer = env[STATIC_ISSUER];
   if (!issuer) return { refused: `Static mode needs a pinned issuer (${STATIC_ISSUER})` };
-  if (!canonicalEndpoint(issuer)) return { refused: `${STATIC_ISSUER} must be an HTTPS URL (or HTTP loopback) without credentials, query or fragment` };
+  if (!issuerEndpoint(issuer)) return { refused: `${STATIC_ISSUER} must be an HTTPS URL (or HTTP loopback) without credentials, query or fragment, written as the server lists its issuer` };
   const token = env[RUN_TOKEN];
   if (!token) return { refused: `Static mode needs the launcher's run token (${RUN_TOKEN})` };
   if (!TOKEN.test(token)) return { refused: `${RUN_TOKEN} isn't a run token` };
@@ -193,7 +193,7 @@ export class StaticLogin implements SignIn {
   // service, and the launcher's when GRAYBOARD_PRINCIPAL is set.
   private async verify(): Promise<void> {
     const { issuer, principal } = this.static;
-    const pin = canonicalEndpoint(issuer!)!;
+    const pin = issuerEndpoint(issuer!)!;
     if (pin.origin !== new URL(this.resource).origin) throw new Refusal("identity", `Static mode refused: the pinned issuer ${issuer} isn't on ${new URL(this.resource).origin}, where this harness's server is set up`);
     let servers: string[];
     try { servers = (await resourceMetadata(this.resource, 10_000)).authorization_servers; }
