@@ -18,19 +18,20 @@ import { attachmentTools } from "./transfer-tools.js";
 // `static`: the service-credential mode (#270 D3), from the launcher's environment only (`staticMode`), never from
 // plugin options, which any config layer, a repository's own included, can set.
 export type Options = { mcpName: string; issuer?: string; name?: string; create?: boolean; launcher?: boolean; static?: StaticMode };
-export const STATIC_AUTH = "GRAYBOARD_OPENCODE_AUTH", STATIC_ISSUER = "GRAYBOARD_OPENCODE_ISSUER";
+export const STATIC_AUTH = "GRAYBOARD_OPENCODE_AUTH", STATIC_ISSUER = "GRAYBOARD_OPENCODE_ISSUER", STATIC_PRINCIPAL = "GRAYBOARD_OPENCODE_PRINCIPAL";
 // Static service-credential mode, read from the launcher's environment: `GRAYBOARD_OPENCODE_AUTH=static` turns it on
 // and `GRAYBOARD_OPENCODE_ISSUER` pins the issuer, which it requires. Unset is OAuth mode; any other value, or a
 // missing or malformed pin, is a refused static mode, never OAuth. Bun loads dotenv files from the working directory
 // into the environment at startup, so a repository's `.env` could set them: a dotenv file there that names either
-// variable refuses the mode.
+// variable refuses the mode. `GRAYBOARD_OPENCODE_PRINCIPAL`, optional, names the service whose run token may
+// auto-enroll a root (whoami's `principal`, #270 audit F3); unset, any service's may.
 export function staticMode(env: Record<string, string | undefined>, cwd: string): StaticMode | undefined {
   const auth = env[STATIC_AUTH];
   if (auth === undefined || auth === "") return;
   if (auth !== "static") return { refused: `${STATIC_AUTH} must be "static" or unset` };
   let files: string[] = [];
   try { files = readdirSync(cwd).filter(name => /^\.env(\..+)?$/.test(name)); } catch {}
-  const named = new RegExp(`^\\s*(export\\s+)?(${STATIC_AUTH}|${STATIC_ISSUER})\\s*=`, "m");
+  const named = new RegExp(`^\\s*(export\\s+)?(${STATIC_AUTH}|${STATIC_ISSUER}|${STATIC_PRINCIPAL})\\s*=`, "m");
   for (const file of files) {
     let text: string;
     try { text = readFileSync(join(cwd, file), "utf8"); } catch { return { refused: `Static mode refused: ${file} in the working directory is unreadable` }; }
@@ -41,7 +42,10 @@ export function staticMode(env: Record<string, string | undefined>, cwd: string)
   let url: URL;
   try { url = new URL(issuer); } catch { return { refused: `${STATIC_ISSUER} must be an HTTPS URL` }; }
   if (url.protocol !== "https:" || url.username || url.password || url.search || url.hash) return { refused: `${STATIC_ISSUER} must be an HTTPS URL without credentials, query or fragment` };
-  return { issuer };
+  const principal = env[STATIC_PRINCIPAL];
+  if (principal === undefined || principal === "") return { issuer };
+  if (!/^[^\s/]{1,128}$/.test(principal)) return { refused: `${STATIC_PRINCIPAL} must be a service name` };
+  return { issuer, principal };
 }
 type Invocation = { tool: string; sessionID: string; id: string };
 const VERSION = "1.10.0";
@@ -203,12 +207,22 @@ export class OpenCodeController extends Controller<OpenCodeEnrollment> {
     if (this.stopped || !this.options.static) return;
     try {
       if ((await this.port.ancestry(sessionID)).root !== sessionID) return;
-      const kind = await principalKind(this, await this.binding.capture(sessionID));
-      if (kind !== "service") {
+      const e = await this.binding.capture(sessionID);
+      const who = await whoami(this, e);
+      if (who.kind !== "service") {
         this.record({ state: "unenrolled", sessionID, message: "Static mode enrolls a root by itself only for a service run token; the server did not report one, so enroll explicitly", operation: "enroll", code: "refused" });
         return;
       }
-      await this.enroll(sessionID);
+      // The launcher named its service (#270 audit F3): another service's token, which a repository config could
+      // put in the entry, never enrolls.
+      const expected = "principal" in this.options.static ? this.options.static.principal : undefined;
+      if (expected !== undefined && who.principal !== expected) {
+        this.record({ state: "unenrolled", sessionID, message: `Static mode enrolls a root by itself only for the run token of the service ${STATIC_PRINCIPAL} names; this token is another's`, operation: "enroll", code: "refused" });
+        return;
+      }
+      // The enrollment's capture must read the entry whoami just checked (F4).
+      this.binding.expectChecked(sessionID, e.configuration.configHash);
+      try { await this.enroll(sessionID); } finally { this.binding.expectChecked(sessionID); }
     } catch (error) {
       this.record({ state: "unenrolled", sessionID, message: error instanceof Refusal && !(error instanceof AccessExpired) ? error.message : failureMessage(error, this.port.resumeHint), operation: "enroll", code: failureCode(error) });
     }
@@ -252,9 +266,9 @@ export function nativeFetcher(controller: OpenCodeController): Fetcher {
   };
 }
 
-// The run token's principal kind (`whoami`'s `principal_kind`), asked with no session key so the question starts no
-// hosted session: a token that turns out to be a user's leaves nothing behind on the server.
-export async function principalKind(controller: OpenCodeController, e: OpenCodeEnrollment): Promise<string | undefined> {
+// The run token's principal and its kind (`whoami`'s `principal` and `principal_kind`), asked with no session key so
+// the question starts no hosted session: a token that turns out to be a user's leaves nothing behind on the server.
+export async function whoami(controller: OpenCodeController, e: OpenCodeEnrollment): Promise<{ kind?: string; principal?: string }> {
   let current: string | undefined;
   const port = controller.port;
   const wire = new NativeWire({ url: e.configuration.url, sessionKey: port.sessionKey, client: port.client }, {
@@ -266,8 +280,9 @@ export async function principalKind(controller: OpenCodeController, e: OpenCodeE
     const result = await wire.client.callTool({ name: "whoami", arguments: {} }, wire.options());
     const content = result.content as { type?: string; text?: string }[] | undefined;
     const value = result.structuredContent ?? (content?.length === 1 && content[0]?.type === "text" ? JSON.parse(content[0].text ?? "null") : undefined);
-    const kind = result.isError ? undefined : (value as { principal_kind?: unknown } | undefined)?.principal_kind;
-    return typeof kind === "string" ? kind : undefined;
+    const fields = result.isError ? undefined : value as { principal_kind?: unknown; principal?: unknown } | undefined;
+    const text = (v: unknown) => typeof v === "string" ? v : undefined;
+    return { kind: text(fields?.principal_kind), principal: text(fields?.principal) };
   } finally { await wire.close().catch(() => {}); }
 }
 

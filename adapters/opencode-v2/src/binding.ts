@@ -9,8 +9,9 @@ export const SIGN_IN = "reconnect or sign in using OpenCode";
 // Static mode's action for a refused or missing run token: only the launcher holds the credential (#270 D3).
 export const NEW_RUN = "the launcher must start a new run with a fresh run token";
 // Static service-credential mode (#270 D3), set only from the launcher's environment (lifecycle.ts `staticMode`):
-// the pinned issuer, or why the mode is refused. A refused mode never falls back to OAuth.
-export type StaticMode = { issuer: string } | { refused: string };
+// the pinned issuer and, optionally, the service the run token must belong to, or why the mode is refused. A refused
+// mode never falls back to OAuth.
+export type StaticMode = { issuer: string; principal?: string } | { refused: string };
 // A static enrollment has no native integration or connection, and the run token doesn't carry its credential's
 // client ID: these stand in for them, so the enrollment hash still covers every field.
 export const STATIC_CONNECTION = "static", STATIC_CLIENT = "service-credential", STATIC_SCOPE = "grayboard:delivery grayboard:tools";
@@ -40,6 +41,12 @@ export class Binding implements CredentialPort<OpenCodeEnrollment> {
   constructor(readonly ctx: Context, readonly name: string, readonly drift: () => void, readonly issuer?: string, readonly static_?: StaticMode) {}
   // Static mode: the resource URLs whose protected-resource metadata named the pinned issuer.
   private readonly vouched = new Set<string>();
+  // Static auto-enroll (#270 audit F4): the configHash of the entry whose run token whoami checked, by root. The
+  // enrollment's own capture must read the same entry, or a token swapped in between would be enrolled unchecked.
+  private readonly checked = new Map<string, string>();
+  expectChecked(sessionID: string, configHash?: string) {
+    if (configHash === undefined) this.checked.delete(sessionID); else this.checked.set(sessionID, configHash);
+  }
   // Native calls in flight in this location (by invocation ID, with their start).
   private readonly calls = new Map<string, number>();
   // The connection and stored expiry the last reconnect was for; how many reconnects; their transform.
@@ -121,8 +128,9 @@ export class Binding implements CredentialPort<OpenCodeEnrollment> {
     return this.static_.issuer;
   }
   // Static mode has no OAuth metadata to name the issuer, so the pin is bound to the entry: same origin, and the
-  // server's protected-resource metadata (RFC 9728) names this URL and the pinned issuer. Checked before any plugin
-  // wire sends the token, so an entry a project config pointed elsewhere gets no plugin request and no whoami.
+  // server's protected-resource metadata (RFC 9728) names this URL and the pinned issuer. It guards who can enroll a
+  // root: the whoami that decides auto-enroll, and every plugin wire, reach only the pinned server. It doesn't protect
+  // the token: OpenCode has sent it to whatever URL the entry names before any plugin code runs (#270 audit F5).
   private async vouch(url: string) {
     const issuer = this.pin();
     if (this.vouched.has(url)) return issuer;
@@ -182,6 +190,8 @@ export class Binding implements CredentialPort<OpenCodeEnrollment> {
     if (this.static_) {
       this.pin();
       const endpoint = await this.configuration(), issuer = await this.vouch(endpoint.url);
+      const checked = this.checked.get(sessionID);
+      if (checked !== undefined && checked !== endpoint.configHash) throw new Refusal("binding", "Native binding changed during enrollment; explicitly enroll again");
       return { version: 2, sessionID, mcpName: this.name, configuration: { ...endpoint, issuer, clientID: STATIC_CLIENT, scope: STATIC_SCOPE }, integrationID: STATIC_CONNECTION, connectionID: STATIC_CONNECTION };
     }
     const captured = await this.projection();

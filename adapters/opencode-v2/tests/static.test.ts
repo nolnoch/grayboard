@@ -5,7 +5,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Binding, NEW_RUN, type StaticMode } from "../src/binding.js";
-import { pluginOptions, staticMode, STATIC_AUTH, STATIC_ISSUER } from "../src/lifecycle.js";
+import { pluginOptions, staticMode, STATIC_AUTH, STATIC_ISSUER, STATIC_PRINCIPAL } from "../src/lifecycle.js";
 import { AccessExpired, Refusal } from "../src/core/model.js";
 import { fixture } from "./native-fixture.js";
 
@@ -47,10 +47,15 @@ test("the mode is the launcher's environment only: plugin options from any confi
   expect(staticMode({}, cwd)).toBeUndefined();
   expect(staticMode({ [STATIC_AUTH]: "" }, cwd)).toBeUndefined();
   expect(staticMode(ON, cwd)).toEqual({ issuer: ISSUER });
+  // The launcher may name its service (#270 audit F3), from the environment only, like the mode and the pin.
+  expect(staticMode({ ...ON, [STATIC_PRINCIPAL]: "ingest" }, cwd)).toEqual({ issuer: ISSUER, principal: "ingest" });
+  expect(staticMode({ ...ON, [STATIC_PRINCIPAL]: "" }, cwd)).toEqual({ issuer: ISSUER });
+  for (const bad of ["in gest", "ingest/w-1"]) expect(staticMode({ ...ON, [STATIC_PRINCIPAL]: bad }, cwd)).toEqual({ refused: expect.any(String) });
+  expect(pluginOptions({ principal: "other" }, ON, cwd).static).toEqual({ issuer: ISSUER });
 });
 
 test("a repository's dotenv file naming either variable refuses the mode (Bun loads it into the environment)", () => {
-  for (const [file, text] of [[".env", `${STATIC_AUTH}=static\n`], [".env.local", `export ${STATIC_ISSUER}=${ISSUER}\n`], [".env.production", `  ${STATIC_AUTH} = static`]]) {
+  for (const [file, text] of [[".env", `${STATIC_AUTH}=static\n`], [".env.local", `export ${STATIC_ISSUER}=${ISSUER}\n`], [".env.production", `  ${STATIC_AUTH} = static`], [".env", `${STATIC_PRINCIPAL}=other\n`]]) {
     const cwd = empty();
     writeFileSync(join(cwd, file), text);
     expect(staticMode(ON, cwd)).toEqual({ refused: expect.stringContaining(file) });

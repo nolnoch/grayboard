@@ -1294,7 +1294,7 @@ test("outer CodeMode execute and malformed native output never open a lease", as
 // Static service-credential mode (#270 D3): a new root enrolls itself only when the pinned issuer vouches for the
 // entry and the server's whoami calls the run token's principal a service. principalKind's whoami goes over a real
 // NativeWire, whose client's connect and callTool are stubbed here; the delivery wires are the runtime's FakeWire.
-async function staticRuntime(kind: unknown, mode: StaticMode = { issuer: "https://grayboard.example.com" }, metadata: unknown = { resource: "https://grayboard.example.com/mcp", authorization_servers: ["https://grayboard.example.com"] }) {
+async function staticRuntime(kind: unknown, mode: StaticMode = { issuer: "https://grayboard.example.com" }, metadata: unknown = { resource: "https://grayboard.example.com/mcp", authorization_servers: ["https://grayboard.example.com"] }, answered: (f: ReturnType<typeof runtime>["f"]) => void = () => {}) {
   const token = "run-token-CANARY-0123456789abcdef";
   const r = runtime({ static: mode });
   r.f.config.oauth = false;
@@ -1305,6 +1305,7 @@ async function staticRuntime(kind: unknown, mode: StaticMode = { issuer: "https:
   const close = spyOn(Client.prototype, "close").mockResolvedValue(undefined);
   const callTool = spyOn(Client.prototype, "callTool").mockImplementation((async (params: { name: string; _meta?: unknown }) => {
     asked.push({ name: params.name, meta: params._meta });
+    answered(r.f);
     return { content: [{ type: "text", text: JSON.stringify({ id: null, principal: "svc", principal_kind: kind, held: [] }) }] };
   }) as unknown as Client["callTool"]);
   const restore = async () => { await r.controller.close(); globalThis.fetch = fetch0; connect.mockRestore(); close.mockRestore(); callTool.mockRestore(); };
@@ -1346,6 +1347,34 @@ test.each([
     expect(s.asked).toEqual([]);
     expect(savedRoots(s.r.storage)).toEqual([]);
     expect(rootRecord(s.r.controller, "R")).toMatchObject({ state: "unenrolled", operation: "enroll" });
+  } finally { await s.restore(); }
+});
+// #270 audit F3: with GRAYBOARD_OPENCODE_PRINCIPAL set, only that service's run token enrolls a root by itself.
+test.each([["svc", true], ["ingest", false]] as const)("static mode with the launcher's principal %j: whoami's principal \"svc\" enrolls: %j", async (principal, enrolls) => {
+  const s = await staticRuntime("service", { issuer: "https://grayboard.example.com", principal });
+  try {
+    await s.r.controller.observe("session.created", { sessionID: "R" });
+    expect(s.asked).toHaveLength(1);
+    expect(savedRoots(s.r.storage)).toHaveLength(enrolls ? 1 : 0);
+    if (!enrolls) {
+      expect(s.r.controller.enrollment("R")).toBeUndefined();
+      expect(rootRecord(s.r.controller, "R")).toMatchObject({ state: "unenrolled", operation: "enroll", code: "refused" });
+    }
+  } finally { await s.restore(); }
+});
+// #270 audit F4: the enrollment's capture must read the entry whose token whoami checked; a token swapped in between
+// (a config reload) is refused, never enrolled unchecked.
+test("static mode refuses to enroll when the entry's run token changed between the kind check and the enrollment", async () => {
+  const s = await staticRuntime("service", undefined, undefined, f => { f.config.headers.Authorization = "Bearer run-token-SWAPPED-0123456789abcdef"; });
+  try {
+    await s.r.controller.observe("session.created", { sessionID: "R" });
+    expect(s.asked).toHaveLength(1);
+    expect(savedRoots(s.r.storage)).toEqual([]);
+    expect(s.r.controller.enrollment("R")).toBeUndefined();
+    expect(rootRecord(s.r.controller, "R")).toMatchObject({ state: "unenrolled", operation: "enroll", message: "Native binding changed during enrollment; explicitly enroll again" });
+    // The expectation doesn't outlive the attempt: a later explicit enroll reads the entry afresh.
+    await s.r.controller.enroll("R");
+    expect(s.r.controller.enrollment("R")).toBeDefined();
   } finally { await s.restore(); }
 });
 test("static mode tells the person to start a new run, not to sign in through OpenCode", async () => {

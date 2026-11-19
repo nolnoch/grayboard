@@ -397,6 +397,30 @@ describe("sessions", () => {
     await refused(session(t));
   });
 
+  // The launcher's end-of-run step (OpenCode V2 static mode, #270 audit F1): RFC 7009 revocation of the run token,
+  // authenticated with the credential's own client_secret_basic.
+  test("/oauth/revoke with the credential's Basic auth revokes one run token; another client, a wrong secret or none can't", async () => {
+    const root = await service();
+    const c = await credential(root), other = await credential(root);
+    const revoke = (t: string, auth?: { client_id: string; client_secret: string }) => fetch(`${srv.base}/oauth/revoke`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded", ...(auth ? { Authorization: `Basic ${btoa(`${encodeURIComponent(auth.client_id)}:${encodeURIComponent(auth.client_secret)}`)}` } : {}) },
+      body: new URLSearchParams({ token: t, token_type_hint: "access_token" }),
+    });
+    const ended = await token(srv.base, c), kept = await token(srv.base, c);
+    const s = await session(ended), k = await session(kept, "w-2");
+    // Another credential's client is answered alike (RFC 7009 §2.2: no oracle) and revokes nothing.
+    expect((await revoke(kept, other)).status).toBe(200);
+    expect((await revoke(kept, { client_id: c.client_id, client_secret: `${c.client_secret}x` })).status).toBe(401);
+    expect((await revoke(kept)).status).not.toBe(200);
+    expect((await revoke(ended, c)).status).toBe(200);
+    await refused(s.call("whoami"));
+    // Only that token: the same credential's other run token, and its session, go on.
+    expect(await k.call("whoami")).toMatchObject({ primary: `${SVC}/w-2` });
+    expect(accessAudits(srv.app.db, "oauth.revoked")).toEqual([expect.objectContaining({ detail: expect.objectContaining({ client_id: c.client_id, kind: "access" }) })]);
+    expect(await mint(srv.base, c.client_id, c.client_secret)).toMatchObject({ status: 200 });
+  });
+
   test("a token is re-read on every call: one revoked on another connection refuses the next call", async () => {
     const root = await service();
     const c = await credential(root);

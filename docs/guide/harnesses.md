@@ -91,15 +91,20 @@ Delivery is at-least-once admission, not exactly-once processing. A hosted sessi
 
 ### OpenCode V2 as a service (no browser)
 
-A launcher (a CI step, a broker) can run OpenCode as a [service](server.md#admins-and-roles) with a run token instead of a person's sign-in. Add the credential with `--source opencode`, mint a token per run, and start OpenCode with a per-run config directory the launcher writes, so no user config supplies the entry:
+A launcher (a CI step, a broker) can run OpenCode as a [service](server.md#admins-and-roles) with a run token instead of a person's sign-in. **Static mode trusts the repository OpenCode opens, and the agent itself, as much as the launcher:** either can read the run token and act as the service until it expires. Run it only on repositories you trust, or isolate the run (below).
+
+Add the credential with `--source opencode` and `--token-seconds` set to about one run's length, mint a token per run, and start OpenCode with a per-run global config directory the launcher writes:
 
 ```sh
 TOKEN="$(curl -fsS -u "$CLIENT_ID:$CLIENT_SECRET" -d grant_type=client_credentials \
   https://grayboard.example.com/oauth/token | jq -r .access_token)"
 export GRAYBOARD_OPENCODE_AUTH=static
 export GRAYBOARD_OPENCODE_ISSUER=https://grayboard.example.com
+export GRAYBOARD_OPENCODE_PRINCIPAL=ingest
 export GRAYBOARD_RUN_TOKEN="$TOKEN"
 OPENCODE_CONFIG_DIR="$RUN_DIR/config" opencode …
+# when the run ends:
+curl -fsS -u "$CLIENT_ID:$CLIENT_SECRET" --data-urlencode "token=$TOKEN" https://grayboard.example.com/oauth/revoke
 ```
 
 with `$RUN_DIR/config/opencode.json`:
@@ -121,4 +126,4 @@ with `$RUN_DIR/config/opencode.json`:
 }
 ```
 
-`GRAYBOARD_OPENCODE_ISSUER` is the server's issuer: its `GRAYBOARD_PUBLIC_URL`, as its protected-resource metadata lists it. Static mode is read only from those environment variables, never from plugin options or a repository's `.env`: one that sets either variable refuses the mode. Every new root session enrolls by itself once the server confirms the token is a service's; bind it to one of the service's names as usual (`bind("w-1", create: true)` makes `ingest/w-1`). There is no refresh: when the token expires or the credential is revoked, every root pauses and says the launcher must start a new run with a fresh token. OpenCode fills `{env:}` in every config it loads, so a repository's `opencode.json` could send the token elsewhere; for untrusted repositories, give the token a per-run variable name or isolate the run. `grayboard setup-opencode` leaves such an entry alone. Mechanism: [`adapters-hosted-login.md`](../adapters-hosted-login.md#opencode-v2-static-mode).
+`GRAYBOARD_OPENCODE_ISSUER` is the server's issuer: its `GRAYBOARD_PUBLIC_URL`, as its protected-resource metadata lists it. `GRAYBOARD_OPENCODE_PRINCIPAL` is the service's name; with it set, only that service's token enrolls a root. Static mode is read only from those environment variables, never from plugin options or a repository's `.env`: one that sets any of them refuses the mode. Every new root session enrolls by itself once the server confirms the token is the service's; bind it to one of the service's names as usual (`bind("w-1", create: true)` makes `ingest/w-1`). There is no refresh: when the token expires or the credential is revoked, every root pauses and says the launcher must start a new run with a fresh token. `OPENCODE_CONFIG_DIR` replaces only your global config: OpenCode still loads `opencode.json` and `.opencode/` from the repository and every directory above it, and a repository's entry, plugin or local MCP server can read the token (through `{env:}`, `{file:/proc/self/environ}` or the environment itself), as can the agent's shell. A per-run config dir or variable name doesn't stop that. For an untrusted repository, isolate the run: drive OpenCode through its SDK with project config off (`project: false`), or run it in a sandbox whose network reaches only your grayboard server and the model provider. Keep the token short-lived and revoke it at the end of the run, as above. `grayboard setup-opencode` leaves such an entry alone. Mechanism: [`adapters-hosted-login.md`](../adapters-hosted-login.md#opencode-v2-static-mode).

@@ -49,6 +49,7 @@ const digest = (s: string | null) => s ? createHash("sha256").update(s).digest("
 process.env.GRAYBOARD_RUN_TOKEN = runToken;
 process.env.GRAYBOARD_OPENCODE_AUTH = "static";
 process.env.GRAYBOARD_OPENCODE_ISSUER = issuer;
+process.env.GRAYBOARD_OPENCODE_PRINCIPAL = SERVICE;
 mkdirSync(join(root, "static-home/config"), { recursive: true }); mkdirSync(join(root, "project"), { recursive: true });
 writeFileSync(join(root, "static-home/config/opencode.json"), JSON.stringify({ mcp: { servers: { grayboard: { type: "remote", url: resource, oauth: false, codemode: codeMode, headers: { Authorization: "Bearer {env:GRAYBOARD_RUN_TOKEN}" } } } } }));
 

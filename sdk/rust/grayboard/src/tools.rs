@@ -542,6 +542,9 @@ pub struct WhoAmI {
     pub id: Option<String>,
     #[serde(default)]
     pub principal: Option<String>,
+    /// The principal's kind, `user` or `service` (a service credential's run token); absent from an older server.
+    #[serde(default)]
+    pub principal_kind: Option<String>,
     /// Every name the session holds, scoped.
     #[serde(default)]
     pub held: Vec<String>,
