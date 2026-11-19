@@ -411,8 +411,10 @@ export function makePgOAuth({ hosted }: { hosted: PgHostedEnds }): OAuthStore {
     async revokeServiceCredential(tx, clientId, now) {
       if (!clientLookup(clientId, now)) return invalid;
       const sql = pgOf(tx);
+      // FOR NO KEY UPDATE on the grant: a second revoke waits here, re-checks the grant after this one commits and
+      // answers missing, as on SQLite (one revoke, one audit row). A mint's FK insert takes only KEY SHARE on it.
       const [c] = await sql`SELECT c.grant_id, c.user_id FROM service_credentials c
-        JOIN oauth_grants g ON g.id = c.grant_id WHERE c.client_id = ${clientId} AND g.revoked_at IS NULL`;
+        JOIN oauth_grants g ON g.id = c.grant_id WHERE c.client_id = ${clientId} AND g.revoked_at IS NULL FOR NO KEY UPDATE OF g`;
       if (!c) return missing;
       // The grant's revocation ends every session attached to it, in this transaction (D2, #226 §3.4). A mint or
       // rotation racing it lands under a revoked grant, which findActiveAccess and liveCredential refuse.

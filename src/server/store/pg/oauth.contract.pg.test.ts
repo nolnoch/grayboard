@@ -57,7 +57,15 @@ async function openPgOAuth(hosted: PgHostedEnds): Promise<OAuthHarness> {
   };
 }
 
-const pgOAuthBackend: OAuthBackend = { kind: "postgres", open: () => openPgOAuth(hostedRecorder().port) };
+// The contract's rows run with a recorder too, so a hosted end out of order in any of them fails at close.
+const pgOAuthBackend: OAuthBackend = {
+  kind: "postgres",
+  async open() {
+    const rec = hostedRecorder();
+    const h = await openPgOAuth(rec.port);
+    return { ...h, async close() { await h.close(); expect(rec.problems).toEqual([]); } };
+  },
+};
 
 describePg("OAuth contract (Postgres)", () => oauthContract(pgOAuthBackend));
 

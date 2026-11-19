@@ -23,9 +23,16 @@ export function hostedRecorder() {
     },
     async endForUser(tx: Tx, userId: number, reason: string, now: number) {
       // This transaction has taken the users row: setDisabled's UPDATE wrote the version this reads (xmin), revokeAllForUser's
-      // FOR NO KEY UPDATE locked it (xmax). A test cluster's xid epoch is 0, so the 32-bit xid is the txid.
-      const [u] = await pgOf(tx)`SELECT txid_current_if_assigned()::text IN (xmin::text, xmax::text) AS mine FROM users WHERE id = ${userId}`;
+      // FOR NO KEY UPDATE locked it (xmax). pg_current_xact_id_if_assigned() is the 64-bit xid8; its ::xid is the 32-bit
+      // xid xmin/xmax carry, whatever the epoch. Limit: when another transaction also holds a lock on the row (an FK
+      // insert's KEY SHARE alongside the FOR NO KEY UPDATE), xmax is a multixact id and this reports a false problem;
+      // no test here holds such a lock across the call.
+      const sql = pgOf(tx);
+      const [u] = await sql`SELECT pg_current_xact_id_if_assigned()::xid::text IN (xmin::text, xmax::text) AS mine FROM users WHERE id = ${userId}`;
       if (!u?.mine) problems.push(`endForUser(${userId}) without this transaction holding the users row`);
+      // After the user's grants are revoked (hosted_port.ts: the lock order revokeGrant also keeps).
+      const [g] = await sql`SELECT count(*)::int AS n FROM oauth_grants WHERE user_id = ${userId} AND revoked_at IS NULL`;
+      if (g!.n > 0) problems.push(`endForUser(${userId}) before the user's grants were revoked`);
       void now;
       if (fail) { fail = false; throw new Error("hosted end failed"); }
       ended.push({ kind: "user", userId, reason });

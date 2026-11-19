@@ -6,8 +6,8 @@
 -- Rules: INTEGER PRIMARY KEY AUTOINCREMENT → int8 GENERATED ALWAYS AS IDENTITY; other INTEGER → int8, except the 0/1
 -- columns, which are boolean; TEXT → text COLLATE "C" (SQLite compares BINARY everywhere), except the JSON columns
 -- queried by path or parsed on read, which are jsonb (write_receipts.result_json stays text: it holds '' while a
--- write is in flight and replays its bytes as stored; oauth_tokens.access_scopes stays text until the OAuth port
--- decides). Every UNIQUE and FOREIGN KEY carries its Postgres default name
+-- write is in flight and replays its bytes as stored; oauth_tokens.access_scopes stays text, as
+-- postgres-server.md D6 records). Every UNIQUE and FOREIGN KEY carries its Postgres default name
 -- (<table>_<columns>_key / _fkey), explicitly, so errors.ts can classify a violation by a name this file promises.
 -- Indexes keep their SQLite names and partial predicates. Tables run in dependency order: Postgres refuses a forward
 -- reference that SQLite accepts.

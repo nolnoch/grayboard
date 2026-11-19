@@ -2637,7 +2637,8 @@ function oauthOps(db: Database, hosted: HostedStoreOf): OAuthOps {
       return db.transaction(() => {
         const c = liveCredential(clientId, now);
         if (!c) return missing;
-        // At most two live secrets (D2), counted in the insert: on Postgres, after the credential row FOR UPDATE (D3).
+        // At most two live secrets (D2), counted in the insert: on Postgres, after the credential's secrets advisory lock
+        // (postgres-server.md D3, the OAuth caps row).
         const secret = db.query<{ id: number }, [number, string, number, number]>(`INSERT INTO service_credential_secrets(credential_id, hash, created_at)
           SELECT ?1, ?2, ?3 WHERE (SELECT COUNT(*) FROM service_credential_secrets WHERE credential_id = ?1 AND revoked_at IS NULL) < ?4
           RETURNING id`).get(c.id, secretHash, now, LIVE_SECRETS);
@@ -2682,8 +2683,9 @@ function oauthOps(db: Database, hosted: HostedStoreOf): OAuthOps {
       return db.transaction(() => {
         // One INSERT … SELECT: the credential, its grant, the secret and the service all live, the bucket (mints in the
         // last minute, revoked ones included) and the cap (unexpired, unrevoked tokens) unspent. That holds under
-        // SQLite's single writer; at Postgres's READ COMMITTED the counts and the secret check need the credential row
-        // FOR UPDATE first, as rotate and both revokes do (postgres-server.md D3).
+        // SQLite's single writer; at Postgres's READ COMMITTED the counts need the credential's mint advisory lock first,
+        // and a token minted past a secret's revoke is refused by findActiveAccess's secret join (postgres-server.md D3,
+        // the OAuth caps row).
         // The expiry is the credential's lifetime, clamped to the ceiling and to the grant's expiry.
         const row = db.query<{ expires_at: number }, [string, number, number, string, string, number, number, number, number]>(`
           INSERT INTO oauth_tokens(hash, grant_id, kind, expires_at, created_at, access_scopes, secret_id)

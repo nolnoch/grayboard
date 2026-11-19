@@ -13,9 +13,10 @@ import { OAUTH_SCOPES } from "../../oauth-config.ts";
 import { BROWSER_SESSIONS, REQUESTS_PER_BROWSER, REQUESTS_TOTAL } from "../../oauth-rules.ts";
 import { OAUTH_TTL, type OAuthAuthorization, type OAuthCode, type OAuthRequest, type OAuthStore, type OAuthTokenPair, type ServiceTokenLimits } from "../../oauth-types.ts";
 import type { Tx } from "../tx_base.ts";
+import type { PgHostedEnds } from "./hosted_port.ts";
 import { makePgIdentity, type PgIdentity } from "./identity.ts";
 import { makePgOAuth } from "./oauth.ts";
-import { makePgTransactions, type PgTransactions } from "./tx.ts";
+import { makePgTransactions, pgOf, type PgTransactions } from "./tx.ts";
 
 const start = 1_800_000_000_000;
 const sha = (s: string) => createHash("sha256").update(s).digest("hex");
@@ -26,13 +27,15 @@ const pairOf = (tag: string, auth = grantAuth, now = start): OAuthTokenPair => (
 
 type Pair = { db: PgDatabase; a: PgTransactions; b: PgTransactions; o: OAuthStore; g: PgIdentity; rec: HostedRecorder; [Symbol.asyncDispose](): Promise<void> };
 
-async function pair(): Promise<Pair> {
+// `hosted` replaces the recorder's port in both stores (the lock-order race's C8-shaped port).
+async function pair(hosted?: PgHostedEnds): Promise<Pair> {
   const db = await pgDatabase({ max: 2 });
   const a = makePgTransactions(db.url, { max: 2, applicationName: "gb-test-a" });
   const b = makePgTransactions(db.url, { max: 2, applicationName: "gb-test-b" });
   const rec = hostedRecorder();
+  const port = hosted ?? rec.port;
   return {
-    db, a, b, rec, o: makePgOAuth({ hosted: rec.port }), g: makePgIdentity({ now: Date.now, hosted: rec.port }),
+    db, a, b, rec, o: makePgOAuth({ hosted: port }), g: makePgIdentity({ now: Date.now, hosted: port }),
     async [Symbol.asyncDispose]() {
       await a.close(); await b.close(); await db[Symbol.asyncDispose]();
       expect(rec.problems).toEqual([]);
@@ -364,6 +367,64 @@ describePg("OAuth races (Postgres)", () => {
     expect([st(r.a), st(r.b)]).toEqual(["ok", "invalid"]);
     expect(await count(p, "service_credential_secrets", p.db.sql`revoked_at IS NULL`)).toBe(1);
     expect(r.waited).toBe(true);
+  });
+
+  test("mint lock is per credential, not per secret: two mints on a credential's two secrets with one left in the minute admit one", async () => {
+    await using p = await pair();
+    const { secretIds: [s1, s2] } = await service(p, 2);
+    const limits = { ...LIMITS, mintsPerMinute: 2 };
+    expect((await p.a.write(mint(p, s1!, "t0", limits))).status).toBe("ok");
+    const r = await race(p, mint(p, s1!, "t1", limits), mint(p, s2!, "t2", limits));
+    expect([st(r.a), st(r.b)]).toEqual(["ok", "capacity"]);
+    expect(await count(p, "oauth_tokens")).toBe(2);
+    expect(r.waited).toBe(true);
+  });
+
+  test("two revokes of one service credential: one revokes it, the second answers not_found", async () => {
+    await using p = await pair();
+    await service(p);
+    const revoke = (tx: Tx) => p.o.revokeServiceCredential(tx, SVC, start);
+    const r = await race(p, revoke, revoke);
+    expect([st(r.a), st(r.b)]).toEqual(["ok", "not_found"]);
+    expect(p.rec.ended).toEqual([{ kind: "grant", grantId: credentialOf(0).grantId }]);
+    expect(r.waited).toBe(true);
+  });
+
+  test("lock order: a token revoke and a disable of its user both end hosted sessions, grant row before hosted row, without a deadlock", async () => {
+    // A C8-shaped port: each end updates hosted rows (here a scratch table) after the grant revoke. The token revoke
+    // pauses inside its grant end, holding the grant row, until the disable is blocked; a disable that ended the
+    // user's hosted rows before revoking the grants would hold the hosted row and wait on the grant: 40P01.
+    const atGate = gate(), release = gate();
+    let pause = false;
+    const port: PgHostedEnds = {
+      async endForGrant(tx, grantId) {
+        if (pause) { pause = false; atGate.open(); await release.wait; }
+        await pgOf(tx)`UPDATE hosted_scratch SET ended = true WHERE grant_id = ${grantId}`;
+      },
+      async endForUser(tx, userId) { await pgOf(tx)`UPDATE hosted_scratch SET ended = true WHERE user_id = ${userId}`; },
+    };
+    await using p = await pair(port);
+    await p.db.sql`CREATE TABLE hosted_scratch (grant_id text, user_id int8, ended boolean NOT NULL DEFAULT false)`;
+    const w = await world(p);
+    await w.until("code");
+    const redemption = w.redemption();
+    expect((await p.a.write(tx => p.o.redeemCode(tx, redemption, start))).status).toBe("ok");
+    await p.db.sql`INSERT INTO hosted_scratch (grant_id, user_id) VALUES (${redemption.grantId}, ${w.userId})`;
+    pause = true;
+    const a = settle(p.a.write(tx => p.o.revokeToken(tx, redemption.tokens.refreshHash, grantAuth.clientId, start)));
+    await Promise.race([atGate.wait, a]);
+    let done = false, waited = false;
+    const b = settle(p.b.write(tx => p.g.users.setDisabled(tx, w.userId, true))).finally(() => { done = true; });
+    await until(async () => {
+      if ((await p.db.sql`SELECT 1 FROM pg_stat_activity WHERE application_name = 'gb-test-b' AND wait_event_type = 'Lock'`).length > 0) waited = true;
+      return waited || done;
+    }, 5000, "the disable blocked on a lock, or settled");
+    release.open();
+    const out = (s: Settled<unknown>) => s.ok ? "ok" : `threw ${s.error?.message}`;
+    expect([out(await a), out(await b)]).toEqual(["ok", "ok"]);
+    expect((await p.db.sql`SELECT ended FROM hosted_scratch`)[0].ended).toBe(true);
+    expect(await p.o.isGrantActive(p.a.read, redemption.grantId, start)).toBe(false);
+    expect(waited).toBe(true);
   });
 
   test("the secret join: a run token minted while its secret's revoke ran is refused, though the revoke couldn't see it", async () => {
