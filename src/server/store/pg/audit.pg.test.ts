@@ -3,7 +3,7 @@
 // owedBridgeNotice over a minimal repo; an eager audit write the database refuses; and the pin of `last`'s order. The
 // end state is asserted before `waited`, so a race whose lock is gone fails on what it broke (two notices), not on a
 // timeout. Without GRAYBOARD_TEST_PG_URL they skip.
-import { afterEach, expect, spyOn, test } from "bun:test";
+import { afterEach, expect, setDefaultTimeout, spyOn, test } from "bun:test";
 import { describePg } from "../../../../tests/support/pg.ts";
 import { committed, outcome, pgPair, race, settle, type PgPair } from "../../../../tests/support/pg_race.ts";
 import { owedBridgeNotice } from "../../application.ts";
@@ -22,7 +22,10 @@ const repo = {
   post: () => { throw new Error("writeAudit posted: the row left the body's transaction"); },
 } as unknown as Repo;
 
-const actions = async (p: PgPair, action: string) => (await p.db.sql`SELECT target FROM access_log WHERE action = ${action} ORDER BY id`).length;
+const countAction = async (p: PgPair, action: string) => (await p.db.sql`SELECT count(*)::int AS n FROM access_log WHERE action = ${action}`)[0].n as number;
+
+// Above the pool's 5 s lock_timeout (pg/tx.ts), so a wait a broken lock leaves fails 55P03, not on Bun's 5 s timeout.
+setDefaultTimeout(30_000);
 
 describePg("audit store (Postgres)", () => {
   let errors: ReturnType<typeof spyOn<Console, "error">> | undefined;
@@ -37,12 +40,13 @@ describePg("audit store (Postgres)", () => {
     const r = await race(p, tx => owedBridgeNotice(repo, tx, EMAIL), tx => owedBridgeNotice(repo, tx, EMAIL));
     expect(committed(r.a)).toContain("your Slack bridge stopped at 2027-01-15T08:00:00.000Z (token revoked)");
     expect(outcome(r.b)).toBeUndefined();
-    expect(await actions(p, "bridge.notified")).toBe(1);
+    expect(await countAction(p, "bridge.notified")).toBe(1);
     expect(r.waitEvent).toBe("advisory");
   });
 
   // Mutations: write sent outside the transaction (posted, or on afterCommit: the body's other rows commit and the
-  // write resolves); its .catch removed (bun fails the test on the insert's unhandled rejection).
+  // write resolves); its .catch removed (no log lines: TxAborted's cause is the later failure, so the log is the only
+  // place the insert's own SQLSTATE shows; Bun 1.4.4 reports no unhandled rejection for an executed query).
   test("T-C7-4: a write the database refuses aborts the body's transaction: the write rejects TxAborted and nothing commits", async () => {
     await using p = await pgPair();
     // A test trigger in this database only: an access_log row whose action is "refused" fails 23514.
@@ -65,6 +69,10 @@ describePg("audit store (Postgres)", () => {
       await cursors.advance(tx, "a@example.com/fe", "direct", "a@example.com/fe", 7);
     }));
     for (const s of [last, after]) expect(s.ok ? "committed" : s.error).toBeInstanceOf(TxAborted);
+    // TxAborted's cause is the failure after the insert, not the insert's 23514: the rolled-back COMMIT, or 25P02.
+    const cause = (s: typeof last) => s.ok ? "committed" : (s.error as TxAborted).cause as { code: string; errno?: string };
+    expect(cause(last)).toMatchObject({ code: "ERR_POSTGRES_COMMIT_ROLLED_BACK" });
+    expect(cause(after)).toMatchObject({ errno: "25P02" });
     expect((await p.db.sql`SELECT count(*)::int AS n FROM access_log`)[0].n).toBe(0);
     expect((await p.db.sql`SELECT count(*)::int AS n FROM mailbox_cursors`)[0].n).toBe(0);
     // Each refused insert's own failure is logged once, as its class and SQLSTATE: never its text, which quotes the row.

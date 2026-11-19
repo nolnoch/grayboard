@@ -5,7 +5,7 @@
 // end state is asserted before `waited`, so a race whose form is gone fails on what it broke (two messages for one
 // call, a failed write holding the key to its caller's commit), not on a timeout. Without GRAYBOARD_TEST_PG_URL they
 // skip.
-import { expect, test } from "bun:test";
+import { expect, setDefaultTimeout, test } from "bun:test";
 import { describePg } from "../../../../tests/support/pg.ts";
 import { BLOCK_WAIT_MS, blockedOrSettled, committed, gate, outcome, pgPair, race, settle, type PgPair, type Settled } from "../../../../tests/support/pg_race.ts";
 import { until } from "../../../../tests/support/until.ts";
@@ -48,6 +48,9 @@ const sent = (o: unknown) => {
   const d = o as DedupOutcome<Sent>;
   return "fresh" in d ? { fresh: d.fresh.payload.message_id } : { replay: d.replay.message_id, ref: d.replay.replayed.ref };
 };
+
+// Above the pool's 5 s lock_timeout (pg/tx.ts), so a wait a broken lock leaves fails 55P03, not on Bun's 5 s timeout.
+setDefaultTimeout(30_000);
 
 describePg("write dedup races (Postgres)", () => {
   // Mutation: the claim gone (find, then write and upsert): B's find misses A's uncommitted receipt, and both write.

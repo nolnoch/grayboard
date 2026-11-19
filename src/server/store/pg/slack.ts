@@ -17,7 +17,7 @@
 //
 // Runtime imports stay off bun:sqlite and db.ts (pg/isolation.test.ts).
 import { jsonSafe } from "../json_safe.ts";
-import type { SlackLink, SlackStore, SlackThread } from "../slack.ts";
+import type { SlackLink, SlackProgress, SlackStore, SlackThread } from "../slack.ts";
 import { int8 } from "./sql.ts";
 import { pgOf, type PgSql } from "./tx.ts";
 
@@ -96,7 +96,7 @@ export function makePgSlack({ clock }: { clock: () => number }): SlackStore {
     },
     async progress(r, userId, ref) {
       const [row] = await pgOf(r)`SELECT progress FROM slack_progress WHERE user_id = ${userId} AND ref = ${ref}`;
-      return row ? row.progress as unknown : undefined;
+      return row ? row.progress as SlackProgress : undefined;
     },
     async setProgress(tx, userId, ref, progress) {
       await pgOf(tx)`INSERT INTO slack_progress (user_id, ref, progress) VALUES (${userId}, ${ref}, ${jsonSafe(progress)})

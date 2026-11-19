@@ -17,7 +17,7 @@
 //   harness's.
 import { expect, test } from "bun:test";
 import { inRequest } from "../request_context.ts";
-import type { AccessLogRow, AuditStore } from "./audit.ts";
+import { AUDIT_WRITE_ON_READ, type AccessLogRow, type AuditStore } from "./audit.ts";
 import type { Read, Tx } from "./tx_base.ts";
 
 export type AuditRawRow = {
@@ -124,7 +124,8 @@ function writes(it: It): void {
   });
 
   // U7.
-  it("write on a settled Tx, or on a parent while its savepoint is open, throws synchronously and writes nothing", async h => {
+  it("write on a Read, a settled Tx, or a parent while its savepoint is open, throws synchronously and writes nothing", async h => {
+    expect(thrown(() => h.audit.write(h.read as Tx, row("read")))).toBe(AUDIT_WRITE_ON_READ);
     const kept = await h.write(async tx => tx);
     expect(thrown(() => h.audit.write(kept, row("late")))).toContain("Tx used after its transaction settled");
     await h.write(async tx => {

@@ -7,6 +7,9 @@ import type { Read, Tx } from "./tx_base.ts";
 // it as a JSON type returns its text; spacing and key order may differ from what was written.
 export type AccessLogRow = { at: number; actor: string | null; action: string; target: string | null; detail: string | null };
 
+// What write throws, on every store, when handed a Read rather than a Tx.
+export const AUDIT_WRITE_ON_READ = "audit.write on a Read: pass the body's Tx (#807 P3 A6h)";
+
 export interface AuditStore {
   // Synchronous on every store (#807 P3 A6h): writeAudit and recordDecision call it at ~100 sites, many in
   // synchronous code inside a body. What a store guarantees, whatever its mechanism:
@@ -17,7 +20,7 @@ export interface AuditStore {
   // - the row carries the origin (requestOrigin) of the request writing it, read when it is written.
   // A store whose statements are async (Postgres) sends the insert on tx's connection at once without awaiting it,
   // so the database orders it; it is never buffered to the commit, nor sent after it.
-  // A settled tx, or a parent while its savepoint is open, throws synchronously. NUL and lone UTF-16 surrogates in
+  // A Read (AUDIT_WRITE_ON_READ), a settled tx, or a parent while its savepoint is open, throws synchronously. NUL and lone UTF-16 surrogates in
   // actor, target and every string of detail are stored as U+FFFD (jsonSafe, store/json_safe.ts): refusing them would
   // fail the audited action.
   write(tx: Tx, row: AccessLogRow): void;

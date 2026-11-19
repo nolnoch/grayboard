@@ -3,7 +3,7 @@
 // B is blocked on A's row (or uncommitted insert) or done. The end state is asserted before `waited`, so an advance
 // that reads then writes fails on what it broke (a 23505 on a first insert, a read point moved back), not on a
 // timeout. Without GRAYBOARD_TEST_PG_URL they skip.
-import { expect, test } from "bun:test";
+import { expect, setDefaultTimeout, test } from "bun:test";
 import { describePg } from "../../../../tests/support/pg.ts";
 import { committed, outcome, pgPair, race, type PgPair } from "../../../../tests/support/pg_race.ts";
 import { makePgCursors } from "./cursors.ts";
@@ -12,6 +12,9 @@ const A = "a@example.com/fe";
 const cursors = makePgCursors();
 const advance = (id: number) => (tx: Parameters<typeof cursors.advance>[0]) => cursors.advance(tx, A, "direct", A, id);
 const readPoint = (p: PgPair) => cursors.directFor(p.a.read, A);
+
+// Above the pool's 5 s lock_timeout (pg/tx.ts), so a wait a broken lock leaves fails 55P03, not on Bun's 5 s timeout.
+setDefaultTimeout(30_000);
 
 describePg("read point races (Postgres)", () => {
   // Mutation: advance as a read then a write in JS (B's first insert fails 23505 on mailbox_cursors_pkey).

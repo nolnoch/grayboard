@@ -5,9 +5,12 @@
 //   once on the Tx's connection, and returns without awaiting it. The database then orders it: it lands in program
 //   order among the body's other statements (the store-direct audit rows too), inside the transaction and any open
 //   savepoint, and `last` on the Tx (a later statement on that connection) sees it. A failing insert aborts the
-//   transaction, so the body's next statement or its COMMIT fails and the write rejects TxAborted (pg/tx.ts); its own
-//   rejection is caught and logged here (class, code and SQLSTATE only: a Postgres error's text quotes row values),
-//   since TxAborted's cause is the later 25P02, and an uncaught one would be an unhandled rejection.
+//   transaction, so the body's next statement or its COMMIT fails and the write rejects TxAborted (pg/tx.ts), whose
+//   cause is that later failure: 25P02 from the next statement, or ERR_POSTGRES_COMMIT_ROLLED_BACK when the refused
+//   insert was the body's last. The insert's own error (its SQLSTATE) would be lost, so its rejection is caught and
+//   logged here (class, code and SQLSTATE only: a Postgres error's text quotes row values). The catch also keeps the
+//   rejection handled, should Bun start reporting an executed query's unhandled one (Bun 1.4.4 doesn't). A Read
+//   refuses synchronously (AUDIT_WRITE_ON_READ): on the pool the insert would fail 25006 after write returned.
 // - access_log.detail is jsonb: write parses writeAudit's JSON text and binds the object (bound as text it would be a
 //   JSON string scalar), and last selects detail::text, so AccessLogRow.detail stays JSON text (spacing and key order
 //   are jsonb's). Strings are made safe first (jsonSafe, store/json_safe.ts): jsonb refuses NUL (22P05) and a lone
@@ -21,7 +24,8 @@
 import { SQL } from "bun";
 import { errorDiagnostic } from "../../diagnostics.ts";
 import { requestOrigin } from "../../request_context.ts";
-import type { AccessLogRow, AuditStore } from "../audit.ts";
+import { AUDIT_WRITE_ON_READ, type AccessLogRow, type AuditStore } from "../audit.ts";
+import { isTx } from "../tx_base.ts";
 import { jsonSafe, textSafeOrNull } from "../json_safe.ts";
 import { int8 } from "./sql.ts";
 import { pgOf } from "./tx.ts";
@@ -43,8 +47,10 @@ function logged(error: unknown): void {
 export function makePgAudit(): AuditStore {
   return {
     write(tx, row) {
-      // pgOf throws synchronously on a settled Tx, or a parent whose savepoint is open, before anything is sent.
+      // pgOf throws synchronously on a settled Tx, or a parent whose savepoint is open, before anything is sent; it
+      // takes a Read too, whose insert would fail 25006 on the read-only pool after write returned.
       const sql = pgOf(tx);
+      if (!isTx(tx)) throw new Error(AUDIT_WRITE_ON_READ);
       const o = requestOrigin();
       const detail = row.detail === null ? null : jsonSafe(JSON.parse(row.detail) as unknown);
       sql`INSERT INTO access_log (at, actor, action, target, detail, ip, ua, client_id)

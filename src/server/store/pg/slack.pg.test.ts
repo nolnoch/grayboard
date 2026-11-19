@@ -6,7 +6,7 @@
 // tests/integration/slack_org.test.ts pins that those bodies lock before their first Slack read. The end state is
 // asserted before `waited`, so a race whose lock is gone fails on what it broke (a raw 23505, a new link deleted), not
 // on a timeout. Without GRAYBOARD_TEST_PG_URL they skip.
-import { expect, test } from "bun:test";
+import { expect, setDefaultTimeout, test } from "bun:test";
 import { describePg } from "../../../../tests/support/pg.ts";
 import { committed, outcome, pgPair, race, type PgPair } from "../../../../tests/support/pg_race.ts";
 import type { Tx } from "../tx_base.ts";
@@ -35,6 +35,9 @@ const unlinkBody = (userId: number, slackUser: string) => async (tx: Tx) => {
   await slack.unlink(tx, userId);
   return true;
 };
+
+// Above the pool's 5 s lock_timeout (pg/tx.ts), so a wait a broken lock leaves fails 55P03, not on Bun's 5 s timeout.
+setDefaultTimeout(30_000);
 
 describePg("Slack link races (Postgres)", () => {
   // Mutation: slack.lock a no-op (both pass linkBySlackUser; B's upsert fails 23505 on slack_links_slack_user_key).
