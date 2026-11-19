@@ -1,8 +1,9 @@
 // #807 P3 C1: the classifier against errors a real Postgres raises through Bun.SQL. The constructed errors in
 // errors.test.ts would keep passing if a Bun upgrade moved the SQLSTATE or the constraint name; these would not.
 import { expect, test } from "bun:test";
-import { describePg, pgEmptyDatabase, type PgDatabase } from "../../../../tests/support/pg.ts";
-import { pgFailure } from "./errors.ts";
+import { describePg, pgDatabase, pgEmptyDatabase, type PgDatabase } from "../../../../tests/support/pg.ts";
+import { MissingParent } from "../errors.ts";
+import { missingParent, pgFailure } from "./errors.ts";
 
 const failure = async (p: Promise<unknown>) => {
   try { await p; } catch (e) { return pgFailure(e) ?? { unclassified: String(e) }; }
@@ -25,6 +26,20 @@ describePg("SQLSTATEs as Bun.SQL reports them", () => {
     await using db = await scratch();
     expect(await failure(db.sql`INSERT INTO child (id, u) VALUES (2, 'a')`)).toEqual({ kind: "unique", constraint: "child_u_key" });
     expect(await failure(db.sql`INSERT INTO child (id, p) VALUES (3, 99)`)).toEqual({ kind: "foreign_key", constraint: "child_p_fkey" });
+  });
+
+  // #807 P3 C5b: the messages store's backstop. The migrated schema's own constraint name, so a rename fails here.
+  test("23503 on messages_parent_id_fkey classifies as MissingParent; another constraint's doesn't", async () => {
+    await using db = await pgDatabase({ max: 2 });
+    let caught: unknown;
+    try { await db.sql`INSERT INTO messages (sender, recipient_type, recipient, body, parent_id, created_at) VALUES ('a', 'user', 'b', 'x', 99, 0)`; }
+    catch (e) { caught = e; }
+    const m = missingParent(caught, 99);
+    expect(m).toBeInstanceOf(MissingParent);
+    expect(m?.message).toBe("parent_id 99 is not a message you sent or received");
+    await using other = await scratch();
+    try { await other.sql`INSERT INTO child (id, p) VALUES (3, 99)`; } catch (e) { caught = e; }
+    expect(missingParent(caught, 99)).toBeUndefined();
   });
 
   test("an error a body swallows without a savepoint aborts the transaction (25P02); inside a savepoint it doesn't", async () => {

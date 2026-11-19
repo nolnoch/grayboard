@@ -3,7 +3,7 @@
 // Bun.SQL puts the SQLSTATE in `errno`; `code` is Bun's own class (ERR_POSTGRES_SERVER_ERROR), so nothing here reads
 // `code` but for Bun's rolled-back COMMIT, which carries no SQLSTATE, and only a real PostgresError is classified.
 import { SQL } from "bun";
-import { PrincipalTaken } from "../errors.ts";
+import { MissingParent, PrincipalTaken } from "../errors.ts";
 
 export type PgFailure =
   | { kind: "unique"; constraint: string }          // 23505
@@ -50,4 +50,14 @@ export const SERVICE_NAME_CONSTRAINTS: ReadonlySet<string> = new Set(["principal
 export function principalTaken(e: unknown, name: string, constraints: ReadonlySet<string> = PRINCIPAL_NAME_CONSTRAINTS): PrincipalTaken | undefined {
   const c = uniqueViolation(e);
   return c !== undefined && constraints.has(c) ? new PrincipalTaken(name) : undefined;
+}
+
+// A message's parent_id foreign key (#807 P3 C5 decision 5).
+export const MESSAGE_PARENT_CONSTRAINT = "messages_parent_id_fkey";
+
+// MissingParent for a 23503 on the message parent's foreign key, else undefined (the caller rethrows `e`). A backstop:
+// messages.insert locks the parent FOR KEY SHARE before it writes, so a missing parent refuses before any statement
+// can fail; a failed insert has already aborted the transaction, and the caller's commit fails TxAborted.
+export function missingParent(e: unknown, parentId: number): MissingParent | undefined {
+  return foreignKeyViolation(e) === MESSAGE_PARENT_CONSTRAINT ? new MissingParent(parentId) : undefined;
 }
