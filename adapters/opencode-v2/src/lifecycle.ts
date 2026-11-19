@@ -237,8 +237,9 @@ export class OpenCodeController extends Controller<OpenCodeEnrollment> {
     // Close during a retry ends the root's `retrying` record. Nothing restores a retry: a restart restores the record
     // as saved (`Saved retrying status`) for a root no `session.created` will ask about again, so a saved `retrying`
     // would claim a retry nothing runs. `unenrolled` is what the root is, and the outage is why. Close waits for this
-    // loop (`enrollRetries`), so the record lands before its flush.
-    const closed = () => this.record({ state: "unenrolled", sessionID, message: "Shut down while auto-enroll was retrying; the root is not enrolled", operation: "enroll", code: "server_unreachable" });
+    // loop (`enrollRetries`), so the record lands before its flush. A root enrolled meanwhile by another path (an
+    // explicit enroll; paused counts, so `roots`, not `enrollment`) keeps its own record: it is enrolled.
+    const closed = () => this.roots.has(sessionID) ? undefined : this.record({ state: "unenrolled", sessionID, message: "Shut down while auto-enroll was retrying; the root is not enrolled", operation: "enroll", code: "server_unreachable" });
     const retry = (async () => {
       for (let attempt = 0; attempt < ENROLL_RETRIES && error !== undefined && transientEnroll(error); attempt++) {
         this.record({ state: "retrying", sessionID, message: `Server unreachable; retrying auto-enroll (${attempt + 1}/${ENROLL_RETRIES})`, operation: "enroll", code: "server_unreachable" });
@@ -248,7 +249,8 @@ export class OpenCodeController extends Controller<OpenCodeEnrollment> {
         // A root that never enrolled has no record `ended` replaces, so its `retrying` would outlive it.
         if (this.routes.isEnded(sessionID)) return this.record({ state: "unenrolled", sessionID, message: "Root ended before auto-enroll reached the server", operation: "enroll", code: "server_unreachable" });
         error = await this.autoEnroll(sessionID);
-        // An attempt that enrolled, or recorded its own refusal, before close keeps its record.
+        // An attempt that enrolled, or recorded its own refusal, before close keeps its record. One that close cut
+        // short is the shutdown even if its answer would have been a refusal (close wins): it stays unenrolled.
         if (this.stopped) return error === undefined ? undefined : closed();
       }
       if (error !== undefined && transientEnroll(error)) return this.enrollExhausted(sessionID, error);

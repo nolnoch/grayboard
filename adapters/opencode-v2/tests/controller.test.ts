@@ -1592,6 +1592,56 @@ test("static mode: close during a retry's whoami aborts it and ends the retrying
     await closeDuringAttempt(s, () => calls === 2);
   } finally { await s.restore(); }
 });
+// #1285 audit: close never calls a root enrolled during the retry "not enrolled"; nor does it overwrite the record
+// of an attempt that answered before close stopped it.
+const whoamiAnswer = (kind: string) => ({ content: [{ type: "text", text: JSON.stringify({ id: null, principal: "svc", principal_kind: kind, held: [] }) }] });
+const closedRecord = { state: "unenrolled", message: "Shut down while auto-enroll was retrying; the root is not enrolled" };
+test("static mode: close during a retry's wait keeps the record of a root enrolled meanwhile", async () => {
+  let failures = 1;
+  const s = await staticRuntime("service", undefined, undefined, () => { if (failures-- > 0) throw unavailable(); });
+  try {
+    await s.r.controller.observe("session.created", { sessionID: "R" });
+    expect(rootRecord(s.r.controller, "R")).toMatchObject({ state: "retrying" });
+    await s.r.controller.enroll("R");
+    const enrolled = rootRecord(s.r.controller, "R");
+    await s.r.controller.close();
+    expect(rootRecord(s.r.controller, "R")).toEqual(enrolled!);
+    expect(rootRecord(s.r.controller, "R")).not.toMatchObject(closedRecord);
+    expect(savedRecord(s.r, "R")).toMatchObject({ state: enrolled!.state, message: enrolled!.message });
+    expect(savedRoots(s.r.storage)).toHaveLength(1);
+  } finally { await s.restore(); }
+});
+test("static mode: close during a retry attempt keeps the record of a root enrolled meanwhile", async () => {
+  let calls = 0, release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const s = await staticRuntime("service", undefined, undefined, () => { if (++calls === 1) throw unavailable(); if (calls === 2) return gate.then(() => whoamiAnswer("service")); });
+  try {
+    await s.r.controller.observe("session.created", { sessionID: "R" });
+    await until(() => calls === 2, 5000, "the retry's whoami starts");
+    // The explicit enroll's own prepare asks whoami over the runtime's FakeWire, not this stub.
+    await s.r.controller.enroll("R");
+    const enrolled = rootRecord(s.r.controller, "R");
+    const closing = s.r.controller.close();
+    release();
+    await closing;
+    expect(rootRecord(s.r.controller, "R")).toEqual(enrolled!);
+    expect(savedRoots(s.r.storage)).toHaveLength(1);
+  } finally { await s.restore(); }
+});
+test("static mode: an attempt's own refusal that lands as close starts keeps its record", async () => {
+  let calls = 0, release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const s = await staticRuntime("user", undefined, undefined, () => { if (++calls === 1) throw unavailable(); if (calls === 2) return gate.then(() => whoamiAnswer("user")); });
+  try {
+    await s.r.controller.observe("session.created", { sessionID: "R" });
+    await until(() => calls === 2, 5000, "the retry's whoami starts");
+    const closing = s.r.controller.close();
+    release();
+    await closing;
+    expect(rootRecord(s.r.controller, "R")).toMatchObject({ state: "unenrolled", operation: "enroll", code: "refused" });
+    expect(savedRecord(s.r, "R")).toMatchObject({ state: "unenrolled", code: "refused" });
+  } finally { await s.restore(); }
+});
 // #1285 I-B: a static run's retries that run out name what its operator can do, and the outage, not "explicitly
 // enroll again" and operation_failed.
 test("static mode: retries run out on whoami 503s record the outage and a new run", async () => {
