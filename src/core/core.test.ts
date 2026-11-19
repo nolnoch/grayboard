@@ -188,6 +188,22 @@ test("snapshot and catalog conceal private boards with bounded authorized catalo
   expect([...first.boards, ...last.boards]).toHaveLength(106);
 });
 
+test("a renewal can't move a claim onto a board its holder can't see, even when the caller can (#1269)", () => {
+  setAccess(db, { ...openAccess(db), canSee: (h, b) => !b.scope || h === "be" || h === "sim", checkCreate: () => null });
+  createBoard(db, "be", "private", "private", "team:private");
+  const row = () => listClaims(db, "lane:x")[0];
+  claim(db, "fe", "lane:x", { note: "start" });
+  // be holds fe too, so the renewal keeps fe as holder; fe can't see #private, so the move rolls back.
+  expect(() => claim(db, "be", "lane:x", { board: "private", note: "moved", addresses: ["be", "fe"] }))
+    .toThrow("fe, which holds lane:x, can't see #private; a claim can't move onto it");
+  expect(row()).toMatchObject({ holder: "fe", board: null, note: "start" });
+  // A holder that sees the board moves there, through another address or its own.
+  claim(db, "sim", "lane:y");
+  expect(claim(db, "be", "lane:y", { board: "private", addresses: ["be", "sim"] })).toMatchObject({ ok: true, renewed: true, claim: { holder: "sim", board: "private" } });
+  claim(db, "be", "lane:z");
+  expect(claim(db, "be", "lane:z", { board: "private" })).toMatchObject({ ok: true, renewed: true, claim: { holder: "be", board: "private" } });
+});
+
 test("a declared human handle persists across sessions; declaring another moves it", () => {
   expect(humanHandles(db)).toEqual([]);
   expect(humanInstruction(humanHandles(db))).toEqual([]);

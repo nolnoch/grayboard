@@ -495,6 +495,34 @@ describe("a claim's renewal and release announced on a service's board are invoc
       expect(eng, route).not.toBe(bindings.bob);
     }
   });
+  test("a renewal can't move a claim onto the service's board when its holder lacks service_invoke, though the caller has it (#1269)", async () => {
+    await cast();
+    expect((await api(tokens[B]!, "POST", "/api/teams", { name: "eng" })).status).toBe(201);
+    const bob = await srv.hosted(B, "fe");
+    sessions.push(bob);
+    await bob.call("bind", { name: "eng/build", create: true });
+    const row = (key: string) => srv.app.db.query("SELECT holder, board, note FROM claims WHERE key = ?").get(key);
+    const routes = {
+      mcp: (args: Record<string, unknown>, as: string) => bob.call("claim_take", { ...args, as }).then(() => "ok", async (e: unknown) => {
+        if (e instanceof HostedToolError) return e.message;
+        throw e;
+      }),
+      http: async (args: Record<string, unknown>, as: string) => {
+        const r = await api(tokens[B]!, "POST", "/api/claims/call", { as, tool: "claim_take", args });
+        return r.status === 200 ? "ok" : JSON.stringify(r.body);
+      },
+    };
+    for (const [route, take] of Object.entries(routes)) {
+      const key = `ticket:MOVE-${route}`;
+      // eng holds no grant on the service, so eng/build can't see #jobs; bob's own name can.
+      expect(await take({ key, note: "start" }, "eng/build"), route).toBe("ok");
+      const before = invokes().length;
+      expect(await take({ key, board: "jobs", note: "moved" }, `${B}/fe`), route).toContain("eng/build, which holds " + key + ", can't see #jobs");
+      expect(row(key), route).toEqual({ holder: "eng/build", board: null, note: "start" });
+      // The caller's own check records its allow; the refused move posts nothing, so records nothing more.
+      expect(invokes().slice(before).every((i) => (i as { detail: { address: string } }).detail.address === `${B}/fe`), route).toBe(true);
+    }
+  });
 });
 
 describe("an ID is judged as its session's primary alike on every route (audit F5)", () => {
