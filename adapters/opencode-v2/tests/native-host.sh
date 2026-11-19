@@ -12,3 +12,5 @@ for mode in direct code disabled; do
   ln -s "$root/node_modules" "$root/$mode/node_modules"
   env -i PATH="$root/tool-bin:/usr/bin:/bin:/usr/sbin:/sbin" HOME="$root/$mode/home" XDG_CONFIG_HOME="$root/$mode/home/config" XDG_DATA_HOME="$root/$mode/home/data" XDG_CACHE_HOME="$root/$mode/home/cache" XDG_STATE_HOME="$root/$mode/home/state" TMPDIR="$root/$mode/tmp" npm_config_ignore_scripts=true GRAYBOARD_GIT_TEST_ROOT="$root/$mode" GRAYBOARD_NATIVE_MODE="$mode" bun "$root/tests/native-host.ts"
 done
+# #270 step 4: static service-credential mode against a real server (its own fresh snapshot under this run).
+GRAYBOARD_PACKAGE_TEST_DIR="$root/static" sh tests/static-host.sh

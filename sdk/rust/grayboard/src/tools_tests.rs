@@ -761,7 +761,7 @@ async fn confirmations_and_results_that_are_not_refusals() {
 async fn whoami_reads_the_conditional_fields() {
     let fake = Fake::start(false, |req, _| {
         let whoami = json!({
-            "id": "id:abc", "principal": "you@example.com", "held": [], "primary": null, "ownership": 3,
+            "id": "id:abc", "principal": "you@example.com", "principal_kind": "service", "held": [], "primary": null, "ownership": 3,
             "alias_lost": [{"alias": "you@example.com/be", "reason": "removed from team core"}, {"alias": "you@example.com/fe"}],
             "writes_as": "you@example.com/be", "root": "id:root", "child": true, "unbound": true,
             "candidates": [{"name": "be", "queued": 2, "claims": 1, "where": null, "suggested": true}]
@@ -805,6 +805,8 @@ async fn whoami_reads_the_conditional_fields() {
         ),
         ("be", Some(2), Some(1), None, true)
     );
+    assert_eq!(me.principal_kind.as_deref(), Some("service"));
+    assert!(!me.extra.contains_key("principal_kind"));
 }
 
 /// `dm_ack`'s bare confirmation is a full ack only as `"ok"` or `"ok: …"`; no value and no such text is invalid, not success.

@@ -307,6 +307,16 @@ test("unrecognized commands and remote secrets refuse migration", () => {
   }
 });
 
+test("a launcher's static service-credential entry (#270 D3) is left alone: setup-opencode refuses it unwritten, setup skips it", () => {
+  const f = fixture();
+  const entry = { type: "remote", url: f.opts.url, oauth: false, headers: { Authorization: "Bearer {env:GRAYBOARD_RUN_TOKEN}" } };
+  writeFileSync(f.config, JSON.stringify({ mcp: { servers: { grayboard: entry } } }));
+  const before = readFileSync(f.config, "utf8");
+  for (const migrate of [false, true]) expect(() => f.run({ migrate })).toThrow("Unrecognized native Grayboard MCP entry");
+  expect(opencodeShimGuard(f.root)).toEqual({ skip: true, warning: expect.stringContaining("leaving OpenCode unchanged") });
+  expect(readFileSync(f.config, "utf8")).toBe(before);
+});
+
 test("plugin source migration preserves option bytes/enrollment and unrelated entries", () => {
   const f = fixture();
   const options = '"options" : { "enrollment" : "{env:KEEP}", "unknown" : [1, 2], "file" : "{file:./keep}" }';
