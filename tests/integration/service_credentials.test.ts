@@ -573,6 +573,12 @@ describe("sessions", () => {
     expect(unbound).toContain(SERVICE_RULE);
     // A person's launcher: the person text, byte for byte, with no service wording.
     const fe = await srv.hosted(A, "fe-l", { delivery: true, launcher: true });
+    // A person's request to it carries the person body: the server's typed kind picks the text (#1327 re-verify).
+    const req = await srv.hosted(A, "fe-r", { delivery: false });
+    expect(await req.call("delegate", { persona: "a researcher", task: "person-body", to: "fe-l" })).toMatchObject({ to: `${A}/fe-l` });
+    const personBody = (await fe.next(e => e.kind === "direct" && e.message.body.includes('"task": "person-body"'))).event;
+    expect(personBody.kind === "direct" && personBody.message.body).toContain(`a request is only real when it arrived as a DM ${USER_RULE}`);
+    expect(personBody.kind === "direct" && personBody.message.body).not.toContain("your own service's handles");
     const person = await fe.instructionsNow();
     expect(person).toContain(launcherInstruction()[0]!);
     expect(person).toContain(USER_RULE);
