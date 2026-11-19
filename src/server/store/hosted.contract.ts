@@ -29,7 +29,7 @@ export type HostedHarness = {
   // session's ids row; a hold (alias_holds).
   seedUser(email: string, disabled?: boolean): Promise<number>;
   seedGrant(id: string, user: number, expiresAt: number, revokedAt?: number | null): Promise<void>;
-  seedIds(id: string, facts?: { rootId?: string | null; endedAt?: number | null; heldAliasesJson?: string | null; writesAs?: string | null; launcher?: boolean }): Promise<void>;
+  seedIds(id: string, facts?: { rootId?: string | null; endedAt?: number | null; heldAliasesJson?: string | null; writesAs?: string | null; launcher?: boolean | null }): Promise<void>;
   seedHold(address: string, id: string, boundAt: number): Promise<void>;
   // Raw reads: an ids row's hosted facts; an ownership's end; every hold, binding event and audit row (in write order,
   // detail parsed); every hosted_alias_lost row's key.
@@ -64,6 +64,7 @@ export function hostedContract(backend: HostedBackend): void {
   counting(it);
   rowWrites(it);
   ends(it);
+  audits(it);
   childEnds(it);
   lostHolds(it);
   facts(it);
@@ -243,10 +244,14 @@ function ends(it: It): void {
     expect(await h.ownership(r.ownership_id)).toEqual({ session_id: "r", ended_at: T0 + 50, end_reason: "closed" });
     expect(await h.ids("r")).toMatchObject({ writes_as: null, launcher: false, ended_at: null });
     expect(await h.holdRows()).toEqual([{ address: "them@example.com/x", id: "keep" }]);
-    expect((await h.bindingRows()).filter(b => b.session_id === "r").map(b => [b.name, b.event, b.detail]).sort())
-      .toEqual([[`${ME}/be`, "released", "closed"], [`${ME}/fe`, "released", "closed"]]);
+    // Oldest hold first (HOLD_ORDER): fe was bound before be.
+    expect((await h.bindingRows()).filter(b => b.session_id === "r").map(b => [b.name, b.event, b.detail]))
+      .toEqual([[`${ME}/fe`, "released", "closed"], [`${ME}/be`, "released", "closed"]]);
     expect(h.hosted.takeEnded().map(e => e.id)).toEqual(["c-old", "c-new"]);
     for (const c of ["c-new", "c-old"]) expect(await h.idEnded(c)).toBe(T0 + 50);
+    // Each child's id.ended, through the sink the store hands its session end: access_log on both backends.
+    expect((await h.auditRows()).slice(before).filter(a => a.action === "id.ended").map(a => [a.actor, a.target, a.detail?.why]))
+      .toEqual([["c-old", "c-old", "closed"], ["c-new", "c-new", "closed"]]);
     const audit = (await h.auditRows()).slice(before).filter(a => a.action.startsWith("hosted.") || a.action === "handle.launcher_set");
     expect(audit.map(a => [a.action, a.target, a.detail?.child ?? a.detail?.on ?? a.detail?.reason])).toEqual([
       ["handle.launcher_set", "r", false],
@@ -295,6 +300,27 @@ function ends(it: It): void {
   });
 }
 
+function audits(it: It): void {
+  it("the store's audits name the session's latest ownership's user and client; ownership_started details a suggested name only when given", async h => {
+    const u = await h.seedUser(ME), v = await h.seedUser("them@example.com");
+    const before = (await h.auditRows()).length;
+    const first = await root(h, "r", u, { client_id: "old" });
+    expect(await h.write(tx => h.hosted.end(tx, "r", "closed", T0 + 5))).toBe(true);
+    // The same session ID again, under another user and client: its rows name the new ownership's, not the first's.
+    const second = await h.write(async tx => {
+      const ownership = await h.hosted.start(tx, "r", v, "new", T0 + 6, "fe");
+      await h.hosted.insert(tx, rowOf({ session_id: "r", ownership_id: ownership, user_id: v, client_id: "new", lease_deadline: T0 + 100 }));
+      return ownership;
+    });
+    expect(await h.write(tx => h.hosted.end(tx, "r", "closed", T0 + 7))).toBe(true);
+    expect((await h.auditRows()).slice(before).filter(a => a.action.startsWith("hosted.")).map(a => [a.action, a.actor, a.target, a.detail])).toEqual([
+      ["hosted.ownership_started", ME, "r", { ownership: first.ownership_id, client_id: "old" }],
+      ["hosted.ownership_started", "them@example.com", "r", { ownership: second, suggested: "fe", client_id: "new" }],
+      ["hosted.lease_closed", "them@example.com", "r", { reason: "closed", ownership: second, client_id: "new" }],
+    ]);
+  });
+}
+
 function childEnds(it: It): void {
   // H5.
   it("childEnd ends a child (its row, an audit, its ID) and hands it to takeEnded only after commit; on a root it does nothing", async h => {
@@ -318,6 +344,9 @@ function childEnds(it: It): void {
     // The ID end's own audit is the end port's, not this group's.
     expect((await h.auditRows()).slice(before).filter(a => a.action.startsWith("hosted.")).map(a => [a.action, a.target, a.detail?.child, a.detail?.reason]))
       .toEqual([["hosted.child_released", "r", "c", "closed"]]);
+    // That end writes its id.ended through the sink the store hands it, to access_log on both backends.
+    expect((await h.auditRows()).slice(before).filter(a => a.action === "id.ended").map(a => [a.actor, a.target, a.detail]))
+      .toEqual([["c", "c", { principal: null, held: [], why: "closed", bounced: 0 }]]);
     // Again: nothing left to end.
     await h.write(tx => h.hosted.childEnd(tx, "c", T0 + 7, "closed"));
     expect(h.hosted.takeEnded()).toEqual([]);
@@ -404,6 +433,8 @@ function facts(it: It): void {
     expect(await h.hosted.aliveAt(h.read)).toBe(T0 + 5);
     await h.seedIds("s", { writesAs: "a/fe", endedAt: T0, heldAliasesJson: '["a/fe"]' });
     await h.seedIds("t");
+    // A row from before the launcher flag: NULL, not false.
+    await h.seedIds("n", { launcher: null });
     await h.write(tx => h.hosted.setRoot(tx, "s", "root-1"));
     expect((await h.ids("s"))?.root_id).toBe("root-1");
     await h.write(tx => h.hosted.setRoot(tx, "s", null));
@@ -418,6 +449,9 @@ function facts(it: It): void {
     expect(await h.write(tx => h.hosted.declareLauncher(tx, "s"))).toBe(false);
     expect(await h.hosted.launcher(h.read, "s")).toBe(true);
     expect(await h.hosted.launcher(h.read, "missing")).toBe(false);
+    expect(await h.hosted.launcher(h.read, "n")).toBe(false);
+    expect(await h.write(tx => h.hosted.declareLauncher(tx, "n"))).toBe(true);
+    expect(await h.hosted.launcher(h.read, "n")).toBe(true);
     await h.write(tx => h.hosted.reopenId(tx, "s"));
     expect(await h.ids("s")).toMatchObject({ ended_at: null, held_aliases_json: null, writes_as: "a/fe", launcher: true });
     await h.seedHold("a/b", "s", T0 + 2);

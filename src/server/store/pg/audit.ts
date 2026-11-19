@@ -22,10 +22,11 @@
 //
 // Runtime imports stay off bun:sqlite and db.ts (pg/isolation.test.ts).
 import { SQL } from "bun";
+import type { AuditSink } from "../../../core/audit.ts";
 import { errorDiagnostic } from "../../diagnostics.ts";
 import { requestOrigin } from "../../request_context.ts";
 import { AUDIT_WRITE_ON_READ, type AccessLogRow, type AuditStore } from "../audit.ts";
-import { isTx } from "../tx_base.ts";
+import { isTx, type Tx } from "../tx_base.ts";
 import { jsonSafe, textSafeOrNull } from "../json_safe.ts";
 import { int8 } from "./sql.ts";
 import { pgOf } from "./tx.ts";
@@ -71,4 +72,11 @@ export function makePgAudit(): AuditStore {
       await pgOf(tx)`DELETE FROM access_log WHERE at < ${olderThanMs}`;
     },
   };
+}
+
+// Core's audit rows on Postgres (an AuditSink: core endSession's id.ended), at `now` on tx through write, as db.ts
+// coreAudit writes them to SQLite's access_log: what the hosted store hands its session-end port (pg/hosted.ts).
+export function pgCoreAuditSink(tx: Tx, now: number): AuditSink {
+  const audit = makePgAudit();
+  return (action, actor, target, detail) => audit.write(tx, { at: now, actor, action, target, detail: detail ? JSON.stringify(detail) : null });
 }

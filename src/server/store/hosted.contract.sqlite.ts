@@ -27,7 +27,7 @@ export const sqliteHostedBackend: HostedBackend = {
       },
       seedIds: async (id, f = {}) => {
         await run("INSERT INTO ids (id, started_at, last_seen, root_id, ended_at, held_aliases_json, writes_as, launcher) VALUES (?, 0, 0, ?, ?, ?, ?, ?)",
-          [id, f.rootId ?? null, f.endedAt ?? null, f.heldAliasesJson ?? null, f.writesAs ?? null, f.launcher ? 1 : 0]);
+          [id, f.rootId ?? null, f.endedAt ?? null, f.heldAliasesJson ?? null, f.writesAs ?? null, f.launcher === null ? null : f.launcher ? 1 : 0]);
       },
       seedHold: async (address, id, boundAt) => { await run("INSERT INTO alias_holds (address, id, bound_at) VALUES (?, ?, ?)", [address, id, boundAt]); },
       ids: async id => {
