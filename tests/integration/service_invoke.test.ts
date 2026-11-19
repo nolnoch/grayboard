@@ -519,8 +519,8 @@ describe("a claim's renewal and release announced on a service's board are invoc
       const before = invokes().length;
       expect(await take({ key, board: "jobs", note: "moved" }, `${B}/fe`), route).toContain("eng/build, which holds " + key + ", can't see #jobs");
       expect(row(key), route).toEqual({ holder: "eng/build", board: null, note: "start" });
-      // The caller's own check records its allow; the refused move posts nothing, so records nothing more.
-      expect(invokes().slice(before).every((i) => i.detail.address === `${B}/fe`), route).toBe(true);
+      // The refused move rolls back with its savepoint and records nothing.
+      expect(invokes().length, route).toBe(before);
     }
   });
 });
