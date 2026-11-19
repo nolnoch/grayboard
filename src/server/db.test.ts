@@ -47,6 +47,8 @@ test("bun:sqlite is only imported from src/server/db.ts (within the v1 server tr
   // is part of the seam: a Postgres port reimplements it alongside db.ts.
   // src/bridge/ keeps a client-side file of its own (the Slack bridge's thread
   // map and outbox), never a backend store, so it's excluded like src/local.
+  // src/server/store/*.contract.sqlite.ts are test-only runners (registered by this file) that put the SQLite store
+  // under a shared contract; they may drive a second connection or spy on the connection class.
   const offenders: string[] = [];
   const glob = new Glob("src/**/*.ts");
   const importPattern = /from\s+["']bun:sqlite["']/;
@@ -56,6 +58,7 @@ test("bun:sqlite is only imported from src/server/db.ts (within the v1 server tr
     if (file.startsWith("src/core/")) continue;
     if (file.startsWith("src/bridge/")) continue;
     if (file.endsWith(".test.ts")) continue;
+    if (/^src\/server\/store\/[^/]+\.contract\.sqlite\.ts$/.test(file)) continue;
     const text = await Bun.file(file).text();
     if (importPattern.test(text)) offenders.push(file);
   }

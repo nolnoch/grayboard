@@ -21,8 +21,8 @@ export type AuthPeek = {
 // Where the generation comes from, per backend.
 export interface AuthGenerationSource {
   // The generation now, or undefined when no cache may be keyed on it. Equal values mean no committed write to the
-  // three tables came between them. May throw (SQLite's counter read): every caller here catches or propagates it as
-  // the code it replaced did.
+  // three tables this process has learnt of came between them. May throw (SQLite's counter read): every caller here
+  // catches or propagates it as the code it replaced did.
   read(): string | undefined;
   // The caller's task holds the store's open transaction: its reads see uncommitted writes, so the cache is bypassed.
   ownsTx(): boolean;

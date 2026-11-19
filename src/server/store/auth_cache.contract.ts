@@ -8,9 +8,12 @@
 //   `auth.active` are what Repo puts in its oauth and users groups.
 // - A held read goes through the cache's own pause points (auth:user:read, auth:access:read), which live in
 //   auth_cache.ts and so hold on every backend.
+// - The generation may move after a write resolves as well as before: on Postgres the pod's own NOTIFY arrives a moment
+//   after its write-path bump and bumps again (scope §2.2). So every row calls `settle()` after each of its own auth
+//   writes and before each baseline (a generation it compares with later) or read-count window; only a row asserting
+//   what a write did before it resolved (A3) reads the generation before settling.
 // - An outside write is another connection's (SQLite: a second Database on the file; Postgres: the test database's raw
-//   client). `seen()` waits until this store could have learnt of it: SQLite at once (data_version moves with the
-//   commit), Postgres until its generation moves, with a deadline.
+//   client). `seen()` waits until this store has learnt of it (see the harness).
 // - Reads are counted by the harness, by backend: the user-by-id and live-token reads under the caches.
 // Rows that only SQLite can express (a failed counter read, an autocommit write, a synchronous post) stay in
 // src/server/auth-generation.test.ts.
@@ -34,13 +37,24 @@ export type AuthCacheHarness = {
   touchOther(tx: Tx): Promise<void>;
   // Sets the user's disabled_at from another connection, committed when it resolves.
   outsideDisable(userId: number): Promise<void>;
+  // Resolves once every notification this store's generation source will get for writes committed before the call
+  // has arrived, so the generation stays put until the next write. SQLite: a no-op (its generation moves with the
+  // commit, data_version included). Postgres: NOTIFY a unique marker on the listener's channel and wait until the
+  // listener receives it, with a deadline; a listener receives notifications in commit order, so every earlier one
+  // (this pod's own included) has arrived by then.
+  settle(): Promise<void>;
+  // Resolves once this store has learnt of the last outsideDisable. SQLite: at once (data_version moves with the
+  // commit). Postgres: the outside client NOTIFYs a unique marker after its commit, and seen() waits, with a deadline,
+  // until the listener receives that marker, so the disable's own notification, and every one before it, has arrived.
   seen(): Promise<void>;
   // Counts the uncached reads under the caches from now until restore().
   reads(): { users(): number; accesses(): number; restore(): void };
   close(): void | Promise<void>;
 };
 
-export type AuthCacheBackend = { kind: "sqlite" | "postgres"; open(): Promise<AuthCacheHarness> };
+// `commitGeneration`: "exact" where Repo.commitGeneration is the committed generation outside the caller's own
+// transaction (SQLite), "none" where it is always undefined because a commit can lag (Postgres: scope §5).
+export type AuthCacheBackend = { kind: "sqlite" | "postgres"; commitGeneration: "exact" | "none"; open(): Promise<AuthCacheHarness> };
 
 const RESOURCE = "https://bus.example.com/mcp", OTHER = "https://other.example.com/mcp";
 const sha = (s: string) => createHash("sha256").update(s).digest("hex");
@@ -52,10 +66,13 @@ const gate = () => { let open!: () => void; const p = new Promise<void>(r => { o
 export function authCacheContract(backend: AuthCacheBackend): void {
   const it = (name: string, fn: (h: AuthCacheHarness) => Promise<void>) => test(name, async () => {
     const h = await backend.open();
-    try { await fn(h); } finally { await h.close(); }
+    try { await h.settle(); await fn(h); } finally { await h.close(); }
   });
-  const seedUser = (h: AuthCacheHarness, email: string) => h.write(async tx => (await h.users.upsertByEmail(tx, email, null)).id);
-  const disable = (h: AuthCacheHarness, userId: number) => h.write(tx => h.users.setDisabled(tx, userId, true));
+  // The raw writes (A3 reads the generation before settling) and their settled forms, which every other row uses.
+  const seedRaw = (h: AuthCacheHarness, email: string) => h.write(async tx => (await h.users.upsertByEmail(tx, email, null)).id);
+  const disableRaw = (h: AuthCacheHarness, userId: number) => h.write(tx => h.users.setDisabled(tx, userId, true));
+  const seedUser = async (h: AuthCacheHarness, email: string) => { const id = await seedRaw(h, email); await h.settle(); return id; };
+  const disable = async (h: AuthCacheHarness, userId: number) => { await disableRaw(h, userId); await h.settle(); };
   const email = (h: AuthCacheHarness, r: Read, userId: number) => h.auth.active(r, userId).then(u => u?.email);
   // Holds a write body open after `fn`'s writes until the returned release() is called; settles with the body.
   const hold = (h: AuthCacheHarness, fn: (tx: Tx) => unknown, fail = false) => {
@@ -68,9 +85,11 @@ export function authCacheContract(backend: AuthCacheBackend): void {
     });
     return { wrote: wrote.p, release: g.open, done: fail ? done.catch(() => {}) : done };
   };
-  // An access token for userId, through the store's consent and redemption path; returns its hash.
+  // An access token for userId, through the store's consent and redemption path, settled unless `settle` is false;
+  // returns its hash.
   let serial = 0;
-  const issueAccess = async (h: AuthCacheHarness, userId: number, resource = RESOURCE): Promise<string> => {
+  const issueAccess = async (h: AuthCacheHarness, userId: number, settle = true): Promise<string> => {
+    const resource = RESOURCE;
     const start = h.now(), n = ++serial;
     const binding: OAuthAuthorization = { clientId: "native", resource, scopes: ["grayboard:tools"], redirectUri: "http://127.0.0.1/callback", codeChallenge: "A".repeat(43) };
     const request = { ...binding, requestHash: sha(`request${n}`), browserHash: sha(`browser${n}`), csrfHash: sha(`csrf${n}`), stateHash: sha(`state${n}`), consentSessionHash: null, createdAt: start, expiresAt: start + OAUTH_TTL.request };
@@ -84,6 +103,7 @@ export function authCacheContract(backend: AuthCacheBackend): void {
       expect((await h.oauth.decideRequest(tx, { requestHash: request.requestHash, browserHash: request.browserHash, csrfHash: request.csrfHash, sessionHash, approve: true, code }, start)).status).toBe("ok");
       expect((await h.oauth.redeemCode(tx, { ...binding, codeHash: code.codeHash, grantId: `grant_${n.toString(16).padStart(16, "0")}`, grantExpiresAt: start + OAUTH_TTL.grant, tokens }, start)).status).toBe("ok");
     });
+    if (settle) await h.settle();
     return tokens.accessHash;
   };
 
@@ -138,26 +158,29 @@ export function authCacheContract(backend: AuthCacheBackend): void {
   });
 
   // A3.
+  // Unsettled on purpose: each generation is read as write() resolves, before any notification could move it. Later
+  // bumps only move it further, so the not-equal checks hold either way.
   it("A3: a commit that writes an auth table moves the generation before write() resolves, for each table", async h => {
+    const exact = backend.commitGeneration === "exact";
     const g0 = h.auth.authGeneration(), c0 = h.auth.commitGeneration();
-    expect(c0).toBeDefined();
-    const user = await seedUser(h, "c@example.com"); // users
+    if (exact) expect(c0).toBeDefined(); else expect(c0).toBeUndefined();
+    const user = await seedRaw(h, "c@example.com"); // users
     const g1 = h.auth.authGeneration(), c1 = h.auth.commitGeneration();
     expect(g1).not.toBe(g0);
-    expect(c1).not.toBe(c0);
-    const issued = await issueAccess(h, user); // oauth_grants and oauth_tokens
+    if (exact) expect(c1).not.toBe(c0); else expect(c1).toBeUndefined();
+    const issued = await issueAccess(h, user, false); // oauth_grants and oauth_tokens
     const g2 = h.auth.authGeneration();
     expect(g2).not.toBe(g1);
     await h.write(tx => h.oauth.revokeToken(tx, issued, "native", h.now()).then(() => {})); // oauth_tokens
     expect(h.auth.authGeneration()).not.toBe(g2);
-    expect(h.auth.commitGeneration()).toBe(h.auth.authGeneration());
+    expect(h.auth.commitGeneration()).toBe(exact ? h.auth.authGeneration() : undefined);
   });
 
   it("A3: an auth commit moves the generation before the write queue's next body starts", async h => {
     const g0 = h.auth.authGeneration();
     const user = await seedUser(h, "c2@example.com");
     const before = h.auth.authGeneration();
-    const disabled = disable(h, user);
+    const disabled = disableRaw(h, user);
     // Queued behind the disable: while it holds the queue, other tasks read the committed generation, which is
     // none seen before the disable committed.
     const held = hold(h, () => {});
@@ -224,6 +247,38 @@ export function authCacheContract(backend: AuthCacheBackend): void {
     await disable(h, user);
     later.open();
     expect(await after).toBeUndefined();
+  });
+
+  it("A5: a body that rejects ends its pin too: a continuation it started reads afresh after a later disable", async h => {
+    const user = await seedUser(h, "p3@example.com");
+    const g0 = h.auth.authGeneration();
+    const later = gate();
+    let after!: Promise<{ g: string | undefined; email: string | undefined }>;
+    await h.auth.authRead(async () => {
+      expect(await email(h, h.read, user)).toBe("p3@example.com"); // fills the user cache at g0
+      after = later.p.then(async () => ({ g: h.auth.authGeneration(), email: await email(h, h.read, user) }));
+      throw ROLLBACK;
+    }).catch(rolledBack);
+    await disable(h, user);
+    later.open();
+    const seen = await after;
+    expect(seen.g).not.toBe(g0);
+    expect(seen.email).toBeUndefined();
+  });
+
+  it("A5: an authRead inside another keeps the outer body's pin across a commit; the outer pin ends with the outer body", async h => {
+    const user = await seedUser(h, "p4@example.com");
+    const g0 = h.auth.authGeneration();
+    await h.auth.authRead(async () => {
+      expect(await email(h, h.read, user)).toBe("p4@example.com"); // fills the user cache at g0
+      await disable(h, user);
+      // Nested: still the outer body's generation and its answer (#881's bound: one authorization), not a new pin.
+      const inner = await h.auth.authRead(async () => ({ g: h.auth.authGeneration(), email: await email(h, h.read, user) }));
+      expect(inner).toEqual({ g: g0, email: "p4@example.com" });
+      expect(h.auth.authGeneration()).toBe(g0);
+    });
+    expect(h.auth.authGeneration()).not.toBe(g0);
+    expect(await email(h, h.read, user)).toBeUndefined();
   });
 
   // A6 (#807 P3 A7c): bodies pinned to different generations overlap across awaits. An older body's lookup bypasses
@@ -296,6 +351,7 @@ export function authCacheContract(backend: AuthCacheBackend): void {
       () => h.write(tx => end === "disable" ? h.users.setDisabled(tx, user, true) : h.oauth.revokeToken(tx, issued, "native", t).then(() => {})));
     expect(held).toBeDefined();
     expect(h.auth.authGeneration()).not.toBe(g0);
+    await h.settle();
     const reads = h.reads();
     try {
       expect(await h.auth.findActiveAccess(h.read, issued, RESOURCE, [], t)).toBeUndefined();
@@ -387,6 +443,31 @@ export function authCacheContract(backend: AuthCacheBackend): void {
       expect(await h.auth.findActiveAccess(h.read, issued, RESOURCE, [], t)).toBeDefined();
       expect(reads.users()).toBe(2);
       expect(reads.accesses()).toBe(1);
+    } finally { reads.restore(); }
+  });
+
+  // A10: a hit is still checked against the lookup's time and scopes. The entry is filled with no required scopes, so
+  // the held token must be refused once `now` reaches its expiry and for a scope it lacks, by findActiveAccess and by
+  // authPeek alike. (A grant expiring before its token can't be seeded: redemption caps the token at the grant's
+  // deadline and rotation clamps it, so the grant-expiry check is pinned only where the two coincide.)
+  it("A10: a cached token isn't served past its expiry or for a scope it lacks", async h => {
+    const user = await seedUser(h, "y@example.com");
+    const t = h.now();
+    const issued = await issueAccess(h, user);
+    const live = await h.auth.findActiveAccess(h.read, issued, RESOURCE, [], t); // fills with no required scopes
+    expect(live).toBeDefined();
+    const expiry = live!.expiresAt;
+    const reads = h.reads();
+    try {
+      expect(await h.auth.findActiveAccess(h.read, issued, RESOURCE, ["grayboard:tools"], t)).toBeDefined();
+      expect(await h.auth.findActiveAccess(h.read, issued, RESOURCE, ["grayboard:delivery"], t)).toBeUndefined();
+      expect(await h.auth.findActiveAccess(h.read, issued, RESOURCE, ["grayboard:tools", "grayboard:delivery"], t)).toBeUndefined();
+      expect(reads.accesses()).toBe(0); // all three from the cache
+      const peek = h.auth.authPeek()!;
+      expect(peek.access(issued, RESOURCE, expiry - 1)).toBeDefined();
+      expect(peek.access(issued, RESOURCE, expiry)).toBeUndefined();
+      expect(await h.auth.findActiveAccess(h.read, issued, RESOURCE, [], expiry)).toBeUndefined();
+      expect(h.auth.authPeek()!.access(issued, RESOURCE, expiry - 1)).toBeUndefined(); // the expired read dropped the entry
     } finally { reads.restore(); }
   });
 }
