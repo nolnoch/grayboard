@@ -48,7 +48,8 @@ export function cursorsContract(backend: CursorsBackend): void {
     expect(got).toBe(7);
     expect(typeof got).toBe("number");
     expect(typeof (await h.cursors.directFor(h.read, A))).toBe("number");
-    // A comparison a caller makes (handleRetract's `directFor(…) >= m.id`) holds numerically, not as text.
+    // A comparison a caller makes (handleRetract's `directFor(…) >= m.id`). The typeof checks above are what catch a
+    // string: JS coerces a numeric string against a number, so this line alone would pass on "7".
     expect((await h.cursors.directFor(h.read, A)) >= 10).toBe(false);
   });
 

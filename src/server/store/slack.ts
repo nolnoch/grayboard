@@ -19,7 +19,8 @@ export interface SlackStore {
   linkBySlackUser(r: Read, slackUser: string): Promise<SlackLink | undefined>;
   // The link writes' lock (#807 P3 C7 decision 4), held until the body ends: one for every link and unlink, taken
   // before the body's first Slack read, so a Slack account links to one user and an unlink naming an old account
-  // can't delete a new link. A no-op on SQLite (the single writer); one advisory lock on Postgres.
+  // can't delete a new link. A no-op on SQLite (the single writer); one advisory lock on Postgres. Never inside a
+  // savepoint that may roll back: on Postgres its ROLLBACK TO frees the lock.
   lock(tx: Tx): Promise<void>;
   // Replaces the user's earlier link, if any. A link to another account (or DM) drops the user's thread map and
   // progress, which live in the old account's DM; the same link again keeps them.

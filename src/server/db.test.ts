@@ -441,6 +441,13 @@ test("audit.last searches access_log by (action, target), never a scan or a sort
   expect((await repo.audit.last(repo.read, "dm.retract", "7"))?.detail).toBe("row 3");
 });
 
+// #807 P3 C7 (U3): last's tiebreak is pinned by its text. SQLite's reverse index scan gives ties in descending rowid
+// with `ORDER BY at DESC` alone, so contract row U3 can't catch the `id DESC` dropped; Postgres breaks such ties by
+// heap order, so it may not either (C67b pins pg/audit.ts's query text the same way).
+test("audit.last orders by (at, id), newest first", () => {
+  expect(ACCESS_LOG_LAST_SQL).toContain("ORDER BY at DESC, id DESC LIMIT 1");
+});
+
 // #807 P1c-5: a leaf store refuses a value that isn't a SQLite store handle. A settled Tx's refusal is a contract row
 // on every backend (cursors.contract.ts K4, write_receipts.contract.ts), as are the store's answers.
 test("#807 P1c-5: cursors and writeReceipts refuse a handle from another store", async () => {

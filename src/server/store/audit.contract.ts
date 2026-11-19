@@ -31,6 +31,8 @@ export type AuditHarness = {
   write<T>(fn: (tx: Tx) => Promise<T>): Promise<T>;
   read: Read;
   // A store-direct audit row on tx (insertAudit on that backend, stamped with the request's origin as audit.write's).
+  // It takes the row as given: actor, target and detail may each be null (U9's rows have a null detail), and any of
+  // them may carry a NUL or a lone surrogate, which the backend's insertAudit sanitizes (U8).
   direct(tx: Tx, row: AccessLogRow): Promise<void>;
   // Raw reads: every access_log row in id order, detail parsed.
   rows(): Promise<AuditRawRow[]>;
@@ -134,14 +136,18 @@ function writes(it: It): void {
   });
 
   // U8.
-  it("a NUL or a lone surrogate in actor, target or a detail string commits as U+FFFD", async h => {
+  it("a NUL or a lone surrogate in actor, target or a detail string commits as U+FFFD, written or store-direct", async h => {
     const bad = "a\u0000b\uD800c\uDC00d";
     const safe = "a\uFFFDb\uFFFDc\uFFFDd";
     await h.write(async tx => {
       h.audit.write(tx, row(bad, T0, { actor: bad, detail: JSON.stringify({ name: bad, list: [bad, { [bad]: 1 }], n: 1, ok: true, none: null }) }));
+      await h.direct(tx, row(bad, T0, { action: "role.granted", actor: bad, detail: JSON.stringify({ name: bad }) }));
     });
     const want = { name: safe, list: [safe, { [safe]: 1 }], n: 1, ok: true, none: null };
-    expect(await h.rows()).toEqual([{ at: T0, actor: safe, action: ACT, target: safe, detail: want, detail_type: "object", ip: null, ua: null, client_id: null }]);
+    expect(await h.rows()).toEqual([
+      { at: T0, actor: safe, action: ACT, target: safe, detail: want, detail_type: "object", ip: null, ua: null, client_id: null },
+      { at: T0, actor: safe, action: "role.granted", target: safe, detail: { name: safe }, detail_type: "object", ip: null, ua: null, client_id: null },
+    ]);
     expect(parsed(await h.audit.last(h.read, ACT, safe))?.detail).toEqual(want);
     // A paired surrogate (an emoji) is kept.
     await h.write(async tx => { h.audit.write(tx, row("😀", T0, { detail: JSON.stringify({ e: "😀" }) })); });

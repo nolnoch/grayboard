@@ -24,6 +24,7 @@ import { ApplicationError, type Application, type ApplicationSession, type Deliv
 import { CoreError } from "../core/errors.ts";
 import { failureDiagnostic } from "./diagnostics.ts";
 import { detached } from "./request_context.ts";
+import { jsonSafe } from "./store/json_safe.ts";
 import type { Tx } from "./store/tx.ts";
 
 /** users.info errors that mean Slack won't give this account's email, as opposed to Slack being unreachable. */
@@ -390,8 +391,9 @@ export class SlackBridge implements SlackLinker {
         return pending ? structuredClone(pending.value) : repo.slack.progress(repo.read, link.user_id, r);
       },
       setProgress: (id, progress) => {
-        // A copy: the relay keeps mutating its progress object after saving it, as the stored JSON doesn't see.
-        const r = ref(id), mine = ++seq, value = structuredClone(progress);
+        // A copy: the relay keeps mutating its progress object after saving it, as the stored JSON doesn't see. Made
+        // safe as the store stores it (#807 P3 C7 decision 3), so a read before the write lands answers the same.
+        const r = ref(id), mine = ++seq, value = jsonSafe(structuredClone(progress));
         pendingProgress.set(r, { value, seq: mine });
         repo.post(tx => repo.slack.setProgress(tx, link.user_id, r, value), () => { if (pendingProgress.get(r)?.seq === mine) pendingProgress.delete(r); }, "Slack progress");
       },

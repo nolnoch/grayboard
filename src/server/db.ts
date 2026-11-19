@@ -909,7 +909,7 @@ function initSchema(db: Database): void {
  * Every access_log row goes in here: it stamps the client address, user agent
  * and OAuth client of the request whose handling wrote it (security audit F-19).
  * NUL and lone surrogates in actor, target and detail's strings are stored as U+FFFD (#807 P3 C7 decision 3), as
- * the Postgres store's insert stores them.
+ * the Postgres store's pg/audit_row.ts will store them (C67b).
  */
 export function insertAudit(db: Database, at: number, actor: string | null, action: string, target: string | null, detail: string | null): void {
   const o = requestOrigin();

@@ -21,8 +21,12 @@ export function jsonSafe<T>(value: T): T {
   if (typeof value === "string") return textSafe(value) as T;
   if (Array.isArray(value)) return value.map(jsonSafe) as T;
   if (value !== null && typeof value === "object") {
+    // defineProperty, not assignment: assigning "__proto__" (a key JSON.parse makes an own property) would set the
+    // copy's prototype and drop the key.
     const out: Record<string, unknown> = {};
-    for (const [k, v] of Object.entries(value)) out[textSafe(k)] = jsonSafe(v);
+    for (const [k, v] of Object.entries(value)) {
+      Object.defineProperty(out, textSafe(k), { value: jsonSafe(v), enumerable: true, writable: true, configurable: true });
+    }
     return out as T;
   }
   return value;

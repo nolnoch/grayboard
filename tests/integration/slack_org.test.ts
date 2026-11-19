@@ -722,7 +722,7 @@ test("#807 P3 C7: the owed bridge notice and the bridge stop take the notice loc
     for (const name of ["fe", "qa"]) {
       start = calls.length;
       await srv.appSession(alice, name).connect();
-      expect(calls.slice(start)).toEqual(["last bridge.stopped", "lock bridge.notified", "last bridge.notified"]);
+      expect(calls.slice(start)).toEqual(["last bridge.stopped", "lock bridge.notified", "last bridge.stopped", "last bridge.notified"]);
     }
     expect(accessAudits(srv.app.db, "bridge.notified")).toHaveLength(1);
     // A second stop inside the dedup window is suppressed: a bind reads it and locks nothing.
@@ -735,6 +735,33 @@ test("#807 P3 C7: the owed bridge notice and the bridge stop take the notice loc
     await srv.appSession(alice, "sim").connect();
     expect(calls.slice(start)).toEqual(["last bridge.stopped"]);
   } finally { for (const s of spies) s.mockRestore(); }
+});
+
+// #807 P3 C7 decision 5: the owed notice re-reads the stop under the lock, so a stop written between its first read and
+// the lock (another bridge's, committed while this bind waited) is the one it reports and marks delivered.
+test("#807 P3 C7: the owed bridge notice reports the stop written before its lock, not the one it first read", async () => {
+  const repo = srv.app.repo;
+  const target = "alice@example.com/human";
+  const alice = await login("alice@example.com");
+  await link(alice);
+  srv.app.slack!.stop({ fatal: true, detail: "first fatal" });
+  await until(async () => !!(await repo.audit.last(repo.read, "bridge.stopped", target)), 5000, "the first stop's row");
+  const first = (await repo.audit.last(repo.read, "bridge.stopped", target))!;
+  const later = first.at + 1000;
+  const original = repo.audit.lock.bind(repo.audit);
+  const lock = spyOn(repo.audit, "lock").mockImplementation(async (tx, action, t) => {
+    if (action === "bridge.notified" && t === target) {
+      repo.audit.write(tx, { at: later, actor: null, action: "bridge.stopped", target, detail: JSON.stringify({ at: "2099-01-01T00:00:00.000Z", reason: "second fatal" }) });
+    }
+    return original(tx, action, t);
+  });
+  try {
+    const hello = await srv.appSession(alice, "be").connect();
+    const notices = (hello.bind?.notices ?? []).filter((n) => n.includes("your Slack bridge stopped"));
+    expect(notices).toEqual([expect.stringContaining("stopped at 2099-01-01T00:00:00.000Z (second fatal)")]);
+  } finally { lock.mockRestore(); }
+  const notified = await repo.audit.last(repo.read, "bridge.notified", target);
+  expect(JSON.parse(notified!.detail!).stopped_at).toBe("2099-01-01T00:00:00.000Z");
 });
 
 // #807 P1c-14b: the link's newest-message read (where the new human's cursor starts) and the Slack receipt's
