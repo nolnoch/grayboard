@@ -6,6 +6,17 @@ import type { CredentialPort } from "./core/port.js";
 import type { OpenCodeEnrollment } from "./approval.js";
 
 export const SIGN_IN = "reconnect or sign in using OpenCode";
+// Static mode's action for a refused or missing run token: only the launcher holds the credential (#270 D3).
+export const NEW_RUN = "the launcher must start a new run with a fresh run token";
+// Static service-credential mode (#270 D3), set only from the launcher's environment (lifecycle.ts `staticMode`):
+// the pinned issuer, or why the mode is refused. A refused mode never falls back to OAuth.
+export type StaticMode = { issuer: string } | { refused: string };
+// A static enrollment has no native integration or connection, and the run token doesn't carry its credential's
+// client ID: these stand in for them, so the enrollment hash still covers every field.
+export const STATIC_CONNECTION = "static", STATIC_CLIENT = "service-credential", STATIC_SCOPE = "grayboard:delivery grayboard:tools";
+const AUTHORITY = ["Authorization", "X-Grayboard-Identity", "X-Grayboard-Lease", "X-Grayboard-Client"];
+// A run token as the server issues it (an OAuth access token): one run of printable characters, no whitespace.
+const BEARER = /^Bearer ([\x21-\x7e]{16,512})$/;
 type Expected = Pick<OpenCodeEnrollment, "configuration" | "integrationID" | "connectionID">;
 const fingerprint = (token: string) => createHash("sha256").update(token).digest("hex");
 // A client stamps a token's `expires` when the token response arrives, so the
@@ -26,7 +37,9 @@ const CATALOG_TIMEOUT_MS = 30_000;
 // it can only make OpenCode reconnect the entry (`refresh`). `drift` latches
 // every root when the endpoint, account or grant behind an enrollment changed.
 export class Binding implements CredentialPort<OpenCodeEnrollment> {
-  constructor(readonly ctx: Context, readonly name: string, readonly drift: () => void, readonly issuer?: string) {}
+  constructor(readonly ctx: Context, readonly name: string, readonly drift: () => void, readonly issuer?: string, readonly static_?: StaticMode) {}
+  // Static mode: the resource URLs whose protected-resource metadata named the pinned issuer.
+  private readonly vouched = new Set<string>();
   // Native calls in flight in this location (by invocation ID, with their start).
   private readonly calls = new Map<string, number>();
   // The connection and stored expiry the last reconnect was for; how many reconnects; their transform.
@@ -52,12 +65,23 @@ export class Binding implements CredentialPort<OpenCodeEnrollment> {
   }
   private reconnecting?: Promise<void>;
   called(id: string) { this.calls.delete(id); }
+  // The entry this mode accepts, as the type, URL and hash an enrollment pins. OAuth mode: a native OAuth entry with
+  // no authority header. Static mode: exactly `oauth: false` and one `Authorization: Bearer <run token>`, no other
+  // authority header; its hash covers a digest of the token, so a new run token is a new enrollment.
   private endpoint(c: ReturnType<MCPEditor["get"]>) {
-    if (!c || c.type !== "remote" || c.oauth === false || c.disabled) return;
+    if (!c || c.type !== "remote" || c.disabled) return;
     const headers = new Headers(c.headers);
-    if (["Authorization", "X-Grayboard-Identity", "X-Grayboard-Lease", "X-Grayboard-Client"].some(key => headers.has(key))) return;
     const url = new URL(c.url);
     if (url.protocol !== "https:" || url.username || url.password || url.hash || url.search) return;
+    if (this.static_) {
+      const token = this.bearer(c);
+      if (c.oauth !== false || token === undefined) return;
+      headers.delete("Authorization");
+      if (AUTHORITY.some(key => headers.has(key))) return;
+      const configHash = createHash("sha256").update(JSON.stringify(["static", url.href, [...headers.entries()].sort(), fingerprint(token)])).digest("hex");
+      return { type: "remote" as const, url: url.href, configHash };
+    }
+    if (c.oauth === false || AUTHORITY.some(key => headers.has(key))) return;
     const oauth = c.oauth || undefined;
     const configHash = createHash("sha256").update(JSON.stringify([url.href, [...headers.entries()].sort(), oauth?.client_id, oauth?.scope, oauth?.auth_server_metadata_url])).digest("hex");
     return { type: "remote" as const, url: url.href, configHash };
@@ -81,8 +105,40 @@ export class Binding implements CredentialPort<OpenCodeEnrollment> {
     let result: ReturnType<Binding["endpoint"]>;
     const observer = await this.ctx.mcp.transform(editor => { result = this.endpoint(editor.get(this.name)); });
     await observer.dispose();
-    if (!result) throw new Refusal("binding", "Configure an enabled native OAuth HTTPS MCP entry without static authority headers");
+    if (!result) throw new Refusal("binding", this.static_ ? "Configure an enabled HTTPS MCP entry with oauth: false and only an Authorization: Bearer header from the launcher's environment" : "Configure an enabled native OAuth HTTPS MCP entry without static authority headers");
     return result;
+  }
+  // Static mode: the entry's run token, from its one `Authorization: Bearer` header (OpenCode substitutes the
+  // launcher's `{env:…}` into it). Read when a wire needs it and never kept.
+  private bearer(c: ReturnType<MCPEditor["get"]>) {
+    if (!c || c.type !== "remote") return;
+    const values = Object.entries(c.headers ?? {}).filter(([key]) => key.toLowerCase() === "authorization");
+    return values.length === 1 ? BEARER.exec(values[0]![1])?.[1] : undefined;
+  }
+  private pin(): string {
+    if (!this.static_) throw new Refusal("identity", "Not in static mode");
+    if ("refused" in this.static_) throw new Refusal("identity", this.static_.refused);
+    return this.static_.issuer;
+  }
+  // Static mode has no OAuth metadata to name the issuer, so the pin is bound to the entry: same origin, and the
+  // server's protected-resource metadata (RFC 9728) names this URL and the pinned issuer. Checked before any plugin
+  // wire sends the token, so an entry a project config pointed elsewhere gets no plugin request and no whoami.
+  private async vouch(url: string) {
+    const issuer = this.pin();
+    if (this.vouched.has(url)) return issuer;
+    const resource = new URL(url);
+    if (resource.origin !== new URL(issuer).origin) throw new Refusal("identity", "Native issuer does not match the pinned issuer");
+    const response = await fetch(resource.origin + "/.well-known/oauth-protected-resource" + resource.pathname, { redirect: "error", signal: AbortSignal.timeout(10_000) });
+    const metadata = await response.json().catch(() => undefined) as { resource?: unknown; authorization_servers?: unknown } | undefined;
+    if (!response.ok || metadata?.resource !== url || !Array.isArray(metadata.authorization_servers) || !metadata.authorization_servers.includes(issuer)) throw new Refusal("identity", "Native issuer does not match the pinned issuer");
+    this.vouched.add(url);
+    return issuer;
+  }
+  private async entry() {
+    let config: ReturnType<MCPEditor["get"]>;
+    const observer = await this.ctx.mcp.transform(editor => { config = editor.get(this.name); });
+    await observer.dispose();
+    return config;
   }
   private mismatch(): never {
     this.drift();
@@ -123,11 +179,22 @@ export class Binding implements CredentialPort<OpenCodeEnrollment> {
     return { configuration: projected.configuration, integrationID: selected.integrationID, connectionID: selected.connectionID };
   }
   async capture(sessionID: string): Promise<OpenCodeEnrollment> {
+    if (this.static_) {
+      this.pin();
+      const endpoint = await this.configuration(), issuer = await this.vouch(endpoint.url);
+      return { version: 2, sessionID, mcpName: this.name, configuration: { ...endpoint, issuer, clientID: STATIC_CLIENT, scope: STATIC_SCOPE }, integrationID: STATIC_CONNECTION, connectionID: STATIC_CONNECTION };
+    }
     const captured = await this.projection();
     if (this.issuer && captured.configuration.issuer !== this.issuer) throw new Refusal("identity", "Native issuer does not match the pinned issuer");
     return { version: 2, sessionID, mcpName: this.name, ...captured };
   }
-  async check(expected: Expected) { await this.projection(expected); }
+  async check(expected: Expected) {
+    if (!this.static_) { await this.projection(expected); return; }
+    const endpoint = await this.configuration();
+    if (!same(endpoint, { type: expected.configuration.type, url: expected.configuration.url, configHash: expected.configuration.configHash })) this.mismatch();
+    if (expected.configuration.issuer !== this.pin() || expected.integrationID !== STATIC_CONNECTION || expected.connectionID !== STATIC_CONNECTION) this.mismatch();
+    await this.vouch(endpoint.url);
+  }
   // The host's current access token for `expected`, with its stored expiry.
   private async stored(expected: Expected) {
     await this.check(expected);
@@ -140,12 +207,22 @@ export class Binding implements CredentialPort<OpenCodeEnrollment> {
     return projected;
   }
   async access(expected: Expected) { return (await this.stored(expected)).access; }
-  private rejected(e: Expected) { return `rejectedAccess:${e.integrationID}:${e.connectionID}`; }
-  async token(e: OpenCodeEnrollment) {
-    const token = await this.access(e);
-    if (await this.ctx.storage.get(this.rejected(e)) === fingerprint(token)) throw new Refusal("auth", "Native access was rejected; restore native authentication before resuming");
+  // Static mode's token for `e`: the entry's current run token, once the entry still matches the enrollment.
+  private async run(e: OpenCodeEnrollment) {
+    await this.check(e);
+    const token = this.bearer(await this.entry());
+    if (token === undefined) this.mismatch();
     return token;
   }
+  private rejected(e: Expected) { return `rejectedAccess:${e.integrationID}:${e.connectionID}`; }
+  async token(e: OpenCodeEnrollment) {
+    const token = this.static_ ? await this.run(e) : await this.access(e);
+    if (await this.ctx.storage.get(this.rejected(e)) === fingerprint(token)) throw this.static_ ? this.runRefused() : new Refusal("auth", "Native access was rejected; restore native authentication before resuming");
+    return token;
+  }
+  // The Controller finds an AccessExpired through the SDK's error wrapping (a plain Refusal thrown from a 401 handler
+  // arrives wrapped and unnamed), and pauses on `login_required` with no retry and no refresh.
+  private runRefused() { return new AccessExpired("OpenCode", NEW_RUN, "login_required"); }
   // #661: OpenCode 2.1.4 refreshes a native token only when a request draws a
   // 401, so with no native call in this location it never does. A reconnect of
   // the entry makes that request: OpenCode reconnects an entry whose config
@@ -154,7 +231,8 @@ export class Binding implements CredentialPort<OpenCodeEnrollment> {
   // (untouched) and one more than it. A reconnect kills a native call in
   // flight, so it waits until there is none, and comes once per stored expiry.
   async refresh(e: OpenCodeEnrollment) {
-    if (this.busy()) return false;
+    // A run token has no host refresh: the launcher mints one per run, so there is nothing to reconnect for.
+    if (this.static_ || this.busy()) return false;
     const selected = await this.selection(e);
     const credential = await this.ctx.integration.connection.resolve(selected.connection);
     if (credential?.type !== "oauth" || credential.expires > Date.now()) return false;
@@ -188,6 +266,14 @@ export class Binding implements CredentialPort<OpenCodeEnrollment> {
   // (AccessExpired, which the Controller waits out); otherwise the server
   // rejected it, recorded so token() refuses it until native auth changes.
   async unauthorized(e: OpenCodeEnrollment, token: string) {
+    // Static mode: a 401 is terminal for the run. `login_required`, never `expired` (which waits for a host refresh
+    // and retries), and never a return (which makes the SDK retry): the token's digest is recorded, so token()
+    // refuses it before any request until the entry changes.
+    if (this.static_) {
+      await this.check(e);
+      if (token) await this.ctx.storage.set(this.rejected(e), fingerprint(token));
+      throw this.runRefused();
+    }
     const stored = await this.stored(e);
     if (token && stored.access !== token) return;
     if (stored.expires - Date.now() <= EXPIRY_SKEW_MS) throw new AccessExpired("OpenCode", SIGN_IN);

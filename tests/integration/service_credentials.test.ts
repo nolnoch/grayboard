@@ -309,7 +309,9 @@ describe("sessions", () => {
     const root = await service();
     const c = await credential(root);
     const s = await session(await token(srv.base, c));
-    expect(await s.call("whoami")).toMatchObject({ primary: `${SVC}/w-1` });
+    // principal_kind: what OpenCode V2's static mode reads before enrolling a root with no human (#270 D3).
+    expect(await s.call("whoami")).toMatchObject({ primary: `${SVC}/w-1`, principal: SVC, principal_kind: "service" });
+    expect(await (await srv.hosted(A, "fe", { delivery: false })).call("whoami")).toMatchObject({ principal: A, principal_kind: "user" });
     await s.call("board_create", { name: "svc-out", purpose: "runs" });
     await s.call("board_post", { board: "svc-out", body: "run 1 done" });
     expect(srv.app.db.query("SELECT author FROM posts WHERE body = 'run 1 done'").get()).toEqual({ author: `${SVC}/w-1` });

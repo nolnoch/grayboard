@@ -1,19 +1,48 @@
+import { readdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import type { Context } from "@opencode/plugin/promise/plugin";
 import { Controller, type Wait } from "./core/controller.js";
-import { failureCode, type DiagnosticSink } from "./core/diagnostics.js";
+import { failureCode, failureMessage, type DiagnosticSink } from "./core/diagnostics.js";
 import type { HostPort, SessionFacts } from "./core/port.js";
-import { Refusal, render } from "./core/model.js";
+import { AccessExpired, Refusal, render } from "./core/model.js";
 import { resolveRoot, type SessionPath } from "./core/sessions.js";
 import { sessionIdentity } from "./core/naming.js";
 import { NativeWire, type Wire } from "./core/wire.js";
 import { observeEvents } from "./core/events.js";
 import { Approval, type OpenCodeEnrollment } from "./approval.js";
-import { Binding, SIGN_IN } from "./binding.js";
+import { Binding, NEW_RUN, SIGN_IN, type StaticMode } from "./binding.js";
 import { Grayboard } from "./rpc.js";
 import { RootInstructions, rewrite, type Fetcher, type Plan } from "./instructions.js";
 import { attachmentTools } from "./transfer-tools.js";
 
-export type Options = { mcpName: string; issuer?: string; name?: string; create?: boolean; launcher?: boolean };
+// `static`: the service-credential mode (#270 D3), from the launcher's environment only (`staticMode`), never from
+// plugin options, which any config layer, a repository's own included, can set.
+export type Options = { mcpName: string; issuer?: string; name?: string; create?: boolean; launcher?: boolean; static?: StaticMode };
+export const STATIC_AUTH = "GRAYBOARD_OPENCODE_AUTH", STATIC_ISSUER = "GRAYBOARD_OPENCODE_ISSUER";
+// Static service-credential mode, read from the launcher's environment: `GRAYBOARD_OPENCODE_AUTH=static` turns it on
+// and `GRAYBOARD_OPENCODE_ISSUER` pins the issuer, which it requires. Unset is OAuth mode; any other value, or a
+// missing or malformed pin, is a refused static mode, never OAuth. Bun loads dotenv files from the working directory
+// into the environment at startup, so a repository's `.env` could set them: a dotenv file there that names either
+// variable refuses the mode.
+export function staticMode(env: Record<string, string | undefined>, cwd: string): StaticMode | undefined {
+  const auth = env[STATIC_AUTH];
+  if (auth === undefined || auth === "") return;
+  if (auth !== "static") return { refused: `${STATIC_AUTH} must be "static" or unset` };
+  let files: string[] = [];
+  try { files = readdirSync(cwd).filter(name => /^\.env(\..+)?$/.test(name)); } catch {}
+  const named = new RegExp(`^\\s*(export\\s+)?(${STATIC_AUTH}|${STATIC_ISSUER})\\s*=`, "m");
+  for (const file of files) {
+    let text: string;
+    try { text = readFileSync(join(cwd, file), "utf8"); } catch { return { refused: `Static mode refused: ${file} in the working directory is unreadable` }; }
+    if (named.test(text)) return { refused: `Static mode refused: ${file} in the working directory sets its variables; the launcher sets them` };
+  }
+  const issuer = env[STATIC_ISSUER];
+  if (!issuer) return { refused: `Static mode needs a pinned issuer (${STATIC_ISSUER})` };
+  let url: URL;
+  try { url = new URL(issuer); } catch { return { refused: `${STATIC_ISSUER} must be an HTTPS URL` }; }
+  if (url.protocol !== "https:" || url.username || url.password || url.search || url.hash) return { refused: `${STATIC_ISSUER} must be an HTTPS URL without credentials, query or fragment` };
+  return { issuer };
+}
 type Invocation = { tool: string; sessionID: string; id: string };
 const VERSION = "1.10.0";
 // Sessions whose model is remembered: the most recently active ones.
@@ -39,7 +68,7 @@ export function suggestion(directory: () => string): () => string | undefined {
 // session tree, native MCP grant, metadata approval and synthetic admission.
 function hostPort(ctx: Context, options: Options, binding: Binding, facts: Map<string, SessionFacts>): HostPort<OpenCodeEnrollment> {
   return {
-    harness: "OpenCode", resumeHint: "explicitly enroll again", loginAction: SIGN_IN,
+    harness: "OpenCode", resumeHint: "explicitly enroll again", loginAction: options.static ? NEW_RUN : SIGN_IN,
     sessionKey: "ai.opencode/sessionID", client: { name: "grayboard-opencode", version: VERSION },
     // Plugin option `launcher: true`, OpenCode's BUS_LAUNCHER=1 (#520): the Controller's wires declare it.
     ...(options.launcher ? { launcher: true as const } : {}),
@@ -61,7 +90,7 @@ export class OpenCodeController extends Controller<OpenCodeEnrollment> {
   readonly binding: Binding;
   constructor(readonly ctx: Context, readonly options: Options, Transport?: typeof Wire, wait?: Wait, sink?: DiagnosticSink) {
     const latch = { drift: (_message: string) => {} };
-    const binding = new Binding(ctx, options.mcpName, () => latch.drift("Native binding changed; explicitly enroll again"), options.issuer);
+    const binding = new Binding(ctx, options.mcpName, () => latch.drift("Native binding changed; explicitly enroll again"), options.issuer, options.static);
     const facts = new Map<string, SessionFacts>();
     super(hostPort(ctx, options, binding, facts), { Transport, wait, sink, knownRoot: OPENCODE_SESSION, ...(options.name ? { configured: { name: options.name, create: options.create === true } } : {}) });
     latch.drift = message => this.drift(message);
@@ -153,6 +182,7 @@ export class OpenCodeController extends Controller<OpenCodeEnrollment> {
         const path = await this.childRoot(id);
         if (path && this.enrollment(path.root)) this.childCreated?.(path);
         await this.configuredBind(id);
+        await this.serviceEnroll(id);
       }
     }
     if (type === "credential.switched") {
@@ -162,6 +192,25 @@ export class OpenCodeController extends Controller<OpenCodeEnrollment> {
     if (type === "session.deleted" || type === "session.archived") {
       const id = (data as { sessionID?: string })?.sessionID;
       if (id) { this.sessionEnded?.(id); await this.ended(id); }
+    }
+  }
+  // Static mode (#270 D3): a new root enrolls with no `/grayboard-enroll` once the pinned issuer vouches for the
+  // entry (Binding.capture) and the server's whoami says the run token's principal is a service. Not an agent
+  // approving itself (principle 10): the launcher set the mode, the pin and the token, and the kind is the
+  // server's, which a user's token can't claim. Grayboard starts nothing here (principle 7): the launcher started
+  // this OpenCode and its session; enrollment only lets the server deliver to it.
+  async serviceEnroll(sessionID: string) {
+    if (this.stopped || !this.options.static) return;
+    try {
+      if ((await this.port.ancestry(sessionID)).root !== sessionID) return;
+      const kind = await principalKind(this, await this.binding.capture(sessionID));
+      if (kind !== "service") {
+        this.record({ state: "unenrolled", sessionID, message: "Static mode enrolls a root by itself only for a service run token; the server did not report one, so enroll explicitly", operation: "enroll", code: "refused" });
+        return;
+      }
+      await this.enroll(sessionID);
+    } catch (error) {
+      this.record({ state: "unenrolled", sessionID, message: error instanceof Refusal && !(error instanceof AccessExpired) ? error.message : failureMessage(error, this.port.resumeHint), operation: "enroll", code: failureCode(error) });
     }
   }
   async enrollmentFailure(sessionID: string) {
@@ -203,6 +252,25 @@ export function nativeFetcher(controller: OpenCodeController): Fetcher {
   };
 }
 
+// The run token's principal kind (`whoami`'s `principal_kind`), asked with no session key so the question starts no
+// hosted session: a token that turns out to be a user's leaves nothing behind on the server.
+export async function principalKind(controller: OpenCodeController, e: OpenCodeEnrollment): Promise<string | undefined> {
+  let current: string | undefined;
+  const port = controller.port;
+  const wire = new NativeWire({ url: e.configuration.url, sessionKey: port.sessionKey, client: port.client }, {
+    token: async () => (current = await controller.binding.token(e)),
+    onUnauthorized: async () => controller.binding.unauthorized(e, current ?? ""),
+  }, AbortSignal.timeout(10_000));
+  await wire.connect();
+  try {
+    const result = await wire.client.callTool({ name: "whoami", arguments: {} }, wire.options());
+    const content = result.content as { type?: string; text?: string }[] | undefined;
+    const value = result.structuredContent ?? (content?.length === 1 && content[0]?.type === "text" ? JSON.parse(content[0].text ?? "null") : undefined);
+    const kind = result.isError ? undefined : (value as { principal_kind?: unknown } | undefined)?.principal_kind;
+    return typeof kind === "string" ? kind : undefined;
+  } finally { await wire.close().catch(() => {}); }
+}
+
 // A root's record whose state, holds or ownership changed: what its server
 // instructions describe may have changed with it (#531).
 // `forget` drops an ended session's last shape (#538), but an ended root's own
@@ -224,14 +292,21 @@ export function watchRoots(sink: DiagnosticSink, changed: (sessionID: string) =>
 }
 
 export type Debug = (message: string, fields: Record<string, unknown>) => void;
-export async function setup(ctx: Context, sink: DiagnosticSink, debug: Debug = () => {}, fetcher?: Fetcher) {
-  const options: Options = {
-    mcpName: typeof ctx.options.mcpName === "string" ? ctx.options.mcpName : "grayboard",
-    issuer: typeof ctx.options.issuer === "string" ? ctx.options.issuer : "",
-    name: typeof ctx.options.name === "string" ? ctx.options.name : undefined,
-    create: ctx.options.create === true,
-    launcher: ctx.options.launcher === true,
+// The plugin's options: OpenCode's plugin options (any config layer, a repository's included) for everything but
+// static mode, which only the launcher's environment sets (`staticMode`); no plugin option is read for it.
+export function pluginOptions(input: Context["options"], env: Record<string, string | undefined>, cwd: string): Options {
+  const static_ = staticMode(env, cwd);
+  return {
+    ...(static_ ? { static: static_ } : {}),
+    mcpName: typeof input.mcpName === "string" ? input.mcpName : "grayboard",
+    issuer: typeof input.issuer === "string" ? input.issuer : "",
+    name: typeof input.name === "string" ? input.name : undefined,
+    create: input.create === true,
+    launcher: input.launcher === true,
   };
+}
+export async function setup(ctx: Context, sink: DiagnosticSink, debug: Debug = () => {}, fetcher?: Fetcher, env: Record<string, string | undefined> = process.env, cwd = process.cwd()) {
+  const options = pluginOptions(ctx.options, env, cwd);
   let instructions: RootInstructions | undefined;
   const watched = watchRoots(sink, id => instructions?.invalidate(id));
   const controller = new OpenCodeController(ctx, options, undefined, undefined, watched);
