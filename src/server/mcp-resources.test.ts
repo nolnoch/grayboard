@@ -262,7 +262,11 @@ for (const version of MCP_PROTOCOL_VERSIONS) for (const stop of ["access", "abor
     await closing;
     if (stop === "close") await client.close();
     const result = await pending;
-    if (stop === "access") expect(result).toMatchObject({ isError: true });
+    // A revoke past admission answers the exchange's 401, not a tool error (#1312), where the response waits for the
+    // result; a legacy session's SSE response returned before it, so its refusal stays the tool's. An abort or a
+    // hosted close (the bearer still live) never answers 401.
+    if (stop === "access") expect(result).toMatchObject(version === "2026-07-28" ? { name: "SdkHttpError", status: 401 } : { isError: true });
+    else expect((result as { status?: number }).status).not.toBe(401);
     await Bun.sleep(0);
     expect(hosted.activeLeases).toBe(0);
     expect(hosted.activeContexts).toBe(hosted.activeGetStreams);
