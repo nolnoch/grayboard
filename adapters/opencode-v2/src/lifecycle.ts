@@ -1,16 +1,17 @@
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Context } from "@opencode/plugin/promise/plugin";
+import { SdkHttpError } from "@modelcontextprotocol/client";
 import { Controller, type Wait } from "./core/controller.js";
 import { failureCode, failureMessage, type DiagnosticSink } from "./core/diagnostics.js";
 import type { HostPort, SessionFacts } from "./core/port.js";
 import { AccessExpired, Refusal, render } from "./core/model.js";
 import { resolveRoot, type SessionPath } from "./core/sessions.js";
 import { sessionIdentity } from "./core/naming.js";
-import { NativeWire, unreachable, type Wire } from "./core/wire.js";
+import { NativeWire, subscriberError, unreachable, type Wire } from "./core/wire.js";
 import { observeEvents } from "./core/events.js";
 import { Approval, type OpenCodeEnrollment } from "./approval.js";
-import { Binding, NEW_RUN, SIGN_IN, type StaticMode } from "./binding.js";
+import { Binding, NEW_RUN, SIGN_IN, timedOut, type StaticMode } from "./binding.js";
 import { Grayboard } from "./rpc.js";
 import { RootInstructions, rewrite, type Fetcher, type Plan } from "./instructions.js";
 import { attachmentTools } from "./transfer-tools.js";
@@ -94,10 +95,11 @@ function hostPort(ctx: Context, options: Options, binding: Binding, facts: Map<s
 const ENROLL_RETRY_FIRST_MS = 250, ENROLL_RETRY_MAX_MS = 8_000, ENROLL_RETRIES = 8;
 const TRANSIENT_CODES = new Set(["server_unreachable", "rate_limited", "internal_error"]);
 // An outage, not an answer: worth another attempt. whoami's own 10 s timeout aborts its wire, which the wire then
-// leaves unclassified, so a TimeoutError anywhere in the cause chain counts too.
+// leaves unclassified, so a TimeoutError anywhere in the cause chain counts too; so does an HTTP 429 that outlasted
+// the wire's own admission retries. `rate_limited` and `internal_error` arrive as whoami's isError codes (whoami).
 function transientEnroll(error: unknown): boolean {
-  if (TRANSIENT_CODES.has(failureCode(error)) || unreachable(error)) return true;
-  for (let e = error, depth = 0; e && depth < 8; e = (e as { cause?: unknown }).cause, depth++) if ((e as { name?: unknown }).name === "TimeoutError") return true;
+  if (TRANSIENT_CODES.has(failureCode(error)) || unreachable(error) || timedOut(error)) return true;
+  for (let e = error, depth = 0; e && depth < 8; e = (e as { cause?: unknown }).cause, depth++) if (e instanceof SdkHttpError && e.status === 429) return true;
   return false;
 }
 function abortableSleep(ms: number, signal: AbortSignal): Promise<void> {
@@ -227,17 +229,21 @@ export class OpenCodeController extends Controller<OpenCodeEnrollment> {
   async serviceEnroll(sessionID: string) {
     if (this.stopped || !this.options.static) return;
     let error = await this.autoEnroll(sessionID);
+    // Close can land during the first attempt, which close doesn't wait for: nothing records after it.
+    if (this.stopped) return;
     if (error === undefined || !transientEnroll(error)) return this.enrollRefused(sessionID, error);
     const retry = (async () => {
       for (let attempt = 0; attempt < ENROLL_RETRIES && error !== undefined && transientEnroll(error); attempt++) {
-        this.record({ state: "retrying", sessionID, message: `Server unreachable; retrying auto-enroll (${attempt + 1}/${ENROLL_RETRIES})`, operation: "enroll", code: failureCode(error) });
+        this.record({ state: "retrying", sessionID, message: `Server unreachable; retrying auto-enroll (${attempt + 1}/${ENROLL_RETRIES})`, operation: "enroll", code: "server_unreachable" });
         await abortableSleep(Math.min(ENROLL_RETRY_MAX_MS, ENROLL_RETRY_FIRST_MS * 2 ** attempt), this.enrollStop.signal);
-        if (this.stopped || this.routes.isEnded(sessionID) || this.enrollment(sessionID)) return;
+        if (this.stopped || this.enrollment(sessionID)) return;
+        // A root that never enrolled has no record `ended` replaces, so its `retrying` would outlive it.
+        if (this.routes.isEnded(sessionID)) return this.record({ state: "unenrolled", sessionID, message: "Root ended before auto-enroll reached the server", operation: "enroll", code: "server_unreachable" });
         error = await this.autoEnroll(sessionID);
         if (this.stopped) return;
       }
       this.enrollRefused(sessionID, error);
-    })().finally(() => this.enrollRetries.delete(retry));
+    })().catch(() => this.backgroundFailure("enroll")).finally(() => this.enrollRetries.delete(retry));
     this.enrollRetries.add(retry);
   }
   // Static mode's retries: close ends their waits and waits them out, so none records or enrolls after it.
@@ -329,7 +335,11 @@ export async function whoami(controller: OpenCodeController, e: OpenCodeEnrollme
   try {
     const result = await wire.client.callTool({ name: "whoami", arguments: {} }, wire.options());
     const content = result.content as { type?: string; text?: string }[] | undefined;
-    const value = result.structuredContent ?? (content?.length === 1 && content[0]?.type === "text" ? JSON.parse(content[0].text ?? "null") : undefined);
+    // A tool error's code is in structuredContent (#806); its text is `error: <message>`, not JSON.
+    const value = result.structuredContent ?? (!result.isError && content?.length === 1 && content[0]?.type === "text" ? JSON.parse(content[0].text ?? "null") : undefined);
+    // The server's outage, not its answer (#1250): a rate limit or internal error throws, so auto-enroll retries it.
+    // Any other error result stands as "not a service token".
+    if (result.isError) { const refused = subscriberError(value, false); if (refused.code === "rate_limited" || refused.code === "internal_error") throw refused; }
     const fields = result.isError ? undefined : value as { principal_kind?: unknown; principal?: unknown } | undefined;
     const text = (v: unknown) => typeof v === "string" ? v : undefined;
     return { kind: text(fields?.principal_kind), principal: text(fields?.principal) };
