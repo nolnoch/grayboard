@@ -280,3 +280,27 @@ test("a refusal after a write, caught in a body that commits, leaves nothing of 
   expect(answer).toContain("attic");
   expect(claimRows()).toEqual(before);
 });
+
+// #807 P3 C5a F1: a lapsed claim whose key holds a NUL (written before keys refused it) doesn't lock out every take on
+// the server: the take's sweep and the expiry timer's announce it with U+FFFD, as core does.
+test("a lapsed NUL-key claim: an unrelated take and the timer's sweep announce it with U+FFFD, as core does", async () => {
+  const access = boardAccess(repo);
+  await seed(repo, async tx => {
+    repo.coreOn(tx).prepare(`INSERT INTO claims (key, holder, note, board, acquired_at, expires_at) VALUES (?, ?, ?, 'general', 1, 2)`).run("ticket:a\0b", `${W}/be`, "n\0te");
+  });
+  const args = { key: "ticket:unrelated" };
+  const want = await inBody(async tx => outcome(() => coreCallBoardTool(repo.coreOn(tx), `${W}/be`, "claim_take", args, wade))) as { out: { value?: unknown }; rows: { posts: { body: string }[] } };
+  const got = await inBody(tx => outcomeAsync(() => callClaimTool(repo, access, tx, `${W}/be`, "claim_take", args, wade))) as typeof want;
+  expect(diverging([["take", want, got]])).toEqual([]);
+  expect(got.out.value).toBeDefined();
+  const expired = "[expired] ticket:a�b: not released by";
+  expect(got.rows.posts.some(p => p.body.startsWith(expired))).toBe(true);
+  const now = Date.now();
+  const swept = await inBody(tx => outcomeAsync(() => sweepClaims(repo, access, tx, now))) as typeof want;
+  expect(swept.out.value).toBeDefined();
+  expect(swept.rows.posts.some(p => p.body.startsWith(expired))).toBe(true);
+  // The key and note themselves refuse at the take, before any sweep.
+  for (const [a, text] of [[{ key: "ticket:a\0b" }, "claim key contains a NUL character"], [{ key: "k", note: "a\0b" }, "claim note contains a NUL character"]] as const) {
+    await expect(repo.write(tx => callClaimTool(repo, access, tx, `${W}/be`, "claim_take", a, wade))).rejects.toThrow(text);
+  }
+});

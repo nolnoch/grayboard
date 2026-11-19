@@ -13,6 +13,7 @@ import { until } from "../../tests/support/until.ts";
 import { AppSession } from "../../tests/support/app_session.ts";
 import { scratchDbPath } from "../../tests/support/scratch_db.ts";
 import { queueFor } from "./store/queue.ts";
+import { MissingParent } from "./store/errors.ts";
 
 let store: ReturnType<typeof openDatabase>;
 let application: ReturnType<typeof createApplication>;
@@ -215,7 +216,73 @@ test("bind budget is per user and spent before an alias is created or a hold tak
   expect((await connect(bob, "fe")).session.holds).toEqual(["bob@example.com/fe"]);
 });
 
-// #807 P1c-13: attachHuman's lazy human alias (the find, then the create) runs on its write's Tx.
+// #807 P3 C5 decisions 4 and 5: on Postgres a delivery, a cursor move or a reply can commit between dm_retract's
+// pre-check and the store's delete, and a parent can go between dm_send's check and its insert. The store's answer,
+// not the pre-check, picks the refusal: each is forced here by the store method saying so.
+test("dm_retract answers the store's reason, and dm_send a missing parent the store found", async () => {
+  const a = await connect(alice, "fe");
+  const b = await connect(bob, "be");
+  b.close();
+  const sent = await a.send("bob@example.com/be", "queued");
+  const retract = () => seed(store.repo, tx => application.retract(tx, a.session, sent.message_id));
+  const id = sent.message_id;
+  for (const [reason, code, message] of [
+    ["gone", "not_found", `no message ${id} from you`],
+    ["read", "bad_request", `message ${id} already reached bob@example.com/be; send a correction instead`],
+    ["replied", "bad_request", `message ${id} has a reply in its thread; send a correction instead`],
+  ] as const) {
+    const spy = spyOn(store.repo.messages, "retract").mockResolvedValue(reason);
+    try { await expect(retract()).rejects.toMatchObject({ code, message }); } finally { spy.mockRestore(); }
+  }
+  expect(await store.repo.messages.getById(store.repo.read, id)).toBeDefined();
+  const spy = spyOn(store.repo.messages, "insert").mockRejectedValue(new MissingParent(id));
+  try {
+    await expect(a.send("bob@example.com/be", "a reply", { parent_id: id })).rejects.toMatchObject({ code: "not_found", message: `parent_id ${id} is not a message you sent or received` });
+  } finally { spy.mockRestore(); }
+  expect(await retract()).toEqual({});
+  a.close();
+});
+
+// #807 P3 C5a audit F3: on Postgres two retracts of one message by its sender can both pass the pre-check; the loser's
+// store finds it gone, and answers as a repeat of the winner's retract when the audit shows it, as the pre-check would.
+test("dm_retract whose store finds the message gone answers 'already retracted by you' when the caller's retract won", async () => {
+  const a = await connect(alice, "fe");
+  const b = await connect(bob, "be");
+  b.close();
+  const sent = await a.send("bob@example.com/be", "queued");
+  const id = sent.message_id;
+  const original = store.repo.messages.retract.bind(store.repo.messages);
+  // The racing retract commits between this call's pre-check and its store call: forced by running it in the spy.
+  const spy = spyOn(store.repo.messages, "retract").mockImplementation((async (...args: Parameters<typeof original>) => {
+    expect(await original(...args)).toBe("retracted");
+    return "gone";
+  }) as never);
+  let out: unknown;
+  try { out = await seed(store.repo, tx => application.retract(tx, a.session, id)); } finally { spy.mockRestore(); }
+  const at = store.db.query<{ at: number }, [string]>("SELECT at FROM access_log WHERE action = 'message.retracted' AND target = ?").get(`message:${id}`)!.at;
+  expect(out).toEqual({ note: `already retracted by you at ${new Date(at).toISOString()}` });
+  // Someone else's retract of it, gone, is told there's no message from them: the audit row names its sender.
+  const c = await connect(bob, "qa");
+  await expect(seed(store.repo, tx => application.retract(tx, c.session, id))).rejects.toMatchObject({ code: "not_found", message: `no message ${id} from you` });
+  c.close();
+  a.close();
+});
+
+// #807 P3 C5 decision 3: every bind runs the lazy create; on a name that exists it returns null, and the bind audits
+// no second creation.
+test("binding an existing name again creates nothing and audits no second alias.created", async () => {
+  const created = () => store.db.query<{ n: number }, [string]>("SELECT count(*) AS n FROM access_log WHERE action = 'alias.created' AND target = ?").get("alice@example.com/fe")!.n;
+  const first = await connect(alice, "fe");
+  expect(created()).toBe(1);
+  await first.unbind("fe");
+  first.close();
+  (await connect(alice, "fe")).close();
+  expect(created()).toBe(1);
+  expect((await store.repo.aliases.listForScope(store.repo.read, "person", "alice@example.com")).map(a => a.name)).toEqual(["fe"]);
+});
+
+// #807 P1c-13: attachHuman's lazy human alias runs on its write's Tx. #807 P3 C5 decision 3: the create is
+// insert-if-absent, with no find before it; a second attach's create finds it and audits nothing.
 test("#807 P1c-13: attachHuman reads and creates the human alias on its write's Tx", async () => {
   const repo = store.repo;
   const checks: string[] = [];
@@ -226,10 +293,15 @@ test("#807 P1c-13: attachHuman reads and creates the human alias on its write's 
       return original(r, ...rest);
     }) as never);
   });
+  const created = () => store.db.query<{ n: number }, []>("SELECT count(*) AS n FROM access_log WHERE action = 'alias.created'").get()!.n;
   try {
     await application.attachHuman(alice, delivery());
+    expect(created()).toBe(1);
+    application.disconnectUser(alice.user_id);
+    await application.attachHuman(alice, delivery());
   } finally { for (const spy of spies) spy.mockRestore(); }
-  expect(checks).toEqual(["find:tx", "create:tx"]);
+  expect(checks).toEqual(["create:tx", "create:tx"]);
+  expect(created()).toBe(1);
 });
 
 test("reserved human authority is a separate trusted method, never a selected client field", async () => {

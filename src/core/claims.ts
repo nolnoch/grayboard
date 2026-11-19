@@ -1,6 +1,6 @@
 import type { Database } from "bun:sqlite";
 
-import { REDELIVERED_NOTE, canSeeBoard, getBoard, normalizeBoard, post, redeliverQueuePost, seenHandles, type Viewer } from "./boards.ts";
+import { REDELIVERED_NOTE, canSeeBoard, getBoard, normalizeBoard, post, redeliverQueuePost, seenHandles, systemBody, type Viewer } from "./boards.ts";
 import { addressParts } from "./addresses.ts";
 import { idRow } from "./bindings.ts";
 import { CoreError } from "./errors.ts";
@@ -82,6 +82,8 @@ function expiresAt(now: number, minutes: number | undefined, until: string | und
 export function validKey(key: string): string {
   const k = key.trim();
   if (!k || k.length > 200) throw new CoreError("claim key must be 1-200 chars");
+  // Postgres text can't hold NUL (#807 P3 C5a F1), and a key goes into every announcement of its claim.
+  if (k.includes("\0")) throw new CoreError("claim key contains a NUL character");
   return k;
 }
 
@@ -90,6 +92,7 @@ export function validKey(key: string): string {
 export const MAX_NOTE_CHARS = 1000;
 function validNote(note: string | undefined): void {
   if (note !== undefined && note.length > MAX_NOTE_CHARS) throw new CoreError(`note must be at most ${MAX_NOTE_CHARS} chars`);
+  if (note?.includes("\0")) throw new CoreError("claim note contains a NUL character");
 }
 
 export type ClaimEvent = "take" | "renew" | "refused" | "release" | "expire";
@@ -303,7 +306,7 @@ export function expireClaims(db: Database, now: number): ClaimRow[] {
 // or expiry, ending what's already there, can (`ending`).
 function announce(db: Database, handle: string, board: string | null, text: string, ctx: ClaimCtx = {}, ending = true): ClaimChanges {
   if (!board) return { wake: [], boards: [] };
-  const result = post(db, handle, board, text, null, { author_id: ctx.session, via: ctx.via, author_user: ctx.user, allowArchived: ending });
+  const result = post(db, handle, board, systemBody(text), null, { author_id: ctx.session, via: ctx.via, author_user: ctx.user, allowArchived: ending });
   return { wake: result.wake, boards: [result.post.board] };
 }
 
@@ -369,7 +372,7 @@ function requeue(db: Database, c: ClaimRow, now: number, ctx: ClaimCtx = {}): Cl
   if (!r) return { wake: [], boards: [] };
   if ("lane" in r) return { wake: [r.lane], boards: [] };
   try {
-    const res = post(db, c.holder, r.board, unclaimedText(c.key, r.held, cc), r.postId, {
+    const res = post(db, c.holder, r.board, systemBody(unclaimedText(c.key, r.held, cc)), r.postId, {
       author_id: ctx.session, via: ctx.via, addresses: ctx.addresses, author_user: ctx.user ?? holderUser(db, c), allowArchived: true,
     });
     return { wake: res.wake, boards: [res.post.board] };

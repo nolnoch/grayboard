@@ -133,7 +133,18 @@ describe("create, list, disable, enable: audited (acceptance 1)", () => {
     const del = (name: string) => api(root, "POST", "/api/admin/services/delete-alias", { service: SVC, name });
     expect(await del("w-2")).toMatchObject({ status: 409 });
     await s.call("unbind", { name: "w-2" });
-    expect(await del("w-2")).toMatchObject({ status: 200, body: { deleted: `${SVC}/w-2` } });
+    // The name's delete lock comes before the remove (#807 P3 C5 decision 2).
+    const aliases = srv.app.repo.aliases;
+    const order: string[] = [];
+    const { lock, remove } = aliases;
+    const spies = [
+      spyOn(aliases, "lock").mockImplementation((tx, address, mode) => { order.push(`lock.${mode}:${address}`); return lock.call(aliases, tx, address, mode); }),
+      spyOn(aliases, "remove").mockImplementation((tx, address) => { order.push(`remove:${address}`); return remove.call(aliases, tx, address); }),
+    ];
+    try {
+      expect(await del("w-2")).toMatchObject({ status: 200, body: { deleted: `${SVC}/w-2` } });
+    } finally { for (const spy of spies) spy.mockRestore(); }
+    expect(order).toEqual([`lock.delete:${SVC}/w-2`, `remove:${SVC}/w-2`]);
     expect(await del("w-2")).toMatchObject({ status: 404 });
     expect(await del("human")).toMatchObject({ status: 400 });
     expect(await api(root, "POST", "/api/admin/services/delete-alias", { service: A, name: "x" })).toMatchObject({ status: 404 });

@@ -25,3 +25,11 @@ export class AuthorityLost extends Error {
     super("the role that allowed this membership change is no longer held");
   }
 }
+
+// A message insert whose parent_id names no message (#807 P3 C5 decision 5): retracted or pruned after the send's
+// check, or never there. The send answers it as the missing parent it is, never as a constraint failure.
+export class MissingParent extends Error {
+  constructor(readonly parentId: number) {
+    super(`parent_id ${parentId} is not a message you sent or received`);
+  }
+}

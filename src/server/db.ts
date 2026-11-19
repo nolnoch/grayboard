@@ -13,7 +13,7 @@ import { ackQueueClaim, addClaimWatch, claimRow, claimWatchers, expireClaims, ho
 import { addressSet, aliasUser, aliasUses, dropHold, holderOf, holdsOf, idRow, idStatuses, logBinding, unendedIds, type AliasUse, type BindingEvent, type IdRow } from "../core/bindings.ts";
 import type { AuditAction } from "./audit.ts";
 import { bindAttachments, blobNamed, dropAttachments, dropBlobEntry, dropUnsentUploads, getAttachment, insertUpload, pruneUnbound, removeUpload, unnamedBlobs, uploadDigests, withAttachments, type AttachmentRow, type BlobStore, type NewUpload, type Uploader } from "../core/attachments.ts";
-import { addressParts, type ScopeKind } from "../core/addresses.ts";
+import { addressParts } from "../core/addresses.ts";
 import { HUMAN_NAME } from "../shared/addressing.ts";
 import type { Principal } from "../core/resolver.ts";
 import { initCoreSchema } from "../core/schema.ts";
@@ -34,12 +34,17 @@ import type { CredentialSource, ServiceCredential, OAuthStore, OAuthAuthorizatio
 import { accessFits, accessLookup, BROWSER_SESSIONS, browserData, browserSessionInput, clampPair, clientLookup, codeData, codeInput, grantInput, isLogin, LIVE_SECRETS,
   loginInput, lookup, MINT_WINDOW_MS, mintInput, requestData, requestInput, REQUESTS_PER_BROWSER, REQUESTS_TOTAL, sameAuthorization, rotationBinding, secretLookup,
   serviceCredentialInput, serviceSecretInput, successorInput, time } from "./oauth-rules.ts";
-import { AuthorityLost, LastOwner, PrincipalTaken } from "./store/errors.ts";
+import { AuthorityLost, LastOwner, MissingParent, PrincipalTaken } from "./store/errors.ts";
+import type { Alias, AliasesStore } from "./store/aliases.ts";
+import type { MessageRow, MessagesStore, RetractResult } from "./store/messages.ts";
 import { DEV_SESSION_LABEL, TEAM_POLICIES, type User, type IdpSignIn, type Session, type PrincipalRow, type Team, type TeamPolicy, type TeamMember, type RoleBinding, type InvokeBinding, type RoleAuthority, type RoleRevoke, type MemberAuthority, type MemberRemoval, type ServiceRow, type UsersStore, type SessionsStore, type PrincipalsStore, type TeamsStore, type RolesStore, type ServicesStore } from "./store/identity.ts";
 // The identity groups' row types and interfaces live in store/identity.ts for the Postgres store (#807 P3 C3a);
 // re-exported for every importer.
 export { DEV_SESSION_LABEL, TEAM_POLICIES } from "./store/identity.ts";
 export type { User, IdpSignIn, Session, PrincipalRow, Team, TeamPolicy, TeamRole, TeamMember, RoleBinding, InvokeBinding, RoleAuthority, RoleGrant, RoleRevoke, MemberAuthority, MemberRemoval, RoleFilter, ServiceRow, UsersStore, SessionsStore, PrincipalsStore, TeamsStore, RolesStore, ServicesStore, JsonValue, AuditFields, IdentityGroups } from "./store/identity.ts";
+// The aliases and messages groups' row types and interfaces live in store/aliases.ts and store/messages.ts (#807 P3 C5a).
+export type { Alias, AliasTarget, AliasesStore, AliasScopeRow } from "./store/aliases.ts";
+export type { MessageRow, MessageFiles, ServicePost, RetractResult, MessagesStore } from "./store/messages.ts";
 
 // Row types
 // Every read of a user row goes through this, so `kind` is never missing (a "SELECT *" would type-check without it).
@@ -49,15 +54,6 @@ const USER_SQL = `SELECT u.id, u.email, u.display_name, u.created_at, u.disabled
   FROM users u LEFT JOIN principals p ON p.user_id = u.id AND p.kind = 'service'`;
 // A user row by id, the auth cache's read (tests count it).
 export const USER_BY_ID_SQL = `${USER_SQL} WHERE u.id = ?`;
-// An alias (#284): a name in a scope, `<scope_ref>/<name>`. A person scope's
-// ref is the user's email; a team or service scope's is the principal's name.
-export type Alias = { id: number; address: string; scope_kind: ScopeKind; scope_ref: string; name: string; created_at: number };
-// attachments: present on reads when the message carries files.
-// delivered_at: when it was handed to the recipient's harness; null until then, and for mail delivered before the column.
-// via: the child session (a harness subagent, #523) that wrote it under its root's addresses; null for a root's own write.
-export type MessageRow = { id: number; sender: string; recipient_type: "user" | "team"; recipient: string; body: string; parent_id: number | null; created_at: number; delivered_at: number | null; pending: number; kind: "bounce" | null; via: string | null; attachments?: AttachmentInfo[] };
-// A message's files: upload ids and the uploader they must belong to (#391).
-export type MessageFiles = { ids: number[]; uploader: Uploader };
 // Only a direct message's sender and recipient can see it, its thread, or
 // the files it carries. One you're not in reads as missing, so its existence
 // doesn't leak. `me`: every address the caller reads as (#284 S8).
@@ -70,8 +66,6 @@ export type SlackLink = { user_id: number; email: string; slack_user: string; dm
 // (message id for dm, post id for board). peer: the other party in a dm.
 // last_id: the newest grayboard id in the thread, the parent for a reply.
 export type SlackThread = { thread_ts: string; kind: "dm" | "board"; board: string | null; root_id: number; peer: string | null; last_id: number };
-// A post on a service's board (#270 D6): its author address, board and the board's scope.
-export type ServicePost = { author: string; board: string; scope: string };
 export type AccessLogRow = { at: number; actor: string | null; action: string; target: string | null; detail: string | null };
 // An append write's receipt (#254, src/server/write_dedup.ts): which row the
 // first call made and the result it answered, so a repeat replays it.
@@ -243,31 +237,8 @@ export interface Repo {
   // transaction they read its writes. principalOf is principals.of. SQLite only: a Postgres Repo won't have it.
   // policy.test.ts ratchets its callers.
   policyNow: PolicyReadsSync & AccessReadsSync;
-  // Names in scopes, keyed by address. Every write and read returns a promise (#807 P3 A6d, A7f3, A7g2), on the
-  // caller's handle.
-  aliases: {
-    // createdBy: the principal that made it (the binder's user for a lazy create).
-    create(tx: Tx, scope: { scope_kind: ScopeKind; scope_ref: string; name: string }, createdBy: string): Promise<Alias>;
-    find(r: Read, address: string): Promise<Alias | undefined>;
-    listForScope(r: Read, kind: ScopeKind, ref: string): Promise<Alias[]>;
-    // The scope's names less the Slack link's human, for the cap (#347).
-    countForScope(r: Read, kind: ScopeKind, ref: string): Promise<number>;
-    // Every scope's alias of this name.
-    findAllByName(r: Read, name: string): Promise<Alias[]>;
-    // When each of these addresses was last used, and the cwd or place of the
-    // session that holds or last held it (ALIAS_SESSION_SQL); unused ones are absent.
-    seen(r: Read, addresses: string[]): Promise<Map<string, { last_seen: number; cwd: string | null; place: string | null }>>;
-    // Also deletes the alias's read points.
-    remove(tx: Tx, address: string): Promise<void>;
-    // Sets or clears the handle's human mark (core markHuman: one linked user's Slack handle), touching its last_seen.
-    markHuman(tx: Tx, handle: string, human: boolean): Promise<void>;
-    // Whether the handle carries the human mark (core isHuman) (#807 P3 B5b1b2).
-    isHuman(r: Read, handle: string): Promise<boolean>;
-    // Each of addresses' scope columns (core aliasScopeRows); an address with no aliases row is absent.
-    scopesOf(r: Read, addresses: string[]): Promise<Map<string, AliasScopeRow>>;
-    // Of handles, those carrying the human mark (core humansAmong) (#807 P3 B5b2).
-    humansAmong(r: Read, handles: string[]): Promise<Set<string>>;
-  };
+  // Names in scopes, keyed by address (store/aliases.ts).
+  aliases: AliasesStore;
   // Holds, session rows and presence (#807 P3 B1): every read returns a promise on the caller's handle (B1a), and every
   // write on the caller's Tx (B1c).
   bindings: {
@@ -465,55 +436,8 @@ export interface Repo {
   teams: TeamsStore;
   roles: RolesStore;
   services: ServicesStore;
-  // Every read and write returns a promise (#807 P3 A6d2, A7i).
-  messages: {
-    // files: unbound uploads (ids) of their uploader (the sending session's
-    // address set, #284 PR 4 S5, and its user, #367), bound in the insert's
-    // transaction (a refused id throws CoreError and nothing is written);
-    // the ids and their uploader travel together, so the type requires one
-    // with the other (#391). senderId: the sending session's ID (#284); null
-    // for a writer with no session. via: the child session that wrote it
-    // (#523), else null. senderUser: the writer's signed-in user (security
-    // audit F-10), kept out of reads like sender_id.
-    insert(
-      tx: Tx, sender: string, recipientType: "user" | "team", recipient: string, body: string, parentId: number | null, pending?: boolean,
-      files?: MessageFiles, senderId?: string | null, via?: string | null, senderUser?: string | null,
-    ): Promise<MessageRow>;
-    // The writer's signed-in user of each message and post that has one
-    // recorded (rows from before F-10, bounces and system posts have none);
-    // and of each post on a service's board (#270 D6), its author address and board, which wake.service_invoke judges.
-    writerUsers(r: Read, messageIds: number[], postIds: number[]): Promise<{ messages: Map<number, string>; posts: Map<number, string>; servicePosts: Map<number, ServicePost> }>;
-    // Which of these messages `delegate` wrote: each has a delegation.requested row targeting its recipient (#256).
-    delegationIds(r: Read, messageIds: number[]): Promise<Set<number>>;
-    // The row alone, without its attachments: an access or ack check.
-    getById(r: Read, id: number): Promise<MessageRow | undefined>;
-    // The bounces an ended session's end sent (#284 decision 4): an ID ends once.
-    // since: only an end's own bounces, made at or after its time (a reopened ID can end again, #475).
-    bouncesFrom(r: Read, id: string, since?: number): Promise<MessageRow[]>;
-    // A session's direct messages, sent or received by any of its addresses
-    // (#284 S8): with peer, only those between the set and peer.
-    history(r: Read, addresses: string[], peer?: string, limit?: number, beforeId?: number): Promise<MessageRow[]>;
-    thread(r: Read, id: number): Promise<MessageRow[]>;
-    unreadSince(r: Read, streams: { type: "direct" | "team"; ref: string; since: number }[]): Promise<MessageRow[]>;
-    // Direct messages to each of recipients still past its cursor, sent by
-    // someone else; recipients with none are absent.
-    queuedTo(r: Read, recipients: string[]): Promise<Map<string, number>>;
-    // Direct messages from any of senders still past each recipient's cursor, per recipient.
-    undeliveredFrom(r: Read, senders: string[], olderThan?: number): Promise<{ recipient: string; n: number; oldest_id: number }[]>;
-    // Direct messages to any of readers since `since` that their recipient hasn't acked, oldest first.
-    receivedUnacked(r: Read, readers: string[], since: number): Promise<MessageRow[]>;
-    // Direct messages from any of senders since `since` sent pending and not acked by their sender, oldest first.
-    sentPending(r: Read, senders: string[], since: number): Promise<MessageRow[]>;
-    ack(tx: Tx, reader: string, id: number): Promise<void>;
-    // Stamps delivered_at on a direct message handed to its recipient's harness; the first stamp stands.
-    markDelivered(tx: Tx, id: number, at: number): Promise<void>;
-    // Deletes a direct message from sender that's past the recipient's cursor
-    // and has no reply. False if any of that doesn't hold. Audited as
-    // message.retracted in the delete's transaction (#306), as local's
-    // retractMessage is, so every caller writes the row a repeat is answered from.
-    retract(tx: Tx, sender: string, id: number, by: { actor: string | null; session: string | null }): Promise<boolean>;
-    prune(tx: Tx, olderThanMs: number): Promise<void>;
-  };
+  // Direct and team messages (store/messages.ts).
+  messages: MessagesStore;
   // The connection a handle resolves to, for core helpers that take a `db` (#807 P1c-15b; D1 keeps core's signatures until
   // P3 forks it): a body's `Tx` inside one, `repo.read` outside. Resolved at the call, so a settled `Tx` is refused there.
   coreOn(h: Read): CoreDb;
@@ -622,12 +546,14 @@ export const SENT_PENDING_SQL = `SELECT ${M_MSG_COLS} FROM messages m
               AND NOT EXISTS (SELECT 1 FROM dm_acks a WHERE a.reader = m.sender AND a.message_id = m.id)
             ORDER BY m.id ASC`;
 
-// retract: the sender's message, still unread and unanswered. Exported for
-// the same EXPLAIN pin.
-export const RETRACTABLE_SQL = `SELECT recipient FROM messages WHERE id = ? AND sender = ? AND recipient_type = 'user'
-               AND id > COALESCE((SELECT last_seen_id FROM mailbox_cursors
-                                   WHERE address = messages.recipient AND stream_type = 'direct' AND stream_ref = messages.recipient), 0) AND delivered_at IS NULL
-               AND NOT EXISTS (SELECT 1 FROM messages r WHERE r.parent_id = messages.id)`;
+// retract: the sender's direct message, with what decides whether it may go: delivered or past the recipient's
+// cursor (read), and whether it has a reply (#807 P3 C5 decision 4: the store says which). Exported for the same
+// EXPLAIN pin.
+export const RETRACTABLE_SQL = `SELECT recipient,
+               delivered_at IS NOT NULL OR id <= COALESCE((SELECT last_seen_id FROM mailbox_cursors
+                                   WHERE address = messages.recipient AND stream_type = 'direct' AND stream_ref = messages.recipient), 0) AS read,
+               EXISTS (SELECT 1 FROM messages r WHERE r.parent_id = messages.id) AS replied
+               FROM messages WHERE id = ? AND sender = ? AND recipient_type = 'user'`;
 
 // audit.last: the newest row for (action, target), searched by idx_access_log_action_target (#295).
 export const ACCESS_LOG_LAST_SQL = `SELECT at, actor, action, target, detail FROM access_log WHERE action = ? AND target = ? ORDER BY at DESC, id DESC LIMIT 1`;
@@ -1577,15 +1503,19 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
     },
 
     aliases: {
+      // Insert-if-absent (#807 P3 C5 decision 3): an existing address returns no row, and the body goes on.
       async create(tx, scope, createdBy) {
         const db = sqliteOf(tx);
         const { scope_kind, scope_ref, name } = scope;
         return db.query<Alias, [string, string, string, string, string, number]>(
           `INSERT INTO aliases (address, scope_kind, scope_ref, name, created_by_principal, created_at)
-           VALUES (?, ?, ?, ?, ?, ?) RETURNING ${ALIAS_COLS}`,
-        ).get(`${scope_ref}/${name}`, scope_kind, scope_ref, name, createdBy, clock())!;
+           VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (address) DO NOTHING RETURNING ${ALIAS_COLS}`,
+        ).get(`${scope_ref}/${name}`, scope_kind, scope_ref, name, createdBy, clock()) ?? null;
       },
       find: async (r, address) => aliasAt(sqliteOf(r), address),
+      // The single writer is the lock: nothing else writes until the body commits.
+      lock: async (tx, address) => aliasAt(sqliteOf(tx), address),
+      lockScope: async (tx) => { sqliteOf(tx); },
       async listForScope(r, kind, ref) {
         return sqliteOf(r).query<Alias, [string, string]>(
           `SELECT ${ALIAS_COLS} FROM aliases WHERE scope_ref = ? AND scope_kind = ? ORDER BY name`,
@@ -1932,6 +1862,8 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       async insert(tx, sender, recipientType, recipient, body, parentId, pending = false, files, senderId = null, via = null, senderUser = null) {
         const db = sqliteOf(tx);
         return db.transaction(() => {
+          // Before the insert, as Postgres's classified foreign-key failure refuses it (#807 P3 C5 decision 5).
+          if (parentId !== null && !db.query<{ id: number }, [number]>("SELECT id FROM messages WHERE id = ?").get(parentId)) throw new MissingParent(parentId);
           const row = db.query<MessageRow, [string, string | null, string, string, string, number | null, number, number, string | null, string | null]>(
             `INSERT INTO messages (sender, sender_id, recipient_type, recipient, body, parent_id, created_at, pending, via, sender_user)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING ${MSG_COLS}`,
@@ -2059,24 +1991,27 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
           SENT_PENDING_SQL,
         ).all(JSON.stringify(senders), since));
       },
+      // Only a message that exists: an ack never outlives a retract (Postgres locks the message: FOR KEY SHARE).
       async ack(tx, reader, id) {
-        sqliteOf(tx).run("INSERT OR IGNORE INTO dm_acks (reader, message_id, acked_at) VALUES (?, ?, ?)", [reader, id, clock()]);
+        sqliteOf(tx).run("INSERT OR IGNORE INTO dm_acks (reader, message_id, acked_at) SELECT ?, id, ? FROM messages WHERE id = ?", [reader, clock(), id]);
       },
       async markDelivered(tx, id, at) {
         sqliteOf(tx).run("UPDATE messages SET delivered_at = ? WHERE id = ? AND delivered_at IS NULL", [at, id]);
       },
       async retract(tx, sender, id, by) {
         const db = sqliteOf(tx);
-        return db.transaction(() => {
-          const retractable = db.query<{ recipient: string }, [number, string]>(
+        return db.transaction((): RetractResult => {
+          const m = db.query<{ recipient: string; read: number; replied: number }, [number, string]>(
             RETRACTABLE_SQL,
           ).get(id, sender);
-          if (!retractable) return false;
+          if (!m) return "gone";
+          if (m.read) return "read";
+          if (m.replied) return "replied";
           dropAttachments(db, "message", "?", id);
           db.run("DELETE FROM messages WHERE id = ?", [id]);
           db.run("DELETE FROM dm_acks WHERE message_id = ?", [id]);
-          insertAudit(db, clock(), by.actor, "message.retracted", `message:${id}`, JSON.stringify({ message_id: id, sender, recipient: retractable.recipient, session: by.session }));
-          return true;
+          insertAudit(db, clock(), by.actor, "message.retracted", `message:${id}`, JSON.stringify({ message_id: id, sender, recipient: m.recipient, session: by.session }));
+          return "retracted";
         })();
       },
       async prune(tx, olderThanMs) {

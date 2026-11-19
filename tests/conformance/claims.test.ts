@@ -64,6 +64,20 @@ conformance("claims", [
     },
   },
   {
+    // #807 P3 C5a F1: a key or note goes into every announcement of its claim, and Postgres text can't hold NUL.
+    name: "a NUL in a claim key or note is refused, and nothing is taken or posted",
+    peers: ["be", "fe"],
+    async run(ctx) {
+      const { refused, peers } = ctx;
+      await workBoard(ctx);
+      expect(refused(await peers.be!.call("claim_take", { key: "ticket:a\u0000b", board: "work" }), "bad_request").text).toContain("claim key contains a NUL character");
+      expect(refused(await peers.be!.call("claim_take", { key: KEY, board: "work", note: "a\u0000b" }), "bad_request").text).toContain("claim note contains a NUL character");
+      expect(refused(await peers.be!.call("claim_release", { key: KEY, note: "a\u0000b" }), "bad_request").text).toContain("claim note contains a NUL character");
+      expect(await listed(ctx, "be")).toEqual([]);
+      expect(await bodies(ctx, "be", "work")).toEqual([]);
+    },
+  },
+  {
     name: "a renew with a new note announces [update] and cc's the watchers; the same note posts nothing",
     peers: ["be", "fe"],
     async run(ctx) {

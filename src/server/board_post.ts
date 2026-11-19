@@ -2,7 +2,7 @@
 // the caller's Tx, judged by the async BoardAccess on that same Tx. Every rule is core's (postGateRule, postPreChecks,
 // planPostTargets, orderLanes, boardPostResult), so local and the server answer alike and only the reads differ.
 import {
-  mentionTokens, needsRotation, orderLanes, planPostTargets, postBranch, postGateRule, postPreChecks, postWakes, seenScopeOf,
+  mentionTokens, needsRotation, orderLanes, planPostTargets, postBranch, postGateRule, postPreChecks, postWakes, seenScopeOf, systemBody,
   type Board, type PostGate, type PostTargetFacts,
 } from "../core/boards.ts";
 import { CoreError } from "../core/errors.ts";
@@ -143,9 +143,10 @@ export async function systemPost(
   o: { allowArchived: boolean; session?: string; via?: string; user?: string; addresses?: string[] },
 ): Promise<{ wake: string[]; boards: string[]; postId: number }> {
   const { board: b, gate } = await postGateOn(repo, access, tx, actor, board, parentId, o.allowArchived);
-  postPreChecks(b.name, body, gate.announcement, {});
+  const text = systemBody(body);
+  postPreChecks(b.name, text, gate.announcement, {});
   const { post, out } = await writePost(repo, access, tx, actor, b, gate, {
-    body, parentId, strict: false, addresses: o.addresses, session: o.session, via: o.via, user: o.user,
+    body: text, parentId, strict: false, addresses: o.addresses, session: o.session, via: o.via, user: o.user,
   });
   return { wake: out.wake, boards: [post.board], postId: post.id };
 }
