@@ -283,8 +283,8 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     const role = hostedRole(request);
     const principal = await oauth.authenticate(request, roleScopes(role));
     if (principal instanceof Response) {
-      // A close or abort while held here must not answer this 401: the fetch catch's guard alone keeps it off a
-      // closing server or a cancelled request, so a restart never reads as a sign-out (#1332).
+      // Tests hold a refused call here to pin the fetch catch's guard: it keeps this stored 401 off a closing
+      // server or a cancelled request, whenever either happens, so a restart never reads as a sign-out (#1332).
       await testPauseAsync("mcp:select:refused");
       return refuse(principal);
     }
