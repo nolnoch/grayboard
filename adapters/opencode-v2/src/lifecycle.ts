@@ -19,25 +19,29 @@ import { attachmentTools } from "./transfer-tools.js";
 // `static`: the service-credential mode (#270 D3), from the launcher's environment only (`staticMode`), never from
 // plugin options, which any config layer, a repository's own included, can set.
 export type Options = { mcpName: string; issuer?: string; name?: string; create?: boolean; launcher?: boolean; static?: StaticMode };
-export const STATIC_AUTH = "GRAYBOARD_AUTH", STATIC_ISSUER = "GRAYBOARD_ISSUER", STATIC_PRINCIPAL = "GRAYBOARD_PRINCIPAL";
+export const STATIC_AUTH = "GRAYBOARD_AUTH", STATIC_ISSUER = "GRAYBOARD_ISSUER", STATIC_PRINCIPAL = "GRAYBOARD_PRINCIPAL", RUN_TOKEN = "GRAYBOARD_RUN_TOKEN";
 // Static service-credential mode, read from the launcher's environment: `GRAYBOARD_AUTH=static` turns it on
-// and `GRAYBOARD_ISSUER` pins the issuer, which it requires. Unset is OAuth mode; any other value, or a
-// missing or malformed pin, is a refused static mode, never OAuth. Bun loads dotenv files from the working directory
-// into the environment at startup, so a repository's `.env` could set them: a dotenv file there that names either
-// variable refuses the mode. `GRAYBOARD_PRINCIPAL`, optional, names the service whose run token may
-// auto-enroll a root (whoami's `principal`, #270 audit F3); unset, any service's may.
+// and `GRAYBOARD_ISSUER` pins the issuer, which it requires. Unset is OAuth mode; any other value, a missing or
+// malformed pin, or a run token (`GRAYBOARD_RUN_TOKEN`, which the launcher's entry substitutes) set without the mode
+// is a refused static mode, never OAuth: the same rule and text as hosted core's (#1313). Bun loads dotenv files from
+// the working directory into the environment at startup, so a repository's `.env` could set them: a dotenv file there
+// that names any of the four variables refuses the mode. `GRAYBOARD_PRINCIPAL`, optional, names the service whose run
+// token may auto-enroll a root (whoami's `principal`, #270 audit F3); unset, any service's may.
 export function staticMode(env: Record<string, string | undefined>, cwd: string): StaticMode | undefined {
   const auth = env[STATIC_AUTH];
-  if (auth === undefined || auth === "") return;
-  if (auth !== "static") return { refused: `${STATIC_AUTH} must be "static" or unset` };
+  if ((auth === undefined || auth === "") && !env[RUN_TOKEN]) return;
+  // The repository first, so a file that set the token alone is named.
   let files: string[] = [];
   try { files = readdirSync(cwd).filter(name => /^\.env(\..+)?$/.test(name)); } catch {}
-  const named = new RegExp(`^\\s*(export\\s+)?(${STATIC_AUTH}|${STATIC_ISSUER}|${STATIC_PRINCIPAL})\\s*=`, "m");
+  // Every separator and prefix Bun's dotenv parser takes: `=` or `:`, an optional `export`.
+  const named = new RegExp(`^\\s*(export\\s+)?(${STATIC_AUTH}|${STATIC_ISSUER}|${STATIC_PRINCIPAL}|${RUN_TOKEN})\\s*[=:]`, "m");
   for (const file of files) {
     let text: string;
     try { text = readFileSync(join(cwd, file), "utf8"); } catch { return { refused: `Static mode refused: ${file} in the working directory is unreadable` }; }
     if (named.test(text)) return { refused: `Static mode refused: ${file} in the working directory sets its variables; the launcher sets them` };
   }
+  if (auth === undefined || auth === "") return { refused: `${RUN_TOKEN} is set without ${STATIC_AUTH}=static` };
+  if (auth !== "static") return { refused: `${STATIC_AUTH} must be "static" or unset` };
   const issuer = env[STATIC_ISSUER];
   if (!issuer) return { refused: `Static mode needs a pinned issuer (${STATIC_ISSUER})` };
   let url: URL;

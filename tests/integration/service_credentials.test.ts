@@ -80,7 +80,7 @@ async function credential(root: string, body: Record<string, unknown> = {}): Pro
   expect(r.status, JSON.stringify(r.body)).toBe(201);
   return r.body as Credential;
 }
-const session = (t: string | (() => Promise<string>), identity: string | null = "w-1", opts: { sessionId?: string; sessionKey?: string } = {}) =>
+const session = (t: string | (() => Promise<string>), identity: string | null = "w-1", opts: { sessionId?: string; sessionKey?: string; clientName?: string } = {}) =>
   open(new HostedSession(`${srv.base}/mcp`, typeof t === "string" ? t : "", identity, { delivery: false, ...opts, ...(typeof t === "string" ? {} : { token: t }) }));
 const refused = async (p: Promise<unknown>) => { await expect(p).rejects.toThrow(); };
 
@@ -473,7 +473,36 @@ describe("sessions", () => {
     const harness = (sid: string) => (srv.app.db.query("SELECT harness FROM ids WHERE id = ?").get(sid) as { harness: string | null } | null)?.harness;
     const svcId = (srv.app.db.query("SELECT id FROM users WHERE email = ?").get(SVC) as { id: number }).id;
     expect(harness(hostedSessionId(svcId, o.client_id, os.sessionId))).toBe("opencode");
-    expect(harness(hostedSessionId(svcId, c.client_id, s.sessionId))).not.toBe("opencode");
+    // HostedSession's wire declares grayboard-pi, which a generic credential's session shows (#1298).
+    expect(harness(hostedSessionId(svcId, c.client_id, s.sessionId))).toBe("pi");
+  });
+
+  test("a generic credential's session shows the built-in harness its client info declares; anything else shows svc_, and a person's client keeps its own (#1298)", async () => {
+    const root = await service();
+    const c = await credential(root);
+    const declaring = async (name: string, identity: string) => session(await token(srv.base, c), identity, { clientName: name });
+    const pi = await declaring("grayboard-pi", "w-pi");
+    await declaring("grayboard-omp", "w-omp");
+    await declaring("grayboard-claude-code", "w-cc");
+    // Bounded to the built-in client IDs: an unknown name, or a bare harness name, is no declaration.
+    await declaring("evil-harness", "w-x");
+    await declaring("pi", "w-bare");
+    type Peers = { peers: { handle: string; harness?: string }[] };
+    const harnesses = (r: Peers) => Object.fromEntries(r.peers.filter(p => p.handle.startsWith(`${SVC}/`)).map(p => [p.handle, p.harness]));
+    expect(harnesses(await pi.call("peer_list", { include_offline: true }) as Peers)).toEqual({
+      [`${SVC}/w-pi`]: "pi", [`${SVC}/w-omp`]: "omp", [`${SVC}/w-cc`]: "claude-code", [`${SVC}/w-x`]: c.client_id, [`${SVC}/w-bare`]: c.client_id,
+    });
+    for (const [harness, handle] of [["pi", "w-pi"], ["omp", "w-omp"], ["claude-code", "w-cc"]]) {
+      const found = (await pi.call("peer_list", { include_offline: true, match: { harness } }) as Peers).peers.map(p => p.handle);
+      expect(found).toEqual([`${SVC}/${handle}`]);
+    }
+    // A child registered under the declaring root shows the same harness.
+    await pi.subscriber.call("session_register", { child: "sub-1" });
+    const svcId = (srv.app.db.query("SELECT id FROM users WHERE email = ?").get(SVC) as { id: number }).id;
+    expect(srv.app.db.query("SELECT harness FROM ids WHERE id = ?").get(hostedSessionId(svcId, c.client_id, "sub-1"))).toEqual({ harness: "pi" });
+    // A person's built-in client declaring another built-in keeps its mapped harness: only a generic credential's declaration is read.
+    await srv.hosted(A, "fe", { delivery: false, clientName: "grayboard-omp" });
+    expect(srv.app.db.query("SELECT harness FROM ids WHERE principal = ?").all(A)).toEqual([{ harness: "pi" }]);
   });
 
   test("revoking the credential ends its live sessions in the revoke's transaction, and its next call and mint are refused (criterion 3)", async () => {

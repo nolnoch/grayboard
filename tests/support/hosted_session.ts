@@ -36,6 +36,8 @@ export type HostedOptions = {
   token?: () => Promise<string>;
   // The _meta key its session ID travels under; default grayboard's (a credential of source opencode reads opencode's).
   sessionKey?: string;
+  // The MCP client info name its wires declare; default HOSTED_CLIENT (a service session's harness label reads it, #1298).
+  clientName?: string;
 };
 
 // One item of the lease's inbox: { id, actionable, event } and the lease
@@ -103,7 +105,7 @@ export class HostedSession {
     private readonly identity: string | null,
     private readonly opts: HostedOptions = {},
   ) {
-    const client = HOSTED_CLIENT;
+    const client = opts.clientName ?? HOSTED_CLIENT;
     this.sessionId = opts.sessionId ?? `test-${randomBytes(8).toString("hex")}`;
     const options: WireOptions = { url, sessionKey: opts.sessionKey ?? GRAYBOARD_SESSION_META, client: { name: client, version: "1.0.0" }, delivery: { mode: "push", source: client } };
     const auth = { token: opts.token ?? (async () => token) };

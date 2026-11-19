@@ -7,6 +7,9 @@
 // stream; a user holding service_invoke posts a work item and another session of
 // the service sends it a DM; the example takes both from the stream, receipts
 // them, replies in the item's thread, dm_acks the DM, ends and revokes its token.
+// The same run with only GRAYBOARD_RUN_TOKEN, as a launcher hands a static
+// service run token to a process (#1313): no credential, so no mint and no
+// revoke, and the token still works afterwards.
 // Asserted on server state, not the example's output. Cargo isn't on dev boxes or
 // in the pre-push hook, so this runs only when GRAYBOARD_RUST_EXAMPLE names the
 // built example; `scripts/e2e.sh rust-sdk` builds it and sets it.
@@ -30,7 +33,7 @@ afterEach(async () => {
   await srv?.stop();
 });
 
-test.skipIf(!example)("the Rust roundtrip example mints its own token as a service and works a queue item and a DM from its delivery stream", async () => {
+async function roundtrip(auth: "credentials" | "static") {
   expect(existsSync(example!)).toBe(true);
   srv = hostedServer({ admins: [ROOT] }, EMAIL);
   const s = srv;
@@ -51,28 +54,36 @@ test.skipIf(!example)("the Rust roundtrip example mints its own token as a servi
   await admin("/api/admin/roles/grant", { role: "service_invoke", principal: EMAIL, scope: SVC });
 
   // The service's other session creates its queue board (so the board is the service's) and later sends the DM.
-  const minted = await fetch(`${s.base}/oauth/token`, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded", Authorization: `Basic ${btoa(`${other.client_id}:${other.client_secret}`)}` },
-    body: new URLSearchParams({ grant_type: "client_credentials" }),
-  });
-  expect(minted.status).toBe(200);
-  const svcPeer = new HostedSession(`${s.base}/mcp`, ((await minted.json()) as { access_token: string }).access_token, "w-0", { delivery: false });
+  const mint = async (c: Record<string, any>) => {
+    const minted = await fetch(`${s.base}/oauth/token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded", Authorization: `Basic ${btoa(`${c.client_id}:${c.client_secret}`)}` },
+      body: new URLSearchParams({ grant_type: "client_credentials" }),
+    });
+    expect(minted.status).toBe(200);
+    return ((await minted.json()) as { access_token: string }).access_token;
+  };
+  const svcPeer = new HostedSession(`${s.base}/mcp`, await mint(other), "w-0", { delivery: false });
   sessions.push(svcPeer);
   await svcPeer.connect();
   await svcPeer.call("board_create", { name: "work", purpose: "rust sdk queue", kind: "queue" });
   const invoker = await s.hosted(EMAIL, "ts-peer");
 
-  const env: Record<string, string | undefined> = { ...process.env, GRAYBOARD_URL: s.resource, GRAYBOARD_ISSUER: s.issuer, GRAYBOARD_CLIENT_ID: rust.client_id, GRAYBOARD_CLIENT_SECRET: rust.client_secret, GRAYBOARD_SESSION: SESSION };
-  delete env.GRAYBOARD_RUN_TOKEN;
+  const env: Record<string, string | undefined> = { ...process.env, GRAYBOARD_URL: s.resource, GRAYBOARD_SESSION: SESSION };
+  for (const name of ["GRAYBOARD_ISSUER", "GRAYBOARD_CLIENT_ID", "GRAYBOARD_CLIENT_SECRET", "GRAYBOARD_RUN_TOKEN", "GRAYBOARD_TOKEN"]) delete env[name];
+  // The launcher's static run token, minted with the example's credential, which the example itself never sees.
+  if (auth === "static") env.GRAYBOARD_RUN_TOKEN = await mint(rust);
+  else Object.assign(env, { GRAYBOARD_ISSUER: s.issuer, GRAYBOARD_CLIENT_ID: rust.client_id, GRAYBOARD_CLIENT_SECRET: rust.client_secret });
   const run = Bun.spawn([example!, "w-1", "work"], { env, stdout: "pipe", stderr: "pipe" });
   const killer = setTimeout(() => run.kill(), 60_000);
   const output = Promise.all([run.exited, new Response(run.stdout).text(), new Response(run.stderr).text()]);
 
   // Post only once the Rust session is subscribed and holds an open lease, so the item reaches it through its stream.
   // Its session ID arrived under the generic key (the credential's source) and its grant is the example's credential.
-  await until(() => rows(`SELECT 1 FROM subscriptions WHERE board = 'work' AND handle = ? AND mode = 'push'`, RUST).length === 1
+  // An example that exited early (a missing variable, a refused token) fails here with its exit code and stderr.
+  await until(() => run.exitCode !== null || rows(`SELECT 1 FROM subscriptions WHERE board = 'work' AND handle = ? AND mode = 'push'`, RUST).length === 1
     && rows(`SELECT 1 FROM hosted_sessions WHERE source_session_id = ? AND client_id = ? AND lease_deadline IS NOT NULL`, SESSION, rust.client_id).length === 1, 30_000, "the Rust session subscribed with an open lease");
+  if (run.exitCode !== null) { const [code, out, err] = await output; expect({ code, out, err }).toBeUndefined(); }
   const posted = await invoker.call<{ post_id: number }>("board_post", { board: "work", body: "work item" });
   const key = `queue:work:${posted.post_id}`;
   expect(rows(`SELECT holder FROM claims WHERE key = ?`, key)).toEqual([{ holder: RUST }]);
@@ -82,7 +93,8 @@ test.skipIf(!example)("the Rust roundtrip example mints its own token as a servi
   clearTimeout(killer);
   expect({ code, err }).toEqual({ code: 0, err: "" });
   expect(out).toContain(`acked ${sent.message_id}`);
-  expect(out).toContain("revoked the run token");
+  if (auth === "credentials") expect(out).toContain("revoked the run token");
+  else expect(out).not.toContain("revoked");
   expect(out).not.toContain(rust.client_secret);
 
   // The reply is in the item's thread, written as the service's name, and released the queue claim.
@@ -92,8 +104,13 @@ test.skipIf(!example)("the Rust roundtrip example mints its own token as a servi
   expect(rows(`SELECT reader FROM dm_acks WHERE message_id = ?`, sent.message_id)).toEqual([{ reader: RUST }]);
   // The session ended: its hosted row is gone.
   expect(rows(`SELECT 1 FROM hosted_sessions WHERE source_session_id = ?`, SESSION)).toEqual([]);
-  // The example minted one run token and revoked it at the end; the other credential's token is untouched.
+  // With its credential the example minted one run token and revoked it at the end; with a static token it revokes
+  // nothing (the launcher holds the token). The other credential's token is untouched either way.
   const tokens = (clientId: string) => rows<{ revoked: number }>(`SELECT t.revoked_at IS NOT NULL AS revoked FROM oauth_tokens t JOIN service_credentials c ON c.grant_id = t.grant_id WHERE c.client_id = ?`, clientId);
-  expect(tokens(rust.client_id)).toEqual([{ revoked: 1 }]);
+  expect(tokens(rust.client_id)).toEqual([{ revoked: auth === "credentials" ? 1 : 0 }]);
   expect(tokens(other.client_id)).toEqual([{ revoked: 0 }]);
-}, 90_000);
+}
+
+test.skipIf(!example)("the Rust roundtrip example mints its own token as a service and works a queue item and a DM from its delivery stream", () => roundtrip("credentials"), 90_000);
+
+test.skipIf(!example)("the Rust roundtrip example works the same with only a launcher's static run token (GRAYBOARD_RUN_TOKEN)", () => roundtrip("static"), 90_000);
