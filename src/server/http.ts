@@ -179,11 +179,15 @@ async function claimList(url: URL, authed: AuthedUser, repo: Repo, access: Board
     const scope = seenScopeOf(await repo.aliases.find(repo.read, holder), holder);
     return !scope || scope.scope_ref === null || (await authorize(repo, repo.read, {}, { verb: "alias.see", principal, scope: { scope_kind: scope.scope_kind, scope_ref: scope.scope_ref } })).allow;
   };
-  const { rows: claims } = await claimsSeen(repo, access, repo.read, principal, await repo.claims.list(repo.read, prefix));
+  const { rows: claims, boards } = await claimsSeen(repo, access, repo.read, principal, await repo.claims.list(repo.read, prefix));
   // One decision per distinct holder.
   const seen = new Map<string, boolean>();
   for (const c of claims) if (!seen.has(c.holder)) seen.set(c.holder, await sees(c.holder));
-  return json(claims.map(({ board: _b, ...c }) => (seen.get(c.holder) ? c : { ...c, holder: null, note: null })));
+  // A claim on a board the caller can't see keeps its note, written for that room, to itself (#1257).
+  return json(claims.map(({ board, ...c }) => {
+    const v = !board || boards.has(board) ? c : { ...c, note: null };
+    return seen.get(c.holder) ? v : { ...v, holder: null, note: null };
+  }));
 }
 
 // An address the caller may act as (#284 S11), in full, or the refusal: a

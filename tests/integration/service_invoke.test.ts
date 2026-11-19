@@ -342,6 +342,24 @@ describe("a queue post's claim on a hidden board is no claim at all (audit F1)",
     expect(holderOf("qaq", q.post_id)).toBe(`${ROOT}/fe`);
     expect(srv.app.db.query("SELECT count(*) AS n FROM claim_watches").get()).toEqual({ n: 0 });
   });
+
+  test("a claim announced on a hidden board shows no board or note to an outsider: claim_list, the held take, HTTP (#1257)", async () => {
+    await cast();
+    const dave = await srv.hosted(D, "fe"), carol = await srv.hosted(C, "fe");
+    sessions.push(dave, carol);
+    await carol.call("board_create", { name: "qa-room", purpose: "qa only", team: "qa" });
+    await carol.call("claim_take", { key: "ticket:QA-1", board: "qa-room", note: "the secret plan" });
+    type Row = { key: string; holder: string | null; board: string | null; note: string | null };
+    const row = async (s: HostedSession) => (await s.call<Row[]>("claim_list", { prefix: "ticket:QA-1" }))[0];
+    expect(await row(carol)).toMatchObject({ holder: `${C}/fe`, board: "qa-room", note: "the secret plan" });
+    expect(await row(dave)).toMatchObject({ key: "ticket:QA-1", holder: `${C}/fe`, board: null, note: null });
+    expect(await dave.call("claim_take", { key: "ticket:QA-1" })).toMatchObject({ ok: false, held_by: `${C}/fe`, note: null });
+    const h = await api(tokens[D]!, "GET", "/api/claims?prefix=ticket:QA-1");
+    expect(JSON.stringify(h.body)).not.toContain("secret plan");
+    expect(JSON.stringify(h.body)).toContain("ticket:QA-1");
+    const t = await api(tokens[D]!, "POST", "/api/claims/call", { as: `${D}/fe`, tool: "claim_take", args: { key: "ticket:QA-1" } });
+    expect(JSON.stringify(t.body)).not.toContain("secret plan");
+  });
 });
 
 describe("a session bound to a team's name sees a service's board only by the team's binding (audit F2)", () => {

@@ -128,7 +128,8 @@ export async function serverClaim(
     const lapsed = await sweepClaims(repo, access, sp, now);
     const held = async (cur: Claim): Promise<ClaimResult> => {
       await repo.claims.logEvent(sp, "refused", handle, { key, note: opts.note, board }, now, cur.holder);
-      return { ...heldAnswer(cur, await holderHidden(repo, access, sp, opts.session ?? handle, cur.holder)), ...lapsed };
+      const boardHidden = !!cur.board && !(await boardVisible(repo, access, sp, handle, cur.board));
+      return { ...heldAnswer(cur, await holderHidden(repo, access, sp, opts.session ?? handle, cur.holder), boardHidden), ...lapsed };
     };
     const cur = await repo.claims.get(sp, key);
     const d = takeDecision(cur, addresses, handle, now, opts);
