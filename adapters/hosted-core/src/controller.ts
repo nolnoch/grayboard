@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import type { Enrollment, HostPort } from "./port.js";
-import { InsufficientScope, LeaseUnavailable, ServerUnreachable, SubscriberError, SubscriptionClosed, Wire, type WireOptions } from "./wire.js";
+import { abortOf, InsufficientScope, LeaseUnavailable, ServerUnreachable, SubscriberError, SubscriptionClosed, Wire, type WireOptions } from "./wire.js";
 import { AccessExpired, Refusal, RefreshInProgress, accessExpiry, admitPrefix, bindingOf, itemsOf, leaseOf, sameHeld, shortOf, stableID, validHeld, type BindingState, type Lease } from "./model.js";
 import { AncestryError, SessionRoutes, type SessionPath } from "./sessions.js";
 import { end, register, type Temporary } from "./children.js";
@@ -129,8 +129,15 @@ export class Controller<E extends Enrollment = Enrollment> {
     return end;
   }
   private startStop(sessionID: string) { return AbortSignal.any([this.closing.signal, this.endOf(sessionID).signal]); }
-  // A start that fails once close or the session's shutdown began was stopped: say so, with no failure code.
-  private stopping(sessionID: string) { return this.stopped || this.ending.has(sessionID); }
+  // A start that failed because close or the session's shutdown stopped it says so, with no failure code: its
+  // error is that stop's abort, or the controller's own refusal of a stopping start, or (after close) an access
+  // token the host is still rotating, which `rotated` rethrows when close cuts its grace short: not yet a
+  // failure. Any other error that merely lands once the stop began (a sign-in refusal) keeps its code (#1309).
+  private stoppedBy(sessionID: string, error: unknown) {
+    if (!this.stopped && !this.ending.has(sessionID)) return false;
+    return abortOf(error, this.closing.signal) || abortOf(error, this.endOf(sessionID).signal) || error instanceof Refusal && error.code === "paused"
+      || this.stopped && accessExpiry(error)?.reason === "expired";
+  }
   private drifted = false;
   private controls: Promise<unknown> = Promise.resolve();
   private state: Status;
@@ -385,7 +392,7 @@ export class Controller<E extends Enrollment = Enrollment> {
     } catch (error) {
       // A drift during it (a guard saw the change) already said why every root paused.
       const what = this.port.approval ? (r.paused ? "Root approval unavailable" : "Root approval saved") : (r.paused ? "Root paused" : "Root enrolled");
-      const stopped = this.stopping(sessionID);
+      const stopped = this.stoppedBy(sessionID, error);
       if (!this.drifted) this.set(r, r.paused ? "paused" : "approved", `${what}; ${stopped ? "stopped before delivery opened" : failureMessage(this.expired(error), this.hint)}`, bound ? "prepare" : "enroll", stopped ? undefined : failureCode(this.expired(error)));
     }
     await this.diagnostics.flush();
@@ -415,7 +422,7 @@ export class Controller<E extends Enrollment = Enrollment> {
         this.retrying(r, error);
         this.retryRestore(r);
       } else if (!this.drifted) {
-        const stopped = this.stopping(sessionID);
+        const stopped = this.stoppedBy(sessionID, error);
         this.set(r, r.paused ? "paused" : "approved", stopped ? "Stopped before delivery opened" : failureMessage(error, this.hint), "enroll", stopped ? undefined : failureCode(error));
       }
     }
