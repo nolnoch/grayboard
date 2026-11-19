@@ -156,7 +156,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
   } });
   const hosted = createHostedSessions(application, { now, caps: caps.sessions, ...(opts.idleSeconds ? { idleSeconds: opts.idleSeconds } : {}), isAuthorized: (principal, r) => oauth.isAuthorized(principal, r) });
   const delivery = createDelivery(hosted, { isAuthorized: (principal, r) => oauth.isAuthorized(principal, r), now, caps: caps.leases });
-  type Exchange = { request: Request; address: string; protocol: string; principal?: number; identity?: string; session?: string; tool?: string; logged?: boolean; failure?: ApplicationError; meta?: unknown; id?: string | number | null; method?: unknown; call?: unknown; refusal?: Response; context?: Context; legacy?: Legacy };
+  type Exchange = { request: Request; address: string; protocol: string; principal?: number; identity?: string; session?: string; tool?: string; logged?: boolean; failure?: ApplicationError; meta?: unknown; id?: string | number | null; method?: unknown; call?: unknown; refusal?: Response; context?: Context; legacy?: Legacy; lost?: boolean };
   const exchanges = new AsyncLocalStorage<Exchange>();
   const refusalLogs = new RateLimiter({ burst: 1, perSec: 0.1 }, { start() {}, end() {} }, now, 4096);
   const report = (error: unknown, source: FailureSource = "hosted-sdk", exchange = exchanges.getStore()) => {
@@ -169,6 +169,20 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     if (refusalLogs.size >= 4096 || !refusalLogs.take(exchange.address).ok) return;
     console.error(`[grayboard] hosted MCP refused: ${JSON.stringify({ reason, address: exchange.address, origin: diagnosticOrigin(exchange.request.headers.get("Origin")), public_origin: trustedOrigin, principal: exchange.principal, identity: exchange.identity, protocol: exchange.protocol, ...detail })}`);
   };
+  // A tool's `unauthenticated` refusal past admission (a revoke that landed mid-call, #1312): noted, so the response
+  // point checks the bearer again (lostRefusal).
+  const noteRefused = (error: unknown) => {
+    const exchange = exchanges.getStore();
+    if (exchange && error instanceof ApplicationError && error.code === "unauthenticated") exchange.lost = true;
+  };
+  // The 401 admission would answer, for a call whose tool refused `unauthenticated` (#1312), so a client signs out
+  // whichever request met the revoke: only when the bearer no longer authenticates. A closing server (mcp closes before
+  // oauth does, app.ts) or a cancelled request keeps the tool's refusal: a restart never reads as a sign-out.
+  async function lostRefusal(request: Request, role: HostedRole): Promise<Response | undefined> {
+    if (closed || request.signal.aborted) return undefined;
+    const refusal = await oauth.authenticate(request, roleScopes(role));
+    return refusal instanceof Response && !closed && !request.signal.aborted ? refusal : undefined;
+  }
   const refuse = (response: Response): never => {
     const exchange = exchanges.getStore();
     if (exchange) exchange.refusal = response;
@@ -603,7 +617,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     server.server.registerCapabilities({ resources: { subscribe: true } });
     registerHostedResources(server, {
       role, current, issuer: oauth.issuer, resource: oauth.resource, resources, delivery, hosted, leaseHooks,
-      authorize() { return authorize(current()); },
+      authorize() { return authorize(current()); }, refused: noteRefused,
     });
     if (legacy) {
       const control = async (uri: string, ctx: ServerContext, subscribe: boolean) => {
@@ -690,7 +704,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
       server.server.setRequestHandler("resources/subscribe", (req, ctx) => serialized(req.params.uri, ctx, true));
       server.server.setRequestHandler("resources/unsubscribe", (req, ctx) => serialized(req.params.uri, ctx, false));
     }
-    if (role !== "subscriber") registerNativeTools(server, application, hosted, async ctx => { await authorize(current(ctx), ctx.mcpReq.signal, false); return current(ctx); }, (error, tool) => { const exchange = exchanges.getStore(); if (exchange) exchange.tool = tool; report(error, "hosted-tool"); }, code => { const exchange = exchanges.getStore(); if (exchange) logRefusal(code, exchange); });
+    if (role !== "subscriber") registerNativeTools(server, application, hosted, async ctx => { await authorize(current(ctx), ctx.mcpReq.signal, false); return current(ctx); }, (error, tool) => { const exchange = exchanges.getStore(); if (exchange) exchange.tool = tool; noteRefused(error); report(error, "hosted-tool"); }, code => { const exchange = exchanges.getStore(); if (exchange) logRefusal(code, exchange); });
     return server;
   }
   const modernFactory = async () => {
@@ -1107,7 +1121,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
               response = await legacy.transport.handleRequest(req, { parsedBody: body.parsedBody });
               if (!sid && !legacy.transport.sessionId) retire(legacy);
             }
-            const refusal = exchange.refusal;
+            const refusal = exchange.refusal ?? (exchange.lost && exchange.context ? await lostRefusal(req, exchange.context.role) : undefined);
             if (refusal && !closed && !req.signal.aborted) {
               await response.body?.cancel(); live?.stop(); exchange.context?.finish();
               releaseListen?.();

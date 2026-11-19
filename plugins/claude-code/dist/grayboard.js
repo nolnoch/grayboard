@@ -36910,6 +36910,10 @@ class Controller {
       await wire.close().catch((error) => this.failure("wire_close", error));
     }
   }
+  signedOut(error) {
+    const e = this.expired(error);
+    return e instanceof AccessExpired && e.reason !== "expired";
+  }
   expired(error) {
     return accessExpiry(error) ?? (causeOf(error, InsufficientScope) ? new AccessExpired(this.port.harness, this.port.loginAction, "login_required") : causeOf(error, RefreshInProgress) ?? error);
   }
@@ -36966,6 +36970,8 @@ class Controller {
       } catch (error) {
         const what = this.port.approval ? r.paused ? "Root approval unavailable" : "Root approval saved" : r.paused ? "Root paused" : "Root enrolled";
         const stopped = this.stoppedBy(sessionID, error);
+        if (!stopped && this.signedOut(error))
+          r.paused = true;
         if (!this.drifted)
           this.set(r, r.paused ? "paused" : "approved", `${what}; ${stopped ? "stopped before delivery opened" : failureMessage(this.expired(error), this.hint)}`, bound ? "prepare" : "enroll", stopped ? undefined : failureCode(this.expired(error)));
       }
@@ -36998,6 +37004,8 @@ class Controller {
           this.retryRestore(r);
         } else if (!this.drifted) {
           const stopped = this.stoppedBy(sessionID, error);
+          if (!stopped && this.signedOut(error))
+            r.paused = true;
           this.set(r, r.paused ? "paused" : "approved", stopped ? "Stopped before delivery opened" : failureMessage(error, this.hint), "enroll", stopped ? undefined : failureCode(error));
         }
       }

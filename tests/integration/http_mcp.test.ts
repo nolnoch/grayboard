@@ -1,4 +1,7 @@
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
 import { TestServer } from "../support/server.ts";
 import { MCP_PROTOCOL_VERSIONS } from "../../src/server/mcp.ts";
@@ -10,6 +13,7 @@ import { GRAYBOARD_LAUNCHER_META } from "../../src/shared/session_meta.ts";
 import { bindFixture, withMeta } from "../helpers/hosted.ts";
 import { seed } from "../support/seed.ts";
 import { stubAuthRead } from "../support/auth_stub.ts";
+import { until } from "../support/until.ts";
 
 let srv: TestServer;
 let app: TestServer["app"];
@@ -417,4 +421,56 @@ test("HTTP: a launcher declared in _meta is stored for its session; initialize c
   }
   expect((await open("lead-root", false)).getInstructions()).toContain(sentence);
   expect((await open("plain-root", false)).getInstructions()).not.toContain(sentence);
+});
+
+// #1312: a revoke that lands after admission, while a tool call is in flight (here between bind's commit and its
+// post-commit check), answers the 401 a dead token draws at admission, not a tool-level `unauthenticated`, on both
+// roles' bind. A live token at the same point answers the tool's result; a server stopping there never answers 401;
+// nor does a refusal there whose bearer still authenticates (`refused`: the post-commit check alone answers false).
+for (const role of ["native", "subscriber"] as const) for (const outcome of ["revoked", "live", "stopping", "refused"] as const) test(`HTTP ${role}: a ${outcome} token at bind's post-commit check ${outcome === "revoked" ? "answers 401" : "never answers 401"} (#1312)`, async () => {
+  const issued = await issueOAuth(app.repo, app.oauth.resource, "carol@example.com", ["grayboard:tools", "grayboard:delivery"], Date.now(), OPENCODE_CLIENT);
+  const statuses: number[] = [];
+  const client = new Client({ name: "http-test", version: "1" }, { supportedProtocolVersions: ["2026-07-28"], versionNegotiation: { mode: { pin: "2026-07-28" } } });
+  clients.push(client);
+  await client.connect(new StreamableHTTPClientTransport(new URL(`${base}/mcp`), {
+    requestInit: { headers: { Authorization: `Bearer ${issued.token}`, ...(role === "subscriber" ? { "X-Grayboard-Client": "subscriber" } : {}) } },
+    fetch: async (input, init) => { const r = await fetch(await withMeta(new Request(input, init), OPENCODE_SESSION_META, `post-commit-${role}`)); statuses.push(r.status); return r; },
+  }));
+  const dir = mkdtempSync(join(tmpdir(), "gb-1312-")), go = join(dir, "go"), hits: string[] = [];
+  const said = spyOn(console, "error").mockImplementation((...args: unknown[]) => { hits.push(args.join(" ")); });
+  const isAuthorized = app.oauth.isAuthorized;
+  process.env.BUS_TEST_PAUSE = "hosted:bind:after-commit";
+  process.env.BUS_TEST_PAUSE_FILE = go;
+  try {
+    const before = statuses.length;
+    const call = client.callTool({ name: "bind", arguments: { name: `pc-${role}`, create: true } }).then(r => ({ result: r }), (error: unknown) => ({ error }));
+    await until(() => hits.some(h => h.includes("test pause hit: hosted:bind:after-commit")), 10_000, "bind's post-commit pause");
+    let stopping: Promise<void> | undefined;
+    if (outcome === "revoked") await seed(app.repo, tx => app.repo.oauth.revokeToken(tx, issued.tokens.refreshHash, issued.binding.clientId, Date.now()));
+    if (outcome === "stopping") stopping = app.stop();
+    if (outcome === "refused") app.oauth.isAuthorized = async () => false;
+    writeFileSync(go, "");
+    const settled = await call;
+    await stopping;
+    const status = statuses.slice(before);
+    if (outcome === "revoked") {
+      expect(status).toEqual([401]);
+      expect("error" in settled).toBe(true);
+    } else if (outcome === "live") {
+      expect(status).toEqual([200]);
+      expect("result" in settled && settled.result.isError).not.toBe(true);
+    } else if (outcome === "refused") {
+      expect(status).toEqual([200]);
+      expect("result" in settled && settled.result.structuredContent).toEqual({ code: "unauthenticated" });
+    } else {
+      // The stop may close the connection before any answer: whatever came back, none was a 401.
+      expect(status).not.toContain(401);
+    }
+  } finally {
+    app.oauth.isAuthorized = isAuthorized;
+    said.mockRestore();
+    delete process.env.BUS_TEST_PAUSE;
+    delete process.env.BUS_TEST_PAUSE_FILE;
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
