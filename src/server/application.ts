@@ -2013,8 +2013,15 @@ async function handleCall(hub: Hub, tx: Tx, session: ApplicationSession, tool: s
     rowAfterRollback(session, tx, w => recordDecision(repo, w, sessionActor(session, actor), inv.req, inv.d));
     throw coreRefusal(hiddenBoard(inv));
   }
+  // A renewal's update or a release announced on a service's board is an invocation too (#1259), recorded with its
+  // post for the address it posts as; a claim_take naming the board was decided and is recorded above.
+  const announced = async (sp: Tx, as: string, board: string) => {
+    if (inv?.req.board === board) return;
+    const a = await invocation(repo, sp, as, board);
+    if (a) recordDecision(repo, sp, sessionActor(session, as), a.req, a.d);
+  };
   let outcome;
-  try { outcome = await callBoardTool(repo, hub.access, tx, actor, tool, rest, { ...ctx, ...(session.readOnly ? { principal: userOf(session) } : {}) }); }
+  try { outcome = await callBoardTool(repo, hub.access, tx, actor, tool, rest, { ...ctx, ...(session.readOnly ? { principal: userOf(session) } : {}), announced }); }
   catch (e) {
     if (e instanceof CoreError) throw coreRefusal(e);
     console.error(`[grayboard] ${tool} failed:`, e);

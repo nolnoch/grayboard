@@ -253,7 +253,13 @@ async function claimCall(req: Request, authed: AuthedUser, repo: Repo, access: B
     }
     try {
       // The tool's own savepoint rolls back a refusal's writes, so answering it here commits none (#807 P3 B5b3c).
-      const out = await callClaimTool(repo, access, tx, handle, tool as ClaimTool, args, { addresses, user: authed.user_email });
+      // A renewal's update or a release announced on a service's board is an invocation too (#1259).
+      const announced = async (sp: Tx, as: string, board: string) => {
+        if (inv?.req.board === board) return;
+        const a = await invocation(repo, sp, as, board);
+        if (a) recordDecision(repo, sp, { user: authed.user_email, address: as }, a.req, a.d);
+      };
+      const out = await callClaimTool(repo, access, tx, handle, tool as ClaimTool, args, { addresses, user: authed.user_email, announced });
       if (inv) recordDecision(repo, tx, { user: authed.user_email, address: handle }, inv.req, inv.d);
       return out;
     } catch (e) {

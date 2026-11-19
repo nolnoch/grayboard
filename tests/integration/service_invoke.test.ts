@@ -424,6 +424,50 @@ describe("claim_take on a service's board is an invocation, on every route (audi
   });
 });
 
+describe("a claim's renewal and release announced on a service's board are invocations (#1259)", () => {
+  test("each announcement records one allow for the address it posts as; a quiet renewal none; a revoked holder releases unannounced", async () => {
+    const { bindings } = await cast();
+    const bob = await srv.hosted(B, "fe");
+    sessions.push(bob);
+    const routes = {
+      mcp: (tool: string, args: Record<string, unknown>) => bob.call(tool, args).then(() => 200),
+      http: async (tool: string, args: Record<string, unknown>) => (await api(tokens[B]!, "POST", "/api/claims/call", { as: `${B}/fe`, tool, args })).status,
+    };
+    const allow = expect.objectContaining({ actor: B, detail: expect.objectContaining({
+      address: `${B}/fe`, allow: true, rule: "role.service_invoke", binding: bindings.bob, principal: B, board: "jobs",
+    }) });
+    const posts = () => (srv.app.db.query("SELECT count(*) AS n FROM posts WHERE board = 'jobs'").get() as { n: number }).n;
+    for (const [route, call] of Object.entries(routes)) {
+      const key = `ticket:ENG-${route}`;
+      expect(await call("claim_take", { key, board: "jobs", note: "start" }), route).toBe(200);
+      let before = invokes().length, n = posts();
+      // A renewal with a new note and no board announces on the claim's board.
+      expect(await call("claim_take", { key, note: "halfway" }), route).toBe(200);
+      expect(posts(), route).toBe(n + 1);
+      expect(invokes().slice(before), route).toEqual([allow]);
+      // The same note again announces nothing, so records nothing.
+      before = invokes().length;
+      expect(await call("claim_take", { key, note: "halfway" }), route).toBe(200);
+      expect(invokes().slice(before), route).toEqual([]);
+      // A renewal naming the board is the claim_take's own invocation: one row, not two.
+      expect(await call("claim_take", { key, board: "jobs", note: "nearly" }), route).toBe(200);
+      expect(invokes().slice(before), route).toEqual([allow]);
+      before = invokes().length, n = posts();
+      expect(await call("claim_release", { key, note: "done" }), route).toBe(200);
+      expect(posts(), route).toBe(n + 1);
+      expect(invokes().slice(before), route).toEqual([allow]);
+    }
+    // Revoked, the holder can still let go of its claim: the release stands, its announcement and its row don't.
+    await bob.call("claim_take", { key: "ticket:ENG-late", board: "jobs" });
+    await revoke(B);
+    const before = invokes().length, n = posts();
+    await bob.call("claim_release", { key: "ticket:ENG-late", note: "done" });
+    expect(posts()).toBe(n);
+    expect(invokes().slice(before)).toEqual([]);
+    expect(srv.app.db.query("SELECT key FROM claims WHERE key = 'ticket:ENG-late'").get()).toBeNull();
+  });
+});
+
 describe("an ID is judged as its session's primary alike on every route (audit F5)", () => {
   test("a tools-only session writing as a team's name: its ID invokes as the team over HTTP and MCP", async () => {
     await cast();
