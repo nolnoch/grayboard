@@ -142,7 +142,10 @@ export async function serverClaim(
     });
     let changed: ClaimChanges = { wake: [], boards: [] };
     if (!d.renewed) {
-      if (row.board) changed = await say(claimText(key, row.note), false);
+      if (row.board) {
+        changed = await say(claimText(key, row.note), false);
+        await opts.announced?.(sp, d.as, row.board);
+      }
     } else if (renewAnnounces(opts.note, cur) && row.board && (await boardVisible(repo, access, sp, d.as, row.board))) {
       changed = await say(updateText(key, opts.note!, await repo.claims.watchers(sp, key)), true);
       await opts.announced?.(sp, d.as, row.board);
@@ -182,7 +185,7 @@ export async function serverRelease(
     const cc = await repo.claims.takeWatchers(sp, key);
     // A holder who lost the board releases quietly; its watchers go too, since they're told through the board.
     if (!gone.board || !(await boardVisible(repo, access, sp, as, gone.board))) return { wake: [], boards: [] };
-    // A release with no signed-in caller is the system's (a session end's): it posts as the claimant's user (#855).
+    // A release with no signed-in caller posts as the claimant's user (#855).
     const changed = await systemPost(repo, access, sp, as, gone.board, releaseText(key, note, cc), null, {
       allowArchived: true, session: ctx.session, via: ctx.via, user: ctx.user ?? (await repo.claims.holderUser(sp, gone)),
     });
