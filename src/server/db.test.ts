@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Glob } from "bun";
-import { ACCESS_LOG_LAST_SQL, mailPort, openDatabase, QUEUED_TO_SQL, RETRACTABLE_SQL, SENT_PENDING_SQL, UNDELIVERED_FROM_SQL, type Repo } from "./db.ts";
+import { ACCESS_LOG_LAST_SQL, INVOKE_BINDING_SQL, mailPort, openDatabase, QUEUED_TO_SQL, RETRACTABLE_SQL, SENT_PENDING_SQL, UNDELIVERED_FROM_SQL, type Repo } from "./db.ts";
 import type { Tx } from "./store/tx.ts";
 import { scratchDbPath } from "../../tests/support/scratch_db.ts";
 import { holdAlias } from "../core/bindings.ts";
@@ -477,6 +477,23 @@ test("undeliveredFrom and sentPending search messages by sender, never by recipi
     expect(plan).toContain("SEARCH m USING INDEX idx_msg_sender (sender=?)");
     expect(plan).not.toContain("idx_msg_recipient");
   }
+});
+
+// #270 D6 (principle 13): the service_invoke grant read is driven from the holder, 1 + its team count probes of the
+// unique (principal_id, role, scope_id) index; never a scan of role_bindings or a pass over a service's holders by
+// idx_role_bindings_scope, even with statistics that make role_bindings look small.
+test("the service_invoke grant read probes by holder, never scans a service's holders", () => {
+  const { db } = openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
+  db.run("ANALYZE");
+  const plan = (db.prepare("EXPLAIN QUERY PLAN " + INVOKE_BINDING_SQL).all("a@example.com", "user", "ingest") as { detail: string }[]).map((p) => p.detail);
+  expect(plan.filter((d) => d.includes(" b "))).toEqual([
+    "SEARCH b USING COVERING INDEX idx_role_bindings_scoped (principal_id=? AND role=? AND scope_id=?)",
+    "SEARCH b USING COVERING INDEX idx_role_bindings_scoped (principal_id=? AND role=? AND scope_id=?)",
+  ]);
+  expect(plan).toContain("SEARCH tm USING INDEX team_members_user (user_id=?)");
+  expect(plan).toContain("SEARCH pt USING INDEX idx_principals_team (team_id=?)");
+  expect(plan.join(" ")).not.toContain("idx_role_bindings_scope ");
+  expect(plan.filter((d) => /^SCAN (b|h|s|tm|pt)\b/.test(d))).toEqual([]);
 });
 
 // #284 audit: queuedTo and retract read the read point by its key too.

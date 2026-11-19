@@ -25,6 +25,7 @@ import { transferTimeoutMs } from "../shared/http.ts";
 import { testPauseAsync } from "../shared/testpause.ts";
 import { aliasHeldText } from "../core/bindings.ts";
 import { callClaimTool } from "./claims.ts";
+import { hiddenBoard, invocation } from "./invoke.ts";
 import type { BoardAccess } from "./access.ts";
 import { SizeTally, checkFile, contentDisposition, reprDigest, sanitizeFilename } from "../shared/attachments.ts";
 import { ALIAS_SCOPE_CAP, aliasCapRefusal } from "./alias_cap.ts";
@@ -241,9 +242,19 @@ async function claimCall(req: Request, authed: AuthedUser, repo: Repo, access: B
     // As the session the address is or is held by: its claims under any of
     // its addresses are its own here (#360).
     const addresses = await repo.bindings.addressSet(tx, handle, authed.user_email);
+    // A claim announced on a service's board is an invocation (#270 D6), decided as board_post's is; this answer
+    // commits, so a deny's row goes on the transaction, and an allow's only when the claim lands. An ID's session's
+    // primary is its oldest hold, addresses[1] (addressSet puts the ID first, then sessionAddresses' holds).
+    const inv = tool === "claim_take" ? await invocation(repo, tx, handle, args.board, addresses[1] ?? handle) : null;
+    if (inv && !inv.d.allow) {
+      recordDecision(repo, tx, { user: authed.user_email, address: handle }, inv.req, inv.d);
+      return badRequest(hiddenBoard(inv).message);
+    }
     try {
       // The tool's own savepoint rolls back a refusal's writes, so answering it here commits none (#807 P3 B5b3c).
-      return await callClaimTool(repo, access, tx, handle, tool as ClaimTool, args, { addresses, user: authed.user_email });
+      const out = await callClaimTool(repo, access, tx, handle, tool as ClaimTool, args, { addresses, user: authed.user_email });
+      if (inv) recordDecision(repo, tx, { user: authed.user_email, address: handle }, inv.req, inv.d);
+      return out;
     } catch (e) {
       if (e instanceof CoreError) return badRequest(e.message);
       throw e;

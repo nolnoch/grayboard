@@ -60,8 +60,10 @@ export async function callBoardTool(
   switch (tool) {
     case "board_create": {
       const team = optStr(a, "team");
-      const scope = team ? `team:${team.toLowerCase()}` : null;
       const kind = optStr(a, "kind");
+      // A team's when named; a service's queue board is the service's, implicitly (#270 D5); else org-open. Read
+      // before the repeat check, which compares it.
+      const scope = await access.createScope(tx, actor, team, kind);
       const name = normalizeBoard(str(a, "name"));
       // A repeat whose first answer was lost (#254), answered from state; never for the Slack bridge's human.
       const repeat = async (mine: Board | undefined) =>

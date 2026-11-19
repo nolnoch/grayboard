@@ -48,6 +48,9 @@ export type RoleBinding = {
   id: number; principal_id: number; principal: string; role: string;
   scope_id: number | null; scope: string | null; granted_by: number | null; granter: string | null; granted_at: number;
 };
+// The service_invoke binding that carries a principal's right on a service (#270 D6): its id, and the team that holds
+// it when the right is a member's through their team (null for the principal's own binding).
+export type InvokeBinding = { id: number; team: string | null };
 // Whose authority a grant or revoke re-checks in its own write (#927): none (a bootstrap admin, whose env list
 // doesn't change at runtime, a team's creator, a member's own removal), the granter's org_admin binding, or their
 // team_owner binding on the binding's scope or an org_admin binding.
@@ -159,6 +162,12 @@ export interface RolesStore {
   find(r: Read, holder: string, role: string, scope: string | null): Promise<RoleBinding | undefined>;
   // A user's binding id for a role on the org (teamId null) or a team: a decision's one indexed lookup.
   bindingOf(r: Read, userId: number, role: string, teamId: number | null): Promise<number | undefined>;
+  // The service_invoke binding a principal holds on a service (#270 D6): its own, else, for a user, one a team it's a
+  // member of holds (`team` names that team), the lowest team name first. One statement driven from the holder:
+  // 1 + its team count probes of the unique (principal_id, role, scope_id) index, never a scan of the service's
+  // holders (principle 13); membership read live (principle 11). A service is never a team member (D1), and a team
+  // principal holds only by its own binding.
+  invokeBinding(r: Read, holder: Principal, service: string): Promise<InvokeBinding | undefined>;
   // Bindings with ids above `after`, in id order, at most `limit`, filtered by role, holder name and scope name.
   list(r: Read, filter: RoleFilter, after: number, limit: number): Promise<RoleBinding[]>;
 }

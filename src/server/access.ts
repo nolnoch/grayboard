@@ -2,16 +2,18 @@
 // through the Resolver (#284 S12). Core calls it synchronously, so its reads
 // are repo.policyNow's (#807 P3 A7e1) until B5b. Open boards (scope null) are visible to
 // any address with a principal; "team:<name>" boards to that team's own
-// aliases and to its members' addresses. A session bound to `eng/x` acts as
-// eng: it sees eng's boards, not its binder's other teams'. Installed on the
-// database by openDatabase, so every core call is checked.
+// aliases and to its members' addresses; "service:<name>" boards (#270 D5) to
+// the service and the principals holding service_invoke on it, directly or
+// through a team. A session bound to `eng/x` acts as eng: it sees eng's boards,
+// not its binder's other teams', and a service's only by eng's own binding.
+// Installed on the database by openDatabase, so every core call is checked.
 import { addressParts, type AliasScope } from "../core/addresses.ts";
 import type { Access, Board, CoreDb } from "../core/boards.ts";
 import { CoreError } from "../core/errors.ts";
 import { ownScope, type Principal } from "../core/resolver.ts";
 import { undeliverableId } from "../core/session_end.ts";
 import { HUMAN_NAME } from "../shared/addressing.ts";
-import { authorize, authorizeNow, type ActScope, type HumanReach } from "./policy.ts";
+import { authorize, authorizeNow, serviceOfScope, type ActScope, type HumanReach } from "./policy.ts";
 import type { Repo } from "./db.ts";
 import type { Read, Tx } from "./store/tx.ts";
 
@@ -31,12 +33,40 @@ function reaches(repo: Repo, humanReach: HumanReach, from: string, to: string): 
 }
 
 // Board visibility is the principal's: an org board is everyone's, a team
-// board its team's and members'. canSee resolves an address to this.
+// board its team's and members', a service's board the service's and its
+// invokers' (#270 D5: service.invoke as a filter, no row; anyone else reads
+// "no such board", as for a team's). canSee resolves an address to this.
 export function principalCanSee(repo: Repo, p: Principal, board: Board): boolean {
   if (board.scope === null) return true;
+  const service = serviceOfScope(board.scope);
+  if (service !== null) return authorizeNow(repo, {}, { verb: "service.invoke", principal: p, service, board: board.name }).allow;
   const team = teamOf(board.scope);
   if (team === null) return false;
   return p.kind === "team" ? p.name === team : actsIn(repo, p, { scope_kind: "team", scope_ref: team });
+}
+
+// Whether principal p may be a lane on `board` (#270 D5): on a service's board only the service's own addresses
+// consume, so an invoker subscribed in push mode never takes work meant for the service; any board else, anyone who
+// may see it.
+export function laneOf(p: Principal | null, board: Board): boolean {
+  const service = serviceOfScope(board.scope);
+  return service === null || (p?.kind === "service" && p.name === service);
+}
+
+// The scope a board the actor creates gets (#270 D5): a team's when named; else a queue board a service's address
+// creates is the service's, implicitly, with no tool argument (principle 2: every session would pay for one); any
+// other board is org-open.
+export function createScope(p: Principal | null, team: string | undefined, kind: string | undefined): string | null {
+  if (team) return `team:${team.toLowerCase()}`;
+  return p?.kind === "service" && kind === "queue" ? `service:${p.name}` : null;
+}
+
+// checkCreate's ruling on a service scope: only that service may create in it. Never a read: a scope that names no
+// service is refused the same way, without saying whether one exists.
+function serviceCreate(p: Principal | null, scope: string): string | null | undefined {
+  const service = serviceOfScope(scope);
+  if (service === null) return undefined;
+  return p?.kind === "service" && p.name === service ? null : `invalid board scope "${scope}"`;
 }
 
 export function serverAccess(repo: Repo, db: CoreDb, humanReach: HumanReach = "team"): Access {
@@ -75,8 +105,12 @@ export function serverAccess(repo: Repo, db: CoreDb, humanReach: HumanReach = "t
     // No server #announce yet (#24): a team board named announce stays ordinary.
     announceBoard: null,
 
+    mayLane: (handle, board) => serviceOfScope(board.scope) === null || laneOf(repo.policyNow.principalOf(handle), board),
+
     checkCreate(handle, scope) {
       if (scope === null) return null;
+      const svc = serviceCreate(repo.policyNow.principalOf(handle), scope);
+      if (svc !== undefined) return svc;
       const team = teamOf(scope);
       if (team === null) return `invalid board scope "${scope}"`;
       // A team reads as missing to a non-member (#1020): one refusal for both.
@@ -158,6 +192,10 @@ export interface BoardAccess {
   // principal.
   visibleTo(r: Read, viewer: string | Principal, boards: Board[]): Promise<Set<string>>;
   checkCreate(r: Read, handle: string, scope: string | null): Promise<string | null>;
+  // Of `handles`, those that may be a lane on `board` (#270 D5): on a service's board, the service's own addresses.
+  lanesAmong(r: Read, handles: string[], board: Board): Promise<Set<string>>;
+  // The scope a board `handle` creates gets (createScope).
+  createScope(r: Read, handle: string, team: string | undefined, kind: string | undefined): Promise<string | null>;
   // Takes a Tx: an @id: is judged by repo.sessionEnd.refusal, the send side of an end's race (D3).
   resolveMention(tx: Tx, token: string, author: string, board: Board, strict: boolean, viewer?: string): Promise<string | null>;
   // core's resolveMentions over tokens already parsed (mentionTokens): a token resolves when its handle may see the board.
@@ -179,6 +217,8 @@ export function boardAccess(repo: Repo, humanReach: HumanReach = "team"): BoardA
   // principalCanSee's rule.
   const principalSees = async (r: Read, p: Principal, board: Board): Promise<boolean> => {
     if (board.scope === null) return true;
+    const service = serviceOfScope(board.scope);
+    if (service !== null) return (await authorize(repo, r, {}, { verb: "service.invoke", principal: p, service, board: board.name })).allow;
     const team = teamOf(board.scope);
     if (team === null) return false;
     return p.kind === "team" ? p.name === team : actsIn(r, p, { scope_kind: "team", scope_ref: team });
@@ -258,8 +298,21 @@ export function boardAccess(repo: Repo, humanReach: HumanReach = "team"): BoardA
       return out;
     },
 
+    async lanesAmong(r, handles, board) {
+      if (serviceOfScope(board.scope) === null) return new Set(handles);
+      const out = new Set<string>();
+      for (const h of new Set(handles)) if (laneOf(await repo.principals.of(r, h), board)) out.add(h);
+      return out;
+    },
+
+    async createScope(r, handle, team, kind) {
+      return createScope(team ? null : await repo.principals.of(r, handle), team, kind);
+    },
+
     async checkCreate(r, handle, scope) {
       if (scope === null) return null;
+      const svc = serviceCreate(await repo.principals.of(r, handle), scope);
+      if (svc !== undefined) return svc;
       const team = teamOf(scope);
       if (team === null) return `invalid board scope "${scope}"`;
       // A team reads as missing to a non-member (#1020): one refusal for both.

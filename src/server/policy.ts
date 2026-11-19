@@ -17,7 +17,7 @@ import type { AttachmentReach } from "../core/attachments.ts";
 import type { Principal, Resolver } from "../core/resolver.ts";
 import { HUMAN_NAME, HUMAN_RESERVED } from "../shared/addressing.ts";
 import { writeAudit } from "./audit.ts";
-import type { Alias, PrincipalRow, Repo, Team, User } from "./db.ts";
+import type { Alias, InvokeBinding, PrincipalRow, Repo, Team, User } from "./db.ts";
 import { RateLimiter, type RateLimit } from "./rate_limit.ts";
 
 // Who besides you can reach your human (your phone, through the Slack
@@ -45,9 +45,14 @@ export type ActScope = { scope_kind: ScopeKind; scope_ref: string };
 // time and the receiving session's user, never an address's spelling, F-01);
 // delegate.to: whether a user's session may name another user's launcher in
 // `delegate`'s `to` (#256; users by email, the target's from the session
-// that holds the address).
+// that holds the address). A msg.wake about a board post carries `post`: the
+// post's board and scope and each side's acting principal (the post's author
+// address's, and the reading address's), which wake.service_invoke judges (#270 D6).
 // alias.see: whether principal p may see that an alias of a scope exists (a
 // filter for listings and name suggestions, #348).
+// service.invoke: whether principal p (the acting address's: a team-scoped
+// name's is the team) may post on service `service`'s board `board` (#270 D6):
+// requested by a post, a filter for the board's visibility.
 export type AuthzRequest =
   | { verb: "msg.send" | "human.reach"; from: string; to: string }
   | { verb: "scope.act"; principal: Principal; scope: ActScope }
@@ -58,8 +63,17 @@ export type AuthzRequest =
   | { verb: "attachment.read"; identity: string; attachment: string; reach: AttachmentReach | undefined }
   | { verb: "team.read" | "team.manage" | "team.leave"; user: SignedIn; team: Team | undefined }
   | { verb: "admin"; user: SignedIn }
-  | { verb: "msg.wake" | "delegate.to"; from_user: string; to_user: string }
-  | { verb: "alias.see"; principal: Principal; scope: ActScope };
+  | { verb: "msg.wake"; from_user: string; to_user: string; post?: WakePost }
+  | { verb: "delegate.to"; from_user: string; to_user: string }
+  | { verb: "alias.see"; principal: Principal; scope: ActScope }
+  | { verb: "service.invoke"; principal: Principal | null; service: string; board: string };
+
+// A board post's facts for msg.wake (#270 D6): its board and the board's scope, and the acting principal of each
+// side, the writer's (its author address's) and the reader's (null: the address names none).
+export type WakePost = { board: string; scope: string | null; from: Principal | null; to: Principal | null };
+
+// The service a board belongs to (#270 D5: scope `service:<name>`), or null.
+export const serviceOfScope = (scope: string | null): string | null => (scope?.startsWith("service:") ? scope.slice(8) : null);
 
 // The signed-in principal of a user-keyed verb: its users row's id and name, and its kind (#270 D1: a service is a
 // users row too, and holds no admin or team authority).
@@ -72,21 +86,23 @@ export type SessionFacts = { principal: string | null; viewer: boolean; ended_at
 // A role-based decision (#927) names its rule from a closed set (`role.org_admin`, `role.team_owner`) and carries
 // the role and scope (a team's name, null for the org) it looked for; an allow also carries the binding that allowed
 // it. The id rides beside the rule, never in it: callers compare rule strings, and rows group by them.
-export type RoleFacts = { binding?: number; role?: Role; scope?: string | null };
+// `team`: the team whose binding carried a member's right (#270 D6), so the row ties the act to the membership.
+export type RoleFacts = { binding?: number; role?: Role; scope?: string | null; team?: string };
 export type Decision =
   | ({ allow: true; rule: string } & RoleFacts)
   | ({ allow: false; code: "forbidden" | "not_found"; reason: string; rule: string } & Omit<RoleFacts, "binding">);
 
 // The roles (#927): each fixes its scope's kind (null: the org) and the principal kinds that may hold it.
 // A row whose role isn't here grants nothing: every lookup names its role. service_owner (#270 D1) is a service's
-// accountability record and carries no power yet: no rule reads it. service_invoke's holder kinds, verb and check
-// arrive with #270's invocation step (D6); until then no principal may hold it.
+// accountability record and carries no power yet: no rule reads it. service_invoke (#270 D6) is the right to post on
+// a service's board and be woken by its replies; a team's binding counts for its members, so a whole team is
+// grantable (a service is never a team member, so it holds only directly).
 export type Role = "org_admin" | "team_owner" | "service_owner" | "service_invoke";
 export const ROLES: Readonly<Record<Role, { scope: "team" | "service" | null; holders: readonly Principal["kind"][] }>> = {
   org_admin: { scope: null, holders: ["user"] },
   team_owner: { scope: "team", holders: ["user"] },
   service_owner: { scope: "service", holders: ["user"] },
-  service_invoke: { scope: "service", holders: [] },
+  service_invoke: { scope: "service", holders: ["user", "service", "team"] },
 };
 export const isRole = (r: unknown): r is Role => typeof r === "string" && Object.hasOwn(ROLES, r);
 
@@ -111,6 +127,8 @@ export interface PolicyReadsSync extends Resolver {
   isMember(teamId: number, userId: number): boolean;
   // A user's binding id for a role on the org (teamId null) or a team, if held (#927).
   roleBinding(userId: number, role: Role, teamId: number | null): number | undefined;
+  // A principal's service_invoke binding on a service, its own or a team's it's a member of (#270 D6).
+  invokeBinding(holder: Principal, service: string): InvokeBinding | undefined;
   shareAny(userA: number, userB: number): boolean;
   shareCollaborative(userA: number, userB: number): boolean;
   shareDelegating(userA: number, userB: number): boolean;
@@ -163,6 +181,7 @@ function policyReads(repo: PolicyStores, r: Read): PolicyReads {
     teamByName: (name) => repo.teams.findByName(r, name),
     isMember: (teamId, userId) => repo.teams.isMember(r, teamId, userId),
     roleBinding: (userId, role, teamId) => repo.roles.bindingOf(r, userId, role, teamId),
+    invokeBinding: (holder, service) => repo.roles.invokeBinding(r, holder, service),
     shareAny: (userA, userB) => repo.teams.shareAny(r, userA, userB),
     shareCollaborative: (userA, userB) => repo.teams.shareCollaborative(r, userA, userB),
     shareDelegating: (userA, userB) => repo.teams.shareDelegating(r, userA, userB),
@@ -242,7 +261,9 @@ export function* decide(ctx: PolicyContext, req: AuthzRequest): Rule<Decision> {
       return deny("role.team_owner", `only an owner of team "${team.name}" (or an admin) can add or remove members; \`grayboard team members ${team.name}\` lists its owners`, "forbidden", { role: "team_owner", scope: team.name });
     }
     case "msg.wake":
-      return yield* wakeRule(req.from_user, req.to_user);
+      return yield* wakeRule(req.from_user, req.to_user, req.post);
+    case "service.invoke":
+      return yield* invokeRule(req.principal, req.service);
     case "delegate.to":
       return yield* delegateRule(req.from_user, req.to_user);
     case "alias.see":
@@ -253,6 +274,11 @@ export function* decide(ctx: PolicyContext, req: AuthzRequest): Rule<Decision> {
       // directory grant (as for msg.wake).
       if (req.scope.scope_kind === "person") return allow("alias.see_person");
       if (req.principal.kind === "team" && req.scope.scope_kind === "team" && req.principal.name === req.scope.scope_ref) return allow("alias.see_own_team");
+      // A service's names are the service's and its invokers' (#270 D4), as a team's are its members'.
+      if (req.scope.scope_kind === "service" && !(req.principal.kind === "service" && req.principal.name === req.scope.scope_ref)) {
+        const g = yield* invokeGrant(req.principal, req.scope.scope_ref);
+        return g ? allow("alias.see_service", g) : deny("alias.see_service", `no service ${req.scope.scope_ref} that ${req.principal.name} may see`, "not_found", { role: "service_invoke", scope: req.scope.scope_ref });
+      }
       return yield* actIn(req.principal, req.scope);
     case "admin":
       return (yield* orgAdmin(ctx, req.user)) ?? deny("role.org_admin", `${req.user.email} is not an org admin`, "forbidden", { role: "org_admin", scope: null });
@@ -285,8 +311,11 @@ function subject(req: AuthzRequest): { target: string | null; detail: Record<str
     case "admin":
       return { target: null, detail: {} };
     case "msg.wake":
+      return { target: req.to_user, detail: { from_user: req.from_user, to_user: req.to_user, ...(req.post ? { board: req.post.board } : {}) } };
     case "delegate.to":
       return { target: req.to_user, detail: { from_user: req.from_user, to_user: req.to_user } };
+    case "service.invoke":
+      return { target: `service:${req.service}`, detail: { principal: req.principal?.name ?? null, principal_kind: req.principal?.kind ?? null, board: req.board } };
     case "alias.see":
       return { target: `${req.scope.scope_kind}:${req.scope.scope_ref}`, detail: { principal: req.principal.name, scope_kind: req.scope.scope_kind, scope_ref: req.scope.scope_ref } };
   }
@@ -337,6 +366,7 @@ export function recordDecision(repo: Repo, h: Read, actor: Actor, req: AuthzRequ
     // The binding that allowed, or the role and scope a deny looked for (#927).
     ...(d.allow && d.binding !== undefined ? { binding: d.binding } : {}),
     ...(d.role !== undefined ? { role: d.role, scope: d.scope ?? null } : {}),
+    ...(d.allow && d.team !== undefined ? { team: d.team } : {}),
     ...Object.fromEntries(Object.entries({ ...detail, ...extra }).map(([k, v]) => [k, clip(v)])),
     user: actor.user,
     address: actor.address ?? null,
@@ -397,11 +427,39 @@ function sessionRule(user: string, session: string, row: SessionFacts | undefine
 // wake. A user's own agents wake each other; across users, only members of a
 // shared 'collaborative' or 'delegating' team do (delegating implies it, #256). No admin exemption: admin is a server role,
 // not a messaging grant. One indexed lookup per decision (principle 11).
-function* wakeRule(fromUser: string, toUser: string): Rule<Decision> {
+// A post on a service's board (#270 D6, principles 9 and 10) also wakes across accounts when one side is that service
+// and the other side's acting principal holds service_invoke on it, in both directions: an invoker's request wakes a
+// lane, the lane's reply wakes the invoker. Re-decided at each pull or read, so a revoked binding or a removed
+// membership turns what's queued to ungranted data. Board posts only: a DM between them stays mail (open question 7).
+function* wakeRule(fromUser: string, toUser: string, post?: WakePost): Rule<Decision> {
   if (fromUser === toUser) return allow("wake.same_user");
+  const service = post ? serviceOfScope(post.scope) : null;
+  if (post && service !== null) {
+    const isService = (p: Principal | null) => p?.kind === "service" && p.name === service;
+    const other = isService(post.from) ? post.to : isService(post.to) ? post.from : null;
+    const g = other ? yield* invokeGrant(other, service) : undefined;
+    if (g) return allow("wake.service_invoke", g);
+  }
   const a = yield* ask("userByEmail", fromUser), b = yield* ask("userByEmail", toUser);
   if (a && b && (yield* ask("shareCollaborative", a.id, b.id))) return allow("wake.team_policy");
   return deny("wake.cross_user", `${fromUser} shares no collaborative team with ${toUser}; delivered as mail that doesn't wake their agent`);
+}
+
+// The service_invoke binding that carries principal p's right on a service (#270 D6), as a decision's role facts: its
+// own binding, else for a user a team's it's a member of (the team named). One statement, read live, never cached
+// (principles 11, 13).
+function* invokeGrant(p: Principal, service: string): Rule<RoleFacts | undefined> {
+  const b = yield* ask("invokeBinding", p, service);
+  return b ? { binding: b.id, role: "service_invoke", scope: service, ...(b.team !== null ? { team: b.team } : {}) } : undefined;
+}
+
+// Whether principal p may post on service `service`'s board (#270 D6): the service itself (`service.own`), or a holder
+// of service_invoke on it. A deny reads as a missing board (not_found), the hidden board's refusal, so it never says
+// the service or its board exists. No admin exemption: admin is a server role, not a grant to a service's work.
+function* invokeRule(p: Principal | null, service: string): Rule<Decision> {
+  if (p?.kind === "service" && p.name === service) return allow("service.own");
+  const g = p ? yield* invokeGrant(p, service) : undefined;
+  return g ? allow("role.service_invoke", g) : deny("role.service_invoke", "no such board", "not_found", { role: "service_invoke", scope: service });
 }
 
 // Whether a user's session may hand a task to another user's launcher by

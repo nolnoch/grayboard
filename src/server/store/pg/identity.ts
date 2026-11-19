@@ -388,6 +388,24 @@ export function makePgIdentity({ now }: { now: () => number }): PgIdentity {
           WHERE b.role = ${role} AND ${teamId === null ? sql.fragment`b.scope_id IS NULL` : sql.fragment`b.scope_id = (SELECT id FROM principals WHERE kind = 'team' AND team_id = ${teamId})`}`,
         row => int8(row.id));
       },
+      // The SQLite store's statement (#270 D6): the holder's own binding, then its teams', each an index probe.
+      async invokeBinding(r, holder, service) {
+        const sql = pgOf(r);
+        return first(sql`SELECT id, team FROM (
+            SELECT b.id AS id, NULL::text AS team
+              FROM principals h JOIN principals s ON s.name = ${service} AND s.kind = 'service'
+              JOIN role_bindings b ON b.principal_id = h.id AND b.role = 'service_invoke' AND b.scope_id = s.id
+             WHERE h.name = ${holder.name} AND h.kind = ${holder.kind}
+            UNION ALL
+            SELECT b.id, pt.name
+              FROM principals h JOIN team_members tm ON tm.user_id = h.user_id
+              JOIN principals pt ON pt.team_id = tm.team_id AND pt.kind = 'team'
+              JOIN principals s ON s.name = ${service} AND s.kind = 'service'
+              JOIN role_bindings b ON b.principal_id = pt.id AND b.role = 'service_invoke' AND b.scope_id = s.id
+             WHERE ${holder.kind} = 'user' AND h.name = ${holder.name} AND h.kind = 'user') x
+          ORDER BY team IS NOT NULL, team LIMIT 1`,
+        row => ({ id: int8(row.id), team: strOrNull(row.team) }));
+      },
       async list(r, f, after, limit) {
         const sql = pgOf(r);
         const none = () => sql.fragment``;

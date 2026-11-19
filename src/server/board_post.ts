@@ -91,7 +91,7 @@ async function writePost(
   const tokens = mentionTokens(body);
   const facts: PostTargetFacts = {
     board: b, handle: actor, parentId, strict, gate, own, ackAddresses: addresses, isViewer,
-    isHuman: prefetched([], new Set(), "isHuman"), sees: prefetched([], new Set(), "sees"),
+    isHuman: prefetched([], new Set(), "isHuman"), sees: prefetched([], new Set(), "sees"), mayLane: prefetched([], new Set(), "mayLane"),
     mentions: { handles: [], unresolved: [] },
   };
   if (branch === "queue") {
@@ -99,10 +99,13 @@ async function writePost(
     const seen = await seenAmong(repo, access, tx, viewer, facts.mentions.handles);
     facts.seenMentioned = facts.mentions.handles.filter((h) => seen.has(h));
     facts.isHuman = prefetched(facts.seenMentioned, await repo.aliases.humansAmong(tx, facts.seenMentioned), "isHuman");
+    // A claim by name asks the lane rule too (#270 D5).
+    facts.mayLane = prefetched(facts.seenMentioned, await access.lanesAmong(tx, facts.seenMentioned, b), "mayLane");
     if (needsRotation(facts.seenMentioned)) {
       const rows = await repo.boards.laneRows(tx, b.name, own);
       const sees = rows.length ? await access.canSeeMany(tx, rows, b) : new Set<string>();
-      facts.lanes = orderLanes(rows, isViewer, (h) => sees.has(h), w.online);
+      const lanes = rows.length ? await access.lanesAmong(tx, rows, b) : new Set<string>();
+      facts.lanes = orderLanes(rows, isViewer, (h) => sees.has(h), (h) => lanes.has(h), w.online);
     }
   } else if (branch === "announcement") {
     throw new Error("board_post: the server has no announce board");

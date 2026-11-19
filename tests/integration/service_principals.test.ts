@@ -161,8 +161,8 @@ describe("owners", () => {
     expect((await grant("service_owner", A)).status).toBe(400);
     expect((await grant("org_admin", SVC)).status).toBe(400);
     expect((await grant("team_owner", SVC, "eng")).status).toBe(400);
-    // service_invoke's holders arrive with the invocation step.
-    expect((await grant("service_invoke", A, SVC)).status).toBe(400);
+    // service_invoke is held on a service, not a team (#270 D6).
+    expect((await grant("service_invoke", A, "eng")).status).toBe(404);
     expect(ownerRows()).toEqual([{ holder: A, service: SVC }]);
   });
 

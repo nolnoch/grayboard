@@ -34,9 +34,11 @@ test("no source file outside policy.ts calls a pre-seam rule helper", () => {
 // http.ts keeps healthz's probe. A7f2 moved application.ts's binds, alias recheck, sends, delegation reach and writer
 // marks; it kept helloOkFields's team list until A7g1. A7u2 raised hosted.ts by 2 (its rebuild read holders' users
 // through policyNow); A7g1 read both on the committing Tx and freed all three. policy.ts counts its drivers' `decide(`.
+// #270 step 5 raised access.ts by 3: core's synchronous Access (still installed on the server's database) takes the
+// service board's visibility, create scope and lane rules, the twins of boardAccess's, so no core path is left open.
 const SYNC_TWIN = /\bauthorizeNow\b|\bpolicyNow\b|\bdecide\(/g;
 const SYNC_TWIN_CEILING: Record<string, number> = {
-  "src/server/access.ts": 16,
+  "src/server/access.ts": 19,
   "src/server/db.ts": 2,
   "src/server/http.ts": 1,
   "src/server/policy.ts": 9,

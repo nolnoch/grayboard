@@ -35,11 +35,11 @@ import { accessFits, accessLookup, BROWSER_SESSIONS, browserData, browserSession
   loginInput, lookup, MINT_WINDOW_MS, mintInput, requestData, requestInput, REQUESTS_PER_BROWSER, REQUESTS_TOTAL, sameAuthorization, rotationBinding, secretLookup,
   serviceCredentialInput, serviceSecretInput, successorInput, time } from "./oauth-rules.ts";
 import { AuthorityLost, LastOwner, PrincipalTaken } from "./store/errors.ts";
-import { DEV_SESSION_LABEL, TEAM_POLICIES, type User, type IdpSignIn, type Session, type PrincipalRow, type Team, type TeamPolicy, type TeamMember, type RoleBinding, type RoleAuthority, type RoleRevoke, type MemberAuthority, type MemberRemoval, type ServiceRow, type UsersStore, type SessionsStore, type PrincipalsStore, type TeamsStore, type RolesStore, type ServicesStore } from "./store/identity.ts";
+import { DEV_SESSION_LABEL, TEAM_POLICIES, type User, type IdpSignIn, type Session, type PrincipalRow, type Team, type TeamPolicy, type TeamMember, type RoleBinding, type InvokeBinding, type RoleAuthority, type RoleRevoke, type MemberAuthority, type MemberRemoval, type ServiceRow, type UsersStore, type SessionsStore, type PrincipalsStore, type TeamsStore, type RolesStore, type ServicesStore } from "./store/identity.ts";
 // The identity groups' row types and interfaces live in store/identity.ts for the Postgres store (#807 P3 C3a);
 // re-exported for every importer.
 export { DEV_SESSION_LABEL, TEAM_POLICIES } from "./store/identity.ts";
-export type { User, IdpSignIn, Session, PrincipalRow, Team, TeamPolicy, TeamRole, TeamMember, RoleBinding, RoleAuthority, RoleGrant, RoleRevoke, MemberAuthority, MemberRemoval, RoleFilter, ServiceRow, UsersStore, SessionsStore, PrincipalsStore, TeamsStore, RolesStore, ServicesStore, JsonValue, AuditFields, IdentityGroups } from "./store/identity.ts";
+export type { User, IdpSignIn, Session, PrincipalRow, Team, TeamPolicy, TeamRole, TeamMember, RoleBinding, InvokeBinding, RoleAuthority, RoleGrant, RoleRevoke, MemberAuthority, MemberRemoval, RoleFilter, ServiceRow, UsersStore, SessionsStore, PrincipalsStore, TeamsStore, RolesStore, ServicesStore, JsonValue, AuditFields, IdentityGroups } from "./store/identity.ts";
 
 // Row types
 // Every read of a user row goes through this, so `kind` is never missing (a "SELECT *" would type-check without it).
@@ -70,6 +70,8 @@ export type SlackLink = { user_id: number; email: string; slack_user: string; dm
 // (message id for dm, post id for board). peer: the other party in a dm.
 // last_id: the newest grayboard id in the thread, the parent for a reply.
 export type SlackThread = { thread_ts: string; kind: "dm" | "board"; board: string | null; root_id: number; peer: string | null; last_id: number };
+// A post on a service's board (#270 D6): its author address, board and the board's scope.
+export type ServicePost = { author: string; board: string; scope: string };
 export type AccessLogRow = { at: number; actor: string | null; action: string; target: string | null; detail: string | null };
 // An append write's receipt (#254, src/server/write_dedup.ts): which row the
 // first call made and the result it answered, so a repeat replays it.
@@ -478,8 +480,9 @@ export interface Repo {
       files?: MessageFiles, senderId?: string | null, via?: string | null, senderUser?: string | null,
     ): Promise<MessageRow>;
     // The writer's signed-in user of each message and post that has one
-    // recorded (rows from before F-10, bounces and system posts have none).
-    writerUsers(r: Read, messageIds: number[], postIds: number[]): Promise<{ messages: Map<number, string>; posts: Map<number, string> }>;
+    // recorded (rows from before F-10, bounces and system posts have none);
+    // and of each post on a service's board (#270 D6), its author address and board, which wake.service_invoke judges.
+    writerUsers(r: Read, messageIds: number[], postIds: number[]): Promise<{ messages: Map<number, string>; posts: Map<number, string>; servicePosts: Map<number, ServicePost> }>;
     // Which of these messages `delegate` wrote: each has a delegation.requested row targeting its recipient (#256).
     delegationIds(r: Read, messageIds: number[]): Promise<Set<number>>;
     // The row alone, without its attachments: an access or ack check.
@@ -1110,6 +1113,26 @@ function upsertUser(db: Database, email: string, displayName: string | null, now
   })();
 }
 
+// A principal's service_invoke binding on a service (#270 D6), one statement driven from the holder's name (?1, kind
+// ?2) and the service's (?3): its own binding, and for a user each team principal reached from team_members by user
+// (team_members_user, then idx_principals_team), each probing idx_role_bindings_scoped: 1 + the holder's team count
+// probes, never a scan of the service's holders (principle 13). CROSS JOIN fixes that order, so the planner can't drive
+// from role_bindings (db.test.ts checks the plan). Its own binding first, then the lowest team name: the decision row
+// names the same binding every time.
+export const INVOKE_BINDING_SQL = `SELECT id, team FROM (
+         SELECT b.id AS id, NULL AS team
+           FROM principals h CROSS JOIN principals s ON s.name = ?3 AND s.kind = 'service'
+           CROSS JOIN role_bindings b ON b.principal_id = h.id AND b.role = 'service_invoke' AND b.scope_id = s.id
+          WHERE h.name = ?1 AND h.kind = ?2
+         UNION ALL
+         SELECT b.id, pt.name
+           FROM principals h CROSS JOIN team_members tm ON tm.user_id = h.user_id
+           CROSS JOIN principals pt ON pt.team_id = tm.team_id AND pt.kind = 'team'
+           CROSS JOIN principals s ON s.name = ?3 AND s.kind = 'service'
+           CROSS JOIN role_bindings b ON b.principal_id = pt.id AND b.role = 'service_invoke' AND b.scope_id = s.id
+          WHERE ?2 = 'user' AND h.name = ?1 AND h.kind = 'user')
+       ORDER BY team IS NOT NULL, team LIMIT 1`;
+
 function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLimits, attachmentUserQuota: number, clock: () => number = Date.now): Repo {
   const att = (c: Database, rows: MessageRow[]) => withAttachments(c, "message", rows);
   // Role bindings (#927). Every read and write is one statement on the caller's handle; grant and revoke re-check
@@ -1184,6 +1207,9 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       `SELECT b.id FROM role_bindings b JOIN principals p ON p.id = b.principal_id AND p.kind = 'user' AND p.user_id = ?
         WHERE b.role = ? AND ${teamId === null ? "b.scope_id IS NULL" : "b.scope_id = (SELECT id FROM principals WHERE kind = 'team' AND team_id = ?)"}`,
     ).get(...(teamId === null ? [userId, role] : [userId, role, teamId]))?.id;
+  // A principal's service_invoke binding on a service (#270 D6): INVOKE_BINDING_SQL.
+  const invokeBinding = (c: Database, holder: Principal, service: string): InvokeBinding | undefined =>
+    c.query<InvokeBinding, [string, string, string]>(INVOKE_BINDING_SQL).get(holder.name, holder.kind, service) ?? undefined;
   // Whether two users share a team whose policy is one of `policies`: one indexed lookup (principle 11).
   // Whether two users share a team, of one of these policies when given (#807 P3 A7e3: none for shareAny).
   const sharePolicy = (c: Database, userA: number, userB: number, policies?: readonly TeamPolicy[]): boolean =>
@@ -1541,6 +1567,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       teamByName: name => teamByName(db, name),
       isMember: (teamId, userId) => isMember(db, teamId, userId),
       roleBinding: (userId, role, teamId) => roleBinding(db, userId, role, teamId),
+      invokeBinding: (holder, service) => invokeBinding(db, holder, service),
       shareAny: (userA, userB) => sharePolicy(db, userA, userB),
       shareCollaborative: (userA, userB) => shareCollaborative(db, userA, userB),
       shareDelegating: (userA, userB) => shareDelegating(db, userA, userB),
@@ -1851,6 +1878,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
         ).get(...(scope === null ? [holder, role] : [holder, role, scope])) ?? undefined;
       },
       async bindingOf(r, userId, role, teamId) { return roleBinding(sqliteOf(r), userId, role, teamId); },
+      async invokeBinding(r, holder, service) { return invokeBinding(sqliteOf(r), holder, service); },
       async list(r, f, after, limit) {
         const where = ["b.id > ?"], args: (string | number)[] = [after];
         if (f.role !== undefined) { where.push("b.role = ?"); args.push(f.role); }
@@ -1921,7 +1949,12 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
         const pairs = (table: "messages" | "posts", column: "sender_user" | "author_user", ids: number[]) => new Map(ids.length === 0 ? [] :
           c.query<{ id: number; user: string }, [string]>(`SELECT id, ${column} AS user FROM ${table} WHERE id IN (SELECT value FROM json_each(?)) AND ${column} IS NOT NULL`)
             .all(JSON.stringify(ids)).map((r) => [r.id, r.user] as const));
-        return { messages: pairs("messages", "sender_user", messageIds), posts: pairs("posts", "author_user", postIds) };
+        const servicePosts = new Map(postIds.length === 0 ? [] :
+          c.query<{ id: number; author: string; board: string; scope: string }, [string]>(
+            `SELECT p.id, p.author, p.board, b.scope FROM posts p JOIN boards b ON b.name = p.board
+              WHERE p.id IN (SELECT value FROM json_each(?)) AND b.scope LIKE 'service:%'`,
+          ).all(JSON.stringify(postIds)).map(({ id, ...f }) => [id, f] as const));
+        return { messages: pairs("messages", "sender_user", messageIds), posts: pairs("posts", "author_user", postIds), servicePosts };
       },
       // The delegation.requested row is written in the message's own
       // transaction on the same clock, so a window around created_at bounds
