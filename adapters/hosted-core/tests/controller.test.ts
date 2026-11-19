@@ -418,6 +418,21 @@ test.each(modes.flatMap(mode => (["enroll", "resume"] as const).map(how => [mode
   expect(r.root(c)?.failure).toBeUndefined();
   await closing;
 });
+// #1312: a start whose access ends in a sign-out pauses its root, as the run loop does; `expired` (a token the host
+// rotates itself) doesn't: past the rotation grace it ends `approved`, since no awaitRefresh would wake a paused root.
+test.each(modes.flatMap(mode => (["enroll", "resume"] as const).flatMap(how => ([["expired", "approved"], ["login_required", "paused"]] as const).map(([reason, state]) => [mode, how, reason, state] as const))))("a start that ends on AccessExpired pauses only on a sign-out (#1312, %s, %s, %s)", async (mode, how, reason, state) => {
+  const r = runtime(mode);
+  if (how === "resume") { await r.controller.enroll("R", ["be"], true); await until(() => r.root(r.controller)?.state === "active"); await r.controller.close(); }
+  let waits = 0;
+  const c = r.make({ wait: async () => { waits++; } });
+  r.expireAccess(reason);
+  try {
+    await (how === "resume" ? c.resume("R") : c.enroll("R"));
+    expect(r.root(c)?.state).toBe(state);
+    // `expired` ran out the rotation grace first; a sign-out ends at once.
+    if (reason === "expired") expect(waits).toBeGreaterThan(0); else expect(waits).toBe(0);
+  } finally { await c.close(); }
+});
 // #1294 audit M-1: pi, omp and the Claude Code plugin stop through RootDelivery, which shuts the session down
 // (queued behind the start) before it closes: the shutdown itself ends the start's wire, and its release still runs.
 test.each(modes.flatMap(mode => (["enroll", "enroll with a name", "resume"] as const).map(how => [mode, how] as const)))("shutdown then close ends a start's wire still connecting at once and still releases (#1294, %s, %s)", async (mode, how) => {
