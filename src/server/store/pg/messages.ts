@@ -11,7 +11,8 @@
 //     a send that loses an upload to another send refuses before it writes.
 //   - retract locks the message FOR UPDATE, reads delivered_at from the locked row, then reads the cursor and the
 //     reply check in a later statement: a reply's FK or parent lock, an ack's FOR KEY SHARE and a delivery stamp each
-//     make it wait, and it then answers "replied" or "read" instead of failing 23503 or deleting past a stamp.
+//     make it wait. A reply or a stamp committed first answers "replied" or "read" instead of failing 23503 or
+//     deleting past a stamp; an ack committed first is deleted with the message, and retract answers "retracted".
 //   - ack inserts through FOR KEY SHARE of the message: an ack racing a retract either lands before the retract's
 //     ack delete or finds no message, so no dm_acks row outlives its message (dm_acks has no FK).
 //   - prune locks its batch FOR UPDATE, by id, first: a reply inserted under an old parent makes it wait, and its

@@ -12,6 +12,7 @@ import { MESSAGE_LIMITS } from "../messages.contract.ts";
 import type { Tx } from "../tx_base.ts";
 import { makePgMessages } from "./messages.ts";
 import { int8, int8OrNull } from "./sql.ts";
+import { pgOf } from "./tx.ts";
 
 const T0 = 1_800_000_000_000;
 const A = "a@example.com/fe", B = "b@example.com/be";
@@ -112,6 +113,24 @@ describePg("messages store races (Postgres)", () => {
       expect(await ackRows(p)).toEqual([]);
       expect(r.waited).toBe(true);
     }
+  });
+
+  // Mutation: retract's cursor read moved into its locked statement (that statement's snapshot predates A's cursor
+  // write, and the lock wait re-checks only the message row, so B retracts a message its recipient has read).
+  test("T-C5-10b: an ack and a cursor move past the message, then a retract: the retract answers read and the message stays", async () => {
+    now = T0;
+    await using p = await pgPair();
+    const m = await root(p);
+    // The ack's FOR KEY SHARE makes the retract wait; the cursor write commits with it.
+    const r = await race(p, async tx => {
+      await ms.ack(tx, B, m.id);
+      await pgOf(tx)`INSERT INTO mailbox_cursors (address, stream_type, stream_ref, last_seen_id) VALUES (${B}, 'direct', ${B}, ${m.id})`;
+    }, retract(m.id));
+    committed(r.a);
+    expect(outcome(r.b)).toBe("read");
+    expect(await messageRows(p)).toEqual([{ id: m.id, parent_id: null, body: "root" }]);
+    expect(await ackRows(p)).toEqual([{ reader: B, message_id: m.id }]);
+    expect(r.waited).toBe(true);
   });
 
   // Mutations: the message inserted before the uploads are checked (the loser's message row stays when its caller

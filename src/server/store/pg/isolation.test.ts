@@ -20,8 +20,9 @@ function runtimeImports(text: string): string[] {
   return specs;
 }
 
-// Every path from `roots` that reaches bun:sqlite or the SQLite store, as "a -> b -> spec" chains.
-function forbiddenReach(roots: string[]): string[] {
+// Every path from `roots` that reaches bun:sqlite or a `forbidden` module (by default the SQLite store), as
+// "a -> b -> spec" chains.
+function forbiddenReach(roots: string[], forbidden: ReadonlySet<string> = new Set([SQLITE_STORE])): string[] {
   const offenders: string[] = [];
   const seen = new Set<string>();
   const visit = (file: string, chain: string[]) => {
@@ -33,7 +34,7 @@ function forbiddenReach(roots: string[]): string[] {
       if (!spec.startsWith(".")) continue;
       const target = resolve(dirname(file), spec);
       const path = existsSync(target) ? target : `${target}.ts`;
-      if (path === SQLITE_STORE) { offenders.push([...here, relative(SRC, path)].join(" -> ")); continue; }
+      if (forbidden.has(path)) { offenders.push([...here, relative(SRC, path)].join(" -> ")); continue; }
       if (!existsSync(path)) throw new Error(`${relative(SRC, file)}: unresolved import ${spec}`);
       visit(path, here);
     }
@@ -93,11 +94,9 @@ test("the walk follows relative imports and skips type-only ones", () => {
 
 // #807 P3 C5 decision 11: the Postgres stores restate core's board and attachment SQL. core/boards.ts and
 // core/attachments.ts run statements on a bun:sqlite Database (type-only, so the walk above passes them); a pg module
-// importing one at runtime would be calling SQLite code with a Postgres handle.
-test("no non-test module under src/server/store/pg/ imports core/boards.ts or core/attachments.ts at runtime", () => {
+// importing one at runtime, directly or through a module that re-exports it, would be calling SQLite code with a
+// Postgres handle.
+test("no non-test module under src/server/store/pg/ reaches core/boards.ts or core/attachments.ts at runtime, even transitively", () => {
   const core = new Set(["core/boards.ts", "core/attachments.ts"].map(p => join(SRC, p)));
-  const hits = pgModules().flatMap(file => runtimeImports(readFileSync(file, "utf8"))
-    .filter(spec => spec.startsWith(".") && core.has(resolve(dirname(file), spec)))
-    .map(spec => `${relative(SRC, file)} -> ${spec}`));
-  expect(hits).toEqual([]);
+  expect(forbiddenReach(pgModules(), core)).toEqual([]);
 });

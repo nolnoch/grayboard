@@ -4,57 +4,25 @@
 // The end state is asserted before the wait, so a race whose lock or savepoint is gone fails on what it broke (zero
 // owners, an owner who isn't a member, a stray user), not on a timeout. Without GRAYBOARD_TEST_PG_URL they skip.
 import { expect, test } from "bun:test";
-import { describePg, pgDatabase, type PgDatabase } from "../../../../tests/support/pg.ts";
-import { until } from "../../../../tests/support/until.ts";
+import { describePg } from "../../../../tests/support/pg.ts";
+import { pgPair, race, type PgPair } from "../../../../tests/support/pg_race.ts";
 import { grantRole, revokeRole, type Granter, type RoleSpec, type RoleStores } from "../../roles.ts";
 import { AuthorityLost, LastOwner, PrincipalTaken } from "../errors.ts";
 import type { MemberAuthority, User } from "../identity.ts";
 import type { Tx } from "../tx_base.ts";
 import { noHosted } from "./hosted_port.ts";
 import { makePgIdentity, ROLE_WRITE_LOCK, type PgIdentity } from "./identity.ts";
-import { makePgTransactions, pgOf, TxAborted, type PgTransactions } from "./tx.ts";
+import { pgOf, TxAborted } from "./tx.ts";
 
 const G = "https://accounts.google.com", OKTA = "https://example.okta.com";
 const A = "a@example.com", B = "b@example.com", C = "c@example.com", D = "d@example.com";
 const NONE = (u: User): Granter => ({ email: u.email, userId: u.id, authority: "none" });
 const spec = (holder: string, role: RoleSpec["role"], scope: string | null): RoleSpec => ({ holder, role, scope });
 
-type Pair = { db: PgDatabase; a: PgTransactions; b: PgTransactions; g: PgIdentity; [Symbol.asyncDispose](): Promise<void> };
+type Pair = PgPair & { g: PgIdentity };
 
 async function pair(): Promise<Pair> {
-  const db = await pgDatabase({ max: 2 });
-  const a = makePgTransactions(db.url, { max: 2, applicationName: "gb-test-a" });
-  const b = makePgTransactions(db.url, { max: 2, applicationName: "gb-test-b" });
-  return {
-    db, a, b, g: makePgIdentity({ now: Date.now, hosted: noHosted }),
-    async [Symbol.asyncDispose]() { await a.close(); await b.close(); await db[Symbol.asyncDispose](); },
-  };
-}
-
-function gate(): { wait: Promise<void>; open(): void } {
-  let open!: () => void;
-  const wait = new Promise<void>(r => { open = r; });
-  return { wait, open };
-}
-
-type Settled<T> = { ok: true; value: T } | { ok: false; error: any };
-const settle = <T>(p: Promise<T>): Promise<Settled<T>> => p.then(value => ({ ok: true as const, value }), error => ({ ok: false as const, error }));
-
-// `first` runs on store A and holds its transaction open after its body; `second` runs on store B. `waited`: B was
-// seen blocked on a lock while A held.
-async function race<TA, TB>(p: Pair, first: (tx: Tx) => Promise<TA>, second: (tx: Tx) => Promise<TB>): Promise<{ a: Settled<TA>; b: Settled<TB>; waited: boolean }> {
-  const held = gate(), release = gate();
-  const a = settle(p.a.write(async tx => { const v = await first(tx); held.open(); await release.wait; return v; }));
-  // A body that fails before holding settles A instead.
-  await Promise.race([held.wait, a]);
-  let done = false, waited = false;
-  const b = settle(p.b.write(second)).finally(() => { done = true; });
-  await until(async () => {
-    if ((await p.db.sql`SELECT 1 FROM pg_stat_activity WHERE application_name = 'gb-test-b' AND wait_event_type = 'Lock'`).length > 0) waited = true;
-    return waited || done;
-  }, 5000, "B blocked on a lock, or settled");
-  release.open();
-  return { a: await a, b: await b, waited };
+  return Object.assign(await pgPair(), { g: makePgIdentity({ now: Date.now, hosted: noHosted }) });
 }
 
 async function caught(f: () => Promise<unknown>): Promise<unknown> {
