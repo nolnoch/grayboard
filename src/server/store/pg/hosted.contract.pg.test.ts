@@ -15,7 +15,7 @@ import type { Tx } from "../tx_base.ts";
 import { HOSTED_CAP_LOCK, makePgHosted } from "./hosted.ts";
 import { makePgHostedEnds } from "./hosted_port.ts";
 import { int8, int8OrNull } from "./sql.ts";
-import { makePgTransactions, type PgTransactions } from "./tx.ts";
+import { makePgTransactions, pgOf, type PgTransactions } from "./tx.ts";
 
 // Above the pool's 5 s lock_timeout, so a row that waits on a lock it shouldn't fails on 55P03, not on bun's timeout.
 setDefaultTimeout(30_000);
@@ -41,7 +41,7 @@ async function openPgHosted(): Promise<PgHosted> {
     async seedIds(id, f = {}) {
       // held_aliases_json is the JSON text; cast through text so it's parsed, not stored as a string scalar.
       await sql`INSERT INTO ids (id, started_at, last_seen, root_id, ended_at, held_aliases_json, writes_as, launcher)
-        VALUES (${id}, 0, 0, ${f.rootId ?? null}::text, ${f.endedAt ?? null}::int8, ${f.heldAliasesJson ?? null}::text::jsonb, ${f.writesAs ?? null}::text, ${f.launcher ?? false})`;
+        VALUES (${id}, 0, 0, ${f.rootId ?? null}::text, ${f.endedAt ?? null}::int8, ${f.heldAliasesJson ?? null}::text::jsonb, ${f.writesAs ?? null}::text, ${f.launcher === undefined ? false : f.launcher})`;
     },
     async seedHold(address, id, boundAt) { await sql`INSERT INTO alias_holds (address, id, bound_at) VALUES (${address}, ${id}, ${boundAt})`; },
     async ids(id) {
@@ -228,5 +228,98 @@ describePg("hosted store (Postgres): beyond the contract", () => {
     expect(await h.write(async tx => { await h.hosted.lockCapacity(tx); return h.hosted.park(tx, "c", T0 + 50, T0 + 1); })).toBe(true);
     expect(await h.write(async tx => { await h.hosted.lockCapacity(tx); return h.hosted.end(tx, "r", "idle", T0 + 60, undefined, T0 + 1); })).toBe(true);
     expect(h.hosted.takeEnded().map(e => e.id)).toEqual(["c"]);
+  });
+
+  // Past its own row, a capped end takes what it writes (its ownership's other rows, its holds) and the ids rows it or
+  // the port writes first (its own, its children's) SKIP LOCKED: one held elsewhere refuses the end before any write,
+  // at once, not after the pool's 5 s lock_timeout. A capped childEnd does the same for its child's ids row.
+  withStore("under the capacity lock, an end whose child, hold or ids row another transaction holds returns false at once and writes nothing", async h => {
+    const u = await h.seedUser(ME);
+    const r = await root(h, "r", u, { lease_deadline: T0 + 1_000 });
+    await child(h, "c", r);
+    await h.seedIds("r", { writesAs: `${ME}/fe`, launcher: true });
+    await h.seedIds("c", { rootId: "r" });
+    await h.seedHold(`${ME}/fe`, "r", T0);
+    const audits = (await h.auditRows()).length;
+    const held = async (what: string, hold: string, call: (tx: Tx) => Promise<unknown>) => {
+      const other = await h.db.sql.reserve();
+      try {
+        await other`BEGIN`;
+        await other.unsafe(hold);
+        const start = performance.now();
+        const got = await h.write(async tx => { await h.hosted.lockCapacity(tx); return call(tx); });
+        return `${what}: ${got} ${performance.now() - start < 1_000 ? "at once" : "after a wait"}`;
+      } finally {
+        await other`ROLLBACK`;
+        other.release();
+      }
+    };
+    const end = (tx: Tx) => h.hosted.end(tx, "r", "closed", T0 + 50);
+    expect([
+      await held("child", "SELECT 1 FROM hosted_sessions WHERE session_id = 'c' FOR UPDATE", end),
+      await held("hold", "SELECT 1 FROM alias_holds WHERE id = 'r' FOR UPDATE", end),
+      await held("root's ids", "SELECT 1 FROM ids WHERE id = 'r' FOR UPDATE", end),
+      await held("child's ids", "SELECT 1 FROM ids WHERE id = 'c' FOR UPDATE", end),
+      await held("childEnd, child's ids", "SELECT 1 FROM ids WHERE id = 'c' FOR UPDATE", tx => h.hosted.childEnd(tx, "c", T0 + 50, "closed")),
+    ]).toEqual(["child: false at once", "hold: false at once", "root's ids: false at once", "child's ids: false at once", "childEnd, child's ids: undefined at once"]);
+    expect((await h.hosted.get(h.read, "r"))?.session_id).toBe("r");
+    expect((await h.hosted.get(h.read, "c"))?.session_id).toBe("c");
+    expect(await h.ownership(r.ownership_id)).toMatchObject({ ended_at: null });
+    expect(await h.ids("r")).toMatchObject({ writes_as: `${ME}/fe`, launcher: true });
+    expect(await h.holdRows()).toEqual([{ address: `${ME}/fe`, id: "r" }]);
+    expect(await h.bindingRows()).toEqual([]);
+    expect((await h.auditRows()).length).toBe(audits);
+    expect(h.ended.calls).toEqual([]);
+    expect(h.hosted.takeEnded()).toEqual([]);
+    // Nothing held: the capped end acts.
+    expect(await h.write(async tx => { await h.hosted.lockCapacity(tx); return end(tx); })).toBe(true);
+    expect(h.hosted.takeEnded().map(e => e.id)).toEqual(["c"]);
+  });
+
+  // Outside the capacity lock, nothing is skipped: an end and a park wait for the row (here until a short
+  // lock_timeout), where a skip would return false at once.
+  withStore("outside the capacity lock, end and park wait on a row another transaction holds", async h => {
+    const u = await h.seedUser(ME);
+    const r = await root(h, "r", u, { last_seen_at: T0 });
+    await child(h, "c", r, { last_seen_at: T0 });
+    const other = await h.db.sql.reserve();
+    const waits = async (call: (tx: Tx) => Promise<unknown>) => {
+      try {
+        return `returned ${await h.write(async tx => { await pgOf(tx)`SET LOCAL lock_timeout = '200ms'`; return call(tx); })}`;
+      } catch (e) { return String((e as { errno?: string }).errno ?? (e as { cause?: { errno?: string } }).cause?.errno ?? e); }
+    };
+    try {
+      await other`BEGIN`;
+      await other`SELECT 1 FROM hosted_sessions WHERE session_id IN ('r', 'c') FOR UPDATE`;
+      expect([
+        await waits(tx => h.hosted.end(tx, "r", "idle", T0 + 50, undefined, T0 + 1)),
+        await waits(tx => h.hosted.park(tx, "c", T0 + 50, T0 + 1)),
+      ]).toEqual(["55P03", "55P03"]);
+    } finally {
+      await other`ROLLBACK`;
+      other.release();
+    }
+    expect((await h.hosted.get(h.read, "r"))?.session_id).toBe("r");
+    expect((await h.hosted.get(h.read, "c"))?.parked_at).toBeNull();
+  });
+
+  // The bounces the port's end wrote, from the child at the end's time; a non-bounce from it at that time, and a bounce
+  // from before, are not its.
+  withStore("an ended child's bounces reach takeEnded as MessageRows: bounce rows from the child at its end's time, pending as 0 or 1", async h => {
+    const u = await h.seedUser(ME);
+    const r = await root(h, "r", u);
+    await child(h, "c", r);
+    await h.seedIds("c", { rootId: "r" });
+    await h.db.sql`INSERT INTO messages (sender, recipient_type, recipient, body, created_at, kind) VALUES ('c', 'user', 'x', 'earlier', ${T0}, 'bounce')`;
+    h.ended.bounceOnEnd();
+    await h.write(tx => h.hosted.childEnd(tx, "c", T0 + 5, "closed"));
+    const idOf = async (body: string) => int8((await h.db.sql`SELECT id FROM messages WHERE body = ${body}`)[0].id);
+    const [ended] = h.hosted.takeEnded();
+    const msg = { sender: "c", recipient_type: "user", parent_id: null, created_at: T0 + 5, delivered_at: null, kind: "bounce", via: null } as const;
+    expect(ended!.bounces).toEqual([
+      { ...msg, id: await idOf("bounced"), recipient: "them@example.com/a", body: "bounced", pending: 1 },
+      { ...msg, id: await idOf("bounced too"), recipient: "them@example.com/b", body: "bounced too", pending: 0 },
+    ]);
+    expect(ended!.bounces.map(b => typeof b.id)).toEqual(["number", "number"]);
   });
 });

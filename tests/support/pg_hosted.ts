@@ -42,20 +42,30 @@ export function hostedRecorder() {
   return { port, ended, problems, failNext() { fail = true; } };
 }
 
-// The session end as a recorder (#807 P3 C8 decision 4): marks the ID's `ids.ended_at` on the caller's Tx, as core
-// endSession does, and wakes nobody. An ID already ended isn't ended again; one with no ids row ends (endSession's
-// rule). `calls` lists every call, committed or not, in order.
+// The session end as a recorder (#807 P3 C8 decision 4): marks the ID's `ids.ended_at` on the caller's Tx and writes
+// its id.ended row through the audit sink it is handed, as core endSession does (the detail's principal, held, why and
+// bounced), and wakes nobody. An ID already ended isn't ended again; one with no ids row ends (endSession's rule).
+// `calls` lists every call, committed or not, in order. `bounceOnEnd()`: each later end also writes, from the ID at
+// its `now`, two bounces (pending and not) and a direct message, so the store's bounce read has rows to pick from.
 export function sessionEndRecorder() {
   const calls: { id: string; why: string; now: number }[] = [];
+  let bounce = false;
   const port: PgSessionEndPort = {
-    async end(tx, id, { why, now }) {
+    async end(tx, id, { why, now, audit }) {
       const sql = pgOf(tx);
       calls.push({ id, why, now });
-      const [row] = await sql`SELECT ended_at FROM ids WHERE id = ${id} FOR UPDATE`;
+      const [row] = await sql`SELECT ended_at, principal FROM ids WHERE id = ${id} FOR UPDATE`;
       if (row && row.ended_at !== null) return { ended: false, held: [], wake: [] };
       await sql`UPDATE ids SET ended_at = ${now} WHERE id = ${id}`;
+      if (bounce) {
+        await sql`INSERT INTO messages (sender, recipient_type, recipient, body, created_at, pending, kind) VALUES
+          (${id}, 'user', 'them@example.com/a', 'bounced', ${now}, true, 'bounce'),
+          (${id}, 'user', ${id}, 'not bounced', ${now}, false, NULL),
+          (${id}, 'user', 'them@example.com/b', 'bounced too', ${now}, false, 'bounce')`;
+      }
+      audit("id.ended", id, id, { principal: (row?.principal as string | null | undefined) ?? null, held: [], why, bounced: 0 });
       return { ended: true, held: [], wake: [] };
     },
   };
-  return { port, calls };
+  return { port, calls, bounceOnEnd() { bounce = true; } };
 }

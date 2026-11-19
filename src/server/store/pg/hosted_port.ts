@@ -30,9 +30,11 @@ export const noHosted: PgHostedEnds = { endForGrant: async () => {}, endForUser:
 
 // The session end the Postgres hosted store ends a released child's ID through (#807 P3 C8 decision 7): Repo's
 // `sessionEnd.end` signature (db.ts), restated here so the store needs nothing of db.ts. The real one is the Postgres
-// session end (C10d2), which C11 wires; tests pass a recorder (tests/support/pg_hosted.ts).
+// session end (C10d2), which C11 wires; tests pass a recorder (tests/support/pg_hosted.ts). `audit` is required: core
+// endSession writes id.ended to audit_log without one, a table Postgres doesn't have, so the store always passes the
+// sink that writes it to access_log (pg/audit.ts pgCoreAuditSink, db.ts coreAudit's), and the port writes through it.
 export type PgSessionEndPort = {
-  end(tx: Tx, id: string, opts: { why: string; now: number; audit?: AuditSink }): Promise<EndedSession>;
+  end(tx: Tx, id: string, opts: { why: string; now: number; audit: AuditSink }): Promise<EndedSession>;
 };
 
 // The revokes' ends over the hosted store's `end`: every root on the grant, or of the user, locked in session_id order

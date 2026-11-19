@@ -9,11 +9,17 @@
 //   (deadline, idle cutoff, an eviction's parked_at) reads the row as a renewal or touch committed it. A missing row, a
 //   child passed to `end` or a failed guard returns false having written nothing.
 // - Under the capacity lock (the nested sweep inside hosted.ts `full()`), `end`, `childEnd` and `park` take their row
-//   FOR UPDATE SKIP LOCKED: a row another body holds is skipped, as a refused guard is, and left to the next tick, so
-//   the one global lock is never held while waiting on a row (a body that holds a root and then wants capacity would
-//   otherwise deadlock against it). The flag is per Tx handle: hosted.ts runs that sweep on the Tx it took the lock on.
+//   FOR UPDATE SKIP LOCKED: a row another body holds is skipped, as a refused guard is, and left to the next tick (a
+//   body that holds a root and then wants capacity would otherwise deadlock against the sweep). Before any write,
+//   `end` then takes the rest of its ownership's hosted_sessions rows, its alias_holds rows, and its own and its
+//   children's ids rows, and `childEnd` its child's ids row, each SKIP LOCKED against an unlocked count: a shortfall
+//   means another body holds one, and the call returns as refused, writing nothing (`dependentsFree`). `park` writes
+//   only its own row. Not bounded: every lock the session-end port takes past those ids rows (core endSession's
+//   claims, messages, aliases and attachments on C10d2's port), so a capped end or childEnd can still wait inside the
+//   port. The flag is per Tx handle: hosted.ts runs that sweep on the Tx it took the lock on.
 // - A released child's ID ends through the injected session-end port (hosted_port.ts PgSessionEndPort, C10d2's), on
-//   the caller's Tx; its wakes and bounces reach `takeEnded` after commit (afterCommitOf), never on rollback.
+//   the caller's Tx, with an audit sink that writes its id.ended row to access_log as db.ts coreAudit does on SQLite;
+//   its wakes and bounces reach `takeEnded` after commit (afterCommitOf), never on rollback.
 // - The lost-hold takes are one UPDATE … RETURNING each, ordered by (at, seq) in JS: `seq` stands for SQLite's rowid.
 // - int8 columns through the mappers, booleans as booleans, `held_aliases_json` jsonb; SQLite's unary-`+` planner
 //   hints are dropped (42883 here); text columns are COLLATE "C", so ORDER BY matches SQLite's binary order.
@@ -28,6 +34,7 @@ import type { EndedChild, HostedLost, HostedSession, LostReader } from "../../ho
 import type { HostedPatch, HostedStore } from "../hosted.ts";
 import type { MessageRow } from "../messages.ts";
 import { afterCommitOf, isTx, type Read, type Tx } from "../tx_base.ts";
+import { pgCoreAuditSink } from "./audit.ts";
 import { insertAudit } from "./audit_row.ts";
 import type { PgSessionEndPort } from "./hosted_port.ts";
 import type { AuditDetail } from "./sql.ts";
@@ -67,13 +74,31 @@ const toLost = (r: LostRow): HostedLost => ({ alias: r.alias, reason: r.reason, 
 export function makePgHosted({ sessionEnd }: { sessionEnd: PgSessionEndPort }): HostedStore {
   // The child IDs ended since the last take, pushed at their transaction's commit (#475 item 1).
   let ended: EndedChild[] = [];
-  // The Tx handles that took the capacity lock: their end, childEnd and park skip a locked row rather than wait.
+  // The Tx handles that took the capacity lock: their end, childEnd and park skip a locked row rather than wait. Keyed
+  // by the handle, so a savepoint's Tx (a new handle) does not inherit it: its ends would wait. No caller takes
+  // capacity and then ends inside a savepoint of that Tx (hosted.ts `full()` sweeps on the Tx it locked on).
   const capped = new WeakSet<Tx>();
   const lockOn = (tx: Tx): PgSql => { const sql = pgOf(tx); if (!isTx(tx)) throw new Error("a hosted lock needs the body's Tx, not a pool Read"); return sql; };
   // The row, locked to the transaction's end; under the capacity lock, undefined when another body holds it.
   const lockRow = (sql: PgSql, tx: Tx, id: string) => capped.has(tx)
     ? one(sql`SELECT ${cols(sql)} FROM hosted_sessions WHERE session_id = ${id} FOR UPDATE SKIP LOCKED`)
     : one(sql`SELECT ${cols(sql)} FROM hosted_sessions WHERE session_id = ${id} FOR UPDATE`);
+  // Under the capacity lock, before any write: the rows an end writes past its own, and the ids rows it or the port
+  // writes first, each locked SKIP LOCKED and counted against an unlocked count taken before it. False when one is
+  // held elsewhere (a row inserted between the count and the lock only adds to what is locked). `ownership`: a root's,
+  // whose hosted_sessions rows (its children) and alias_holds rows (`holder`'s) end with it.
+  const dependentsFree = async (sql: PgSql, ids: string[], ownership?: { id: number; holder: string }): Promise<boolean> => {
+    if (ownership) {
+      const [{ n: rows }] = await sql`SELECT count(*)::int AS n FROM hosted_sessions WHERE ownership_id = ${ownership.id}`;
+      const kids: Row[] = await sql`SELECT session_id FROM hosted_sessions WHERE ownership_id = ${ownership.id} FOR UPDATE SKIP LOCKED`;
+      if (kids.length < rows) return false;
+      for (const k of kids) if (k.session_id !== ownership.holder) ids = [...ids, k.session_id as string];
+      const [{ n: holds }] = await sql`SELECT count(*)::int AS n FROM alias_holds WHERE id = ${ownership.holder}`;
+      if ((await sql`SELECT 1 FROM alias_holds WHERE id = ${ownership.holder} FOR UPDATE SKIP LOCKED`).length < holds) return false;
+    }
+    const [{ n }] = await sql`SELECT count(*)::int AS n FROM ids WHERE id = ANY(${ids}::text[])`;
+    return (await sql`SELECT 1 FROM ids WHERE id = ANY(${ids}::text[]) FOR UPDATE SKIP LOCKED`).length >= n;
+  };
 
   // db.ts hostedWrites' audit: the session's latest ownership names the actor and the client.
   const audit = async (sql: PgSql, session: string, action: AuditAction, detail: AuditDetail, now: number) => {
@@ -84,7 +109,7 @@ export function makePgHosted({ sessionEnd }: { sessionEnd: PgSessionEndPort }): 
   // A released child's ID ends in the release's transaction, with its reason (#475 item 1); its wakes and bounces are
   // queued at commit, so a rolled-back release wakes nobody and bounces nothing.
   const endChild = async (tx: Tx, sql: PgSql, child: string, why: string, now: number) => {
-    const end = await sessionEnd.end(tx, child, { why, now });
+    const end = await sessionEnd.end(tx, child, { why, now, audit: pgCoreAuditSink(tx, now) });
     if (!end.ended) return;
     const bounces = (await sql`SELECT id, sender, recipient_type, recipient, body, parent_id, created_at, delivered_at, pending, kind, via
       FROM messages WHERE sender = ${child} AND kind = 'bounce' AND created_at >= ${now} ORDER BY id`).map(toMessage);
@@ -192,6 +217,7 @@ export function makePgHosted({ sessionEnd }: { sessionEnd: PgSessionEndPort }): 
       const row = await lockRow(sql, tx, session);
       if (!row || row.root_session_id || (deadline !== undefined && row.lease_deadline !== deadline)) return false;
       if (idleBefore !== undefined && !(row.last_seen_at < idleBefore)) return false;
+      if (capped.has(tx) && !(await dependentsFree(sql, [session], { id: row.ownership_id, holder: session }))) return false;
       await testPauseAsync(reason === "expired" ? "hosted:lease-expire:in-txn" : "hosted:release:in-txn");
       const children = (await sessions(sql`DELETE FROM hosted_sessions WHERE ownership_id = ${row.ownership_id} RETURNING ${cols(sql)}`)).sort(byStart);
       await sql`UPDATE hosted_ownerships SET ended_at = ${now}, end_reason = ${reason} WHERE id = ${row.ownership_id} AND ended_at IS NULL`;
@@ -217,6 +243,7 @@ export function makePgHosted({ sessionEnd }: { sessionEnd: PgSessionEndPort }): 
       const row = await lockRow(sql, tx, session);
       // An eviction ends only a child still parked: a request that woke it since the sweep's read keeps it.
       if (!row?.root_session_id || (reason === "evicted" && row.parked_at === null)) return;
+      if (capped.has(tx) && !(await dependentsFree(sql, [session]))) return;
       await sql`DELETE FROM hosted_sessions WHERE session_id = ${session}`;
       await audit(sql, row.root_session_id, "hosted.child_released", { child: session, reason }, now);
       await endChild(tx, sql, session, reason, now);
