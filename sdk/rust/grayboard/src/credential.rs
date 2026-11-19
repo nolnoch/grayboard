@@ -11,9 +11,9 @@ use tokio::time::Instant;
 ///
 /// The methods return boxed `Send` futures so a `Client` can hold an `Arc<dyn Credential>` and its tasks can be spawned; the shape matches hosted-core's `AuthProvider`.
 pub trait Credential: Send + Sync + 'static {
-    /// The token for the next request.
+    /// The token for the next request. A `retryable` error fails the request as `Error::Unreachable`, a terminal one as `Error::Auth`.
     fn token(&self) -> BoxFuture<'_, Result<String, AuthError>>;
-    /// The server answered 401 to `rejected`. Return `Ok` once a fresh token is ready (the request is retried once), or an error to fail it as `Unauthorized`.
+    /// The server answered 401 to `rejected`. Return `Ok` once a fresh token is ready (the request is retried once), or an error to fail it: `Unauthorized` when terminal, `Unreachable` when `retryable`.
     fn unauthorized<'a>(&'a self, rejected: &'a str) -> BoxFuture<'a, Result<(), AuthError>>;
 }
 
@@ -40,8 +40,8 @@ impl Credential for StaticBearer {
     }
     fn unauthorized<'a>(&'a self, _rejected: &'a str) -> BoxFuture<'a, Result<(), AuthError>> {
         Box::pin(async {
-            Err(AuthError(
-                "the server rejected the static bearer token".into(),
+            Err(AuthError::terminal(
+                "the server rejected the static bearer token",
             ))
         })
     }
@@ -56,6 +56,8 @@ const BACKOFF_MAX: Duration = Duration::from_secs(60);
 const WAIT_MAX: Duration = Duration::from_secs(2);
 /// Each metadata, token or revocation request, body included.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(4);
+/// A token's lifetime is clamped to this (the server's own ceiling), so a broken issuer's huge `expires_in` can't overflow an `Instant`.
+const LIFETIME_MAX: Duration = Duration::from_secs(366 * 24 * 60 * 60);
 
 /// A service credential (#270): a `svc_` client ID and its secret, which mint run tokens with the OAuth client-credentials grant, no browser.
 ///
@@ -84,6 +86,8 @@ struct Secret(String);
 struct State {
     endpoints: Option<Endpoints>,
     current: Option<Minted>,
+    /// Tokens `revoke` took out of service whose revocation hasn't succeeded yet: never served again, and retried by the next `revoke`.
+    revoking: Vec<String>,
     /// Set by a terminal refusal; every later call fails with it.
     dead: Option<String>,
     /// While set and in the future, no mint is attempted.
@@ -116,9 +120,11 @@ enum MintError {
 }
 
 impl MintError {
-    fn message(self) -> String {
+    /// As a request's error: a transient failure is `Unreachable`, as the transport classes one.
+    fn into_error(self) -> Error {
         match self {
-            Self::Transient { message, .. } | Self::Terminal(message) => message,
+            Self::Transient { message, .. } => Error::Unreachable(message),
+            Self::Terminal(message) => Error::Auth(AuthError::terminal(message)),
         }
     }
 }
@@ -287,33 +293,42 @@ impl ClientCredentials {
         self
     }
 
-    /// Revokes the current token (RFC 7009, at the server's revocation endpoint with the same Basic auth), so a run's token ends when the run does: its sessions are refused on their next call. Call it after `Session::end`. With no current token nothing is sent; a later `token` mints a new one.
+    /// Revokes the current token (RFC 7009, at the server's revocation endpoint with the same Basic auth), so a run's token ends when the run does: its sessions are refused on their next call. Call it after `Session::end`. The token is out of service from the start, so a later `token` mints a new one; if the revocation fails (`Unreachable`, or `Auth` for a refusal), calling `revoke` again retries the same token. With no token to revoke nothing is sent.
     pub async fn revoke(&self) -> Result<(), Error> {
         let mut s = self.inner.state.lock().await;
-        let Some(current) = s.current.take() else {
+        if let Some(current) = s.current.take() {
+            s.revoking.push(current.token);
+        }
+        if s.revoking.is_empty() {
             return Ok(());
-        };
+        }
         let endpoints = self
             .inner
             .endpoints(&mut s)
             .await
-            .map_err(|e| Error::Auth(AuthError(e.message())))?;
+            .map_err(MintError::into_error)?;
         let Some(url) = endpoints.revocation.clone() else {
-            return Err(Error::Auth(AuthError(
-                "the server's metadata names no revocation endpoint".into(),
+            return Err(Error::Auth(AuthError::terminal(
+                "the server's metadata names no revocation endpoint",
             )));
         };
-        let response = self
-            .inner
-            .post(url, format!("token={}", form_encode(&current.token)))
-            .send()
-            .await
-            .map_err(|e| Error::Unreachable(format!("revoke: {}", e.without_url())))?;
-        if !response.status().is_success() {
-            return Err(Error::Auth(AuthError(format!(
-                "revoke answered HTTP {}",
-                response.status().as_u16()
-            ))));
+        while let Some(token) = s.revoking.first() {
+            let response = self
+                .inner
+                .post(url.clone(), format!("token={}", form_encode(token)))
+                .send()
+                .await
+                .map_err(|e| Error::Unreachable(format!("revoke: {}", e.without_url())))?;
+            let status = response.status();
+            if !status.is_success() {
+                let text = format!("revoke answered HTTP {}", status.as_u16());
+                return Err(if status.as_u16() == 429 || status.is_server_error() {
+                    Error::Unreachable(text)
+                } else {
+                    Error::Auth(AuthError::terminal(text))
+                });
+            }
+            s.revoking.remove(0);
         }
         Ok(())
     }
@@ -435,7 +450,7 @@ impl Inner {
             });
         }
         // Timed from the request's start, so the token's age is never underestimated.
-        let lifetime = Duration::from_secs(issued.expires_in);
+        let lifetime = Duration::from_secs(issued.expires_in).min(LIFETIME_MAX);
         Ok(Minted {
             token: issued.access_token,
             expires_at: started + lifetime,
@@ -457,7 +472,7 @@ impl Inner {
                 let message = format!("the service credential is refused: {message}");
                 s.dead = Some(message.clone());
                 s.current = None;
-                Err(AuthError(message))
+                Err(AuthError::terminal(message))
             }
             Err(MintError::Transient {
                 message,
@@ -472,7 +487,7 @@ impl Inner {
                     .min(BACKOFF_MAX);
                 s.retry_at = Some(Instant::now() + wait);
                 s.last_failure = message.clone();
-                Err(AuthError(message))
+                Err(AuthError::transient(message))
             }
         }
     }
@@ -481,12 +496,12 @@ impl Inner {
     async fn mint_soon(&self, s: &mut State) -> Result<(), AuthError> {
         loop {
             if let Some(dead) = &s.dead {
-                return Err(AuthError(dead.clone()));
+                return Err(AuthError::terminal(dead.clone()));
             }
             if let Some(at) = s.retry_at {
                 let wait = at.saturating_duration_since(Instant::now());
                 if wait > WAIT_MAX {
-                    return Err(AuthError(format!(
+                    return Err(AuthError::transient(format!(
                         "minting a token is backing off for {wait:?} after: {}",
                         s.last_failure
                     )));
@@ -504,7 +519,7 @@ impl Inner {
         // Held across the mint: concurrent callers share one mint and its token.
         let mut s = self.state.lock().await;
         if let Some(dead) = &s.dead {
-            return Err(AuthError(dead.clone()));
+            return Err(AuthError::terminal(dead.clone()));
         }
         let now = Instant::now();
         if let Some(m) = &s.current {
@@ -532,7 +547,7 @@ impl Inner {
     async fn unauthorized(&self, rejected: &str) -> Result<(), AuthError> {
         let mut s = self.state.lock().await;
         if let Some(dead) = &s.dead {
-            return Err(AuthError(dead.clone()));
+            return Err(AuthError::terminal(dead.clone()));
         }
         if let Some(m) = &s.current {
             // Another request already replaced it.
@@ -542,8 +557,8 @@ impl Inner {
             // A token minted to replace a rejected one was rejected too: another mint won't help this request. The next `token` mints afresh.
             if m.replaced_rejected {
                 s.current = None;
-                return Err(AuthError(
-                    "the server rejected a freshly minted token".into(),
+                return Err(AuthError::terminal(
+                    "the server rejected a freshly minted token",
                 ));
             }
         }

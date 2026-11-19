@@ -38,15 +38,38 @@ pub(crate) fn shown_text(text: &str) -> bool {
 }
 
 /// A credential could not produce a token, or refused to replace a rejected one.
+///
+/// `retryable` says whether trying again later can help: a transient failure (the authorization server unreachable, a 5xx, a `slow_down`, a backoff in force) surfaces from a request as `Error::Unreachable`, which the delivery stream rides out as it does a server outage; a terminal one (a refused credential, an issuer mismatch) surfaces as `Error::Auth`, which stops it.
 #[derive(Debug, Clone, thiserror::Error)]
-#[error("{0}")]
-pub struct AuthError(pub String);
+#[error("{message}")]
+pub struct AuthError {
+    pub message: String,
+    pub retryable: bool,
+}
+
+impl AuthError {
+    /// Retrying can't help.
+    pub fn terminal(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            retryable: false,
+        }
+    }
+
+    /// Worth retrying later.
+    pub fn transient(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            retryable: true,
+        }
+    }
+}
 
 /// Everything a request can fail with. Refusals are compared by `code`, never by text.
 #[non_exhaustive]
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// The server can't be reached right now: a connect error, a timeout before the request was sent, or a gateway status (502, 503, 504) on a request that is safe to repeat.
+    /// The server can't be reached right now: a connect error, a timeout before the request was sent, a gateway status (502, 503, 504) on a request that is safe to repeat, or a transient credential failure before anything was sent (`AuthError::retryable`, or the credential giving no token within the request timeout).
     #[error("server unreachable: {0}")]
     Unreachable(String),
     /// A `tools/call` timed out or lost its connection after it was sent: the call may or may not have taken effect, and it is never retried (a repeated `board_post` would post twice).
@@ -97,7 +120,7 @@ pub enum Error {
     /// A caller-supplied value the crate refuses before sending anything (an endpoint, a delivery source).
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
-    /// The credential failed before a request was sent.
+    /// The credential failed terminally before a request was sent (a transient failure is `Unreachable`).
     #[error("credential error: {0}")]
     Auth(#[from] AuthError),
     /// The session was ended or dropped while the request was in flight.

@@ -3,6 +3,7 @@
 use crate::credential::{ClientCredentials, Credential, form_encode};
 use crate::error::Error;
 use serde_json::{Value, json};
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -11,6 +12,8 @@ use tokio::net::TcpListener;
 const ID: &str = "svc_0123456789abcdef0123456789abcdef";
 /// Characters a form encoding must escape, so the test sees that the Basic header encodes them.
 const SECRET: &str = "s3cret+/=:ünïcode-SECRET-VALUE";
+/// `SECRET` form-encoded, by hand.
+const SECRET_ENCODED: &str = "s3cret%2B%2F%3D%3A%C3%BCn%C3%AFcode-SECRET-VALUE";
 
 #[derive(Debug, Clone)]
 struct Seen {
@@ -26,6 +29,8 @@ type Answer = (u16, Vec<(&'static str, String)>, Value);
 struct Auth {
     base: String,
     seen: Arc<Mutex<Vec<Seen>>>,
+    /// Answers for the next POSTs to `/oauth/revoke`, in order; once empty, 200.
+    revoke: Arc<Mutex<VecDeque<Answer>>>,
 }
 
 impl Auth {
@@ -37,14 +42,20 @@ impl Auth {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let seen: Arc<Mutex<Vec<Seen>>> = Arc::default();
+        let revoke: Arc<Mutex<VecDeque<Answer>>> = Arc::default();
         let token = Arc::new(token);
-        let (recorded, b) = (Arc::clone(&seen), base.clone());
+        let (recorded, b, revokes) = (Arc::clone(&seen), base.clone(), Arc::clone(&revoke));
         tokio::spawn(async move {
             loop {
                 let Ok((mut socket, _)) = listener.accept().await else {
                     return;
                 };
-                let (recorded, token, b) = (Arc::clone(&recorded), Arc::clone(&token), b.clone());
+                let (recorded, token, b, revokes) = (
+                    Arc::clone(&recorded),
+                    Arc::clone(&token),
+                    b.clone(),
+                    Arc::clone(&revokes),
+                );
                 tokio::spawn(async move {
                     let Some(req) = read(&mut socket).await else {
                         return;
@@ -60,7 +71,11 @@ impl Auth {
                                 (200, vec![], metadata(&b))
                             }
                             ("POST", "/oauth/token") => token(mints - 1),
-                            ("POST", "/oauth/revoke") => (200, vec![], json!({})),
+                            ("POST", "/oauth/revoke") => revokes
+                                .lock()
+                                .unwrap()
+                                .pop_front()
+                                .unwrap_or((200, vec![], json!({}))),
                             _ => (404, vec![], json!({"error": "not_found"})),
                         };
                     let body = body.to_string();
@@ -78,7 +93,7 @@ impl Auth {
                 });
             }
         });
-        Self { base, seen }
+        Self { base, seen, revoke }
     }
 
     fn endpoint(&self) -> String {
@@ -201,13 +216,12 @@ async fn mints_with_basic_auth_and_the_resource_then_caches() {
         auth.seen("/.well-known/oauth-authorization-server").len(),
         1
     );
-    assert_eq!(basic(&mints[0]), format!("{ID}:{}", form_encode(SECRET)));
+    // Literal expectations, not `form_encode` itself: the encoder is what's under test.
+    assert_eq!(basic(&mints[0]), format!("{ID}:{SECRET_ENCODED}"));
+    let port = auth.base.rsplit(':').next().unwrap();
     assert_eq!(
         mints[0].body,
-        format!(
-            "grant_type=client_credentials&resource={}",
-            form_encode(&auth.endpoint())
-        )
+        format!("grant_type=client_credentials&resource=http%3A%2F%2F127.0.0.1%3A{port}%2Fmcp")
     );
     assert!(!mints[0].body.contains("client_secret"));
 }
@@ -242,7 +256,8 @@ async fn issuer_mismatch_is_terminal_and_sends_no_secret() {
     .await;
     let c = auth.credential();
     let e = c.token().await.unwrap_err();
-    assert!(e.0.contains("issuer"), "{e}");
+    assert!(e.message.contains("issuer"), "{e}");
+    assert!(!e.retryable, "terminal");
     assert!(c.token().await.is_err());
     assert_eq!(
         auth.seen("/.well-known/oauth-authorization-server").len(),
@@ -260,7 +275,7 @@ async fn an_endpoint_off_the_issuers_origin_is_refused() {
     )
     .await;
     let e = auth.credential().token().await.unwrap_err();
-    assert!(e.0.contains("off the issuer"), "{e}");
+    assert!(e.message.contains("off the issuer"), "{e}");
     assert!(auth.seen("/oauth/token").is_empty());
 }
 
@@ -269,9 +284,10 @@ async fn invalid_client_is_terminal() {
     let auth = Auth::start(standard, |_| refused(401, "invalid_client")).await;
     let c = auth.credential();
     let e = c.token().await.unwrap_err();
-    assert!(e.0.contains("invalid_client"), "{e}");
+    assert!(e.message.contains("invalid_client"), "{e}");
+    assert!(!e.retryable, "terminal");
     let again = c.token().await.unwrap_err();
-    assert_eq!(again.0, e.0);
+    assert_eq!(again.message, e.message);
     assert!(c.unauthorized("anything").await.is_err());
     assert_eq!(auth.seen("/oauth/token").len(), 1, "never asked again");
 }
@@ -303,9 +319,11 @@ async fn a_long_retry_after_fails_the_call_rather_than_waiting() {
     .await;
     let c = auth.credential();
     let e = c.token().await.unwrap_err();
-    assert!(e.0.contains("slow_down"), "{e}");
+    assert!(e.message.contains("slow_down"), "{e}");
+    assert!(e.retryable, "a slow_down is transient");
     let e = c.token().await.unwrap_err();
-    assert!(e.0.contains("backing off"), "{e}");
+    assert!(e.message.contains("backing off"), "{e}");
+    assert!(e.retryable, "a backoff in force is transient");
     assert_eq!(
         auth.seen("/oauth/token").len(),
         1,
@@ -372,7 +390,7 @@ async fn revoke_sends_the_current_token_with_basic_auth() {
     let revoked = auth.seen("/oauth/revoke");
     assert_eq!(revoked.len(), 1);
     assert_eq!(revoked[0].body, "token=tok-0");
-    assert_eq!(basic(&revoked[0]), format!("{ID}:{}", form_encode(SECRET)));
+    assert_eq!(basic(&revoked[0]), format!("{ID}:{SECRET_ENCODED}"));
     assert_eq!(c.token().await.unwrap(), "tok-1", "a later call mints anew");
 }
 
@@ -435,5 +453,174 @@ async fn the_secret_never_appears_in_debug_output_or_errors() {
         .chain([as_error.to_string(), format!("{as_error:?}")])
     {
         assert!(!leaks(&text), "{text}");
+    }
+}
+
+#[tokio::test]
+async fn a_server_error_or_an_unreachable_server_is_retryable() {
+    let auth = Auth::start(standard, |_| refused(503, "temporarily_unavailable")).await;
+    let e = auth.credential().token().await.unwrap_err();
+    assert!(e.retryable, "{e}");
+    let gone =
+        ClientCredentials::new("http://127.0.0.1:9/mcp", "http://127.0.0.1:9", ID, SECRET).unwrap();
+    let e = gone.token().await.unwrap_err();
+    assert!(e.retryable, "{e}");
+}
+
+#[tokio::test]
+async fn retry_after_is_honoured_up_to_60_s() {
+    let auth = Auth::start(standard, |_| {
+        (
+            429,
+            vec![("retry-after", "3600".into())],
+            json!({"error": "slow_down"}),
+        )
+    })
+    .await;
+    let c = auth.credential();
+    c.token().await.unwrap_err();
+    let e = c.token().await.unwrap_err();
+    let wait = e
+        .message
+        .split_once("backing off for ")
+        .and_then(|(_, rest)| rest.split_once("s after"))
+        .map(|(secs, _)| secs.parse::<f64>().unwrap())
+        .unwrap_or_else(|| panic!("no wait in {e}"));
+    assert!((50.0..=60.0).contains(&wait), "{wait}");
+}
+
+#[tokio::test]
+async fn a_huge_expires_in_is_clamped_rather_than_a_panic() {
+    let auth = Auth::start(standard, |n| issued(&format!("tok-{n}"), u64::MAX)).await;
+    let c = auth.credential();
+    assert_eq!(c.token().await.unwrap(), "tok-0");
+    assert_eq!(c.token().await.unwrap(), "tok-0", "cached");
+    assert_eq!(auth.seen("/oauth/token").len(), 1);
+}
+
+#[tokio::test]
+async fn a_failed_revoke_takes_the_token_out_of_service_and_a_retry_sends_it_again() {
+    let auth = Auth::start(standard, |n| issued(&format!("tok-{n}"), 3600)).await;
+    auth.revoke
+        .lock()
+        .unwrap()
+        .push_back(refused(404, "not_found"));
+    let c = auth.credential();
+    assert_eq!(c.token().await.unwrap(), "tok-0");
+    assert!(c.revoke().await.is_err());
+    assert_eq!(
+        c.token().await.unwrap(),
+        "tok-1",
+        "a token being revoked is never served"
+    );
+    c.revoke().await.unwrap();
+    let bodies: Vec<String> = auth
+        .seen("/oauth/revoke")
+        .into_iter()
+        .map(|r| r.body)
+        .collect();
+    assert_eq!(bodies, ["token=tok-0", "token=tok-0", "token=tok-1"]);
+    c.revoke().await.unwrap();
+    assert_eq!(
+        auth.seen("/oauth/revoke").len(),
+        3,
+        "nothing left to revoke"
+    );
+}
+
+/// A token or revocation endpoint that redirects to another origin: refused, and the redirect not followed.
+#[tokio::test]
+async fn a_redirect_from_the_token_or_revocation_endpoint_is_not_followed() {
+    let other = Auth::start(standard, |n| issued(&format!("other-{n}"), 3600)).await;
+    let to = other.base.clone();
+    let auth = Auth::start(standard, move |_| {
+        (
+            307,
+            vec![("location", format!("{to}/oauth/token"))],
+            json!({}),
+        )
+    })
+    .await;
+    let e = auth.credential().token().await.unwrap_err();
+    assert!(e.message.contains("307"), "{e}");
+    assert!(!e.retryable, "a redirect is terminal");
+    assert!(other.seen.lock().unwrap().is_empty(), "not followed");
+
+    let auth = Auth::start(standard, |n| issued(&format!("tok-{n}"), 3600)).await;
+    auth.revoke.lock().unwrap().push_back((
+        307,
+        vec![("location", format!("{}/oauth/revoke", other.base))],
+        json!({}),
+    ));
+    let c = auth.credential();
+    c.token().await.unwrap();
+    assert!(c.revoke().await.is_err());
+    assert!(other.seen.lock().unwrap().is_empty(), "not followed");
+}
+
+#[tokio::test]
+async fn a_revocation_endpoint_off_the_issuers_origin_is_refused() {
+    let auth = Auth::start(
+        |b| {
+            let mut m = standard(b);
+            m["revocation_endpoint"] = json!("https://elsewhere.example.com/oauth/revoke");
+            m
+        },
+        |_| issued("never", 3600),
+    )
+    .await;
+    let e = auth.credential().token().await.unwrap_err();
+    assert!(e.message.contains("off the issuer"), "{e}");
+    assert!(auth.seen("/oauth/token").is_empty());
+}
+
+/// The origin is scheme, host and port: the same host under another scheme or on another port is elsewhere.
+#[tokio::test]
+async fn an_endpoint_on_the_issuers_host_under_another_scheme_or_port_is_refused() {
+    fn other_scheme(b: &str) -> Value {
+        let mut m = standard(b);
+        m["token_endpoint"] = json!(format!(
+            "{}/oauth/token",
+            b.replacen("http://", "https://", 1)
+        ));
+        m
+    }
+    fn other_port(b: &str) -> Value {
+        let (host, port) = b.rsplit_once(':').unwrap();
+        let port: u16 = port.parse().unwrap();
+        let mut m = standard(b);
+        m["token_endpoint"] = json!(format!("{host}:{}/oauth/token", port.wrapping_add(1)));
+        m
+    }
+    for metadata in [other_scheme as fn(&str) -> Value, other_port] {
+        let auth = Auth::start(metadata, |_| issued("never", 3600)).await;
+        let e = auth.credential().token().await.unwrap_err();
+        assert!(e.message.contains("off the issuer"), "{e}");
+        assert!(!e.retryable);
+        assert!(auth.seen("/oauth/token").is_empty());
+    }
+}
+
+#[tokio::test]
+async fn metadata_without_the_grant_or_basic_auth_is_refused() {
+    fn no_grant(b: &str) -> Value {
+        let mut m = standard(b);
+        m["grant_types_supported"] = json!(["authorization_code", "refresh_token"]);
+        m
+    }
+    fn no_basic(b: &str) -> Value {
+        let mut m = standard(b);
+        m["token_endpoint_auth_methods_supported"] = json!(["none", "client_secret_post"]);
+        m
+    }
+    for (metadata, says) in [
+        (no_grant as fn(&str) -> Value, "client-credentials grant"),
+        (no_basic, "client_secret_basic"),
+    ] {
+        let auth = Auth::start(metadata, |_| issued("never", 3600)).await;
+        let e = auth.credential().token().await.unwrap_err();
+        assert!(e.message.contains(says), "{e}");
+        assert!(!e.retryable);
+        assert!(auth.seen("/oauth/token").is_empty(), "no secret sent");
     }
 }

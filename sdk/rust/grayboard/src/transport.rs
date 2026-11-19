@@ -188,8 +188,8 @@ impl Connection {
         // Checked here, not deferred to `send`: reqwest would surface a bad value as a send error, classed like a lost request.
         let mut authorization =
             HeaderValue::from_str(&format!("Bearer {token}")).map_err(|_| {
-                Error::Auth(AuthError(
-                    "the credential's token is not a valid header value".into(),
+                Error::Auth(AuthError::terminal(
+                    "the credential's token is not a valid header value",
                 ))
             })?;
         authorization.set_sensitive(true);
@@ -245,8 +245,9 @@ impl Connection {
             let token = tokio::time::timeout(limit, self.shared.credential.token())
                 .await
                 .map_err(|_| {
-                    AuthError(format!("the credential gave no token within {limit:?}"))
-                })??;
+                    Error::Unreachable(format!("the credential gave no token within {limit:?}"))
+                })?
+                .map_err(credential_error)?;
             let mut rb = self.post(&token, method, body)?;
             if let Some(t) = timeout {
                 rb = rb.timeout(t);
@@ -265,11 +266,17 @@ impl Connection {
                     tokio::time::timeout(limit, self.shared.credential.unauthorized(&token))
                         .await
                         .map_err(|_| {
-                            Error::Unauthorized(format!(
+                            Error::Unreachable(format!(
                                 "the credential did not replace the token within {limit:?}"
                             ))
                         })?
-                        .map_err(|e| Error::Unauthorized(e.0))?;
+                        .map_err(|e| {
+                            if e.retryable {
+                                credential_error(e)
+                            } else {
+                                Error::Unauthorized(e.message)
+                            }
+                        })?;
                     continue;
                 }
                 StatusCode::UNAUTHORIZED => {
@@ -561,6 +568,15 @@ async fn limited_text(response: reqwest::Response, limit: usize) -> String {
         }
     }
     String::from_utf8_lossy(&buf).into_owned()
+}
+
+/// A credential failure before anything was sent: a transient one is `Unreachable`, so the delivery stream backs off and reopens rather than stopping; a terminal one is `Auth`.
+fn credential_error(e: AuthError) -> Error {
+    if e.retryable {
+        Error::Unreachable(format!("credential: {}", e.message))
+    } else {
+        Error::Auth(e)
+    }
 }
 
 fn transport_error(error: &reqwest::Error, write: bool) -> Error {

@@ -797,7 +797,7 @@ impl Credential for Hanging {
 }
 
 #[tokio::test]
-async fn a_credential_that_never_answers_is_bounded_by_the_request_timeout() {
+async fn a_credential_that_never_answers_is_bounded_by_the_request_timeout_and_unreachable() {
     let fake = Fake::start(true, |req, _| ok_text(req)).await;
     let s = Client::new(
         &fake.url,
@@ -811,7 +811,8 @@ async fn a_credential_that_never_answers_is_bounded_by_the_request_timeout() {
         .await
         .expect("the credential's token call is bounded")
         .unwrap_err();
-    assert!(matches!(err, Error::Auth(_)), "{err:?}");
+    // Transient: nothing was sent, and a delivery stream backs off and reopens rather than stopping.
+    assert!(matches!(err, Error::Unreachable(_)), "{err:?}");
 }
 
 #[derive(Default)]
@@ -825,7 +826,7 @@ impl Credential for Counting {
         Box::pin(async { Ok("t".into()) })
     }
     fn unauthorized<'a>(&'a self, _: &'a str) -> BoxFuture<'a, Result<(), AuthError>> {
-        Box::pin(async { Err(AuthError("no".into())) })
+        Box::pin(async { Err(AuthError::terminal("no")) })
     }
 }
 
