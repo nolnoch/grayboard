@@ -138,7 +138,9 @@ export class Binding implements CredentialPort<OpenCodeEnrollment> {
   // server's protected-resource metadata (RFC 9728) names this URL and the pinned issuer. It guards who can enroll a
   // root: the whoami that decides auto-enroll, and every plugin wire, reach only the pinned server. It doesn't protect
   // the token: OpenCode has sent it to whatever URL the entry names before any plugin code runs (#270 audit F5).
-  private async vouch(url: string) {
+  // `stop`: the caller's own abort (auto-enroll's close, #1285), which cuts the fetch short and rethrows as it came,
+  // never as ServerUnreachable: a stop is not an outage.
+  private async vouch(url: string, stop?: AbortSignal) {
     const issuer = this.pin();
     if (this.vouched.has(url)) return issuer;
     const resource = new URL(url);
@@ -148,13 +150,17 @@ export class Binding implements CredentialPort<OpenCodeEnrollment> {
     // A redirect, another 4xx, or a 2xx whose metadata doesn't name this URL and the pin is the identity refusal.
     let response: Response;
     try {
-      response = await fetch(resource.origin + "/.well-known/oauth-protected-resource" + resource.pathname, { redirect: "error", signal: AbortSignal.timeout(10_000) });
+      const timeout = AbortSignal.timeout(10_000);
+      response = await fetch(resource.origin + "/.well-known/oauth-protected-resource" + resource.pathname, { redirect: "error", signal: stop ? AbortSignal.any([timeout, stop]) : timeout });
     } catch (error) {
+      if (stop?.aborted) throw error;
       if (unreachable(error) || timedOut(error)) throw new ServerUnreachable(error);
       throw error;
     }
     if (response.status >= 500 || response.status === 429) { await response.body?.cancel().catch(() => {}); throw new ServerUnreachable(new Error(`Protected-resource metadata answered HTTP ${response.status}`)); }
     const metadata = await response.json().catch(() => undefined) as { resource?: unknown; authorization_servers?: unknown } | undefined;
+    // A body cut short by the stop reads as no metadata: it's the stop, not the identity refusal.
+    stop?.throwIfAborted();
     if (!response.ok || metadata?.resource !== url || !Array.isArray(metadata.authorization_servers) || !metadata.authorization_servers.includes(issuer)) throw new Refusal("identity", "Native issuer does not match the pinned issuer");
     this.vouched.add(url);
     return issuer;
@@ -203,10 +209,11 @@ export class Binding implements CredentialPort<OpenCodeEnrollment> {
     if (again.connectionID !== selected.connectionID || !same(await this.configuration(), endpoint)) this.mismatch();
     return { configuration: projected.configuration, integrationID: selected.integrationID, connectionID: selected.connectionID };
   }
-  async capture(sessionID: string): Promise<OpenCodeEnrollment> {
+  // `stop` (static mode only): auto-enroll's abort, so close cuts an in-flight pin check short (#1285).
+  async capture(sessionID: string, stop?: AbortSignal): Promise<OpenCodeEnrollment> {
     if (this.static_) {
       this.pin();
-      const endpoint = await this.configuration(), issuer = await this.vouch(endpoint.url);
+      const endpoint = await this.configuration(), issuer = await this.vouch(endpoint.url, stop);
       const checked = this.checked.get(sessionID);
       if (checked !== undefined && checked !== endpoint.configHash) throw new Refusal("binding", "Native binding changed during enrollment; explicitly enroll again");
       return { version: 2, sessionID, mcpName: this.name, configuration: { ...endpoint, issuer, clientID: STATIC_CLIENT, scope: STATIC_SCOPE }, integrationID: STATIC_CONNECTION, connectionID: STATIC_CONNECTION };

@@ -223,31 +223,46 @@ export class OpenCodeController extends Controller<OpenCodeEnrollment> {
   // approving itself (principle 10): the launcher set the mode, the pin and the token, and the kind is the
   // server's, which a user's token can't claim. Grayboard starts nothing here (principle 7): the launcher started
   // this OpenCode and its session; enrollment only lets the server deliver to it.
-  // A static run has no person to enroll by hand (#1250): an attempt that fails on an outage (unreachable, a gateway
+  // A static run has no person to enroll by hand (#1250): an attempt that fails on an outage (unreachable, a
   // 5xx, a timeout, a rate limit or the server's internal error) is retried on a capped backoff, ENROLL_RETRIES times;
   // any other answer stands. A retry stops when the controller closes, the session ends or the root is enrolled.
+  // Close aborts an attempt's pin check and whoami (`enrollStop`, #1285) as well as a retry's wait.
   async serviceEnroll(sessionID: string) {
     if (this.stopped || !this.options.static) return;
     let error = await this.autoEnroll(sessionID);
-    // Close can land during the first attempt, which close doesn't wait for: nothing records after it.
+    // Close can land during the first attempt, which close doesn't wait for: nothing records after it. Nothing has
+    // recorded `retrying` yet either, so there's no record to finish.
     if (this.stopped) return;
     if (error === undefined || !transientEnroll(error)) return this.enrollRefused(sessionID, error);
+    // Close during a retry ends the root's `retrying` record. Nothing restores a retry: a restart restores the record
+    // as saved (`Saved retrying status`) for a root no `session.created` will ask about again, so a saved `retrying`
+    // would claim a retry nothing runs. `unenrolled` is what the root is, and the outage is why. Close waits for this
+    // loop (`enrollRetries`), so the record lands before its flush. A root enrolled meanwhile by another path (an
+    // explicit enroll; paused counts, so `roots`, not `enrollment`) keeps its own record: it is enrolled.
+    const closed = () => this.roots.has(sessionID) ? undefined : this.record({ state: "unenrolled", sessionID, message: "Shut down while auto-enroll was retrying; the root is not enrolled", operation: "enroll", code: "server_unreachable" });
     const retry = (async () => {
       for (let attempt = 0; attempt < ENROLL_RETRIES && error !== undefined && transientEnroll(error); attempt++) {
         this.record({ state: "retrying", sessionID, message: `Server unreachable; retrying auto-enroll (${attempt + 1}/${ENROLL_RETRIES})`, operation: "enroll", code: "server_unreachable" });
-        await abortableSleep(Math.min(ENROLL_RETRY_MAX_MS, ENROLL_RETRY_FIRST_MS * 2 ** attempt), this.enrollStop.signal);
-        if (this.stopped || this.enrollment(sessionID)) return;
+        await abortableSleep(Math.min(ENROLL_RETRY_MAX_MS, this.enrollRetryFirstMs * 2 ** attempt), this.enrollStop.signal);
+        if (this.stopped) return closed();
+        if (this.enrollment(sessionID)) return;
         // A root that never enrolled has no record `ended` replaces, so its `retrying` would outlive it.
         if (this.routes.isEnded(sessionID)) return this.record({ state: "unenrolled", sessionID, message: "Root ended before auto-enroll reached the server", operation: "enroll", code: "server_unreachable" });
         error = await this.autoEnroll(sessionID);
-        if (this.stopped) return;
+        // An attempt that enrolled, or recorded its own refusal, before close keeps its record. One that close cut
+        // short is the shutdown even if its answer would have been a refusal (close wins): it stays unenrolled.
+        if (this.stopped) return error === undefined ? undefined : closed();
       }
+      if (error !== undefined && transientEnroll(error)) return this.enrollExhausted(sessionID, error);
       this.enrollRefused(sessionID, error);
     })().catch(() => this.backgroundFailure("enroll")).finally(() => this.enrollRetries.delete(retry));
     this.enrollRetries.add(retry);
   }
-  // Static mode's retries: close ends their waits and waits them out, so none records or enrolls after it.
+  // Static mode's retries: close ends their waits and in-flight attempts and waits them out, so none records or
+  // enrolls after it.
   private readonly enrollStop = new AbortController();
+  // The first retry's wait; a test shortens it to run the retries out.
+  private enrollRetryFirstMs = ENROLL_RETRY_FIRST_MS;
   private readonly enrollRetries = new Set<Promise<void>>();
   override async close() {
     this.stopped = true; this.enrollStop.abort();
@@ -258,13 +273,20 @@ export class OpenCodeController extends Controller<OpenCodeEnrollment> {
     if (error === undefined) return;
     this.record({ state: "unenrolled", sessionID, message: error instanceof Refusal && !(error instanceof AccessExpired) ? error.message : failureMessage(error, this.port.resumeHint), operation: "enroll", code: failureCode(error) });
   }
+  // The retries ran out on an outage (#1285 I-B). A static run has no person to enroll by hand, so the record names
+  // what its operator can do, not "explicitly enroll again"; the code is the outage's, a raw HTTP 5xx from whoami's
+  // call (which bypasses the wire's classification) as `server_unreachable`.
+  private enrollExhausted(sessionID: string, error: unknown) {
+    const code = failureCode(error), outage = TRANSIENT_CODES.has(code) ? code : "server_unreachable";
+    this.record({ state: "unenrolled", sessionID, message: `Auto-enroll gave up after ${ENROLL_RETRIES} retries (${outage}); once the server answers, the launcher must start a new run`, operation: "enroll", code: outage });
+  }
   // One auto-enroll attempt: undefined when it enrolled or recorded its own refusal, else the error that stopped it.
   private async autoEnroll(sessionID: string): Promise<unknown> {
     const mode = this.options.static;
     try {
       if ((await this.port.ancestry(sessionID)).root !== sessionID) return;
-      const e = await this.binding.capture(sessionID);
-      const who = await whoami(this, e);
+      const e = await this.binding.capture(sessionID, this.enrollStop.signal);
+      const who = await whoami(this, e, this.enrollStop.signal);
       if (who.kind !== "service") {
         this.record({ state: "unenrolled", sessionID, message: "Static mode enrolls a root by itself only for a service run token; the server did not report one, so enroll explicitly", operation: "enroll", code: "refused" });
         return;
@@ -324,13 +346,15 @@ export function nativeFetcher(controller: OpenCodeController): Fetcher {
 
 // The run token's principal and its kind (`whoami`'s `principal` and `principal_kind`), asked with no session key so
 // the question starts no hosted session: a token that turns out to be a user's leaves nothing behind on the server.
-export async function whoami(controller: OpenCodeController, e: OpenCodeEnrollment): Promise<{ kind?: string; principal?: string }> {
+// `stop`: auto-enroll's abort (#1285), on top of the 10 s timeout; the wire treats its own signal's abort as a stop,
+// never an outage, and auto-enroll checks `stopped` before it reads the error.
+export async function whoami(controller: OpenCodeController, e: OpenCodeEnrollment, stop?: AbortSignal): Promise<{ kind?: string; principal?: string }> {
   let current: string | undefined;
   const port = controller.port;
   const wire = new NativeWire({ url: e.configuration.url, sessionKey: port.sessionKey, client: port.client }, {
     token: async () => (current = await controller.binding.token(e)),
     onUnauthorized: async () => controller.binding.unauthorized(e, current ?? ""),
-  }, AbortSignal.timeout(10_000));
+  }, stop ? AbortSignal.any([AbortSignal.timeout(10_000), stop]) : AbortSignal.timeout(10_000));
   await wire.connect();
   try {
     const result = await wire.client.callTool({ name: "whoami", arguments: {} }, wire.options());

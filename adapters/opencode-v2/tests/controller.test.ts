@@ -1294,7 +1294,7 @@ test("outer CodeMode execute and malformed native output never open a lease", as
 // Static service-credential mode (#270 D3): a new root enrolls itself only when the pinned issuer vouches for the
 // entry and the server's whoami calls the run token's principal a service. principalKind's whoami goes over a real
 // NativeWire, whose client's connect and callTool are stubbed here; the delivery wires are the runtime's FakeWire.
-async function staticRuntime(kind: unknown, mode: StaticMode = { issuer: "https://grayboard.example.com" }, metadata: unknown = { resource: "https://grayboard.example.com/mcp", authorization_servers: ["https://grayboard.example.com"] }, answered: (f: ReturnType<typeof runtime>["f"]) => unknown = () => {}) {
+async function staticRuntime(kind: unknown, mode: StaticMode = { issuer: "https://grayboard.example.com" }, metadata: unknown = { resource: "https://grayboard.example.com/mcp", authorization_servers: ["https://grayboard.example.com"] }, answered: (f: ReturnType<typeof runtime>["f"], options?: { signal?: AbortSignal }) => unknown = () => {}) {
   const token = "run-token-CANARY-0123456789abcdef";
   const r = runtime({ static: mode });
   r.f.config.oauth = false;
@@ -1303,9 +1303,9 @@ async function staticRuntime(kind: unknown, mode: StaticMode = { issuer: "https:
   globalThis.fetch = (async () => Response.json(metadata)) as unknown as typeof fetch;
   const connect = spyOn(Client.prototype, "connect").mockResolvedValue(undefined);
   const close = spyOn(Client.prototype, "close").mockResolvedValue(undefined);
-  const callTool = spyOn(Client.prototype, "callTool").mockImplementation((async (params: { name: string; _meta?: unknown }) => {
+  const callTool = spyOn(Client.prototype, "callTool").mockImplementation((async (params: { name: string; _meta?: unknown }, options?: { signal?: AbortSignal }) => {
     asked.push({ name: params.name, meta: params._meta });
-    const result = answered(r.f);
+    const result = answered(r.f, options);
     if (result !== undefined) return result;
     return { content: [{ type: "text", text: JSON.stringify({ id: null, principal: "svc", principal_kind: kind, held: [] }) }] };
   }) as unknown as Client["callTool"]);
@@ -1548,6 +1548,135 @@ test("static mode: close ends a retry's wait promptly", async () => {
     await s.r.controller.close();
     expect(performance.now() - started).toBeLessThan(500);
     expect(s.asked).toHaveLength(3);
+    // #1285: the wait's `retrying` record doesn't outlive close.
+    expect(rootRecord(s.r.controller, "R")).toMatchObject({ state: "unenrolled", operation: "enroll", code: "server_unreachable", message: "Shut down while auto-enroll was retrying; the root is not enrolled" });
+  } finally { await s.restore(); }
+});
+// #1285: close during an in-flight retry attempt aborts it (a server that never answers would hold close for the
+// attempt's 10 s timeouts) and ends the root's `retrying` record before close's flush, so a restart restores no
+// retry that nothing runs; nothing records after close returns.
+const hung = (signal: AbortSignal | undefined) => new Promise<never>((_, reject) => {
+  if (!signal) return;
+  signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+});
+const savedRecord = (r: ReturnType<typeof runtime>, id: string) => (r.storage.get("diagnostics:v1") as { sessionID?: string }[] | undefined)?.find(d => d.sessionID === id);
+async function closeDuringAttempt(s: Awaited<ReturnType<typeof staticRuntime>>, started: () => boolean) {
+  await s.r.controller.observe("session.created", { sessionID: "R" });
+  expect(rootRecord(s.r.controller, "R")).toMatchObject({ state: "retrying", message: expect.stringContaining("(1/8)") });
+  await until(started, 5000, "the second attempt's request starts");
+  const began = performance.now();
+  await s.r.controller.close();
+  expect(performance.now() - began).toBeLessThan(500);
+  const closed = { state: "unenrolled", operation: "enroll", code: "server_unreachable", message: "Shut down while auto-enroll was retrying; the root is not enrolled" };
+  const after = rootRecord(s.r.controller, "R");
+  expect(after).toMatchObject(closed);
+  expect(savedRecord(s.r, "R")).toMatchObject(closed);
+  await retriesSettled(s.r.controller);
+  await new Promise(resolve => setTimeout(resolve, 20));
+  expect(rootRecord(s.r.controller, "R")).toEqual(after!);
+  expect(savedRoots(s.r.storage)).toEqual([]);
+}
+test("static mode: close during a retry's pin check aborts it and ends the retrying record", async () => {
+  const s = await staticRuntime("service");
+  let fetches = 0;
+  globalThis.fetch = (async (_url: unknown, init?: { signal?: AbortSignal }) => ++fetches === 1 ? new Response(null, { status: 503 }) : hung(init?.signal)) as unknown as typeof fetch;
+  try {
+    await closeDuringAttempt(s, () => fetches === 2);
+    expect(s.asked).toEqual([]);
+  } finally { await s.restore(); }
+});
+test("static mode: close during a retry's whoami aborts it and ends the retrying record", async () => {
+  let calls = 0;
+  const s = await staticRuntime("service", undefined, undefined, (_f, options) => { if (++calls === 1) throw unavailable(); return hung(options?.signal); });
+  try {
+    await closeDuringAttempt(s, () => calls === 2);
+  } finally { await s.restore(); }
+});
+// #1285 audit: close never calls a root enrolled during the retry "not enrolled"; nor does it overwrite the record
+// of an attempt that answered before close stopped it.
+const whoamiAnswer = (kind: string) => ({ content: [{ type: "text", text: JSON.stringify({ id: null, principal: "svc", principal_kind: kind, held: [] }) }] });
+const closedRecord = { state: "unenrolled", message: "Shut down while auto-enroll was retrying; the root is not enrolled" };
+test("static mode: close during a retry's wait keeps the record of a root enrolled meanwhile", async () => {
+  let failures = 1;
+  const s = await staticRuntime("service", undefined, undefined, () => { if (failures-- > 0) throw unavailable(); });
+  try {
+    await s.r.controller.observe("session.created", { sessionID: "R" });
+    expect(rootRecord(s.r.controller, "R")).toMatchObject({ state: "retrying" });
+    await s.r.controller.enroll("R");
+    const enrolled = rootRecord(s.r.controller, "R");
+    await s.r.controller.close();
+    expect(rootRecord(s.r.controller, "R")).toEqual(enrolled!);
+    expect(rootRecord(s.r.controller, "R")).not.toMatchObject(closedRecord);
+    expect(savedRecord(s.r, "R")).toMatchObject({ state: enrolled!.state, message: enrolled!.message });
+    expect(savedRoots(s.r.storage)).toHaveLength(1);
+  } finally { await s.restore(); }
+});
+test("static mode: close during a retry attempt keeps the record of a root enrolled meanwhile", async () => {
+  let calls = 0, release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const s = await staticRuntime("service", undefined, undefined, () => { if (++calls === 1) throw unavailable(); if (calls === 2) return gate.then(() => whoamiAnswer("service")); });
+  try {
+    await s.r.controller.observe("session.created", { sessionID: "R" });
+    await until(() => calls === 2, 5000, "the retry's whoami starts");
+    // The explicit enroll's own prepare asks whoami over the runtime's FakeWire, not this stub.
+    await s.r.controller.enroll("R");
+    const enrolled = rootRecord(s.r.controller, "R");
+    const closing = s.r.controller.close();
+    release();
+    await closing;
+    expect(rootRecord(s.r.controller, "R")).toEqual(enrolled!);
+    expect(savedRoots(s.r.storage)).toHaveLength(1);
+  } finally { await s.restore(); }
+});
+// A paused root is still enrolled (its enrollment is saved): close keeps its `paused` record.
+test("static mode: close keeps the paused record of a root enrolled and paused during a retry's wait", async () => {
+  let failures = 1;
+  const s = await staticRuntime("service", undefined, undefined, () => { if (failures-- > 0) throw unavailable(); });
+  try {
+    await s.r.controller.observe("session.created", { sessionID: "R" });
+    expect(rootRecord(s.r.controller, "R")).toMatchObject({ state: "retrying" });
+    await s.r.controller.enroll("R");
+    await s.r.controller.pause();
+    const paused = rootRecord(s.r.controller, "R");
+    expect(paused).toMatchObject({ state: "paused" });
+    await s.r.controller.close();
+    expect(rootRecord(s.r.controller, "R")).toEqual(paused!);
+    expect(savedRecord(s.r, "R")).toMatchObject({ state: "paused", message: paused!.message });
+  } finally { await s.restore(); }
+});
+test("static mode: an attempt's own refusal that lands as close starts keeps its record", async () => {
+  let calls = 0, release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const s = await staticRuntime("user", undefined, undefined, () => { if (++calls === 1) throw unavailable(); if (calls === 2) return gate.then(() => whoamiAnswer("user")); });
+  try {
+    await s.r.controller.observe("session.created", { sessionID: "R" });
+    await until(() => calls === 2, 5000, "the retry's whoami starts");
+    const closing = s.r.controller.close();
+    release();
+    await closing;
+    expect(rootRecord(s.r.controller, "R")).toMatchObject({ state: "unenrolled", operation: "enroll", code: "refused" });
+    expect(savedRecord(s.r, "R")).toMatchObject({ state: "unenrolled", code: "refused" });
+  } finally { await s.restore(); }
+});
+// #1285 I-B: a static run's retries that run out name what its operator can do, and the outage, not "explicitly
+// enroll again" and operation_failed.
+test("static mode: retries run out on whoami 503s record the outage and a new run", async () => {
+  const s = await staticRuntime("service", undefined, undefined, () => { throw unavailable(); });
+  (s.r.controller as unknown as { enrollRetryFirstMs: number }).enrollRetryFirstMs = 1;
+  try {
+    await s.r.controller.observe("session.created", { sessionID: "R" });
+    await retriesSettled(s.r.controller);
+    expect(s.asked).toHaveLength(9);
+    expect(rootRecord(s.r.controller, "R")).toMatchObject({ state: "unenrolled", operation: "enroll", code: "server_unreachable", message: "Auto-enroll gave up after 8 retries (server_unreachable); once the server answers, the launcher must start a new run" });
+  } finally { await s.restore(); }
+});
+// #1250 re-verify I-A: an isError result with no structuredContent is never parsed as whoami's JSON answer.
+test("static mode: a whoami isError result without structuredContent stands as not a service token", async () => {
+  const s = await staticRuntime("service", undefined, undefined, () => ({ content: [{ type: "text", text: "error: forbidden" }], isError: true }));
+  try {
+    await s.r.controller.observe("session.created", { sessionID: "R" });
+    expect(rootRecord(s.r.controller, "R")).toMatchObject({ state: "unenrolled", operation: "enroll", code: "refused" });
+    expect(s.asked).toHaveLength(1);
   } finally { await s.restore(); }
 });
 test("static mode tells the person to start a new run, not to sign in through OpenCode", async () => {
