@@ -33,12 +33,12 @@ import { LOGIN_SCOPE, OAUTH_SCOPES } from "./oauth-config.ts";
 import type { CredentialSource, ServiceCredential, OAuthStore, OAuthAuthorization, OAuthRequest, OAuthBrowserSession, OAuthCode, OAuthGrant, OAuthTokenPair, OAuthAccess, OAuthFailure } from "./oauth-types.ts";
 import { accessFits, browserData, browserSessionInput, clampPair, codeData, codeInput, grantInput, hash, isLogin, loginInput, mintInput, requestData, requestInput, sameAuthorization,
   rotationBinding, serviceCredentialInput, serviceSecretInput, successorInput, time } from "./oauth-rules.ts";
-import { LastOwner, PrincipalTaken } from "./store/errors.ts";
-import { DEV_SESSION_LABEL, TEAM_POLICIES, type User, type IdpSignIn, type Session, type PrincipalRow, type Team, type TeamPolicy, type TeamMember, type RoleBinding, type RoleAuthority, type RoleRevoke, type ServiceRow, type UsersStore, type SessionsStore, type PrincipalsStore, type TeamsStore, type RolesStore, type ServicesStore } from "./store/identity.ts";
+import { AuthorityLost, LastOwner, PrincipalTaken } from "./store/errors.ts";
+import { DEV_SESSION_LABEL, TEAM_POLICIES, type User, type IdpSignIn, type Session, type PrincipalRow, type Team, type TeamPolicy, type TeamMember, type RoleBinding, type RoleAuthority, type RoleRevoke, type MemberAuthority, type MemberRemoval, type ServiceRow, type UsersStore, type SessionsStore, type PrincipalsStore, type TeamsStore, type RolesStore, type ServicesStore } from "./store/identity.ts";
 // The identity groups' row types and interfaces live in store/identity.ts for the Postgres store (#807 P3 C3a);
 // re-exported for every importer.
 export { DEV_SESSION_LABEL, TEAM_POLICIES } from "./store/identity.ts";
-export type { User, IdpSignIn, Session, PrincipalRow, Team, TeamPolicy, TeamRole, TeamMember, RoleBinding, RoleAuthority, RoleGrant, RoleRevoke, RoleFilter, ServiceRow, UsersStore, SessionsStore, PrincipalsStore, TeamsStore, RolesStore, ServicesStore, JsonValue, AuditFields, IdentityGroups } from "./store/identity.ts";
+export type { User, IdpSignIn, Session, PrincipalRow, Team, TeamPolicy, TeamRole, TeamMember, RoleBinding, RoleAuthority, RoleGrant, RoleRevoke, MemberAuthority, MemberRemoval, RoleFilter, ServiceRow, UsersStore, SessionsStore, PrincipalsStore, TeamsStore, RolesStore, ServicesStore, JsonValue, AuditFields, IdentityGroups } from "./store/identity.ts";
 
 // Row types
 // Every read of a user row goes through this, so `kind` is never missing (a "SELECT *" would type-check without it).
@@ -1083,7 +1083,7 @@ function seedSchema(db: Database, first: boolean, firstRoles: boolean): void {
 
 
 // Moved to store/errors.ts for the Postgres store; re-exported for http.ts and the tests.
-export { LastOwner, PrincipalTaken } from "./store/errors.ts";
+export { AuthorityLost, LastOwner, PrincipalTaken } from "./store/errors.ts";
 
 // The column a write's UNIQUE violation names ("principals.name"), or undefined for any other error. D6 classifies
 // Postgres's 23505 by its constraint in P3; on SQLite the message is the only place the column appears.
@@ -1113,10 +1113,10 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
   const att = (c: Database, rows: MessageRow[]) => withAttachments(c, "message", rows);
   // Role bindings (#927). Every read and write is one statement on the caller's handle; grant and revoke re-check
   // the granter's authority in their own statement, and revoke holds the last-owner guard, so every writer
-  // (the admin routes, `team add --role`, team creation, member removal) gets both. The Postgres port is a straight
-  // translation: grant's INSERT ... SELECT ... ON CONFLICT DO NOTHING RETURNING, revoke's DELETE ... RETURNING, plus
-  // a FOR SHARE on the team's row before a team_owner grant and D3's FOR UPDATE on it before the last-owner count;
-  // SQLite's single writer serializes them.
+  // (the admin routes, `team add --role`, team creation, member removal) gets both. SQLite's single writer serializes
+  // them. The Postgres port (store/pg/identity.ts) keeps the statements but not the reasoning: under READ COMMITTED
+  // the in-statement re-checks don't exclude a concurrent revoke, so every role-binding writer takes one advisory lock
+  // first (D3), and the refusals thrown after a write run in the store's own savepoint.
   const BINDING_SQL = `SELECT b.id, b.principal_id, p.name AS principal, b.role, b.scope_id, s.name AS scope, b.granted_by, g.name AS granter, b.granted_at
     FROM role_bindings b JOIN principals p ON p.id = b.principal_id LEFT JOIN principals s ON s.id = b.scope_id LEFT JOIN principals g ON g.id = b.granted_by`;
   const bindingById = (c: Database, id: number): RoleBinding | undefined =>
@@ -1150,8 +1150,8 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
         if (c && c.owners === 0 && c.members > 1) throw new LastOwner(c.team, "team");
       }
       // Every service keeps an owner (#270 D1), with no sole-member exception: the owner is its accountability record.
-      // SQLite's single writer serializes this count with any concurrent revoke; the Postgres port locks the service's
-      // principal row (FOR UPDATE) before it, as D3 does the team's.
+      // SQLite's single writer serializes this count with any concurrent revoke; the Postgres port takes the role-write
+      // advisory lock before the revoke, as for a team's (D3).
       if (role === "service_owner" && scopeId !== null) {
         const c = db.query<{ owners: number; name: string }, [number, number]>(
           `SELECT (SELECT COUNT(*) FROM role_bindings WHERE scope_id = ? AND role = 'service_owner') AS owners, ps.name
@@ -1162,6 +1162,17 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       insertAudit(db, clock(), r.actor, "role.revoked", before.principal, JSON.stringify({ ...bindingDetail(before), ...r.audit }));
       return before;
     })();
+  // Whether a membership change's authority holds on the team (`teamId`), as of the statement it's spliced into: its
+  // placeholders take `args`, in order.
+  const teamAuthority = (by: MemberAuthority, teamId: number): { sql: string; args: (number | null)[] } => {
+    const auth = authoritySql(by.authority, "(SELECT id FROM principals WHERE kind = 'team' AND team_id = ?)");
+    return { sql: auth.sql, args: [...Array(auth.n).fill(by.byUser), ...(by.authority === "owner_or_admin" ? [teamId] : [])] };
+  };
+  const authorityHolds = (db: Database, by: MemberAuthority, teamId: number): boolean => {
+    const auth = teamAuthority(by, teamId);
+    return !!db.query<{ ok: number }, (number | null)[]>(`SELECT ${auth.sql} AS ok`).get(...auth.args)!.ok;
+  };
+  const NO_AUTHORITY: MemberRemoval = { byUser: null, authority: "none", actor: null };
   const bindingDetail = (b: RoleBinding) => ({
     binding: b.id, role: b.role, principal: b.principal, principal_id: b.principal_id, scope: b.scope, scope_id: b.scope_id,
     granted_by: b.granted_by, granter: b.granter, granted_at: b.granted_at,
@@ -1415,11 +1426,11 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       async signIn(tx, issuer, subject, email, displayName) {
         const db = sqliteOf(tx);
         return db.transaction((): IdpSignIn => {
-          // A link is conditional on the row still being unlinked (D3): on Postgres another sign-in may link it
-          // between the read and the write. Zero rows: re-read and decide again, now a refusal.
+          // A link is conditional on the row still being unlinked and enabled (D3): on Postgres another sign-in may
+          // link it, or an admin disable it, between the read and the write. Zero rows: re-read and decide again.
           const link = (id: number) => db.run(
             `UPDATE users SET idp_issuer = ?, idp_subject = ?, display_name = ?
-             WHERE id = ? AND idp_subject IS NULL AND (idp_issuer IS NULL OR idp_issuer = ?)`,
+             WHERE id = ? AND idp_subject IS NULL AND (idp_issuer IS NULL OR idp_issuer = ?) AND disabled_at IS NULL`,
             [issuer, subject, displayName, id, issuer]).changes === 1;
           for (let attempt = 0; attempt < 3; attempt++) {
             // 1. This IdP account's user.
@@ -1750,22 +1761,30 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       },
       async findByName(r, name) { return teamByName(sqliteOf(r), name); },
       async listForUser(r, userId) { return teamsOf(sqliteOf(r), userId); },
-      async addMember(tx, teamId, userId) {
+      // Conditional on the actor's authority in its own statement, as roles.grant is; zero rows is an existing member
+      // or the authority gone, and a second read says which. SQLite's single writer serializes both with any revoke.
+      async addMember(tx, teamId, userId, by = NO_AUTHORITY) {
         const db = sqliteOf(tx);
-        return db.run(
-          "INSERT OR IGNORE INTO team_members (team_id, user_id, joined_at) VALUES (?, ?, ?)",
-          [teamId, userId, clock()],
+        const auth = teamAuthority(by, teamId);
+        const added = db.run(
+          `INSERT OR IGNORE INTO team_members (team_id, user_id, joined_at) SELECT ?, ?, ? WHERE ${auth.sql}`,
+          [teamId, userId, clock(), ...auth.args],
         ).changes > 0;
+        if (!added && !authorityHolds(db, by, teamId)) throw new AuthorityLost();
+        return added;
       },
-      async removeMember(tx, teamId, userId, actor = null, audit) {
+      // The authority is read once, before any write: the revoke below may delete the very binding it rests on (an
+      // owner removing themselves), so a re-check after it would refuse what the decision allowed.
+      async removeMember(tx, teamId, userId, by = NO_AUTHORITY) {
         const db = sqliteOf(tx);
         return db.transaction(() => {
+          if (!authorityHolds(db, by, teamId)) throw new AuthorityLost();
           // An owner is a member (#927): their binding goes first, through revoke, with its row and the guard.
           const ids = db.query<{ pu: number | null; pt: number | null }, [number, number]>(
             `SELECT (SELECT id FROM principals WHERE kind = 'user' AND user_id = ?) AS pu, (SELECT id FROM principals WHERE kind = 'team' AND team_id = ?) AS pt`,
           ).get(userId, teamId)!;
           const revoked = ids.pu !== null && ids.pt !== null
-            ? revokeBinding(db, ids.pu, "team_owner", ids.pt, { byUser: null, authority: "none", actor, audit })
+            ? revokeBinding(db, ids.pu, "team_owner", ids.pt, { byUser: by.byUser, authority: by.authority, actor: by.actor, audit: by.audit })
             : null;
           db.run("DELETE FROM team_members WHERE team_id = ? AND user_id = ?", [teamId, userId]);
           return revoked;

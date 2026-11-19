@@ -41,9 +41,13 @@ export function foreignKeyViolation(e: unknown): string | undefined {
 
 // The two UNIQUE constraints on a principal's name: a team or user created in a race for a taken name.
 export const PRINCIPAL_NAME_CONSTRAINTS: ReadonlySet<string> = new Set(["principals_name_key", "teams_name_key"]);
+// A service's name is also its users row's email (#270 D1), so services.create maps users_email_key too. Only there:
+// teams.create inserts no users row, and an email collision anywhere else is not a taken principal name.
+export const SERVICE_NAME_CONSTRAINTS: ReadonlySet<string> = new Set(["principals_name_key", "users_email_key"]);
 
-// PrincipalTaken for a 23505 on a principal's name, else undefined (the caller rethrows `e`).
-export function principalTaken(e: unknown, name: string): PrincipalTaken | undefined {
+// PrincipalTaken for a 23505 on one of `constraints` (the caller's own name constraints), else undefined (the caller
+// rethrows `e`).
+export function principalTaken(e: unknown, name: string, constraints: ReadonlySet<string> = PRINCIPAL_NAME_CONSTRAINTS): PrincipalTaken | undefined {
   const c = uniqueViolation(e);
-  return c !== undefined && PRINCIPAL_NAME_CONSTRAINTS.has(c) ? new PrincipalTaken(name) : undefined;
+  return c !== undefined && constraints.has(c) ? new PrincipalTaken(name) : undefined;
 }

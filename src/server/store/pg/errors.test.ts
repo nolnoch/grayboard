@@ -3,7 +3,7 @@ import { expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { SQL } from "bun";
 import { PrincipalTaken } from "../errors.ts";
-import { foreignKeyViolation, pgFailure, principalTaken, uniqueViolation } from "./errors.ts";
+import { foreignKeyViolation, pgFailure, principalTaken, SERVICE_NAME_CONSTRAINTS, uniqueViolation } from "./errors.ts";
 
 // Bun's own class in `code`, the SQLSTATE in `errno`, as Bun.SQL reports a server error.
 const pgError = (errno: string | undefined, constraint?: string) =>
@@ -46,4 +46,9 @@ test("a 23505 on a principal's name is PrincipalTaken; on any other constraint t
   }
   expect(principalTaken(pgError("23505", "aliases_address_key"), "eng")).toBeUndefined();
   expect(principalTaken(pgError("23503", "principals_name_key"), "eng")).toBeUndefined();
+  // An email collision is a taken name only for the caller that passes the service set.
+  expect(principalTaken(pgError("23505", "users_email_key"), "eng")).toBeUndefined();
+  expect(principalTaken(pgError("23505", "users_email_key"), "ingest", SERVICE_NAME_CONSTRAINTS)).toBeInstanceOf(PrincipalTaken);
+  expect(principalTaken(pgError("23505", "principals_name_key"), "ingest", SERVICE_NAME_CONSTRAINTS)).toBeInstanceOf(PrincipalTaken);
+  expect(principalTaken(pgError("23505", "teams_name_key"), "ingest", SERVICE_NAME_CONSTRAINTS)).toBeUndefined();
 });
