@@ -5,7 +5,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Binding, NEW_RUN, type StaticMode } from "../src/binding.js";
-import { pluginOptions, staticMode, STATIC_AUTH, STATIC_ISSUER, STATIC_PRINCIPAL } from "../src/lifecycle.js";
+import { pluginOptions, RUN_TOKEN, staticMode, STATIC_AUTH, STATIC_ISSUER, STATIC_PRINCIPAL } from "../src/lifecycle.js";
 import { AccessExpired, Refusal } from "../src/core/model.js";
 import { fixture } from "./native-fixture.js";
 
@@ -65,8 +65,8 @@ test("the variables are hosted core's names, and the pre-#1300 GRAYBOARD_OPENCOD
   expect(staticMode({ ...old, GRAYBOARD_AUTH: "static", GRAYBOARD_ISSUER: ISSUER }, cwd)).toEqual({ issuer: ISSUER });
 });
 
-test("a repository's dotenv file naming either variable refuses the mode (Bun loads it into the environment)", () => {
-  for (const [file, text] of [[".env", `${STATIC_AUTH}=static\n`], [".env.local", `export ${STATIC_ISSUER}=${ISSUER}\n`], [".env.production", `  ${STATIC_AUTH} = static`], [".env", `${STATIC_PRINCIPAL}=other\n`]]) {
+test("a repository's dotenv file naming any of the variables refuses the mode (Bun loads it into the environment)", () => {
+  for (const [file, text] of [[".env", `${STATIC_AUTH}=static\n`], [".env.local", `export ${STATIC_ISSUER}=${ISSUER}\n`], [".env.production", `  ${STATIC_AUTH} = static`], [".env", `${STATIC_PRINCIPAL}=other\n`], [".env", `${RUN_TOKEN}=${TOKEN}\n`], [".env", `${STATIC_AUTH}: static\n`], [".env.local", `export ${STATIC_ISSUER}: ${ISSUER}\n`]]) {
     const cwd = empty();
     writeFileSync(join(cwd, file), text);
     expect(staticMode(ON, cwd)).toEqual({ refused: expect.stringContaining(file) });
@@ -74,6 +74,34 @@ test("a repository's dotenv file naming either variable refuses the mode (Bun lo
   const cwd = empty();
   writeFileSync(join(cwd, ".env"), "UNRELATED=1\n");
   expect(staticMode(ON, cwd)).toEqual({ issuer: ISSUER });
+});
+
+// Hosted core's rule and text (adapters/hosted-core/src/static.ts), so one launcher mistake reads the same in every
+// harness (#1313): a run token without the mode is a refused static mode, never OAuth beside the launcher's entry.
+const NO_MODE = "GRAYBOARD_RUN_TOKEN is set without GRAYBOARD_AUTH=static";
+test("a run token without GRAYBOARD_AUTH=static is hosted core's refusal, whatever the entry's shape, and sends nothing", async () => {
+  const cwd = empty();
+  expect(RUN_TOKEN).toBe("GRAYBOARD_RUN_TOKEN");
+  for (const env of [{ [RUN_TOKEN]: TOKEN }, { [RUN_TOKEN]: TOKEN, [STATIC_AUTH]: "" }, { [RUN_TOKEN]: TOKEN, [STATIC_ISSUER]: ISSUER, [STATIC_PRINCIPAL]: "ingest" }]) {
+    expect(staticMode(env, cwd)).toEqual({ refused: NO_MODE });
+    expect(pluginOptions({}, env, cwd).static).toEqual({ refused: NO_MODE });
+  }
+  // An empty token is no token: OAuth mode, as before.
+  expect(staticMode({ [RUN_TOKEN]: "" }, cwd)).toBeUndefined();
+  // A dotenv file that set the token is named instead (Bun put it in the environment).
+  writeFileSync(join(cwd, ".env"), `${RUN_TOKEN}=${TOKEN}\n`);
+  expect(staticMode({ [RUN_TOKEN]: TOKEN }, cwd)).toEqual({ refused: expect.stringContaining(".env in the working directory sets its variables") });
+  // The launcher's static entry, and an ordinary OAuth entry in a shell with a stray token: both surface the refusal
+  // itself, not an entry-shape message, and neither fetches anything nor reads OpenCode's grant.
+  const mode = staticMode({ [RUN_TOKEN]: TOKEN }, empty());
+  for (const oauth of [false, true]) {
+    const seen = server(), s = entry(mode);
+    if (oauth) { delete s.f.config.oauth; delete s.f.config.headers.Authorization; }
+    expect(await error(s.binding.capture("R"))).toMatchObject({ code: "identity", message: NO_MODE });
+    expect(await error(s.binding.configuration())).toMatchObject({ code: "identity", message: NO_MODE });
+    expect(seen).toEqual([]);
+    expect(s.f.resolutions).toBe(0);
+  }
 });
 
 test("static mode without a valid pinned issuer is refused, never OAuth, and no request or token read happens", async () => {
