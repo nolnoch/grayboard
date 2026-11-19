@@ -1,13 +1,18 @@
 //! A queue worker through the hosted MCP endpoint (#929 stage 3; `docs/sdk-rust.md` §2): bind a name, subscribe to a queue board in push mode, take one work item and one direct message from the delivery stream, receipt each, reply to the work item in its thread (which releases its queue claim), `dm_ack` the message, then end the session.
 //!
+//! It authenticates as a service (#270) with its credential, minting its own run token with no browser, and revokes that token when it's done:
+//!
 //! ```sh
-//! GRAYBOARD_URL=https://bus.example.com/mcp GRAYBOARD_TOKEN=... GRAYBOARD_SESSION=rust-example-1 \
+//! GRAYBOARD_URL=https://bus.example.com/mcp GRAYBOARD_ISSUER=https://bus.example.com \
+//!   GRAYBOARD_CLIENT_ID=svc_... GRAYBOARD_CLIENT_SECRET=... GRAYBOARD_SESSION=rust-example-1 \
 //!   cargo run --example roundtrip -- w-1 work
 //! ```
+//!
+//! With `GRAYBOARD_TOKEN` in place of the issuer, client ID and secret, it uses that token as given (`StaticBearer`).
 
 use futures_util::StreamExt;
 use grayboard::tools::{BindArgs, BoardPostArgs, BoardSubscribeArgs, DmAckArgs, SubscribeMode};
-use grayboard::{Client, ClientInfo, DeliveryMode, Error, StaticBearer};
+use grayboard::{Client, ClientCredentials, ClientInfo, DeliveryMode, Error, StaticBearer};
 
 fn env(name: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| {
@@ -22,11 +27,24 @@ async fn main() -> Result<(), Error> {
     let name = args.next().unwrap_or_else(|| "rust-roundtrip".into());
     let board = args.next().unwrap_or_else(|| "work".into());
 
-    let client = Client::new(
-        &env("GRAYBOARD_URL"),
-        StaticBearer::new(env("GRAYBOARD_TOKEN")),
-        ClientInfo::new("grayboard-rust-roundtrip", env!("CARGO_PKG_VERSION")),
-    )?;
+    let url = env("GRAYBOARD_URL");
+    let info = ClientInfo::new("grayboard-rust-roundtrip", env!("CARGO_PKG_VERSION"));
+    // The service credential when one is configured; it's kept to revoke the run's token at the end.
+    let (client, credential) = if std::env::var_os("GRAYBOARD_CLIENT_ID").is_some() {
+        let credential = ClientCredentials::new(
+            &url,
+            &env("GRAYBOARD_ISSUER"),
+            env("GRAYBOARD_CLIENT_ID"),
+            env("GRAYBOARD_CLIENT_SECRET"),
+        )?;
+        (
+            Client::new(&url, credential.clone(), info)?,
+            Some(credential),
+        )
+    } else {
+        let token = StaticBearer::new(env("GRAYBOARD_TOKEN"));
+        (Client::new(&url, token, info)?, None)
+    };
     let session = client.session(
         env("GRAYBOARD_SESSION"),
         DeliveryMode::push("grayboard-rust-roundtrip")?,
@@ -81,5 +99,10 @@ async fn main() -> Result<(), Error> {
         }
     }
     // Stops the stream (releasing its lease) before session_end.
-    session.end().await
+    session.end().await?;
+    if let Some(credential) = credential {
+        credential.revoke().await?;
+        println!("revoked the run token");
+    }
+    Ok(())
 }
