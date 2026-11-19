@@ -282,7 +282,12 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
   async function select(request: Request, admit = true): Promise<Context> {
     const role = hostedRole(request);
     const principal = await oauth.authenticate(request, roleScopes(role));
-    if (principal instanceof Response) return refuse(principal);
+    if (principal instanceof Response) {
+      // A close or abort while held here must not answer this 401: the fetch catch's guard alone keeps it off a
+      // closing server or a cancelled request, so a restart never reads as a sign-out (#1332).
+      await testPauseAsync("mcp:select:refused");
+      return refuse(principal);
+    }
     setRequestClient(principal.clientId);
     const meta = exchanges.getStore()?.meta;
     // A malformed `_meta` field is the client's bug: refused with its own message and logged, so it's diagnosable.
