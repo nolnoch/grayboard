@@ -1121,7 +1121,7 @@ export function post(
     if (branch === "queue") {
       facts.mentions = resolveMentions(db, body, handle, b, strict, viewer);
       facts.seenMentioned = seenHandles(db, viewer, facts.mentions.handles);
-      if (needsRotation(facts.seenMentioned)) {
+      if (needsRotation(facts.seenMentioned, mayLane)) {
         facts.lanes = orderLanes(queueLaneRows(db, board, own), isViewer, sees, mayLane, opts.online);
       }
     } else {
@@ -1164,8 +1164,12 @@ export function postBranch(b: Board, parentId: number | null, announcement: bool
   return !b.archived_at && (b.kind ?? "broadcast") === "queue" ? "queue" : "broadcast";
 }
 
-/** Whether a queue post goes to the rotation: no mention the author may see exists named anyone (#219, #871). */
-export const needsRotation = (seenMentioned: string[]): boolean => seenMentioned.length === 0;
+/**
+ * Whether a queue post goes to the rotation: no mention the author may see exists names one of the board's possible
+ * lanes (#219, #871). On a service's board a name that may not be its lane is told, but doesn't hold the post back
+ * (#1256); elsewhere every name may be a lane, so any visible name skips the rotation.
+ */
+export const needsRotation = (seenMentioned: string[], mayLane: (h: string) => boolean): boolean => !seenMentioned.some(mayLane);
 
 /**
  * Everything post's targeting reads, read and judged already. Predicates may be lazy (core) or set lookups (a caller
@@ -1235,12 +1239,12 @@ export function planPostTargets(f: PostTargetFacts): PostPlan {
     // isn't work. Exactly one visible name, and it no human, viewer or poster's own address: one claim names
     // one agent, and only agents hold queue work. Subscription and opt-out govern the rotation, not a name. On a
     // service's board the name must also be one of the service's lanes (#270 D5): an invoker named there is told,
-    // not handed the service's work, and the post waits on the board.
+    // not handed the service's work, and the post still rotates to a lane (needsRotation, #1256).
     const agents = seen.filter((h) => !f.own.includes(h) && !f.isHuman(h) && !f.isViewer(h) && f.mayLane(h));
     if (f.strict && seen.length === 1 && agents.length === 1) {
       claim = { lane: agents[0]!, note: "queue post (mentioned)", push: false };
     }
-    if (needsRotation(seen)) {
+    if (needsRotation(seen, f.mayLane)) {
       // Eligible lanes, least-recently-woken first, live lanes preferred: a
       // post claimed by an offline lane would sit for the full TTL while
       // live lanes idle (#192 review).

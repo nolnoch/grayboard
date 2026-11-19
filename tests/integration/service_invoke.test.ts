@@ -229,9 +229,14 @@ describe("Tests item 4: the pilot gate", () => {
       const next = holderOf("jobs", id);
       expect(next === undefined || lanes.has(next), `declined job ${id} went to ${next}`).toBe(true);
     }
-    // A post that @mentions the holder tells it, but doesn't hand it the work.
+    // A post that @mentions the holder tells it, but doesn't hand it the work, nor hold it back from a lane (#1256).
     const named = await post(carol, "jobs", `@${B}/fe please look`);
-    expect(holderOf("jobs", named.post_id)).not.toBe(`${B}/fe`);
+    expect(lanes.has(holderOf("jobs", named.post_id)!), `named job went to ${holderOf("jobs", named.post_id)}`).toBe(true);
+    // A post naming a lane is still that lane's alone: the name, not the rotation, decides.
+    const direct = await post(carol, "jobs", `@${SVC}/w-2 @${B}/fe this one is yours`);
+    expect(holderOf("jobs", direct.post_id)).toBeUndefined();
+    const solo = await post(carol, "jobs", `@${SVC}/w-2 this one is yours`);
+    expect(holderOf("jobs", solo.post_id)).toBe(`${SVC}/w-2`);
     for (const id of [...ids, named.post_id]) expect(holderOf("jobs", id)).not.toBe(`${B}/fe`);
   });
 

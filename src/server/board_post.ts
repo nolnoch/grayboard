@@ -101,7 +101,7 @@ async function writePost(
     facts.isHuman = prefetched(facts.seenMentioned, await repo.aliases.humansAmong(tx, facts.seenMentioned), "isHuman");
     // A claim by name asks the lane rule too (#270 D5).
     facts.mayLane = prefetched(facts.seenMentioned, await access.lanesAmong(tx, facts.seenMentioned, b), "mayLane");
-    if (needsRotation(facts.seenMentioned)) {
+    if (needsRotation(facts.seenMentioned, facts.mayLane)) {
       const rows = await repo.boards.laneRows(tx, b.name, own);
       const sees = rows.length ? await access.canSeeMany(tx, rows, b) : new Set<string>();
       const lanes = rows.length ? await access.lanesAmong(tx, rows, b) : new Set<string>();
