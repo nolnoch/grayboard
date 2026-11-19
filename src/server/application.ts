@@ -45,7 +45,7 @@ import { detached } from "./request_context.ts";
 import { onAliasCreated } from "./teams.ts";
 import { boardAccess, ownScopeOn, seerIn, type BoardAccess } from "./access.ts";
 import { boardCatalog, boardSnapshot, pendingOf, visibleBoards } from "./board_reads.ts";
-import { callBoardTool, serverBoardActor } from "./boards.ts";
+import { callBoardTool, claimsSeen, serverBoardActor } from "./boards.ts";
 import { PROMISE_DAYS, STALE_UNDELIVERED_MS, alreadyRetracted, historyLimit, inboxDays, promised, queuedNote, retractRefusal, showMessage, unanswered, undeliveredInstruction, type InboxItem, type PromiseItem } from "../shared/inbox.ts";
 import type { Pending } from "../shared/notifications.ts";
 
@@ -442,7 +442,8 @@ async function noticesFor(hub: Hub, r: Read, addresses: string[], first: string[
   const undelivered = await hub.repo.messages.undeliveredFrom(r, addresses, hub.now() - STALE_UNDELIVERED_MS);
   // Read before the synchronous helper (#807 P3 B1a), which asks per stale recipient.
   const seen = await hub.repo.bindings.lastSeen(r, undelivered.map((u) => u.recipient));
-  const claims = await hub.repo.claims.list(r);
+  // A queue post's claim on a board none of `addresses` sees isn't named (claimsSeen, as claim_list's).
+  const { rows: claims } = await claimsSeen(hub.repo, hub.access, r, addresses, await hub.repo.claims.list(r));
   return [
     ...first,
     ...undeliveredInstruction(undelivered, (h) => seen.get(h) ?? null),
@@ -2112,8 +2113,10 @@ async function writerMarks(repo: Repo, r: Read, session: ApplicationSession, mes
   const me = session.authed.user_email;
   const decided = new Map<string, boolean>();
   const principals = new Map<string, Principal | null>();
+  // Only a service's board's posts ask: an ID there, author or reader, is judged as its session's primary (seerIn), as
+  // its post was invoked and its board is seen.
   const principalAt = async (address: string): Promise<Principal | null> => {
-    if (!principals.has(address)) principals.set(address, address ? await repo.principals.of(r, address) : null);
+    if (!principals.has(address)) principals.set(address, address ? await seerIn(repo, r, address, true) : null);
     return principals.get(address)!;
   };
   const pkey = (p: Principal | null) => (p ? `${p.kind}:${p.name}` : "-");

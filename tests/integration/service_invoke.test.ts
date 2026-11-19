@@ -487,3 +487,54 @@ describe("wake.service_invoke judges each post by its own board and reader (audi
     expect(reply!.item.post.ungranted).toBeUndefined();
   });
 });
+
+describe("the residuals (audit re-verification)", () => {
+  test("a session's bind notices and the CLI's claim list name a queue post's claim only to those who see its board", async () => {
+    await cast();
+    const bob = await srv.hosted(B, "fe"), dave = await srv.hosted(D, "fe");
+    sessions.push(bob, dave);
+    const p = await post(bob, "jobs", "job for the service");
+    const key = `queue:jobs:${p.post_id}`;
+    await bob.call("claim_take", { key: "ticket:OPEN-1" });
+    const notices = async (s: HostedSession, name: string) => JSON.stringify(await s.call("bind", { name, create: true }));
+    const daves = await notices(dave, "second");
+    expect(daves).toContain("ticket:OPEN-1");
+    expect(daves).not.toContain("queue:jobs");
+    expect(await notices(bob, "second")).toContain(key);
+    const cli = async (t: string) => ((await api(t, "GET", "/api/claims")).body as { key: string }[]).map((c) => c.key);
+    expect(await cli(tokens[D]!)).toEqual(["ticket:OPEN-1"]);
+    expect(await cli(tokens[B]!)).toContain(key);
+  });
+
+  test("an ID's sight of a service's names, single and in a mention roster, is its session's primary's", async () => {
+    await cast();
+    expect((await api(tokens[B]!, "POST", "/api/teams", { name: "eng" })).status).toBe(201);
+    const build = await srv.hosted(B, "eng/build");
+    sessions.push(build);
+    await build.call("board_create", { name: "lobby", purpose: "everyone" });
+    const id = idHolding("eng/build");
+    const access = boardAccess(srv.app.repo), read = srv.app.repo.read;
+    const scope = { scope_kind: "service" as const, scope_ref: SVC };
+    expect(await access.seesAlias(read, id, scope)).toBe(false);
+    // A bare @w-1 that isn't eng's: strict, a seen holder is named in the refusal; an unseen one is just unresolved.
+    expect((await post(build, "lobby", "@w-1 hello")).unresolved).toEqual(["w-1"]);
+    await grant("eng");
+    expect(await access.seesAlias(read, id, scope)).toBe(true);
+    expect((await refusal(post(build, "lobby", "@w-1 hello again"))).message).toContain(`${SVC}/w-1`);
+  });
+
+  // Its user holds the grant through eng too (invokeBinding reads a user's teams), so this holds whether writerMarks
+  // judges the ID as eng or as its user: a regression check for the as-ID post, not a mutation guard for seerIn there.
+  test("a team-granted session's post as its ID reaches the service granted", async () => {
+    const { w1 } = await cast();
+    expect((await api(tokens[B]!, "POST", "/api/teams", { name: "eng" })).status).toBe(201);
+    await revoke(B);
+    await grant("eng");
+    const build = await srv.hosted(B, "eng/build");
+    sessions.push(build);
+    await post(build, "jobs", "as the ID", { as: idHolding("eng/build") });
+    const item = await w1.next(push("as the ID"));
+    expect(item.actionable).toBe(true);
+    expect((item.event as { item: { post: { ungranted?: true } } }).item.post.ungranted).toBeUndefined();
+  });
+});

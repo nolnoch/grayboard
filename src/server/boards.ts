@@ -17,7 +17,7 @@ import {
 import { scopeKey, type AliasScopeOf, type BoardAccess } from "./access.ts";
 import { seenAmong } from "./board_post.ts";
 import { callClaimTool } from "./claims.ts";
-import { readableBoard, visibleBoards } from "./board_reads.ts";
+import { readableBoard, visibleBoards, type BoardViewer } from "./board_reads.ts";
 import type { Repo } from "./db.ts";
 import type { Read, Tx } from "./store/tx.ts";
 
@@ -174,12 +174,20 @@ export async function callBoardTool(
 // delivery machinery's and its key names its board and post, so one on a board `viewer` can't see isn't listed at all:
 // a hidden board's name and traffic stay hidden (#270 D5, principle 9).
 async function claimViews(repo: Repo, access: BoardAccess, r: Read, prefix: string | undefined, viewer: string | Principal, seer: string): Promise<ClaimView[]> {
-  const all = await repo.claims.list(r, prefix);
-  if (!all.length) return [];
-  const boards = await visibleBoards(repo, access, r, viewer, all.flatMap((c) => (c.board ? [c.board] : [])));
-  const rows = all.filter((c) => !isQueueKey(c.key) || (!!c.board && boards.has(c.board)));
+  const { rows, boards } = await claimsSeen(repo, access, r, viewer, await repo.claims.list(r, prefix));
+  if (!rows.length) return [];
   const seen = await seenAmong(repo, access, r, seer, rows.map((c) => c.holder));
   return rows.map((c) => claimView(c, !c.board || boards.has(c.board), seen.has(c.holder)));
+}
+
+// Of `all`, the claims `viewer` is shown, with the boards among theirs it sees: a queue post's claim only on a board it
+// sees, since its key names the board and post (#270 D5, principle 9). claim_list and a session's notices share it.
+export async function claimsSeen<C extends { key: string; board: string | null }>(
+  repo: Repo, access: BoardAccess, r: Read, viewer: BoardViewer, all: C[],
+): Promise<{ rows: C[]; boards: Map<string, Board> }> {
+  if (!all.length) return { rows: [], boards: new Map() };
+  const boards = await visibleBoards(repo, access, r, viewer, all.flatMap((c) => (c.board ? [c.board] : [])));
+  return { rows: all.filter((c) => !isQueueKey(c.key) || (!!c.board && boards.has(c.board))), boards };
 }
 
 // core's listBoards: each open board's row is the view of the address a read without `as` acts as (S14); a principal
