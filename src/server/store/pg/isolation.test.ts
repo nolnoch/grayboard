@@ -72,6 +72,8 @@ test("the walk follows relative imports and skips type-only ones", () => {
   // bun:sqlite.
   expect(forbiddenReach([join(SRC, "server/store/identity.ts")])).toEqual([]);
   expect(forbiddenReach([join(import.meta.dir, "identity.ts")])).toEqual([]);
+  // The OAuth input rules both stores run (#807 P3 C4a): pg/oauth.ts imports them, so they reach neither.
+  expect(forbiddenReach([join(SRC, "server/oauth-rules.ts")])).toEqual([]);
   expect(runtimeImports(`import type { X } from "../tx.ts";\nexport type { Y } from "../db.ts";`)).toEqual([]);
   expect(runtimeImports(`import {\n  a,\n  b,\n} from "../tx.ts";\nexport { c } from "./d.ts";\nimport "./e.ts";\nconst f = await import("../db.ts");`))
     .toEqual(["../tx.ts", "./d.ts", "./e.ts", "../db.ts"]);
