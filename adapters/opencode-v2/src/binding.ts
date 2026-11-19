@@ -4,6 +4,13 @@ import type { MCPEditor } from "@opencode/plugin/promise/mcp";
 import { AccessExpired, Refusal, same, type Configuration } from "./core/model.js";
 import type { CredentialPort } from "./core/port.js";
 import type { OpenCodeEnrollment } from "./approval.js";
+import { ServerUnreachable, unreachable } from "./core/wire.js";
+
+// A TimeoutError anywhere on the cause chain (AbortSignal.timeout's abort).
+export function timedOut(error: unknown): boolean {
+  for (let e = error, depth = 0; e && depth < 8; e = (e as { cause?: unknown }).cause, depth++) if ((e as { name?: unknown }).name === "TimeoutError") return true;
+  return false;
+}
 
 export const SIGN_IN = "reconnect or sign in using OpenCode";
 // Static mode's action for a refused or missing run token: only the launcher holds the credential (#270 D3).
@@ -136,7 +143,17 @@ export class Binding implements CredentialPort<OpenCodeEnrollment> {
     if (this.vouched.has(url)) return issuer;
     const resource = new URL(url);
     if (resource.origin !== new URL(issuer).origin) throw new Refusal("identity", "Native issuer does not match the pinned issuer");
-    const response = await fetch(resource.origin + "/.well-known/oauth-protected-resource" + resource.pathname, { redirect: "error", signal: AbortSignal.timeout(10_000) });
+    // An outage is not an answer (#1250): a network failure, the 10 s timeout, a 5xx or a 429 throws ServerUnreachable,
+    // which callers treat as one (auto-enroll retries it; a wire's token reports it unreachable), and caches nothing.
+    // A redirect, another 4xx, or a 2xx whose metadata doesn't name this URL and the pin is the identity refusal.
+    let response: Response;
+    try {
+      response = await fetch(resource.origin + "/.well-known/oauth-protected-resource" + resource.pathname, { redirect: "error", signal: AbortSignal.timeout(10_000) });
+    } catch (error) {
+      if (unreachable(error) || timedOut(error)) throw new ServerUnreachable(error);
+      throw error;
+    }
+    if (response.status >= 500 || response.status === 429) { await response.body?.cancel().catch(() => {}); throw new ServerUnreachable(new Error(`Protected-resource metadata answered HTTP ${response.status}`)); }
     const metadata = await response.json().catch(() => undefined) as { resource?: unknown; authorization_servers?: unknown } | undefined;
     if (!response.ok || metadata?.resource !== url || !Array.isArray(metadata.authorization_servers) || !metadata.authorization_servers.includes(issuer)) throw new Refusal("identity", "Native issuer does not match the pinned issuer");
     this.vouched.add(url);
