@@ -139,6 +139,8 @@ function ompHarness(settings: Record<string, unknown> = {}, reasoning = false): 
     logoutNoticeLags: true,
     // A root whose subscription closed first sits in `retrying` until its next reopen meets the sign-out (#606).
     pauseLags: true,
+    // One task subagent, in omp's process.
+    subagent: (_dir, trigger, steps) => taskFanout(1, new RegExp(`^${trigger}$`), () => steps),
   };
 }
 const OMP_HARNESS = ompHarness();

@@ -1312,6 +1312,15 @@ const PI_HARNESS: HostedHarness = {
   forkCopiesRecords: false,
   logoutNoticeLags: false,
   pauseLags: false,
+  // pi-subagents' detached runner: the root's bash execs pi with the runner's marker and the root's session as its
+  // parent, so the runner inherits the root's environment (a static run's token among it).
+  subagent: (_dir, trigger, steps, root) => [
+    (req) => scripted(trigger, [{
+      tool: "bash",
+      args: { command: `exec env PI_SUBAGENT_CHILD=1 PI_SUBAGENT_PARENT_SESSION='${root()}' '${Bun.which("node")}' '${PI_CLI}' -p --offline --provider fake --model fake-1 --no-session 'subagent run'` },
+    }])(req),
+    scripted("subagent run", steps),
+  ],
 };
 
 // After the user prompt `prompt` (the latest; <channel> deliveries aren't

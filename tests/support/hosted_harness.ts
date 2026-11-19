@@ -8,10 +8,11 @@ import type { ChildProcess } from "node:child_process";
 import { existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Config } from "../../src/server/config.ts";
-import { onChannelDm, startFakeModel, type FakeModel, type Rule } from "./fake_model.ts";
+import { onChannelDm, startFakeModel, type FakeModel, type Reply, type Rule } from "./fake_model.ts";
 import { hostedServer, seedGrant, tokenRequests, type HostedServer } from "./hosted_oauth.ts";
 import { answerPeer, expectDeliveryRecords, expectSignInOffer, hostedPeer, tokenPeer, hostedRow, leased, ownershipEnded, pingPong, scripted, statusOf, stopAll, toolResultNamed, type Peer, type Pi } from "./pi.ts";
 import { grayboardDescendants } from "./procs.ts";
+import { accessAudits } from "./audit.ts";
 import { serviceRun } from "./service_token.ts";
 import { until } from "./until.ts";
 
@@ -51,6 +52,10 @@ export type HostedHarness = {
   logoutNoticeLags: boolean;
   // A root may sit in `retrying` until its next reopen meets the sign-out (#606), so the scenario waits for the paused status.
   pauseLags: boolean;
+  // Model rules under which the prompt `trigger` makes the root run one subagent whose calls are `steps`: pi's
+  // detached runner, a process its bash execs with the root's environment; omp's task subagent, in its process.
+  // `root()` is the root's own session ID, read when the root's step runs.
+  subagent(dir: string, trigger: string, steps: Reply[], root: () => string): Rule[];
 };
 
 export type Hosted = { srv: HostedServer; model: FakeModel; peer: Peer; start(o?: StartOpts): Pi };
@@ -231,7 +236,9 @@ export function hostedRefreshLogoutScenario(h: HostedHarness, dir: string): Prom
 // BUS_IDENTITY=w-1, no grant store. The harness binds `ingest/w-1` as the
 // service under its svc_ client and takes the lease, a DM from another of the
 // service's sessions (on a second run token from the same credential) starts
-// one turn whose reply goes out as `ingest/w-1`, /grayboard status names the
+// one turn whose reply goes out as `ingest/w-1`, a subagent (which inherits
+// the run token) registers as a child under the root's svc_ session, writes
+// as `ingest/w-1` and ends with its run (#1303), /grayboard status names the
 // static run and never the token, /grayboard login and logout refuse, and
 // nothing offers a sign-in or opens a browser. Revoking the credential then
 // ends the run: one notice naming the launcher, and the next tool call
@@ -239,9 +246,16 @@ export function hostedRefreshLogoutScenario(h: HostedHarness, dir: string): Prom
 export function hostedStaticScenario(h: HostedHarness, dir: string): Promise<void> {
   const SVC = "ingest", NAME = `${SVC}/w-1`, SENDER = `${SVC}/sender`;
   const ended = `grayboard: delivery paused: Signed out of grayboard in ${h.name}; the launcher must start a new run with a fresh run token`;
+  const gate = join(dir, "subagent-go");
+  let rootSession = "";
   return withHosted(h, dir, [
     onChannelDm(SENDER, (id) => ({ tool: `${h.prefix}dm_send`, args: { to: SENDER, body: "pong", parent_id: id } })),
     scripted("check", [{ tool: `${h.prefix}whoami`, args: {} }]),
+    // The subagent sends, then holds its run open (a bash gate) until the scenario has looked at its child row.
+    ...h.subagent(dir, "delegate", [
+      { tool: `${h.prefix}dm_send`, args: { to: SENDER, body: "from the subagent" } },
+      { tool: "bash", args: { command: `while [ ! -f '${gate}' ]; do sleep 0.1; done` } },
+    ], () => rootSession),
   ], async ({ srv, start }) => {
     const run = await serviceRun(srv, { admin: "root@example.com" });
     // The service's other session: a cross-account DM stays mail that doesn't wake (#270 open question 7), the service's own wakes.
@@ -257,6 +271,29 @@ export function hostedStaticScenario(h: HostedHarness, dir: string): Promise<voi
     const { message_id: id } = await sender.call("dm_send", { to: NAME, body: "ping w-1" });
     const reply = await until(() => srv.app.db.query<{ sender: string }, [number]>("SELECT sender FROM messages WHERE parent_id = ? AND body = 'pong'").get(id), 30_000, `pong to DM ${id}`);
     expect(reply.sender).toBe(NAME);
+    await h.idle(proc);
+
+    // A subagent of the service run (#1303): it inherits the run token, registers as a child under the root's
+    // svc_ session at its first call, writes as the root's name, and ends with its run.
+    rootSession = state.sessionId;
+    const root = srv.app.db.query<{ session_id: string }, [string, string]>("SELECT session_id FROM hosted_sessions WHERE client_id = ? AND source_session_id = ?").get(run.clientId, state.sessionId)!.session_id;
+    await proc.command({ type: "prompt", message: "delegate" });
+    const sent = await until(() => srv.app.db.query<{ sender: string }, []>("SELECT sender FROM messages WHERE body = 'from the subagent'").get(), 60_000, "the subagent's DM");
+    expect(sent.sender).toBe(NAME);
+    const registered = accessAudits(srv.app.db, "hosted.child_registered");
+    expect(registered.map((r) => [r.target, r.detail.via])).toEqual([[root, []]]);
+    const child = registered[0]!.detail.child as string;
+    expect(child).not.toBe(root);
+    expect(registered[0]!.detail.source_session_id).not.toBe(state.sessionId);
+    const childRow = srv.app.db.query<{ client_id: string; user_id: number; root_session_id: string | null }, [string]>("SELECT client_id, user_id, root_session_id FROM hosted_sessions WHERE session_id = ?").get(child);
+    const rootRow = srv.app.db.query<{ user_id: number }, [string]>("SELECT user_id FROM hosted_sessions WHERE session_id = ?").get(root)!;
+    expect(childRow).toEqual({ client_id: run.clientId, user_id: rootRow.user_id, root_session_id: root });
+    const writes = accessAudits(srv.app.db, "hosted.write").filter((w) => w.detail.tool === "dm_send" && w.target === child);
+    expect(writes.map((w) => w.detail)).toEqual([expect.objectContaining({ session: child, root, held: [NAME] })]);
+    writeFileSync(gate, "");
+    await until(() => accessAudits(srv.app.db, "hosted.child_released").length === 1, 30_000, "the subagent's child ended with its run");
+    expect(accessAudits(srv.app.db, "hosted.child_released").map((r) => [r.target, r.detail.child])).toEqual([[root, child]]);
+    expect(srv.app.db.query("SELECT 1 FROM hosted_sessions WHERE session_id = ?").get(child)).toBeNull();
     await h.idle(proc);
 
     const status = await statusOf(proc);
