@@ -15,6 +15,7 @@ import { openDatabase } from "./db.ts";
 import { createBoard, post, subscribe } from "../core/boards.ts";
 import { scratchDbPath } from "../../tests/support/scratch_db.ts";
 import { seed } from "../../tests/support/seed.ts";
+import { liveGrants } from "../../tests/support/grants.ts";
 
 let store: ReturnType<typeof openDatabase>;
 let application: ReturnType<typeof createApplication>;
@@ -35,6 +36,7 @@ beforeEach(async () => {
   application = createApplication(store.repo);
   const principal = async (email: string): Promise<DeliveryPrincipal> => {
     const user = await seed(store.repo, tx => store.repo.users.upsertByEmail(tx, email, null));
+    await liveGrants(store.repo, user.id, [`grant:${user.id}`, "G2"]);
     return { authed: { user_id: user.id, user_email: email, kind: "user", session_id: 0 }, grantId: `grant:${user.id}`, clientId: OPENCODE_CLIENT, sourceKey: OPENCODE_SESSION_META, scopes: ["tools", "delivery"], accessHash: "test", accessExpiry: Number.MAX_SAFE_INTEGER };
   };
   alice = await principal("alice@example.com"); bob = await principal("bob@example.com");
@@ -413,7 +415,7 @@ test("a lease finished while renew's update awaits stays finished: renew refuses
   let entered!: () => void, release!: () => void;
   const started = new Promise<void>(resolve => { entered = resolve; });
   const held = new Promise<void>(resolve => { release = resolve; });
-  const spy = spyOn(store.repo.hosted, "update").mockImplementationOnce(async (tx, row) => { entered(); await held; return update(tx, row); });
+  const spy = spyOn(store.repo.hosted, "update").mockImplementationOnce(async (tx, id, patch) => { entered(); await held; return update(tx, id, patch); });
   try {
     const renewed = delivery.renew(bob, context(bob), lease.capability);
     await started;

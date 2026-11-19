@@ -24,6 +24,7 @@ import { claim, listClaims } from "../core/claims.ts";
 import { scratchDbPath } from "../../tests/support/scratch_db.ts";
 import { queueFor } from "./store/queue.ts";
 import { seed } from "../../tests/support/seed.ts";
+import { liveGrants } from "../../tests/support/grants.ts";
 
 let database: ReturnType<typeof openDatabase>;
 let application: ReturnType<typeof createApplication>;
@@ -40,6 +41,7 @@ beforeEach(async () => {
   application = createApplication(database.repo);
   const user = await seed(database.repo, tx => database.repo.users.upsertByEmail(tx, "you@example.com", null));
   principal = { authed: { user_id: user.id, user_email: user.email, kind: "user", session_id: 0 }, clientId: OPENCODE_CLIENT, sourceKey: OPENCODE_SESSION_META, grantId: "G1", accessHash: "test", accessExpiry: Number.MAX_SAFE_INTEGER, scopes: ["tools", "delivery"] };
+  await liveGrants(database.repo, user.id, ["G1", "G2"]);
   now = Date.now(); authorized = true;
   hosted = createHostedSessions(application, { now: () => now, isAuthorized: () => authorized }); await hosted.ready;
   delivery = createDelivery(hosted, { isAuthorized: () => authorized });
@@ -1994,7 +1996,7 @@ const windows: [string, (m: { root: string; child: string; other: string; name: 
   // The child alone goes idle: the root stays live (touched, its lease renewed), so a miss here is the child's.
   ["the child parked", async ({ root, child }) => { now += 900_001; await keepLive(root); await hosted.sweep(); const row = await database.repo.hosted.get(database.repo.read, hostedId(child)); expect(row).toBeDefined(); expect(row!.parked_at).not.toBeNull(); }],
   ["the root's lease lapsed", async ({ root }) => { await seed(database.repo, () => database.db.run("UPDATE hosted_sessions SET lease_deadline = ? WHERE session_id = ?", [now - 1, hostedId(root)])); }],
-  ["the root's generation moved", async ({ root }) => { await seed(database.repo, async tx => { const r = (await database.repo.hosted.get(tx, hostedId(root)))!; return database.repo.hosted.update(tx, { ...r, bind_gen: r.bind_gen + 1 }); }); }],
+  ["the root's generation moved", async ({ root }) => { await seed(database.repo, async tx => { const r = (await database.repo.hosted.get(tx, hostedId(root)))!; return database.repo.hosted.update(tx, r.session_id, { bind_gen: r.bind_gen + 1 }); }); }],
   ["the root ended and started again", async ({ root }) => { await hosted.end(principal, context(root)); await hosted.whoami(principal, context(root)); }],
   ["the child moved to another root", async ({ root, other, child }) => { await hosted.end(principal, context(root), hostedId(child)); await hosted.register(principal, context(other), child); }],
   ["the child's idle window passed", async ({ root, child }) => { now += 900_001; await keepLive(root); expect(await database.repo.hosted.get(database.repo.read, hostedId(child))).toBeDefined(); }],
@@ -2020,9 +2022,10 @@ for (const [change, apply] of windows) for (const caller of ["root", "child"] as
       const { verdict } = await hosted.snapshot(principal, context(self), false);
       await apply(m);
       const body = `${mode} ${change} ${caller} ${parkedFirst}`;
-      const get = spyOn(database.repo.hosted, "get");
+      // Row reads, locked or not (#807 P3 C8a: settle and fence read with `lock`).
+      const get = spyOn(database.repo.hosted, "get"), lock = spyOn(database.repo.hosted, "lock");
       const result = await hosted.run(principal, context(self), "dm_send", (session, tx) => application.send(tx, session, m.name, body), undefined, mode === "prior" ? verdict : undefined)
-        .then(() => "ok", (e: { code?: string }) => e.code ?? "error").finally(() => { reads.push(get.mock.calls.length); get.mockRestore(); });
+        .then(() => "ok", (e: { code?: string }) => e.code ?? "error").finally(() => { reads.push(get.mock.calls.length + lock.mock.calls.length); get.mockRestore(); lock.mockRestore(); });
       const sent = database.db.query<{ sender_id: string }, [string]>("SELECT sender_id FROM messages WHERE body = ?").get(body)?.sender_id;
       const row = await database.repo.hosted.get(database.repo.read, hostedId(self));
       return { result, sender: sent === undefined ? null : sent === hostedId(self), parked: row?.parked_at ?? null, root: row?.root_session_id === null ? "self" : row?.root_session_id === hostedId(m.root) ? "root" : row?.root_session_id === hostedId(m.other) ? "other" : "none", inflight: hosted.inflightCount };
@@ -2146,7 +2149,7 @@ test("#807 P3 A7d2b: fence reads the binding after its token check's await: a re
       const checked = guard(database.repo.read);
       await held.reached;
       const row = (await rowOf(context("fence-root")))!;
-      await seed(database.repo, tx => database.repo.hosted.update(tx, { ...row, bind_gen: row.bind_gen + 1 }));
+      await seed(database.repo, tx => database.repo.hosted.update(tx, row.session_id, { bind_gen: row.bind_gen + 1 }));
       held.release(true);
       verdict = await checked.then(() => "passed", (e: { code?: string }) => e.code ?? "error");
     });
@@ -2172,7 +2175,7 @@ test("#807 P3 A7d2b: a close while a hosted token check awaits refuses the call"
 const rootId = () => (context("root") as { id: string }).id;
 const bumpGen = () => seed(database.repo, async tx => {
   const r = (await database.repo.hosted.get(tx, rootId()))!;
-  return database.repo.hosted.update(tx, { ...r, bind_gen: r.bind_gen + 1 });
+  return database.repo.hosted.update(tx, r.session_id, { bind_gen: r.bind_gen + 1 });
 });
 
 test("#807 P3 A7g1: a full reconcile's read holds the write queue; two commits during it land after its apply and the holder matches the last", async () => {
@@ -2195,7 +2198,7 @@ test("#807 P3 A7g1: a named commit's facts are read at COMMIT, so a hold dropped
   expect(hosted.holderCount).toBe(1);
   await seed(database.repo, async tx => {
     const r = (await database.repo.hosted.get(tx, rootId()))!;
-    await database.repo.hosted.update(tx, { ...r, bind_gen: r.bind_gen + 1 });
+    await database.repo.hosted.update(tx, r.session_id, { bind_gen: r.bind_gen + 1 });
     dropHold(database.repo.coreOn(tx), at("be"), rootId());
   });
   expect(hosted.holder(rootId())).toBeUndefined();
@@ -2272,4 +2275,407 @@ test("#807 P3 A7g1 audit: a full reconcile whose write is refused before its bod
     await hosted.reconcile();
     expect(all).toHaveBeenCalledTimes(1);
   } finally { write.mockRestore(); all.mockRestore(); }
+});
+
+// #807 P3 C8a: the lock seams' call sites. On SQLite `lock`, `lockCapacity` and `grantLive` take no lock (the single
+// writer serializes every body), so what these rows pin is where each call sits: in the write body, before the read it
+// guards, with the guarded value read again after it. On Postgres those positions are what make the locks work.
+type SeamCall = { name: string; id?: string };
+function seamCalls(): { calls: SeamCall[]; restore(): void } {
+  const store = database.repo.hosted, calls: SeamCall[] = [];
+  const names = ["grantLive", "lockCapacity", "lock", "get", "counts", "start", "insert", "update", "touch", "unpark", "end"] as const;
+  const spies = names.map(name => {
+    const original = store[name] as (...a: unknown[]) => unknown;
+    return spyOn(store, name).mockImplementation(((...a: unknown[]) => {
+      // Write bodies only: a pool read is no lock's business.
+      if (a[0] !== database.repo.read) calls.push({ name, id: typeof a[1] === "string" ? a[1] : (a[1] as { session_id?: string } | undefined)?.session_id });
+      return original.apply(store, a);
+    }) as never);
+  });
+  return { calls, restore: () => { for (const s of spies) s.mockRestore(); } };
+}
+const seamAt = (calls: SeamCall[], name: string, id?: string, from = 0) => calls.findIndex((c, i) => i >= from && c.name === name && (id === undefined || c.id === id));
+const order = (calls: SeamCall[]) => calls.map(c => c.id ? `${c.name} ${c.id}` : c.name).join(", ");
+
+test("#807 P3 C8a: a creating request reads its grant first, then takes the capacity lock and reads its row again before it counts or inserts", async () => {
+  const id = hostedId("seam-new");
+  const seams = seamCalls();
+  try { await hosted.whoami(principal, context("seam-new")); } finally { seams.restore(); }
+  const { calls } = seams, capacity = seamAt(calls, "lockCapacity");
+  expect(order(calls)).toStartWith("grantLive");
+  expect(capacity).toBeGreaterThan(0);
+  const reread = seamAt(calls, "get", id, capacity);
+  expect(reread, order(calls)).toBeGreaterThan(capacity);
+  expect(reread, order(calls)).toBeLessThan(seamAt(calls, "counts"));
+  expect(seamAt(calls, "counts"), order(calls)).toBeLessThan(seamAt(calls, "insert", id));
+});
+
+test("#807 P3 C8a: a same-ID row committed while a creating request waited for the capacity lock is found, not inserted twice (scope R1)", async () => {
+  const id = hostedId("seam-racer");
+  const store = database.repo.hosted, lockCapacity = store.lockCapacity.bind(store);
+  // The racer's insert lands while this request waits for the lock: on SQLite, inside it, in the same body.
+  const spy = spyOn(store, "lockCapacity").mockImplementationOnce(async tx => {
+    await lockCapacity(tx);
+    const ownership = await store.start(tx, id, principal.authed.user_id, principal.clientId, now);
+    await store.insert(tx, { session_id: id, ownership_id: ownership, user_id: principal.authed.user_id, client_id: principal.clientId, grant_id: principal.grantId,
+      source_session_id: "seam-racer", writes_as: null, bind_gen: 0, root_session_id: null, place: null, lease_deadline: null, created_at: now, last_seen_at: now, suggested: null, parked_at: null });
+  });
+  try { await hosted.whoami(principal, context("seam-racer")); } finally { spy.mockRestore(); }
+  expect(database.db.query("SELECT count(*) AS n FROM hosted_ownerships WHERE session_id = ?").get(id)).toEqual({ n: 1 });
+  expect(await store.get(database.repo.read, id)).toBeDefined();
+});
+
+test("#807 P3 C8a: a call on a live root reads its grant first and locks the row before settle writes it", async () => {
+  const id = hostedId("seam-live");
+  await hosted.whoami(principal, context("seam-live"));
+  now += 1_000;
+  const seams = seamCalls();
+  try { await hosted.whoami(principal, context("seam-live")); } finally { seams.restore(); }
+  const { calls } = seams;
+  expect(order(calls)).toStartWith("grantLive");
+  const locked = seamAt(calls, "lock", id);
+  expect(locked, order(calls)).toBeGreaterThan(0);
+  expect(seamAt(calls, "get", id), order(calls)).toBe(-1);
+  const write = calls.findIndex(c => (c.name === "touch" || c.name === "update") && c.id === id);
+  if (write !== -1) expect(locked).toBeLessThan(write);
+});
+
+test("#807 P3 C8a: bind reads its grant first and attach locks the root before it reads it for the update", async () => {
+  const id = hostedId("seam-bind");
+  await hosted.whoami(principal, context("seam-bind"));
+  const seams = seamCalls();
+  try { await hosted.bind(principal, context("seam-bind"), { name: "seam-fe", create: true }); } finally { seams.restore(); }
+  const { calls } = seams;
+  // Two bodies: the gate's settle, then the owning body that writes the bind; each starts with the grant.
+  expect(calls[0]?.name, order(calls)).toBe("grantLive");
+  const body = seamAt(calls, "grantLive", undefined, 1);
+  expect(body, order(calls)).toBeGreaterThan(seamAt(calls, "lock", id));
+  const locked = seamAt(calls, "lock", id, body), update = seamAt(calls, "update", id, body);
+  expect(locked, order(calls)).toBeGreaterThan(body);
+  expect(update, order(calls)).toBeGreaterThan(locked);
+  // No unlocked read of the row before its update (an audit reads it after).
+  expect(calls.slice(body, update).some(c => c.name === "get" && c.id === id), order(calls)).toBe(false);
+});
+
+test("#807 P3 C8a audit: attach locks the root before its fence reads it", async () => {
+  await hosted.whoami(principal, context("seam-attach"));
+  const store = database.repo.hosted, lock = store.lock.bind(store), callers: string[] = [];
+  // Which function asked: the frame just above the spy's.
+  const spy = spyOn(store, "lock").mockImplementation((tx, id) => {
+    const stack = new Error().stack ?? "";
+    callers.push(/\bat (?:async )?fence\b/.test(stack) ? "fence" : /\bat (?:async )?attach\b/.test(stack) ? "attach" : "other");
+    return lock(tx, id);
+  });
+  try { await hosted.bind(principal, context("seam-attach"), { name: "seam-at", create: true }); } finally { spy.mockRestore(); }
+  const attach = callers.indexOf("attach"), fence = callers.indexOf("fence");
+  expect(attach, callers.join(", ")).toBeGreaterThanOrEqual(0);
+  expect(fence, callers.join(", ")).toBeGreaterThan(attach);
+});
+
+test("#807 P3 C8a: register reads its grant first, then locks the root before it inserts the child", async () => {
+  const root = hostedId("seam-root"), child = hostedId("seam-child");
+  await hosted.bind(principal, context("seam-root"), { name: "seam-be", create: true });
+  const seams = seamCalls();
+  try { await hosted.register(principal, context("seam-root"), "seam-child"); } finally { seams.restore(); }
+  const { calls } = seams;
+  // Its body's first store call: before rowFor reads the root.
+  const body = seamAt(calls, "grantLive");
+  expect(body, order(calls)).toBe(0);
+  const insert = seamAt(calls, "insert", child, body);
+  expect(insert, order(calls)).toBeGreaterThan(body);
+  expect(seamAt(calls, "lock", root, body), order(calls)).toBeGreaterThan(body);
+  expect(seamAt(calls, "lock", root, body), order(calls)).toBeLessThan(insert);
+  // admit's lock, before its count (admitChild takes it again).
+  const capacity = seamAt(calls, "lockCapacity", undefined, body);
+  expect(capacity, order(calls)).toBeGreaterThan(body);
+  expect(capacity, order(calls)).toBeLessThan(seamAt(calls, "counts", undefined, body));
+  expect(capacity, order(calls)).toBeLessThan(insert);
+  expect(seamAt(calls, "lock", child, body), order(calls)).toBeGreaterThan(body);
+  expect(seamAt(calls, "lock", child, body), order(calls)).toBeLessThan(insert);
+  // The lock order (store/hosted.ts): root, then child, then capacity; attach's later root lock is re-entrant.
+  expect(seamAt(calls, "lock", root, body), order(calls)).toBeLessThan(seamAt(calls, "lock", child, body));
+  expect(seamAt(calls, "lock", child, body), order(calls)).toBeLessThan(capacity);
+});
+
+test("#807 P3 C8a: registering an unbound root as a child takes the capacity lock before it ends that root and inserts the child", async () => {
+  const child = hostedId("seam-convert");
+  await hosted.bind(principal, context("seam-root2"), { name: "seam-r2", create: true });
+  await hosted.whoami(principal, context("seam-convert"));
+  const seams = seamCalls();
+  try { await hosted.register(principal, context("seam-root2"), "seam-convert"); } finally { seams.restore(); }
+  const { calls } = seams;
+  const body = seamAt(calls, "grantLive"), end = seamAt(calls, "end", child, body);
+  expect(end, order(calls)).toBeGreaterThan(body);
+  const capacity = seamAt(calls, "lockCapacity", undefined, body);
+  expect(capacity, order(calls)).toBeGreaterThan(body);
+  expect(capacity, order(calls)).toBeLessThan(end);
+  expect(seamAt(calls, "insert", child, end), order(calls)).toBeGreaterThan(end);
+  // The lock order: the root, then the root being converted, then capacity.
+  const root = hostedId("seam-root2"), lockedRoot = seamAt(calls, "lock", root, body), lockedChild = seamAt(calls, "lock", child, body);
+  expect(lockedRoot, order(calls)).toBeGreaterThan(body);
+  expect(lockedRoot, order(calls)).toBeLessThan(lockedChild);
+  expect(lockedChild, order(calls)).toBeLessThan(capacity);
+});
+
+test("#807 P3 C8a audit: a parked child's call locks it (its root first) before unpark takes the capacity lock", async () => {
+  const child = hostedId("seam-wake-child");
+  await hosted.bind(principal, context("seam-wake-root"), { name: "seam-wk", create: true });
+  await hosted.register(principal, context("seam-wake-root"), "seam-wake-child");
+  now += 900_001;
+  await hosted.sweep();
+  expect((await database.repo.hosted.get(database.repo.read, child))!.parked_at).not.toBeNull();
+  const seams = seamCalls();
+  try { await hosted.whoami(principal, context("seam-wake-child")); } finally { seams.restore(); }
+  const { calls } = seams, locked = seamAt(calls, "lock", child), capacity = seamAt(calls, "lockCapacity"), unparked = seamAt(calls, "unpark", child);
+  expect(locked, order(calls)).toBeGreaterThan(0);
+  expect(capacity, order(calls)).toBeGreaterThan(locked);
+  expect(unparked, order(calls)).toBeGreaterThan(capacity);
+  // No row lock after the capacity lock until the unpark it guards.
+  expect(calls.slice(capacity, unparked).some(c => c.name === "lock"), order(calls)).toBe(false);
+});
+
+test("#807 P3 C8a audit: register on an unknown root takes the capacity lock and reads the root again before it creates it", async () => {
+  const root = hostedId("seam-fresh-root");
+  const seams = seamCalls();
+  try { await hosted.register(principal, context("seam-fresh-root"), "seam-fresh-child"); } finally { seams.restore(); }
+  const { calls } = seams, capacity = seamAt(calls, "lockCapacity"), insert = seamAt(calls, "insert", root);
+  expect(capacity, order(calls)).toBeGreaterThan(0);
+  const reread = seamAt(calls, "get", root, capacity);
+  expect(reread, order(calls)).toBeGreaterThan(capacity);
+  expect(reread, order(calls)).toBeLessThan(insert);
+  expect(seamAt(calls, "counts"), order(calls)).toBeGreaterThan(reread);
+});
+
+test("#807 P3 C8a: delivery's renew, receipt and release lock the row before they read it; a tool call's fence in its body locks it", async () => {
+  const id = hostedId("seam-lease");
+  await hosted.bind(principal, context("seam-lease"), { name: "seam-dl", create: true });
+  const lease = await delivery.open(principal, context("seam-lease"));
+  const run = async (fn: () => Promise<unknown>) => {
+    const seams = seamCalls();
+    try { await fn(); } finally { seams.restore(); }
+    return seams.calls;
+  };
+  const renew = await run(() => delivery.renew(principal, context("seam-lease"), lease.capability));
+  expect(seamAt(renew, "lock", id), order(renew)).toBeGreaterThanOrEqual(0);
+  expect(seamAt(renew, "lock", id), order(renew)).toBeLessThan(seamAt(renew, "update", id));
+  expect(renew.slice(0, seamAt(renew, "update", id)).some(c => c.name === "get" && c.id === id), order(renew)).toBe(false);
+  const receipt = await run(() => delivery.receipt(principal, context("seam-lease"), lease.capability, []));
+  expect(seamAt(receipt, "lock", id), order(receipt)).toBeGreaterThanOrEqual(0);
+  expect(receipt.some(c => c.name === "get" && c.id === id), order(receipt)).toBe(false);
+  // A tool call: settle's lock, then the fence's, both in the body; neither reads the row unlocked there.
+  const tool = await run(() => hosted.run(principal, context("seam-lease"), "dm_send", (session, tx) => application.send(tx, session, "seam-dl", "hi")));
+  expect(tool.filter(c => c.name === "lock" && c.id === id).length, order(tool)).toBeGreaterThanOrEqual(2);
+  expect(tool.filter(c => c.name === "get" && c.id === id).length, order(tool)).toBe(0);
+  const release = await run(() => delivery.release(principal, context("seam-lease"), lease.capability));
+  expect(seamAt(release, "lock", id), order(release)).toBeGreaterThanOrEqual(0);
+  expect(release.slice(0, seamAt(release, "end", id)).some(c => c.name === "get" && c.id === id), order(release)).toBe(false);
+});
+
+test("#807 P3 C8a: a revoked hold's root is locked on the recheck's Tx, before the savepoint that reads and updates it", async () => {
+  const team = await seed(database.repo, async tx => {
+    const t = await database.repo.teams.create(tx, "ops", principal.authed.user_id);
+    await database.repo.teams.addMember(tx, t.id, principal.authed.user_id);
+    return t;
+  });
+  const id = hostedId("seam-revoke");
+  await hosted.bind(principal, context("seam-revoke"), { name: "ops/seam", create: true });
+  await seed(database.repo, tx => database.repo.teams.removeMember(tx, team.id, principal.authed.user_id));
+  const handles: { name: string; tx: unknown }[] = [];
+  const store = database.repo.hosted;
+  const spies = (["lock", "get", "update"] as const).map(name => {
+    const original = store[name] as (...a: unknown[]) => unknown;
+    return spyOn(store, name).mockImplementation(((...a: unknown[]) => { if (a[1] === id && a[0] !== database.repo.read) handles.push({ name, tx: a[0] }); return original.apply(store, a); }) as never);
+  });
+  try { await application.accessChanged(database.repo.read, principal.authed.user_email, "admin@example.com"); }
+  finally { for (const s of spies) s.mockRestore(); }
+  const names = handles.map(h => h.name);
+  expect(names[0], names.join(", ")).toBe("lock");
+  expect(names.slice(1, 3), names.join(", ")).toEqual(["get", "update"]);
+  // The lock on the caller's Tx, the read and the update on the savepoint's.
+  expect(handles[1]!.tx).not.toBe(handles[0]!.tx);
+  expect(handles[2]!.tx).toBe(handles[1]!.tx);
+});
+
+test("#807 P3 C8a: a cancelled creating open locks the row before it ends the session", async () => {
+  const id = hostedId("seam-cancel");
+  await hosted.bind(principal, context("seam-cancel"), { name: "seam-cx", create: true });
+  const created = await delivery.open(principal, context("seam-cancel"));
+  const seams = seamCalls();
+  try { await delivery.cancel(created); } finally { seams.restore(); }
+  const { calls } = seams;
+  const end = seamAt(calls, "end", id);
+  expect(end, order(calls)).toBeGreaterThan(0);
+  expect(seamAt(calls, "lock", id), order(calls)).toBeLessThan(end);
+  expect(seamAt(calls, "lock", id), order(calls)).toBeGreaterThanOrEqual(0);
+});
+
+test("#807 P3 C8a: a restart's downtime credit locks each root before it reads the column it credits", async () => {
+  const id = hostedId("seam-credit");
+  // An unleased root seen during the outage's idle window: the restart credits its last_seen_at.
+  await hosted.whoami(principal, context("seam-credit"));
+  delivery.close(); await hosted.close();
+  await seed(database.repo, async tx => { await database.repo.hosted.heartbeat(tx, now - 600_000); await database.repo.hosted.touch(tx, id, now - 300_000); });
+  const seams = seamCalls();
+  const service = createHostedSessions(application, { now: () => now, isAuthorized: () => true });
+  try { await service.ready; } finally { seams.restore(); await service.close(); }
+  hosted = createHostedSessions(application, { now: () => now, isAuthorized: () => authorized }); await hosted.ready;
+  delivery = createDelivery(hosted, { isAuthorized: () => authorized });
+  const { calls } = seams;
+  const update = seamAt(calls, "update", id);
+  expect(update, order(calls)).toBeGreaterThanOrEqual(0);
+  expect(seamAt(calls, "lock", id), order(calls)).toBeGreaterThanOrEqual(0);
+  expect(seamAt(calls, "lock", id), order(calls)).toBeLessThan(update);
+});
+
+test("#807 P3 C8a audit: a restart's downtime credit is computed from the locked row, and skips one parked since the listing", async () => {
+  const bumped = hostedId("credit-bumped"), parked = hostedId("credit-parked");
+  // Two unleased roots seen during the outage's idle window; the listing reads them so, the lock reads them changed.
+  await hosted.whoami(principal, context("credit-bumped"));
+  await hosted.whoami(principal, context("credit-parked"));
+  delivery.close(); await hosted.close();
+  // A lease still live at the last heartbeat, whose credit stays under the one-TTL cap.
+  const alive = now - 600_000, deadline = now - 590_000;
+  await seed(database.repo, async tx => {
+    await database.repo.hosted.heartbeat(tx, alive);
+    for (const id of [bumped, parked]) await database.repo.hosted.touch(tx, id, now - 300_000);
+  });
+  const store = database.repo.hosted, lock = store.lock.bind(store);
+  const lockSpy = spyOn(store, "lock").mockImplementation(async (tx, id) => {
+    const row = await lock(tx, id);
+    if (!row) return row;
+    if (id === bumped) return { ...row, lease_deadline: deadline };
+    if (id === parked) return { ...row, parked_at: now - 1 };
+    return row;
+  });
+  const updates = spyOn(store, "update");
+  const service = createHostedSessions(application, { now: () => now, isAuthorized: () => true });
+  let patches: unknown[][];
+  try { await service.ready; patches = updates.mock.calls.map(([, id, patch]) => [id, patch]); }
+  finally { lockSpy.mockRestore(); updates.mockRestore(); await service.close(); }
+  hosted = createHostedSessions(application, { now: () => now, isAuthorized: () => authorized }); await hosted.ready;
+  delivery = createDelivery(hosted, { isAuthorized: () => authorized });
+  // The locked row's lease, pushed out by the downtime; not the listed row's last_seen_at.
+  expect(patches).toContainEqual([bumped, { lease_deadline: deadline + 600_000 }]);
+  expect(patches.filter(([id]) => id === bumped)).toHaveLength(1);
+  expect(patches.filter(([id]) => id === parked)).toEqual([]);
+});
+
+test("#807 P3 C8a audit: a park the store refuses writes no child_parked audit and evicts nothing", async () => {
+  const child = hostedId("refused-park-child");
+  await hosted.bind(principal, context("refused-park-root"), { name: "refused-pk", create: true });
+  await hosted.register(principal, context("refused-park-root"), "refused-park-child");
+  now += 900_001;
+  const store = database.repo.hosted;
+  const parks = spyOn(store, "park").mockImplementation(async () => false), childEnds = spyOn(store, "childEnd");
+  let ended: number;
+  try { await hosted.sweep(); ended = childEnds.mock.calls.length; expect(parks).toHaveBeenCalled(); }
+  finally { parks.mockRestore(); childEnds.mockRestore(); }
+  expect(ended).toBe(0);
+  expect(database.db.query("SELECT count(*) AS n FROM access_log WHERE action = 'hosted.child_parked'").get()).toEqual({ n: 0 });
+  expect((await store.get(database.repo.read, child))!.parked_at).toBeNull();
+});
+
+test("#807 P3 C8a audit: a delivery open and a renew move the root's last_seen_at", async () => {
+  const id = hostedId("seen-lease");
+  await hosted.bind(principal, context("seen-lease"), { name: "seen-ls", create: true });
+  const seen = async () => (await database.repo.hosted.get(database.repo.read, id))!.last_seen_at;
+  // Calls that touch the row on their own are kept out: only the store's update is observed.
+  const updates = spyOn(database.repo.hosted, "update");
+  let opened: unknown[][], renewed: unknown[][];
+  try {
+    now += 1_000;
+    const lease = await delivery.open(principal, context("seen-lease"));
+    opened = updates.mock.calls.filter(([, u]) => u === id).map(([, , patch]) => [patch]);
+    expect(await seen()).toBe(now);
+    updates.mockClear();
+    now += 1_000;
+    await delivery.renew(principal, context("seen-lease"), lease.capability);
+    renewed = updates.mock.calls.filter(([, u]) => u === id).map(([, , patch]) => [patch]);
+    expect(await seen()).toBe(now);
+  } finally { updates.mockRestore(); }
+  expect(opened.some(([patch]) => (patch as { last_seen_at?: number }).last_seen_at !== undefined), JSON.stringify(opened)).toBe(true);
+  expect(renewed.some(([patch]) => (patch as { last_seen_at?: number }).last_seen_at !== undefined), JSON.stringify(renewed)).toBe(true);
+});
+
+test("#807 P3 C8a: the sweep hands each end and park the value it judged, for the store to check on the row it acts on", async () => {
+  // An idle unleased root, a lapsed lease and an idle child.
+  await hosted.whoami(principal, context("sweep-idle"));
+  await hosted.bind(principal, context("sweep-lease"), { name: "sweep-ls", create: true });
+  await delivery.open(principal, context("sweep-lease"));
+  // The child's root holds a name and has no lease: neither idle nor expired, so the child parks.
+  await hosted.bind(principal, context("sweep-held"), { name: "sweep-hd", create: true });
+  await hosted.register(principal, context("sweep-held"), "sweep-child");
+  const deadline = (await database.repo.hosted.get(database.repo.read, hostedId("sweep-lease")))!.lease_deadline!;
+  now += 900_001;
+  const store = database.repo.hosted;
+  const ends = spyOn(store, "end"), parks = spyOn(store, "park");
+  let endArgs: unknown[][], parkArgs: unknown[][];
+  try {
+    await hosted.sweep();
+    endArgs = ends.mock.calls.map(([, id, reason, at, d, i]) => [id, reason, at, d, i]);
+    parkArgs = parks.mock.calls.map(([, id, at, i]) => [id, at, i]);
+  } finally { ends.mockRestore(); parks.mockRestore(); }
+  const idleBefore = now - 900_000;
+  expect(endArgs).toContainEqual([hostedId("sweep-idle"), "idle", now, undefined, idleBefore]);
+  expect(endArgs).toContainEqual([hostedId("sweep-lease"), "expired", now, deadline, undefined]);
+  expect(parkArgs).toContainEqual([hostedId("sweep-child"), now, idleBefore]);
+});
+
+test("#807 P3 C8a: a grant revoked after the request's auth check refuses its write body, whatever the auth cache says", async () => {
+  await hosted.bind(principal, context("seam-revoked"), { name: "seam-rv", create: true });
+  const id = hostedId("seam-revoked"), before = (await database.repo.hosted.get(database.repo.read, id))!;
+  await seed(database.repo, tx => { database.db.run("UPDATE oauth_grants SET revoked_at = ? WHERE id = 'G1'", [now]); return Promise.resolve(); });
+  // A new root: refused before its insert.
+  await expect(hosted.whoami(principal, context("seam-new-under-revoked"))).rejects.toThrow("unauthenticated");
+  expect(await database.repo.hosted.get(database.repo.read, hostedId("seam-new-under-revoked"))).toBeUndefined();
+  // The live root: refused before its bind writes.
+  await expect(hosted.bind(principal, context("seam-revoked"), { name: "seam-rv2", create: true })).rejects.toThrow("unauthenticated");
+  expect((await database.repo.hosted.get(database.repo.read, id))!.bind_gen).toBe(before.bind_gen);
+  // A child's register: refused before its insert.
+  await expect(hosted.register(principal, context("seam-revoked"), "seam-rv-child")).rejects.toThrow("unauthenticated");
+  expect(await database.repo.hosted.get(database.repo.read, hostedId("seam-rv-child"))).toBeUndefined();
+});
+
+// The ends a request makes of an idle or lapsed root hand the store the value they judged, as the sweep's do.
+async function endArgsOf(fn: () => Promise<unknown>): Promise<unknown[][]> {
+  const ends = spyOn(database.repo.hosted, "end");
+  try { await fn(); return ends.mock.calls.map(([, id, reason, at, d, i]) => [id, reason, at, d, i]); } finally { ends.mockRestore(); }
+}
+
+test("#807 P3 C8a: settle's end of an idle root it was called on passes the idle cutoff it judged", async () => {
+  const id = hostedId("seam-settle-idle");
+  await hosted.whoami(principal, context("seam-settle-idle"));
+  now += 900_001;
+  const args = await endArgsOf(() => hosted.whoami(principal, context("seam-settle-idle")));
+  expect(args).toContainEqual([id, "idle", now, undefined, now - 900_000]);
+});
+
+test("#807 P3 C8a audit: settle whose idle end the store refused keeps the row it read rather than reading it again", async () => {
+  const id = hostedId("seam-settle-refused");
+  await hosted.whoami(principal, context("seam-settle-refused"));
+  now += 900_001;
+  const store = database.repo.hosted, get = store.get.bind(store), calls: string[] = [];
+  const ends = spyOn(store, "end").mockImplementation(async (_tx, session, reason) => { calls.push(`end ${session} ${reason}`); return false; });
+  const gets = spyOn(store, "get").mockImplementation((r, session) => { if (r !== database.repo.read) calls.push(`get ${session}`); return get(r, session); });
+  try { await hosted.whoami(principal, context("seam-settle-refused")); } finally { ends.mockRestore(); gets.mockRestore(); }
+  expect(calls, calls.join(", ")).toContain(`end ${id} idle`);
+  // Nothing was written, so rowFor takes settle's row: no second read of it.
+  expect(calls, calls.join(", ")).not.toContain(`get ${id}`);
+  expect(await database.repo.hosted.get(database.repo.read, id)).toBeDefined();
+});
+
+test("#807 P3 C8a: a bind's end of an idle or lapsed contender passes the cutoff or deadline it judged", async () => {
+  const idleHolder = hostedId("seam-idle-holder"), leased = hostedId("seam-leased-holder");
+  await hosted.bind(principal, context("seam-idle-holder"), { name: "seam-idle-name", create: true });
+  await hosted.bind(principal, context("seam-leased-holder"), { name: "seam-lease-name", create: true });
+  await delivery.open(principal, context("seam-leased-holder"));
+  const deadline = (await database.repo.hosted.get(database.repo.read, leased))!.lease_deadline!;
+  await hosted.whoami(principal, context("seam-taker"));
+  now += 900_001;
+  // The taker stays active: only the holders went quiet.
+  await seed(database.repo, tx => database.repo.hosted.touch(tx, hostedId("seam-taker"), now));
+  const idleArgs = await endArgsOf(() => hosted.bind(principal, context("seam-taker"), { name: "seam-idle-name" }));
+  expect(idleArgs).toContainEqual([idleHolder, "idle", now, undefined, now - 900_000]);
+  const leaseArgs = await endArgsOf(() => hosted.bind(principal, context("seam-taker"), { name: "seam-lease-name" }));
+  expect(leaseArgs).toContainEqual([leased, "expired", now, deadline, undefined]);
 });

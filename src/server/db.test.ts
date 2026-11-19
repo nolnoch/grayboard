@@ -30,6 +30,8 @@ import { auditContract } from "./store/audit.contract.ts";
 import { sqliteAuditBackend } from "./store/audit.contract.sqlite.ts";
 import { slackContract } from "./store/slack.contract.ts";
 import { sqliteSlackBackend } from "./store/slack.contract.sqlite.ts";
+import { hostedContract } from "./store/hosted.contract.ts";
+import { sqliteHostedBackend } from "./store/hosted.contract.sqlite.ts";
 
 const person = (email: string, name: string) => ({ scope_kind: "person" as const, scope_ref: email, name });
 
@@ -239,6 +241,8 @@ describe("cursors contract (SQLite)", () => cursorsContract(sqliteCursorsBackend
 describe("write receipts contract (SQLite)", () => writeReceiptsContract(sqliteWriteReceiptsBackend));
 describe("audit contract (SQLite)", () => auditContract(sqliteAuditBackend));
 describe("slack contract (SQLite)", () => slackContract(sqliteSlackBackend));
+// The hosted sessions group's rows, shared with the Postgres store (#807 P3 C8a); its settled-Tx refusals moved there.
+describe("hosted contract (SQLite)", () => hostedContract(sqliteHostedBackend));
 
 // Sign-in fixtures for the rows below (security audit F-13, #928 D4).
 const G = GOOGLE_ISSUER, OKTA = "https://example.okta.com";
@@ -613,75 +617,17 @@ test("#807 P1c-10: team writes run on the handle they're given", async () => {
   expect((await repo.teams.findByName(repo.read, "ops"))?.policy).toBe("open");
 });
 
-// #807 P1c-11: the hosted store's writes run on the handle they're given, as P1c-7's users writes do. The facade
-// resolves the handle before it reads any argument, so a kept Tx is refused whatever the rest of the call says.
-test("#807 P1c-11: hosted writes run on the handle they're given", async () => {
+// #807 P1c-11/P1c-12: the hosted store refuses a handle that isn't a SQLite store's, the three lock seams (#807 P3 C8a)
+// among them; its settled-Tx refusals are contract rows (store/hosted.contract.ts).
+test("#807 P1c-11: the hosted store refuses a foreign handle", async () => {
   const { repo } = openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
-  const { kept, row } = await seed(repo, async tx => {
-    const u = await repo.users.upsertByEmail(tx, "a@example.com", null);
-    const ownership = await repo.hosted.start(tx, "root-1", u.id, "test", 1);
-    const row = { session_id: "root-1", ownership_id: ownership, user_id: u.id, client_id: "test", grant_id: "g", source_session_id: "root-1",
-      writes_as: null, bind_gen: 0, root_session_id: null, place: null, lease_deadline: null, created_at: 1, last_seen_at: 1, suggested: null, parked_at: null };
-    await repo.hosted.insert(tx, row);
-    return { kept: tx, row };
-  });
-  expect((await repo.hosted.get(repo.read, "root-1"))?.last_seen_at).toBe(1);
-  const settled = /used after its transaction settled/;
-  const h = repo.hosted, x = {} as never;
-  await expect(h.park(kept, "root-1", 2)).rejects.toThrow(settled);
-  await expect(h.unpark(kept, "root-1", "g", 2)).rejects.toThrow(settled);
-  await expect(h.start(kept, "root-2", row.user_id, "test", 2)).rejects.toThrow(settled);
-  await expect(h.insert(kept, { ...row, session_id: "root-2" })).rejects.toThrow(settled);
-  await expect(h.update(kept, { ...row, last_seen_at: 9 })).rejects.toThrow(settled);
-  await expect(h.touch(kept, "root-1", 9)).rejects.toThrow(settled);
-  await expect(h.end(kept, "root-1", "closed", 9)).rejects.toThrow(settled);
-  await expect(h.childEnd(kept, "root-1", 9, x)).rejects.toThrow(settled);
-  await expect(h.lose(kept, "root-1", { alias: "a@example.com/fe", reason: "r", primary: true }, 9)).rejects.toThrow(settled);
-  await expect(h.tellLost(kept, "root-1", 9)).rejects.toThrow(settled);
-  await expect(h.reportLost(kept, "root-1", 9)).rejects.toThrow(settled);
-  await expect(h.seeLost(kept, "root-1", 9)).rejects.toThrow(settled);
-  await expect(h.forgetLost(kept, "root-1", "a@example.com/fe")).rejects.toThrow(settled);
-  await expect(h.heartbeat(kept, 9)).rejects.toThrow(settled);
-  await expect(h.touch({} as Tx, "root-1", 9)).rejects.toThrow("not a SQLite store handle");
-  expect(await h.get(repo.read, "root-1")).toMatchObject({ last_seen_at: 1, parked_at: null });
-  expect(await h.get(repo.read, "root-2")).toBeUndefined();
-  expect(await h.owned(repo.read, "root-2")).toBe(false);
-  expect(await h.lost(repo.read, "root-1", "agent")).toEqual([]);
-  expect(await h.aliveAt(repo.read)).toBeUndefined();
-});
-
-// #807 P1c-12: the hosted store's reads run on the handle they're given, as P1c-6's sessions reads do.
-test("#807 P1c-12: hosted reads run on the handle they're given", async () => {
-  const { repo } = openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
-  const { kept, u } = await seed(repo, async tx => {
-    const u = await repo.users.upsertByEmail(tx, "a@example.com", null);
-    const ownership = await repo.hosted.start(tx, "root-1", u.id, "test", 1);
-    await repo.hosted.insert(tx, { session_id: "root-1", ownership_id: ownership, user_id: u.id, client_id: "test", grant_id: "g", source_session_id: "root-1",
-      writes_as: null, bind_gen: 0, root_session_id: null, place: null, lease_deadline: 5, created_at: 1, last_seen_at: 1, suggested: null, parked_at: null });
-    // Read inside the body that wrote it, on its Tx.
-    expect((await repo.hosted.get(tx, "root-1"))?.ownership_id).toBe(ownership);
-    return { kept: tx, u };
-  });
-  const settled = /used after its transaction settled/;
-  const h = repo.hosted;
-  await expect(h.get(kept, "root-1")).rejects.toThrow(settled);
-  await expect(h.owned(kept, "root-1")).rejects.toThrow(settled);
-  await expect(h.all(kept)).rejects.toThrow(settled);
-  await expect(h.counts(kept, u.id)).rejects.toThrow(settled);
-  await expect(h.ofOwnership(kept, 1)).rejects.toThrow(settled);
-  await expect(h.children(kept, "root-1")).rejects.toThrow(settled);
-  await expect(h.roots(kept, u.id)).rejects.toThrow(settled);
-  await expect(h.expired(kept, 9)).rejects.toThrow(settled);
-  await expect(h.idle(kept, 9)).rejects.toThrow(settled);
-  await expect(h.disabled(kept)).rejects.toThrow(settled);
-  await expect(h.lost(kept, "root-1", "agent")).rejects.toThrow(settled);
-  await expect(h.aliveAt(kept)).rejects.toThrow(settled);
-  await expect(h.get({} as Tx, "root-1")).rejects.toThrow("not a SQLite store handle");
-  expect((await h.get(repo.read, "root-1"))?.user_id).toBe(u.id);
-  expect(await h.owned(repo.read, "root-1")).toBe(true);
-  expect(await h.counts(repo.read, u.id)).toEqual({ total: 1, user: 1 });
-  expect((await h.roots(repo.read, u.id)).map(r => r.session_id)).toEqual(["root-1"]);
-  expect((await h.expired(repo.read, 9)).map(r => r.session_id)).toEqual(["root-1"]);
+  const h = repo.hosted, foreign = {} as Tx, refused = "not a SQLite store handle";
+  await expect(h.touch(foreign, "root-1", 9)).rejects.toThrow(refused);
+  await expect(h.get(foreign, "root-1")).rejects.toThrow(refused);
+  await expect(h.lock(foreign, "root-1")).rejects.toThrow(refused);
+  await expect(h.lockCapacity(foreign)).rejects.toThrow(refused);
+  await expect(h.grantLive(foreign, "g", 1)).rejects.toThrow(refused);
+  repo.close();
 });
 
 // #807 P1c-13: the aliases store runs on the handle it's given, as P1c-6's sessions do.

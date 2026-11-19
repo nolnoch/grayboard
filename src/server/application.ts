@@ -920,7 +920,9 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
       return;
     }
     // A hosted root's change goes through the hosted store's writes, whose commit tells the hosted
-    // service and delivery to close the lease now, not at its next renewal.
+    // service and delivery to close the lease now, not at its next renewal. Its row is locked on the caller's Tx, outside
+    // the savepoint whose rollback would free it on Postgres, and read again inside (#807 P3 C8 R2).
+    if (hosted) await repo.hosted.lock(tx, u.id);
     await tx.savepoint(async sp => {
       const primary = hosted && (await repo.bindings.holdsOf(sp, u.id))[0] === u.address;
       await repo.bindings.release(sp, u.address, u.id);
@@ -930,7 +932,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
         const row = await repo.hosted.get(sp, u.id);
         if (row) {
           // Its last hold gone, the root is unbound but owning: no lease, so the sweep doesn't expire it.
-          await repo.hosted.update(sp, { ...row, bind_gen: row.bind_gen + 1, lease_deadline: (await repo.bindings.holdsOf(sp, u.id)).length ? row.lease_deadline : null });
+          await repo.hosted.update(sp, u.id, { bind_gen: row.bind_gen + 1, ...((await repo.bindings.holdsOf(sp, u.id)).length ? {} : { lease_deadline: null }) });
           if (row.lease_deadline !== null) writeAudit(repo, sp, "hosted.lease_closed", null, u.id, { reason: "revoked", ownership: row.ownership_id });
           await repo.hosted.lose(sp, u.id, { alias: u.address, reason, primary }, now());
         }

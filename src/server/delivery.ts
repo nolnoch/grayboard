@@ -167,7 +167,8 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
         if (leases.size - replaced >= caps.global || (perUser.get(p.authed.user_id) ?? 0) - replaced >= mine) { countRefusal("delivery_lease"); throw new ApplicationError("bad_request", "delivery lease capacity reached"); }
         const expiresAt = now() + ttl;
         const opened = { ...row, lease_deadline: expiresAt, last_seen_at: now() };
-        await store.update(tx, opened);
+        // The lease's columns only (#807 P3 C8 decision 2); attach locked the row.
+        await store.update(tx, row.session_id, { lease_deadline: opened.lease_deadline, last_seen_at: opened.last_seen_at });
         await hosted.audit(tx, row.session_id, "hosted.lease_opened", { ownership: row.ownership_id, bind_gen: row.bind_gen, grant: p.grantId, reopened: row.lease_deadline !== null, ...(openOptions.context === false ? { context: false } : {}) });
         return { row: opened, expiresAt, holds, facts };
       }, result => {
@@ -200,10 +201,12 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
     async renew(p: DeliveryPrincipal, context: SessionContext, capability: string, hooks?: DeliveryHooks) {
       return hosted.control(p, context, false, async row => {
         const { lease } = await store.write(async tx => {
-          const fresh = await store.get(tx, row.session_id);
+          // Locked before it is read (#807 P3 C8 R2): a bind's generation bump committed meanwhile is the row judged here,
+          // and the update writes the lease's columns only.
+          const fresh = await store.lock(tx, row.session_id);
           const lease = await get(p, context, capability, fresh, tx), deadline = now() + ttl;
           if (!fresh || fresh.root_session_id) stale(p, context, capability);
-          await store.update(tx, { ...fresh, lease_deadline: deadline, last_seen_at: now() });
+          await store.update(tx, fresh.session_id, { lease_deadline: deadline, last_seen_at: now() });
           // The lease was read before the update's await (#807 P3 A6e2): one finished meanwhile is refused here, which
           // rolls the new deadline back, and stays finished.
           if (leases.get(capability) !== lease) stale(p, context, capability);
@@ -242,7 +245,8 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
         await testPauseAsync("hosted:receipt:before-txn");
         await store.write(async tx => {
           testPause("hosted:receipt:in-txn");
-          const row = "id" in context ? await store.get(tx, context.id) : undefined;
+          // Locked before its generation is judged against the receipts (#807 P3 C8 R2).
+          const row = "id" in context ? await store.lock(tx, context.id) : undefined;
           const lease = await get(p, context, capability, row, tx);
           if (!row || row.root_session_id) stale(p, context, capability);
           if (!Array.isArray(ids) || ids.length > 100 || new Set(ids).size !== ids.length) stale(p, context, capability);
@@ -283,7 +287,7 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
     async release(p: DeliveryPrincipal, context: SessionContext, capability: string) {
       return hosted.control(p, context, true, async row => {
         await store.write(async tx => {
-          await get(p, context, capability, await store.get(tx, row.session_id), tx);
+          await get(p, context, capability, await store.lock(tx, row.session_id), tx);
           await store.end(tx, row.session_id, "closed", now());
         });
       }, () => undefined).catch(error => refused(p, context, error));
@@ -299,7 +303,7 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
       await hosted.gate(lease.sessionId).bind(async () => {
         if (leases.get(capability) !== lease || !lease.cancelledCreator || lease.pendingOpens.size || lease.acceptedVersion) return;
         await store.write(async tx => {
-          if (matches(lease, await store.get(tx, lease.sessionId))) await store.end(tx, lease.sessionId, "closed", now());
+          if (matches(lease, await store.lock(tx, lease.sessionId))) await store.end(tx, lease.sessionId, "closed", now());
           await hosted.settle(tx, lease.sessionId);
         }, () => {
           finish(lease);

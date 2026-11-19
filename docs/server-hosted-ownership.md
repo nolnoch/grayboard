@@ -3,7 +3,7 @@
 ```doc-meta
 owns: hosted admission, ownership history and live source-session rows, grant attachment, the BindGate, live-session bounds
 invariants: a hosted root's session ID is stable and never ends (its ownership does), a hosted child's ends at its release, and a session that holds an alias always has an unended `ids` row
-code-pointers: src/server/hosted.ts, src/server/hosted-types.ts, src/server/db.ts, src/core/session_end.ts
+code-pointers: src/server/hosted.ts, src/server/hosted-types.ts, src/server/store/hosted.ts, src/server/db.ts, src/core/session_end.ts
 companions: server-hosted-mcp.md (the endpoint), server-sessions.md (bind)
 ```
 

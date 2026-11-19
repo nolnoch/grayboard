@@ -457,19 +457,21 @@ test("#1053: the guard's reads inside a transaction body use that body's handle,
     if (queue.mine) inBody.push({ what, pool: args[0] === store.repo.read });
     return (fn as (...a: unknown[]) => unknown).apply(this, args);
   };
-  const find = store.repo.aliases.find, get = store.repo.hosted.get;
+  const find = store.repo.aliases.find, get = store.repo.hosted.get, lock = store.repo.hosted.lock;
   store.repo.aliases.find = record("aliases.find", find) as typeof find;
   store.repo.hosted.get = record("hosted.get", get) as typeof get;
+  store.repo.hosted.lock = record("hosted.lock", lock) as typeof lock;
   const restoreAccess = stubAuthRead(store.repo, "findActiveAccess", active => record("findActiveAccess", active) as typeof active);
   try {
     const id = await uploaded();
     expect((await send(request("GET", `/hosted/mcp/attachments/${id}?identity=be`))).status).toBe(200);
     expect((await send(request("DELETE", `/hosted/mcp/attachments/${id}?identity=be`))).status).toBe(200);
   } finally {
-    store.repo.aliases.find = find; store.repo.hosted.get = get; restoreAccess();
+    store.repo.aliases.find = find; store.repo.hosted.get = get; store.repo.hosted.lock = lock; restoreAccess();
   }
   // Each of the three reads ran in a body (store, audit, download recheck, release), and none of them on the pool.
-  for (const what of ["aliases.find", "hosted.get", "findActiveAccess"]) expect(inBody.some(c => c.what === what)).toBe(true);
+  // In a body the guard reads its row with `lock` (#807 P3 C8a).
+  for (const what of ["aliases.find", "hosted.lock", "findActiveAccess"]) expect(inBody.some(c => c.what === what)).toBe(true);
   expect(inBody.filter(c => c.pool)).toEqual([]);
 });
 
