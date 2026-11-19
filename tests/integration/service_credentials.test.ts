@@ -189,6 +189,19 @@ describe("the token route", () => {
     expect(accessAudits(srv.app.db, "oauth.token_issued")).toEqual([]);
   });
 
+  test("a credential's slow_down isn't charged to the address bucket: other token posts from that address still go through (#1244)", async () => {
+    await fresh({ oauthLimit: { burst: 3, perSec: 0.001 }, serviceTokens: { maxSeconds: 86_400, mintsPerMinute: 1, unexpired: 1000 } });
+    const root = await service();
+    const c = await credential(root);
+    expect((await mint(srv.base, c.client_id, c.client_secret)).status).toBe(200);
+    // A fleet behind one address retrying past its mint bucket: every retry is the credential's slow_down, never the address's 429.
+    for (let i = 0; i < 6; i++) expect(await mint(srv.base, c.client_id, c.client_secret)).toEqual({ status: 429, body: { error: "slow_down" } });
+    expect(accessAudits(srv.app.db, "oauth.request_refused").map(r => r.detail)).toEqual(Array(6).fill({ code: "slow_down", status: 429 }));
+    // The address's whole bucket is left: three unauthenticated refusals spend it, and only then does the address wait.
+    for (let i = 0; i < 3; i++) expect(await mint(srv.base, c.client_id, `${c.client_secret}x`)).toEqual({ status: 401, body: { error: "invalid_client" } });
+    expect(await mint(srv.base, c.client_id, `${c.client_secret}x`)).toMatchObject({ status: 429, body: { error: "temporarily_unavailable" } });
+  });
+
   test("a credential's secret only in the Basic header: a form secret or no secret is refused", async () => {
     const root = await service();
     const c = await credential(root);

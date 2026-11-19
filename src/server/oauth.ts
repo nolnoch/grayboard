@@ -38,7 +38,10 @@ const challenge = (s: string) => createHash("sha256").update(s).digest("base64ur
 const escapeHTML = (s: string) => s.replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]!);
 const secret = (s: string | null): s is string => s !== null && /^[A-Za-z0-9_-]{43}$/.test(s);
 class OAuthError extends Error {
-  constructor(readonly error: string, readonly status = 400) { super(error); }
+  // `charged`: whether the token route spends the caller's address bucket on it. Only a refusal of an authenticated
+  // credential's mint for its own bucket or cap isn't (#1244): the secret was right, and a fleet behind one NAT
+  // retrying through it would otherwise drain the address and block other users' refreshes from it.
+  constructor(readonly error: string, readonly status = 400, readonly charged = true) { super(error); }
 }
 function fail(error = "invalid_request", status = 400): never { throw new OAuthError(error, status); }
 // error_description texts for a refusal after the request is bound (#928): fixed, since they reach any client.
@@ -588,7 +591,7 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
             const t = now();
             return { t, minted: await repo.oauth.mintServiceToken(tx, { clientId: client.clientId, secretId: client.credential!.secretId!, tokenHash: hashToken(token), scopes: selected, limits: serviceTokens }, t) };
           });
-          if (minted.status === "capacity") fail("slow_down", 429);
+          if (minted.status === "capacity") throw new OAuthError("slow_down", 429, false);
           if (minted.status !== "ok") fail("invalid_client", 401);
           return json({ access_token: token, token_type: "Bearer", expires_in: Math.floor((minted.value.expiresAt - t) / 1000), scope: selected.join(" ") });
         }
@@ -640,7 +643,7 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
         const refused = e instanceof OAuthError && e.status < 500;
         // A listed client's document unavailable is charged as a refusal (#933): retrying posts spend their address,
         // so an office NAT's clients retrying through a long outage can drain it for that address's other token posts.
-        if (refused || e instanceof CimdUnavailable) spend(checks, path);
+        if ((refused && (e as OAuthError).charged) || e instanceof CimdUnavailable) spend(checks, path);
         if (refused || deferred.length) {
           // One decision per refusal, after every await, for all its rows; the CIMD rows go with it. Only a refusal or
           // an outage answers here without a row; any other error (the shutdown 503) keeps fetch's own row.
