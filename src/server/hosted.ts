@@ -146,21 +146,22 @@ export const OTHER_USER_NOTE = `An item marked other_user was written by another
 // A hosted session's general lines in a bind or unbind result: the other_user line, and a launcher's. Callers
 // pass launcher only for a session that isn't declared poll: delegation routes only to a launcher whose delivery
 // is live (#521 4), so a poll root would pay for lines it can never act on.
-const hostedGeneral = (launcher: boolean) => [OTHER_USER_NOTE, ...(launcher ? launcherInstruction() : [])];
+// `service`: the session is a service credential's, whose launcher text names its own handles (#1327).
+const hostedGeneral = (launcher: boolean, service: boolean) => [OTHER_USER_NOTE, ...(launcher ? launcherInstruction(service) : [])];
 // A session with no delivery declaration and no open lease: bind's note, and the bound initialize text's (#531).
 const noLeaseNote = (name: string) => `No delivery lease is open for this session, so DMs to "${name}" wait until the client opens one (delivery_open).`;
 // A bound native session's `initialize` text. A declaration names its delivery. Without one (OpenCode), the
 // ownership's lease does, as in bind's result (#531): open, its mail is pushed with the default channel source;
 // none, it polls until the client opens one. The launcher lines ride only a pushed session: a polling one is never
 // picked or named as a delegation target (handleDelegate's online check, #521 4), so it would pay for nothing.
-export function hostedBoundInstruction(info: IdentityInfo, declared?: DeclaredDelivery, launcher = false, leased = false): string {
+export function hostedBoundInstruction(info: IdentityInfo, declared?: DeclaredDelivery, launcher = false, leased = false, service = false): string {
   const push = declared ? declared.mode === "push" : leased;
   return [
     ...(push
       ? [`You are "${info.identity_full}" on grayboard.`, ...channelInstructions(declared?.source ?? DEFAULT_CHANNEL_SOURCE), OTHER_USER_NOTE]
       : [`You are "${info.identity_full}" on grayboard. Poll dm_inbox and board_list for pending work.`, declared ? POLL_NOTE : noLeaseNote(info.identity_full), ...COORDINATION_INSTRUCTIONS, OTHER_USER_NOTE]),
     ...(info.teams.length ? [TEAM_BOARDS_NOTE] : []),
-    ...(launcher && push ? launcherInstruction() : []),
+    ...(launcher && push ? launcherInstruction(service) : []),
     ...(info.human?.linked ? ownHumanInstruction(info.human.handle) : []),
   ].join(" ");
 }
@@ -1007,7 +1008,7 @@ export function createHostedSessions(application: Application, options: { now?: 
       // Read before the reply's thunks, which are synchronous (#807 P3 A7h1).
       const launcher = source !== null && "id" in context && await application.hostedLauncher(context.id);
       // The general part rides the text on a root's first hold: a hosted root has had no bind to carry it before.
-      const response = bindOk(name, held, general => boundInstructions(held[0]!, source, general || result.first, () => hostedGeneral(launcher), notices, held.slice(1)), note);
+      const response = bindOk(name, held, general => boundInstructions(held[0]!, source, general || result.first, () => hostedGeneral(launcher, p.authed.kind === "service"), notices, held.slice(1)), note);
       return { ...response, structuredContent: { ...response.structuredContent, ownership: result.ownership } };
     },
     // unbind (#451): release one hold. Its mail and claims stay with the alias; the primary becomes the
@@ -1038,7 +1039,7 @@ export function createHostedSessions(application: Application, options: { now?: 
       const offered = held.length ? [] : await application.hostedCandidates(repo.read, p.authed, result.suggested);
       const launcher = held.length > 0 && source !== null && "id" in context && await application.hostedLauncher(context.id);
       const instructions = held.length
-        ? (general: boolean) => boundInstructions(held[0]!, source, general, () => hostedGeneral(launcher), [], held.slice(1))
+        ? (general: boolean) => boundInstructions(held[0]!, source, general, () => hostedGeneral(launcher, p.authed.kind === "service"), [], held.slice(1))
         : () => [hostedUnboundInstruction(offered)];
       const response = unbindOk(alias, short(result.before[0] ?? ""), held[0] ?? null, result.ok.left ?? [], instructions);
       return { ...response, structuredContent: { ...response.structuredContent, ownership: result.ownership } };
