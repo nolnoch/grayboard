@@ -7,7 +7,7 @@ import type { Principal } from "../core/resolver.ts";
 import { boardAccess, principalCanSee, scopeKey, serverAccess } from "./access.ts";
 import type { Repo } from "./db.ts";
 import type { Read, Tx } from "./store/tx.ts";
-import { AUTHORS, B, BOARDS, D, E, HANDLES, openBoardParity, SCOPES, TOKENS, W, WADE_ID } from "../../tests/support/board_parity.ts";
+import { AUTHORS, B, BOARDS, D, E, ENG_ID, HANDLES, openBoardParity, SCOPES, TOKENS, TOOLS_ID, W, WADE_ID } from "../../tests/support/board_parity.ts";
 
 let repo: Repo;
 let db: CoreDb;
@@ -88,6 +88,12 @@ describe("boardAccess agrees with serverAccess", () => {
       // The fixture reaches every answer: some rows allow and some refuse, and resolveMention resolves and refuses.
       const values = new Set(inside.map(([, s]) => JSON.stringify(s)));
       for (const v of ["true", "false", "null"]) expect(values.has(v)).toBe(true);
+      // seer's fallbacks for an ID (#1286): a tools-only one as its writes_as name (eng/deploy, not wade) on ops; a
+      // bound one as its primary (eng, not wade) on a service's names. Wade's own session is the control for both.
+      const said = (l: string) => inside.find(([x]) => x === l)?.[1];
+      const svc = scopeKey({ scope_kind: "service", scope_ref: "svc" });
+      expect([said(`canSee ${TOOLS_ID} ops`), said(`canSee ${WADE_ID} ops`), said(`canSee ${TOOLS_ID} eng`)]).toEqual([false, true, true]);
+      expect([said(`seesAlias ${ENG_ID} ${svc}`), said(`seesAlias ${WADE_ID} ${svc}`)]).toEqual([false, true]);
       expect(inside.some(([l, s]) => l.startsWith("resolveMention ") && JSON.stringify(s).includes("isn't in your scope"))).toBe(true);
       expect(inside.some(([l, s]) => l.startsWith("resolveMention ") && JSON.stringify(s).includes("id_ended"))).toBe(true);
     }, 60_000);
