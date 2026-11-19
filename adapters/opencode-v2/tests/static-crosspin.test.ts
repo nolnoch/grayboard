@@ -4,7 +4,9 @@
 //
 // It lives in OpenCode V2's tests, not the root suite: lifecycle.ts imports OpenCode's plugin types, which only this
 // package's own install has (the root typecheck excludes tests/e2e/opencode-config.ts for the same reason). Hosted
-// core's static.ts is imported by relative path: scripts/sync_hosted_core.ts doesn't vendor it.
+// core's static.ts is imported by relative path: scripts/sync_hosted_core.ts doesn't vendor it. Its own imports (zod, the
+// MCP client) resolve from the repository root's node_modules, so this file needs the root install as well as V2's
+// (CI's strict lane runs V2's tests before hosted core's own install).
 //
 // The table holds only the common contract. Documented differences are kept out of it:
 // - hosted core compares the exec-time environment (`launch`) and the Claude Code project settings files; V2 reads
@@ -91,6 +93,9 @@ const rows: Row[] = [
   { name: "a dotenv file is named before a bad mode", env: { GRAYBOARD_AUTH: "oauth" }, files: { ".env": "GRAYBOARD_AUTH=oauth\n" }, mode: dotenvRefusal(".env") },
   { name: "a dotenv file is named before a missing issuer", env: { GRAYBOARD_AUTH: "static", GRAYBOARD_RUN_TOKEN: TOKEN }, files: { ".env.local": "GRAYBOARD_AUTH=static\n" }, mode: dotenvRefusal(".env.local") },
   { name: "an unreadable dotenv file", env: ON, files: { ".env": null }, mode: { refused: "Static mode refused: .env in the working directory is unreadable" } },
+  // What the dotenv check leaves alone: a comment line, and a file that isn't .env* (direnv's .envrc).
+  { name: "a commented-out variable in a dotenv file", env: ON, files: { ".env": "# GRAYBOARD_AUTH=static\n" }, mode: { issuer: ISSUER } },
+  { name: "an .envrc file", env: ON, files: { ".envrc": "export GRAYBOARD_AUTH=static\n" }, mode: { issuer: ISSUER } },
 ];
 
 test.each(rows.map(row => [row.name, row] as const))("V2 and hosted core agree: %s", (_name, row) => {
@@ -98,6 +103,13 @@ test.each(rows.map(row => [row.name, row] as const))("V2 and hosted core agree: 
   const env = Object.fromEntries(Object.entries(row.env).filter(([, v]) => v !== undefined));
   expect(hosted(env, dir)).toEqual(row.mode);
   expect(v2(env, dir)).toEqual(row.mode as never);
+});
+
+// A working directory that can't be listed holds no dotenv file to refuse: both take the environment alone.
+test("V2 and hosted core agree: a missing working directory", () => {
+  const dir = join(cwd(), "gone");
+  expect(hosted(ON, dir)).toEqual({ issuer: ISSUER });
+  expect(v2(ON, dir)).toEqual({ issuer: ISSUER });
 });
 
 // The issuer's shape: both refuse, in their own words (V2 is HTTPS-only; hosted core also takes HTTP loopback).
