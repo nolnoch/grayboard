@@ -15,6 +15,14 @@ import type { Repo } from "./db.ts";
 import type { Read, Tx } from "./store/tx.ts";
 
 /**
+ * The caller's hook for an announcement its own claim call wrote: a renewal's update or a release, posted as `as` on
+ * `board` within `sp`. On a service's board that post is an invocation (#270 D6, #1259), which only the caller can
+ * record, since it knows who asked. A lapse, a requeue's reply and a session end's release are the system's: no hook.
+ */
+export type Announced = (sp: Tx, as: string, board: string) => Promise<void>;
+type ServerClaimCtx = ClaimCtx & { announced?: Announced };
+
+/**
  * core sweepChanges on `tx`: delete the claims lapsed at `now` and, per claim in lapse order, log its expiry, then
  * requeue a queue post's claim or announce the lapse on the claim's board, its watchers cc'd. The delete makes each
  * lapse announce once, however many sweep. A holder who lost the board lapses quietly; its watches go all the same.
@@ -77,9 +85,10 @@ async function boardVisible(repo: Repo, access: BoardAccess, r: Read, handle: st
 
 /** core callBoardTool's claim arms on `tx`: the same arguments read in the same order, the same answers. */
 export async function callClaimTool(
-  repo: Repo, access: BoardAccess, tx: Tx, actor: string, tool: "claim_take" | "claim_release" | "claim_watch", a: Record<string, unknown>, ctx: ToolContext,
+  repo: Repo, access: BoardAccess, tx: Tx, actor: string, tool: "claim_take" | "claim_release" | "claim_watch", a: Record<string, unknown>,
+  ctx: ToolContext & { announced?: Announced },
 ): Promise<ToolOutcome> {
-  const who: ClaimCtx = { addresses: ctx.addresses, session: ctx.session, via: ctx.via, user: ctx.user };
+  const who: ServerClaimCtx = { addresses: ctx.addresses, session: ctx.session, via: ctx.via, user: ctx.user, announced: ctx.announced };
   switch (tool) {
     case "claim_take": {
       const { key, ...take } = claimTakeArgs(a);
@@ -107,7 +116,7 @@ async function holderHidden(repo: Repo, access: BoardAccess, r: Read, seer: stri
  * the refusal and commits (HTTP's claimCall does).
  */
 export async function serverClaim(
-  repo: Repo, access: BoardAccess, tx: Tx, handle: string, keyInput: string, opts: TakeOpts & ClaimCtx = {},
+  repo: Repo, access: BoardAccess, tx: Tx, handle: string, keyInput: string, opts: TakeOpts & ServerClaimCtx = {},
 ): Promise<ClaimResult> {
   const { key, board } = checkTake(keyInput, opts);
   const addresses = opts.addresses ?? [handle];
@@ -133,9 +142,13 @@ export async function serverClaim(
     });
     let changed: ClaimChanges = { wake: [], boards: [] };
     if (!d.renewed) {
-      if (row.board) changed = await say(claimText(key, row.note), false);
+      if (row.board) {
+        changed = await say(claimText(key, row.note), false);
+        await opts.announced?.(sp, d.as, row.board);
+      }
     } else if (renewAnnounces(opts.note, cur) && row.board && (await boardVisible(repo, access, sp, d.as, row.board))) {
       changed = await say(updateText(key, opts.note!, await repo.claims.watchers(sp, key)), true);
+      await opts.announced?.(sp, d.as, row.board);
     }
     return {
       ok: true, claim: row, renewed: d.renewed,
@@ -147,7 +160,7 @@ export async function serverClaim(
 
 /** core release on `tx`, in a savepoint as core's own transaction was (serverClaim says why). */
 export async function serverRelease(
-  repo: Repo, access: BoardAccess, tx: Tx, handle: string, keyInput: string, note?: string, ctx: ClaimCtx = {},
+  repo: Repo, access: BoardAccess, tx: Tx, handle: string, keyInput: string, note?: string, ctx: ServerClaimCtx = {},
 ): Promise<ClaimChanges & { releasedAt?: number }> {
   const key = checkRelease(keyInput, note);
   const addresses = ctx.addresses ?? [handle];
@@ -172,10 +185,12 @@ export async function serverRelease(
     const cc = await repo.claims.takeWatchers(sp, key);
     // A holder who lost the board releases quietly; its watchers go too, since they're told through the board.
     if (!gone.board || !(await boardVisible(repo, access, sp, as, gone.board))) return { wake: [], boards: [] };
-    // A release with no signed-in caller is the system's (a session end's): it posts as the claimant's user (#855).
-    return systemPost(repo, access, sp, as, gone.board, releaseText(key, note, cc), null, {
+    // A release with no signed-in caller posts as the claimant's user (#855).
+    const changed = await systemPost(repo, access, sp, as, gone.board, releaseText(key, note, cc), null, {
       allowArchived: true, session: ctx.session, via: ctx.via, user: ctx.user ?? (await repo.claims.holderUser(sp, gone)),
     });
+    await ctx.announced?.(sp, as, gone.board);
+    return changed;
   });
 }
 

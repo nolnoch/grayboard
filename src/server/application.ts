@@ -2013,14 +2013,19 @@ async function handleCall(hub: Hub, tx: Tx, session: ApplicationSession, tool: s
     rowAfterRollback(session, tx, w => recordDecision(repo, w, sessionActor(session, actor), inv.req, inv.d));
     throw coreRefusal(hiddenBoard(inv));
   }
+  // Each claim announcement on a service's board is an invocation (#1259), recorded with its post for the address
+  // it posts as: the take's decision above when that's the actor on the named board, else the poster's own.
+  const announced = async (sp: Tx, as: string, board: string) => {
+    const a = inv && as === actor && inv.req.board === board ? inv : await invocation(repo, sp, as, board);
+    if (a?.d.allow) recordDecision(repo, sp, sessionActor(session, as), a.req, a.d);
+  };
   let outcome;
-  try { outcome = await callBoardTool(repo, hub.access, tx, actor, tool, rest, { ...ctx, ...(session.readOnly ? { principal: userOf(session) } : {}) }); }
+  try { outcome = await callBoardTool(repo, hub.access, tx, actor, tool, rest, { ...ctx, ...(session.readOnly ? { principal: userOf(session) } : {}), announced }); }
   catch (e) {
     if (e instanceof CoreError) throw coreRefusal(e);
     console.error(`[grayboard] ${tool} failed:`, e);
     return fail("internal", `${tool} failed`);
   }
-  if (inv) recordDecision(repo, tx, sessionActor(session, actor), inv.req, inv.d);
   // board_read's posts carry the writer marks every read path does (#825).
   if (tool === "board_read") {
     const r = outcome.result as ReadResult;

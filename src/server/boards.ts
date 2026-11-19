@@ -16,14 +16,14 @@ import {
 } from "../core/tools.ts";
 import { scopeKey, type AliasScopeOf, type BoardAccess } from "./access.ts";
 import { seenAmong } from "./board_post.ts";
-import { callClaimTool } from "./claims.ts";
+import { callClaimTool, type Announced } from "./claims.ts";
 import { readableBoard, visibleBoards, type BoardViewer } from "./board_reads.ts";
 import type { Repo } from "./db.ts";
 import type { Read, Tx } from "./store/tx.ts";
 
 // core's ToolContext (its `reader` unset on the server), plus `principal`: an addressless
 // caller's user (an unbound hosted session, #410), whose sight judges board_list, peer_list and the boards it reads.
-export type ServerToolContext = ToolContext & { principal?: Principal };
+export type ServerToolContext = ToolContext & { principal?: Principal; announced?: Announced };
 
 /**
  * core's boardActor over the store: `as`, else the first of `addresses` a board use acts as (#284 S3, S14), else the
