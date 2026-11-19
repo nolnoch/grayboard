@@ -53,8 +53,10 @@ export async function sweepClaims(repo: Repo, access: BoardAccess, tx: Tx, now: 
 
 /**
  * core requeue on `tx`: a queue post's claim ended (a lapse, or a decline in `ctx`'s name). Its watches go; the post goes
- * to the next lane that hasn't held it, presence-blind; with none left, an `[unclaimed]` reply in its thread, which a
- * holder who lost the board can't write: then nothing, the reply's savepoint rolled back and the rest kept.
+ * to the next lane that hasn't held it, presence-blind; with none left, an `[unclaimed]` reply in its thread. A holder
+ * who lost the board ends it as serverRelease does (core endReachRule, #1286): the reply is posted for the claimant's
+ * user when that user still sees the board, never as the caller's session, else nothing. A reply refused all the same
+ * (a CoreError) is nothing too, its savepoint rolled back and the rest kept.
  */
 export async function requeue(repo: Repo, access: BoardAccess, tx: Tx, c: ClaimRow, now: number, ctx: ClaimCtx = {}): Promise<ClaimChanges> {
   const cc = await repo.claims.takeWatchers(tx, c.key);
@@ -69,11 +71,15 @@ export async function requeue(repo: Repo, access: BoardAccess, tx: Tx, c: ClaimR
     await repo.boards.claimQueuePost(tx, f.board.name, f.postId, lane, now, { note: REDELIVERED_NOTE, push: true });
     return { wake: [lane], boards: [] };
   }
-  const user = ctx.user ?? (await repo.claims.holderUser(tx, c));
+  // Judged on the post's board, the key's, which claimQueuePost also recorded as the claim's.
+  const end = await endReach(repo, access, tx, { ...c, board: f.board.name });
+  if (!end) return { wake: [], boards: [] };
+  // The system's reply for the claimant's user: no caller's session, via or name set reaches it.
+  const opts = end.user
+    ? { allowArchived: true, user: end.user, seenBy: end.user }
+    : { allowArchived: true, session: ctx.session, via: ctx.via, addresses: ctx.addresses, user: ctx.user ?? (await repo.claims.holderUser(tx, c)) };
   try {
-    return await tx.savepoint((sp) => systemPost(repo, access, sp, c.holder, f.board.name, unclaimedText(c.key, f.takers, cc), f.postId, {
-      allowArchived: true, session: ctx.session, via: ctx.via, addresses: ctx.addresses, user,
-    }));
+    return await tx.savepoint((sp) => systemPost(repo, access, sp, c.holder, f.board.name, unclaimedText(c.key, f.takers, cc), f.postId, opts));
   } catch (e) {
     if (e instanceof CoreError) return { wake: [], boards: [] };
     throw e;

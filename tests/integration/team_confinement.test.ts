@@ -211,3 +211,73 @@ describe("a confined holder's claim end is announced for its user (#1286)", () =
     await quiet.ops.none(board((i) => i.kind === "push" && i.post.body.startsWith("[expired] ticket:QA-LQ")));
   });
 });
+
+// #1296: a queue post on qa's queue board, claimed for a session's ID by mention (#219) while its primary was a
+// person name, the primary since moved to eng/h: with no lane left, its claim's end is an `[unclaimed]` reply posted
+// for the claimant's user, who still sees qa's board, cc'ing the watcher. The holder's decline note never reaches it,
+// and its own answer and deliveries are a quiet end's.
+describe("a confined holder's queue claim ends in an [unclaimed] reply for its user (#1296)", () => {
+  async function confinedQueue(email = B, cast_?: Awaited<ReturnType<typeof cast>>) {
+    const { ops } = cast_ ?? (await cast());
+    const tag = email === B ? "b" : "f";
+    if (email !== B) {
+      await srv.login(email);
+      for (const team of ["eng", "qa"]) expect((await srv.api(bob, "POST", `/api/teams/${team}/add`, { email })).status).toBe(200);
+    }
+    // bob comes first, so his call makes the queue board.
+    if (email === B) await ops.call("board_create", { name: "qa-q", purpose: "qa queue", team: "qa", kind: "queue" });
+    const h = await hosted("fe", email);
+    const id = idHolding(`${email}/fe`);
+    const { post_id: postId } = await ops.call<{ post_id: number }>("board_post", { board: "qa-q", body: `@${id} qa work ${tag}` });
+    const key = `queue:qa-q:${postId}`;
+    const claim = srv.app.db.query("SELECT holder, holder_user FROM claims WHERE key = ?").get(key);
+    expect(claim).toEqual({ holder: id, holder_user: email });
+    // qa/w-<tag> watches; it sees qa's board and is no lane.
+    const w = await hosted(`qa/w-${tag}`);
+    expect(await w.call("claim_watch", { key })).toBeDefined();
+    await h.bind(`eng/h-${tag}`);
+    await h.call("unbind", { name: "fe" });
+    await h.reopen();
+    const access = boardAccess(srv.app.repo), read = srv.app.repo.read;
+    expect(await access.canSee(read, id, (await srv.app.repo.boards.get(read, "qa-q"))!)).toBe(false);
+    return { ops, w, h, id, postId, key };
+  }
+  const replies = (postId: number) => srv.app.db.query("SELECT body, author, author_user, author_id FROM posts WHERE parent_id = ?").all(postId);
+  const unclaimed = (key: string) => board((i) => (i.kind === "push" ? i.post : i.latest).body.startsWith(`[unclaimed] ${key}:`));
+
+  test("a decline: the watcher is told without the holder's note; the holder's answer and inbox are a quiet decline's", async () => {
+    const c = await cast();
+    const { w, h, id, postId, key } = await confinedQueue(B, c);
+    const answer = await h.call("claim_release", { key, note: "eng secret" });
+    const got = await w.next(board((i) => i.kind === "push" && i.reason === "mention" && i.post.body.startsWith(`[unclaimed] ${key}:`)));
+    if (got.event.kind !== "board" || got.event.item.kind !== "push") throw new Error("not a push");
+    expect(got.event.item.post.body).toEndWith(" cc @qa/w-b");
+    expect(replies(postId)).toEqual([{ body: expect.stringMatching(/^\[unclaimed\] /), author: id, author_user: B, author_id: null }]);
+    expect(JSON.stringify(srv.app.db.query("SELECT body FROM posts").all())).not.toContain("eng secret");
+    // The control: frank's user lost qa too, so his decline is quiet. Both holders answer alike and are told nothing.
+    const quiet = await confinedQueue(F, c);
+    expect((await srv.api(bob, "POST", "/api/teams/qa/remove", { email: F })).status).toBe(200);
+    const quietAnswer = await quiet.h.call("claim_release", { key: quiet.key, note: "eng secret" });
+    expect(replies(quiet.postId)).toEqual([]);
+    expect([answer, quietAnswer]).toEqual([`released ${key}`, `released ${quiet.key}`]);
+    await quiet.w.none(unclaimed(quiet.key));
+    await h.none(unclaimed(key));
+    await quiet.h.none(unclaimed(quiet.key));
+  });
+
+  test("a lapse is replied to for the user; one whose user lost the board too lapses quietly", async () => {
+    const c = await cast();
+    const { w, id, postId, key } = await confinedQueue(B, c);
+    const quiet = await confinedQueue(F, c);
+    expect((await srv.api(bob, "POST", "/api/teams/qa/remove", { email: F })).status).toBe(200);
+    await srv.app.repo.write(tx => srv.app.repo.coreOn(tx).prepare("UPDATE claims SET expires_at = ? WHERE key IN (?, ?)").run(Date.now() - 1, key, quiet.key));
+    // A take sweeps the lapsed claims first.
+    await c.ops.call("claim_take", { key: "ticket:sweep" });
+    const got = await w.next(board((i) => i.kind === "push" && i.reason === "mention" && i.post.body.startsWith(`[unclaimed] ${key}:`)));
+    if (got.event.kind !== "board" || got.event.item.kind !== "push") throw new Error("not a push");
+    expect(replies(postId)).toEqual([{ body: expect.stringMatching(/ cc @qa\/w-b$/), author: id, author_user: B, author_id: null }]);
+    expect(srv.app.db.query("SELECT count(*) AS n FROM claims WHERE key IN (?, ?)").get(key, quiet.key)).toEqual({ n: 0 });
+    expect(replies(quiet.postId)).toEqual([]);
+    await quiet.w.none(unclaimed(quiet.key));
+  });
+});
