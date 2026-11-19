@@ -16,8 +16,8 @@
 //   carries a well-formed token, and hosted core's `token` field is dropped before comparing;
 // - V2 accepts only an HTTPS issuer, hosted core also HTTP loopback, and their issuer-shape texts differ: those rows
 //   are checked below for a refusal on both sides, not for the same text. Both run the issuer through the one endpoint
-//   rule (`canonicalEndpoint`, src/shared/endpoint.ts, vendored into V2), so apart from HTTP loopback no
-//   issuer one refuses passes the other (#1321).
+//   rule (`issuerEndpoint`, src/shared/endpoint.ts, vendored into V2), so apart from HTTP loopback no
+//   issuer one refuses passes the other (#1321, #1326).
 import { afterEach, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -77,7 +77,8 @@ const rows: Row[] = [
   // The pin.
   { name: "no issuer", env: { ...ON, GRAYBOARD_ISSUER: undefined }, mode: { refused: "Static mode needs a pinned issuer (GRAYBOARD_ISSUER)" } },
   { name: "empty issuer", env: { ...ON, GRAYBOARD_ISSUER: "" }, mode: { refused: "Static mode needs a pinned issuer (GRAYBOARD_ISSUER)" } },
-  { name: "an issuer `new URL` would rewrite (an uppercase scheme and host) is pinned as given", env: { ...ON, GRAYBOARD_ISSUER: "HTTPS://GRAYBOARD.example.com" }, mode: { issuer: "HTTPS://GRAYBOARD.example.com" } },
+  // A pin the server can advertise is kept as given, an explicit default port included (#1326).
+  ...["https://grayboard.example.com:443", "https://grayboard.example.com:443/hosted", "https://grayboard.example.com/hosted"].map(issuer => ({ name: `the pin ${issuer}`, env: { ...ON, GRAYBOARD_ISSUER: issuer }, mode: { issuer } })),
   { name: "a missing issuer is named before a bad principal", env: { ...ON, GRAYBOARD_ISSUER: undefined, GRAYBOARD_PRINCIPAL: "in gest" }, mode: { refused: "Static mode needs a pinned issuer (GRAYBOARD_ISSUER)" } },
   // The principal.
   ...["in gest", "ingest/w-1", "p".repeat(129)].map(principal => ({ name: `principal ${JSON.stringify(principal.slice(0, 16))}`, env: { ...ON, GRAYBOARD_PRINCIPAL: principal }, mode: { refused: "GRAYBOARD_PRINCIPAL must be a service name" } })),
@@ -116,10 +117,15 @@ test("V2 and hosted core agree: a missing working directory", () => {
 });
 
 // The issuer's shape: both refuse, in their own words (V2 is HTTPS-only; hosted core also takes HTTP loopback).
-// The second line: what `new URL` reads past and the endpoint rule refuses (#1321).
+// The second line: what `new URL` reads past and the endpoint rule refuses (#1321). The third and fourth: what `new URL`
+// rewrites, or a trailing slash the server strips: it never advertises either as its issuer, so the pin could only
+// fail later as a mismatch (#1326).
 test.each([
   "http://grayboard.example.com", "https://u:p@grayboard.example.com", "https://grayboard.example.com/?q=1", "https://grayboard.example.com/#f", "not a url",
   ` ${ISSUER}`, `${ISSUER} `, `${ISSUER}/?`, `${ISSUER}/#`, "https://grayboard.%65xample.com", `${ISSUER}/%7Eops`, "https:\\\\grayboard.example.com", `${ISSUER}\\mcp`, `${ISSUER}/${"a".repeat(2048)}`,
+  "HTTPS://GRAYBOARD.example.com", "https://GRAYBOARD.example.com", "https:grayboard.example.com", "https:///grayboard.example.com", "https://@grayboard.example.com", "https://:@grayboard.example.com",
+  "https://0x7f.1", "https://bücher.example", "https://grayboard.example.com:0443", `${ISSUER}/a/../hosted`, `${ISSUER}//hosted`,
+  `${ISSUER}/`, `${ISSUER}/hosted/`, "https://grayboard.example.com:443/",
 ])("both refuse the issuer %s", issuer => {
   const env = { ...ON, GRAYBOARD_ISSUER: issuer }, dir = cwd();
   expect(hosted(env, dir)).toEqual({ refused: expect.stringMatching(/^GRAYBOARD_ISSUER must be an HTTPS URL/) });
