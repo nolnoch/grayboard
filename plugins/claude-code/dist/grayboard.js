@@ -32147,7 +32147,7 @@ function canonicalEndpoint(raw) {
 }
 function issuerEndpoint(raw) {
   const u = canonicalEndpoint(raw);
-  if (!u || u.pathname.includes("//"))
+  if (!u || raw.endsWith("/") || u.pathname.includes("//"))
     return;
   const portless = raw.replace(/^(https:\/\/[^/]+):443(?=\/|$)/, "$1").replace(/^(http:\/\/[^/]+):80(?=\/|$)/, "$1");
   return u.href === portless || u.pathname === "/" && u.href === `${portless}/` ? u : undefined;

@@ -21,14 +21,15 @@ export function canonicalEndpoint(raw: string): URL | undefined {
 // metadata (static mode, #1326): the endpoint rule, and only a string the
 // server's own issuer rule (`oauthPublicUrl`, src/server/oauth-config.ts) can
 // advertise, so a launcher's typo is refused at launch, not at enrollment as a
-// pin mismatch. That is `new URL`'s own serialisation of it, less the trailing
-// slash of an empty path, and with an explicit default port (`:443`, or `:80`
-// on loopback HTTP), which the server keeps in its issuer; no `//` in the path.
-// Anything `new URL` rewrites (case, `https:host`, `https:///host`, empty
-// userinfo, a numeric or IDN host, dot segments) is refused.
+// pin mismatch. That is exactly `new URL`'s own serialisation of it, with an
+// explicit default port (`:443`, or `:80` on loopback HTTP), which the server
+// keeps in its issuer; no trailing `/` (the server strips it, so `https://host`
+// is the bare host's pin) and no `//` in the path. Anything `new URL` rewrites
+// (case, `https:host`, `https:///host`, empty userinfo, a numeric or IDN host,
+// dot segments) is refused.
 export function issuerEndpoint(raw: string): URL | undefined {
   const u = canonicalEndpoint(raw);
-  if (!u || u.pathname.includes("//")) return undefined;
+  if (!u || raw.endsWith("/") || u.pathname.includes("//")) return undefined;
   const portless = raw.replace(/^(https:\/\/[^/]+):443(?=\/|$)/, "$1").replace(/^(http:\/\/[^/]+):80(?=\/|$)/, "$1");
   return u.href === portless || (u.pathname === "/" && u.href === `${portless}/`) ? u : undefined;
 }

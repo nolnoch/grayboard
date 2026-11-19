@@ -6,13 +6,21 @@ import { oauthPublicUrl } from "../server/oauth-config.ts";
 
 // Every form the server keeps as its issuer: an explicit default port among them (oauthPublicUrl preserves it).
 const kept = [
-  "https://grayboard.example.com", "https://grayboard.example.com/", "https://grayboard.example.com/hosted", "https://grayboard.example.com/hosted/",
-  "https://grayboard.example.com:443", "https://grayboard.example.com:443/hosted", "https://grayboard.example.com:8443/hosted", "http://127.0.0.1:9", "http://localhost:80",
+  "https://grayboard.example.com", "https://grayboard.example.com/hosted", "https://grayboard.example.com:443", "https://grayboard.example.com:443/hosted",
+  "https://grayboard.example.com:8443/hosted", "http://127.0.0.1:9", "http://localhost:80",
 ];
 test.each(kept)("the pin %s passes, as the server would advertise it", issuer => {
   expect(issuerEndpoint(issuer)?.href).toBe(canonicalEndpoint(issuer)!.href);
-  // The server's own rule takes it too (loopback HTTP only under dev auth).
-  expect(() => oauthPublicUrl(issuer, issuer.startsWith("http:"))).not.toThrow();
+  // The server advertises it as written (loopback HTTP only under dev auth).
+  expect(oauthPublicUrl(issuer, issuer.startsWith("http:"))).toBe(issuer);
+});
+
+// A trailing slash: the server strips it from its issuer, so such a pin can never match.
+const slashed = ["https://grayboard.example.com/", "https://grayboard.example.com/hosted/", "https://grayboard.example.com:443/", "http://localhost/"];
+test.each(slashed)("the pin %s is refused: the server lists it without the slash", issuer => {
+  expect(canonicalEndpoint(issuer)).toBeDefined();
+  expect(issuerEndpoint(issuer)).toBeUndefined();
+  expect(oauthPublicUrl(issuer, issuer.startsWith("http:"))).toBe(issuer.slice(0, -1));
 });
 
 // Forms the endpoint rule accepts but `new URL` rewrites: the server refuses every one as its public URL, so no

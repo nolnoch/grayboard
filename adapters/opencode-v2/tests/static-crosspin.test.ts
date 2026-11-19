@@ -118,12 +118,14 @@ test("V2 and hosted core agree: a missing working directory", () => {
 
 // The issuer's shape: both refuse, in their own words (V2 is HTTPS-only; hosted core also takes HTTP loopback).
 // The second line: what `new URL` reads past and the endpoint rule refuses (#1321). The third and fourth: what `new URL`
-// rewrites, which the server never advertises as its issuer, so the pin could only fail later as a mismatch (#1326).
+// rewrites, or a trailing slash the server strips: it never advertises either as its issuer, so the pin could only
+// fail later as a mismatch (#1326).
 test.each([
   "http://grayboard.example.com", "https://u:p@grayboard.example.com", "https://grayboard.example.com/?q=1", "https://grayboard.example.com/#f", "not a url",
   ` ${ISSUER}`, `${ISSUER} `, `${ISSUER}/?`, `${ISSUER}/#`, "https://grayboard.%65xample.com", `${ISSUER}/%7Eops`, "https:\\\\grayboard.example.com", `${ISSUER}\\mcp`, `${ISSUER}/${"a".repeat(2048)}`,
   "HTTPS://GRAYBOARD.example.com", "https://GRAYBOARD.example.com", "https:grayboard.example.com", "https:///grayboard.example.com", "https://@grayboard.example.com", "https://:@grayboard.example.com",
   "https://0x7f.1", "https://bücher.example", "https://grayboard.example.com:0443", `${ISSUER}/a/../hosted`, `${ISSUER}//hosted`,
+  `${ISSUER}/`, `${ISSUER}/hosted/`, "https://grayboard.example.com:443/",
 ])("both refuse the issuer %s", issuer => {
   const env = { ...ON, GRAYBOARD_ISSUER: issuer }, dir = cwd();
   expect(hosted(env, dir)).toEqual({ refused: expect.stringMatching(/^GRAYBOARD_ISSUER must be an HTTPS URL/) });
