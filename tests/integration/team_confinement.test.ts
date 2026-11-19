@@ -73,6 +73,19 @@ describe("an ID is judged as its session's primary on every scoped board (#1255)
     expect((await fe.call<{ name: string }[]>("board_list", {})).map((b) => b.name)).toContain("qa-room");
   });
 
+  test("peer_list shows qa's name to it (#348) but not its labels or status, which can name qa's board", async () => {
+    const { ops, build } = await cast();
+    await ops.call("bind", { name: "qa/ops", meta: { task: "qa task", source_board: "qa-room", description: "qa desc" } });
+    await ops.call("peer_status", { text: "qa status" });
+    const listed = JSON.stringify(await build.call("peer_list", { include_offline: true }));
+    expect(listed).toContain("qa/ops");
+    for (const leak of ["qa-room", "qa task", "qa desc", "qa status"]) expect(listed, leak).not.toContain(leak);
+    // The control: a person-scoped session of bob's sees them.
+    const fe = await hosted("fe");
+    const all = JSON.stringify(await fe.call("peer_list", { include_offline: true }));
+    for (const label of ["qa-room", "qa task", "qa status"]) expect(all, label).toContain(label);
+  });
+
   test("over HTTP: /api/claims/call as the ID is refused qa's board like a missing one", async () => {
     const { id } = await cast();
     const call = (board: string) => srv.api(bob, "POST", "/api/claims/call", { as: id, tool: "claim_take", args: { key: `ticket:QA-${board}`, board } });

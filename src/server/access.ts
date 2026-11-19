@@ -268,23 +268,29 @@ export function boardAccess(repo: Repo, humanReach: HumanReach = "team"): BoardA
   };
   const seesMetaOf = async (r: Read, p: Principal | null, scope: AliasScopeOf): Promise<boolean> =>
     p !== null && scope.scope_ref !== null && actsIn(r, p, { scope_kind: scope.scope_kind, scope_ref: scope.scope_ref });
-  const byScope = (rule: (r: Read, p: Principal | null, s: AliasScopeOf) => Promise<boolean>, asBoard = false) =>
+  // `primary`: which scope kinds judge an ID as its session's primary (seerIn) rather than its user.
+  const byScope = (rule: (r: Read, p: Principal | null, s: AliasScopeOf) => Promise<boolean>, primary: (kind: AliasScopeOf["scope_kind"]) => boolean) =>
     async (r: Read, viewer: string, scopes: AliasScopeOf[]): Promise<Map<string, boolean>> => {
       const out = new Map<string, boolean>();
       if (!scopes.length) return out;
       const p = await repo.principals.of(r, viewer);
-      // A service's names, to an ID, are judged as its board is (seerIn), read once and only when one is asked. A
-      // team's names are judged for the ID's user, as #348 decided: name sight is the user's, board sight the primary's.
-      let onService: Principal | null | undefined;
+      // The ID's primary, read once and only when a scope asks for it.
+      let onPrimary: Principal | null | undefined;
       for (const s of scopes) {
         const k = scopeKey(s);
         if (out.has(k)) continue;
-        const q = s.scope_kind === "service" && asBoard ? (onService === undefined ? (onService = await seerIn(repo, r, viewer, true)) : onService) : p;
+        const q = primary(s.scope_kind) ? (onPrimary === undefined ? (onPrimary = await seerIn(repo, r, viewer, true)) : onPrimary) : p;
         out.set(k, await rule(r, q, s));
       }
       return out;
     };
 
+  // A service's names, to an ID, are judged as its board is (#270 D4); a team's names for the ID's user, as #348
+  // decided (name sight is the user's). A scoped alias's labels (task, source_board, description, status) are judged
+  // as its scope's boards are (#1255): they can name a board, so a session bound to `eng/x` sees qa's names but not
+  // their labels.
+  const namesAsPrimary = (kind: AliasScopeOf["scope_kind"]) => kind === "service";
+  const metaAsPrimary = (kind: AliasScopeOf["scope_kind"]) => kind !== "person";
   const resolveMention = async (tx: Tx, token: string, author: string, board: Board, strict: boolean, viewer: string = author): Promise<string | null> => {
     const t = addressParts(token);
     if (!t || t.kind === "team") return null;
@@ -302,7 +308,7 @@ export function boardAccess(repo: Repo, humanReach: HumanReach = "team"): BoardA
     if (!strict) return null;
     // Only names the posting session may see exist (#348).
     const named = await repo.aliases.findAllByName(tx, t.name);
-    const seen = await byScope(seesAliasOf, true)(tx, viewer, named);
+    const seen = await byScope(seesAliasOf, namesAsPrimary)(tx, viewer, named);
     const roster: string[] = [];
     for (const a of named) if (seen.get(scopeKey(a)) && (await reach(a.address))) roster.push(a.address);
     if (roster.length) throw new CoreError(`@${t.name} isn't in your scope; name it in full: ${roster.join(", ")}`);
@@ -380,9 +386,9 @@ export function boardAccess(repo: Repo, humanReach: HumanReach = "team"): BoardA
     },
 
     seesAlias: async (r, handle, scope) => seesAliasOf(r, scope.scope_kind === "person" ? null : await seerIn(repo, r, handle, scope.scope_kind === "service"), scope),
-    seesAliasScopes: byScope(seesAliasOf, true),
-    seesAliasMeta: async (r, handle, scope) => seesMetaOf(r, await repo.principals.of(r, handle), scope),
-    seesAliasMetaScopes: byScope(seesMetaOf),
+    seesAliasScopes: byScope(seesAliasOf, namesAsPrimary),
+    seesAliasMeta: async (r, handle, scope) => seesMetaOf(r, await seerIn(repo, r, handle, metaAsPrimary(scope.scope_kind)), scope),
+    seesAliasMetaScopes: byScope(seesMetaOf, metaAsPrimary),
 
     // A human archives only boards its own user's addresses created (#848).
     async sameUser(r, human, address) {
