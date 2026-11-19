@@ -862,9 +862,11 @@ export class Controller<E extends Enrollment = Enrollment> {
               return false;
             }
             // A resumed root with no saved approval (pi, omp, Claude Code) ends as its
-            // resume would have without the outage: unpaused, with the cause (#895).
-            if (!this.port.approval) this.set(r, r.paused ? "paused" : "approved", failureMessage(error, this.hint), "enroll", failureCode(error));
-            else { r.paused = true; await this.stop(r); this.set(r, "degraded", `Saved root unavailable; approval retained, ${this.hint}`, "restore"); }
+            // resume would have without the outage: unpaused unless signed out, with the cause (#895, #1325).
+            if (!this.port.approval) {
+              if (this.signedOut(error)) r.paused = true;
+              this.set(r, r.paused ? "paused" : "approved", failureMessage(error, this.hint), "enroll", failureCode(error));
+            } else { r.paused = true; await this.stop(r); this.set(r, "degraded", `Saved root unavailable (${failureCode(error)}); approval retained, ${this.hint}`, "restore", failureCode(error)); }
             return true;
           }
         });
@@ -931,6 +933,8 @@ export class Controller<E extends Enrollment = Enrollment> {
             if (error instanceof AccessExpired && error.reason === "expired") { r.paused = true; r.awaiting = mark; awaiting(); return false; }
             // An outage now: restore's retry, on the outage backoff (#424 6).
             if (error instanceof ServerUnreachable && this.restorable(r, r.epoch)) { this.set(r, "retrying", UNREACHABLE_AT_RECOVER, "recover", failureCode(error)); this.retryRestore(r); return true; }
+            // A sign-out pauses the root, as every start's does (#1325).
+            if (this.signedOut(error)) r.paused = true;
             this.set(r, r.paused ? "paused" : "approved", failureMessage(error, this.hint), "recover", failureCode(error));
           }
           return true;
@@ -995,7 +999,12 @@ export class Controller<E extends Enrollment = Enrollment> {
           }
         }
         await this.rotated({ spent: 0 }, () => this.prepare(r, false));
-      } catch (error) { if (!this.drifted) this.set(r, "approved", failureMessage(this.expired(error), this.hint), "after", failureCode(this.expired(error))); }
+      } catch (error) {
+        if (this.drifted) return;
+        // A sign-out pauses the root, as every start's does (#1325).
+        if (this.signedOut(error)) r.paused = true;
+        this.set(r, r.paused ? "paused" : "approved", failureMessage(this.expired(error), this.hint), "after", failureCode(this.expired(error)));
+      }
     });
   }
   // A new top-level root binds the configured name; receiving still needs approval where the host keeps one.

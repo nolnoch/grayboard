@@ -45,6 +45,7 @@ function runtime(mode: Mode) {
   // real failure and before its catch records it (#1309).
   let onRefused: (() => void) | undefined;
   let prepareHold: Promise<void> | undefined, admitHold: ((signal: AbortSignal) => Promise<void>) | undefined, beforeOpen: (() => void) | undefined;
+  let whoamiFault: (() => Error) | undefined;
   // The host's receipt hook (#441), when a test sets one.
   let receiptHook: ((sessionID: string, ids: readonly string[]) => void) | undefined;
   const loops: FakeWire[] = [];
@@ -75,6 +76,7 @@ function runtime(mode: Mode) {
       let row = rows.get(this.sessionID);
       if (name === "whoami") {
         if (!this.beforeRetry && prepareHold) await prepareHold;
+        if (!this.beforeRetry && whoamiFault) { const fault = whoamiFault; whoamiFault = undefined; throw fault(); }
         // The server reports each loss to the Controller until its next delivery_open (#453).
         const taken = lost.get(this.sessionID) ?? [];
         for (const l of taken) l.reported = true;
@@ -168,6 +170,8 @@ function runtime(mode: Mode) {
     onRefused: (hook: () => void) => { onRefused = hook; },
     // The next delivery_open runs `hook` first (a revocation landing between a whoami and the open).
     beforeOpen: (hook: () => void) => { beforeOpen = hook; },
+    // The next temporary wire's whoami (a start's prepare) throws `fault()` (the server refusing the access token).
+    failWhoami: (fault: () => Error) => { whoamiFault = fault; },
     holdAdmit: (hold: (signal: AbortSignal) => Promise<void>) => { admitHold = hold; },
     onReceipted: (hook: (sessionID: string, ids: readonly string[]) => void) => { receiptHook = hook; },
     drift: () => { grant++; for (const w of [...watchers]) w(); },
@@ -327,6 +331,36 @@ test.each(modes)("a resume's outage retry that comes back to a refused name ends
     }
   } finally { await restarted.close(); }
 });
+// #1325 audit M-1: the server back, the resume's outage retry draws a 401 on prepare's whoami. A sign-out pauses the root,
+// as every start path's does: a root without a saved approval records it paused with the cause, an approval host's
+// saved root degrades with the cause's code (as its restore does). `expired` retries until the host rotates it.
+test.each(modes.flatMap(mode => (["expired", "login_required"] as const).map(reason => [mode, reason] as const)))("a resume's outage retry that comes back to AccessExpired pauses only on a sign-out (#1325, %s, %s)", async (mode, reason) => {
+  const r = runtime(mode);
+  await r.controller.enroll("R", ["be"], true);
+  await until(() => r.root(r.controller)?.state === "active");
+  await r.controller.close();
+  r.rows.delete("R");
+  const down = Promise.reject(new ServerUnreachable(new Error("down")));
+  down.catch(() => {});
+  r.holdPrepare(down);
+  let waits = 0;
+  const restarted: Controller = r.make({ wait: async () => {
+    if (++waits === 1) { r.holdPrepare(Promise.resolve()); r.failWhoami(() => new AccessExpired("pi", "run /grayboard login", reason)); }
+  } });
+  try {
+    await restarted.resume("R");
+    expect(r.root(restarted)?.state).toBe("retrying");
+    if (reason === "expired") {
+      await until(() => r.root(restarted)?.state === "active");
+      expect(waits).toBe(2);
+    } else {
+      await until(() => r.root(restarted)?.state !== "retrying");
+      expect(r.root(restarted)).toMatchObject(mode === "approval" ? { state: "degraded", operation: "restore", code: "login_required" } : { state: "paused", operation: "enroll", code: "login_required" });
+      expect(waits).toBe(1);
+      expect(r.named("delivery_open")).toHaveLength(1);
+    }
+  } finally { await restarted.close(); }
+});
 // Several processes sharing one grant store restart during an upgrade: one holds the refresh lock while the
 // server is slow, and the others' prepares find the refresh in progress. They retry, as the run loop does.
 test.each(modes)("a resume that finds the token refresh in another process retries on the outage backoff (#895, %s)", async mode => {
@@ -432,6 +466,22 @@ test.each(modes.flatMap(mode => (["enroll", "resume"] as const).flatMap(how => (
     // `expired` ran out the rotation grace first; a sign-out ends at once.
     if (reason === "expired") expect(waits).toBeGreaterThan(0); else expect(waits).toBe(0);
   } finally { await c.close(); }
+});
+// #1325: the recovery's own start is one more start path. Its stored token reads fresh, then the server refuses it on
+// prepare's whoami: `expired` goes back to waiting for the host's rotation (#661); a sign-out pauses the root.
+test.each(modes.flatMap(mode => (["expired", "login_required"] as const).map(reason => [mode, reason] as const)))("a recovery whose start ends on AccessExpired pauses on a sign-out, and waits again on `expired` (#1325, %s, %s)", async (mode, reason) => {
+  const o = await expiredPause(mode, (n, r) => {
+    if (n === 1) { r.expireAccess(); r.failWhoami(() => { r.expireAccess(reason); return new AccessExpired("pi", "run /grayboard login", reason); }); }
+  });
+  try {
+    if (reason === "expired") await until(() => o.recovering() >= 2);
+    else await until(() => o.r.root(o.c)?.operation === "recover" && o.r.root(o.c)?.state !== "retrying");
+    await o.c.close();
+    expect(o.r.root(o.c)?.state).toBe("paused");
+    expect(o.r.root(o.c)?.code).toBe(reason === "expired" ? "native_access_expired" : "login_required");
+    if (reason === "login_required") expect(o.recovering()).toBe(1);
+    expect(o.r.named("delivery_open")).toHaveLength(o.opened);
+  } finally { await o.c.close(); await o.r.controller.close(); }
 });
 // #1294 audit M-1: pi, omp and the Claude Code plugin stop through RootDelivery, which shuts the session down
 // (queued behind the start) before it closes: the shutdown itself ends the start's wire, and its release still runs.
@@ -812,6 +862,22 @@ test.each(modes)("an unbound result from any tool rebinds the remembered name (%
     const after = r.named("bind").length;
     await r.controller.afterCall({ sessionID: "R", tool: "dm_send", result: { status: "error" } });
     expect(r.named("bind")).toHaveLength(after);
+  } finally { await r.controller.close(); }
+});
+
+// #1325 reverify: afterCall's delivery restart is one more start path. A native bind (whatever its status), or a tool
+// result that says unbound, restarts delivery through prepare; a sign-out there pauses the root rather than recording it approved.
+test.each(modes.flatMap(mode => (["bind", "dm_send"] as const).map(tool => [mode, tool] as const)))("afterCall's delivery restart pauses its root on a sign-out (#1325, %s, %s)", async (mode, tool) => {
+  const r = runtime(mode);
+  try {
+    await r.controller.enroll("R", ["be"], true);
+    await until(() => r.root(r.controller)?.state === "active");
+    const opens = r.named("delivery_open").length;
+    r.failWhoami(() => new AccessExpired("pi", "run /grayboard login", "login_required"));
+    const output = tool === "bind" ? { name: "be", ownership: r.rows.get("R")!.ownership, instructions: ["bound"] } : { unbound: true };
+    await r.controller.afterCall({ sessionID: "R", tool, result: { status: "completed", output } });
+    expect(r.root(r.controller)).toMatchObject({ state: "paused", operation: "after", code: "login_required" });
+    expect(r.named("delivery_open")).toHaveLength(opens);
   } finally { await r.controller.close(); }
 });
 
