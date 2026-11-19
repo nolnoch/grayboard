@@ -38,6 +38,8 @@ export type HostedOptions = {
   sessionKey?: string;
   // The MCP client info name its wires declare; default HOSTED_CLIENT (a service session's harness label reads it, #1298).
   clientName?: string;
+  // Whether its wires declare a launcher (BUS_LAUNCHER=1, #473); default false.
+  launcher?: true;
 };
 
 // One item of the lease's inbox: { id, actionable, event } and the lease
@@ -107,7 +109,7 @@ export class HostedSession {
   ) {
     const client = opts.clientName ?? HOSTED_CLIENT;
     this.sessionId = opts.sessionId ?? `test-${randomBytes(8).toString("hex")}`;
-    const options: WireOptions = { url, sessionKey: opts.sessionKey ?? GRAYBOARD_SESSION_META, client: { name: client, version: "1.0.0" }, delivery: { mode: "push", source: client } };
+    const options: WireOptions = { url, sessionKey: opts.sessionKey ?? GRAYBOARD_SESSION_META, client: { name: client, version: "1.0.0" }, delivery: { mode: "push", source: client }, ...(opts.launcher ? { launcher: true as const } : {}) };
     const auth = { token: opts.token ?? (async () => token) };
     this.wireOptions = options;
     this.native = new NativeWire(options, auth, this.abort.signal, this.sessionId);

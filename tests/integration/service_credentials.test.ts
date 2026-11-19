@@ -16,7 +16,7 @@ import { accessAudits } from "../support/audit.ts";
 import { buildCli } from "../support/build.ts";
 import { runCli } from "../support/cli.ts";
 import { cleanEnv } from "../support/env.ts";
-import { HostedSession } from "../support/hosted_session.ts";
+import { HostedSession, HostedToolError } from "../support/hosted_session.ts";
 import { hostedPause } from "../support/hosted-pause.ts";
 import { hostedRowCount } from "../support/hosted_rows.ts";
 import { ROOT as REPO_ROOT } from "../support/paths.ts";
@@ -80,9 +80,13 @@ async function credential(root: string, body: Record<string, unknown> = {}): Pro
   expect(r.status, JSON.stringify(r.body)).toBe(201);
   return r.body as Credential;
 }
-const session = (t: string | (() => Promise<string>), identity: string | null = "w-1", opts: { sessionId?: string; sessionKey?: string; clientName?: string } = {}) =>
+const session = (t: string | (() => Promise<string>), identity: string | null = "w-1", opts: { sessionId?: string; sessionKey?: string; clientName?: string; delivery?: boolean; launcher?: true } = {}) =>
   open(new HostedSession(`${srv.base}/mcp`, typeof t === "string" ? t : "", identity, { delivery: false, ...opts, ...(typeof t === "string" ? {} : { token: t }) }));
 const refused = async (p: Promise<unknown>) => { await expect(p).rejects.toThrow(); };
+const refusedText = async (p: Promise<unknown>) => {
+  try { await p; } catch (e) { if (e instanceof HostedToolError) return e.message; throw e; }
+  throw new Error("the call wasn't refused");
+};
 
 describe("add: the secret reaches the launcher only", () => {
   test("add answers the secret once, no-store; the store keeps only its SHA-256 and no audit row carries it", async () => {
@@ -503,6 +507,41 @@ describe("sessions", () => {
     // A person's built-in client declaring another built-in keeps its mapped harness: only a generic credential's declaration is read.
     await srv.hosted(A, "fe", { delivery: false, clientName: "grayboard-omp" });
     expect(srv.app.db.query("SELECT harness FROM ids WHERE principal = ?").all(A)).toEqual([{ harness: "pi" }]);
+  });
+
+  test("a service credential's session declaring a launcher is one, for its own service's requests only; session_end clears it (#1299)", async () => {
+    const root = await service();
+    const c = await credential(root);
+    const svcId = (srv.app.db.query("SELECT id FROM users WHERE email = ?").get(SVC) as { id: number }).id;
+    const flag = (client: string, raw: string) => (srv.app.db.query("SELECT launcher FROM ids WHERE id = ?").get(hostedSessionId(svcId, client, raw)) as { launcher: number }).launcher;
+    const lx = await session(await token(srv.base, c), "lx", { delivery: true, launcher: true });
+    expect(flag(c.client_id, lx.sessionId)).toBe(1);
+    expect(accessAudits(srv.app.db, "handle.launcher_set")).toEqual([expect.objectContaining({ actor: SVC, detail: expect.objectContaining({ on: true, client_id: c.client_id }) })]);
+    // The service's own other session: auto-pick and an explicit `to` both reach the launcher.
+    const w = await session(await token(srv.base, c), "w-1");
+    expect(await w.call("delegate", { persona: "a researcher", task: "auto" })).toMatchObject({ to: `${SVC}/lx` });
+    expect((await lx.next(e => e.kind === "direct" && e.message.body.includes('"task": "auto"'))).event).toMatchObject({ kind: "direct", message: { sender: `${SVC}/w-1` } });
+    expect(await w.call("delegate", { persona: "a researcher", task: "named", to: "lx" })).toMatchObject({ to: `${SVC}/lx` });
+    // A person, the service's owner included, neither auto-picks it nor reaches it by name.
+    const alice = await srv.hosted(A, "fe", { delivery: false });
+    expect(await refusedText(alice.call("delegate", { persona: "p", task: "t" }))).toStartWith("no live launcher session (a session started with BUS_LAUNCHER=1) and no reachable human");
+    expect(await refusedText(alice.call("delegate", { persona: "p", task: "t", to: `${SVC}/lx` }))).toBe(`no agent "${SVC}/lx" has ever connected; peer_list shows exact handles`);
+    // Another service's session is refused too: no team grant reaches a service.
+    expect((await api(root, "POST", "/api/admin/services", { name: "other", owners: [A] })).status).toBe(201);
+    const oc = await api(root, "POST", "/api/admin/services/credentials", { service: "other" });
+    const ow = await session(await token(srv.base, oc.body as Credential), "o-1");
+    expect(await refusedText(ow.call("delegate", { persona: "p", task: "t" }))).toContain("no live launcher session of service other");
+    expect(await refusedText(ow.call("delegate", { persona: "p", task: "t", to: `${SVC}/lx` }))).toBe(`no agent "${SVC}/lx" has ever connected; peer_list shows exact handles`);
+    expect(srv.app.db.query("SELECT count(*) AS n FROM messages WHERE recipient = ?").get(`${SVC}/lx`)).toEqual({ n: 2 });
+    // An opencode-source credential's declaration counts too; a session that never declared is no launcher.
+    const o = await credential(root, { source: "opencode" });
+    const ol = await session(await token(srv.base, o), "olx", { sessionKey: OPENCODE_SESSION_META, launcher: true });
+    expect(flag(o.client_id, ol.sessionId)).toBe(1);
+    expect(flag(c.client_id, w.sessionId)).toBe(0);
+    // session_end ends the ownership, which clears the flag: one off row, and no on row from the end's own request (#532).
+    await lx.end();
+    expect(flag(c.client_id, lx.sessionId)).toBe(0);
+    expect(accessAudits(srv.app.db, "handle.launcher_set").map(a => [a.detail.client_id, a.detail.on])).toEqual([[c.client_id, true], [o.client_id, true], [c.client_id, false]]);
   });
 
   test("revoking the credential ends its live sessions in the revoke's transaction, and its next call and mint are refused (criterion 3)", async () => {
