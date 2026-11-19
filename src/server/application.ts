@@ -1919,7 +1919,7 @@ async function handleDelegate(hub: Hub, tx: Tx, session: ApplicationSession, m: 
       // What core's synchronous decision asks of the store, read first on the savepoint (#807 P3 B4b): the named
       // target's facts, or every launcher's user and open count.
       const facts = await repo.delegation.facts(sp, { to, since });
-      const d = resolveDelegationWith(facts, session.primary, authed.user_email, { ...m, to }, online, await humanReachable(sp), (h) => session.addresses.includes(h), facts.open, hub.delegateOpenCap, reach);
+      const d = resolveDelegationWith(facts, session.primary, authed.user_email, { ...m, to }, online, await humanReachable(sp), (h) => session.addresses.includes(h), facts.open, hub.delegateOpenCap, reach, authed.kind === "service");
       picked = d.to;
       const w = await writeSend(hub, sp, session, await prepareSend(hub, sp, session, session.primary, d.to, d.body, null, true, undefined));
       const payload: DelegateResult = { ...w.payload, ...delegateOkFields(d, w.payload) };

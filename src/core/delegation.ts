@@ -234,13 +234,15 @@ export function resolveDelegationWith(
   open: (handle: string) => number = () => 0,
   cap: number = DELEGATE_OPEN_CAP,
   reach: (to: string) => DelegateReach = (to) => userMatches(principal, facts.userOf(to)) ? { ok: "own" } : { refused: crossUserRefusal(to) },
+  // The requester is a service principal, from its typed kind (`authed.kind`), never its name's spelling (#1327 audit
+  // L1): a service's requests reach only its own launchers (no team grant reaches a service), so the launcher is one
+  // too, and its body names its own service's handles. Local mode has no services.
+  service = false,
 ): Delegation {
   const persona = field(args.persona, "persona", MAX_PERSONA_CHARS);
   const task = field(args.task, "task", MAX_TASK_CHARS, true);
   const context = optField(args.context, "context", MAX_CONTEXT_CHARS);
   const brief = { requester, persona, task, context };
-  // A service's requests reach only its own launchers (no team grant reaches a service), so the launcher is one too.
-  const service = principal !== null && !hasHuman(principal);
 
   if (args.to !== undefined) {
     if (typeof args.to !== "string" || !args.to.trim()) throw new CoreError("to must be a string");
