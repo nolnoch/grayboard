@@ -116,6 +116,9 @@ export class Binding implements CredentialPort<OpenCodeEnrollment> {
     return { async dispose() { active = false; await registration.dispose(); } };
   }
   async configuration() {
+    // A refused static mode is the refusal whatever the entry's shape (#1313): a stray run token beside an OAuth
+    // entry would otherwise read as an entry-shape problem.
+    if (this.static_ && "refused" in this.static_) throw new Refusal("identity", this.static_.refused);
     let result: ReturnType<Binding["endpoint"]>;
     const observer = await this.ctx.mcp.transform(editor => { result = this.endpoint(editor.get(this.name)); });
     await observer.dispose();
