@@ -195,8 +195,14 @@ async function listBoards(repo: Repo, access: BoardAccess, r: Read, viewer: stri
   return boardsFromViews(judged);
 }
 
+// The scope an ID row's principal acts in (#1241): a service's own scope for a service, else a person's. An ID's
+// principal is the user or service that registered it, never a team, and a service's name never holds "@" while a
+// user's is an email (#270 D1), so the name alone says which.
+const principalScope = (principal: string | null): AliasScopeOf =>
+  ({ scope_kind: principal !== null && !principal.includes("@") ? "service" : "person", scope_ref: principal });
+
 // core's who over the store. Every scope assembleWho may ask about (each row's alias scope, and each row's
-// principal as a person scope, null included) is decided up front in one batch per check, for the caller's session
+// principal's own scope, null included) is decided up front in one batch per check, for the caller's session
 // (`ctx.session`, else the actor); a lookup outside that set is a bug, so it throws rather than answer either way.
 async function who(
   repo: Repo,
@@ -219,8 +225,8 @@ async function who(
   const scopes = new Map<string, AliasScopeOf>();
   for (const r of rows) {
     if (r.scope_kind !== null) scopes.set(scopeKey({ scope_kind: r.scope_kind, scope_ref: r.scope_ref }), { scope_kind: r.scope_kind, scope_ref: r.scope_ref });
-    const person: AliasScopeOf = { scope_kind: "person", scope_ref: r.principal };
-    scopes.set(scopeKey(person), person);
+    const own = principalScope(r.principal);
+    scopes.set(scopeKey(own), own);
   }
   const list = [...scopes.values()];
   const names = list.length ? await access.seesAliasScopes(tx, viewer, list) : new Map<string, boolean>();
@@ -240,6 +246,7 @@ async function who(
     online: ctx.online!,
     own: new Set(ctx.addresses ?? [actor]),
     now: Date.now(),
+    principalScope,
   });
   // A board's roster lists its unbound subscribers by ID among its peers.
   return finishWho(peers, unboundFrom(unbound, (id) => facts.get(id), opts.match), viewers.has(actor) ? undefined : actor, opts.include_offline);

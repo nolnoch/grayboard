@@ -209,7 +209,8 @@ export function createHostedSessions(application: Application, options: { now?: 
   // `parked`: a root's parked children past it are evicted, oldest first (#584); with `children` a root has at most
   // twice MAX_CHILDREN child rows.
   const caps = options.caps ?? DEFAULT_HOSTED_CAPS.sessions;
-  const limits = { user: caps.perUser, global: caps.global, children: MAX_CHILDREN, parked: MAX_CHILDREN };
+  // service: a service principal's tier (#270 D4), picked by the principal's kind at admission; never above global.
+  const limits = { user: caps.perUser, service: Math.min(caps.perService ?? caps.perUser, caps.global), global: caps.global, children: MAX_CHILDREN, parked: MAX_CHILDREN };
   // Calls running per session ID (#584): a row with one is never idle-ended or parked. A child's call counts for
   // its root too, since ending a root deletes its children.
   const inflight = new Map<string, number>();
@@ -233,8 +234,9 @@ export function createHostedSessions(application: Application, options: { now?: 
   async function admitChild(tx: Tx, root: string, own: string[]) {
     if (await full(tx, async () => (await store.children(tx, root)).filter(r => r.parked_at === null).length >= limits.children, own)) { countRefusal("hosted_child"); throw new ApplicationError("bad_request", childCapacity(root)); }
   }
-  async function admit(tx: Tx, user: number, own: string[], root?: string) {
-    if (await full(tx, async () => { const n = await store.counts(tx, user); return n.total >= limits.global || n.user >= limits.user; }, own)) {
+  async function admit(tx: Tx, authed: AuthedUser, own: string[], root?: string) {
+    const mine = authed.kind === "service" ? limits.service : limits.user;
+    if (await full(tx, async () => { const n = await store.counts(tx, authed.user_id); return n.total >= limits.global || n.user >= mine; }, own)) {
       countRefusal("hosted_session");
       throw new ApplicationError("bad_request", "hosted session capacity reached; end unused sessions first");
     }
@@ -304,13 +306,13 @@ export function createHostedSessions(application: Application, options: { now?: 
     if (row) ownRow(p, row, later);
     if (row && row.parked_at !== null && wake) row = await unpark(tx, p, row);
     if (!row && create) {
-      await admit(tx, p.authed.user_id, []);
+      await admit(tx, p.authed, []);
       const t = now();
       const writesAs = context.writesAs === undefined ? null : await application.hostedWritesAs(tx, p.authed, context.id, context.writesAs, true, (address, detail) => later(w => application.hostedRefused(w, context.id, address, detail)), later);
       row = { session_id: context.id, ownership_id: await store.start(tx, context.id, p.authed.user_id, p.clientId, t, context.suggested), user_id: p.authed.user_id,
         client_id: p.clientId, grant_id: p.grantId, source_session_id: context.raw, writes_as: writesAs, bind_gen: 0,
         root_session_id: null, place: null, lease_deadline: null, created_at: t, last_seen_at: t, suggested: context.suggested ?? null, parked_at: null };
-      await application.hostedRegister(tx, p.authed, row.session_id, harnessFor(p.clientId), writesAs, why => later(w => application.hostedCollided(w, p.authed, context.id, why)), context.facts);
+      await application.hostedRegister(tx, p.authed, row.session_id, harnessFor(p.clientId, p.source ?? null), writesAs, why => later(w => application.hostedCollided(w, p.authed, context.id, why)), context.facts);
       // An ID that was a child (its source row ended) starts as a root: an address again (#523).
       await application.hostedRoot(tx, row.session_id, null);
       await store.insert(tx, row);
@@ -364,7 +366,7 @@ export function createHostedSessions(application: Application, options: { now?: 
   // as a registration is (a refusal leaves it parked), under the root's grant, which `attach` moved past it.
   async function unpark(tx: Tx, p: OAuthPrincipal, row: HostedSession): Promise<HostedSession> {
     const root = await rootOf(tx, row), t = now();
-    await admit(tx, p.authed.user_id, [root.session_id, row.session_id], root.session_id);
+    await admit(tx, p.authed, [root.session_id, row.session_id], root.session_id);
     await store.unpark(tx, row.session_id, root.grant_id, t);
     await audit(tx, root.session_id, "hosted.child_unparked", { child: row.session_id, ownership: row.ownership_id, parked_ms: t - row.parked_at! }, p);
     return { ...row, parked_at: null, grant_id: root.grant_id, last_seen_at: t };
@@ -1022,7 +1024,7 @@ export function createHostedSessions(application: Application, options: { now?: 
           if (existing?.root_session_id && existing.root_session_id !== root.session_id) throw new ApplicationError("child_registered_elsewhere", `session ${childId} is registered under root ${existing.root_session_id}; a session has one root. session_end(${childId}) from ${existing.root_session_id} first.`);
           const descendants = await store.children(tx, childId);
           if (descendants.length) throw new ApplicationError("has_children", `session ${childId} has ${descendants.length} registered children, so it can't become a child.`);
-          if (!existing) await admit(tx, p.authed.user_id, [root.session_id, childId], root.session_id);
+          if (!existing) await admit(tx, p.authed, [root.session_id, childId], root.session_id);
           else if (!existing.root_session_id) await admitChild(tx, root.session_id, [root.session_id, childId]);
           const attached = await attach(tx, p, root);
           await touch(tx, attached);
@@ -1033,7 +1035,7 @@ export function createHostedSessions(application: Application, options: { now?: 
             return { message: "already registered" };
           }
           if (existing) await store.end(tx, existing.session_id, "closed", now());
-          await application.hostedRegister(tx, p.authed, childId, harnessFor(p.clientId));
+          await application.hostedRegister(tx, p.authed, childId, harnessFor(p.clientId, p.source ?? null));
           await application.hostedRoot(tx, childId, root.session_id);
           await store.insert(tx, { session_id: childId, ownership_id: attached.ownership_id, user_id: p.authed.user_id, client_id: p.clientId, grant_id: p.grantId,
             source_session_id: child, writes_as: null, bind_gen: 0, root_session_id: root.session_id, place: null, lease_deadline: null, created_at: now(), last_seen_at: now(), suggested: null, parked_at: null });

@@ -1201,7 +1201,7 @@ roleCmd
 
 // Service principals (#270): a pipeline's agents act as a service, owned by users and managed by org admins.
 type ServiceRow = { id: number; name: string; created_at: number; disabled_at: number | null; owners: string[] };
-const serviceCmd = adminCmd.command("service").description("Create, list, disable and enable service principals, and delete their unused names");
+const serviceCmd = adminCmd.command("service").description("Create, list, disable and enable service principals, manage their credentials, and delete their unused names");
 
 serviceCmd
   .command("create <name>")
@@ -1247,6 +1247,47 @@ serviceCmd
   .action(async (service: string, name: string) => {
     try { output(await makeClient().post("/api/admin/services/delete-alias", { service, name }), globalJson()); }
     catch (e) { handleApiError(e); }
+  });
+
+// Service credentials (#270 D2): what a launcher holds to mint run tokens (POST /oauth/token, client_credentials).
+const credentialCmd = serviceCmd.command("credential").description("Add, rotate and revoke a service's OAuth client credentials");
+
+credentialCmd
+  .command("add <service>")
+  .description("Add a credential (its client ID and secret, shown once), or with --rotate a second secret for a live one")
+  .option("--source <source>", "The session source its sessions carry: generic (the SDK's) or opencode", undefined)
+  .option("--token-seconds <n>", "Its run tokens' lifetime in seconds (default 3600; at most the server's GRAYBOARD_SERVICE_TOKEN_MAX_SECONDS)")
+  .option("--expires-days <n>", "Days until the credential expires (default never)")
+  .option("--rotate <client_id>", "Add a second secret to this live credential instead; its client ID, grant and sessions stay")
+  .action(async (service: string, opts: { source?: string; tokenSeconds?: string; expiresDays?: string; rotate?: string }) => {
+    try {
+      const n = (raw: string | undefined, what: string) => {
+        if (raw === undefined) return undefined;
+        if (!/^[1-9][0-9]*$/.test(raw)) throw new Error(`${what} must be a positive whole number`);
+        return Number(raw);
+      };
+      const days = n(opts.expiresDays, "--expires-days");
+      const body = { service, ...(opts.rotate ? { rotate: opts.rotate } : {}), ...(opts.source ? { source: opts.source } : {}),
+        ...(opts.tokenSeconds ? { token_seconds: n(opts.tokenSeconds, "--token-seconds") } : {}),
+        ...(days !== undefined ? { expires_at: Date.now() + days * 86_400_000 } : {}) };
+      const out = await makeClient().post("/api/admin/services/credentials", body) as { client_id: string; client_secret: string; secret_id: number };
+      if (globalJson()) { output(out, true); return; }
+      console.log(`client_id:     ${out.client_id}\nclient_secret: ${out.client_secret}\nsecret_id:     ${out.secret_id}`);
+      console.error("The secret is shown once: give it to the launcher only (it mints run tokens with it), never to an agent.");
+    } catch (e) { handleApiError(e); }
+  });
+
+credentialCmd
+  .command("revoke [client_id]")
+  .description("Revoke a credential, ending its sessions, or with --secret one of its secrets and that secret's tokens")
+  .option("--secret <id>", "Revoke this secret (its id from add) instead of the whole credential")
+  .action(async (clientId: string | undefined, opts: { secret?: string }) => {
+    try {
+      if ((clientId === undefined) === (opts.secret === undefined)) throw new Error("give a client ID, or --secret <id>");
+      if (opts.secret !== undefined && !/^[1-9][0-9]*$/.test(opts.secret)) throw new Error("--secret must be a secret's id");
+      const body = opts.secret !== undefined ? { secret: Number(opts.secret) } : { client_id: clientId };
+      output(await makeClient().post("/api/admin/services/credentials/revoke", body), globalJson());
+    } catch (e) { handleApiError(e); }
   });
 
 program.parseAsync(process.argv);

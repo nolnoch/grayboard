@@ -17,6 +17,9 @@ const KEYS = [
   "GRAYBOARD_HOSTED_SESSIONS_GLOBAL", "GRAYBOARD_HOSTED_SESSIONS_PER_USER", "GRAYBOARD_DELIVERY_LEASES_GLOBAL", "GRAYBOARD_DELIVERY_LEASES_PER_USER",
   "GRAYBOARD_RESOURCE_WATCHES_GLOBAL", "GRAYBOARD_RESOURCE_WATCHES_PER_SESSION",
   "GRAYBOARD_HEALTHZ_LAG_P99_MS", "GRAYBOARD_HEALTHZ_LAG_WINDOWS",
+  "GRAYBOARD_HOSTED_SESSIONS_PER_SERVICE", "GRAYBOARD_DELIVERY_LEASES_PER_SERVICE",
+  ...["HOSTED_REQUEST_SERVICE", "HOSTED_SUBSCRIBER_SERVICE", "HELLO_SERVICE"].flatMap(p => [`GRAYBOARD_${p}_BURST`, `GRAYBOARD_${p}_PER_SEC`]),
+  "GRAYBOARD_SERVICE_TOKEN_MAX_SECONDS", "GRAYBOARD_SERVICE_TOKEN_MINTS_PER_MINUTE", "GRAYBOARD_SERVICE_TOKENS_UNEXPIRED",
 ];
 
 describe("loadConfig", () => {
@@ -65,11 +68,14 @@ describe("loadConfig", () => {
     primary();
     const config = loadConfig();
     expect(config.mcpLimits).toEqual({ listen: { global: 128, perUser: 32 }, legacy: { global: 256, perUser: 32 }, post: { global: 256, perUser: 64 } });
-    expect(config.hostedCaps).toEqual({ sessions: { global: 4096, perUser: 256 }, leases: { global: 256, perUser: 32 }, watches: { global: 1024, perSession: 32 } });
+    expect(config.hostedCaps).toEqual({ sessions: { global: 4096, perUser: 256, perService: 1024 }, leases: { global: 256, perUser: 32, perService: 64 }, watches: { global: 1024, perSession: 32 } });
     const families: [string, string, (c: ReturnType<typeof loadConfig>) => { global: number; scoped: number }][] = [
       ...(["listen", "legacy", "post"] as const).map(kind => [`GRAYBOARD_MCP_${kind.toUpperCase()}`, "PER_USER", (c: ReturnType<typeof loadConfig>) => ({ global: c.mcpLimits![kind].global, scoped: c.mcpLimits![kind].perUser })] as [string, string, (c: ReturnType<typeof loadConfig>) => { global: number; scoped: number }]),
       ["GRAYBOARD_HOSTED_SESSIONS", "PER_USER", c => ({ global: c.hostedCaps!.sessions.global, scoped: c.hostedCaps!.sessions.perUser })],
       ["GRAYBOARD_DELIVERY_LEASES", "PER_USER", c => ({ global: c.hostedCaps!.leases.global, scoped: c.hostedCaps!.leases.perUser })],
+      // The service tier (#270 D4): clamped under the same global.
+      ["GRAYBOARD_HOSTED_SESSIONS", "PER_SERVICE", c => ({ global: c.hostedCaps!.sessions.global, scoped: c.hostedCaps!.sessions.perService! })],
+      ["GRAYBOARD_DELIVERY_LEASES", "PER_SERVICE", c => ({ global: c.hostedCaps!.leases.global, scoped: c.hostedCaps!.leases.perService! })],
       ["GRAYBOARD_RESOURCE_WATCHES", "PER_SESSION", c => ({ global: c.hostedCaps!.watches.global, scoped: c.hostedCaps!.watches.perSession })],
     ];
     for (const [prefix, scope, read] of families) {
@@ -283,6 +289,26 @@ describe("loadConfig", () => {
     process.env.GRAYBOARD_HOSTED_REQUEST_BURST = "120";
     process.env.GRAYBOARD_HOSTED_REQUEST_PER_SEC = "0";
     expect(() => loadConfig()).toThrow(/GRAYBOARD_HOSTED_REQUEST_PER_SEC/);
+  });
+
+  test("a service's buckets and its run tokens' bounds are configured apart from a user's (#270 D2, D4)", () => {
+    process.env.GRAYBOARD_DEV_AUTH = "1";
+    expect(loadConfig().serviceLimits).toEqual({ hostedRequest: { burst: 480, perSec: 80 }, hostedSubscriber: { burst: 960, perSec: 160 }, bind: { burst: 240, perSec: 4 } });
+    expect(loadConfig().serviceTokens).toEqual({ maxSeconds: 86_400, mintsPerMinute: 60, unexpired: 1000 });
+    process.env.GRAYBOARD_HOSTED_REQUEST_SERVICE_BURST = "900";
+    process.env.GRAYBOARD_HELLO_SERVICE_PER_SEC = "8";
+    process.env.GRAYBOARD_SERVICE_TOKEN_MAX_SECONDS = "600";
+    process.env.GRAYBOARD_SERVICE_TOKEN_MINTS_PER_MINUTE = "5";
+    process.env.GRAYBOARD_SERVICE_TOKENS_UNEXPIRED = "7";
+    const c = loadConfig();
+    expect(c.serviceLimits).toMatchObject({ hostedRequest: { burst: 900, perSec: 80 }, bind: { burst: 240, perSec: 8 } });
+    expect(c.hostedRequestLimit).toEqual({ burst: 120, perSec: 20 });
+    expect(c.serviceTokens).toEqual({ maxSeconds: 600, mintsPerMinute: 5, unexpired: 7 });
+    // Below the mint bucket's minute the window could undercount; above a year is a typo.
+    for (const v of ["59", "31622401", "0"]) {
+      process.env.GRAYBOARD_SERVICE_TOKEN_MAX_SECONDS = v;
+      expect(() => loadConfig()).toThrow(/GRAYBOARD_SERVICE_TOKEN_MAX_SECONDS/);
+    }
   });
 
   test("the subscriber request bucket is configured apart from the tool-call one (#845)", () => {

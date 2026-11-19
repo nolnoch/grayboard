@@ -162,7 +162,9 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
         // A lease this open replaces (another grant's) frees its slot here, not after the check; a
         // session is one user's, so that slot is this user's.
         const replaced = previous ? 1 : 0;
-        if (leases.size - replaced >= caps.global || (perUser.get(p.authed.user_id) ?? 0) - replaced >= caps.perUser) { countRefusal("delivery_lease"); throw new ApplicationError("bad_request", "delivery lease capacity reached"); }
+        // A service's tier (#270 D4) in place of the per-user cap, never above the global one.
+        const mine = p.authed.kind === "service" ? Math.min(caps.perService ?? caps.perUser, caps.global) : caps.perUser;
+        if (leases.size - replaced >= caps.global || (perUser.get(p.authed.user_id) ?? 0) - replaced >= mine) { countRefusal("delivery_lease"); throw new ApplicationError("bad_request", "delivery lease capacity reached"); }
         const expiresAt = now() + ttl;
         const opened = { ...row, lease_deadline: expiresAt, last_seen_at: now() };
         await store.update(tx, opened);

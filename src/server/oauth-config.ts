@@ -1,5 +1,6 @@
 import { SESSION_FACT_MAX } from "../shared/protocol.ts";
 import { GRAYBOARD_SESSION_META } from "../shared/session_meta.ts";
+import type { CredentialSource, ServiceCredential } from "./oauth-types.ts";
 
 export const OAUTH_SCOPES = ["grayboard:delivery", "grayboard:tools"] as const;
 // The scope that mints a CLI session (#928 D8, R3). Never a member of OAUTH_SCOPES: every built-in, every CIMD
@@ -17,7 +18,16 @@ export type OAuthClient = {
   allowRefresh?: boolean;
   // Operator opt-in to the generic hosted session source key; never set for a CIMD client.
   sessionSource?: boolean;
+  // A service credential's client (#270 D2), read from the store: its live secrets, and once client authentication
+  // has matched one, its ID (the secret a run token is minted with). Only such a client runs client_credentials.
+  credential?: ServiceCredential & { secretId?: number };
 };
+// A service credential's client ID: this prefix and 32 hex digits, generated, never configured (#270 D2).
+export const SERVICE_CLIENT_PREFIX = "svc_";
+export const isServiceClientId = (id: string) => id.startsWith(SERVICE_CLIENT_PREFIX);
+// The server's hosted MCP resource identifier: what every grant is bound to and findActiveAccess matches. One place,
+// for the AS and for the admin route that writes a credential's grant.
+export const mcpResource = (publicUrl: string, devAuth: boolean) => new URL(oauthPublicUrl(publicUrl, devAuth) + "/mcp").href;
 
 // Hosted session source mapping (#414): the `_meta` key that carries a client's raw
 // session source, and the harness its sessions show in peer_list. OpenCode's CIMD client
@@ -49,14 +59,18 @@ export const CLI_CLIENT: OAuthClient = {
   clientId: CLI_CLIENT_ID, name: "Grayboard for the CLI", redirectUris: ["http://127.0.0.1/callback", "http://[::1]/callback"],
   scopes: [LOGIN_SCOPE], tokenEndpointAuthMethod: "none", allowRefresh: false,
 };
-export function sourceKeyFor(clientId: string, clients: ReadonlyMap<string, OAuthClient>): string | null {
+// `source`: a service credential's (#270 D3), carried on the access read; it decides alone for such a client.
+export function sourceKeyFor(clientId: string, clients: ReadonlyMap<string, OAuthClient>, source: CredentialSource | null = null): string | null {
+  if (source !== null) return source === "opencode" ? OPENCODE_SESSION_META : GRAYBOARD_SESSION_META;
   if (clientId === OPENCODE_CLIENT) return OPENCODE_SESSION_META;
   if (builtinHarness.has(clientId)) return GRAYBOARD_SESSION_META;
   return clients.get(clientId)?.sessionSource === true ? GRAYBOARD_SESSION_META : null;
 }
 // Only a mapped client registers sessions; a built-in shows its harness, and the parser
-// keeps an opted-in operator ID within SESSION_FACT_MAX, so that label is the exact ID.
-export const harnessFor = (clientId: string) => clientId === OPENCODE_CLIENT ? "opencode" : builtinHarness.get(clientId) ?? clientId;
+// keeps an opted-in operator ID within SESSION_FACT_MAX, so that label is the exact ID. A service credential's
+// opencode source shows opencode; its generic one, its client ID (svc_ and 32 hex digits, within the limit).
+export const harnessFor = (clientId: string, source: CredentialSource | null = null) =>
+  clientId === OPENCODE_CLIENT || source === "opencode" ? "opencode" : builtinHarness.get(clientId) ?? clientId;
 const httpsId = (id: string) => { try { return new URL(id).protocol === "https:"; } catch { return false; } };
 
 const unsafe = /[\x00-\x20\x7f\\]/;
@@ -122,6 +136,8 @@ export function parseOAuthClients(raw: string | undefined): OAuthClient[] {
       (v.sessionSource !== undefined && typeof v.sessionSource !== "boolean")) throw new Error("invalid OAuth client configuration");
     if (builtinHarness.has(v.clientId)) throw new Error(`OAuth client ID ${v.clientId} is reserved for a built-in client; rename that GRAYBOARD_OAUTH_CLIENTS entry`);
     if (v.clientId === CLI_CLIENT_ID) throw new Error(`OAuth client ID ${v.clientId} is reserved for the CLI's client; rename that GRAYBOARD_OAUTH_CLIENTS entry`);
+    // The startup map wins over the store, so a configured svc_ ID would shadow a service's credential (#270 D2).
+    if (isServiceClientId(v.clientId)) throw new Error(`OAuth client ID ${v.clientId} is under the prefix ${SERVICE_CLIENT_PREFIX}, reserved for service credentials; rename that GRAYBOARD_OAUTH_CLIENTS entry`);
     // CIMD resolves only https: identifiers and grants keep only the client ID string, so an
     // https: ID never maps the generic key: a grant consented under a metadata document can't
     // turn write-capable because the operator later registers the same ID.

@@ -1635,11 +1635,15 @@ export type WhoFacts = {
   online: (handle: string) => boolean;
   own: Set<string>;
   now: number;
+  // The scope an ID row's principal acts in: the mode's to say (a server's service principal acts in a service scope,
+  // #1241); a person's when absent, as local mode's one principal is.
+  principalScope?: (principal: string | null) => AliasScopeOf;
 };
 
 /** The peers the caller is shown of roster `rows` it may see the board of, cut and matched as who's comment says. */
 export function assembleWho(rows: WhoRow[], match: PeerMatch | undefined, f: WhoFacts): Peer[] {
   const all: Peer[] = [];
+  const principalScope = f.principalScope ?? ((principal: string | null): AliasScopeOf => ({ scope_kind: "person", scope_ref: principal }));
   for (const r of rows) {
     if (f.isViewer(r.handle)) continue;
     // Whether the row is listed at all: a team's alias only to the team's
@@ -1652,7 +1656,7 @@ export function assembleWho(rows: WhoRow[], match: PeerMatch | undefined, f: Who
     // in its scope, an ID's to one that may act in its principal's (security
     // audit F-12). Another user's agent is a handle and its presence, nothing
     // about their machine or work. Locally every row passes.
-    const seesSession = f.own.has(r.handle) || (r.scope_kind !== null ? seesMeta : f.seesMeta({ scope_kind: "person", scope_ref: r.principal }));
+    const seesSession = f.own.has(r.handle) || (r.scope_kind !== null ? seesMeta : f.seesMeta(principalScope(r.principal)));
     const where = !seesSession ? null : r.cwd ? describeLocation(r.cwd) : r.place;
     const session = seesSession ? sessionFacts(r) : {};
     const meta: AliasMeta = {};
@@ -1660,7 +1664,7 @@ export function assembleWho(rows: WhoRow[], match: PeerMatch | undefined, f: Who
     // An ID row's scope is its principal, which the row doesn't show: it
     // matches only for a caller that may act in that principal's scope (#371).
     if (match) {
-      const idScope = match.scope !== undefined && r.principal !== null && f.seesMeta({ scope_kind: "person", scope_ref: r.principal });
+      const idScope = match.scope !== undefined && r.principal !== null && f.seesMeta(principalScope(r.principal));
       const scope = (r.scope_kind !== null ? r.scope_ref : idScope ? r.principal : null) ?? undefined;
       if (!matches(match, { id: r.id ?? undefined, ...session, ...meta, scope })) continue;
     }

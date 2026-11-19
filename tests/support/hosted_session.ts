@@ -32,6 +32,10 @@ export type HostedOptions = {
   receipt?: "auto" | "manual";
   delivery?: boolean;
   context?: false;
+  // Each request's bearer token, read per request (a launcher that mints run tokens, #270); default the constructor's.
+  token?: () => Promise<string>;
+  // The _meta key its session ID travels under; default grayboard's (a credential of source opencode reads opencode's).
+  sessionKey?: string;
 };
 
 // One item of the lease's inbox: { id, actionable, event } and the lease
@@ -101,8 +105,8 @@ export class HostedSession {
   ) {
     const client = HOSTED_CLIENT;
     this.sessionId = opts.sessionId ?? `test-${randomBytes(8).toString("hex")}`;
-    const options: WireOptions = { url, sessionKey: GRAYBOARD_SESSION_META, client: { name: client, version: "1.0.0" }, delivery: { mode: "push", source: client } };
-    const auth = { token: async () => token };
+    const options: WireOptions = { url, sessionKey: opts.sessionKey ?? GRAYBOARD_SESSION_META, client: { name: client, version: "1.0.0" }, delivery: { mode: "push", source: client } };
+    const auth = { token: opts.token ?? (async () => token) };
     this.wireOptions = options;
     this.native = new NativeWire(options, auth, this.abort.signal, this.sessionId);
     this.subscriber = new Wire(options, auth, this.abort.signal, this.sessionId);
