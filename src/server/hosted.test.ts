@@ -2706,3 +2706,18 @@ test("#1298: sessionContext reads the declared client for a generic source only"
   expect(sessionContext({ ...principal, clientId: "grayboard-pi", sourceKey: GRAYBOARD_SESSION_META }, meta)).not.toHaveProperty("client");
   expect(sessionContext({ ...svc, source: "generic" }, { ...meta, [CLIENT_INFO_META_KEY]: { name: 7 } })).not.toHaveProperty("client");
 });
+
+// #1299: a launcher declaration is read for a built-in client, OpenCode's, and a service credential of either source;
+// an operator-configured third-party client's (no credential source) is ignored.
+test("#1299: sessionContext reads a launcher declaration for a service credential of either source, never a third-party client's", () => {
+  const meta = { [GRAYBOARD_SESSION_META]: "declared-1299", [OPENCODE_SESSION_META]: "declared-1299", [GRAYBOARD_LAUNCHER_META]: true };
+  const svc: OAuthPrincipal = { ...principal, clientId: `svc_${"c".repeat(32)}`, sourceKey: GRAYBOARD_SESSION_META };
+  expect(sessionContext({ ...svc, source: "generic" }, meta)).toHaveProperty("launcher", true);
+  expect(sessionContext({ ...svc, source: "opencode", sourceKey: OPENCODE_SESSION_META }, meta)).toHaveProperty("launcher", true);
+  for (const source of [null, undefined] as const) expect(sessionContext({ ...svc, source }, meta)).not.toHaveProperty("launcher");
+  expect(sessionContext({ ...principal, clientId: "brokered-agents", sourceKey: GRAYBOARD_SESSION_META }, meta)).not.toHaveProperty("launcher");
+  expect(sessionContext({ ...principal, clientId: "grayboard-pi", sourceKey: GRAYBOARD_SESSION_META }, meta)).toHaveProperty("launcher", true);
+  // The same checks as a built-in client's: a non-boolean is refused, false is no declaration.
+  expect(() => sessionContext({ ...svc, source: "generic" }, { ...meta, [GRAYBOARD_LAUNCHER_META]: "yes" })).toThrow(`_meta["${GRAYBOARD_LAUNCHER_META}"] must be a boolean`);
+  expect(sessionContext({ ...svc, source: "generic" }, { ...meta, [GRAYBOARD_LAUNCHER_META]: false })).not.toHaveProperty("launcher");
+});
