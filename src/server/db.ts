@@ -30,7 +30,9 @@ import { DiskBlobs } from "./blobs.ts";
 import { detached, inRequest, requestOrigin } from "./request_context.ts";
 import { GOOGLE_ISSUER } from "./idp_google.ts";
 import { LOGIN_SCOPE, OAUTH_SCOPES } from "./oauth-config.ts";
-import { CREDENTIAL_SOURCES, OAUTH_TTL, SERVICE_TOKEN_MIN_SECONDS, type CredentialSource, type ServiceCredential, type OAuthStore, type OAuthBinding, type OAuthAuthorization, type OAuthRequest, type OAuthBrowserSession, type OAuthCode, type OAuthGrant, type OAuthTokenPair, type OAuthAccess, type OAuthFailure } from "./oauth-types.ts";
+import type { CredentialSource, ServiceCredential, OAuthStore, OAuthAuthorization, OAuthRequest, OAuthBrowserSession, OAuthCode, OAuthGrant, OAuthTokenPair, OAuthAccess, OAuthFailure } from "./oauth-types.ts";
+import { accessFits, browserData, browserSessionInput, clampPair, codeData, codeInput, grantInput, hash, isLogin, loginInput, mintInput, requestData, requestInput, sameAuthorization,
+  rotationBinding, serviceCredentialInput, serviceSecretInput, successorInput, time } from "./oauth-rules.ts";
 import { LastOwner, PrincipalTaken } from "./store/errors.ts";
 import { DEV_SESSION_LABEL, TEAM_POLICIES, type User, type IdpSignIn, type Session, type PrincipalRow, type Team, type TeamPolicy, type TeamMember, type RoleBinding, type RoleAuthority, type RoleRevoke, type ServiceRow, type UsersStore, type SessionsStore, type PrincipalsStore, type TeamsStore, type RolesStore, type ServicesStore } from "./store/identity.ts";
 // The identity groups' row types and interfaces live in store/identity.ts for the Postgres store (#807 P3 C3a);
@@ -2282,24 +2284,16 @@ function oauthOps(db: Database, hosted: HostedStoreOf): OAuthOps {
   const invalid = { status: "invalid" } as const;
   const missing = { status: "not_found" } as const;
   const ok = <T>(value: T) => ({ status: "ok" as const, value });
-  const hash = (s: string) => /^[a-f0-9]{64}$/.test(s);
-  const time = (n: number) => Number.isSafeInteger(n) && n >= 0;
-  const deadline = (created: number, expiry: number, now: number, ttl: number) =>
-    time(now) && created === now && time(expiry) && expiry > now && expiry <= now + ttl;
-  const scopes = (s: string[]) => Array.isArray(s) && s.length > 0 && s.length <= 16 &&
-    s.every(v => typeof v === "string" && /^[a-zA-Z0-9:_-]{1,100}$/.test(v)) &&
-    JSON.stringify(s) === JSON.stringify([...new Set(s)].sort());
-  const binding = (b: OAuthBinding) => typeof b.clientId === "string" && b.clientId.length > 0 && b.clientId.length <= 512 &&
-    typeof b.resource === "string" && b.resource.length > 0 && b.resource.length <= 2048 && scopes(b.scopes);
-  const same = (a: OAuthBinding, b: OAuthBinding) => binding(b) && a.clientId === b.clientId && a.resource === b.resource &&
-    JSON.stringify(a.scopes) === JSON.stringify(b.scopes);
-  const authorization = (b: OAuthAuthorization) => binding(b) && typeof b.redirectUri === "string" &&
-    b.redirectUri.length > 0 && b.redirectUri.length <= 2048 && /^[A-Za-z0-9_-]{43}$/.test(b.codeChallenge);
-  const sameAuthorization = (a: OAuthAuthorization, b: OAuthAuthorization) => same(a, b) &&
-    a.redirectUri === b.redirectUri && a.codeChallenge === b.codeChallenge;
-  const authorizationData = (a: OAuthAuthorization): OAuthAuthorization => ({ clientId: a.clientId,
-    resource: a.resource, scopes: a.scopes, redirectUri: a.redirectUri, codeChallenge: a.codeChallenge });
-  const activeUser = (id: number) => !!db.query("SELECT 1 FROM users WHERE id = ? AND disabled_at IS NULL").get(id);
+  // Whether the user exists and is enabled (and, for `service`, is a service principal). `lock` is true in every write
+  // that mints for the user (a grant, a code, a browser session, a CLI session, a credential): on Postgres that read
+  // takes FOR SHARE on the users row, so a concurrent disable or revoke-all waits for the mint and then sees its row
+  // (postgres-server.md D3). SQLite's single writer already orders the two, so here it only names the call sites.
+  const activeUser = (id: number, lock: boolean, kind: "service" | null = null) => {
+    void lock;
+    return !!(kind === "service"
+      ? db.query("SELECT 1 FROM users u JOIN principals p ON p.user_id = u.id AND p.kind = 'service' WHERE u.id = ? AND u.disabled_at IS NULL").get(id)
+      : db.query("SELECT 1 FROM users WHERE id = ? AND disabled_at IS NULL").get(id));
+  };
   const read = <T>(table: "oauth_requests" | "oauth_browsers" | "oauth_codes", h: string, now: number): T | undefined => {
     if (!time(now) || !hash(h)) return undefined;
     const row = db.query<{ data: string }, [string, number]>(`SELECT data FROM ${table} WHERE hash = ? AND expires_at > ?`).get(h, now);
@@ -2309,12 +2303,9 @@ function oauthOps(db: Database, hosted: HostedStoreOf): OAuthOps {
     const row = db.query<{ data: string; revoked_at: number | null }, [string]>("SELECT data, revoked_at FROM oauth_grants WHERE id = ?").get(id);
     return row ? { ...JSON.parse(row.data), revokedAt: row.revoked_at } : undefined;
   };
+  // Mints nothing for the user: a rotation's pair goes under an existing grant, which a disable's revoke sees.
   const live = (g: OAuthGrant | undefined, now: number): g is OAuthGrant =>
-    !!g && time(now) && g.revokedAt === null && g.expiresAt > now && activeUser(g.userId);
-  const validPair = (p: OAuthTokenPair, b: OAuthBinding, now: number, cap: number) =>
-    same(b, p) && hash(p.accessHash) && hash(p.refreshHash) && p.accessHash !== p.refreshHash &&
-    deadline(now, p.accessExpiresAt, now, OAUTH_TTL.access) && p.accessExpiresAt <= cap &&
-    deadline(now, p.refreshExpiresAt, now, OAUTH_TTL.refresh) && p.refreshExpiresAt <= cap;
+    !!g && time(now) && g.revokedAt === null && g.expiresAt > now && activeUser(g.userId, false);
   const insertPair = (p: OAuthTokenPair, id: string, now: number) => {
     for (const [h, kind, expiry] of [[p.accessHash, "access", p.accessExpiresAt], [p.refreshHash, "refresh", p.refreshExpiresAt]] as const) {
       db.run("INSERT INTO oauth_tokens(hash, grant_id, kind, expires_at, created_at, access_scopes) VALUES (?, ?, ?, ?, ?, ?)",
@@ -2334,9 +2325,9 @@ function oauthOps(db: Database, hosted: HostedStoreOf): OAuthOps {
       WHERE c.client_id = ? AND g.revoked_at IS NULL AND g.expires_at > ? AND u.disabled_at IS NULL`).get(clientId, now) ?? undefined;
   type Token = { hash: string; grant_id: string; kind: string; expires_at: number; spent_at: number | null; revoked_at: number | null; created_at: number };
   const token = (h: string) => db.query<Token, [string]>("SELECT * FROM oauth_tokens WHERE hash = ?").get(h);
-  const browser = (h: string, now: number) => {
+  const browser = (h: string, now: number, lock: boolean) => {
     const b = read<OAuthBrowserSession>("oauth_browsers", h, now);
-    return b && activeUser(b.userId) ? b : undefined;
+    return b && activeUser(b.userId, lock) ? b : undefined;
   };
   // A code row and the checks both redeemers share (#928 D8): the code exists and its binding (client, resource,
   // scopes, redirect, fresh S256 challenge) is the presented one. A spent row (grant_id or session_id set) is the
@@ -2350,9 +2341,9 @@ function oauthOps(db: Database, hosted: HostedStoreOf): OAuthOps {
     const c: OAuthCode = JSON.parse(row.data);
     return sameAuthorization(c, input) ? { c, row } : invalid;
   };
+  // Both redeemers mint for the code's user (a grant, a CLI session), so the user read locks.
   const usable = (c: OAuthCode, row: CodeRow, now: number): OAuthFailure | undefined =>
-    row.expires_at <= now ? missing : activeUser(c.userId) ? undefined : invalid;
-  const isLogin = (c: OAuthBinding) => c.scopes.length === 1 && c.scopes[0] === LOGIN_SCOPE;
+    row.expires_at <= now ? missing : activeUser(c.userId, true) ? undefined : invalid;
   const liveSession = (id: number) => !!db.query("SELECT 1 FROM sessions WHERE id = ? AND revoked_at IS NULL").get(id);
   const sessionAudit = (action: AuditAction, c: OAuthCode, sessionId: number, now: number, detail: Record<string, unknown> = {}) => {
     const user = db.query<{ email: string }, [number]>("SELECT email FROM users WHERE id = ?").get(c.userId);
@@ -2382,16 +2373,13 @@ function oauthOps(db: Database, hosted: HostedStoreOf): OAuthOps {
   };
   return {
     createRequest(input, now) {
-      if (!authorization(input) || input.consentSessionHash !== null || ![input.requestHash, input.browserHash, input.csrfHash, input.stateHash].every(hash) ||
-          !deadline(input.createdAt, input.expiresAt, now, OAUTH_TTL.request)) return invalid;
+      if (!requestInput(input, now)) return invalid;
       return db.transaction(() => {
         db.run("DELETE FROM oauth_requests WHERE expires_at <= ?", [now]);
         const count = db.query<{ n: number }, [string]>("SELECT COUNT(*) AS n FROM oauth_requests WHERE browser_hash = ?").get(input.browserHash)!.n;
         const total = db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM oauth_requests").get()!.n;
         if (count >= 10 || total >= 1000) return { status: "capacity" } as const;
-        db.run("INSERT INTO oauth_requests(hash, browser_hash, expires_at, data) VALUES (?, ?, ?, ?)", [input.requestHash, input.browserHash, input.expiresAt, JSON.stringify({ ...authorizationData(input),
-          requestHash: input.requestHash, browserHash: input.browserHash, csrfHash: input.csrfHash, stateHash: input.stateHash,
-          consentSessionHash: null, createdAt: input.createdAt, expiresAt: input.expiresAt })]);
+        db.run("INSERT INTO oauth_requests(hash, browser_hash, expires_at, data) VALUES (?, ?, ?, ?)", [input.requestHash, input.browserHash, input.expiresAt, JSON.stringify(requestData(input))]);
         return ok(input);
       }).immediate();
     },
@@ -2402,7 +2390,8 @@ function oauthOps(db: Database, hosted: HostedStoreOf): OAuthOps {
     bindRequestSession(requestHash, browserHash, sessionHash, now) {
       return db.transaction(() => {
         const r = read<OAuthRequest>("oauth_requests", requestHash, now);
-        const b = browser(sessionHash, now);
+        // Binding mints nothing: decideRequest re-reads the session's user, locked, before it inserts the code.
+        const b = browser(sessionHash, now, false);
         if (!r || !b) return missing;
         if (r.browserHash !== browserHash || (r.consentSessionHash !== null && r.consentSessionHash !== sessionHash)) return invalid;
         const bound = { ...r, consentSessionHash: sessionHash };
@@ -2413,34 +2402,31 @@ function oauthOps(db: Database, hosted: HostedStoreOf): OAuthOps {
       }).immediate();
     },
     createBrowserSession(input, now, replaceHash) {
-      if (!hash(input.sessionHash) || !deadline(input.createdAt, input.expiresAt, now, OAUTH_TTL.browser)) return invalid;
+      if (!browserSessionInput(input, now)) return invalid;
       return db.transaction(() => {
-        if (!activeUser(input.userId)) return invalid;
+        if (!activeUser(input.userId, true)) return invalid;
         db.run("DELETE FROM oauth_browsers WHERE expires_at <= ?", [now]);
         const count = db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM oauth_browsers").get()!.n;
         if (count >= 10000) return { status: "capacity" } as const;
         if (replaceHash) db.run("DELETE FROM oauth_browsers WHERE hash = ?", [replaceHash]);
-        db.run("INSERT INTO oauth_browsers(hash, user_id, expires_at, data) VALUES (?, ?, ?, ?)", [input.sessionHash, input.userId, input.expiresAt, JSON.stringify({ sessionHash: input.sessionHash,
-          userId: input.userId, createdAt: input.createdAt, expiresAt: input.expiresAt })]);
+        db.run("INSERT INTO oauth_browsers(hash, user_id, expires_at, data) VALUES (?, ?, ?, ?)", [input.sessionHash, input.userId, input.expiresAt, JSON.stringify(browserData(input))]);
         return ok(input);
       }).immediate();
     },
-    findBrowserSession: browser,
+    findBrowserSession: (h, now) => browser(h, now, false),
     revokeBrowserSession(h) { db.run("DELETE FROM oauth_browsers WHERE hash = ?", [h]); },
     decideRequest(input, now) {
       return db.transaction(() => {
         const r = read<OAuthRequest>("oauth_requests", input.requestHash, now);
-        const b = browser(input.sessionHash, now);
+        const b = browser(input.sessionHash, now, true);
         if (!r || !b) return missing;
         if (r.browserHash !== input.browserHash || r.csrfHash !== input.csrfHash || r.consentSessionHash !== input.sessionHash) return invalid;
         const c = input.code;
-        if (input.approve && (!sameAuthorization(r, c) || c.userId !== b.userId || !hash(c.codeHash) ||
-            !deadline(c.createdAt, c.expiresAt, now, OAUTH_TTL.code))) return invalid;
+        if (input.approve && !codeInput(r, c, b.userId, now)) return invalid;
         // The delete consumes the request (D3): of two concurrent decisions only one deletes a row.
         if (!db.query<{ hash: string }, [string]>("DELETE FROM oauth_requests WHERE hash = ? RETURNING hash").get(input.requestHash)) return missing;
         if (!input.approve) return ok(null);
-        db.run("INSERT INTO oauth_codes(hash, user_id, expires_at, data) VALUES (?, ?, ?, ?)", [c.codeHash, c.userId, c.expiresAt, JSON.stringify({ ...authorizationData(c),
-          codeHash: c.codeHash, userId: c.userId, createdAt: c.createdAt, expiresAt: c.expiresAt })]);
+        db.run("INSERT INTO oauth_codes(hash, user_id, expires_at, data) VALUES (?, ?, ?, ?)", [c.codeHash, c.userId, c.expiresAt, JSON.stringify(codeData(c))]);
         return ok(c);
       }).immediate();
     },
@@ -2449,7 +2435,7 @@ function oauthOps(db: Database, hosted: HostedStoreOf): OAuthOps {
       const row = codeRow(h);
       if (!row) return undefined;
       const c: OAuthCode = JSON.parse(row.data);
-      if (c.clientId !== clientId || c.resource !== resource || c.redirectUri !== redirectUri || !activeUser(c.userId)) return undefined;
+      if (c.clientId !== clientId || c.resource !== resource || c.redirectUri !== redirectUri || !activeUser(c.userId, false)) return undefined;
       // A spent code stays findable while what it minted lives, so a replay reaches its redeemer and revokes it.
       if (row.grant_id !== null ? !live(grant(row.grant_id), now) : row.session_id !== null ? !liveSession(row.session_id) : row.expires_at <= now) return undefined;
       return [...c.scopes];
@@ -2464,9 +2450,7 @@ function oauthOps(db: Database, hosted: HostedStoreOf): OAuthOps {
         if (row.grant_id !== null) return grantCodeReplay(row.grant_id, now);
         const unusable = usable(c, row, now);
         if (unusable) return unusable;
-        if (!/^[A-Za-z0-9_-]{16,128}$/.test(input.grantId) ||
-            !deadline(now, input.grantExpiresAt, now, OAUTH_TTL.grant) ||
-            !validPair(input.tokens, c, now, input.grantExpiresAt)) return invalid;
+        if (!grantInput(input, c, now)) return invalid;
         const g: OAuthGrant = { id: input.grantId, userId: c.userId, clientId: c.clientId, resource: c.resource,
           scopes: c.scopes, createdAt: now, expiresAt: input.grantExpiresAt, revokedAt: null };
         db.run("INSERT INTO oauth_grants(id, user_id, expires_at, data) VALUES (?, ?, ?, ?)", [g.id, g.userId, g.expiresAt, JSON.stringify(g)]);
@@ -2492,7 +2476,7 @@ function oauthOps(db: Database, hosted: HostedStoreOf): OAuthOps {
         if (row.session_id !== null) return loginCodeReplay(c, row.session_id, now);
         const unusable = usable(c, row, now);
         if (unusable) return unusable;
-        if (!hash(input.tokenHash) || (input.label !== null && typeof input.label !== "string")) return invalid;
+        if (!loginInput(input)) return invalid;
         const session = createSession(c.userId, input.tokenHash, input.label, now);
         // As redeemCode: setting session_id spends the code; a loser withdraws its session and answers as a replay (or not_found).
         if (!spendCode("session_id", session.id, input.codeHash)) {
@@ -2520,15 +2504,12 @@ function oauthOps(db: Database, hosted: HostedStoreOf): OAuthOps {
         const t = token(input.refreshHash);
         if (!t || t.kind !== "refresh") return missing;
         const g = grant(t.grant_id);
-        if (!g || !binding(input) || g.clientId !== input.clientId || g.resource !== input.resource ||
-            !input.scopes.every(s => g.scopes.includes(s))) return invalid;
+        if (!g || !rotationBinding(g, input)) return invalid;
         if (!live(g, now)) return invalid;
         // A recognized ancestor revokes even after its sliding expiry; tombstones outlive it.
         if (t.spent_at !== null) return refreshReplay(g, now);
-        if (t.revoked_at !== null || t.expires_at <= now || !validPair(input.tokens, input, now, Number.MAX_SAFE_INTEGER) ||
-            input.tokens.accessHash === input.refreshHash || input.tokens.refreshHash === input.refreshHash) return invalid;
-        const tokens = { ...input.tokens, accessExpiresAt: Math.min(input.tokens.accessExpiresAt, g.expiresAt),
-          refreshExpiresAt: Math.min(input.tokens.refreshExpiresAt, g.expiresAt) };
+        if (t.revoked_at !== null || t.expires_at <= now || !successorInput(input, now)) return invalid;
+        const tokens = clampPair(input.tokens, g.expiresAt);
         insertPair(tokens, g.id, now);
         // The statement that sets spent_at spends the token (D3): of two concurrent rotations one wins at any isolation
         // level. The new pair goes in first, as a redeemed code's grant does; a loser withdraws it and re-reads the token.
@@ -2570,8 +2551,7 @@ function oauthOps(db: Database, hosted: HostedStoreOf): OAuthOps {
       const g: OAuthGrant = JSON.parse(row.data);
       // Pre-downscope rows were issued with exactly the full grant scope.
       const accessScopes: string[] = row.access_scopes === null ? g.scopes : JSON.parse(row.access_scopes);
-      if (!scopes(accessScopes) || !accessScopes.every(s => g.scopes.includes(s)) ||
-          g.resource !== resource || !requiredScopes.every(s => accessScopes.includes(s))) return undefined;
+      if (!accessFits(g, accessScopes, resource, requiredScopes)) return undefined;
       const a: OAuthAccess = { tokenHash: h, grantId: g.id, userId: g.userId, clientId: g.clientId,
         resource: g.resource, scopes: accessScopes, createdAt: row.created_at, expiresAt: row.token_expiry, grantExpiresAt: row.grant_expiry,
         source: row.source };
@@ -2585,7 +2565,9 @@ function oauthOps(db: Database, hosted: HostedStoreOf): OAuthOps {
     revokePreBuiltinGrants(clientIds, now, key = "builtin_clients") {
       if (!time(now)) throw new RangeError("invalid OAuth cutover time");
       return db.transaction(() => {
-        if (db.query("SELECT 1 FROM server_state WHERE key = ?").get(key)) return 0;
+        // The key is claimed first (D3): a second run, or on Postgres a second pod booting at once, finds it taken and
+        // returns 0 without revoking or auditing anything. Its value is the time of the first run.
+        if (!db.query("INSERT INTO server_state(key, value) VALUES (?, ?) ON CONFLICT(key) DO NOTHING RETURNING key").get(key, now)) return 0;
         const ids = JSON.stringify(clientIds);
         // An operator client could use these IDs before #429; its grants and codes must not
         // become a built-in's (write-capable, refreshed with no secret).
@@ -2596,7 +2578,6 @@ function oauthOps(db: Database, hosted: HostedStoreOf): OAuthOps {
           audit("oauth.builtin_client_grant_revoked", grant(id)!, now);
         }
         db.run("DELETE FROM oauth_codes WHERE grant_id IS NULL AND json_extract(data, '$.clientId') IN (SELECT value FROM json_each(?))", [ids]);
-        db.run("INSERT INTO server_state(key, value) VALUES (?, ?)", [key, now]);
         return grants.length;
       }).immediate();
     },
@@ -2617,13 +2598,10 @@ function oauthOps(db: Database, hosted: HostedStoreOf): OAuthOps {
     },
     addServiceCredential(input, now) {
       const { userId, clientId, grantId, resource, source, tokenSeconds, expiresAt, secretHash } = input;
-      if (!time(now) || !hash(secretHash) || !/^svc_[a-f0-9]{32}$/.test(clientId) || !/^[A-Za-z0-9_-]{16,128}$/.test(grantId) ||
-          !(CREDENTIAL_SOURCES as readonly string[]).includes(source) || !Number.isSafeInteger(tokenSeconds) || tokenSeconds < SERVICE_TOKEN_MIN_SECONDS ||
-          !time(expiresAt) || expiresAt <= now || !binding({ clientId, resource, scopes: [...OAUTH_SCOPES] })) return invalid;
+      if (!serviceCredentialInput(input, now)) return invalid;
       return db.transaction(() => {
         // Only an enabled service holds a credential (D1): a person's grant comes from consent, never from here.
-        const svc = db.query("SELECT 1 FROM users u JOIN principals p ON p.user_id = u.id AND p.kind = 'service' WHERE u.id = ? AND u.disabled_at IS NULL").get(userId);
-        if (!svc) return invalid;
+        if (!activeUser(userId, true, "service")) return invalid;
         const g: OAuthGrant = { id: grantId, userId, clientId, resource, scopes: [...OAUTH_SCOPES], createdAt: now, expiresAt, revokedAt: null };
         db.run("INSERT INTO oauth_grants(id, user_id, expires_at, data) VALUES (?, ?, ?, ?)", [g.id, g.userId, g.expiresAt, JSON.stringify(g)]);
         const { id } = db.query<{ id: number }, [string, number, string, string, number, number]>(`INSERT INTO service_credentials(client_id, user_id, grant_id, source, token_seconds, created_at)
@@ -2633,7 +2611,7 @@ function oauthOps(db: Database, hosted: HostedStoreOf): OAuthOps {
       }).immediate();
     },
     rotateServiceCredential({ clientId, secretHash }, now) {
-      if (!time(now) || !hash(secretHash) || typeof clientId !== "string") return invalid;
+      if (!serviceSecretInput({ clientId, secretHash }, now)) return invalid;
       return db.transaction(() => {
         const c = liveCredential(clientId, now);
         if (!c) return missing;
@@ -2678,8 +2656,7 @@ function oauthOps(db: Database, hosted: HostedStoreOf): OAuthOps {
       return found;
     },
     mintServiceToken({ clientId, secretId, tokenHash, scopes: selected, limits }, now) {
-      if (!time(now) || !hash(tokenHash) || !Number.isSafeInteger(secretId) || !scopes(selected) || !selected.every(s => (OAUTH_SCOPES as readonly string[]).includes(s)) ||
-          ![limits.maxSeconds, limits.mintsPerMinute, limits.unexpired].every(n => Number.isSafeInteger(n) && n > 0)) return invalid;
+      if (!mintInput({ secretId, tokenHash, scopes: selected, limits }, now)) return invalid;
       return db.transaction(() => {
         // One INSERT … SELECT: the credential, its grant, the secret and the service all live, the bucket (mints in the
         // last minute, revoked ones included) and the cap (unexpired, unrevoked tokens) unspent. That holds under
