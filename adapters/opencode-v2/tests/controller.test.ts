@@ -1628,6 +1628,22 @@ test("static mode: close during a retry attempt keeps the record of a root enrol
     expect(savedRoots(s.r.storage)).toHaveLength(1);
   } finally { await s.restore(); }
 });
+// A paused root is still enrolled (its enrollment is saved): close keeps its `paused` record.
+test("static mode: close keeps the paused record of a root enrolled and paused during a retry's wait", async () => {
+  let failures = 1;
+  const s = await staticRuntime("service", undefined, undefined, () => { if (failures-- > 0) throw unavailable(); });
+  try {
+    await s.r.controller.observe("session.created", { sessionID: "R" });
+    expect(rootRecord(s.r.controller, "R")).toMatchObject({ state: "retrying" });
+    await s.r.controller.enroll("R");
+    await s.r.controller.pause();
+    const paused = rootRecord(s.r.controller, "R");
+    expect(paused).toMatchObject({ state: "paused" });
+    await s.r.controller.close();
+    expect(rootRecord(s.r.controller, "R")).toEqual(paused!);
+    expect(savedRecord(s.r, "R")).toMatchObject({ state: "paused", message: paused!.message });
+  } finally { await s.restore(); }
+});
 test("static mode: an attempt's own refusal that lands as close starts keeps its record", async () => {
   let calls = 0, release!: () => void;
   const gate = new Promise<void>(resolve => { release = resolve; });
