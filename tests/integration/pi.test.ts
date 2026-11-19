@@ -10,7 +10,7 @@ import { closeSessions } from "../support/mcp.ts";
 import { localAdapterExcludedScenario } from "../support/local_adapter_exclusions.ts";
 import { startPi } from "../support/pi.ts";
 import {
-  piHostedCarryScenario, piHostedLoadSmoke, piHostedRefreshLogoutScenario, piHostedScenario, piHostedTwiceScenario,
+  piHostedCarryScenario, piHostedLoadSmoke, piHostedRefreshLogoutScenario, piHostedScenario, piHostedStaticScenario, piHostedTwiceScenario,
   piExcludedForegroundChildScenario, piForegroundChildScenario, piLocalCarryScenario, piLocalInitFailScenario, piLocalRestartScenario, piLocalRestartShutdownScenario, piMissingBinaryScenario, piReenabledScenario, piRunnerScenario, piScenario, piStdinClosedScenario, piLocalStopsReadingScenario, piUnboundScenario,
 } from "../support/pi.ts";
 
@@ -53,3 +53,4 @@ test("pi hosted: signed out it says how to sign in; /grayboard login walks the c
 test("pi hosted: /fork is a new root with its own lease that carries the name, /new carries it, /resume of the first session rebinds its remembered name", () => piHostedCarryScenario(dir), 120_000);
 test("pi hosted: two processes with an expired token refresh it once; /grayboard logout in one pauses both", () => piHostedRefreshLogoutScenario(dir), 120_000);
 test("pi hosted: the same session opened twice leaves one lease holder; the second takes over when the first quits", () => piHostedTwiceScenario(dir), 120_000);
+test("pi hosted static (#1243): a launcher's run token binds the service's BUS_IDENTITY name and receives; status names the static run; login and logout refuse; a revoked credential ends the run with no sign-in offer, browser or token request", () => piHostedStaticScenario(dir), 120_000);

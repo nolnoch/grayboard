@@ -21,7 +21,7 @@ import { end, register } from "../hosted-core/src/children.ts";
 import { endFailedText, failureText, HostedClient, message, type Disposable, type Level } from "../hosted-core/src/client.ts";
 import { readHostedConfig } from "../hosted-core/src/config.ts";
 import { DRIFTED, type Status } from "../hosted-core/src/controller.ts";
-import { Login } from "../hosted-core/src/login.ts";
+import { Login, type SignIn } from "../hosted-core/src/login.ts";
 import * as signIns from "../hosted-core/src/offer.ts";
 import type { Flow, Last, Origin, Outcome, SignInState } from "../hosted-core/src/offer.ts";
 import type { SessionFacts } from "../hosted-core/src/port.ts";
@@ -29,6 +29,7 @@ import { AccessExpired, accessExpiry, Refusal } from "../hosted-core/src/model.t
 import { CallAborted, failure, hostTools, signOutCause, snapshotTools, type CallHooks, type NativeTool, type ToolProxy } from "../hosted-core/src/proxy.ts";
 import { outputOf } from "../hosted-core/src/results.ts";
 import { NotStarted, RootDelivery } from "../hosted-core/src/root.ts";
+import { NEW_RUN, StaticLogin, staticMode } from "../hosted-core/src/static.ts";
 import { openBrowser } from "../../src/shared/browser.ts";
 import { configuredIdentity, describeLocation, sessionIdentity } from "../../src/shared/identity.ts";
 
@@ -195,7 +196,12 @@ export function createGrayboard(h: Harness): Grayboard {
   // The name local mode would suggest here (#522); none when the directory gives no name.
   const suggestion = (() => { try { return sessionIdentity(process.env, process.cwd()); } catch { return undefined; } })();
 
-  const login = "url" in config ? new Login({
+  // A launcher-set run token (#1243): the environment decides, never a stored grant.
+  const mode = "url" in config ? staticMode(process.env, process.cwd()) : undefined;
+  const loginAction = mode ? NEW_RUN : LOGIN_ACTION;
+  const login: SignIn | undefined = !("url" in config) ? undefined
+    : mode ? new StaticLogin({ resource: config.url, clientId: h.clientId, version: h.version, harness: h.name, mode })
+    : new Login({
     resource: config.url, clientId: h.clientId, stateDir, harness: h.name, loginAction: LOGIN_ACTION,
     // Every login goes through signIn(), so the flow is the process's. An
     // offer's flow opens no browser: a model's call never opens a window.
@@ -221,11 +227,11 @@ export function createGrayboard(h: Harness): Grayboard {
       if (logoutWarnings) logoutWarnings.push(record.message);
       else log(record.message, "warning");
     },
-  }) : undefined;
+  });
 
   const client = login ? new HostedClient({
     harness: h.name, clientId: h.clientId, version: h.version, login, source: SOURCE,
-    loginAction: LOGIN_ACTION, resumeHint: RESUME_HINT, retryHint: RETRY_HINT, get launcher() { return role.kind === "root" && process.env.BUS_LAUNCHER === "1"; }, log,
+    loginAction, resumeHint: RESUME_HINT, retryHint: RETRY_HINT, get launcher() { return role.kind === "root" && process.env.BUS_LAUNCHER === "1"; }, log,
     // Only this process's own session: the harness's model is that session's.
     ...(h.facts ? { facts: (id: string) => session?.id === id ? h.facts!(id) : undefined } : {}),
     ...(suggestion ? { suggested: (id: string) => session?.id === id ? suggestion : undefined } : {}),
@@ -276,7 +282,7 @@ export function createGrayboard(h: Harness): Grayboard {
   // restarts delivery under it then (#596); /grayboard login always runs a
   // flow.
   const begin = (origin: Origin, browser: boolean): Flow | undefined =>
-    state.signins.flow ?? (!login || closed ? undefined : signIns.start(state.signins, login, { origin, browser, ifSignedOut: !browser, ended, current: () => restartAll(speakerNow()) }));
+    mode ? undefined : state.signins.flow ?? (!(login instanceof Login) || closed ? undefined : signIns.start(state.signins, login, { origin, browser, ifSignedOut: !browser, ended, current: () => restartAll(speakerNow()) }));
   // Whether this process outlives a browser round trip. A root's own mode;
   // any other runtime takes its process's root's, since omp starts in-process
   // task subagents without a mode (so they read "print"). A pi subagent is its
@@ -289,7 +295,8 @@ export function createGrayboard(h: Harness): Grayboard {
     started: `sign-in started: ask the user to open the link ${h.name} shows (/grayboard login shows it again), then call a grayboard tool again`,
     starting: `sign-in is starting; ${h.name} shows its link once it has one: ask the user to open it, then call a grayboard tool again`,
   };
-  const offer = () => signIns.offer(state.signins, login!, { interactive: interactive(), begin: () => begin("offer", false), notes });
+  // A static run offers nothing: its token is the launcher's to replace.
+  const offer = async () => mode ? undefined : signIns.offer(state.signins, login!, { interactive: interactive(), begin: () => begin("offer", false), notes });
 
   // ---- tools ----
 
@@ -521,7 +528,7 @@ export function createGrayboard(h: Harness): Grayboard {
   // While signed out, a root the sign-out paused restarts on its own after a
   // login; resume can't help, so its line names the login instead.
   const describe = (status: Status, signedIn: boolean) => {
-    const shown = (state: string, message: string) => !signedIn && state === "paused" && message.startsWith(DRIFTED) ? `signed out; ${LOGIN_ACTION}` : message;
+    const shown = (state: string, message: string) => !signedIn && state === "paused" && message.startsWith(DRIFTED) ? `signed out; ${loginAction}` : message;
     return [
       `${status.state}: ${shown(status.state, status.message)}`,
       ...status.roots.map(r => `  ${r.sessionID ?? "-"}${r.held?.length ? ` (${r.held.join(", ")})` : ""}: ${r.state}, ${shown(r.state, r.message)}${r.failure ? ` [last failure: ${r.failure.operation} ${r.failure.code}]` : ""}`),
@@ -530,11 +537,22 @@ export function createGrayboard(h: Harness): Grayboard {
 
   const status = async (): Promise<string> => {
     if ("error" in config) return config.error;
-    const grant = await login!.read().catch(() => undefined);
-    const signedIn = !!grant && !grant.loginRequired && !!grant.access;
+    let signedIn: boolean, signIn: string;
+    if (login instanceof StaticLogin) {
+      // Never the token or its fingerprint.
+      const s = login.static;
+      signedIn = !s.refused && !login.ended;
+      signIn = s.refused ? `refused: ${s.refused}`
+        : login.ended ? `run token ended; ${NEW_RUN}`
+        : `static run token for ${s.principal ? `service ${s.principal}` : "a service"} (issuer ${s.issuer})`;
+    } else {
+      const grant = await (login as Login).read().catch(() => undefined);
+      signedIn = !!grant && !grant.loginRequired && !!grant.access;
+      signIn = signedIn ? "signed in" : `signed out (${grant?.loginRequired?.reason ?? "never signed in"}); ${LOGIN_ACTION}`;
+    }
     const lines = [
       `server: ${login!.resource}`,
-      `sign-in: ${signedIn ? "signed in" : `signed out (${grant?.loginRequired?.reason ?? "never signed in"}); ${LOGIN_ACTION}`}`,
+      `sign-in: ${signIn}`,
       `session: ${session?.id ?? "not started"} (${role.kind === "child" ? `subagent of ${placement(role).root}` : role.kind === "loose" ? "unattributed subagent" : "root"})`,
     ];
     const delivery = root?.status();
@@ -550,6 +568,12 @@ export function createGrayboard(h: Harness): Grayboard {
     const verb = args.trim().split(/\s+/)[0] || "status";
     if ("error" in config) { log(config.error, "warning"); return; }
     try {
+      if (mode && (verb === "login" || verb === "logout")) {
+        // Nothing here signs in or out: the launcher holds the run token and revokes it.
+        log(verb === "login" ? `this run uses a launcher-set run token (static mode): there's no sign-in here; ${mode && "refused" in mode ? mode.refused : `if it stops working, ${NEW_RUN}`}`
+          : "this run uses a launcher-set run token: nothing to sign out here; the launcher revokes it", "warning");
+        return;
+      }
       if (verb === "login") {
         // One flow per process: a pending one (an offer's) is joined, shown
         // again and opened in the browser, not replaced.

@@ -5,7 +5,7 @@ import { afterEach, beforeEach, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ompHostedCarryScenario, ompHostedLoadSmoke, ompHostedManyChildrenScenario, ompHostedNestedScenario, ompHostedRefreshLogoutScenario, ompHostedScenario, ompHostedTaskScenario, ompLocalAcpClientGrayboardScenario, ompLocalAcpScenario, ompLocalCarryScenario, ompLocalHandshakeFailScenario, ompLocalInitFailScenario, ompLocalPinScenario, ompLocalRefusalScenario, ompLocalResumeScenario, ompLocalRestartAbortScenario, ompLocalStopsReadingScenario, ompLocalSwitchExhaustScenario, ompLocalTaskScenario } from "../support/omp.ts";
+import { ompHostedCarryScenario, ompHostedLoadSmoke, ompHostedManyChildrenScenario, ompHostedNestedScenario, ompHostedRefreshLogoutScenario, ompHostedScenario, ompHostedStaticScenario, ompHostedTaskScenario, ompLocalAcpClientGrayboardScenario, ompLocalAcpScenario, ompLocalCarryScenario, ompLocalHandshakeFailScenario, ompLocalInitFailScenario, ompLocalPinScenario, ompLocalRefusalScenario, ompLocalResumeScenario, ompLocalRestartAbortScenario, ompLocalStopsReadingScenario, ompLocalSwitchExhaustScenario, ompLocalTaskScenario } from "../support/omp.ts";
 import { installLocal, startLocalOmp } from "../support/omp.ts";
 import { localAdapterExcludedScenario } from "../support/local_adapter_exclusions.ts";
 import { closeSessions } from "../support/mcp.ts";
@@ -32,6 +32,8 @@ test("omp hosted nested task run: a subagent's own subagent registers under main
 test("omp hosted /fork, /new and /resume in one runtime: each replaces the session; the name carries to the fork and the new session, and the resumed first session rebinds it; the outgoing session ends each time", () => ompHostedCarryScenario(dir), 120_000);
 
 test("omp hosted: 130 sequential subagents stay under the 128-child cap; each registers at its first call and ends with its run", () => ompHostedManyChildrenScenario(dir), 900_000);
+
+test("omp hosted static (#1243): a launcher's run token binds the service's BUS_IDENTITY name and receives; status names the static run; login and logout refuse; a revoked credential ends the run with no sign-in offer, browser or token request", () => ompHostedStaticScenario(dir), 120_000);
 
 test("omp hosted: two processes on one agent dir share one refresh; /grayboard logout in one pauses both", () => ompHostedRefreshLogoutScenario(dir), 120_000);
 
