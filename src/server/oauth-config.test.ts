@@ -70,6 +70,13 @@ test("a service credential's source decides its session key and harness alone (#
   expect(sourceKeyFor(id, new Map(), null)).toBeNull();
   expect([harnessFor(id, "opencode"), harnessFor(id, "generic")]).toEqual(["opencode", id]);
 });
+test("only a generic source reads a declared built-in client, and a built-in never relabels (#1298)", () => {
+  const id = `svc_${"b".repeat(32)}`;
+  expect(harnessFor(id, "generic", "grayboard-omp")).toBe("omp");
+  expect([harnessFor(id, null, "grayboard-omp"), harnessFor(id, undefined, "grayboard-omp"), harnessFor(id, "opencode", "grayboard-omp")]).toEqual([id, id, "opencode"]);
+  expect([harnessFor("operator-broker", null, "grayboard-pi"), harnessFor("grayboard-pi", "generic", "grayboard-omp")]).toEqual(["operator-broker", "pi"]);
+  expect([harnessFor(id, "generic", "pi"), harnessFor(id, "generic", "grayboard-opencode"), harnessFor(id, "generic")]).toEqual([id, id, id]);
+});
 test("redirect matching is exact except a registered loopback HTTP port", () => {
   for (const url of ["http://127.0.0.1:45678/callback?fixed=1", "http://[::1]:45678/callback", "https://client.example/callback"]) expect(matchesRedirect(client, url)).toBe(true);
   for (const url of ["http://localhost:45678/callback", "http://127.0.0.2/callback?fixed=1", "http://127.0.0.1:45678/callback?fixed=2", "http://127.0.0.1:45678/callback/", "https://client.example/callback?x=1", "https://client.example:444/callback", "https://client.example/callback#", "http://2130706433/callback?fixed=1"]) expect(matchesRedirect(client, url)).toBe(false);
