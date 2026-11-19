@@ -289,9 +289,12 @@ async function identityCreate(req: Request, authed: AuthedUser, repo: Repo, conf
   return repo.write(async tx => {
     const existing = await repo.aliases.find(tx, `${authed.user_email}/${name}`);
     if (existing) return conflict(`identity "${name}" already exists`);
-    const capped = await aliasCapRefusal(repo, tx, { scope_kind: "person", scope_ref: authed.user_email }, config.aliasScopeCap ?? ALIAS_SCOPE_CAP);
+    const target = { scope_kind: "person" as const, scope_ref: authed.user_email, name };
+    const capped = await aliasCapRefusal(repo.aliases, tx, target, config.aliasScopeCap ?? ALIAS_SCOPE_CAP);
     if (capped) return badRequest(capped);
-    const identity = await repo.aliases.create(tx, { scope_kind: "person", scope_ref: authed.user_email, name }, authed.user_email);
+    // Null: a concurrent create of the name committed first (#807 P3 C5 decision 3).
+    const identity = await repo.aliases.create(tx, target, authed.user_email);
+    if (!identity) return conflict(`identity "${name}" already exists`);
     writeAudit(repo, tx, "alias.created", authed.user_email, identity.address);
     await onAliasCreated(repo, tx, authed.user_id, identity.address);
     return json({ name: identity.name, created_at: identity.created_at }, 201);
@@ -302,7 +305,8 @@ function identityDelete(name: string, authed: AuthedUser, repo: Repo): Response 
   name = name.toLowerCase();
   if (name === HUMAN_NAME) return badRequest(`"${HUMAN_NAME}" goes away with your Slack link: grayboard slack unlink`);
   return repo.write(async tx => {
-    const existing = await repo.aliases.find(tx, `${authed.user_email}/${name}`);
+    // Locked before its holds are checked (#807 P3 C5 decision 2): a bind's take locks it too, so one waits for the other.
+    const existing = await repo.aliases.lock(tx, `${authed.user_email}/${name}`, "delete");
     if (!existing) return notFound();
     // Its holds and writers would outlive it: a second session could then bind
     // the name while the first still acts as it.
@@ -633,7 +637,7 @@ async function teamDeleteAlias(teamName: string, req: Request, authed: AuthedUse
     const name = body.name.toLowerCase();
     if (name === HUMAN_NAME) return badRequest(`"${HUMAN_NAME}" is reserved in every scope; no team has one`);
     if (!isValidIdentityName(name)) return badRequest("invalid name");
-    const existing = await repo.aliases.find(tx, `${managed.team.name}/${name}`);
+    const existing = await repo.aliases.lock(tx, `${managed.team.name}/${name}`, "delete");
     if (!existing) return jsonErr("not_found", `team "${managed.team.name}" has no name "${name}"`, 404);
     const user = await repo.bindings.userOf(tx, existing.address);
     if (user) return jsonErr("alias_held", aliasHeldText(existing.address, `the session ${user}`, "end it, or have it unbind the name, first"), 409);
@@ -895,7 +899,7 @@ async function adminServiceDeleteAlias(req: Request, authed: AuthedUser, repo: R
     const name = body.name.toLowerCase();
     if (name === HUMAN_NAME) return badRequest(`"${HUMAN_NAME}" is reserved in every scope; no service has one`);
     if (!isValidIdentityName(name)) return badRequest("invalid name");
-    const existing = await repo.aliases.find(tx, `${svc.email}/${name}`);
+    const existing = await repo.aliases.lock(tx, `${svc.email}/${name}`, "delete");
     if (!existing) return jsonErr("not_found", `service "${svc.email}" has no name "${name}"`, 404);
     const holder = await repo.bindings.userOf(tx, existing.address);
     if (holder) return jsonErr("alias_held", aliasHeldText(existing.address, `the session ${holder}`, "end it, or have it unbind the name, first"), 409);

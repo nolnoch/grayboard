@@ -133,7 +133,7 @@ describe("dedupWrite", () => {
   test("a receipt whose row is gone is a miss, and is replaced", async () => {
     const first = await dedup(1_000, call(), send());
     if (!("fresh" in first)) throw new Error("expected a fresh write");
-    expect(await seed(repo, tx => repo.messages.retract(tx, SENDER, first.fresh.ref.id, { actor: "a@example.com", session: "s1" }))).toBe(true);
+    expect(await seed(repo, tx => repo.messages.retract(tx, SENDER, first.fresh.ref.id, { actor: "a@example.com", session: "s1" }))).toBe("retracted");
     // The Repo's retract writes its own audit row (#306), whoever calls it.
     const [retracted] = audits("message.retracted");
     expect(retracted).toMatchObject({ target: `message:${first.fresh.ref.id}`, actor: "a@example.com" });

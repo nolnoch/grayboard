@@ -138,15 +138,16 @@ test("grayboard team delete-alias deletes an unused team name; a member is refus
 
 // #807 P1c-13: the HTTP routes that read or write aliases inside a write body (identity add and delete, a team's
 // delete-alias, a claim call's address check, a team create's or join's follows, a member removal's unfollows) do so
-// on that body's Tx; the GET routes on the pool.
+// on that body's Tx; the GET routes on the pool. #807 P3 C5 decisions 1 and 2: a create takes its scope's cap lock before
+// it looks the name up again and counts, and a delete takes the alias's delete lock before it checks the name's holds.
 test("#807 P1c-13: HTTP alias reads and writes inside a write body run on its Tx", async () => {
   const repo = srv.app.repo;
   const checks: { route: string; op: string; inTxn: boolean; handle: "pool" | "tx" }[] = [];
   let route = "";
-  const spies = (["find", "countForScope", "listForScope", "create", "remove"] as const).map(name => {
+  const spies = (["find", "lock", "lockScope", "countForScope", "listForScope", "create", "remove"] as const).map(name => {
     const original = repo.aliases[name].bind(repo.aliases) as (...a: unknown[]) => unknown;
     return spyOn(repo.aliases, name).mockImplementation(((r: unknown, ...rest: unknown[]) => {
-      checks.push({ route, op: name, inTxn: srv.app.db.inTransaction, handle: r === repo.read ? "pool" : "tx" });
+      checks.push({ route, op: name === "lock" ? `lock.${String(rest[1])}` : name, inTxn: srv.app.db.inTransaction, handle: r === repo.read ? "pool" : "tx" });
       return original(r, ...rest);
     }) as never);
   });
@@ -166,10 +167,10 @@ test("#807 P1c-13: HTTP alias reads and writes inside a write body run on its Tx
     await step("team.create", () => srv.api(alice, "POST", "/api/teams", { name: "ops" }), 201);
     await step("team.remove", () => srv.api(alice, "POST", "/api/teams/eng/remove", { email: B }), 200);
     const ops = (r: string) => checks.filter(c => c.route === r).map(c => `${c.op}:${c.handle}`);
-    expect(ops("identity.create")).toEqual(["find:tx", "countForScope:tx", "create:tx"]);
+    expect(ops("identity.create")).toEqual(["find:tx", "lockScope:tx", "find:tx", "countForScope:tx", "create:tx"]);
     expect(ops("claim.call")).toContain("find:tx");
-    expect(ops("identity.delete")).toEqual(["find:tx", "remove:tx"]);
-    expect(ops("team.delete_alias")).toEqual(["find:tx", "remove:tx"]);
+    expect(ops("identity.delete")).toEqual(["lock.delete:tx", "remove:tx"]);
+    expect(ops("team.delete_alias")).toEqual(["lock.delete:tx", "remove:tx"]);
     expect(ops("team.add")).toContain("listForScope:tx");
     expect(ops("team.leave")).toContain("listForScope:tx");
     expect(ops("identity.list")).toEqual(["listForScope:pool"]);
@@ -178,4 +179,19 @@ test("#807 P1c-13: HTTP alias reads and writes inside a write body run on its Tx
     expect(ops("team.remove")).toContain("listForScope:tx");
     expect(checks.filter(c => c.route && c.inTxn !== (c.handle === "tx"))).toEqual([]);
   } finally { for (const spy of spies) spy.mockRestore(); }
+});
+
+// #807 P3 C5 decision 3: a create that loses to a same-name create committed after its pre-check gets null from the
+// store and answers as the pre-check would have, writing no audit row. The race is forced here by every find in the
+// body missing the name (on Postgres, a READ COMMITTED snapshot taken before the winner committed).
+test("#807 P3 C5: identity create answers 409 when the store's create finds the name taken", async () => {
+  expect((await srv.api(bob, "POST", "/api/identities", { name: "one" })).status).toBe(201);
+  const created = () => srv.app.db.query(`SELECT count(*) AS n FROM access_log WHERE action = 'alias.created'`).get() as { n: number };
+  const before = created();
+  const spy = spyOn(srv.app.repo.aliases, "find").mockResolvedValue(undefined);
+  try {
+    expect(await srv.api(bob, "POST", "/api/identities", { name: "one" })).toMatchObject({ status: 409, body: { message: 'identity "one" already exists' } });
+  } finally { spy.mockRestore(); }
+  expect(created()).toEqual(before);
+  expect(names(B)).toEqual(["one"]);
 });

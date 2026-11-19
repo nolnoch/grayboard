@@ -20,6 +20,8 @@ export const MAX_PURPOSE_CHARS = 500;
 // A post's or direct message's body, checked alike in both modes (#75).
 export function checkBody(body: unknown): string {
   if (typeof body !== "string" || !body.trim()) throw new CoreError("body is required");
+  // Postgres text can't hold NUL (#807 P3 C5 decision 7): refused in both modes, so they stay at parity.
+  if (body.includes("\0")) throw new CoreError("body contains a NUL character");
   if (new TextEncoder().encode(body).length > MAX_BODY_BYTES) {
     throw new CoreError(`body exceeds ${MAX_BODY_BYTES} bytes`);
   }

@@ -18,6 +18,10 @@ import { issueOAuth } from "../../tests/helpers/oauth.ts";
 import { grantOwner } from "../../tests/support/roles.ts";
 import { identityContract } from "./store/identity.contract.ts";
 import { sqliteIdentityBackend } from "./store/identity.contract.sqlite.ts";
+import { aliasesContract } from "./store/aliases.contract.ts";
+import { sqliteAliasesBackend } from "./store/aliases.contract.sqlite.ts";
+import { messagesContract } from "./store/messages.contract.ts";
+import { sqliteMessagesBackend } from "./store/messages.contract.sqlite.ts";
 
 const person = (email: string, name: string) => ({ scope_kind: "person" as const, scope_ref: email, name });
 
@@ -186,105 +190,12 @@ describe("Repo", () => {
     repo = r;
   });
 
-  test("aliases: create, list, remove", async () => {
-    const fe = await seed(repo, async tx => {
-      await repo.users.upsertByEmail(tx, "you@example.com", null);
-      const fe = await repo.aliases.create(tx, person("you@example.com", "fe"), "you@example.com");
-      await repo.aliases.create(tx, person("you@example.com", "be"), "you@example.com");
-      return fe;
-    });
-    expect(fe.address).toBe("you@example.com/fe");
-    expect((await repo.aliases.listForScope(repo.read, "person", "you@example.com")).map((a) => a.name)).toEqual(["be", "fe"]);
-    await seed(repo, async tx => {
-      await repo.cursors.advance(tx, "you@example.com/fe", "direct", "you@example.com/fe", 7);
-      await repo.aliases.remove(tx, "you@example.com/fe");
-    });
-    expect(await repo.aliases.listForScope(repo.read, "person", "you@example.com")).toHaveLength(1);
-    // Its read point goes with it: a new alias of the name starts from scratch.
-    expect(await repo.cursors.directFor(repo.read, "you@example.com/fe")).toBe(0);
-  });
-
-  // #284 S9: aliases are keyed by address in any scope.
-  test("aliases: a team scope's alias is its own address, listed under its scope", async () => {
-    const team = await seed(repo, async tx => {
-      const u = await repo.users.upsertByEmail(tx, "you@example.com", null);
-      await repo.teams.create(tx, "eng", u.id);
-      await repo.aliases.create(tx, person("you@example.com", "be"), "you@example.com");
-      return await repo.aliases.create(tx, { scope_kind: "team", scope_ref: "eng", name: "be" }, "you@example.com");
-    });
-    expect(team).toMatchObject({ address: "eng/be", scope_kind: "team", scope_ref: "eng", name: "be" });
-    expect((await repo.aliases.find(repo.read, "eng/be"))?.id).toBe(team.id);
-    expect(await repo.aliases.find(repo.read, "eng/fe")).toBeUndefined();
-    expect((await repo.aliases.listForScope(repo.read, "team", "eng")).map((a) => a.address)).toEqual(["eng/be"]);
-    expect((await repo.aliases.listForScope(repo.read, "person", "you@example.com")).map((a) => a.address)).toEqual(["you@example.com/be"]);
-    expect((await repo.aliases.listForScope(repo.read, "person", "eng"))).toEqual([]);
-    expect((await repo.aliases.findAllByName(repo.read, "be")).map((a) => a.address)).toEqual(["eng/be", "you@example.com/be"]);
-  });
-
-  test("messages: insert and thread", async () => {
-    const { root, reply } = await seed(repo, async tx => {
-      const root  = await repo.messages.insert(tx, "a@example.com/fe", "user", "b@example.com/be", "hello", null);
-      return { root, reply: await repo.messages.insert(tx, "b@example.com/be", "user", "a@example.com/fe", "hi", root.id) };
-    });
-    const thread = (await repo.messages.thread(repo.read, root.id));
-    expect(thread).toHaveLength(2);
-    expect(thread[0].id).toBe(root.id);
-    expect(thread[1].id).toBe(reply.id);
-    expect((await repo.messages.thread(repo.read, reply.id)).map(m => m.id)).toEqual([root.id, reply.id]);
-  });
-
   test("cursors: advance is idempotent and takes MAX", async () => {
     await seed(repo, tx => repo.cursors.advance(tx, "you@example.com/fe", "direct", "you@example.com/fe", 10));
     await seed(repo, tx => repo.cursors.advance(tx, "you@example.com/fe", "direct", "you@example.com/fe", 5));  // lower — should not regress
     expect(await repo.cursors.get(repo.read, "you@example.com/fe", "direct", "you@example.com/fe")).toBe(10);
     await seed(repo, tx => repo.cursors.advance(tx, "you@example.com/fe", "direct", "you@example.com/fe", 20));
     expect(await repo.cursors.directFor(repo.read, "you@example.com/fe")).toBe(20);
-  });
-
-  test("unreadSince returns only messages after cursor", async () => {
-    const [m1, m2] = await seed(repo, async tx => [
-      await repo.messages.insert(tx, "a@example.com/fe", "user", "b@example.com/be", "msg1", null),
-      await repo.messages.insert(tx, "a@example.com/fe", "user", "b@example.com/be", "msg2", null),
-    ]);
-    const unread = (await repo.messages.unreadSince(repo.read, [{ type: "direct", ref: "b@example.com/be", since: m1.id }]));
-    expect(unread).toHaveLength(1);
-    expect(unread[0].id).toBe(m2.id);
-  });
-
-  // #284 S8: a session reads as every address it has, its ID and its alias.
-  test("history, undeliveredFrom, receivedUnacked and sentPending take an address set", async () => {
-    const [id, alias, peer, other] = ["id:s1", "a@example.com/fe", "b@example.com/be", "c@example.com/qa"];
-    const { toId, fromAlias, toAlias, fromId } = await seed(repo, async tx => {
-      const toId = await repo.messages.insert(tx, peer, "user", id, "to the id", null);
-      const fromAlias = await repo.messages.insert(tx, alias, "user", peer, "from the alias", null, true);
-      const toAlias = await repo.messages.insert(tx, peer, "user", alias, "to the alias", null);
-      const fromId = await repo.messages.insert(tx, id, "user", other, "from the id", null, true);
-      await repo.messages.insert(tx, peer, "user", other, "not ours", null);
-      return { toId, fromAlias, toAlias, fromId };
-    });
-    const set = [id, alias];
-    const ids = (rows: { id: number }[]) => rows.map((m) => m.id);
-
-    expect(ids((await repo.messages.history(repo.read, set)))).toEqual([fromId.id, toAlias.id, fromAlias.id, toId.id]);
-    expect(ids((await repo.messages.history(repo.read, set, peer)))).toEqual([toAlias.id, fromAlias.id, toId.id]);
-    expect(ids((await repo.messages.history(repo.read, set, peer, 20, toAlias.id)))).toEqual([fromAlias.id, toId.id]);
-    expect(ids((await repo.messages.history(repo.read, [alias])))).toEqual([toAlias.id, fromAlias.id]);
-
-    expect((await repo.messages.undeliveredFrom(repo.read, set))).toEqual([
-      { recipient: peer, n: 1, oldest_id: fromAlias.id },
-      { recipient: other, n: 1, oldest_id: fromId.id },
-    ]);
-    expect(ids((await repo.messages.receivedUnacked(repo.read, set, 0)))).toEqual([toId.id, toAlias.id]);
-    expect(ids((await repo.messages.sentPending(repo.read, set, 0)))).toEqual([fromAlias.id, fromId.id]);
-    // An ack counts for the address the row names, not any address of the set.
-    await seed(repo, tx => repo.messages.ack(tx, alias, toId.id));
-    expect(ids((await repo.messages.receivedUnacked(repo.read, set, 0)))).toEqual([toId.id, toAlias.id]);
-    await seed(repo, async tx => {
-      await repo.messages.ack(tx, id, toId.id);
-      await repo.messages.ack(tx, id, fromId.id);
-    });
-    expect(ids((await repo.messages.receivedUnacked(repo.read, set, 0)))).toEqual([toAlias.id]);
-    expect(ids((await repo.messages.sentPending(repo.read, set, 0)))).toEqual([fromAlias.id]);
   });
 
   // #284 S5: the MailPort core endSession runs on the server (repo.sessionEnd.end's, #807 P3 B4a).
@@ -328,6 +239,9 @@ describe("Repo", () => {
 // The identity groups' rows (users, sessions, principals, teams, roles, services), shared with the Postgres store
 // (#807 P3 C3): the sign-in D4 branches, the name guards, the role refusals and the savepoint rows live there.
 describe("identity contract (SQLite)", () => identityContract(sqliteIdentityBackend));
+// The aliases and messages groups' rows, shared with the Postgres store (#807 P3 C5).
+describe("aliases contract (SQLite)", () => aliasesContract(sqliteAliasesBackend));
+describe("messages contract (SQLite)", () => messagesContract(sqliteMessagesBackend));
 
 // Sign-in fixtures for the rows below (security audit F-13, #928 D4).
 const G = GOOGLE_ISSUER, OKTA = "https://example.okta.com";
@@ -799,6 +713,9 @@ test("#807 P1c-13: the aliases store runs on the handle it's given", async () =>
   await expect(a.listForScope(kept, "person", "a@example.com")).rejects.toThrow(settled);
   await expect(a.countForScope(kept, "person", "a@example.com")).rejects.toThrow(settled);
   await expect(a.findAllByName(kept, "fe")).rejects.toThrow(settled);
+  await expect(a.lock(kept, "a@example.com/fe", "delete")).rejects.toThrow(settled);
+  await expect(a.lockScope(kept, { scope_kind: "person", scope_ref: "a@example.com" })).rejects.toThrow(settled);
+  await expect(a.lockScope({} as Tx, { scope_kind: "person", scope_ref: "a@example.com" })).rejects.toThrow("not a SQLite store handle");
   await expect(a.find({} as Tx, "a@example.com/fe")).rejects.toThrow("not a SQLite store handle");
   expect(await a.find(repo.read, "a@example.com/be")).toBeUndefined();
   expect((await a.listForScope(repo.read, "person", "a@example.com")).map(x => x.name)).toEqual(["fe"]);
@@ -839,7 +756,7 @@ test("#807 P1c-14a: the messages writes run on the Tx they're given", async () =
     await m.insert(tx, peer, "user", id, "rolled back", null);
     await m.ack(tx, id, first.id);
     await m.markDelivered(tx, first.id, 1234);
-    expect(await m.retract(tx, peer, second.id, { actor: null, session: null })).toBe(true);
+    expect(await m.retract(tx, peer, second.id, { actor: null, session: null })).toBe("retracted");
     throw new Error("rolled back");
   })).rejects.toThrow("rolled back");
   expect((await m.history(repo.read, [id])).map(x => x.body)).toEqual(["second", "first"]);

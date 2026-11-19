@@ -19,6 +19,7 @@ import {
 import { participant, type MessageRow, type Repo } from "./db.ts";
 import { sweepStoredBlobs } from "./attachments.ts";
 import { afterCommitOf, isTx, type Read, type Tx } from "./store/tx.ts";
+import { MissingParent } from "./store/errors.ts";
 import { HUMAN_NAME, HUMAN_RESERVED, formatTeamAddress } from "../shared/addressing.ts";
 import { describeLocation } from "../shared/identity.ts";
 import { authorize, recordDecision, type Actor, type AuthzRequest, type Decision, type HumanReach, type WakePost } from "./policy.ts";
@@ -504,8 +505,8 @@ async function bindTarget(hub: Hub, r: Read, authed: AuthedUser, input: string):
 // the user who named it. Callers are inside a transaction, whose Tx is `tx`.
 async function createLazily(hub: Hub, tx: Tx, authed: AuthedUser, { address, scope }: Exclude<Target, { error: string }>, session: string): Promise<void> {
   const { repo } = hub;
-  if ((await repo.aliases.find(tx, address))) return;
-  await repo.aliases.create(tx, scope, authed.user_email);
+  // Null: it exists, made earlier or by a concurrent body that committed first (#807 P3 C5 decision 3).
+  if (!(await repo.aliases.create(tx, scope, authed.user_email))) return;
   writeAudit(repo, tx, "alias.created", authed.user_email, address, { lazy: true, session });
   await onAliasCreated(repo, tx, authed.user_id, address);
 }
@@ -938,8 +939,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
       if ((await repo.users.findById(tx, authed.user_id))?.disabled_at != null) fail("unauthenticated", "session is closed");
       const stale = await current?.(tx);
       if (stale) fail("unauthenticated", stale);
-      if (!(await repo.aliases.find(tx, addr))) {
-        await repo.aliases.create(tx, { scope_kind: "person", scope_ref: authed.user_email, name: HUMAN_NAME }, authed.user_email);
+      if (await repo.aliases.create(tx, { scope_kind: "person", scope_ref: authed.user_email, name: HUMAN_NAME }, authed.user_email)) {
         writeAudit(repo, tx, "alias.created", authed.user_email, addr, { lazy: true, slack: true });
         await onAliasCreated(repo, tx, authed.user_id, addr);
       }
@@ -1044,7 +1044,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     }
     // A new name past its scope's cap (#347); checked here, not in the
     // transaction below, so the refused binding event stays.
-    const capped = (await repo.aliases.find(tx, address)) ? null : await aliasCapRefusal(repo, tx, target.scope, hub.aliasScopeCap);
+    const capped = (await repo.aliases.find(tx, address)) ? null : await aliasCapRefusal(repo.aliases, tx, target.scope, hub.aliasScopeCap);
     if (capped) return await refuse("bad_request", capped, capped);
 
     // No savepoint (#807 P3 A1): a throw here fails the bind, and every caller's transaction rolls back with it.
@@ -1235,7 +1235,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
         return fail("alias_held", aliasHeldText(target.address, why, "write as another name"));
       }
       if (create) {
-        const capped = (await repo.aliases.find(tx, target.address)) ? null : await aliasCapRefusal(repo, tx, target.scope, hub.aliasScopeCap);
+        const capped = (await repo.aliases.find(tx, target.address)) ? null : await aliasCapRefusal(repo.aliases, tx, target.scope, hub.aliasScopeCap);
         if (capped) {
           await note(target.address, capped);
           return fail("bad_request", capped);
@@ -1685,6 +1685,8 @@ async function writeSend(hub: Hub, tx: Tx, session: ApplicationSession, p: Prepa
     msg = await repo.messages.insert(tx, p.from, "user", p.to, p.body, p.parentId, p.pending, { ids: p.ids, uploader: uploaderOf(session) }, session.writerId ?? null, session.via ?? null, session.authed.user_email);
   } catch (e) {
     if (e instanceof CoreError) throw coreRefusal(e);
+    // The parent went (a retract or a prune) after prepareSend's check: the refusal that check gives.
+    if (e instanceof MissingParent) fail("not_found", e.message);
     throw e;
   }
   const f = {
@@ -1978,7 +1980,12 @@ async function handleRetract(hub: Hub, tx: Tx, session: ApplicationSession, id: 
   // Retracted as the address that sent it (S8).
   if (!m || m.recipient_type !== "user" || !mine.includes(m.sender)) return fail("not_found", retractRefusal.notYours(id));
   if (m.delivered_at !== null || registry.get(m.recipient)?.active || (await repo.cursors.directFor(tx, m.recipient)) >= m.id) return fail("bad_request", retractRefusal.reached(id, m.recipient));
-  if (!(await repo.messages.retract(tx, m.sender, id, { actor: session.authed.user_email, session: session.sessionId }))) return fail("bad_request", retractRefusal.replied(id));
+  // The store re-checks what the reads above saw (#807 P3 C5 decision 4): on Postgres a delivery, an ack or a reply can
+  // commit after them, so its reason, not the pre-check, picks the refusal.
+  const done = await repo.messages.retract(tx, m.sender, id, { actor: session.authed.user_email, session: session.sessionId });
+  if (done === "gone") return fail("not_found", retractRefusal.notYours(id));
+  if (done === "read") return fail("bad_request", retractRefusal.reached(id, m.recipient));
+  if (done === "replied") return fail("bad_request", retractRefusal.replied(id));
   tx.afterCommit(async () => { await sweepStoredBlobs(repo); });
   return {};
 }

@@ -639,23 +639,25 @@ test("#807: a rolled-back link leaves no link, no human identity and nothing att
 
 // #807 P1c-13: the link's human create and the unlink's remove run on their body's Tx. P3 B5b1: so do the human mark
 // and the dropped subscriptions and pushes (repo.boards.forget), and the bridge reaches core for neither.
+// #807 P3 C5: link creates the human insert-if-absent (no pre-find, decision 3); unlink takes its delete lock before
+// it removes it (decision 2).
 test("#807 P1c-13: link and unlink read and write the human alias on their body's Tx", async () => {
   const repo = srv.app.repo;
   const checks: { op: string; inTxn: boolean; handle: "pool" | "tx" }[] = [];
   const spy = <G extends object>(group: G, name: keyof G & string) => {
     const original = (group[name] as (...a: unknown[]) => unknown).bind(group);
     return spyOn(group, name as never).mockImplementation(((r: unknown, ...rest: unknown[]) => {
-      if (new Error().stack?.includes("/slack.ts:")) checks.push({ op: name, inTxn: srv.app.db.inTransaction, handle: r === repo.read ? "pool" : "tx" });
+      if (new Error().stack?.includes("/slack.ts:")) checks.push({ op: name === "lock" ? `lock.${String(rest[1])}` : name, inTxn: srv.app.db.inTransaction, handle: r === repo.read ? "pool" : "tx" });
       return original(r, ...rest);
     }) as never);
   };
-  const spies = [...(["find", "create", "remove", "markHuman"] as const).map((name) => spy(repo.aliases, name)), spy(repo.boards, "forget"), spy(repo, "coreOn")];
+  const spies = [...(["find", "lock", "create", "remove", "markHuman"] as const).map((name) => spy(repo.aliases, name)), spy(repo.boards, "forget"), spy(repo, "coreOn")];
   try {
     const alice = await login("alice@example.com");
     await link(alice);
     expect((await api(alice, "POST", "/api/slack/unlink")).status).toBe(200);
   } finally { for (const s of spies) s.mockRestore(); }
-  expect(checks.map(c => `${c.op}:${c.handle}:${c.inTxn}`)).toEqual(["find:tx:true", "forget:tx:true", "create:tx:true", "markHuman:tx:true", "remove:tx:true", "forget:tx:true"]);
+  expect(checks.map(c => `${c.op}:${c.handle}:${c.inTxn}`)).toEqual(["create:tx:true", "forget:tx:true", "markHuman:tx:true", "lock.delete:tx:true", "remove:tx:true", "forget:tx:true"]);
 });
 
 // #807 P1c-14b: the link's newest-message read (where the new human's cursor starts) and the Slack receipt's
@@ -711,6 +713,8 @@ test("relinking from another Slack account with the same email starts new thread
   // #805 F-05: a link never moves silently.
   expect(slack.posts().find((p) => p.channel === DM && p.markdown_text?.includes("now linked to another Slack account"))).toBeDefined();
   expect(accessAudits(srv.app.db, "slack.relinked").map((row) => [row.actor, row.target, row.detail])).toEqual([["alice@example.com", "U0OTHER", { from: ALICE_SLACK }]]);
+  // The human outlived the move: the relink's create finds it (#807 P3 C5 decision 3) and makes nothing new.
+  expect(accessAudits(srv.app.db, "alias.created").filter((row) => row.target === "alice@example.com/human")).toHaveLength(1);
   await be.call("dm_send", { to: "human", body: "second", parent_id: q.message_id });
   const post = await until(() => slack.posts().find((p) => p.markdown_text === "**be** second"));
   expect(post.channel).toBe("D0OTHER");

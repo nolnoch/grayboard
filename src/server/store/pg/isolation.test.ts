@@ -78,6 +78,11 @@ test("the walk follows relative imports and skips type-only ones", () => {
   // audit row's request_context.ts.
   expect(forbiddenReach([join(SRC, "server/oauth-config.ts")])).toEqual([]);
   expect(forbiddenReach([join(import.meta.dir, "oauth.ts")])).toEqual([]);
+  // The aliases and messages groups' types, and the cap refusal both stores' callers run over the aliases group
+  // (#807 P3 C5a): the Postgres store and its contract runner import them.
+  expect(forbiddenReach([join(SRC, "server/store/aliases.ts")])).toEqual([]);
+  expect(forbiddenReach([join(SRC, "server/store/messages.ts")])).toEqual([]);
+  expect(forbiddenReach([join(SRC, "server/alias_cap.ts")])).toEqual([]);
   expect(runtimeImports(`import type { X } from "../tx.ts";\nexport type { Y } from "../db.ts";`)).toEqual([]);
   expect(runtimeImports(`import {\n  a,\n  b,\n} from "../tx.ts";\nexport { c } from "./d.ts";\nimport "./e.ts";\nconst f = await import("../db.ts");`))
     .toEqual(["../tx.ts", "./d.ts", "./e.ts", "../db.ts"]);

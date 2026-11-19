@@ -376,11 +376,15 @@ test("a bare DM recipient is only ever your own identity of that name (F-08)", a
   });
 });
 
-test("dm_history: peer resolves like dm_send's recipient, oldest first, limit clamped; empty bodies refused", async () => {
+test("dm_history: peer resolves like dm_send's recipient, oldest first, limit clamped; empty and NUL bodies refused", async () => {
   const a = await srv.hosted(A, "be");
   await srv.hosted(B, "fe");
   for (const body of ["one", "two", "three"]) await a.call("dm_send", { to: `${B}/fe`, body });
   await expect(a.call("dm_send", { to: `${B}/fe`, body: "  " })).rejects.toMatchObject({ message: "body is required" });
+  // NUL is refused as local mode refuses it (#807 P3 C5 decision 7), for a DM and a post alike.
+  await expect(a.call("dm_send", { to: `${B}/fe`, body: "a\u0000b" })).rejects.toMatchObject({ code: "bad_request", message: "body contains a NUL character" });
+  await a.call("board_create", { name: "nul", purpose: "x" });
+  await expect(a.call("board_post", { board: "nul", body: "a\u0000b" })).rejects.toMatchObject({ code: "bad_request", message: "body contains a NUL character" });
 
   const bodies = async (peer: string, limit?: number) =>
     (await a.call<HistoryMessage[]>("dm_history", { peer, ...(limit !== undefined ? { limit } : {}) })).map((m) => m.body);
