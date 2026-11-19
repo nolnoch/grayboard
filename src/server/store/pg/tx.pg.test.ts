@@ -5,6 +5,7 @@
 import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
 import { describePg, pgEmptyDatabase, type PgDatabase } from "../../../../tests/support/pg.ts";
+import { commitCutProxy } from "../../../../tests/support/pg_proxy.ts";
 import { until } from "../../../../tests/support/until.ts";
 import { txContract, type TxBackend } from "../tx.contract.ts";
 import { sqliteOf, sqliteRead } from "../tx.ts";
@@ -420,47 +421,14 @@ describePg("Postgres transactions", () => {
   });
 });
 
-// A proxy between the store and the database that cuts the connection at the client's COMMIT: dropped before the
-// server sees it ("dropped"), or forwarded and its ack lost ("ack lost"). Either way the client can't know the outcome.
+// A proxy between the store and the database cuts the connection at the client's COMMIT (tests/support/pg_proxy.ts).
 describePg("Postgres in-doubt COMMIT", () => {
   for (const mode of ["dropped", "ack lost"] as const) {
     test(`T-P18 COMMIT ${mode}: the write rejects, "commit outcome unknown" is logged, no effect runs, the queue goes on`, async () => {
       const db = await pgEmptyDatabase({ max: 2 });
       await db.sql`CREATE TABLE t (seq int8 GENERATED ALWAYS AS IDENTITY, v text)`;
-      const target = new URL(db.url);
-      const sockets = new Set<{ end(): void }>();
-      let armed = false;
-      type Link = { up?: { write(d: Uint8Array): number; end(): void }; pending: Uint8Array[]; muted: boolean };
-      const proxy = Bun.listen<Link>({
-        hostname: "127.0.0.1", port: 0,
-        socket: {
-          open(client) {
-            client.data = { pending: [], muted: false };
-            sockets.add(client);
-            void Bun.connect({ hostname: target.hostname, port: Number(target.port), socket: {
-              open(up) { sockets.add(up); client.data.up = up; for (const b of client.data.pending) up.write(b); client.data.pending = []; },
-              // The ack of a muted COMMIT never reaches the client: both ends close instead.
-              data(up, d) { if (client.data.muted) { up.end(); client.end(); } else client.write(d); },
-              close() { client.end(); },
-              error() { client.end(); },
-            } }).catch(() => client.end());
-          },
-          data(client, d) {
-            const buf = Buffer.from(d);
-            if (armed && buf.includes("COMMIT")) {
-              armed = false;
-              if (mode === "dropped") { client.data.up?.end(); client.end(); return; }
-              client.data.muted = true;
-            }
-            if (client.data.up) client.data.up.write(buf); else client.data.pending.push(buf);
-          },
-          close(client) { client.data.up?.end(); },
-        },
-      });
-      const url = new URL(db.url);
-      url.hostname = "127.0.0.1";
-      url.port = String(proxy.port);
-      const s = makePgTransactions(url.toString(), { max: 2 });
+      const proxy = commitCutProxy(db.url, mode);
+      const s = makePgTransactions(proxy.url, { max: 2 });
       const seen: string[] = [];
       try {
         const logged = await capturingErrors(async () => {
@@ -469,7 +437,7 @@ describePg("Postgres in-doubt COMMIT", () => {
             rejection(s.write(async tx => {
               await put(tx, "in doubt");
               tx.afterCommit(() => { seen.push("effect"); });
-              armed = true;
+              proxy.arm();
             }, () => { seen.push("committed"); })),
             new Promise((_, reject) => { deadline = setTimeout(() => reject(new Error("the in-doubt write never settled within 10 s")), 10000); }),
           ]).finally(() => clearTimeout(deadline)) as any;
@@ -486,8 +454,7 @@ describePg("Postgres in-doubt COMMIT", () => {
         expect((await db.sql`SELECT v FROM t ORDER BY seq`).map((r: { v: string }) => r.v)).toEqual(mode === "dropped" ? ["next"] : ["in doubt", "next"]);
       } finally {
         await s.close();
-        for (const sock of sockets) sock.end();
-        proxy.stop(true);
+        proxy.stop();
         await db[Symbol.asyncDispose]();
       }
     }, 30000);

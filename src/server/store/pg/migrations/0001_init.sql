@@ -126,6 +126,39 @@ CREATE TABLE oauth_tokens (
 CREATE INDEX idx_oauth_tokens_grant ON oauth_tokens (grant_id);
 CREATE INDEX idx_oauth_tokens_secret ON oauth_tokens (secret_id);
 
+-- The auth generation (postgres-server.md D5; #807 P3 C9b): a statement that changes a row of users, oauth_grants or
+-- oauth_tokens, or truncates one, marks its transaction (gb.auth_touched, transaction-local, so ROLLBACK TO undoes it)
+-- and sends NOTIFY gb_auth, delivered at commit. store/pg/tx.ts reads the mark before COMMIT and bumps this process's
+-- counter after it; every listening process bumps on the notification. Statement triggers with transition tables: a
+-- statement that changed no rows (the OAuth cleanup's DELETEs, usually) marks nothing, and a bulk one runs the
+-- function once. A transition table serves one event per trigger, so each table has one per event; TRUNCATE has none.
+CREATE FUNCTION gb_auth_touched() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  PERFORM set_config('gb.auth_touched', '1', true);
+  PERFORM pg_notify('gb_auth', '');
+  RETURN NULL;
+END $$;
+CREATE FUNCTION gb_auth_rows_touched() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM changed) THEN
+    PERFORM set_config('gb.auth_touched', '1', true);
+    PERFORM pg_notify('gb_auth', '');
+  END IF;
+  RETURN NULL;
+END $$;
+CREATE TRIGGER users_auth_ins AFTER INSERT ON users REFERENCING NEW TABLE AS changed FOR EACH STATEMENT EXECUTE FUNCTION gb_auth_rows_touched();
+CREATE TRIGGER users_auth_upd AFTER UPDATE ON users REFERENCING NEW TABLE AS changed FOR EACH STATEMENT EXECUTE FUNCTION gb_auth_rows_touched();
+CREATE TRIGGER users_auth_del AFTER DELETE ON users REFERENCING OLD TABLE AS changed FOR EACH STATEMENT EXECUTE FUNCTION gb_auth_rows_touched();
+CREATE TRIGGER users_auth_trunc AFTER TRUNCATE ON users FOR EACH STATEMENT EXECUTE FUNCTION gb_auth_touched();
+CREATE TRIGGER oauth_grants_auth_ins AFTER INSERT ON oauth_grants REFERENCING NEW TABLE AS changed FOR EACH STATEMENT EXECUTE FUNCTION gb_auth_rows_touched();
+CREATE TRIGGER oauth_grants_auth_upd AFTER UPDATE ON oauth_grants REFERENCING NEW TABLE AS changed FOR EACH STATEMENT EXECUTE FUNCTION gb_auth_rows_touched();
+CREATE TRIGGER oauth_grants_auth_del AFTER DELETE ON oauth_grants REFERENCING OLD TABLE AS changed FOR EACH STATEMENT EXECUTE FUNCTION gb_auth_rows_touched();
+CREATE TRIGGER oauth_grants_auth_trunc AFTER TRUNCATE ON oauth_grants FOR EACH STATEMENT EXECUTE FUNCTION gb_auth_touched();
+CREATE TRIGGER oauth_tokens_auth_ins AFTER INSERT ON oauth_tokens REFERENCING NEW TABLE AS changed FOR EACH STATEMENT EXECUTE FUNCTION gb_auth_rows_touched();
+CREATE TRIGGER oauth_tokens_auth_upd AFTER UPDATE ON oauth_tokens REFERENCING NEW TABLE AS changed FOR EACH STATEMENT EXECUTE FUNCTION gb_auth_rows_touched();
+CREATE TRIGGER oauth_tokens_auth_del AFTER DELETE ON oauth_tokens REFERENCING OLD TABLE AS changed FOR EACH STATEMENT EXECUTE FUNCTION gb_auth_rows_touched();
+CREATE TRIGGER oauth_tokens_auth_trunc AFTER TRUNCATE ON oauth_tokens FOR EACH STATEMENT EXECUTE FUNCTION gb_auth_touched();
+
 CREATE TABLE oauth_requests (
   hash         text COLLATE "C" PRIMARY KEY,
   browser_hash text COLLATE "C" NOT NULL,

@@ -210,7 +210,12 @@ export type PgTransactions = {
 // writes fails 25006 (the stand-in for SQLite's writer check). lock_timeout bounds a wait on a lock an outside writer
 // (psql, a seeding script) holds: one queue serves every write, so an unbounded wait would stall them all (55P03).
 // Isolation is READ COMMITTED on every BEGIN, whatever the database default (D3, D6). No retries.
-export function makePgTransactions(url: string, opts: Omit<PgOptions, "connection"> = {}): PgTransactions {
+//
+// `ownAuthCommit` (postgres-server.md D5; #807 P3 C9b): called once a transaction that wrote users, oauth_grants or
+// oauth_tokens has committed (0001's triggers mark it gb.auth_touched; ROLLBACK TO undoes the mark), before the effects,
+// `committed` and the queue's next body; also when such a COMMIT's outcome is unknown, since a bump is always safe.
+// Set, it costs each write one round trip before COMMIT to read the mark.
+export function makePgTransactions(url: string, { ownAuthCommit, ...opts }: Omit<PgOptions, "connection"> & { ownAuthCommit?: () => void } = {}): PgTransactions {
   const sql = openPg(url, { ...opts, connection: { default_transaction_read_only: "on", lock_timeout: "5000" } });
   const store: Store = { sql, queue: queueFor(sql), open: undefined };
   const { queue } = store;
@@ -223,7 +228,7 @@ export function makePgTransactions(url: string, opts: Omit<PgOptions, "connectio
 
     async function body(): Promise<{ out: R }> {
       let root: PgTx | undefined;
-      let fulfilled = false;
+      let fulfilled = false, touched = false;
       let box: { v: T };
       try {
         box = await sql.begin("isolation level read committed, read write", async conn => {
@@ -233,6 +238,8 @@ export function makePgTransactions(url: string, opts: Omit<PgOptions, "connectio
           try {
             const v = await fn(root as unknown as Tx);
             if (root.hasBeforeCommit) await root.runBeforeCommit();
+            // After the beforeCommit hooks, whose writes (an audit flush) count too.
+            if (ownAuthCommit) touched = (await conn`SELECT current_setting('gb.auth_touched', true) = '1' AS t`)[0].t === true;
             fulfilled = true;
             // Boxed: Bun's handling of a callback's array result can't touch the body's value.
             return { v };
@@ -251,8 +258,11 @@ export function makePgTransactions(url: string, opts: Omit<PgOptions, "connectio
         if (fulfilled && !(error instanceof SQL.PostgresError && (typeof error.errno === "string" || pgFailure(error)))) {
           console.error("[grayboard] commit outcome unknown:", loggable(error));
         }
+        // The mark was read, so only COMMIT failed: one whose outcome is unknown may have landed, and a bump is harmless.
+        if (touched) ownAuthCommit!();
         throw TxAborted.wrap(error);
       }
+      if (touched) ownAuthCommit!();
       store.open = undefined;
       for (const effect of root!.effects) flushEffect(effect);
       return { out: committed ? committed(box.v) : box.v as unknown as R };
