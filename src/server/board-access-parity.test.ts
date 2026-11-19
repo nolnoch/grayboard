@@ -7,7 +7,7 @@ import type { Principal } from "../core/resolver.ts";
 import { boardAccess, principalCanSee, scopeKey, serverAccess } from "./access.ts";
 import type { Repo } from "./db.ts";
 import type { Read, Tx } from "./store/tx.ts";
-import { AUTHORS, B, BOARDS, D, HANDLES, openBoardParity, SCOPES, TOKENS, W, WADE_ID } from "../../tests/support/board_parity.ts";
+import { AUTHORS, B, BOARDS, D, E, HANDLES, openBoardParity, SCOPES, TOKENS, W, WADE_ID } from "../../tests/support/board_parity.ts";
 
 let repo: Repo;
 let db: CoreDb;
@@ -40,6 +40,8 @@ async function rows(r: Read, tx: Tx | null, humanReach: "team" | "all"): Promise
     const want = BOARDS.filter(b => typeof v === "string" ? sync.canSee(v, b) : principalCanSee(repo, v, b)).map(b => b.name).sort();
     out.push([`visibleTo ${typeof v === "string" ? v : `${v.kind}:${v.name}`}`, want, sorted(await async.visibleTo(r, v, BOARDS))]);
   }
+  // A claimant's user by its principal's name (#1286): a person, a team, a service, and a name nobody has.
+  for (const u of [W, B, E, D, "nobody@example.com", "eng", "ops", "svc", ""]) for (const b of BOARDS) out.push([`userSees ${u} ${b.name}`, sync.userSees!(u, b), await async.userSees(r, u, b)]);
   for (const h of HANDLES) {
     for (const scope of [null, "team:eng", "team:ops", "team:nope", "weird"]) out.push([`checkCreate ${h} ${scope}`, sync.checkCreate(h, scope), await async.checkCreate(r, h, scope)]);
     for (const s of SCOPES) {

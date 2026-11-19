@@ -14,7 +14,7 @@ import { boardAccess } from "./access.ts";
 import { callClaimTool, sweepClaims } from "./claims.ts";
 import type { Repo } from "./db.ts";
 import type { Tx } from "./store/tx.ts";
-import { B, BOB_ID, CHILD_ID, D, DAN_WRITER, diverging, E, ENDED_ID, EVE_ID, inBody as inBodyOn, ONLINE, openPostParity, outcome, outcomeAsync, TAIL_ID, team, W, WADE_ID } from "../../tests/support/board_parity.ts";
+import { B, BOB_ID, CHILD_ID, D, DAN_WRITER, diverging, E, ENDED_ID, ENG_ID, EVE_ID, inBody as inBodyOn, ONLINE, openPostParity, outcome, outcomeAsync, TAIL_ID, team, W, WADE_ID } from "../../tests/support/board_parity.ts";
 import { seed } from "../../tests/support/seed.ts";
 
 let repo: Repo;
@@ -39,6 +39,11 @@ beforeEach(async () => {
     // dan never was in eng: he lapses quietly, and his watcher's watch goes all the same.
     lapsed("ticket:lost", `${D}/be`, "eng");
     core.prepare(`INSERT INTO claim_watches (key, handle) VALUES (?, ?)`).run("ticket:lost", `${W}/be`);
+    // #1286: wade's session bound to eng/build can't see ops, but wade can: the lapse is posted for him, cc'ing eve,
+    // who sees ops, and dan, who doesn't and so gets nothing. eng/idle, held by nobody, names no user: quiet.
+    lapsed("ticket:confined", ENG_ID, "ops", W);
+    core.prepare(`INSERT INTO claim_watches (key, handle) VALUES (?, ?), (?, ?)`).run("ticket:confined", `${E}/be`, "ticket:confined", `${D}/be`);
+    lapsed("ticket:team-lost", "eng/idle", "ops");
     lapsed("ticket:attic-lapsed", `${W}/be`, "attic");
     lapsed("ticket:q", `${E}/be`, "q");
     // A single watcher cc'd on a queue board: a non-strict mention claims no queue post.
@@ -72,6 +77,9 @@ beforeEach(async () => {
     live("ticket:attic", `${W}/be`, "attic");
     live("ticket:onq", `${B}/be`, "q");
     live("ticket:nob", `${B}/be`, null);
+    // #1286: a live claim of the eng-bound session's on ops, taken by wade's user, eve watching.
+    core.prepare(`INSERT INTO claims (key, holder, note, board, acquired_at, expires_at, holder_user) VALUES ('ticket:confined-live', ?, 'n', 'ops', 1, ?, ?)`).run(ENG_ID, Date.now() + 3_600_000, W);
+    core.prepare(`INSERT INTO claim_watches (key, handle) VALUES (?, ?)`).run("ticket:confined-live", `${E}/be`);
     // bob released ticket:gone a moment ago: a repeat release answers "already released".
     logEvent(core, "release", `${B}/be`, { key: "ticket:gone", board: "general" }, Date.now() - 1000);
     // A live engq post bob holds and is its only lane: his decline leaves none, so it gets an [unclaimed] reply.
@@ -103,7 +111,13 @@ test("sweepClaims gives core sweepChanges' wakes and boards and leaves its rows"
   expect(body("[expired] ticket:user")!.author_user).toBe(B);
   expect(body("[expired] ticket:attic-lapsed")).toBeDefined();
   expect(body("[expired] ticket:q")).toBeDefined();
-  for (const quiet of ["ticket:lost", "ticket:none", "ticket:live"]) expect(posts).not.toContain(`[expired] ${quiet}`);
+  for (const quiet of ["ticket:lost", "ticket:none", "ticket:live", "ticket:team-lost"]) expect(posts).not.toContain(`[expired] ${quiet}`);
+  // #1286: posted for the claimant's user, though its holder can't see ops; only the watcher who sees ops is told.
+  const confined = (want.rows.posts as { id: number; body: string; author: string; author_user: string | null; author_id: string | null }[]).find(p => p.body.startsWith("[expired] ticket:confined"))!;
+  expect(confined).toMatchObject({ author: ENG_ID, author_user: W, author_id: null });
+  expect(confined.body).toEndWith(` cc @${D}/be @${E}/be`);
+  const told = (want.rows.outbox as { post_id: number; handle: string }[]).filter(o => o.post_id === confined.id).map(o => o.handle);
+  expect(told).toEqual([`${E}/be`]);
   expect(JSON.stringify(want.rows.claim_watches)).not.toContain("ticket:lost");
   expect(JSON.stringify(want.rows.claims)).toContain("ticket:live");
   expect(JSON.stringify(want.rows.claims)).toContain(`"note":"queue post (redelivered)"`);
@@ -130,6 +144,7 @@ const CALLERS: Caller[] = [
   { label: "dan, sessionless", addresses: [`${D}/be`], user: D },
   { label: "dan writing as bob", addresses: [`${B}/be`], user: D, session: DAN_WRITER },
   { label: "wade's tail", addresses: [TAIL_ID], user: W, session: TAIL_ID },
+  { label: "wade's eng-bound", addresses: ["eng/build", ENG_ID], user: W, session: ENG_ID },
   { label: "bob's ended", addresses: [ENDED_ID], user: B },
   { label: "wade via slack", addresses: [`${W}/be`], user: W, session: WADE_ID, human: true },
   { label: "wade's child", addresses: [`${W}/be`, "eng/deploy"], user: W, session: CHILD_ID, via: CHILD_ID },
@@ -151,6 +166,7 @@ const CALLS = (): Call[] => [
   ["claim_release", { key: "ticket:attic" }], ["claim_release", { key: "ticket:onq" }], ["claim_release", { key: "ticket:nob" }],
   ["claim_release", { key: "ticket:gone" }], ["claim_release", { key: "ticket:watched" }], ["claim_release", { key: "ticket:absent" }],
   ["claim_release", { key: `queue:q:${QPOST}` }], ["claim_release", { key: `queue:q:${QLIVE}` }], ["claim_release", { key: `queue:engq:${ENGQ2}` }], ["claim_release", { key: `queue:engq:${ENGQ2}`, note: "can't" }],
+  ["claim_release", { key: "ticket:confined-live", note: "secret" }],
   ["claim_watch", { key: "ticket:live" }], ["claim_watch", { key: "ticket:live", off: true }], ["claim_watch", { key: "ticket:eng" }],
   ["claim_watch", { key: "ticket:nob" }], ["claim_watch", { key: "ticket:absent" }], ["claim_watch", { key: "ticket:watched" }], ["claim_watch", { key: "ticket:onq" }],
   ["claim_watch", { key: "" }],
@@ -210,6 +226,12 @@ test("claim_take, claim_release and claim_watch give core's answers and leave it
   expect(text("bob", "claim_release", { key: "ticket:gone" })).toContain("already released");
   expect(JSON.stringify(call("bob", "claim_release", { key: `queue:q:${QLIVE}` }).rows.claims)).toContain(`"note":"queue post (redelivered)"`);
   expect(JSON.stringify(call("bob", "claim_release", { key: `queue:engq:${ENGQ2}` }).rows.posts)).toContain(`[unclaimed] queue:engq:${ENGQ2}`);
+  // #1286: the eng-bound session's release of its claim on ops is posted for wade, without its note or its session,
+  // and answers as a quiet one.
+  const confined = call("wade's eng-bound", "claim_release", { key: "ticket:confined-live", note: "secret" });
+  const rel = (confined.rows.posts as { body: string; author_user: string | null; author_id: string | null }[]).find(p => p.body.startsWith("[release] ticket:confined-live"));
+  expect(rel).toMatchObject({ body: `[release] ticket:confined-live cc @${E}/be`, author_user: W, author_id: null });
+  expect(confined.out.value!.result).toBe("released ticket:confined-live");
   // Watches: on, off, own, no board, a hidden board, absent.
   expect(text("bob", "claim_watch", { key: "ticket:live" })).toContain("watching");
   expect(text("wade", "claim_watch", { key: "ticket:live" })).toContain("error");
@@ -217,6 +239,23 @@ test("claim_take, claim_release and claim_watch give core's answers and leave it
   expect(text("eve", "claim_watch", { key: "ticket:eng" })).not.toContain("eng/deploy");
   expect(text("wade", "claim_watch", { key: "ticket:absent" })).toContain("error");
   expect(JSON.stringify(call("bob", "claim_watch", { key: "ticket:live" }).rows.claim_watches)).toContain(`"handle":"${B}/be"`);
+});
+
+// #1286: a release posted for the claimant's user is the system's post, not the caller's: its invocation hook doesn't
+// run, while the holder's own release on a board it sees still runs it.
+test("a release posted for the claimant's user runs no caller hook; a holder's own does", async () => {
+  const access = boardAccess(repo);
+  const hooked: string[] = [];
+  const announced = async (_sp: Tx, as: string, board: string) => { hooked.push(`${as} ${board}`); };
+  const engBound: ToolContext = { user: W, addresses: ["eng/build", ENG_ID], session: ENG_ID };
+  const out = await inBody(async tx => {
+    const r = await callClaimTool(repo, access, tx, "eng/build", "claim_release", { key: "ticket:confined-live", note: "secret" }, { ...engBound, announced });
+    await callClaimTool(repo, access, tx, `${W}/be`, "claim_release", { key: "ticket:live" }, { ...wade, announced });
+    return r.result;
+  }) as { out: unknown; rows: { posts: { body: string }[] } };
+  expect(out.out).toBe("released ticket:confined-live");
+  expect(out.rows.posts.map(p => p.body)).toContain(`[release] ticket:confined-live cc @${E}/be`);
+  expect(hooked).toEqual([`${W}/be general`]);
 });
 
 // #807 P3 B5b3c rollback: a take or a decline that throws after its writes leaves none of them, its sweep's included;

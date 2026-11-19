@@ -4,10 +4,11 @@
 // (#348, alias_visibility.test.ts), so they aren't asserted here.
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { boardAccess } from "../../src/server/access.ts";
+import { board } from "../support/events.ts";
 import { HostedSession, HostedToolError } from "../support/hosted_session.ts";
 import { TestServer } from "../support/server.ts";
 
-const B = "bob@example.com";
+const B = "bob@example.com", F = "frank@example.com", D = "dan@example.com";
 let srv: TestServer;
 let sessions: HostedSession[] = [];
 let bob: string;
@@ -22,8 +23,8 @@ afterEach(async () => {
   await srv.stop();
 });
 
-const hosted = async (name: string) => {
-  const s = await srv.hosted(B, name);
+const hosted = async (name: string | null, email = B) => {
+  const s = await srv.hosted(email, name);
   sessions.push(s);
   return s;
 };
@@ -115,5 +116,98 @@ describe("an ID is judged as its session's primary on every scoped board (#1255)
     expect(hidden.status).toBe(400);
     expect(unnamed({ message: JSON.stringify(hidden.body) }, "qa-room")).toBe(unnamed({ message: JSON.stringify(none.body) }, "no-such-thing"));
     expect(srv.app.db.query("SELECT count(*) AS n FROM claims WHERE key LIKE 'ticket:QA-%'").get()).toEqual({ n: 0 });
+  });
+});
+
+// #1286: a claim taken on qa's board as a session's ID while its primary was a person name, the primary since moved
+// to eng/h (the fe name released): its ID now acts as eng there (#1255), but
+// the claimant's user still sees qa's board, so the claim's end is posted for that user, in fixed text, cc'ing the
+// watchers who can see the board. The holder's own words never reach it, and its own answer and deliveries are a
+// quiet end's.
+describe("a confined holder's claim end is announced for its user (#1286)", () => {
+  // `email`'s session bound to fe takes `key` on qa-room as its ID, qa/ops (bob's) watches it, and the session binds
+  // eng/h and releases fe, so eng/h is its primary.
+  async function confined(key: string, email = B, cast_?: Awaited<ReturnType<typeof cast>>) {
+    const { ops } = cast_ ?? (await cast());
+    const eng = `eng/h-${email === B ? "b" : "f"}`;
+    if (email !== B) {
+      await srv.login(email);
+      for (const team of ["eng", "qa"]) expect((await srv.api(bob, "POST", `/api/teams/${team}/add`, { email })).status).toBe(200);
+    }
+    const h = await hosted("fe", email);
+    const id = idHolding(`${email}/fe`);
+    expect(await h.call("claim_take", { key, board: "qa-room", note: "qa note", as: id })).toMatchObject({ ok: true });
+    expect(await ops.call("claim_watch", { key })).toBeDefined();
+    await h.bind(eng);
+    await h.call("unbind", { name: "fe" });
+    await h.reopen();
+    const access = boardAccess(srv.app.repo), read = srv.app.repo.read;
+    const room = (await srv.app.repo.boards.get(read, "qa-room"))!;
+    expect(await access.canSee(read, idHolding(eng), room)).toBe(false);
+    return { ops, h, id };
+  }
+  const mentioned = (key: string, start: string) => board((i) => i.kind === "push" && i.reason === "mention" && i.post.board === "qa-room" && i.post.body.startsWith(`${start} ${key}`));
+  // Any delivery of `key`'s end post: a push of it, or a digest whose latest post it is.
+  const ended = (key: string) => board((i) => /^\[(release|expired)\] /.test((i.kind === "push" ? i.post : i.latest).body) && (i.kind === "push" ? i.post : i.latest).body.includes(key));
+  const posts = (key: string) => srv.app.db.query("SELECT body, author, author_user, author_id FROM posts WHERE board = 'qa-room' AND body LIKE ?").all(`%${key}%`);
+
+  test("an explicit release: the watcher is told without the holder's note; the holder's answer and inbox are a quiet release's", async () => {
+    const c = await cast();
+    const { ops, h, id } = await confined("ticket:QA-R", B, c);
+    const answer = await h.call("claim_release", { key: "ticket:QA-R", note: "eng secret" });
+    const got = await ops.next(mentioned("ticket:QA-R", "[release]"));
+    if (got.event.kind !== "board" || got.event.item.kind !== "push") throw new Error("not a push");
+    expect(got.event.item.post.body).toBe("[release] ticket:QA-R cc @qa/ops");
+    expect(posts("ticket:QA-R")).toEqual([
+      { body: "[claim] ticket:QA-R — qa note", author: id, author_user: B, author_id: id },
+      { body: "[release] ticket:QA-R cc @qa/ops", author: id, author_user: B, author_id: null },
+    ]);
+    expect(JSON.stringify(srv.app.db.query("SELECT body FROM posts").all())).not.toContain("eng secret");
+    // The control: frank's user lost qa too, so his release is quiet. Both holders answer alike and are told nothing.
+    const quiet = await confined("ticket:QA-Q", F, c);
+    expect((await srv.api(bob, "POST", "/api/teams/qa/remove", { email: F })).status).toBe(200);
+    const quietAnswer = await quiet.h.call("claim_release", { key: "ticket:QA-Q", note: "eng secret" });
+    expect(posts("ticket:QA-Q")).toHaveLength(1);
+    expect([answer, quietAnswer]).toEqual(["released ticket:QA-R", "released ticket:QA-Q"]);
+    await quiet.ops.none(ended("ticket:QA-Q"));
+    await h.none(ended("ticket:QA-R"));
+    await quiet.h.none(ended("ticket:QA-Q"));
+  });
+
+  test("a session end's release is posted for the user, without its note; a watcher who lost the board gets nothing", async () => {
+    const { ops, id } = await confined("ticket:QA-E");
+    // dan watched while in qa, then left it: the end post's mention of him resolves to nothing.
+    await srv.login(D);
+    expect((await srv.api(bob, "POST", "/api/teams/qa/add", { email: D })).status).toBe(200);
+    const dan = await hosted("w", D);
+    expect(await dan.call("claim_watch", { key: "ticket:QA-E" })).toBeDefined();
+    expect((await srv.api(bob, "POST", "/api/teams/qa/remove", { email: D })).status).toBe(200);
+    // A hosted root's own session_end leaves its ID unended (the hosted store's); the server's ID end (a startup
+    // leftover's, a revoked tools-only session's, a released child's) is core's endSession, run here as they run it.
+    // Its release has no signed-in caller (no ctx.user).
+    await srv.app.repo.write(tx => srv.app.repo.sessionEnd.end(tx, id, { why: "test", now: Date.now() }));
+    expect(srv.app.db.query("SELECT count(*) AS n FROM claims WHERE key = 'ticket:QA-E'").get()).toEqual({ n: 0 });
+    const got = await ops.next(mentioned("ticket:QA-E", "[release]"));
+    if (got.event.kind !== "board" || got.event.item.kind !== "push") throw new Error("not a push");
+    expect(got.event.item.post.body).toBe(`[release] ticket:QA-E cc @${D}/w @qa/ops`);
+    expect(posts("ticket:QA-E")).toContainEqual({ body: `[release] ticket:QA-E cc @${D}/w @qa/ops`, author: expect.any(String), author_user: B, author_id: null });
+    await dan.none(ended("ticket:QA-E"));
+  });
+
+  test("a lapse is posted for the user; one whose user lost the board too lapses quietly", async () => {
+    const c = await cast();
+    const { ops } = await confined("ticket:QA-L", B, c);
+    const quiet = await confined("ticket:QA-LQ", F, c);
+    expect((await srv.api(bob, "POST", "/api/teams/qa/remove", { email: F })).status).toBe(200);
+    await srv.app.repo.write(tx => srv.app.repo.coreOn(tx).prepare("UPDATE claims SET expires_at = ? WHERE key IN ('ticket:QA-L', 'ticket:QA-LQ')").run(Date.now() - 1));
+    // A take sweeps the lapsed claims first.
+    await ops.call("claim_take", { key: "ticket:sweep" });
+    const got = await ops.next(mentioned("ticket:QA-L:", "[expired]"));
+    if (got.event.kind !== "board" || got.event.item.kind !== "push") throw new Error("not a push");
+    expect(got.event.item.post).toMatchObject({ body: expect.stringMatching(/ cc @qa\/ops$/) });
+    expect(posts("ticket:QA-L:")).toHaveLength(1);
+    expect(srv.app.db.query("SELECT count(*) AS n FROM claims WHERE key LIKE 'ticket:QA-L%'").get()).toEqual({ n: 0 });
+    expect(posts("ticket:QA-LQ")).toHaveLength(1);
+    await quiet.ops.none(board((i) => i.kind === "push" && i.post.body.startsWith("[expired] ticket:QA-LQ")));
   });
 });
