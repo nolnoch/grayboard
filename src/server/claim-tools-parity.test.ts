@@ -290,6 +290,29 @@ test("a release posted for the claimant's user runs no caller hook; a holder's o
   expect(hooked).toEqual([`${W}/be general`]);
 });
 
+// #1306: the server's ID end is core's endSession, whose release passes the ended session as ctx into core requeue.
+// Its [unclaimed] reply to the ops queue post is the one the port's decline posts: for wade, with no session, no note,
+// and only eve, who sees ops, told.
+test("a session end's requeue of a confined holder's queue post replies as the port's decline does", async () => {
+  const access = boardAccess(repo);
+  type Reply = { id: number; body: string; author: string; author_user: string | null; author_id: string | null; parent_id: number | null };
+  type R = { rows: { posts: Reply[]; outbox: { post_id: number; handle: string }[]; claims: { key: string }[] } };
+  const reply = (r: R) => {
+    const p = r.rows.posts.find(x => x.body.startsWith(`[unclaimed] queue:opsq:${OPSQ_LIVE}:`));
+    if (!p) throw new Error(`no [unclaimed] reply to ${OPSQ_LIVE}`);
+    const { id, ...rest } = p;
+    return { ...rest, told: r.rows.outbox.filter(o => o.post_id === id).map(o => o.handle) };
+  };
+  const ended = await inBody(tx => repo.sessionEnd.end(tx, ENG_ID, { why: "test", now: Date.now() })) as R;
+  const engBound: ToolContext = { user: W, addresses: ["eng/build", ENG_ID], session: ENG_ID };
+  const declined = await inBody(tx => callClaimTool(repo, access, tx, "eng/build", "claim_release", { key: `queue:opsq:${OPSQ_LIVE}` }, engBound)) as R;
+  expect(ended.rows.claims.map(c => c.key)).not.toContain(`queue:opsq:${OPSQ_LIVE}`);
+  expect(reply(ended)).toEqual(reply(declined));
+  expect(reply(ended)).toMatchObject({ author: ENG_ID, author_user: W, author_id: null, parent_id: OPSQ_LIVE, told: [`${E}/be`] });
+  expect(reply(ended).body).toEndWith(` cc @${E}/be`);
+  expect(JSON.stringify(ended.rows.posts)).not.toContain("session ended");
+});
+
 // #807 P3 B5b3c rollback: a take or a decline that throws after its writes leaves none of them, its sweep's included;
 // and a refusal after a write is rolled back by the tool's own savepoint even when the caller catches it and commits,
 // as HTTP's claim call does (it answers a CoreError inside the body).
