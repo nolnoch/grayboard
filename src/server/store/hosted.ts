@@ -13,17 +13,18 @@ export type HostedPatch = Partial<Pick<HostedSession, "grant_id" | "bind_gen" | 
 export interface HostedStore {
   // The store's reads all return promises, on the caller's handle (#807 P3 A7h1).
   get(r: Read, id: string): Promise<HostedSession | undefined>;
-  // Lock order (#807 P3 C8, amended by the C8a audit): grant (`grantLive`), then a root's row, then a child's, then
-  // the capacity lock, which is taken last and held the shortest. `lock(child)` locks its root first, so a body that
-  // locks a child has its root too. register locks its root before the child; a parked child's wake locks it (settle)
-  // before unpark's admit; a create takes only the capacity lock. The nested sweep inside `full()` runs while holding
-  // the capacity lock, so on Postgres its row locks must not wait (C8b: `FOR UPDATE SKIP LOCKED`, or NOWAIT and skip;
-  // a busy row is left to the next tick). Lockers of many roots (the queued sweep, creditDowntime) are #808's. On
-  // SQLite the single writer serializes every body, so the three seams below take no lock there (each still refuses a
-  // handle that isn't a live store Tx, a pool Read included); on Postgres they are FOR SHARE, FOR UPDATE and an
-  // advisory lock. Each is taken in the body whose write it guards, before the read it guards, and the guarded value
-  // is read again after it. Never inside a savepoint that may roll back unless what it guards rolls back with it: on
-  // Postgres ROLLBACK TO frees the lock.
+  // Lock order (#807 P3 C8, amended by the C8a audit): grant (`grantLive`), then a root's row, then a child's, then the
+  // capacity lock, which is taken last and held the shortest. `lock(child)` locks its root first, so a body that locks
+  // a child has its root too. register locks its root before the child; a parked child's wake locks it (settle) before
+  // unpark's admit; a create takes only the capacity lock. The nested sweep inside `full()` runs while holding the
+  // capacity lock, so on Postgres its end, childEnd and park skip a busy row rather than wait (`FOR UPDATE SKIP
+  // LOCKED`; left to the next tick): the target row, and an end's child, hold and ids rows (pg/hosted.ts). Locks the
+  // session-end port takes past those ids rows are not bounded and may still wait. Lockers of many roots (the queued
+  // sweep, creditDowntime) are #808's. On SQLite the single writer serializes every body, so the three seams below take
+  // no lock there (each still refuses a handle that isn't a live store Tx, a pool Read included); on Postgres they are
+  // FOR SHARE, FOR UPDATE and an advisory lock. Each is taken in the body whose write it guards, before the read it
+  // guards, and the guarded value is read again after it. Never inside a savepoint that may roll back unless what it
+  // guards rolls back with it: on Postgres ROLLBACK TO frees the lock.
   // The row, locked for the rest of the body: a child's root first, then the child. What a caller that reads a row and
   // then writes it (or ends it, or inserts a child under it) reads it with.
   lock(tx: Tx, id: string): Promise<HostedSession | undefined>;

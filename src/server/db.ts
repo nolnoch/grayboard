@@ -2869,8 +2869,9 @@ function hostedWrites(db: Database, ended: { list: EndedChild[] }): HostedWrites
       const launcher = db.query<{ launcher: number | null }, [string]>("SELECT launcher FROM ids WHERE id = ?").get(session)?.launcher === 1;
       db.run("UPDATE ids SET writes_as = NULL, launcher = 0 WHERE id = ?", [session]);
       if (launcher) audit(session, "handle.launcher_set", { on: false, ownership: row.ownership_id, reason }, now);
-      // Every hold the ownership has, not one name's (#451): ending it releases them all.
-      for (const { address } of db.query<{ address: string }, [string]>("SELECT address FROM alias_holds WHERE id = ?").all(session)) {
+      // Every hold the ownership has, not one name's (#451): ending it releases them all, oldest first (HOLD_ORDER), so
+      // its binding events land in the order Postgres writes them (pg/hosted.ts).
+      for (const { address } of db.query<{ address: string }, [string]>(`SELECT address FROM alias_holds WHERE id = ? ${HOLD_ORDER}`).all(session)) {
         dropHold(db, address, session);
         logBinding(db, session, address, "released", reason, now);
       }

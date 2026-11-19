@@ -280,4 +280,23 @@ describe("a confined holder's queue claim ends in an [unclaimed] reply for its u
     expect(replies(quiet.postId)).toEqual([]);
     await quiet.w.none(unclaimed(quiet.key));
   });
+
+  // #1306: session end releases through core release with the ended session's ctx (src/core/session_end.ts), which
+  // reaches core requeue: the reply is still the user's, without the session or the end's note.
+  test("a session end's requeue is replied to for the user; one whose user lost the board too ends quietly", async () => {
+    const c = await cast();
+    const { w, id, postId, key } = await confinedQueue(B, c);
+    const quiet = await confinedQueue(F, c);
+    expect((await srv.api(bob, "POST", "/api/teams/qa/remove", { email: F })).status).toBe(200);
+    // As the #1286 session-end case runs it: the server's ID end is core's endSession, with no signed-in caller.
+    for (const ended of [id, quiet.id]) await srv.app.repo.write(tx => srv.app.repo.sessionEnd.end(tx, ended, { why: "test", now: Date.now() }));
+    expect(srv.app.db.query("SELECT count(*) AS n FROM claims WHERE key IN (?, ?)").get(key, quiet.key)).toEqual({ n: 0 });
+    const got = await w.next(board((i) => i.kind === "push" && i.reason === "mention" && i.post.body.startsWith(`[unclaimed] ${key}:`)));
+    if (got.event.kind !== "board" || got.event.item.kind !== "push") throw new Error("not a push");
+    expect(got.event.item.post.body).toEndWith(" cc @qa/w-b");
+    expect(replies(postId)).toEqual([{ body: expect.stringMatching(/ cc @qa\/w-b$/), author: id, author_user: B, author_id: null }]);
+    expect(JSON.stringify(replies(postId))).not.toContain("session ended");
+    expect(replies(quiet.postId)).toEqual([]);
+    await quiet.w.none(unclaimed(quiet.key));
+  });
 });
