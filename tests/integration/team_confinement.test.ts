@@ -92,13 +92,14 @@ describe("an ID is judged as its session's primary on every scoped board (#1255)
     for (const label of ["qa-room", "qa task", "qa status"]) expect(all, label).toContain(label);
   });
 
-  test("a claim on qa's board shows its ID neither the board nor the note, in claim_list or a held answer (#1273 L1)", async () => {
+  test("a claim on qa's board shows its ID neither the board nor the note in a held answer (#1273 L1)", async () => {
     const { ops, build, id } = await cast();
     await ops.call("claim_take", { key: "ticket:QA-2", board: "qa-room", note: "qa note" });
     type View = { key: string; board: string | null; note: string | null };
+    // claim_list takes no `as`: its viewer is the bound eng/build alias, the bound-actor control.
+    const row = (await build.call<View[]>("claim_list", { prefix: "ticket:QA-2" })).find((c) => c.key === "ticket:QA-2");
+    expect(row).toMatchObject({ board: null, note: null });
     for (const as of [undefined, id]) {
-      const row = (await build.call<View[]>("claim_list", { prefix: "ticket:QA-2" })).find((c) => c.key === "ticket:QA-2");
-      expect(row, String(as)).toMatchObject({ board: null, note: null });
       const held = await build.call<{ ok: boolean; note: string | null }>("claim_take", { key: "ticket:QA-2", ...(as ? { as } : {}) });
       expect(held, String(as)).toMatchObject({ ok: false, note: null });
     }
