@@ -97,7 +97,9 @@ export function serverAccess(repo: Repo, db: CoreDb, humanReach: HumanReach = "t
     // (#284 S13): a team's task or private board name stays inside the team.
     seesAliasMeta(handle, scope) {
       const p = repo.policyNow.principalOf(handle);
-      return p !== null && scope.scope_ref !== null && actsIn(repo, p, { scope_kind: scope.scope_kind, scope_ref: scope.scope_ref });
+      if (p === null || scope.scope_ref === null) return false;
+      if (p.kind === "team") return scope.scope_kind === "team" && p.name === scope.scope_ref;
+      return actsIn(repo, p, { scope_kind: scope.scope_kind, scope_ref: scope.scope_ref });
     },
 
     seesAlias,
