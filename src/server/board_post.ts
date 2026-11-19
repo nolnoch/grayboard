@@ -136,17 +136,18 @@ async function writePost(
  * core post as the system writes it for a claim (announce, requeue's `[unclaimed]`): the gate on `tx` (allowArchived for
  * a post ending a claim), core's pre-checks with no files or live sessions, and the write with mentions non-strict, so
  * a watcher's ended `@id:` goes unresolved rather than refusing. Throws the gate's and the pre-checks' refusals.
+ * `postId` is the post written, for an invocation row to name (#1261).
  */
 export async function systemPost(
   repo: Repo, access: BoardAccess, tx: Tx, actor: string, board: string, body: string, parentId: number | null,
   o: { allowArchived: boolean; session?: string; via?: string; user?: string; addresses?: string[] },
-): Promise<{ wake: string[]; boards: string[] }> {
+): Promise<{ wake: string[]; boards: string[]; postId: number }> {
   const { board: b, gate } = await postGateOn(repo, access, tx, actor, board, parentId, o.allowArchived);
   postPreChecks(b.name, body, gate.announcement, {});
   const { post, out } = await writePost(repo, access, tx, actor, b, gate, {
     body, parentId, strict: false, addresses: o.addresses, session: o.session, via: o.via, user: o.user,
   });
-  return { wake: out.wake, boards: [post.board] };
+  return { wake: out.wake, boards: [post.board], postId: post.id };
 }
 
 // core viewers on `r`.

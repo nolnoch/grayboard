@@ -259,9 +259,9 @@ async function claimCall(req: Request, authed: AuthedUser, repo: Repo, access: B
       // The tool's own savepoint rolls back a refusal's writes, so answering it here commits none (#807 P3 B5b3c).
       // Each claim announcement on a service's board is an invocation (#1259), recorded with its post for the
       // address it posts as: the take's decision above when that's the caller on the named board, else the poster's.
-      const announced = async (sp: Tx, as: string, board: string) => {
+      const announced = async (sp: Tx, as: string, board: string, postId: number) => {
         const a = inv && as === handle && inv.req.board === board ? inv : await invocation(repo, sp, as, board);
-        if (a?.d.allow) recordDecision(repo, sp, { user: authed.user_email, address: as }, a.req, a.d);
+        if (a?.d.allow) recordDecision(repo, sp, { user: authed.user_email, address: as }, a.req, a.d, { post_id: postId });
       };
       return await callClaimTool(repo, access, tx, handle, tool as ClaimTool, args, { addresses, user: authed.user_email, announced });
     } catch (e) {
