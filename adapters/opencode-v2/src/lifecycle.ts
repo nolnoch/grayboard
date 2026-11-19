@@ -7,7 +7,7 @@ import type { HostPort, SessionFacts } from "./core/port.js";
 import { AccessExpired, Refusal, render } from "./core/model.js";
 import { resolveRoot, type SessionPath } from "./core/sessions.js";
 import { sessionIdentity } from "./core/naming.js";
-import { NativeWire, type Wire } from "./core/wire.js";
+import { NativeWire, unreachable, type Wire } from "./core/wire.js";
 import { observeEvents } from "./core/events.js";
 import { Approval, type OpenCodeEnrollment } from "./approval.js";
 import { Binding, NEW_RUN, SIGN_IN, type StaticMode } from "./binding.js";
@@ -90,6 +90,24 @@ function hostPort(ctx: Context, options: Options, binding: Binding, facts: Map<s
 
 // The core Controller wired to OpenCode: native tool detection, tool hooks and
 // host event names stay here; everything else is hosted-core's.
+// Static mode's auto-enroll retry (#1250): 250 ms doubling to 8 s, 8 retries (about 30 s of waits in all).
+const ENROLL_RETRY_FIRST_MS = 250, ENROLL_RETRY_MAX_MS = 8_000, ENROLL_RETRIES = 8;
+const TRANSIENT_CODES = new Set(["server_unreachable", "rate_limited", "internal_error"]);
+// An outage, not an answer: worth another attempt. whoami's own 10 s timeout aborts its wire, which the wire then
+// leaves unclassified, so a TimeoutError anywhere in the cause chain counts too.
+function transientEnroll(error: unknown): boolean {
+  if (TRANSIENT_CODES.has(failureCode(error)) || unreachable(error)) return true;
+  for (let e = error, depth = 0; e && depth < 8; e = (e as { cause?: unknown }).cause, depth++) if ((e as { name?: unknown }).name === "TimeoutError") return true;
+  return false;
+}
+function abortableSleep(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise(resolve => {
+    if (signal.aborted) return resolve();
+    const done = () => { clearTimeout(timer); signal.removeEventListener("abort", done); resolve(); };
+    const timer = setTimeout(done, ms);
+    signal.addEventListener("abort", done, { once: true });
+  });
+}
 export class OpenCodeController extends Controller<OpenCodeEnrollment> {
   readonly binding: Binding;
   constructor(readonly ctx: Context, readonly options: Options, Transport?: typeof Wire, wait?: Wait, sink?: DiagnosticSink) {
@@ -203,8 +221,40 @@ export class OpenCodeController extends Controller<OpenCodeEnrollment> {
   // approving itself (principle 10): the launcher set the mode, the pin and the token, and the kind is the
   // server's, which a user's token can't claim. Grayboard starts nothing here (principle 7): the launcher started
   // this OpenCode and its session; enrollment only lets the server deliver to it.
+  // A static run has no person to enroll by hand (#1250): an attempt that fails on an outage (unreachable, a gateway
+  // 5xx, a timeout, a rate limit or the server's internal error) is retried on a capped backoff, ENROLL_RETRIES times;
+  // any other answer stands. A retry stops when the controller closes, the session ends or the root is enrolled.
   async serviceEnroll(sessionID: string) {
     if (this.stopped || !this.options.static) return;
+    let error = await this.autoEnroll(sessionID);
+    if (error === undefined || !transientEnroll(error)) return this.enrollRefused(sessionID, error);
+    const retry = (async () => {
+      for (let attempt = 0; attempt < ENROLL_RETRIES && error !== undefined && transientEnroll(error); attempt++) {
+        this.record({ state: "retrying", sessionID, message: `Server unreachable; retrying auto-enroll (${attempt + 1}/${ENROLL_RETRIES})`, operation: "enroll", code: failureCode(error) });
+        await abortableSleep(Math.min(ENROLL_RETRY_MAX_MS, ENROLL_RETRY_FIRST_MS * 2 ** attempt), this.enrollStop.signal);
+        if (this.stopped || this.routes.isEnded(sessionID) || this.enrollment(sessionID)) return;
+        error = await this.autoEnroll(sessionID);
+        if (this.stopped) return;
+      }
+      this.enrollRefused(sessionID, error);
+    })().finally(() => this.enrollRetries.delete(retry));
+    this.enrollRetries.add(retry);
+  }
+  // Static mode's retries: close ends their waits and waits them out, so none records or enrolls after it.
+  private readonly enrollStop = new AbortController();
+  private readonly enrollRetries = new Set<Promise<void>>();
+  override async close() {
+    this.stopped = true; this.enrollStop.abort();
+    while (this.enrollRetries.size) await Promise.all(this.enrollRetries);
+    await super.close();
+  }
+  private enrollRefused(sessionID: string, error: unknown) {
+    if (error === undefined) return;
+    this.record({ state: "unenrolled", sessionID, message: error instanceof Refusal && !(error instanceof AccessExpired) ? error.message : failureMessage(error, this.port.resumeHint), operation: "enroll", code: failureCode(error) });
+  }
+  // One auto-enroll attempt: undefined when it enrolled or recorded its own refusal, else the error that stopped it.
+  private async autoEnroll(sessionID: string): Promise<unknown> {
+    const mode = this.options.static;
     try {
       if ((await this.port.ancestry(sessionID)).root !== sessionID) return;
       const e = await this.binding.capture(sessionID);
@@ -215,7 +265,7 @@ export class OpenCodeController extends Controller<OpenCodeEnrollment> {
       }
       // The launcher named its service (#270 audit F3): another service's token, which a repository config could
       // put in the entry, never enrolls.
-      const expected = "principal" in this.options.static ? this.options.static.principal : undefined;
+      const expected = mode && "principal" in mode ? mode.principal : undefined;
       if (expected !== undefined && who.principal !== expected) {
         this.record({ state: "unenrolled", sessionID, message: `Static mode enrolls a root by itself only for the run token of the service ${STATIC_PRINCIPAL} names; this token is another's`, operation: "enroll", code: "refused" });
         return;
@@ -224,7 +274,7 @@ export class OpenCodeController extends Controller<OpenCodeEnrollment> {
       this.binding.expectChecked(sessionID, e.configuration.configHash);
       try { await this.enroll(sessionID); } finally { this.binding.expectChecked(sessionID); }
     } catch (error) {
-      this.record({ state: "unenrolled", sessionID, message: error instanceof Refusal && !(error instanceof AccessExpired) ? error.message : failureMessage(error, this.port.resumeHint), operation: "enroll", code: failureCode(error) });
+      return error ?? new Error("auto-enroll failed");
     }
   }
   async enrollmentFailure(sessionID: string) {

@@ -1,6 +1,6 @@
 import { expect, spyOn, test } from "bun:test";
 import assert from "node:assert/strict";
-import { Client } from "@modelcontextprotocol/client";
+import { Client, SdkErrorCode, SdkHttpError } from "@modelcontextprotocol/client";
 import type { Context } from "@opencode/plugin/promise/plugin";
 import { OpenCodeController as Controller, OPENCODE_SESSION, setup as setupPlugin, STATIC_AUTH, STATIC_ISSUER } from "../src/lifecycle.js";
 import { Controller as CoreController } from "../src/core/controller.js";
@@ -9,7 +9,7 @@ const failureMessage = (error: unknown) => failureMessageWith(error, "explicitly
 import { observeEvents } from "../src/core/events.js";
 import { Wire, LAUNCHER_META, SUGGESTED_META, LeaseUnavailable, ServerUnreachable, SubscriberError } from "../src/core/wire.js";
 import { Approval, METADATA, enrollmentHash, type OpenCodeEnrollment as Enrollment } from "../src/approval.js";
-import { AccessExpired, type Item } from "../src/core/model.js";
+import { AccessExpired, Refusal, type Item } from "../src/core/model.js";
 import { NEW_RUN, SIGN_IN, type StaticMode } from "../src/binding.js";
 class NativeAccessExpired extends AccessExpired { constructor() { super("OpenCode", SIGN_IN); } }
 import { fixture } from "./native-fixture.js";
@@ -1375,6 +1375,39 @@ test("static mode refuses to enroll when the entry's run token changed between t
     // The expectation doesn't outlive the attempt: a later explicit enroll reads the entry afresh.
     await s.r.controller.enroll("R");
     expect(s.r.controller.enrollment("R")).toBeDefined();
+  } finally { await s.restore(); }
+});
+// #1250: a static run has no person to enroll by hand, so an auto-enroll that met an outage is retried; an answer
+// (a refusal) is not, and close ends a retry's wait without enrolling.
+const unavailable = () => new SdkHttpError(SdkErrorCode.ClientHttpFailedToOpenStream, "Service Unavailable", { status: 503 });
+test("static mode retries an auto-enroll whose whoami met a 503, and enrolls the root once the server answers", async () => {
+  let failures = 1;
+  const s = await staticRuntime("service", undefined, undefined, () => { if (failures-- > 0) throw unavailable(); });
+  try {
+    await s.r.controller.observe("session.created", { sessionID: "R" });
+    expect(rootRecord(s.r.controller, "R")).toMatchObject({ state: "retrying", operation: "enroll" });
+    expect(s.r.controller.enrollment("R")).toBeUndefined();
+    await until(() => s.r.controller.enrollment("R"), 5000, "the retry enrolls R");
+    expect(s.asked).toHaveLength(2);
+    expect(savedRoots(s.r.storage)).toHaveLength(1);
+  } finally { await s.restore(); }
+});
+test("static mode doesn't retry an auto-enroll the server refused", async () => {
+  const s = await staticRuntime("service", undefined, undefined, () => { throw new Refusal("auth", "token refused"); });
+  try {
+    await s.r.controller.observe("session.created", { sessionID: "R" });
+    expect(rootRecord(s.r.controller, "R")).toMatchObject({ state: "unenrolled", operation: "enroll", message: "token refused" });
+    expect(s.asked).toHaveLength(1);
+  } finally { await s.restore(); }
+});
+test("static mode: close ends an auto-enroll retry's wait, and nothing enrolls after it", async () => {
+  const s = await staticRuntime("service", undefined, undefined, () => { throw unavailable(); });
+  try {
+    await s.r.controller.observe("session.created", { sessionID: "R" });
+    expect(rootRecord(s.r.controller, "R")).toMatchObject({ state: "retrying" });
+    await s.r.controller.close();
+    expect(s.asked).toHaveLength(1);
+    expect(savedRoots(s.r.storage)).toEqual([]);
   } finally { await s.restore(); }
 });
 test("static mode tells the person to start a new run, not to sign in through OpenCode", async () => {
