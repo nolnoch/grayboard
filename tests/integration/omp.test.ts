@@ -33,7 +33,7 @@ test("omp hosted /fork, /new and /resume in one runtime: each replaces the sessi
 
 test("omp hosted: 130 sequential subagents stay under the 128-child cap; each registers at its first call and ends with its run", () => ompHostedManyChildrenScenario(dir), 900_000);
 
-test("omp hosted static (#1243): a launcher's run token binds the service's BUS_IDENTITY name and receives; status names the static run; login and logout refuse; a revoked credential ends the run with no sign-in offer, browser or token request", () => ompHostedStaticScenario(dir), 120_000);
+test("omp hosted static (#1243): a launcher's run token binds the service's BUS_IDENTITY name and receives; a subagent registers as a child under the svc_ root, writes as its name and ends with its run (#1303); status names the static run; login and logout refuse; a revoked credential ends the run with no sign-in offer, browser or token request", () => ompHostedStaticScenario(dir), 120_000);
 
 test("omp hosted: two processes on one agent dir share one refresh; /grayboard logout in one pauses both", () => ompHostedRefreshLogoutScenario(dir), 120_000);
 

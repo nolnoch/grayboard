@@ -14,7 +14,10 @@
 // grayboard CLI process runs under Claude Code. A session with no grant is
 // shown a sign-in link under its first tool call, and opening it signs the
 // session in (#497: Claude Code never received the prompt the plugin sent at
-// startup); the link reaches the user, never the model (#500).
+// startup); the link reaches the user, never the model (#500). A service
+// run (#1243, #1303): the launcher's run token in Claude Code's environment
+// leases the service's BUS_IDENTITY name with no sign-in prompt or link, and
+// a revoke of its credential ends the run.
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -23,7 +26,9 @@ import { pinMarketplace } from "../../scripts/pin_claude_plugin.ts";
 import { CLAUDE_PLUGIN } from "../../src/shared/claude_channels.ts";
 import { CLAUDE_CODE_VERSION, type ClaudeHome, claudeCli, claudeCodeBin, claudeHome, claudeTty, descendants, transcript } from "../support/claude_code.ts";
 import { onChannelDm, onUserText, startFakeAnthropic, toolResults, userTexts } from "../support/fake_anthropic.ts";
-import { browse, hostedServer, seedGrant } from "../support/hosted_oauth.ts";
+import { browse, hostedServer, seedGrant, tokenRequests } from "../support/hosted_oauth.ts";
+import { serviceRun } from "../support/service_token.ts";
+import { NEW_RUN } from "../../adapters/hosted-core/src/static.ts";
 import { direct } from "../support/events.ts";
 import { ROOT } from "../support/paths.ts";
 import { keep } from "../support/run_dir.ts";
@@ -271,3 +276,52 @@ test(`Claude Code ${CLAUDE_CODE_VERSION}: with no grant, the first tool call sho
     await srv.stop();
   }
 }, 300_000);
+
+test(`Claude Code ${CLAUDE_CODE_VERSION}: a service run's token leases its BUS_IDENTITY name with no sign-in prompt or link, and a revoked credential ends the run with the new-run text`, async () => {
+  const srv = hostedServer({ admins: ["root@example.com"] });
+  const model = startFakeAnthropic([
+    onUserText("STATIC-WHO", SOURCE, TOOL("whoami"), {}),
+    onUserText("STATIC-AFTER", SOURCE, TOOL("whoami"), {}),
+  ]);
+  const home = join(dir, "static");
+  const h = claudeHome(home, model.url, ["mcp__plugin_grayboard_grayboard"]);
+  let tty: ReturnType<typeof claudeTty> | undefined;
+  try {
+    const from = install(h, srv, join(home, "mp"));
+    // No grant store: the launcher's variables are the plugin's only credential.
+    const run = await serviceRun(srv);
+    Object.assign(h.env, run.env, { BUS_IDENTITY: "w-1" });
+    const tokens = tokenRequests(srv);
+    tty = claudeTty(bin, h, ["--permission-mode", "default", "--dangerously-load-development-channels", `plugin:${CLAUDE_PLUGIN}`]);
+    const t = tty;
+    const row = () => srv.app.db.query<{ client_id: string; name: string | null; lease_deadline: number | null }, []>(
+      "SELECT client_id, (SELECT address FROM alias_holds WHERE id = session_id ORDER BY bound_at, address LIMIT 1) AS name, lease_deadline FROM hosted_sessions WHERE root_session_id IS NULL").get();
+    await until(() => row()?.name === "ingest/w-1" && row()?.lease_deadline != null, 60_000, `the plugin (from ${from}) to lease ingest/w-1 as the service`);
+    expect(row()!.client_id).toBe(run.clientId);
+
+    await until(() => t.screen().includes(`v${CLAUDE_CODE_VERSION}`), 60_000, "Claude Code's main screen");
+    await t.submit("STATIC-WHO");
+    await until(() => toolResults(model, "toolu_STATIC_WHO").length > 0, 60_000, "the whoami under the run token");
+    expect(toolResults(model, "toolu_STATIC_WHO").join("\n")).toContain("ingest/w-1");
+
+    await run.revoke();
+    await t.submit("STATIC-AFTER");
+    await until(() => toolResults(model, "toolu_STATIC_AFTER").length > 0, 60_000, "the whoami after the revoke");
+    expect(toolResults(model, "toolu_STATIC_AFTER").join("\n")).toContain(NEW_RUN);
+
+    // Nothing offered a sign-in, and the token went nowhere but the server.
+    const debug = readFileSync(join(home, "debug.log"), "utf8");
+    expect(debug).not.toContain("Received elicitation request");
+    expect(t.screen()).not.toContain("to sign in");
+    expect(JSON.stringify(model.requests)).not.toContain(run.token);
+    expect(t.screen()).not.toContain(run.token);
+    expect(existsSync(h.bunStderr) ? readFileSync(h.bunStderr, "utf8") : "").not.toContain(run.token);
+    expect(tokens()).toEqual([]);
+    expect(model.unhandled).toEqual([]);
+  } finally {
+    await tty?.stop();
+    model.stop();
+    writeFileSync(join(home, "model.jsonl"), model.requests.map((r) => JSON.stringify(r)).join("\n"));
+    await srv.stop();
+  }
+}, 240_000);

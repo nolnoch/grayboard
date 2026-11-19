@@ -10,6 +10,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { CallToolResult } from "@modelcontextprotocol/client";
 import { HostedClient, type Level } from "../../adapters/hosted-core/src/client.ts";
+import { Controller } from "../../adapters/hosted-core/src/controller.ts";
 import { AccessExpired, Refusal } from "../../adapters/hosted-core/src/model.ts";
 import { RootDelivery } from "../../adapters/hosted-core/src/root.ts";
 import { deliveryPath } from "../../adapters/hosted-core/src/storage.ts";
@@ -291,6 +292,53 @@ describe("a run on a run token", () => {
       expect(net.seen).toEqual([]);
     } finally { net.restore(); }
   }, 30_000);
+
+  // The restore path (#1303). For pi, omp and Claude Code (RootDelivery's port has no saved approvals, so
+  // Controller.restore's saved-roots pass is a no-op) it is a start's resume: a later run on the same session takes
+  // back the name the first run held, and `prepare` rebinds it. The revoke lands at that step, after the proxy
+  // connected and before the resume's first request, so the 401 meets the restore itself. The seam is a wrapper on
+  // Controller.resume, not a testPause point: hosted core has none (its Node-only typecheck refuses
+  // src/shared/testpause.ts), and a server point past admission turns a revoke into a tool-level `unauthenticated`
+  // rather than a 401 (#1312).
+  test("a run token revoked at the restore step: the resume's 401 ends the run with the new-run text, unbound, and nothing retries", async () => {
+    const run = await serviceRun(srv);
+    const first = rig(signIn(mode(run.env)), "svc-restore-1", "w-1");
+    await first.root.start();
+    await until(() => record(first, "svc-restore-1")?.held?.[0] === `${SVC}/w-1`, 15_000, "the first run bound as ingest/w-1");
+    await first.root.shutdown("release");
+    roots.splice(roots.indexOf(first.root), 1);
+    await until(() => !srv.app.db.query("SELECT 1 FROM hosted_sessions WHERE source_session_id = 'svc-restore-1'").get(), 10_000, "the first run's session ended");
+
+    // The next run: a fresh run token from the same credential, no BUS_IDENTITY, so the start restores the remembered name.
+    const env = { ...run.env, GRAYBOARD_RUN_TOKEN: await run.mint() };
+    const tokens = tokenRequests(srv);
+    const resume = Controller.prototype.resume, revoked: string[] = [];
+    const at = spyOn(Controller.prototype, "resume").mockImplementation(async function (this: Controller, id: string) {
+      await run.revoke();
+      revoked.push(id);
+      return resume.call(this, id);
+    });
+    try {
+      const second = rig(signIn(mode(env)), "svc-restore-1");
+      await second.root.start();
+      expect(revoked).toEqual(["svc-restore-1"]);
+      await until(() => record(second, "svc-restore-1")?.code === "login_required", 15_000, "the restore's 401 recorded");
+      // A resumed root with no saved approval ends unpaused with the cause (#895); for a static run the cause is the run's end.
+      expect(record(second, "svc-restore-1")).toMatchObject({ state: "approved", message: ENDED, operation: "enroll" });
+      expect(second.logs).toEqual([{ level: "warning", message: `this session couldn't take back its name ${SVC}/w-1 (${ENDED}); it is unbound` }]);
+      expect(srv.app.db.query("SELECT 1 FROM alias_holds h JOIN hosted_sessions s ON s.session_id = h.id WHERE s.source_session_id = 'svc-restore-1'").get()).toBeNull();
+      // The 401 spent the token for the process: nothing carries it again.
+      const net = outgoing();
+      try {
+        const result = await second.root.call("whoami", {});
+        expect(result.isError).toBe(true);
+        expect(texts(result).join("\n")).toContain(ENDED);
+        await expect(signIn(mode(env)).token()).rejects.toBeInstanceOf(AccessExpired);
+        expect(net.seen.filter(x => x.bearer)).toEqual([]);
+      } finally { net.restore(); }
+      expect(tokens()).toEqual([]);
+    } finally { at.mockRestore(); }
+  }, 60_000);
 });
 
 describe("nothing else is touched", () => {
