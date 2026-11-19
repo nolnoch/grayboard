@@ -31,8 +31,9 @@ import { detached, inRequest, requestOrigin } from "./request_context.ts";
 import { GOOGLE_ISSUER } from "./idp_google.ts";
 import { LOGIN_SCOPE, OAUTH_SCOPES } from "./oauth-config.ts";
 import type { CredentialSource, ServiceCredential, OAuthStore, OAuthAuthorization, OAuthRequest, OAuthBrowserSession, OAuthCode, OAuthGrant, OAuthTokenPair, OAuthAccess, OAuthFailure } from "./oauth-types.ts";
-import { accessFits, browserData, browserSessionInput, clampPair, codeData, codeInput, grantInput, hash, isLogin, loginInput, mintInput, requestData, requestInput, sameAuthorization,
-  rotationBinding, serviceCredentialInput, serviceSecretInput, successorInput, time } from "./oauth-rules.ts";
+import { accessFits, accessLookup, BROWSER_SESSIONS, browserData, browserSessionInput, clampPair, clientLookup, codeData, codeInput, grantInput, isLogin, LIVE_SECRETS,
+  loginInput, lookup, MINT_WINDOW_MS, mintInput, requestData, requestInput, REQUESTS_PER_BROWSER, REQUESTS_TOTAL, sameAuthorization, rotationBinding, secretLookup,
+  serviceCredentialInput, serviceSecretInput, successorInput, time } from "./oauth-rules.ts";
 import { AuthorityLost, LastOwner, PrincipalTaken } from "./store/errors.ts";
 import { DEV_SESSION_LABEL, TEAM_POLICIES, type User, type IdpSignIn, type Session, type PrincipalRow, type Team, type TeamPolicy, type TeamMember, type RoleBinding, type RoleAuthority, type RoleRevoke, type MemberAuthority, type MemberRemoval, type ServiceRow, type UsersStore, type SessionsStore, type PrincipalsStore, type TeamsStore, type RolesStore, type ServicesStore } from "./store/identity.ts";
 // The identity groups' row types and interfaces live in store/identity.ts for the Postgres store (#807 P3 C3a);
@@ -2306,7 +2307,8 @@ function oauthOps(db: Database, hosted: HostedStoreOf): OAuthOps {
   // Whether the user exists and is enabled (and, for `service`, is a service principal). `lock` is true in every write
   // that mints for the user (a grant, a code, a browser session, a CLI session, a credential): on Postgres that read
   // takes FOR SHARE on the users row, so a concurrent disable or revoke-all waits for the mint and then sees its row
-  // (postgres-server.md D3). SQLite's single writer already orders the two, so here it only names the call sites.
+  // (C4b adds that form to postgres-server.md D3). SQLite's single writer already orders the two, so here it only
+  // names the call sites.
   const activeUser = (id: number, lock: boolean, kind: "service" | null = null) => {
     void lock;
     return !!(kind === "service"
@@ -2314,7 +2316,7 @@ function oauthOps(db: Database, hosted: HostedStoreOf): OAuthOps {
       : db.query("SELECT 1 FROM users WHERE id = ? AND disabled_at IS NULL").get(id));
   };
   const read = <T>(table: "oauth_requests" | "oauth_browsers" | "oauth_codes", h: string, now: number): T | undefined => {
-    if (!time(now) || !hash(h)) return undefined;
+    if (!lookup(h, now)) return undefined;
     const row = db.query<{ data: string }, [string, number]>(`SELECT data FROM ${table} WHERE hash = ? AND expires_at > ?`).get(h, now);
     return row ? JSON.parse(row.data) as T : undefined;
   };
@@ -2337,7 +2339,7 @@ function oauthOps(db: Database, hosted: HostedStoreOf): OAuthOps {
     endHostedWhere(hosted, db, "revoked", now, row => row.grant_id === id);
   };
   // A credential whose grant is live and whose service is enabled (#270 D2).
-  const liveCredential = (clientId: string, now: number) => typeof clientId !== "string" || !time(now) ? undefined :
+  const liveCredential = (clientId: string, now: number) => !clientLookup(clientId, now) ? undefined :
     db.query<{ id: number; userId: number; grantId: string; source: CredentialSource; tokenSeconds: number }, [string, number]>(`
       SELECT c.id, c.user_id AS userId, c.grant_id AS grantId, c.source, c.token_seconds AS tokenSeconds FROM service_credentials c
       JOIN oauth_grants g ON g.id = c.grant_id JOIN users u ON u.id = c.user_id
@@ -2354,7 +2356,7 @@ function oauthOps(db: Database, hosted: HostedStoreOf): OAuthOps {
   type CodeRow = { data: string; expires_at: number; grant_id: string | null; session_id: number | null };
   const codeRow = (h: string) => db.query<CodeRow, [string]>("SELECT data, expires_at, grant_id, session_id FROM oauth_codes WHERE hash = ?").get(h);
   const presented = (input: OAuthAuthorization & { codeHash: string }, now: number): { c: OAuthCode; row: CodeRow } | OAuthFailure => {
-    if (!time(now) || !hash(input.codeHash)) return invalid;
+    if (!lookup(input.codeHash, now)) return invalid;
     const row = codeRow(input.codeHash);
     if (!row) return missing;
     const c: OAuthCode = JSON.parse(row.data);
@@ -2397,7 +2399,7 @@ function oauthOps(db: Database, hosted: HostedStoreOf): OAuthOps {
         db.run("DELETE FROM oauth_requests WHERE expires_at <= ?", [now]);
         const count = db.query<{ n: number }, [string]>("SELECT COUNT(*) AS n FROM oauth_requests WHERE browser_hash = ?").get(input.browserHash)!.n;
         const total = db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM oauth_requests").get()!.n;
-        if (count >= 10 || total >= 1000) return { status: "capacity" } as const;
+        if (count >= REQUESTS_PER_BROWSER || total >= REQUESTS_TOTAL) return { status: "capacity" } as const;
         db.run("INSERT INTO oauth_requests(hash, browser_hash, expires_at, data) VALUES (?, ?, ?, ?)", [input.requestHash, input.browserHash, input.expiresAt, JSON.stringify(requestData(input))]);
         return ok(input);
       }).immediate();
@@ -2426,7 +2428,7 @@ function oauthOps(db: Database, hosted: HostedStoreOf): OAuthOps {
         if (!activeUser(input.userId, true)) return invalid;
         db.run("DELETE FROM oauth_browsers WHERE expires_at <= ?", [now]);
         const count = db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM oauth_browsers").get()!.n;
-        if (count >= 10000) return { status: "capacity" } as const;
+        if (count >= BROWSER_SESSIONS) return { status: "capacity" } as const;
         if (replaceHash) db.run("DELETE FROM oauth_browsers WHERE hash = ?", [replaceHash]);
         db.run("INSERT INTO oauth_browsers(hash, user_id, expires_at, data) VALUES (?, ?, ?, ?)", [input.sessionHash, input.userId, input.expiresAt, JSON.stringify(browserData(input))]);
         return ok(input);
@@ -2450,7 +2452,7 @@ function oauthOps(db: Database, hosted: HostedStoreOf): OAuthOps {
       }).immediate();
     },
     findCodeScopes(h, clientId, resource, redirectUri, now) {
-      if (!time(now) || !hash(h)) return undefined;
+      if (!lookup(h, now)) return undefined;
       const row = codeRow(h);
       if (!row) return undefined;
       const c: OAuthCode = JSON.parse(row.data);
@@ -2508,7 +2510,7 @@ function oauthOps(db: Database, hosted: HostedStoreOf): OAuthOps {
       }).immediate();
     },
     findRefreshGrant(h, clientId, resource, now) {
-      if (!time(now) || !hash(h)) return undefined;
+      if (!lookup(h, now)) return undefined;
       const row = db.query<{ data: string }, [string, number]>(`
         SELECT g.data FROM oauth_tokens t JOIN oauth_grants g ON g.id = t.grant_id JOIN users u ON u.id = g.user_id
         WHERE t.hash = ? AND t.kind = 'refresh' AND g.revoked_at IS NULL AND g.expires_at > ? AND u.disabled_at IS NULL`).get(h, now);
@@ -2517,7 +2519,7 @@ function oauthOps(db: Database, hosted: HostedStoreOf): OAuthOps {
       return g.clientId === clientId && g.resource === resource ? g : undefined;
     },
     rotateRefresh(input, now) {
-      if (!time(now) || !hash(input.refreshHash)) return invalid;
+      if (!lookup(input.refreshHash, now)) return invalid;
       return db.transaction(() => {
         testPause("oauth:refresh:in-txn");
         const t = token(input.refreshHash);
@@ -2543,7 +2545,7 @@ function oauthOps(db: Database, hosted: HostedStoreOf): OAuthOps {
       }).immediate();
     },
     revokeToken(h, clientId, now) {
-      if (!time(now) || !hash(h)) return;
+      if (!lookup(h, now)) return;
       db.transaction(() => {
         const t = token(h);
         if (!t) return;
@@ -2555,7 +2557,7 @@ function oauthOps(db: Database, hosted: HostedStoreOf): OAuthOps {
       }).immediate();
     },
     findActiveAccess(h, resource, requiredScopes, now) {
-      if (!time(now) || !hash(h) || !Array.isArray(requiredScopes)) return undefined;
+      if (!accessLookup(h, requiredScopes, now)) return undefined;
       // One read snapshot binds token, grant and user liveness.
       // A service credential's source rides the same join (#270 D3), so the cached access carries it. A run token's
       // secret must be live too (a primary-key join, no extra query): on SQLite the secret's revoke revokes its tokens
@@ -2584,8 +2586,9 @@ function oauthOps(db: Database, hosted: HostedStoreOf): OAuthOps {
     revokePreBuiltinGrants(clientIds, now, key = "builtin_clients") {
       if (!time(now)) throw new RangeError("invalid OAuth cutover time");
       return db.transaction(() => {
-        // The key is claimed first (D3): a second run, or on Postgres a second pod booting at once, finds it taken and
-        // returns 0 without revoking or auditing anything. Its value is the time of the first run.
+        // The key is claimed first: a second run, or on Postgres a second pod booting at once, finds it taken and returns
+        // 0 without revoking or auditing anything (C4b adds this form to postgres-server.md D3, with its two-boot row).
+        // Its value is the time of the first run.
         if (!db.query("INSERT INTO server_state(key, value) VALUES (?, ?) ON CONFLICT(key) DO NOTHING RETURNING key").get(key, now)) return 0;
         const ids = JSON.stringify(clientIds);
         // An operator client could use these IDs before #429; its grants and codes must not
@@ -2637,12 +2640,12 @@ function oauthOps(db: Database, hosted: HostedStoreOf): OAuthOps {
         // At most two live secrets (D2), counted in the insert: on Postgres, after the credential row FOR UPDATE (D3).
         const secret = db.query<{ id: number }, [number, string, number, number]>(`INSERT INTO service_credential_secrets(credential_id, hash, created_at)
           SELECT ?1, ?2, ?3 WHERE (SELECT COUNT(*) FROM service_credential_secrets WHERE credential_id = ?1 AND revoked_at IS NULL) < ?4
-          RETURNING id`).get(c.id, secretHash, now, 2);
+          RETURNING id`).get(c.id, secretHash, now, LIVE_SECRETS);
         return secret ? ok({ secretId: secret.id, userId: c.userId }) : { status: "capacity" } as const;
       }).immediate();
     },
     revokeServiceCredential(clientId, now) {
-      if (!time(now) || typeof clientId !== "string") return invalid;
+      if (!clientLookup(clientId, now)) return invalid;
       return db.transaction(() => {
         const c = db.query<{ grant_id: string; user_id: number }, [string]>(`SELECT c.grant_id, c.user_id FROM service_credentials c
           JOIN oauth_grants g ON g.id = c.grant_id WHERE c.client_id = ? AND g.revoked_at IS NULL`).get(clientId);
@@ -2653,7 +2656,7 @@ function oauthOps(db: Database, hosted: HostedStoreOf): OAuthOps {
       }).immediate();
     },
     revokeServiceSecret(secretId, now) {
-      if (!time(now) || !Number.isSafeInteger(secretId)) return invalid;
+      if (!secretLookup(secretId, now)) return invalid;
       return db.transaction(() => {
         const s = db.query<{ credential_id: number; client_id: string; user_id: number; grant_revoked: number | null }, [number]>(`SELECT s.credential_id, c.client_id, c.user_id,
           g.revoked_at AS grant_revoked FROM service_credential_secrets s JOIN service_credentials c ON c.id = s.credential_id
@@ -2682,15 +2685,15 @@ function oauthOps(db: Database, hosted: HostedStoreOf): OAuthOps {
         // SQLite's single writer; at Postgres's READ COMMITTED the counts and the secret check need the credential row
         // FOR UPDATE first, as rotate and both revokes do (postgres-server.md D3).
         // The expiry is the credential's lifetime, clamped to the ceiling and to the grant's expiry.
-        const row = db.query<{ expires_at: number }, [string, number, number, string, string, number, number, number]>(`
+        const row = db.query<{ expires_at: number }, [string, number, number, string, string, number, number, number, number]>(`
           INSERT INTO oauth_tokens(hash, grant_id, kind, expires_at, created_at, access_scopes, secret_id)
           SELECT ?1, g.id, 'access', MIN(?2 + MIN(c.token_seconds, ?3) * 1000, g.expires_at), ?2, ?4, s.id
           FROM service_credentials c JOIN oauth_grants g ON g.id = c.grant_id JOIN users u ON u.id = c.user_id
           JOIN service_credential_secrets s ON s.credential_id = c.id
           WHERE c.client_id = ?5 AND s.id = ?6 AND s.revoked_at IS NULL AND g.revoked_at IS NULL AND g.expires_at > ?2 AND u.disabled_at IS NULL
-            AND (SELECT COUNT(*) FROM oauth_tokens t WHERE t.grant_id = g.id AND t.created_at > ?2 - 60000) < ?7
+            AND (SELECT COUNT(*) FROM oauth_tokens t WHERE t.grant_id = g.id AND t.created_at > ?2 - ?9) < ?7
             AND (SELECT COUNT(*) FROM oauth_tokens t WHERE t.grant_id = g.id AND t.revoked_at IS NULL AND t.expires_at > ?2) < ?8
-          RETURNING expires_at`).get(tokenHash, now, limits.maxSeconds, JSON.stringify(selected), clientId, secretId, limits.mintsPerMinute, limits.unexpired);
+          RETURNING expires_at`).get(tokenHash, now, limits.maxSeconds, JSON.stringify(selected), clientId, secretId, limits.mintsPerMinute, limits.unexpired, MINT_WINDOW_MS);
         if (!row) {
           const live = liveCredential(clientId, now);
           const secret = live && db.query("SELECT 1 FROM service_credential_secrets WHERE id = ? AND credential_id = ? AND revoked_at IS NULL").get(secretId, live.id);

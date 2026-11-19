@@ -108,17 +108,36 @@ describe("OAuth domain store (SQLite only)", () => {
     first.db.exec("DROP TRIGGER fail_refresh");
     expect((await w2(tx => second.repo.oauth.rotateRefresh(tx, next, start + 1))).status).toBe("ok");
   });
-  test("reopen preserves grants, hash-only capabilities, spent-code tombstones and refresh lineage", async () => {
-    const input = await issue();
-    await w1(tx => first.repo.oauth.cleanup(tx, code.expiresAt + 1));
-    second.db.close();
-    second = openDatabase(join(dir, "db.sqlite"), { blobDir: join(dir, "blobs") });
-    expect((await second.repo.oauth.findActiveAccess(second.repo.read, input.tokens.accessHash, binding.resource, binding.scopes, start))?.userId).toBe(userId);
-    expect(await second.repo.oauth.findCodeScopes(second.repo.read, code.codeHash, binding.clientId, binding.resource, binding.redirectUri, code.expiresAt + 1)).toEqual(binding.scopes);
+  test("reopen preserves grants, hash-only capabilities, narrowed access scopes, spent-code tombstones and refresh lineage", async () => {
+    // A grant for both scopes, so a rotation can narrow its access token.
+    const full = ["grayboard:delivery", "grayboard:tools"];
+    request = { ...request, scopes: full };
+    code = { ...code, scopes: full };
+    await issueCode();
+    const input = { ...redemption({ ...pair(), scopes: full }), scopes: full };
+    expect((await w1(tx => first.repo.oauth.redeemCode(tx, input, start))).status).toBe("ok");
+    const later = code.expiresAt + 1;
+    await w1(tx => first.repo.oauth.cleanup(tx, later));
+    const reopen = () => {
+      second.db.close();
+      second = openDatabase(join(dir, "db.sqlite"), { blobDir: join(dir, "blobs") });
+    };
+    reopen();
+    expect((await second.repo.oauth.findActiveAccess(second.repo.read, input.tokens.accessHash, binding.resource, full, start))?.userId).toBe(userId);
+    expect(await second.repo.oauth.findCodeScopes(second.repo.read, code.codeHash, binding.clientId, binding.resource, binding.redirectUri, later)).toEqual(full);
     const serialized = JSON.stringify(first.db.query("SELECT * FROM oauth_tokens").all());
     expect(serialized).toContain(input.tokens.refreshHash);
     expect(serialized).not.toContain(`refresh-${serial}\"`);
-    expect((await w2(tx => second.repo.oauth.rotateRefresh(tx, { ...binding, refreshHash: input.tokens.refreshHash, tokens: pair(start + 1) }, start + 1))).status).toBe("ok");
+    const narrow = { ...binding, refreshHash: input.tokens.refreshHash, tokens: pair(start + 1) };
+    expect((await w2(tx => second.repo.oauth.rotateRefresh(tx, narrow, start + 1))).status).toBe("ok");
+    // The narrowed access scopes and the stable refresh permission are what a fresh connection reads.
+    reopen();
+    expect(await second.repo.oauth.findActiveAccess(second.repo.read, narrow.tokens.accessHash, binding.resource, ["grayboard:delivery"], start + 1)).toBeUndefined();
+    expect((await second.repo.oauth.findActiveAccess(second.repo.read, narrow.tokens.accessHash, binding.resource, ["grayboard:tools"], start + 1))?.scopes).toEqual(["grayboard:tools"]);
+    expect((await second.repo.oauth.findRefreshGrant(second.repo.read, narrow.tokens.refreshHash, binding.clientId, binding.resource, start + 1))?.scopes).toEqual(full);
+    // The spent code's tombstone still replays after the reopen, past the code's expiry and a cleanup.
+    expect((await w2(tx => second.repo.oauth.redeemCode(tx, { ...input, grantId: "grant_replay_0123456789", tokens: { ...pair(later), scopes: full } }, later))).status).toBe("replay");
+    expect(await first.repo.oauth.isGrantActive(first.repo.read, input.grantId, later)).toBe(false);
   });
   test("independent processes serialize simultaneous code and refresh consumption", async () => {
     await issueCode();

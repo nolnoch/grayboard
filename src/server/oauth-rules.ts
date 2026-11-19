@@ -1,6 +1,10 @@
-// The OAuth store's input rules (#807 P3 C4a): the pure checks every OAuthStore backend runs before it touches a row,
-// and the whitelists of what it stores. One copy, imported by the SQLite store (db.ts oauthOps) and the Postgres store
-// (store/pg/oauth.ts): a check missing from both backends is one no contract row can catch, and two copies drift.
+// The OAuth store's input rules (#807 P3 C4a): the pure checks an OAuthStore backend runs before it touches a row,
+// the whitelists of what it stores, and the capacity limits its counts are held to. One copy, imported today by the
+// SQLite store (db.ts oauthOps); C4b's Postgres store adds the second import. A check missing from both backends is one
+// no contract row can catch, and two copies drift.
+// What stays in each backend's SQL, because it reads rows the statement itself locks or writes: user, grant, token and
+// secret liveness (the joins), the counts the limits below bound, and a run token's expiry clamp (mintServiceToken
+// computes it from the credential row inside its INSERT ... SELECT, so the clamp and the bucket see one snapshot).
 // Nothing here reads a database; nothing it imports at runtime reaches bun:sqlite or db.ts (store/pg/isolation.test.ts).
 import { LOGIN_SCOPE, OAUTH_SCOPES } from "./oauth-config.ts";
 import { CREDENTIAL_SOURCES, OAUTH_TTL, SERVICE_TOKEN_MIN_SECONDS, type CredentialSource, type OAuthAuthorization, type OAuthBinding,
@@ -9,6 +13,24 @@ import { CREDENTIAL_SOURCES, OAUTH_TTL, SERVICE_TOKEN_MIN_SECONDS, type Credenti
 // A capability input: a SHA-256 hex digest, never the secret itself.
 export const hash = (s: string) => /^[a-f0-9]{64}$/.test(s);
 export const time = (n: number) => Number.isSafeInteger(n) && n >= 0;
+
+// Capacity, each counted in the write that admits it: pending consent requests per browser and in all, live browser
+// sessions, live secrets per service credential (#270 D2), and the window of a credential's mint bucket (the
+// shortest run-token lifetime, so cleanup never deletes a token the window still counts).
+export const REQUESTS_PER_BROWSER = 10;
+export const REQUESTS_TOTAL = 1000;
+export const BROWSER_SESSIONS = 10_000;
+export const LIVE_SECRETS = 2;
+export const MINT_WINDOW_MS = SERVICE_TOKEN_MIN_SECONDS * 1000;
+
+// Entry guards: what a lookup or a revoke checks of its arguments before it reads anything.
+// A lookup by capability hash at a valid time (a request, browser session, code, token).
+export const lookup = (h: string, now: number) => time(now) && hash(h);
+// findActiveAccess: a lookup whose required scopes are an array (an empty one requires nothing).
+export const accessLookup = (h: string, requiredScopes: string[], now: number) => lookup(h, now) && Array.isArray(requiredScopes);
+// A service credential named by client ID, and a secret by its id.
+export const clientLookup = (clientId: string, now: number) => time(now) && typeof clientId === "string";
+export const secretLookup = (secretId: number, now: number) => time(now) && Number.isSafeInteger(secretId);
 // A record created now that expires after now and within its lifetime.
 export const deadline = (created: number, expiry: number, now: number, ttl: number) =>
   time(now) && created === now && time(expiry) && expiry > now && expiry <= now + ttl;
@@ -80,7 +102,7 @@ export const serviceCredentialInput = (input: { clientId: string; grantId: strin
   (CREDENTIAL_SOURCES as readonly string[]).includes(input.source) && Number.isSafeInteger(input.tokenSeconds) && input.tokenSeconds >= SERVICE_TOKEN_MIN_SECONDS &&
   time(input.expiresAt) && input.expiresAt > now && binding({ clientId: input.clientId, resource: input.resource, scopes: [...OAUTH_SCOPES] });
 export const serviceSecretInput = (input: { clientId: string; secretHash: string }, now: number) =>
-  time(now) && hash(input.secretHash) && typeof input.clientId === "string";
+  clientLookup(input.clientId, now) && hash(input.secretHash);
 // mintServiceToken: a hashed token, canonical scopes within OAUTH_SCOPES, and positive limits.
 export const mintInput = (input: { secretId: number; tokenHash: string; scopes: string[]; limits: ServiceTokenLimits }, now: number) =>
   time(now) && hash(input.tokenHash) && Number.isSafeInteger(input.secretId) && scopes(input.scopes) &&

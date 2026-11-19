@@ -325,10 +325,13 @@ function refresh(it: It): void {
     expect(await h.oauth.findRefreshGrant(h.read, input.tokens.refreshHash, binding.clientId, "wrong", start)).toBeUndefined();
     expect(await h.oauth.findRefreshGrant(h.read, input.tokens.accessHash, binding.clientId, binding.resource, start)).toBeUndefined();
     for (const change of [{ clientId: "foreign" }, { resource: "wrong" }, { scopes: ["grayboard:delivery"] }, { tokens: { ...next.tokens, resource: "wrong" } },
-      { tokens: { ...next.tokens, refreshHash: next.refreshHash } }, { tokens: { ...next.tokens, accessHash: next.refreshHash } }, { refreshHash: input.tokens.accessHash }]) {
-      expect(await status(h.write(tx => h.oauth.rotateRefresh(tx, { ...next, ...change }, start + 1)))).not.toBe("ok");
+      { tokens: { ...next.tokens, refreshHash: next.refreshHash } }, { tokens: { ...next.tokens, accessHash: next.refreshHash } }, { refreshHash: "raw-refresh" }]) {
+      expect(await status(h.write(tx => h.oauth.rotateRefresh(tx, { ...next, ...change }, start + 1)))).toBe("invalid");
       expect(await h.oauth.isGrantActive(h.read, input.grantId, start + 1)).toBe(true);
     }
+    // An access token presented as the refresh token is no refresh token at all.
+    expect(await status(h.write(tx => h.oauth.rotateRefresh(tx, { ...next, refreshHash: input.tokens.accessHash }, start + 1)))).toBe("not_found");
+    expect(await h.oauth.isGrantActive(h.read, input.grantId, start + 1)).toBe(true);
     expect(await status(h.write(tx => h.oauth.rotateRefresh(tx, { ...next, refreshHash: sha("unknown") }, start + 1)))).toBe("not_found");
     const rotated = await h.write(tx => h.oauth.rotateRefresh(tx, next, start + 1));
     expect(rotated).toMatchObject({ status: "ok", value: { grant: { id: input.grantId }, tokens: next.tokens } });
@@ -440,9 +443,34 @@ function access(it: It): void {
     expect(await status(h.write(tx => o.rotateRefresh(tx, { ...binding, refreshHash: input.tokens.refreshHash, tokens: next }, start + 1)))).toBe("ok");
     await h.write(tx => o.revokeToken(tx, input.tokens.refreshHash, binding.clientId, start + 2));
     expect(await o.isGrantActive(h.read, input.grantId, start + 2)).toBe(false);
+    // Revoking a revoked family again resolves and is audited again (RFC 7009: revocation is idempotent).
+    await h.write(tx => o.revokeToken(tx, input.tokens.refreshHash, binding.clientId, start + 2));
     expect(await o.findActiveAccess(h.read, next.accessHash, binding.resource, [], start + 2)).toBeUndefined();
     expect(await status(h.write(tx => o.rotateRefresh(tx, { ...binding, refreshHash: next.refreshHash, tokens: pair(binding, start + 2) }, start + 2)))).toBe("invalid");
-    expect((await h.audits("oauth.revoked")).map(a => a.detail)).toEqual([{ client_id: binding.clientId, kind: "access" }, { client_id: binding.clientId, kind: "refresh" }]);
+    expect((await h.audits("oauth.revoked")).map(a => a.detail)).toEqual([{ client_id: binding.clientId, kind: "access" }, { client_id: binding.clientId, kind: "refresh" },
+      { client_id: binding.clientId, kind: "refresh" }]);
+  });
+
+  // The entry guards (oauth-rules.ts lookup, accessLookup): a bad time or an unhashed capability is refused before any
+  // read, so it can neither find a live row nor reach a replay's or a revoke's write.
+  it("an invalid time or an unhashed capability finds nothing and writes nothing", async h => {
+    const w = await world(h);
+    const input = await w.issue();
+    const o = h.oauth;
+    const bad = -1;
+    expect(await o.findBrowserSession(h.read, w.sessionHash, bad)).toBeUndefined();
+    expect(await o.findCodeScopes(h.read, w.code.codeHash, binding.clientId, binding.resource, binding.redirectUri, bad)).toBeUndefined();
+    expect(await o.findRefreshGrant(h.read, input.tokens.refreshHash, binding.clientId, binding.resource, bad)).toBeUndefined();
+    // In a transaction: a backend's cache in front of the store may answer a hit without the guard.
+    expect(await h.write(tx => o.findActiveAccess(tx, input.tokens.accessHash, binding.resource, [], bad))).toBeUndefined();
+    expect(await status(h.write(tx => o.rotateRefresh(tx, { ...binding, refreshHash: input.tokens.refreshHash, tokens: pair(binding, start + 1) }, bad)))).toBe("invalid");
+    expect(await status(h.write(tx => o.redeemCode(tx, input, bad)))).toBe("invalid");
+    expect(await status(h.write(tx => o.redeemCode(tx, { ...input, codeHash: "raw-code" }, start)))).toBe("invalid");
+    expect(await status(h.write(tx => o.redeemLoginCode(tx, { ...login, codeHash: "raw-code", tokenHash: sha("cli"), label: null }, start)))).toBe("invalid");
+    await h.write(tx => o.revokeToken(tx, input.tokens.refreshHash, binding.clientId, bad));
+    expect(await o.isGrantActive(h.read, input.grantId, start)).toBe(true);
+    expect(await h.audits("oauth.revoked")).toEqual([]);
+    expect(await h.audits("oauth.code_replay_revoked")).toEqual([]);
   });
 
   it("revokeToken then rotateRefresh never resurrects a grant", async h => {
@@ -461,6 +489,9 @@ function access(it: It): void {
     expect(await o.findActiveAccess(h.read, input.tokens.accessHash, binding.resource, ["grayboard:delivery"], start)).toBeUndefined();
     expect(await o.findActiveAccess(h.read, input.tokens.accessHash, binding.resource, [], input.tokens.accessExpiresAt)).toBeUndefined();
     expect(await o.findActiveAccess(h.read, input.tokens.refreshHash, binding.resource, [], start)).toBeUndefined();
+    // Required scopes that aren't an array find nothing, and don't throw.
+    expect(await o.findActiveAccess(h.read, input.tokens.accessHash, binding.resource, "grayboard:tools" as unknown as string[], start)).toBeUndefined();
+    expect(await h.write(tx => o.findActiveAccess(tx, input.tokens.accessHash, binding.resource, "grayboard:tools" as unknown as string[], start))).toBeUndefined();
     expect((await o.findActiveAccess(h.read, input.tokens.accessHash, binding.resource, binding.scopes, start))?.grantId).toBe(input.grantId);
     expect(await o.isGrantActive(h.read, input.grantId, input.grantExpiresAt)).toBe(false);
     // A disabled user's token, grant, refresh and browser session read as dead even before anything is revoked.
@@ -505,17 +536,34 @@ function access(it: It): void {
     await l.issueCode();
     await h.write(tx => h.oauth.createRequest(tx, { ...w.request, requestHash: sha("pending") }, start));
     await h.write(tx => h.oauth.bindRequestSession(tx, sha("pending"), w.request.browserHash, w.sessionHash, start));
+    await h.write(tx => h.oauth.createRequest(tx, { ...w.request, requestHash: sha("unbound") }, start));
     const svc = await h.write(tx => h.services.create(tx, "ingest"));
+    const added = await h.write(tx => h.oauth.addServiceCredential(tx, credential(svc.id), start));
+    if (added.status !== "ok") throw new Error(`addServiceCredential answered ${added.status}`);
+    const codeScopes = () => h.oauth.findCodeScopes(h.read, w.code.codeHash, binding.clientId, binding.resource, binding.redirectUri, start);
+    expect(await codeScopes()).toEqual(binding.scopes);
     await h.disable(w.userId);
     await h.disable(svc.id);
-    const before = { grants: await h.rows("oauth_grants"), codes: await h.rows("oauth_codes"), sessions: await h.rows("sessions"), browsers: await h.rows("oauth_browsers") };
+    const tables = ["oauth_grants", "oauth_codes", "sessions", "oauth_browsers", "oauth_tokens", "service_credentials", "service_credential_secrets"] as const;
+    const snapshot = async () => Promise.all(tables.map(t => h.rows(t)));
+    const before = await snapshot();
+    // The reads a mint starts from see the disable too: an unspent code's scopes, and a bind's browser session.
+    expect(await codeScopes()).toBeUndefined();
+    expect(await status(h.write(tx => h.oauth.bindRequestSession(tx, sha("unbound"), w.request.browserHash, w.sessionHash, start)))).toBe("not_found");
     expect(await status(h.write(tx => h.oauth.createBrowserSession(tx, { sessionHash: sha("fresh"), userId: w.userId, createdAt: start, expiresAt: start + 1000 }, start)))).toBe("invalid");
     expect(await status(h.write(tx => h.oauth.decideRequest(tx, { ...w.decision(), requestHash: sha("pending"), code: { ...w.code, codeHash: sha("fresh-code") } }, start)))).toBe("not_found");
     expect(await status(h.write(tx => h.oauth.redeemCode(tx, w.redemption(), start)))).toBe("invalid");
     expect(await status(h.write(tx => h.oauth.redeemLoginCode(tx, { ...login, codeHash: l.code.codeHash, tokenHash: sha("cli"), label: null }, start)))).toBe("invalid");
-    expect(await status(h.write(tx => h.oauth.addServiceCredential(tx, credential(svc.id), start)))).toBe("invalid");
-    expect({ grants: await h.rows("oauth_grants"), codes: await h.rows("oauth_codes"), sessions: await h.rows("sessions"), browsers: await h.rows("oauth_browsers") }).toEqual(before);
-    expect(await h.rows("service_credentials")).toEqual([]);
+    expect(await status(h.write(tx => h.oauth.addServiceCredential(tx, credential(svc.id, { clientId: `svc_${"b".repeat(32)}`, grantId: "svcgrant_second_0123",
+      secretHash: sha("secret-other") }), start)))).toBe("invalid");
+    // A credential added before the disable: no run token, no new secret, and it reads as gone.
+    expect(await status(h.write(tx => h.oauth.mintServiceToken(tx, { clientId: SVC_CLIENT, secretId: added.value.secretId, tokenHash: sha("run-token"),
+      scopes: [...OAUTH_SCOPES], limits: LIMITS }, start)))).toBe("invalid");
+    expect(await status(h.write(tx => h.oauth.rotateServiceCredential(tx, { clientId: SVC_CLIENT, secretHash: sha("secret-2") }, start)))).toBe("not_found");
+    expect(await h.oauth.findServiceCredential(h.read, SVC_CLIENT, start)).toBeUndefined();
+    expect(await snapshot()).toEqual(before);
+    expect(await h.rows("oauth_tokens")).toEqual([]);
+    expect(await h.rows("service_credential_secrets")).toHaveLength(1);
   });
 }
 
@@ -709,6 +757,7 @@ function serviceCredentials(it: It): void {
     if (second.status !== "ok") throw new Error(`rotate answered ${second.status}`);
     expect(await status(mint(h, secretId, "t1"))).toBe("ok");
     expect(await status(mint(h, second.value.secretId, "t2"))).toBe("ok");
+    expect(await status(h.write(tx => h.oauth.revokeServiceSecret(tx, secretId, -1)))).toBe("invalid");
     expect(await h.write(tx => h.oauth.revokeServiceSecret(tx, secretId, start + 1))).toEqual({ status: "ok", value: { clientId: SVC_CLIENT, userId: svc.id } });
     expect(await h.oauth.findActiveAccess(h.read, sha("t1"), binding.resource, [], start + 1)).toBeUndefined();
     expect((await h.rows("oauth_tokens")).find(t => t.hash === sha("t1"))).toMatchObject({ revoked_at: start + 1 });
@@ -724,6 +773,7 @@ function serviceCredentials(it: It): void {
   it("revokeServiceCredential revokes the grant: the credential, its tokens and its mints are dead", async h => {
     const { svc, secretId } = await added(h);
     expect(await status(mint(h, secretId, "t1"))).toBe("ok");
+    expect(await status(h.write(tx => h.oauth.revokeServiceCredential(tx, 5 as unknown as string, start + 1)))).toBe("invalid");
     expect(await h.write(tx => h.oauth.revokeServiceCredential(tx, SVC_CLIENT, start + 1))).toEqual({ status: "ok", value: { userId: svc.id } });
     expect(await h.oauth.isGrantActive(h.read, credential(svc.id).grantId, start + 1)).toBe(false);
     expect(await h.oauth.findServiceCredential(h.read, SVC_CLIENT, start + 1)).toBeUndefined();
@@ -753,6 +803,7 @@ function serviceCredentials(it: It): void {
     // The bucket: two mints in the minute, then capacity.
     expect(await status(mint(h, secretId, "t2"))).toBe("ok");
     expect(await status(mint(h, secretId, "t3"))).toBe("capacity");
+    expect(await status(mint(h, secretId, "t3", start + 59_999))).toBe("capacity");
     // A minute on, the bucket is clear but three are unexpired: the cap.
     expect(await status(mint(h, secretId, "t3", start + 60_000))).toBe("ok");
     expect(await status(mint(h, secretId, "t4", start + 60_000))).toBe("capacity");
