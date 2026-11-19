@@ -5,13 +5,18 @@
 // the descriptor says so; each keeps its own, stricter where it has one.
 import { expect } from "bun:test";
 import type { ChildProcess } from "node:child_process";
-import { startFakeModel, type FakeModel, type Rule } from "./fake_model.ts";
+import { existsSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import type { Config } from "../../src/server/config.ts";
+import { onChannelDm, startFakeModel, type FakeModel, type Rule } from "./fake_model.ts";
 import { hostedServer, seedGrant, tokenRequests, type HostedServer } from "./hosted_oauth.ts";
-import { answerPeer, expectDeliveryRecords, expectSignInOffer, hostedPeer, hostedRow, leased, ownershipEnded, pingPong, scripted, statusOf, stopAll, toolResultNamed, type Peer, type Pi } from "./pi.ts";
+import { answerPeer, expectDeliveryRecords, expectSignInOffer, hostedPeer, tokenPeer, hostedRow, leased, ownershipEnded, pingPong, scripted, statusOf, stopAll, toolResultNamed, type Peer, type Pi } from "./pi.ts";
 import { grayboardDescendants } from "./procs.ts";
+import { serviceRun } from "./service_token.ts";
 import { until } from "./until.ts";
 
-export type StartOpts = { persist?: boolean; session?: string };
+// `env`: extra environment for the harness process (a static run's launcher variables, BUS_IDENTITY).
+export type StartOpts = { persist?: boolean; session?: string; env?: Record<string, string> };
 
 export type HostedHarness = {
   // "pi" or "omp": its notices and sign-in text name it, and so do the scenarios' bus names.
@@ -62,10 +67,10 @@ export async function named(h: { name: string; version: string }, run: () => Pro
 
 // A server, the fake model (answerPeer first, then `rules`), the peer and the
 // installed extension; `run` starts the harness processes. Everything stops after.
-export function withHosted(h: HostedHarness, dir: string, rules: Rule[], run: (hosted: Hosted) => Promise<void>): Promise<void> {
+export function withHosted(h: HostedHarness, dir: string, rules: Rule[], run: (hosted: Hosted) => Promise<void>, server: Partial<Config> = {}): Promise<void> {
   return named(h, async () => {
     const procs: ChildProcess[] = [];
-    const srv = hostedServer();
+    const srv = hostedServer(server);
     const model = startFakeModel([answerPeer(h.prefix), ...rules]);
     let peer: Peer | undefined;
     try {
@@ -220,4 +225,66 @@ export function hostedRefreshLogoutScenario(h: HostedHarness, dir: string): Prom
     }, 20_000, "both roots restarted signed in");
     await Promise.all([a.quit(), b.quit()]);
   });
+}
+
+// A service run (#1243): the launcher's run token in the environment and
+// BUS_IDENTITY=w-1, no grant store. The harness binds `ingest/w-1` as the
+// service under its svc_ client and takes the lease, a DM from another of the
+// service's sessions (on a second run token from the same credential) starts
+// one turn whose reply goes out as `ingest/w-1`, /grayboard status names the
+// static run and never the token, /grayboard login and logout refuse, and
+// nothing offers a sign-in or opens a browser. Revoking the credential then
+// ends the run: one notice naming the launcher, and the next tool call
+// answers it, with no token request.
+export function hostedStaticScenario(h: HostedHarness, dir: string): Promise<void> {
+  const SVC = "ingest", NAME = `${SVC}/w-1`, SENDER = `${SVC}/sender`;
+  const ended = `grayboard: delivery paused: Signed out of grayboard in ${h.name}; the launcher must start a new run with a fresh run token`;
+  return withHosted(h, dir, [
+    onChannelDm(SENDER, (id) => ({ tool: `${h.prefix}dm_send`, args: { to: SENDER, body: "pong", parent_id: id } })),
+    scripted("check", [{ tool: `${h.prefix}whoami`, args: {} }]),
+  ], async ({ srv, start }) => {
+    const run = await serviceRun(srv, { admin: "root@example.com" });
+    // The service's other session: a cross-account DM stays mail that doesn't wake (#270 open question 7), the service's own wakes.
+    const sender = await tokenPeer(srv, dir, await run.mint(), "sender");
+    // A browser opened anywhere leaves a mark.
+    const opened = join(dir, "opened");
+    for (const opener of ["open", "xdg-open"]) writeFileSync(join(dir, "bin", opener), `#!/bin/sh\necho "$@" >> '${opened}'\n`, { mode: 0o755 });
+    const tokens = tokenRequests(srv);
+    const proc = start({ env: { ...run.env, BUS_IDENTITY: "w-1" } });
+    const state = await proc.command({ type: "get_state" }, h.stateTimeout);
+    await until(() => leased(srv, run.clientId, state.sessionId, "w-1"), 30_000, `leased as ${NAME}`);
+
+    const { message_id: id } = await sender.call("dm_send", { to: NAME, body: "ping w-1" });
+    const reply = await until(() => srv.app.db.query<{ sender: string }, [number]>("SELECT sender FROM messages WHERE parent_id = ? AND body = 'pong'").get(id), 30_000, `pong to DM ${id}`);
+    expect(reply.sender).toBe(NAME);
+    await h.idle(proc);
+
+    const status = await statusOf(proc);
+    expect(status).toContain(`\nsign-in: static run token for service ${SVC} (issuer ${srv.issuer})\n`);
+    const seen = proc.notices().length;
+    await proc.command({ type: "prompt", message: "/grayboard login" });
+    await proc.command({ type: "prompt", message: "/grayboard logout" });
+    await until(() => proc.notices().length >= seen + 2, 5_000, "login and logout answered");
+    expect(proc.notices().slice(seen)).toEqual([
+      `grayboard: this run uses a launcher-set run token (static mode): there's no sign-in here; if it stops working, the launcher must start a new run with a fresh run token`,
+      "grayboard: this run uses a launcher-set run token: nothing to sign out here; the launcher revokes it",
+    ]);
+
+    // The credential's revoke ends the run.
+    await run.revoke();
+    await until(() => proc.notices().includes(ended), 20_000, "the run-ended notice");
+    await proc.command({ type: "prompt", message: "check" });
+    const result = await toolResultNamed(proc, `${h.prefix}whoami`);
+    expect(result.isError).toBe(true);
+    expect(JSON.stringify(result.content)).toContain("the launcher must start a new run with a fresh run token");
+    await h.idle(proc);
+
+    expect(proc.notices().filter(n => n.includes("sign in at") || n.includes("sign-in started"))).toEqual([]);
+    expect(existsSync(opened)).toBe(false);
+    expect(tokens()).toEqual([]);
+    expect(proc.notices().join("\n")).not.toContain(run.token);
+    expect(proc.stderr).not.toContain(run.token);
+    await proc.quit();
+    await sender.close();
+  }, { admins: ["root@example.com"] });
 }

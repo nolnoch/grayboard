@@ -132,9 +132,46 @@ const printable = (text: string) => /^[\x20-\x7e]{1,128}$/.test(text) ? text : "
 const escapeHTML = (text: string) => text.replace(/[&<>"']/g, c => `&#${c.charCodeAt(0)};`);
 const form = (fields: Record<string, string>) => ({ method: "POST", redirect: "error" as const, headers: { "Content-Type": "application/x-www-form-urlencoded", Accept: "application/json" }, body: new URLSearchParams(fields) });
 
-export class Login {
+// A metadata GET, never carrying a token or following a redirect: an
+// outage (unreachable, timeout, 5xx) is ServerUnreachable, any other non-200 a plain Error.
+async function getJson(url: string, timeoutMs: number): Promise<unknown> {
+  let response: Response;
+  try { response = await fetch(url, { headers: { Accept: "application/json" }, redirect: "error", signal: AbortSignal.timeout(timeoutMs) }); }
+  catch (error) { throw new ServerUnreachable(error); }
+  if (response.status >= 500) { await response.body?.cancel(); throw new ServerUnreachable(new Error(`${url} answered HTTP ${response.status}`)); }
+  if (response.status !== 200) { await response.body?.cancel(); throw new Error(`${url} answered HTTP ${response.status}`); }
+  return response.json();
+}
+// RFC 9728 protected-resource metadata for `resource` (canonical), which must
+// name it exactly. Shared by Login's discovery and static mode's issuer pin.
+export async function resourceMetadata(resource: string, timeoutMs: number): Promise<z.infer<typeof ResourceMetadata>> {
+  const r = new URL(resource);
+  const prm = ResourceMetadata.parse(await getJson(`${r.origin}/.well-known/oauth-protected-resource${r.pathname === "/" ? "" : r.pathname}`, timeoutMs));
+  if (prm.resource !== resource) throw new Error(`Protected resource metadata names ${prm.resource}, expected ${resource}`);
+  return prm;
+}
+
+// What HostedClient, RootDelivery and the hosts use of a sign-in: Login (the
+// browser grant) or static.ts's StaticLogin (a launcher-set run token, #1243).
+// `static` is set only on StaticLogin. `stateKey` keys the local delivery
+// lock and session file in place of the built-in client ID.
+export interface SignIn {
+  readonly resource: string;
+  readonly stateKey: string;
+  readonly static?: { issuer?: string; principal?: string; refused?: string };
+  token(): Promise<string>;
+  unauthorized(token: string): Promise<void>;
+  read(): Promise<{ epoch: string } | undefined>;
+  watch(changed: () => void, intervalMs?: number): { dispose(): void };
+  credential(): CredentialPort<Enrollment>;
+  login(signal?: AbortSignal, ifSignedOut?: boolean): Promise<"signed in" | "current">;
+  logout(): Promise<void>;
+}
+
+export class Login implements SignIn {
   readonly resource: string;
   readonly path: string; // <stateDir>/grants/<sha256(resource + "\n" + clientId)>.json
+  get stateKey(): string { return this.config.clientId; }
   private refreshing?: Promise<string>;
   private signingIn?: Promise<"signed in" | "current">;
   constructor(readonly config: LoginConfig) {
@@ -302,21 +339,13 @@ export class Login {
 
   // ---- discovery ----
 
-  private async getJson(url: string, timeoutMs: number): Promise<unknown> {
-    let response: Response;
-    try { response = await fetch(url, { headers: { Accept: "application/json" }, redirect: "error", signal: AbortSignal.timeout(timeoutMs) }); }
-    catch (error) { throw new ServerUnreachable(error); }
-    if (response.status >= 500) { await response.body?.cancel(); throw new ServerUnreachable(new Error(`${url} answered HTTP ${response.status}`)); }
-    if (response.status !== 200) { await response.body?.cancel(); throw new Error(`${url} answered HTTP ${response.status}`); }
-    return response.json();
-  }
   // RFC 8414 metadata for `issuer`, from the resource's origin like every
   // grayboard endpoint (a resource never sends its tokens elsewhere).
   private async serverMetadata(issuer: string, timeoutMs: number): Promise<ServerMetadata> {
     const at = canonicalEndpoint(issuer), origin = new URL(this.resource).origin;
     if (!at) throw new Error("OAuth issuer must be canonical HTTPS (or HTTP loopback), without credentials, query or fragment");
     if (at.origin !== origin) throw new Error(`OAuth issuer ${issuer} is not on ${origin}`);
-    const meta = ServerMetadata.parse(await this.getJson(`${at.origin}/.well-known/oauth-authorization-server${at.pathname === "/" ? "" : at.pathname}`, timeoutMs));
+    const meta = ServerMetadata.parse(await getJson(`${at.origin}/.well-known/oauth-authorization-server${at.pathname === "/" ? "" : at.pathname}`, timeoutMs));
     if (meta.issuer !== issuer) throw new Error(`OAuth metadata names issuer ${meta.issuer}, expected ${issuer}`);
     for (const endpoint of [meta.authorization_endpoint, meta.token_endpoint, meta.revocation_endpoint]) {
       if (new URL(endpoint).origin !== origin) throw new Error(`OAuth endpoint ${endpoint} is not on ${origin}`);
@@ -326,9 +355,7 @@ export class Login {
   // RFC 9728 protected-resource metadata, then the first authorization
   // server's metadata; refuses a server that lacks this harness's client.
   private async discover(): Promise<ServerMetadata> {
-    const r = new URL(this.resource);
-    const prm = ResourceMetadata.parse(await this.getJson(`${r.origin}/.well-known/oauth-protected-resource${r.pathname === "/" ? "" : r.pathname}`, 10_000));
-    if (prm.resource !== this.resource) throw new Error(`Protected resource metadata names ${prm.resource}, expected ${this.resource}`);
+    const prm = await resourceMetadata(this.resource, 10_000);
     const meta = await this.serverMetadata(prm.authorization_servers[0]!, 10_000);
     if (!meta.code_challenge_methods_supported.includes("S256")) throw new Error("OAuth server does not support PKCE S256");
     if (!meta.grayboard_builtin_clients?.includes(this.config.clientId)) throw new ServerOutdated(this.config.harness);

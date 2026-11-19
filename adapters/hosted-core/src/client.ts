@@ -1,7 +1,8 @@
 // One hosted harness session's connection to the server (#444), for every
 // kind of session a harness adapter runs: a root (under root.ts's
 // RootDelivery), and pi/omp's subagent children and unattributed (loose)
-// sessions. The host builds the Login (its sign-in presentation differs);
+// sessions. The host builds the Login (its sign-in presentation differs),
+// or static.ts's StaticLogin for a launcher-set run token (#1243);
 // this holds the rest: the bearer, the wire options every request sends
 // (the generic session key and the declared delivery), the credential watch
 // that says a sign-out once, the one tool-call error wrapper, its tool
@@ -12,7 +13,7 @@
 import type { AuthProvider, CallToolResult } from "@modelcontextprotocol/client";
 import type { Temporary } from "./children.js";
 import { failureMessage } from "./diagnostics.js";
-import type { Login } from "./login.js";
+import type { SignIn } from "./login.js";
 import { accessExpiry } from "./model.js";
 import { CallAborted, failure, ToolProxy, type CallHooks, type NativeTool } from "./proxy.js";
 import type { SessionFacts } from "./port.js";
@@ -26,7 +27,7 @@ export type HostedClientOptions = {
   harness: string;          // "pi" | "omp" | "Claude Code", in messages
   clientId: string;         // the server's built-in client
   version: string;
-  login: Login;             // built by the host: its sign-in presentation differs
+  login: SignIn;            // built by the host: a Login (its sign-in presentation differs) or a StaticLogin (static.ts)
   source: string;           // channel source ("grayboard" | "plugin:grayboard:grayboard")
   loginAction: string;
   resumeHint: string;       // how to restart a paused root (the Controller's pause records)
@@ -73,7 +74,7 @@ export class HostedClient {
     };
   }
 
-  get login(): Login { return this.options.login; }
+  get login(): SignIn { return this.options.login; }
 
   wireOptions(mode: "push" | "poll"): WireOptions {
     return { url: this.login.resource, sessionKey: GRAYBOARD_SESSION_META, client: { name: this.options.clientId, version: this.options.version }, delivery: { mode, source: this.options.source }, ...(this.options.launcher ? { launcher: true as const } : {}), ...(this.options.facts ? { facts: this.facts } : {}), ...(this.options.suggested ? { suggested: this.options.suggested } : {}) };

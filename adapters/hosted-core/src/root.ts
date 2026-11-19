@@ -100,7 +100,7 @@ export class RootDelivery {
   private log(text: string, level: "info" | "warning" | "error") {
     if (!this.done) this.client.options.log(text, level);
   }
-  private path() { return deliveryPath(this.o.stateDir, this.client.login.resource, this.client.options.clientId, this.o.sessionID); }
+  private path() { return deliveryPath(this.o.stateDir, this.client.login.resource, this.client.login.stateKey, this.o.sessionID); }
   // An unreadable store leaves the epoch unknown, so the sink may take a
   // later pause for a credential change and drop it: said once per root.
   private async epoch() {
@@ -246,7 +246,7 @@ export class RootDelivery {
     return {
       harness: c.harness, resumeHint: c.resumeHint, loginAction: c.loginAction, sessionKey: wire.sessionKey,
       client: wire.client, delivery: wire.delivery!, ...(wire.launcher ? { launcher: true as const } : {}), ...(wire.facts ? { facts: wire.facts } : {}), ...(wire.suggested ? { suggested: wire.suggested } : {}),
-      storage: new FileStorage(sessionPath(this.o.stateDir, this.client.login.resource, c.clientId, id)),
+      storage: new FileStorage(sessionPath(this.o.stateDir, this.client.login.resource, this.client.login.stateKey, id)),
       place: this.o.place,
       // This root, or a child a host call passed (Claude Code's subagents, #551);
       // any other session is refused.
