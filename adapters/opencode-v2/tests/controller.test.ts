@@ -1456,6 +1456,28 @@ test.each([["rate_limited"], ["internal_error"]])("static mode retries an auto-e
     expect(s.asked).toHaveLength(2);
   } finally { await s.restore(); }
 });
+// An HTTP 429 that outlasted the wire's own admission retries reaches auto-enroll as the SDK's error: an outage too.
+test("static mode retries an auto-enroll whose whoami met an HTTP 429", async () => {
+  let failures = 1;
+  const s = await staticRuntime("service", undefined, undefined, () => { if (failures-- > 0) throw new SdkHttpError(SdkErrorCode.ClientHttpFailedToOpenStream, "Too Many Requests", { status: 429 }); });
+  try {
+    await s.r.controller.observe("session.created", { sessionID: "R" });
+    expect(rootRecord(s.r.controller, "R")).toMatchObject({ state: "retrying" });
+    await until(() => s.r.controller.enrollment("R"), 5000, "the retry enrolls R");
+  } finally { await s.restore(); }
+});
+// The pin check classifies its own fetch's failures, so a plugin wire's token (Binding.check) reports a timeout as
+// the server unreachable, which the core's outage paths match, never as an unclassified error.
+test.each([
+  ["a timeout", () => { throw new DOMException("The operation timed out.", "TimeoutError"); }],
+  ["a refused connection", () => { throw networkError(); }],
+] as const)("static mode: the pin check reports %s as ServerUnreachable", async (_name, outage) => {
+  const s = await staticRuntime("service");
+  globalThis.fetch = (async () => outage()) as unknown as typeof fetch;
+  try {
+    expect(await s.r.controller.binding.capture("R").then(() => undefined, (error: unknown) => error)).toBeInstanceOf(ServerUnreachable);
+  } finally { await s.restore(); }
+});
 test("static mode: whoami's other isError answers stand as not a service token", async () => {
   const s = await staticRuntime("service", undefined, undefined, () => ({ content: [{ type: "text", text: "error: forbidden" }], structuredContent: { code: "forbidden" }, isError: true }));
   try {
