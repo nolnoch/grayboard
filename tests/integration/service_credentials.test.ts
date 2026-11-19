@@ -526,6 +526,10 @@ describe("sessions", () => {
     const alice = await srv.hosted(A, "fe", { delivery: false });
     expect(await refusedText(alice.call("delegate", { persona: "p", task: "t" }))).toStartWith("no live launcher session (a session started with BUS_LAUNCHER=1) and no reachable human");
     expect(await refusedText(alice.call("delegate", { persona: "p", task: "t", to: `${SVC}/lx` }))).toBe(`no agent "${SVC}/lx" has ever connected; peer_list shows exact handles`);
+    // An invoker sees the service's names, so the refusal comes from the delegation rule, not visibility: by name or raw ID.
+    expect((await api(root, "POST", "/api/admin/roles/grant", { role: "service_invoke", principal: A, scope: SVC })).status).toBe(201);
+    expect(await refusedText(alice.call("delegate", { persona: "p", task: "t", to: `${SVC}/lx` }))).toContain("a service and a user can't delegate");
+    expect(await refusedText(alice.call("delegate", { persona: "p", task: "t", to: hostedSessionId(svcId, c.client_id, lx.sessionId) }))).toContain("a service and a user can't delegate");
     // Another service's session is refused too: no team grant reaches a service.
     expect((await api(root, "POST", "/api/admin/services", { name: "other", owners: [A] })).status).toBe(201);
     const oc = await api(root, "POST", "/api/admin/services/credentials", { service: "other" });
