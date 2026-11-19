@@ -175,11 +175,11 @@ export interface ServicesStore {
   orphanedBy(r: Read, userId: number): Promise<string[]>;
 }
 
-// The groups as the Postgres store implements them in C3: users.setDisabled and sessions.revokeAllForUser port with
-// the hosted and OAuth stores (C8), users.isDisabled and users.active with the auth cache (C9).
+// The groups as the Postgres store implements them: users.setDisabled and sessions.revokeAllForUser came with the OAuth
+// store (C4b); users.isDisabled and users.active port with the auth cache (C9).
 export type IdentityGroups = {
-  users: Omit<UsersStore, "setDisabled" | "isDisabled" | "active">;
-  sessions: Omit<SessionsStore, "revokeAllForUser">;
+  users: Omit<UsersStore, "isDisabled" | "active">;
+  sessions: SessionsStore;
   principals: PrincipalsStore;
   teams: TeamsStore;
   roles: RolesStore;

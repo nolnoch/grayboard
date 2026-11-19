@@ -58,7 +58,7 @@ function pgModules(): string[] {
 test("no non-test module under src/server/store/pg/ reaches bun:sqlite or the SQLite store, even transitively", () => {
   const roots = pgModules();
   // The scan sees this directory's modules (a scan that read nothing would pass vacuously).
-  expect(roots.map(p => relative(import.meta.dir, p))).toEqual(expect.arrayContaining(["errors.ts", "identity.ts", "migrate.ts", "sql.ts", "tx.ts"]));
+  expect(roots.map(p => relative(import.meta.dir, p))).toEqual(expect.arrayContaining(["audit_row.ts", "errors.ts", "hosted_port.ts", "identity.ts", "migrate.ts", "oauth.ts", "sql.ts", "tx.ts"]));
   expect(forbiddenReach(roots)).toEqual([]);
 });
 
@@ -74,6 +74,10 @@ test("the walk follows relative imports and skips type-only ones", () => {
   expect(forbiddenReach([join(import.meta.dir, "identity.ts")])).toEqual([]);
   // The OAuth input rules both stores run (#807 P3 C4a): pg/oauth.ts imports them, so they reach neither.
   expect(forbiddenReach([join(SRC, "server/oauth-rules.ts")])).toEqual([]);
+  // The Postgres OAuth store (#807 P3 C4b) and what it reaches beyond the rules: oauth-config.ts (the scopes) and the
+  // audit row's request_context.ts.
+  expect(forbiddenReach([join(SRC, "server/oauth-config.ts")])).toEqual([]);
+  expect(forbiddenReach([join(import.meta.dir, "oauth.ts")])).toEqual([]);
   expect(runtimeImports(`import type { X } from "../tx.ts";\nexport type { Y } from "../db.ts";`)).toEqual([]);
   expect(runtimeImports(`import {\n  a,\n  b,\n} from "../tx.ts";\nexport { c } from "./d.ts";\nimport "./e.ts";\nconst f = await import("../db.ts");`))
     .toEqual(["../tx.ts", "./d.ts", "./e.ts", "../db.ts"]);

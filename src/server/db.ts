@@ -2307,8 +2307,8 @@ function oauthOps(db: Database, hosted: HostedStoreOf): OAuthOps {
   // Whether the user exists and is enabled (and, for `service`, is a service principal). `lock` is true in every write
   // that mints for the user (a grant, a code, a browser session, a CLI session, a credential): on Postgres that read
   // takes FOR SHARE on the users row, so a concurrent disable or revoke-all waits for the mint and then sees its row
-  // (C4b adds that form to postgres-server.md D3). SQLite's single writer already orders the two, so here it only
-  // names the call sites.
+  // (postgres-server.md D3, the disable and revoke-all row; src/server/store/pg/oauth.ts). SQLite's single writer
+  // already orders the two, so here it only names the call sites.
   const activeUser = (id: number, lock: boolean, kind: "service" | null = null) => {
     void lock;
     return !!(kind === "service"
@@ -2587,7 +2587,7 @@ function oauthOps(db: Database, hosted: HostedStoreOf): OAuthOps {
       if (!time(now)) throw new RangeError("invalid OAuth cutover time");
       return db.transaction(() => {
         // The key is claimed first: a second run, or on Postgres a second pod booting at once, finds it taken and returns
-        // 0 without revoking or auditing anything (C4b adds this form to postgres-server.md D3, with its two-boot row).
+        // 0 without revoking or auditing anything (postgres-server.md D3, the boot cutover row; pg/oauth.pg.test.ts T-C4-10).
         // Its value is the time of the first run.
         if (!db.query("INSERT INTO server_state(key, value) VALUES (?, ?) ON CONFLICT(key) DO NOTHING RETURNING key").get(key, now)) return 0;
         const ids = JSON.stringify(clientIds);
