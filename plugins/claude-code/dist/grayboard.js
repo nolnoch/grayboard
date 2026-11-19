@@ -36871,8 +36871,8 @@ class Controller {
     await wire.connect();
     return wire;
   }
-  async temporary(e, call, sessionID = e.sessionID) {
-    const wire = await this.wire(e, sessionID);
+  async temporary(e, call, sessionID = e.sessionID, stop) {
+    const wire = await this.wire(e, sessionID, stop && AbortSignal.any([AbortSignal.timeout(1e4), stop]));
     try {
       return await call(wire);
     } finally {
@@ -36928,7 +36928,7 @@ class Controller {
             for (const name of names)
               await w.call("bind", { name, create, where: this.port.place() });
             await this.guard(r, epoch, signal);
-          });
+          }, sessionID, this.closing.signal);
           bound = true;
         }
         await this.rotated({ spent: 0 }, () => this.prepare(r, !!previous?.paused && !names.length));
@@ -37065,7 +37065,7 @@ class Controller {
         if (waitForStart)
           await started;
       }
-    });
+    }, r.e.sessionID, this.closing.signal);
   }
   start(r) {
     if (r.task || r.paused || this.stopped || this.ending.has(r.e.sessionID))

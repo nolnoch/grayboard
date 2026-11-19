@@ -117,8 +117,9 @@ export class Controller<E extends Enrollment = Enrollment> {
   // Sessions a shutdown has begun for: treated like `stopped`, per session,
   // since one Controller may run several roots (OpenCode V2).
   private readonly ending = new Set<string>();
-  // Aborted by close: ends a wait outside any root's run loop (a restore's rotation grace).
-  private readonly closing = new AbortController();
+  // Aborted by close: ends a wait outside any root's run loop (a restore's rotation grace) and an
+  // enroll's or prepare's wire (#1294). A subclass whose close waits on its own work first aborts it then.
+  protected readonly closing = new AbortController();
   private drifted = false;
   private controls: Promise<unknown> = Promise.resolve();
   private state: Status;
@@ -318,8 +319,9 @@ export class Controller<E extends Enrollment = Enrollment> {
     await wire.connect();
     return wire;
   }
-  private async temporary<T>(e: E, call: (wire: Wire) => Promise<T>, sessionID = e.sessionID) {
-    const wire = await this.wire(e, sessionID);
+  // `stop` ends the wire before its timeout: close, for a start's wire; a release's or session end's has none.
+  private async temporary<T>(e: E, call: (wire: Wire) => Promise<T>, sessionID = e.sessionID, stop?: AbortSignal) {
+    const wire = await this.wire(e, sessionID, stop && AbortSignal.any([AbortSignal.timeout(10_000), stop]));
     try { return await call(wire); } finally { await wire.close().catch(error => this.failure("wire_close", error)); }
   }
   // A 403 insufficient_scope needs a new sign-in exactly like an ended grant;
@@ -365,7 +367,7 @@ export class Controller<E extends Enrollment = Enrollment> {
           await this.guard(r, epoch, signal);
           for (const name of names) await w.call("bind", { name, create, where: this.port.place() });
           await this.guard(r, epoch, signal);
-        });
+        }, sessionID, this.closing.signal);
         bound = true;
       }
       await this.rotated({ spent: 0 }, () => this.prepare(r, !!previous?.paused && !names.length));
@@ -492,7 +494,7 @@ export class Controller<E extends Enrollment = Enrollment> {
         const started = this.start(r);
         if (waitForStart) await started;
       }
-    });
+    }, r.e.sessionID, this.closing.signal);
   }
   private start(r: Root<E>) {
     if (r.task || r.paused || this.stopped || this.ending.has(r.e.sessionID)) return;
