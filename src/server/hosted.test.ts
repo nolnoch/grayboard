@@ -2446,6 +2446,22 @@ test("#807 P3 C8a audit: register on an unknown root takes the capacity lock and
   expect(seamAt(calls, "counts"), order(calls)).toBeGreaterThan(reread);
 });
 
+test("#807 P3 C8b2: register that creates its root and converts an existing root locks that root before any capacity lock", async () => {
+  const root = hostedId("seam-new-root"), child = hostedId("seam-old-root");
+  await hosted.whoami(principal, context("seam-old-root"));
+  const seams = seamCalls();
+  try { await hosted.register(principal, context("seam-new-root"), "seam-old-root"); } finally { seams.restore(); }
+  const { calls } = seams, body = seamAt(calls, "grantLive"), capacity = seamAt(calls, "lockCapacity", undefined, body);
+  // The path: rowFor creates the root under the capacity lock, then the old root is ended and inserted as its child.
+  expect(seamAt(calls, "insert", root, body), order(calls)).toBeGreaterThan(capacity);
+  expect(seamAt(calls, "end", child, body), order(calls)).toBeGreaterThan(capacity);
+  expect(seamAt(calls, "insert", child, body), order(calls)).toBeGreaterThan(seamAt(calls, "end", child, body));
+  // The lock order (store/hosted.ts): grant, root, child, capacity.
+  const lockedChild = seamAt(calls, "lock", child, body);
+  expect(lockedChild, order(calls)).toBeGreaterThan(body);
+  expect(lockedChild, order(calls)).toBeLessThan(capacity);
+});
+
 test("#807 P3 C8a: delivery's renew, receipt and release lock the row before they read it; a tool call's fence in its body locks it", async () => {
   const id = hostedId("seam-lease");
   await hosted.bind(principal, context("seam-lease"), { name: "seam-dl", create: true });
