@@ -99,6 +99,17 @@ export function unreachable(error: unknown): boolean {
   return false;
 }
 
+// Whether `error` is `signal`'s abort, by cause rather than timing (#1309): the reason itself, however deep a
+// wrapper nested it (fetch and the SDK's requests rethrow it), or the SDK's restatement of it (an aborted wait
+// or pre-check becomes a RequestTimeout SdkError carrying the reason's text).
+export function abortOf(error: unknown, signal: AbortSignal): boolean {
+  if (!signal.aborted) return false;
+  for (let e = error, depth = 0; e && depth < 8; e = (e as { cause?: unknown }).cause, depth++) {
+    if (e === signal.reason || e instanceof SdkError && e.code === SdkErrorCode.RequestTimeout && e.message === String(signal.reason)) return true;
+  }
+  return false;
+}
+
 const connectMethods = new Set(["server/discover", "initialize"]);
 async function methodOf(request: Request): Promise<string | undefined> {
   if (request.method !== "POST") return;
