@@ -132,11 +132,13 @@ export class Controller<E extends Enrollment = Enrollment> {
   }
   private startStop(sessionID: string) { return AbortSignal.any([this.closing.signal, this.endOf(sessionID).signal]); }
   // A start that failed because close or the session's shutdown stopped it says so, with no failure code: its
-  // error is that stop's abort, or the controller's own refusal of a stopping start. Any other error that
-  // merely lands once the stop began (a sign-in refusal) keeps its failure and code (#1309).
+  // error is that stop's abort, or the controller's own refusal of a stopping start, or (after close) an access
+  // token the host is still rotating, which `rotated` rethrows when close cuts its grace short: not yet a
+  // failure. Any other error that merely lands once the stop began (a sign-in refusal) keeps its code (#1309).
   private stoppedBy(sessionID: string, error: unknown) {
     if (!this.stopped && !this.ending.has(sessionID)) return false;
-    return abortOf(error, this.closing.signal) || abortOf(error, this.endOf(sessionID).signal) || error instanceof Refusal && error.code === "paused";
+    return abortOf(error, this.closing.signal) || abortOf(error, this.endOf(sessionID).signal) || error instanceof Refusal && error.code === "paused"
+      || this.stopped && accessExpiry(error)?.reason === "expired";
   }
   private drifted = false;
   private controls: Promise<unknown> = Promise.resolve();

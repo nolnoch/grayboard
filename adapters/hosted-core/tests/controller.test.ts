@@ -403,6 +403,21 @@ test.each(modes.flatMap(mode => (["enroll", "enroll with a name", "resume"] as c
   await stopping;
   await c.close();
 });
+// #1309 audit M-1: an access token the host is rotating (#472) is retried on the rotation grace's polls; a close that
+// ends the grace rethrows the pending expiry. That expiry was never a failure: the start records a stop, not a sign-out.
+test.each(modes.flatMap(mode => (["enroll", "resume"] as const).map(how => [mode, how] as const)))("a close during a start's rotation grace records a stop, not a sign-out (#1309, %s, %s)", async (mode, how) => {
+  const r = runtime(mode);
+  if (how === "resume") { await r.controller.enroll("R", ["be"], true); await until(() => r.root(r.controller)?.state === "active"); await r.controller.close(); }
+  let closing: Promise<void> | undefined, waits = 0;
+  const c: Controller = r.make({ wait: async () => { waits++; closing ??= c.close(); } });
+  r.expireAccess("expired");
+  await (how === "resume" ? c.resume("R") : c.enroll("R"));
+  expect(waits).toBe(1);
+  expect(r.root(c)?.message).toMatch(/stopped before delivery opened/i);
+  expect(r.root(c)?.code).toBeUndefined();
+  expect(r.root(c)?.failure).toBeUndefined();
+  await closing;
+});
 // #1294 audit M-1: pi, omp and the Claude Code plugin stop through RootDelivery, which shuts the session down
 // (queued behind the start) before it closes: the shutdown itself ends the start's wire, and its release still runs.
 test.each(modes.flatMap(mode => (["enroll", "enroll with a name", "resume"] as const).map(how => [mode, how] as const)))("shutdown then close ends a start's wire still connecting at once and still releases (#1294, %s, %s)", async (mode, how) => {

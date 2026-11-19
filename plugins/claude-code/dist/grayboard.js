@@ -36685,7 +36685,7 @@ class Controller {
   stoppedBy(sessionID, error) {
     if (!this.stopped && !this.ending.has(sessionID))
       return false;
-    return abortOf(error, this.closing.signal) || abortOf(error, this.endOf(sessionID).signal) || error instanceof Refusal && error.code === "paused";
+    return abortOf(error, this.closing.signal) || abortOf(error, this.endOf(sessionID).signal) || error instanceof Refusal && error.code === "paused" || this.stopped && accessExpiry(error)?.reason === "expired";
   }
   drifted = false;
   controls = Promise.resolve();

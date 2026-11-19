@@ -3,7 +3,7 @@
 // revision, the server's own status and body for a refusal at initialize, and
 // a scope refusal classified for a new sign-in.
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { ConnectRefused, DELIVERY_META, EFFORT_META, InsufficientScope, LAUNCHER_META, MODEL_META, NativeWire, SERVER_TEXT_LIMIT, SUGGESTED_META, Wire, type WireOptions } from "../../adapters/hosted-core/src/wire.ts";
+import { abortOf, ConnectRefused, DELIVERY_META, EFFORT_META, InsufficientScope, LAUNCHER_META, MODEL_META, NativeWire, SERVER_TEXT_LIMIT, SUGGESTED_META, Wire, type WireOptions } from "../../adapters/hosted-core/src/wire.ts";
 import { GRAYBOARD_DELIVERY_META, GRAYBOARD_EFFORT_META, GRAYBOARD_LAUNCHER_META, GRAYBOARD_MODEL_META, GRAYBOARD_SESSION_META, GRAYBOARD_SUGGESTED_META } from "../../src/shared/session_meta.ts";
 import { issueOAuth } from "../helpers/oauth.ts";
 import { TestServer } from "../support/server.ts";
@@ -178,4 +178,19 @@ test("server-supplied error text is capped at connect and on a call", async () =
     expect(refusal.message.length).toBeLessThan(SERVER_TEXT_LIMIT + 100);
     expect(refusal.message).toContain("more characters cut");
   } finally { proxy.stop(true); }
+});
+
+// #1309: a start's stop aborts its wire's signal; the SDK restates an aborted call as a RequestTimeout carrying only
+// the reason's text, so the Controller's abortOf must still read it as that stop. Pins the restatement on the real SDK.
+test.each(["whoami", "bind"] as const)("an aborted %s on a real wire is its stop's abort (#1309)", async name => {
+  const token = await issue(), stop = new AbortController();
+  const wire = new Wire(options(), { token: async () => token }, AbortSignal.any([AbortSignal.timeout(10_000), stop.signal]), "raw-root");
+  wires.push(wire);
+  await wire.connect();
+  const pending = wire.call(name, name === "bind" ? { name: "be", create: true } : {}).then(() => undefined, e => e);
+  stop.abort();
+  const error = await pending;
+  expect(error).toBeDefined();
+  expect(abortOf(error, stop.signal)).toBe(true);
+  expect(abortOf(error, new AbortController().signal)).toBe(false);
 });
