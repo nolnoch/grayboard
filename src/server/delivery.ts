@@ -155,7 +155,9 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
         const kept = reuse();
         if (kept) return kept;
         // The session's facts on this transaction (#807 P3 A7g1), so `committed` builds it without reading. The
-        // lease map is read again after the await: a close can change it meanwhile (D4's exception).
+        // lease map is read again after the await: a close (finish, outside the queue) can drop `previous` meanwhile
+        // (D4's exception). No lease can appear: only an open's `committed` adds one, and it runs inside the queue this
+        // body holds, so the re-read never reuses; it stays as a guard should that ever change (#1188).
         const facts = await application.hostedBuildFacts(tx, p.authed, row.session_id, { holds, writesAs: null, suggested: row.suggested, root: null });
         const again = reuse();
         if (again) return again;
