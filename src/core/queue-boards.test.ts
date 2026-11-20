@@ -731,6 +731,23 @@ describe("a take follows its taking session while it is live (#1351)", () => {
     expect(replies(r.post.id)).toEqual([unclaimed(key, 2)]);
   });
 
+  test("rename: the alias a session took a post as and then released isn't offered it again as a lane of its own", () => {
+    db.prepare(`DELETE FROM subscriptions WHERE handle = 'sim'`).run();
+    holdAlias(db, "x", A, 100);
+    holdAlias(db, "y", A, 101);
+    subscribe(db, "x", "work", "push");
+    subscribe(db, "y", "work", "push");
+    const r = post(db, "be", "work", "@x take this", null, said);
+    const key = claimKey(r.post.id);
+    expect(holders(key)).toEqual(["x"]);
+    db.prepare(`DELETE FROM alias_holds WHERE address = 'x'`).run(); // A is live as y; x, unheld, is still a lane
+    expect(lanes()).toEqual(["x", "y"]);
+    lapse();
+    // Neither x (the alias A took it as) nor y (A's other lane) gets it back.
+    expect(holders(key)).toEqual([]);
+    expect(replies(r.post.id)).toEqual([unclaimed(key, 1)]);
+  });
+
   for (const sub of ["z", "y"]) {
     test(`move: an alias that moved to another live session doesn't take its turn (subscribed as ${sub === "z" ? "its primary" : "a non-primary alias"})`, () => {
       db.prepare(`DELETE FROM subscriptions WHERE handle = 'sim'`).run();

@@ -1049,8 +1049,11 @@ export function redeliveryFacts(db: Database, key: string, prevHolder: string): 
   const p = getPost(db, Number(m[2]));
   if (!b || !p || p.board !== b.name) return null;
   // Each take, session-keyed or address-keyed (#1351, liveSessionSql): a session-keyed take was its taking session's
-  // turn, which held gets as that session's addresses now (its ID and the aliases it holds), never as the raw handle:
-  // that alias may be another session's now, and that session still gets its turn. An address-keyed take (from before
+  // turn, which held gets as that session's addresses now (its ID and the aliases it holds), and as its raw handle
+  // only while no other session holds it: an alias another session holds now leaves that session its turn, but an
+  // unheld one is still a lane (a subscription under it) that the taking session would get the post back through. A
+  // live session reopened after its name's successor bound (a server's reopenId) takes its rows back from the
+  // successor, so the successor can get one more turn; accepted, as a reopen after a rebind is rare. An address-keyed take (from before
   // #1351, under an alias no session held, or by a session that has ended) maps through who holds its handle now
   // (#219, #1174), so a restarted session that rebound the name has had its predecessor's turn.
   const takes = db.prepare(
@@ -1061,12 +1064,15 @@ export function redeliveryFacts(db: Database, key: string, prevHolder: string): 
   const addressKeyed = new Set<string>();
   const sessions = new Set<string>();
   const addressesOf = db.prepare(`SELECT address FROM ${laneAddressesSql("?1")}`);
+  const sessionOf = db.prepare(`SELECT ${laneSessionSql("?1")} AS sid`);
   for (const t of takes) {
     if (t.sid === null) {
       addressKeyed.add(t.handle);
       continue;
     }
     sessions.add(t.sid);
+    const holder = (sessionOf.get(t.handle) as { sid: string }).sid;
+    if (holder === t.handle || holder === t.sid) held.add(t.handle);
     for (const r of addressesOf.all(t.sid) as { address: string }[]) held.add(r.address);
   }
   // The claim's last holder, as today's address rule maps it, unless a take row already speaks for its handle: then
@@ -1075,7 +1081,6 @@ export function redeliveryFacts(db: Database, key: string, prevHolder: string): 
   // A lane is its session as of now: a take as its ID or any alias it holds was its turn, whichever of them
   // queueLanes names it by (its primary, its ID, or the alias it subscribed as). The `[unclaimed]` reply counts
   // sessions, where known: a handle no session holds counts as itself.
-  const sessionOf = db.prepare(`SELECT ${laneSessionSql("?1")} AS sid`);
   for (const h of addressKeyed) {
     held.add(h);
     sessions.add((sessionOf.get(h) as { sid: string }).sid);
