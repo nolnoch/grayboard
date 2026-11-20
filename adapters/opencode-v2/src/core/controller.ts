@@ -258,7 +258,7 @@ export class Controller<E extends Enrollment = Enrollment> {
   async enlist(path: SessionPath, fetch = false): Promise<void> {
     const r = this.roots.get(path.root), live = !!r && !r.paused, releases = r?.released ?? 0, epoch = r?.epoch;
     const e = r?.e ?? await this.port.credential.capture(path.root);
-    const call: Temporary = (sessionID, c) => this.temporary(e, c, sessionID);
+    const call: Temporary = (sessionID, c, ending) => this.temporary(e, c, sessionID, undefined, ending);
     const shared = () => {
       const known = r && this.registered.get(path.sessionID);
       return known && known.r === r && known.epoch === r.epoch && (!known.settled || known.ownership !== undefined && known.ownership === r.lease?.ownership) ? known.done : undefined;
@@ -359,9 +359,9 @@ export class Controller<E extends Enrollment = Enrollment> {
   private wireOptions(e: E): WireOptions {
     return { url: e.configuration.url, sessionKey: this.port.sessionKey, client: this.port.client, ...(this.port.delivery ? { delivery: this.port.delivery } : {}), ...(this.port.launcher ? { launcher: true as const } : {}), ...(this.port.facts ? { facts: (id: string) => this.port.facts!(id) } : {}), ...(this.port.suggested ? { suggested: (id: string) => this.port.suggested!(id) } : {}) };
   }
-  private async wire(e: E, sessionID = e.sessionID, signal = AbortSignal.timeout(10_000), beforeRetry?: () => Promise<void>) {
+  private async wire(e: E, sessionID = e.sessionID, signal = AbortSignal.timeout(10_000), beforeRetry?: () => Promise<void>, ending = false) {
     let current: string | undefined;
-    const wire = new this.Transport(this.wireOptions(e), {
+    const wire = new this.Transport({ ...this.wireOptions(e), ...(ending ? { ending: true as const } : {}) }, {
       token: async () => (current = await this.port.credential.token(e)),
       onUnauthorized: async () => this.port.credential.unauthorized(e, current ?? ""),
     }, signal, sessionID, beforeRetry);
@@ -369,8 +369,9 @@ export class Controller<E extends Enrollment = Enrollment> {
     return wire;
   }
   // `stop` ends the wire before its timeout: close, for a start's wire; a release's or session end's has none.
-  private async temporary<T>(e: E, call: (wire: Wire) => Promise<T>, sessionID = e.sessionID, stop?: AbortSignal) {
-    const wire = await this.wire(e, sessionID, stop && AbortSignal.any([AbortSignal.timeout(10_000), stop]));
+  // `ending`: the wire only ends its session (a release, a session end), so its connect admits nothing (#1099).
+  private async temporary<T>(e: E, call: (wire: Wire) => Promise<T>, sessionID = e.sessionID, stop?: AbortSignal, ending = false) {
+    const wire = await this.wire(e, sessionID, stop && AbortSignal.any([AbortSignal.timeout(10_000), stop]), undefined, ending);
     try { return await call(wire); } finally { await wire.close().catch(error => this.failure("wire_close", error)); }
   }
   // A start's failure that only a sign-in (or, in static mode, a new run) fixes pauses its root, as the run loop's
@@ -771,7 +772,7 @@ export class Controller<E extends Enrollment = Enrollment> {
     await this.temporary(r.e, async wire => {
       if (lease) { wire.capability = lease.capability; await wire.call("delivery_release").catch(error => this.failure("delivery_release", error, r)); }
       await wire.call("session_end");
-    });
+    }, r.e.sessionID, undefined, true);
   }
   async pause(message = `Ownership ended; ${this.hint}`) { return this.serial(async () => {
     for (const r of this.roots.values()) {
@@ -815,7 +816,7 @@ export class Controller<E extends Enrollment = Enrollment> {
   private async endUnowned(sessionID: string) {
     try {
       const e = await this.port.credential.capture(sessionID);
-      await this.temporary(e, wire => wire.call("session_end"));
+      await this.temporary(e, wire => wire.call("session_end"), e.sessionID, undefined, true);
     } catch (error) {
       this.diagnostics.record({ state: "degraded", message: `session_end failed (${failureCode(error)})`, operation: "session_end", sessionID, code: failureCode(error) });
     }
@@ -1125,7 +1126,7 @@ export class Controller<E extends Enrollment = Enrollment> {
       });
     } else {
       const e = r?.e ?? await this.port.credential.capture(path.root);
-      await end((id, call) => this.temporary(e, call, id), { child: sessionID }).catch(error => this.failure("child_end", error, r));
+      await end((id, call, ending) => this.temporary(e, call, id, undefined, ending), { child: sessionID }).catch(error => this.failure("child_end", error, r));
     }
   }
   // A host's failure outside any call result (the tool proxy's `report`).
