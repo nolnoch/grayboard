@@ -394,6 +394,9 @@ if (WRITES_AS) {
   // The session that owns delivery owns the name: it writes the session's
   // rows, its presence while unbound, and acquires through them.
   // Channels-off sessions too: they own the session, they just don't listen.
+  // Before this session registers or takes a name, so another grayboard
+  // started beside it gets there first (#1228).
+  testPause("mcp:before-register");
   const self = thisSession(SESSION_ID, HARNESS);
   // A keyed session restarting under its live harness: the open above ended
   // it first if the harness had died, so attaching is refused then.
