@@ -8,7 +8,7 @@ import type { BindRequest, DelegateRequest, DelegateResult, ErrorCode, Replayed,
 import { DEFAULT_HOSTED_CAPS, DEFAULT_SERVICE_LIMITS, type ServiceLimits } from "./config.ts";
 import { DEFAULT_HELLO_LIMIT, DEFAULT_HOSTED_REQUEST_LIMIT, DEFAULT_HOSTED_SUBSCRIBER_LIMIT, RateLimiter, retrySecs, type RateLimit, type Take } from "./rate_limit.ts";
 import { dedupWrite, type DedupOutcome, type DedupTool, type Written } from "./write_dedup.ts";
-import { testPause, testPauseAsync } from "../shared/testpause.ts";
+import { testPause, testPauseAsync, testPaused } from "../shared/testpause.ts";
 import { ALIAS_SCOPE_CAP, aliasCapRefusal } from "./alias_cap.ts";
 import { lockedUserOf } from "./alias_use.ts";
 import { DELEGATE_LIMIT, DELEGATE_OPEN_CAP, crossUserRefusal, delegateOkFields, delegateThrottled, neverConnected, resolveDelegationWith, type DelegateReach } from "../core/delegation.ts";
@@ -312,7 +312,7 @@ function drainBoards(session: ApplicationSession, hub: Hub, all = false): Promis
 
 async function drainBoardsOnce(session: ApplicationSession, hub: Hub, all: boolean, acked: Set<string>): Promise<void> {
   for (const address of [...session.addresses]) {
-    await testPauseAsync("server:drain-boards:before-read");
+    if (testPaused("server:drain-boards:before-read")) await testPauseAsync("server:drain-boards:before-read");
     const items = await pendingOf(hub.repo, hub.access, hub.repo.read, address, all, lostAck(hub, hub.repo.read, address, receiverOf(session)));
     // Closed while the read awaited: nothing more to send. Unbound from this address: the holds change dropped its
     // in-flight items.
@@ -665,7 +665,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
       on(async () => {
         // A copy: liveObservers removes a dead observer from the set mid-walk.
         const live = await liveObservers(board, [...observersByBoard.get(board) ?? []]);
-        await testPauseAsync("board-change:observers-read");
+        if (testPaused("board-change:observers-read")) await testPauseAsync("board-change:observers-read");
         // Still observing after the await: a close meanwhile isn't notified.
         for (const observer of live) if (observers.has(observer)) notify(() => observer.hooks.changed());
       });
