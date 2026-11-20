@@ -346,3 +346,18 @@ test("a user's bind in a service principal's scope reads as a missing scope (#27
   await expect(srv.appSession(bob, "ingest/worker").connect()).rejects.toMatchObject({ code: "not_found", message: '"ingest/worker": no team or service is named "ingest"' });
   expect(await rows(`SELECT address FROM aliases WHERE address = 'ingest/worker'`)).toEqual([]);
 });
+
+// #1402: a team's names are seen by the team's own principal and no other team's (alias.see_own_team). An HTTP call
+// as a team alias has no session ID, so it is judged as the team itself: as eng/build, a held claim_take names the
+// holder when eng's name holds it, and not when qa's (a team bob isn't in) does.
+test("as a team alias over HTTP, a held claim_take names its own team's holder and hides another team's", async () => {
+  expect((await srv.api(alice, "POST", "/api/teams", { name: "qa" })).status).toBe(201);
+  for (const name of ["qa/ops", "eng/deploy"]) await srv.appSession(alice, name).connect();
+  await srv.appSession(bob, "eng/build").connect();
+  const take = (token: string, as: string, key: string) => srv.api(token, "POST", "/api/claims/call", { as, tool: "claim_take", args: { key, note: `${as}'s` } });
+  expect((await take(alice, "qa/ops", "ticket:QA-1")).status).toBe(200);
+  expect((await take(alice, "eng/deploy", "ticket:ENG-1")).status).toBe(200);
+  const eng = await take(bob, "eng/build", "ticket:ENG-1"), qa = await take(bob, "eng/build", "ticket:QA-1");
+  expect(eng).toMatchObject({ status: 200, body: { ok: false, held_by: "eng/deploy", note: "eng/deploy's" } });
+  expect(qa).toMatchObject({ status: 200, body: { ok: false, held_by: null, note: null } });
+});
