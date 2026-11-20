@@ -14,6 +14,7 @@ import { stubAuthRead } from "../support/auth_stub.ts";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { requestOrigin } from "../../src/server/request_context.ts";
 
 let srv: TestServer, app: TestServer["app"], base: string, clock: number;
 const clients: Client[] = [];
@@ -320,46 +321,68 @@ for (const version of MCP_PROTOCOL_VERSIONS.slice(1)) test(`${version}: fresh sa
   const missing = await fetch(base + "/mcp", { method: "DELETE", headers });
   expect(missing.status).toBe(404); await missing.body?.cancel();
 });
+// A testPause point armed in this process (the TestServer runs here): `hit` resolves once a task reaches it, `disarm`
+// stops later tasks pausing there, `go` releases every paused one. `restore` (in a finally) releases too, and puts the
+// environment back as it was. The point is armed per test, not in tests/support/hosted-pause.ts's start-and-overlap
+// shape, since these tests release it partway through their overlap.
+function armPause(point: string) {
+  const dir = mkdtempSync(join(tmpdir(), "gb-1408-")), file = join(dir, "go");
+  const oldPoint = process.env.BUS_TEST_PAUSE, oldFile = process.env.BUS_TEST_PAUSE_FILE;
+  let reached!: () => void;
+  const hit = new Promise<void>(resolve => { reached = resolve; });
+  const log = spyOn(console, "error").mockImplementation((message: unknown) => { if (message === `[grayboard] test pause hit: ${point}`) reached(); });
+  process.env.BUS_TEST_PAUSE = point; process.env.BUS_TEST_PAUSE_FILE = file;
+  const go = () => writeFileSync(file, "go");
+  return {
+    hit, go,
+    disarm() { delete process.env.BUS_TEST_PAUSE; },
+    restore() {
+      go();
+      if (oldPoint === undefined) delete process.env.BUS_TEST_PAUSE; else process.env.BUS_TEST_PAUSE = oldPoint;
+      if (oldFile === undefined) delete process.env.BUS_TEST_PAUSE_FILE; else process.env.BUS_TEST_PAUSE_FILE = oldFile;
+      log.mockRestore(); rmSync(dir, { recursive: true, force: true });
+    },
+  };
+}
 // #1408: a resource read whose write body waits behind another request's body runs as its own exchange, not the
 // releasing holder's. Alice's read is held at `hosted:tool:in-gate` (past its gate's write, before its body's); bob's
-// tool call then takes the queue and holds it, alice's body queues behind it, and bob's release starts it. Started in
-// bob's context, it judged bob's exchange principal and refused as "resource session is closed or unauthorized".
+// tool call then takes the queue and holds it, alice's body queues behind it (told by her request's user agent), and
+// bob's release starts it. Started in bob's context, it judged bob's exchange principal and refused as "resource
+// session is closed or unauthorized".
 for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: a resource read queued behind another request's write body judges its own exchange`, async () => {
   const c = await connect((await issue()).token, version);
   const d = await connect((await issue("bob@example.com")).token, version, undefined, "fe");
   await call(c, "board_create", { name: "e2e", purpose: "fixtures" });
+  c.headers.set("User-Agent", "alice-1408");
   type Body = (tx: unknown) => unknown;
   const hosted = app.repo.hosted as unknown as Record<"write", (fn: Body, ...rest: unknown[]) => unknown>, write = hosted.write;
-  let queued = 0, arm = false, held = false, release!: () => void;
+  let arm = false, holding = false, aliceQueued = false, release!: () => void;
   const gate = new Promise<void>(r => { release = r; });
   hosted.write = (fn: Body, ...rest: unknown[]) => {
-    queued++;
-    const hold = arm && !held;
-    if (hold) held = true;
-    return write.call(app.repo.hosted, hold ? async (tx: unknown) => { await gate; return fn(tx); } : fn, ...rest);
+    const hold = arm && !holding;
+    if (hold) holding = true;
+    const out = write.call(app.repo.hosted, hold ? async (tx: unknown) => { await gate; return fn(tx); } : fn, ...rest);
+    // Queued behind bob's hold by the call above (the queue enqueues synchronously): only now may bob release.
+    if (!hold && holding && requestOrigin()?.ua === "alice-1408") aliceQueued = true;
+    return out;
   };
-  const dir = mkdtempSync(join(tmpdir(), "gb-1408-")), go = join(dir, "go"), hits: string[] = [];
-  const said = spyOn(console, "error").mockImplementation((...args: unknown[]) => { hits.push(args.join(" ")); });
-  process.env.BUS_TEST_PAUSE = "hosted:tool:in-gate";
-  process.env.BUS_TEST_PAUSE_FILE = go;
+  const pause = armPause("hosted:tool:in-gate");
+  const read = c.client.readResource({ uri: boardUri }).then(r => JSON.stringify(r), (error: unknown) => String(error));
+  let bob: Promise<unknown> | undefined;
   try {
-    const read = c.client.readResource({ uri: boardUri }).then(r => JSON.stringify(r), (error: unknown) => String(error));
-    await until(() => hits.some(h => h.includes("test pause hit: hosted:tool:in-gate")));
-    delete process.env.BUS_TEST_PAUSE;
+    await pause.hit;
+    pause.disarm();
     arm = true;
-    const bob = call(d, "whoami");
-    await until(() => held);
-    const before = queued;
-    writeFileSync(go, "");
-    await until(() => queued > before);
+    bob = call(d, "whoami");
+    await until(() => holding);
+    pause.go();
+    await until(() => aliceQueued);
     release();
     await bob;
     expect(await read).toContain("e2e");
   } finally {
-    hosted.write = write; release(); writeFileSync(go, "");
-    said.mockRestore();
-    delete process.env.BUS_TEST_PAUSE; delete process.env.BUS_TEST_PAUSE_FILE;
-    rmSync(dir, { recursive: true, force: true });
+    hosted.write = write; release(); pause.restore();
+    await Promise.allSettled([read, bob]);
   }
 });
 // #1408: a GET that attaches while a subscribe's checks await was built from the registrations before it. The subscribe
@@ -373,24 +396,19 @@ for (const version of MCP_PROTOCOL_VERSIONS.slice(1)) test(`${version}: a GET at
   const resume = c.pauseGets();
   await unwatch();
   await until(() => app.mcp.activeGetStreams === 0);
-  const dir = mkdtempSync(join(tmpdir(), "gb-1408-")), go = join(dir, "go"), hits: string[] = [];
-  const said = spyOn(console, "error").mockImplementation((...args: unknown[]) => { hits.push(args.join(" ")); });
-  process.env.BUS_TEST_PAUSE = "mcp:legacy:control-stream";
-  process.env.BUS_TEST_PAUSE_FILE = go;
+  const pause = armPause("mcp:legacy:control-stream");
+  const subscribed = c.client.subscribeResource({ uri: boardUri });
   try {
-    const subscribed = c.client.subscribeResource({ uri: boardUri });
-    await until(() => hits.some(h => h.includes("test pause hit: mcp:legacy:control-stream")));
-    delete process.env.BUS_TEST_PAUSE;
+    await pause.hit;
+    pause.disarm();
     resume();
     await until(() => app.mcp.activeGetStreams === 1);
-    writeFileSync(go, "");
+    pause.go();
     await subscribed;
     await until(() => app.mcp.activeWatches === 1);
   } finally {
-    resume(); writeFileSync(go, "");
-    said.mockRestore();
-    delete process.env.BUS_TEST_PAUSE; delete process.env.BUS_TEST_PAUSE_FILE;
-    rmSync(dir, { recursive: true, force: true });
+    resume(); pause.restore();
+    await subscribed.catch(() => {});
   }
 });
 
