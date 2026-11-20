@@ -60,7 +60,7 @@ import { listenIdentity, type IdentityRequest } from "../shared/claude_identity.
 import { z } from "zod";
 import { hooksDisabledBy, recordHookInstalled } from "../shared/claude_settings.ts";
 import { dropUnboundRecord, freshRecord, sweepRecords, writeRecord } from "../shared/namerecord.ts";
-import { isAlive, procStart, wrapperName } from "../shared/proc.ts";
+import { claudeIsHarness, isAlive, procStart, wrapperName } from "../shared/proc.ts";
 import { LOCAL_TOOLS } from "./tools.ts";
 import { describeLocation, isExplicitIdentity, sessionIdentity } from "../shared/identity.ts";
 import { LateCancels } from "../shared/latecancel.ts";
@@ -172,7 +172,12 @@ const harnessId = (key: string): string | undefined => {
   }
   return v;
 };
-let HARNESS_SESSION = harnessId("BUS_HARNESS_SESSION") ?? (process.env.CLAUDECODE === "1" ? harnessId("CLAUDE_CODE_SESSION_ID") : undefined);
+// Claude Code's own, CLAUDE_CODE_SESSION_ID, only when Claude Code is this
+// process's harness: a harness launched from a Claude Code shell (omp, pi)
+// inherits it with CLAUDECODE, and a sibling recorded under it would never be
+// displaced (#1403). An unreadable harness keeps the env's word.
+let HARNESS_SESSION = harnessId("BUS_HARNESS_SESSION") ??
+  (process.env.CLAUDECODE === "1" && process.env.CLAUDE_CODE_SESSION_ID && claudeIsHarness() !== false ? harnessId("CLAUDE_CODE_SESSION_ID") : undefined);
 const PARENT_SESSION = harnessId("BUS_PARENT_SESSION");
 // A runner child stands in for a session that would own its delivery, so
 // it falls back to (or is promoted to) one.

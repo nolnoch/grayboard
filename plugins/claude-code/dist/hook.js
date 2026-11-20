@@ -99,6 +99,9 @@ function isAlive(pid, start) {
   return judge(pid, start, procStart(pid));
 }
 var SHELLS = new Set(["sh", "bash", "zsh", "dash", "fish", "env"]);
+var LAUNCHERS = new Set(["timeout", "nice", "ionice", "nohup", "stdbuf", "uvx"]);
+var LAUNCHER_VERBS = { direnv: new Set(["exec"]), mise: new Set(["x", "exec"]), uv: new Set(["run"]) };
+var VALUE_OPTS = new Set(["-C", "--cd", "--directory", "--project", "-E", "--env", "-p", "--python"]);
 
 // src/shared/protocol.ts
 var SESSION_FACT_MAX = 64;
