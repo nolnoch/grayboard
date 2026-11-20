@@ -226,7 +226,9 @@ const CALLS = (): Call[] => [
   ["claim_take", { key: "ticket:live", note: "new plan" }], ["claim_take", { key: "ticket:live", ttl_minutes: 1 }], ["claim_take", { key: "ticket:live", board: "attic" }],
   ["claim_take", { key: "ticket:attic", note: "still" }], ["claim_take", { key: "ticket:onq", note: "moving" }], ["claim_take", { key: "ticket:watched" }],
   ["claim_take", { key: "queue:x" }], ["claim_take", { key: "k", ttl_minutes: -1 }], ["claim_take", { key: "k", until: "never" }],
-  ["claim_take", { key: "k", ttl_minutes: 5, until: "2030-01-01T00:00:00Z" }], ["claim_take", { key: "" }], ["claim_take", { key: 7 }], ["claim_take", { key: "k", board: 3 }],
+  ["claim_take", { key: "k", ttl_minutes: 5, until: "2030-01-01T00:00:00Z" }],
+  // #1230: a valid until, on a renewal and on a free key, settles to exactly later+90m.
+  ["claim_take", { key: "ticket:live", until: new Date(T1 + 90 * 60_000).toISOString() }], ["claim_take", { key: "ticket:new", until: new Date(T1 + 90 * 60_000).toISOString() }], ["claim_take", { key: "" }], ["claim_take", { key: 7 }], ["claim_take", { key: "k", board: 3 }],
   ["claim_release", { key: "ticket:live" }], ["claim_release", { key: "ticket:live", note: "done" }], ["claim_release", { key: "ticket:eng" }],
   ["claim_release", { key: "ticket:attic" }], ["claim_release", { key: "ticket:onq" }], ["claim_release", { key: "ticket:nob" }],
   ["claim_release", { key: "ticket:gone" }], ["claim_release", { key: "ticket:watched" }], ["claim_release", { key: "ticket:absent" }],
@@ -268,7 +270,7 @@ test("claim_take, claim_release and claim_watch give core's answers and leave it
   }
   expect(diverging(out)).toEqual([]);
   // The ended ID's takes that reach the server's refusal.
-  expect(out.filter(([l, , g]) => l.startsWith("bob's ended claim_take") && JSON.stringify(g).includes("has ended; it can't take")).length).toBe(15);
+  expect(out.filter(([l, , g]) => l.startsWith("bob's ended claim_take") && JSON.stringify(g).includes("has ended; it can't take")).length).toBe(17);
 
   // The fixture reaches each branch the port decides.
   type R = { out: { value?: { result: unknown; wake: string[] }; error?: string }; rows: Record<string, unknown[]> };
