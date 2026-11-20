@@ -38,6 +38,7 @@ import {
   getHistory,
   getMessage,
   getThread,
+  dmHuman,
   insertMessage,
   openEnded,
   receivedUnacked,
@@ -1165,7 +1166,8 @@ async function drainLoop(): Promise<void> {
       for (const msg of batch) {
         if (shuttingDown) return;
         const params = dmNotification(msg, primary());
-        if (isHuman(db, msg.sender)) params.meta.human = "true";
+        // As the DM's row recorded it when sent (#1364), not whether its sender is human now.
+        if (dmHuman(msg.id)) params.meta.human = "true";
         if (!await pushChannel(params)) return;
         // A push in flight while another process's open merges a 1.x name in (#1192).
         await testPauseAsync("drain:before-delivered");

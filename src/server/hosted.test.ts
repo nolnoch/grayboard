@@ -2745,3 +2745,19 @@ test("#1355: the server records the human mark at write time; a system post neve
     { body: "before", human: 0 }, { body: "[claim] h1355:x", human: 0 }, { body: "[release] h1355:x", human: 0 }, { body: "after", human: 1 },
   ]);
 });
+
+// #1364: the server records a DM's human mark on its row when written: one sent before its sender bears the mark
+// stays 0, one sent after is 1.
+test("#1364: the server records a DM's human mark at write time", async () => {
+  const a = context("h1364");
+  await hosted.bind(principal, a, { name: "h1364", create: true });
+  const b = context("h1364b");
+  await hosted.bind(principal, b, { name: "h1364b", create: true });
+  const send = (body: string) => hosted.run(principal, a, "dm_send", (session, tx) => application.send(tx, session, "h1364b", body)) as Promise<{ message_id: number }>;
+  const human = (id: number) => database.db.query<{ human: number | null }, [number]>("SELECT human FROM messages WHERE id = ?").get(id)!.human;
+  const before = await send("before");
+  // As in #1355's test: the server marks only `<email>/human`; marking a bound alias drives the write path's judgment.
+  await seed(database.repo, tx => database.repo.aliases.markHuman(tx, "you@example.com/h1364", true));
+  const after = await send("after");
+  expect([human(before.message_id), human(after.message_id)]).toEqual([0, 1]);
+});

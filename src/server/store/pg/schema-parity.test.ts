@@ -37,7 +37,7 @@ const ADDED = new Set([
 // SQLite INTEGER 0/1 columns that are boolean in Postgres (D6). Every other INTEGER is bigint.
 const BOOLEANS = new Set([
   "hosted_alias_lost.was_primary", "messages.pending", "ids.launcher", "ids.viewer", "ids.keyed", "ids.local_resume",
-  "aliases.human", "aliases.queue_off", "outbox.wake", "posts.human",
+  "aliases.human", "aliases.queue_off", "outbox.wake", "posts.human", "messages.human",
 ]);
 // SQLite TEXT columns that are jsonb in Postgres: queried by path or parsed on read (D6). Every other TEXT is text,
 // write_receipts.result_json among them: it holds '' while a write is in flight (not valid jsonb) and is replayed

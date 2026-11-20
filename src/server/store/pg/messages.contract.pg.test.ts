@@ -46,6 +46,7 @@ const pgMessagesBackend: MessagesBackend = {
           VALUES (${sender}, 'user', ${recipient}, 'bounced', ${parentId}, ${at}, 'bounce') RETURNING id`;
         return int8(r.id);
       },
+      humanRows: async () => (await sql`SELECT id, human FROM messages ORDER BY id`).map((r: Record<string, unknown>) => ({ id: int8(r.id), human: r.human as boolean | null })),
       messageRows: async () => (await sql`SELECT id, parent_id FROM messages ORDER BY id`).map((r: Record<string, unknown>) => ({ id: int8(r.id), parent_id: int8OrNull(r.parent_id) })),
       ackRows: async () => (await sql`SELECT reader, message_id FROM dm_acks ORDER BY message_id, reader`).map((r: Record<string, unknown>) => ({ reader: r.reader as string, message_id: int8(r.message_id) })),
       attachmentRows: async () => (await sql`SELECT id, message_id FROM attachments ORDER BY id`).map((r: Record<string, unknown>) => ({ id: int8(r.id), message_id: int8OrNull(r.message_id) })),

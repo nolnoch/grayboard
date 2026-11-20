@@ -35,9 +35,12 @@ export interface MessagesStore {
   // session's ID (#284); null for a writer with no session. via: the child
   // session that wrote it (#523), else null. senderUser: the writer's
   // signed-in user (security audit F-10), kept out of reads like sender_id.
+  // human: the DM bears the human mark (#1364), the caller having judged its
+  // sender human in this transaction; false (the default) for every other.
+  // Recorded, never shown on reads.
   insert(
     tx: Tx, sender: string, recipientType: "user" | "team", recipient: string, body: string, parentId: number | null, pending?: boolean,
-    files?: MessageFiles, senderId?: string | null, via?: string | null, senderUser?: string | null,
+    files?: MessageFiles, senderId?: string | null, via?: string | null, senderUser?: string | null, human?: boolean,
   ): Promise<MessageRow>;
   // The writer's signed-in user of each message and post that has one
   // recorded (rows from before F-10, bounces and system posts have none);

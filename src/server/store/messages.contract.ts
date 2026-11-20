@@ -42,9 +42,11 @@ export type MessagesHarness = {
   post(board: string, scope: string | null, author: string, authorUser: string | null): Promise<number>;
   delegation(target: string, at: number, messageId: number): Promise<void>;
   bounce(sender: string, recipient: string, parentId: number | null, at: number): Promise<number>;
-  // Raw reads: every message's id and parent_id, by id; every ack; every attachment's id and message_id, by id; an
-  // action's access_log rows in write order.
+  // Raw reads: every message's id and parent_id, by id; every message's id and human mark (#1364; SQLite's 0/1 as a
+  // boolean, null as null), by id; every ack; every attachment's id and message_id, by id; an action's access_log rows
+  // in write order.
   messageRows(): Promise<{ id: number; parent_id: number | null }[]>;
+  humanRows(): Promise<{ id: number; human: boolean | null }[]>;
   ackRows(): Promise<{ reader: string; message_id: number }[]>;
   attachmentRows(): Promise<{ id: number; message_id: number | null }[]>;
   audits(action: string): Promise<{ actor: string | null; target: string | null; detail: unknown; detail_type: string | null }[]>;
@@ -92,6 +94,12 @@ function inserts(it: It): void {
     expect(team.recipient_type).toBe("team");
     for (const m of [root, reply, team]) expect(await h.messages.getById(h.read, m.id)).toEqual(m);
     expect(await h.messages.getById(h.read, team.id + 1000)).toBeUndefined();
+    // The human mark is what the write said (#1364), false unless given; it's recorded, never shown on reads.
+    const marked = await h.write(tx => h.messages.insert(tx, A, "user", B, "mine", null, false, undefined, null, null, null, true));
+    expect(marked).not.toHaveProperty("human");
+    expect(await h.humanRows()).toEqual([
+      { id: root.id, human: false }, { id: reply.id, human: false }, { id: team.id, human: false }, { id: marked.id, human: true },
+    ]);
     // Read inside the body that wrote it, on its Tx.
     await h.write(async tx => {
       const m = await h.messages.insert(tx, A, "user", B, "inside", null);
