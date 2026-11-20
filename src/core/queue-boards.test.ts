@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, test } from "bun:test";
 
 import {
   acknowledge,
+  claimQueuePost,
   createBoard,
   declareHuman,
   openAccess,
@@ -837,6 +838,76 @@ describe("a take follows its taking session while it is live (#1351)", () => {
   });
 });
 
+// #1370: the rotation's push half (the newest board post in a lane's outbox) follows the receiving session
+// (outbox.session_id) while it is live, as the take half does (#1351): a push alias X got while session A held it isn't
+// session B's after X moves to B. An old row, or one whose session has ended, maps through who holds X now.
+describe("a push follows its receiving session while it is live (#1370)", () => {
+  const A = "id:0000000001370", B = "id:0000000002370";
+  beforeEach(() => {
+    db.prepare(`DELETE FROM subscriptions WHERE handle = 'fe'`).run();
+    for (const id of [A, B]) registerId(db, { id, principal: null, launcher: false });
+    for (const h of ["x", "z"]) ensureAlias(db, h, "test");
+    holdAlias(db, "x", A, 100);
+    subscribe(db, A, "work", "push"); // A's lane is x
+    holdAlias(db, "z", B, 100);
+    subscribe(db, B, "work", "push"); // B's lane is z
+  });
+  const lanes = () => queueLanes(db, getBoard(db, "work")!, ["be"]);
+  const sessionOf = (handle: string, postId: number) =>
+    (db.prepare(`SELECT session_id FROM outbox WHERE handle = ? AND post_id = ?`).get(handle, postId) as { session_id: string | null }).session_id;
+  // sim woken at 500 by a rotated post; A, as x, at 1000 by a post that named it. Then x moves to B (B's lane stays z,
+  // its older hold), and A's take is dropped, so only the push to x speaks for when A was woken.
+  const delivered = () => {
+    const first = post(db, "be", "work", "item 0");
+    expect(first.wake).toEqual(["sim"]);
+    const r = post(db, "be", "work", "@x take this", null, said);
+    expect(sessionOf("x", r.post.id)).toBe(A);
+    for (const [p, at] of [[first.post.id, 500], [r.post.id, 1000]] as const) {
+      db.prepare(`UPDATE posts SET created_at = ? WHERE id = ?`).run(at, p);
+      db.prepare(`UPDATE claim_events SET at = ? WHERE key = ?`).run(at, claimKey(p));
+      db.prepare(`DELETE FROM claims WHERE key = ?`).run(claimKey(p));
+    }
+    holdAlias(db, "x", B, 102);
+    db.prepare(`DELETE FROM claim_events WHERE key = ?`).run(claimKey(r.post.id));
+    return r.post.id;
+  };
+
+  test("an alias moved between live sessions: A's push counts for A's lane, and B, never woken, isn't passed over", () => {
+    delivered();
+    // B (z) never woken, sim at 500, A at 1000 by the push it received as x.
+    expect(lanes()).toEqual(["z", "sim", A]);
+    expect(post(db, "be", "work", "item 2").wake).toEqual(["z"]);
+  });
+
+  test("a push from before the column (no session) maps through who holds its handle now", () => {
+    const p = delivered();
+    db.prepare(`UPDATE outbox SET session_id = NULL WHERE post_id = ?`).run(p);
+    // x's push is B's now (z at 1000); A never woken.
+    expect(lanes()).toEqual([A, "sim", "z"]);
+  });
+
+  test("a push to a session that has ended maps through who holds its handle now", () => {
+    delivered();
+    db.prepare(`UPDATE ids SET ended_at = 2000 WHERE id = ?`).run(A);
+    db.prepare(`DELETE FROM subscriptions WHERE handle = ?`).run(A);
+    expect(lanes()).toEqual(["sim", "z"]);
+  });
+
+  test("insertOutbox records an alias's holder, a session ID itself, and null for an alias no session holds", () => {
+    ensureAlias(db, "y", "test");
+    const r = post(db, "be", "work", "@x @y @" + B + " heads up", null, said);
+    expect(["x", "y", B].map((h) => sessionOf(h, r.post.id))).toEqual([A, null, B]);
+  });
+
+  test("a redelivery that resets a lane's push re-records the session holding the lane now", () => {
+    const r = post(db, "be", "work", "@x take this", null, said);
+    expect(sessionOf("x", r.post.id)).toBe(A);
+    holdAlias(db, "x", B, 102);
+    claimQueuePost(db, "work", r.post.id, "x", Date.now());
+    expect(sessionOf("x", r.post.id)).toBe(B);
+  });
+});
+
 // #1174 audit H1: queueLaneRows runs inside every queue post's and requeue's write transaction, so its per-lane
 // history reads must stay index searches as history grows, with or without ANALYZE stats. Its address-set subqueries
 // once knocked the planner onto idx_claim_events_key's GLOB range (with stats) or onto every post on the board,
@@ -855,13 +926,14 @@ describe("queueLaneRows' plan stays indexed (#1174 audit)", () => {
       subscribe(db, i % 2 ? id : "l" + i, "work", "push");
     }
     const insP = db.prepare(`INSERT INTO posts (board, author, body, created_at) VALUES (?, 'be', 'x', ?)`);
-    const insO = db.prepare(`INSERT OR IGNORE INTO outbox (handle, post_id, reason) VALUES (?, ?, 'subscription')`);
+    const insO = db.prepare(`INSERT OR IGNORE INTO outbox (handle, post_id, reason, session_id) VALUES (?, ?, 'subscription', ?)`);
     const insE = db.prepare(`INSERT INTO claim_events (key, handle, event, board, at, session_id) VALUES (?, ?, ?, ?, ?, ?)`);
     db.transaction(() => {
       for (let k = 0; k < 3000; k++) {
         const board = k % 3 ? "other" : "work";
         const id = Number(insP.run(board, k).lastInsertRowid);
-        insO.run("l" + (k % lanes), id);
+        // Two pushes in three carry their receiving session (#1370), the rest are from before it.
+        insO.run("l" + (k % lanes), id, k % 3 === 1 ? null : "id:" + String(k % lanes).padStart(13, "0"));
         const handle = k % 4 ? "l" + (k % lanes) : "id:" + String(k % lanes).padStart(13, "0");
         // Half the rows carry their taking session (#1351), half are from before it.
         insE.run(`queue:${board}:${id}`, handle, k % 5 ? "take" : "release", board, k, k % 2 ? "id:" + String(k % lanes).padStart(13, "0") : null);
@@ -870,22 +942,25 @@ describe("queueLaneRows' plan stays indexed (#1174 audit)", () => {
   });
 
   for (const analyze of [false, true]) {
-    test(`takes by (board, session_id) and (board, handle), outbox by handle then posts by id, ${analyze ? "with" : "without"} ANALYZE`, () => {
+    test(`takes by (board, session_id) and (board, handle), outbox by session or handle then posts by id, ${analyze ? "with" : "without"} ANALYZE`, () => {
       if (analyze) db.run("ANALYZE");
       const p = plan();
       // Names only our own indexes and the query's table aliases, so a SQLite upgrade's rewording ("SEARCH TABLE",
       // COVERING) doesn't fail it: every read of e, o2 and p2 is a search, takes go through (board, handle), posts
       // never through the board range, and outbox drives the join (its search before the posts probe).
       const of = (alias: string) => p.filter((d) => new RegExp(`^(SCAN|SEARCH)( TABLE)? ${alias}\\b`).test(d));
-      const es = of("es"), e = of("e"), o2 = of("o2"), p2 = of("p2");
-      for (const reads of [es, e, o2, p2]) expect(reads.length).toBeGreaterThan(0);
-      for (const d of [...es, ...e, ...o2, ...p2]) expect(d).toStartWith("SEARCH");
+      const es = of("es"), e = of("e"), os = of("os"), ps = of("ps"), o2 = of("o2"), p2 = of("p2");
+      for (const reads of [es, e, os, ps, o2, p2]) expect(reads.length).toBeGreaterThan(0);
+      for (const d of [...es, ...e, ...os, ...ps, ...o2, ...p2]) expect(d).toStartWith("SEARCH");
       // The session-keyed takes (#1351) by (board, session_id), the address-keyed ones by (board, handle).
       for (const d of es) expect(d).toMatch(/\bidx_claim_events_take_sid\b/);
       for (const d of e) expect(d).toMatch(/\bidx_claim_events_take\b(?!_)/);
-      for (const d of p2) expect(d).not.toContain("idx_posts_board_id");
+      // The session-keyed pushes (#1370) by idx_outbox_session (session_id).
+      for (const d of os) expect(d).toMatch(/\bidx_outbox_session\b/);
+      for (const d of [...ps, ...p2]) expect(d).not.toContain("idx_posts_board_id");
       const first = (alias: string) => p.findIndex((d) => new RegExp(`^SEARCH( TABLE)? ${alias}\\b`).test(d));
       expect(first("o2")).toBeLessThan(first("p2"));
+      expect(first("os")).toBeLessThan(first("ps"));
     });
   }
 });

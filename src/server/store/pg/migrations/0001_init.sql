@@ -451,9 +451,11 @@ CREATE TABLE outbox (
   reason       text COLLATE "C" NOT NULL CHECK (reason IN ('mention', 'thread', 'subscription')),
   delivered_at int8,
   wake         boolean NOT NULL DEFAULT true,
+  session_id   text COLLATE "C",
   PRIMARY KEY (handle, post_id)
 );
 CREATE INDEX idx_outbox_pending ON outbox (handle, delivered_at);
+CREATE INDEX idx_outbox_session ON outbox (session_id, post_id) WHERE session_id IS NOT NULL;
 
 CREATE TABLE thread_mutes (
   handle  text COLLATE "C" NOT NULL,

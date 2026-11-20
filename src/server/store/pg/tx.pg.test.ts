@@ -161,10 +161,13 @@ describePg("Postgres transactions", () => {
       await resume.wait;
       await put(tx, "lost too");
     }, () => { seen.push("committed"); });
+    // Handled from the start: once Bun sees the connection close, its begin() rejects at once, with the body still
+    // parked, so the write can reject while the terminate below is awaited (#1283).
+    const failed = rejection(w);
     await entered.wait;
     await x.db.sql`SELECT pg_terminate_backend(${pid})`;
     resume.open();
-    expect((await rejection(w)).errno).toBe("57P01");
+    expect((await failed).errno).toBe("57P01");
     expect(seen).toEqual([]);
     expect(x.s.queue.held).toBe(false);
     await x.s.write(tx => put(tx, "next"));
