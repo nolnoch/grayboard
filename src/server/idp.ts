@@ -17,7 +17,7 @@ export type AuthorizeInput = { redirectUri: string; state: string; nonce: string
 export type ExchangeInput = { code: string; verifier: string; redirectUri: string; nonce: string };
 
 export type IdentityProvider = {
-  id: string;        // "google", "okta": config, the callback path (/oauth/<id>/callback), audit detail
+  id: string;        // "google", "okta", "oidc": config, the callback path (/oauth/<id>/callback), audit detail
   label: string;     // the chooser's link text
   issuer: string;    // a callback's `iss` parameter, when present, must equal it
   callbackParams: readonly string[];
@@ -36,13 +36,17 @@ export class DomainRefused extends Error {}
 export const callbackPath = (p: Pick<IdentityProvider, "id">) => `/oauth/${p.id}/callback`;
 
 // The providers a server signs in with when OAuthOptions.providers doesn't inject any, built from Config alone in
-// GRAYBOARD_IDPS's order (#928 D6): Google with the client pair the AS uses (mcpGoogle, else the primary), Okta as
-// the generic OIDC provider. loadConfig has checked the list (checkIdpConfig); nothing is fetched here (D2).
+// GRAYBOARD_IDPS's order (#928 D6): Google with the client pair the AS uses (mcpGoogle, else the primary), Okta and
+// oidc (#1418) as the generic OIDC provider. loadConfig has checked the list (checkIdpConfig); nothing is fetched here (D2).
 export function defaultProviders(config: Config): IdentityProvider[] {
   return (config.idps ?? ["google"]).map(id => {
     if (id === "okta") {
       if (!config.okta) throw new Error("GRAYBOARD_IDPS lists okta without its configuration");
       return oidcProvider({ id: "okta", label: "Okta", ...config.okta });
+    }
+    if (id === "oidc") {
+      if (!config.oidc) throw new Error("GRAYBOARD_IDPS lists oidc without its configuration");
+      return oidcProvider({ id: "oidc", ...config.oidc });
     }
     const googleClient = config.mcpGoogle ?? { clientId: config.googleClientId, clientSecret: config.googleClientSecret };
     return googleProvider({ ...googleClient, orgDomain: config.orgDomain });

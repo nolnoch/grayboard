@@ -29,10 +29,13 @@ export const DEFAULT_SERVICE_LIMITS: ServiceLimits = { hostedRequest: { burst: 4
 const CAP_CEILING = 1_000_000;
 
 // The upstream identity providers a server can list (#928 D6), in GRAYBOARD_IDPS.
-export const IDP_IDS = ["google", "okta"] as const;
+export const IDP_IDS = ["google", "okta", "oidc"] as const;
 export type IdpId = (typeof IDP_IDS)[number];
 // The Okta org behind the generic OIDC provider (src/server/idp_oidc.ts): one per server.
 export type OktaConfig = { issuer: string; clientId: string; clientSecret: string; allowedDomains: string[] };
+// Any other OpenID Connect issuer (#1418), one per server, under the chooser label it names: a confidential client, or
+// a public one (no secret) that the token endpoint knows by PKCE alone.
+export type OidcConfig = { issuer: string; clientId: string; clientSecret?: string; allowedDomains: string[]; label: string };
 
 // The server's database (#807 P3 C11b): a SQLite file, or a Postgres URL behind GRAYBOARD_UNRELEASED_POSTGRES=1 until
 // the cutover (docs/future/postgres-server.md D8 P3, P5).
@@ -53,6 +56,7 @@ export type Config = {
   // GRAYBOARD_IDPS: the providers sign-in offers, in the chooser's order; absent means Google alone.
   idps?: IdpId[];
   okta?: OktaConfig;
+  oidc?: OidcConfig;
   publicUrl: string;
   messageRetentionDays: number;
   auditRetentionDays: number;
@@ -106,7 +110,7 @@ export type Config = {
 // Docker and Kubernetes convention, so a secret needn't sit in the process environment's source.
 export const FILE_SECRETS = [
   "GRAYBOARD_DATABASE_URL", "GOOGLE_OAUTH_CLIENT_SECRET", "GRAYBOARD_MCP_GOOGLE_CLIENT_SECRET",
-  "GRAYBOARD_OKTA_CLIENT_SECRET", "SLACK_APP_TOKEN", "SLACK_BOT_TOKEN",
+  "GRAYBOARD_OKTA_CLIENT_SECRET", "GRAYBOARD_OIDC_CLIENT_SECRET", "SLACK_APP_TOKEN", "SLACK_BOT_TOKEN",
 ] as const;
 
 // Resolves each NAME_FILE into env.NAME before anything reads it. Both set (to different values) is refused: which
@@ -139,6 +143,9 @@ export function loadConfig(): Config {
       "GRAYBOARD_DEV_AUTH=1 must not be set alongside GOOGLE_OAUTH_CLIENT_SECRET, GRAYBOARD_MCP_GOOGLE_CLIENT_SECRET or GRAYBOARD_OKTA_CLIENT_SECRET (prevents prod misconfig)",
     );
   }
+  // A public oidc client has no secret to key on: its issuer alone refuses dev auth (#1418).
+  if (devAuth && process.env.GRAYBOARD_OIDC_ISSUER !== undefined)
+    throw new Error("GRAYBOARD_DEV_AUTH=1 must not be set alongside GRAYBOARD_OIDC_ISSUER (prevents prod misconfig)");
 
   const { store, blobDir } = storeConfig(process.env);
   const publicUrl = requireEnv("GRAYBOARD_PUBLIC_URL");
@@ -152,6 +159,7 @@ export function loadConfig(): Config {
   const idps = parseIdps(process.env.GRAYBOARD_IDPS);
   const google = idps.includes("google");
   const okta = oktaConfig(idps.includes("okta"));
+  const oidc = oidcConfig(idps.includes("oidc"));
 
   // One Google client pair (#928 D6, D8): the MCP pair when set, else the primary, which is then required. A
   // deployment with a Desktop primary pair and a Web MCP pair runs on the Web pair; its Desktop pair goes unused.
@@ -161,7 +169,7 @@ export function loadConfig(): Config {
   const googleClientId     = primaryRequired ? requireEnv("GOOGLE_OAUTH_CLIENT_ID") : !google ? "" : (process.env.GOOGLE_OAUTH_CLIENT_ID ?? (devAuth ? "dev" : ""));
   const googleClientSecret = primaryRequired ? requireEnv("GOOGLE_OAUTH_CLIENT_SECRET") : devAuth || !google ? "" : (process.env.GOOGLE_OAUTH_CLIENT_SECRET ?? "");
   const orgDomain          = !google ? "" : devAuth ? (process.env.GRAYBOARD_ORG_DOMAIN ?? "example.com") : requireEnv("GRAYBOARD_ORG_DOMAIN");
-  const identity = { idps, ...(okta ? { okta } : {}), devAuth, googleClientSecret, ...mcpGoogle };
+  const identity = { idps, ...(okta ? { okta } : {}), ...(oidc ? { oidc } : {}), devAuth, googleClientSecret, ...mcpGoogle };
   checkIdpConfig(identity);
 
   return {
@@ -175,6 +183,7 @@ export function loadConfig(): Config {
     orgDomain,
     idps,
     ...(okta ? { okta } : {}),
+    ...(oidc ? { oidc } : {}),
     publicUrl: publicUrl.replace(/\/$/, ""),
     messageRetentionDays: retentionDays("GRAYBOARD_MESSAGE_RETENTION_DAYS", process.env.GRAYBOARD_MESSAGE_RETENTION_DAYS, DEFAULT_RETENTION_DAYS),
     auditRetentionDays:   retentionDays("GRAYBOARD_AUDIT_RETENTION_DAYS",   process.env.GRAYBOARD_AUDIT_RETENTION_DAYS,   90),
@@ -265,7 +274,7 @@ function parseIdps(raw: string | undefined): IdpId[] {
 }
 
 function checkIdpList(idps: readonly string[]): void {
-  if (!idps.length || idps.some(id => id === "")) throw new Error("GRAYBOARD_IDPS has an empty entry: list provider IDs, comma-separated (google, okta)");
+  if (!idps.length || idps.some(id => id === "")) throw new Error("GRAYBOARD_IDPS has an empty entry: list provider IDs, comma-separated (google, okta, oidc)");
   for (const id of idps) if (!(IDP_IDS as readonly string[]).includes(id)) throw new Error(`GRAYBOARD_IDPS: unknown provider "${id}" (known: ${IDP_IDS.join(", ")})`);
   if (new Set(idps).size !== idps.length) throw new Error("GRAYBOARD_IDPS lists a provider twice");
 }
@@ -289,31 +298,75 @@ function oktaConfig(listed: boolean): OktaConfig | undefined {
   };
 }
 
+const OIDC_VARS = ["GRAYBOARD_OIDC_ISSUER", "GRAYBOARD_OIDC_CLIENT_ID", "GRAYBOARD_OIDC_ALLOWED_DOMAINS"] as const;
+const OIDC_OPTIONAL = ["GRAYBOARD_OIDC_CLIENT_SECRET", "GRAYBOARD_OIDC_LABEL"] as const;
+const OIDC_LABEL = "Single sign-on";
+
+// The generic provider's variables, as Okta's: three required when oidc is listed, any set while it isn't refused. An
+// unset secret makes a public client; a set but empty one is refused, never read as public.
+function oidcConfig(listed: boolean): OidcConfig | undefined {
+  const set = [...OIDC_VARS, ...OIDC_OPTIONAL].filter(name => process.env[name] !== undefined);
+  if (!listed) {
+    if (set.length) throw new Error(`${set.join(", ")} set but GRAYBOARD_IDPS doesn't list oidc: list it, or unset them`);
+    return undefined;
+  }
+  for (const name of OIDC_VARS) if (!process.env[name]) throw new Error(`GRAYBOARD_IDPS lists oidc, so ${name} is required`);
+  // resolveFileSecrets skips an empty NAME_FILE; for oidc that would silently mean a public client.
+  if (process.env.GRAYBOARD_OIDC_CLIENT_SECRET_FILE === "")
+    throw new Error("GRAYBOARD_OIDC_CLIENT_SECRET_FILE is set but empty: give the secret's path, or unset it for a public client");
+  const secret = process.env.GRAYBOARD_OIDC_CLIENT_SECRET;
+  return {
+    issuer: process.env.GRAYBOARD_OIDC_ISSUER!,
+    clientId: process.env.GRAYBOARD_OIDC_CLIENT_ID!,
+    ...(secret !== undefined ? { clientSecret: secret } : {}),
+    allowedDomains: process.env.GRAYBOARD_OIDC_ALLOWED_DOMAINS!.split(",").map(d => d.trim().toLowerCase()),
+    label: process.env.GRAYBOARD_OIDC_LABEL ?? OIDC_LABEL,
+  };
+}
+
 const CREDENTIAL = /^[\x21-\x7e]{1,4096}$/;
 const DOMAIN = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/;
 
 // The identity-provider rules (#928 D6), on Config alone: loadConfig and createOAuthServer both run it, and neither
 // reads an injected provider list (tests inject a provider holding a secret under dev auth). Errors never quote a
 // credential.
-export function checkIdpConfig(config: Pick<Config, "idps" | "okta" | "devAuth" | "googleClientSecret" | "mcpGoogle">): void {
+export function checkIdpConfig(config: Pick<Config, "idps" | "okta" | "oidc" | "devAuth" | "googleClientSecret" | "mcpGoogle">): void {
   const idps = config.idps ?? ["google"];
   checkIdpList(idps);
-  const okta = config.okta;
+  const { okta, oidc } = config;
   if (!idps.includes("okta") && okta) throw new Error("Okta is configured but GRAYBOARD_IDPS doesn't list okta");
   if (idps.includes("okta")) {
     if (!okta) throw new Error("GRAYBOARD_IDPS lists okta without its configuration");
-    let url: URL | undefined;
-    try { url = new URL(okta.issuer); } catch { /* refused below */ }
-    if (!url || url.protocol !== "https:" || /[?#]/.test(okta.issuer) || okta.issuer.endsWith("/") || url.username || url.password)
-      throw new Error("GRAYBOARD_OKTA_ISSUER must be an https URL with no query, fragment or trailing slash (the issuer exactly as the org's discovery document gives it)");
-    if (okta.issuer === GOOGLE_ISSUER) throw new Error("GRAYBOARD_OKTA_ISSUER can't be Google's issuer");
-    if (!CREDENTIAL.test(okta.clientId) || !CREDENTIAL.test(okta.clientSecret))
-      throw new Error("GRAYBOARD_OKTA_CLIENT_ID and GRAYBOARD_OKTA_CLIENT_SECRET must be nonempty credentials without whitespace");
-    if (!okta.allowedDomains.length || okta.allowedDomains.some(d => !DOMAIN.test(d)))
-      throw new Error(`GRAYBOARD_OKTA_ALLOWED_DOMAINS must be email domains, comma-separated (example.com), not "${okta.allowedDomains.join(",")}"`);
+    checkOidcClient("GRAYBOARD_OKTA", okta, "the org's");
   }
-  if (config.devAuth && (config.googleClientSecret || config.mcpGoogle?.clientSecret || okta?.clientSecret))
-    throw new Error("dev auth must not coexist with an identity provider's client secret");
+  if (!idps.includes("oidc") && oidc) throw new Error("OIDC is configured but GRAYBOARD_IDPS doesn't list oidc");
+  if (idps.includes("oidc")) {
+    if (!oidc) throw new Error("GRAYBOARD_IDPS lists oidc without its configuration");
+    checkOidcClient("GRAYBOARD_OIDC", oidc, "the provider's");
+    // The label reaches the sign-in chooser and refusal text: one short line.
+    if (!/^[^\p{Cc}]{1,64}$/u.test(oidc.label) || !oidc.label.trim()) throw new Error("GRAYBOARD_OIDC_LABEL must be 1 to 64 characters on one line");
+    // Each provider's issuer keys its accounts (idpSignIn): two providers on one issuer would share them.
+    if (okta && idps.includes("okta") && okta.issuer === oidc.issuer) throw new Error("GRAYBOARD_OIDC_ISSUER can't be GRAYBOARD_OKTA_ISSUER");
+  }
+  // A public oidc client has no secret, so its presence alone refuses dev auth.
+  if (config.devAuth && (config.googleClientSecret || config.mcpGoogle?.clientSecret || okta?.clientSecret || oidc))
+    throw new Error("dev auth must not coexist with an identity provider's client secret or an oidc provider");
+}
+
+// One OIDC client's issuer, credentials and domains, under its variables' prefix. A secret, when the client has one,
+// is a credential like the ID; Okta's is required by type.
+function checkOidcClient(prefix: string, c: { issuer: string; clientId: string; clientSecret?: string; allowedDomains: readonly string[] }, whose: string): void {
+  let url: URL | undefined;
+  try { url = new URL(c.issuer); } catch { /* refused below */ }
+  if (!url || url.protocol !== "https:" || /[?#]/.test(c.issuer) || c.issuer.endsWith("/") || url.username || url.password)
+    throw new Error(`${prefix}_ISSUER must be an https URL with no query, fragment or trailing slash (the issuer exactly as ${whose} discovery document gives it)`);
+  if (c.issuer === GOOGLE_ISSUER) throw new Error(`${prefix}_ISSUER can't be Google's issuer`);
+  if (!CREDENTIAL.test(c.clientId) || (c.clientSecret !== undefined && !CREDENTIAL.test(c.clientSecret)))
+    throw new Error(c.clientSecret === undefined
+      ? `${prefix}_CLIENT_ID must be a nonempty credential without whitespace`
+      : `${prefix}_CLIENT_ID and ${prefix}_CLIENT_SECRET must be nonempty credentials without whitespace`);
+  if (!c.allowedDomains.length || c.allowedDomains.some(d => !DOMAIN.test(d)))
+    throw new Error(`${prefix}_ALLOWED_DOMAINS must be email domains, comma-separated (example.com), not "${c.allowedDomains.join(",")}"`);
 }
 
 function mcpGoogleConfig(): Pick<Config, "mcpGoogle"> {
