@@ -111,14 +111,19 @@ test("board observers are independent hints with concealed access and explicit l
   let changed = 0, closed = 0;
   const unsubscribe = application.observeBoard(a, "#E2E", { changed: () => { changed++; }, closed: () => { closed++; } });
   application.observeBoard(a, "e2e", { changed: () => { throw new Error("ignored hint"); } });
+  // #1500: commit effects aren't awaited, so wait for the hint; a witness that stays subscribed proves a later post
+  // was delivered before the unsubscribed observer's count is read.
+  let witnessed = 0;
+  application.observeBoard(a, "e2e", { changed: () => { witnessed++; } });
   await seed(store.repo, tx => application.call(tx, a, "board_post", { board: "e2e", body: "hello" }));
-  expect(changed).toBe(1);
+  await until(() => changed === 1 && witnessed === 1);
   expect((await application.boardSnapshot(store.repo.read, a, "e2e")).posts[0]!.body).toBe("hello");
   expect((await application.boardCatalog(store.repo.read, a)).boards.map(b => b.name)).toContain("e2e");
   unsubscribe();
   unsubscribe();
   expect(closed).toBe(1);
   await seed(store.repo, tx => application.call(tx, a, "board_post", { board: "e2e", body: "later" }));
+  await until(() => witnessed === 2);
   expect(changed).toBe(1);
   application.close(a);
   expect(() => application.observeBoard(a, "e2e", { changed: () => {} })).toThrow("session is closed");
