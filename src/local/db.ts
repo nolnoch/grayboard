@@ -7,6 +7,7 @@ import { DEFAULT_ATTACHMENT_LIMITS, type AttachmentFile, type AttachmentInfo } f
 import { lastCoreAudit, writeCoreAudit } from "../core/audit.ts";
 import { addressParts } from "../core/addresses.ts";
 import { assertDeliverableId } from "../core/session_end.ts";
+import { isHuman } from "../core/boards.ts";
 import { testPause } from "../shared/testpause.ts";
 
 const opened = openLocalDb();
@@ -58,7 +59,10 @@ const MSG_COLS = `id, sender, recipient, body, parent_id, created_at, delivered_
 // its principal is null) to it, in one transaction. A session ID recipient is
 // checked in that transaction, so the send can't race the session's end (#284
 // S8): it's refused once the end has the lock, and bounced by it if it landed
-// first. `via`: the child session writing it (#523), else null.
+// first. `via`: the child session writing it (#523), else null. Every caller
+// writes the sender's own words (dm_send, delegate), so the row bears the
+// human mark when the sender is the declared human (#1364), judged in the same
+// IMMEDIATE transaction: a `grayboard human` can't land between the two.
 export function insertMessage(
   sender: string,
   senderId: string,
@@ -77,12 +81,13 @@ export function insertMessage(
     guard?.();
     if (addressParts(recipient)?.kind === "id") assertDeliverableId(db, recipient);
     const now = Date.now();
+    const human = isHuman(db, sender) ? 1 : 0;
     const { lastInsertRowid } = db
       .prepare(
-        `INSERT INTO messages (sender, sender_id, recipient, body, parent_id, created_at, pending, via)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO messages (sender, sender_id, recipient, body, parent_id, created_at, pending, via, human)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
-      .run(sender, senderId, recipient, body, parent_id, now, pending ? 1 : 0, via);
+      .run(sender, senderId, recipient, body, parent_id, now, pending ? 1 : 0, via, human);
     const id = Number(lastInsertRowid);
     return { id, attachments: bindAttachments(db, ids, uploader, { message_id: id }, DEFAULT_ATTACHMENT_LIMITS) };
   }).immediate();
@@ -103,6 +108,16 @@ export function unreadFor(reader: string): Message[] {
       )
       .all(reader, cursor) as Message[],
   );
+}
+
+// Whether a delivered DM bears the human mark: as its row recorded it when
+// written (#1364), so a sender declared human later never marks what it sent
+// before. A row from before the column (null), from an older binary, or gone
+// bears none: a pre-upgrade human DM losing its mark is harmless, an agent's
+// DM gaining one isn't.
+export function dmHuman(id: number): boolean {
+  const row = db.prepare(`SELECT human FROM messages WHERE id = ?`).get(id) as { human: number | null } | undefined;
+  return row?.human === 1;
 }
 
 export function getCursor(reader: string): number {

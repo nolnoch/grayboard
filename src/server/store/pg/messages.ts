@@ -48,15 +48,15 @@ const HISTORY_CAP = 200;
 export function makePgMessages({ clock, attachmentLimits }: { clock: () => number; attachmentLimits: AttachmentLimits }): MessagesStore {
   const att = (sql: PgSql, list: MessageRow[]) => withAttachments(sql, "message", list);
   return {
-    async insert(tx, sender, recipientType, recipient, body, parentId, pending = false, files, senderId = null, via = null, senderUser = null) {
+    async insert(tx, sender, recipientType, recipient, body, parentId, pending = false, files, senderId = null, via = null, senderUser = null, human = false) {
       const sql = pgOf(tx);
       // Every refusal before the first write (decision 5, 8): the transaction stays usable when the caller catches it.
       if (parentId !== null && (await sql`SELECT id FROM messages WHERE id = ${parentId} FOR KEY SHARE`).length === 0) throw new MissingParent(parentId);
       const locked = files ? await lockUnsent(sql, files.ids, files.uploader, attachmentLimits) : [];
       let row: MessageRow;
       try {
-        [row] = await rows(sql`INSERT INTO messages (sender, sender_id, recipient_type, recipient, body, parent_id, created_at, pending, via, sender_user)
-          VALUES (${sender}, ${senderId}, ${recipientType}, ${recipient}, ${body}, ${parentId}, ${clock()}, ${pending}, ${via}, ${senderUser})
+        [row] = await rows(sql`INSERT INTO messages (sender, sender_id, recipient_type, recipient, body, parent_id, created_at, pending, via, sender_user, human)
+          VALUES (${sender}, ${senderId}, ${recipientType}, ${recipient}, ${body}, ${parentId}, ${clock()}, ${pending}, ${via}, ${senderUser}, ${human})
           RETURNING ${cols(sql)}`) as [MessageRow];
       } catch (e) {
         throw (parentId !== null && missingParent(e, parentId)) || e;

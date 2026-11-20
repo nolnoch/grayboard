@@ -42,8 +42,9 @@ export function localMail(db: Database): MailPort {
     },
     bounce(from, to, parentId, body, now) {
       db.prepare(
-        `INSERT INTO messages (sender, sender_id, recipient, body, parent_id, created_at, pending, kind)
-         VALUES (?1, ?1, ?2, ?3, ?4, ?5, 0, 'bounce')`,
+        // A system DM: never the human mark (#1364), whoever it's from.
+        `INSERT INTO messages (sender, sender_id, recipient, body, parent_id, created_at, pending, kind, human)
+         VALUES (?1, ?1, ?2, ?3, ?4, ?5, 0, 'bounce', 0)`,
       ).run(from, to, body, parentId, now);
     },
     dropReader(id) {

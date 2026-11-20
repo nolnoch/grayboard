@@ -794,6 +794,10 @@ function initSchema(db: Database): void {
   // sender_user: the writer's signed-in user (security audit F-10), so a
   // recipient of another user can be told so; null before it and for bounces.
   if (!msgCols.some((c) => c.name === "sender_user")) db.exec(`ALTER TABLE messages ADD COLUMN sender_user TEXT`);
+  // human: whether the DM bears the human mark (#1364), judged when it's written: 1 when its sender bore the human
+  // mark then (writeSend), 0 for every other DM (a bounce among them); null before it. Never shown on reads (MSG_COLS).
+  // Hosted delivery reads no column: adapters mark by the reserved `<email>/human` sender (own-human.ts).
+  if (!msgCols.some((c) => c.name === "human")) db.exec(`ALTER TABLE messages ADD COLUMN human INTEGER`);
   // role: 'owner' or 'member' (security audit F-02); null on rows from
   // before it. Read once, by the #927 seed (seedSchema); role_bindings holds
   // ownership since, and nothing reads or writes this column.
@@ -1625,15 +1629,15 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
     },
 
     messages: {
-      async insert(tx, sender, recipientType, recipient, body, parentId, pending = false, files, senderId = null, via = null, senderUser = null) {
+      async insert(tx, sender, recipientType, recipient, body, parentId, pending = false, files, senderId = null, via = null, senderUser = null, human = false) {
         const db = sqliteOf(tx);
         return db.transaction(() => {
           // Before the insert, as Postgres's classified foreign-key failure refuses it (#807 P3 C5 decision 5).
           if (parentId !== null && !db.query<{ id: number }, [number]>("SELECT id FROM messages WHERE id = ?").get(parentId)) throw new MissingParent(parentId);
-          const row = db.query<MessageRow, [string, string | null, string, string, string, number | null, number, number, string | null, string | null]>(
-            `INSERT INTO messages (sender, sender_id, recipient_type, recipient, body, parent_id, created_at, pending, via, sender_user)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING ${MSG_COLS}`,
-          ).get(sender, senderId, recipientType, recipient, body, parentId, clock(), pending ? 1 : 0, via, senderUser)!;
+          const row = db.query<MessageRow, [string, string | null, string, string, string, number | null, number, number, string | null, string | null, number]>(
+            `INSERT INTO messages (sender, sender_id, recipient_type, recipient, body, parent_id, created_at, pending, via, sender_user, human)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING ${MSG_COLS}`,
+          ).get(sender, senderId, recipientType, recipient, body, parentId, clock(), pending ? 1 : 0, via, senderUser, human ? 1 : 0)!;
           const attachments = files ? bindAttachments(db, files.ids, files.uploader, { message_id: row.id }, attachmentLimits) : [];
           return attachments.length ? { ...row, attachments } : row;
         })();
@@ -2465,8 +2469,9 @@ export function mailPort(db: Database): MailPort {
     },
     bounce(from, to, parentId, body, now) {
       db.query(
-        `INSERT INTO messages (sender, sender_id, recipient_type, recipient, body, parent_id, created_at, pending, kind)
-         VALUES (?1, ?1, 'user', ?2, ?3, ?4, ?5, 0, 'bounce')`,
+        // A system DM: never the human mark (#1364).
+        `INSERT INTO messages (sender, sender_id, recipient_type, recipient, body, parent_id, created_at, pending, kind, human)
+         VALUES (?1, ?1, 'user', ?2, ?3, ?4, ?5, 0, 'bounce', 0)`,
       ).run(from, to, body, parentId, now);
     },
     dropReader(id) {

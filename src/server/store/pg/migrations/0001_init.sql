@@ -276,7 +276,8 @@ CREATE TABLE messages (
   kind           text COLLATE "C",
   delivered_at   int8,
   via            text COLLATE "C",
-  sender_user    text COLLATE "C"
+  sender_user    text COLLATE "C",
+  human          boolean
 );
 CREATE INDEX idx_msg_recipient ON messages (recipient_type, recipient, id);
 CREATE INDEX idx_msg_sender ON messages (sender, id);

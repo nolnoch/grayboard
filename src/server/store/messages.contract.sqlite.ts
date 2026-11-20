@@ -41,6 +41,8 @@ export const sqliteMessagesBackend: MessagesBackend = {
       bounce: async (sender, recipient, parentId, at) => (await one<{ id: number }>(
         "INSERT INTO messages (sender, recipient_type, recipient, body, parent_id, created_at, kind) VALUES (?, 'user', ?, 'bounced', ?, ?, 'bounce') RETURNING id",
         [sender, recipient, parentId, at])).id,
+      humanRows: async () => sqliteOf(repo.read).query<{ id: number; human: number | null }, []>("SELECT id, human FROM messages ORDER BY id").all()
+        .map(r => ({ id: r.id, human: r.human === null ? null : r.human === 1 })),
       messageRows: async () => sqliteOf(repo.read).query<{ id: number; parent_id: number | null }, []>("SELECT id, parent_id FROM messages ORDER BY id").all(),
       ackRows: async () => sqliteOf(repo.read).query<{ reader: string; message_id: number }, []>("SELECT reader, message_id FROM dm_acks ORDER BY message_id, reader").all(),
       attachmentRows: async () => sqliteOf(repo.read).query<{ id: number; message_id: number | null }, []>("SELECT id, message_id FROM attachments ORDER BY id").all(),
