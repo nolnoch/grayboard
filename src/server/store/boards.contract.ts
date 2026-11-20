@@ -879,6 +879,7 @@ function queue(it: It): void {
       await sub(h, S1, "jobs", "push");
       await sub(h, S2, "jobs", "push");
       const p = await write(h, np("jobs", QA, "job", T0 + 50));
+      await h.claim({ key: `queue:jobs:${p}`, holder: OPS, board: "jobs", at: T0 + 60 });
       await h.claimEvent({ key: `queue:jobs:${p}`, handle: OPS, event: "take", board: "jobs", at: T0 + 60, session: S1 });
       await h.push(OPS, p, S1);
       // Undelivered, both still S1's: BE was woken (the take at T0+60, the push at T0+50), FE never.
@@ -891,6 +892,56 @@ function queue(it: It): void {
       expect(await h.boards.laneRows(h.read, "jobs", [])).toEqual([BE, FE]);
     });
   }
+
+  // #1461 audit L1: a stale push, read after the post's claim stopped naming OPS (lapsed and gone, or redelivered to
+  // another lane): the outbox row is the reader's, but the take stays S1's, so BE keeps its turn at T0+60, after FE's
+  // push at T0+50. Mutation: creditQueueTakes without its claims condition gives the take to S2 ([BE, FE]).
+  for (const claim of ["lapsed", "redelivered"] as const) {
+    it(`a push delivered after its claim ${claim}: the take keeps the session whose turn it was`, async h => {
+      await board(h, "jobs", { kind: "queue" });
+      for (const a of [BE, FE, OPS, QA]) await h.alias(a);
+      await h.session(S1, ME);
+      await h.session(S2, ME);
+      await h.hold(BE, S1, T0);
+      await h.hold(FE, S2, T0);
+      await h.hold(OPS, S2, T0 + 1);
+      await sub(h, S1, "jobs", "push");
+      await sub(h, S2, "jobs", "push");
+      const p = await write(h, np("jobs", QA, "job", T0 + 50));
+      if (claim === "redelivered") await h.claim({ key: `queue:jobs:${p}`, holder: QA, board: "jobs", at: T0 + 70 });
+      await h.claimEvent({ key: `queue:jobs:${p}`, handle: OPS, event: "take", board: "jobs", at: T0 + 60, session: S1 });
+      await h.push(OPS, p, S1);
+      await h.write(tx => h.boards.acknowledge(tx, OPS, { kind: "push", post_id: p }));
+      expect(await h.outboxSessions()).toEqual([{ handle: OPS, post_id: p, session_id: S2 }]);
+      expect(await h.boards.laneRows(h.read, "jobs", [])).toEqual([FE, BE]);
+    });
+  }
+
+  // #1461 audit L2: only a push's first delivery credits. Delivered while no session held OPS (both rows NULL), then S2
+  // binds it and the push is acknowledged again: neither row moves to S2. Mutation: pg acknowledge without its
+  // first-delivery guard re-records both.
+  it("a repeat acknowledge after the address's holder changed credits nothing", async h => {
+    await board(h, "jobs", { kind: "queue" });
+    for (const a of [BE, FE, OPS]) await h.alias(a);
+    await h.session(S1, ME);
+    await h.session(S2, ME);
+    await h.hold(BE, S1, T0);
+    await h.hold(FE, S2, T0);
+    await sub(h, S1, "jobs", "push");
+    await sub(h, S2, "jobs", "push");
+    const p = await write(h, np("jobs", QA, "job", T0 + 50));
+    await h.claim({ key: `queue:jobs:${p}`, holder: OPS, board: "jobs", at: T0 + 60 });
+    await h.claimEvent({ key: `queue:jobs:${p}`, handle: OPS, event: "take", board: "jobs", at: T0 + 60, session: S1 });
+    await h.push(OPS, p, S1);
+    const ack = () => h.write(tx => h.boards.acknowledge(tx, OPS, { kind: "push", post_id: p }));
+    await ack();
+    expect(await h.outboxSessions()).toEqual([{ handle: OPS, post_id: p, session_id: null }]);
+    const before = await h.boards.laneRows(h.read, "jobs", []);
+    await h.hold(OPS, S2, T0 + 1);
+    await ack();
+    expect(await h.outboxSessions()).toEqual([{ handle: OPS, post_id: p, session_id: null }]);
+    expect(await h.boards.laneRows(h.read, "jobs", [])).toEqual(before);
+  });
 
   it("insertOutbox and claimQueuePost record the receiving session: an alias's holder, a session ID itself, null for an alias no session holds", async h => {
     await board(h, "jobs", { kind: "queue" });

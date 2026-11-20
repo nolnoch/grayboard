@@ -967,6 +967,25 @@ describe("a delivered push is credited to the session that read it (#1461)", () 
     acknowledge(db, "x", { kind: "push", post_id: p });
     expect([sessionOf("x", p), takeSession(p)]).toEqual([B, B]);
   });
+
+  // Audit L1: a push read after its claim lapsed is a stale turn. x's claim lapsed (A's turn) and the post went to sim;
+  // then x moved to B, whose drain delivered the old push. The take stays A's, so A's lanes still count as having held
+  // the post: the next lapse goes to B's lane z, never back to A. Mutation: creditQueueTakes without its claims
+  // condition re-records the take to B, so the second lapse skips B and offers the post to A again.
+  test("a stale push delivered after its claim lapsed leaves the take with the session whose turn it was", () => {
+    post(db, "be", "work", "item 0"); // sim
+    const p = post(db, "be", "work", "@x take this", null, said).post.id;
+    const holder = () => (db.prepare(`SELECT holder FROM claims WHERE key = ?`).get(claimKey(p)) as { holder: string } | null)?.holder;
+    expect(holder()).toBe("x");
+    sweepExpired(db, Date.now() + 31 * 60_000);
+    expect(holder()).toBe("sim");
+    db.prepare(`DELETE FROM alias_holds WHERE address = 'x'`).run();
+    holdAlias(db, "x", B, 102);
+    acknowledge(db, "x", { kind: "push", post_id: p });
+    expect([sessionOf("x", p), takeSession(p)]).toEqual([B, A]);
+    sweepExpired(db, Date.now() + 62 * 60_000);
+    expect(holder()).toBe("z");
+  });
 });
 
 // #1174 audit H1: queueLaneRows runs inside every queue post's and requeue's write transaction, so its per-lane

@@ -897,12 +897,15 @@ export function holdingSessionSql(h: string): string {
 /**
  * A queue post's push to `handle` just delivered (#1461): its take, the newest one under `handle` (claimQueuePost
  * logged it when the post was written, for whoever held `handle` then), re-records the session holding `handle` now,
- * as the push's outbox row does. A push read after its alias moved is the new holder's turn, not the old one's.
+ * as the push's outbox row does. A push read after its alias moved is the new holder's turn, not the old one's. Only
+ * while the post's claim still names `handle`: once it lapsed or was released (and maybe redelivered to another lane),
+ * that turn is over, and a stale push read later by whoever holds `handle` then must not take it from the old session.
  */
 export function creditQueueTakes(db: Database, handle: string, board: string, postIds: number[]): void {
   const take = db.prepare(
     `UPDATE claim_events SET session_id = ${holdingSessionSql("?1")}
-      WHERE id = (SELECT MAX(id) FROM claim_events WHERE key = ?2 AND handle = ?1 AND event = 'take')`,
+      WHERE id = (SELECT MAX(id) FROM claim_events WHERE key = ?2 AND handle = ?1 AND event = 'take')
+        AND EXISTS (SELECT 1 FROM claims WHERE key = ?2 AND holder = ?1)`,
   );
   for (const id of postIds) take.run(handle, `queue:${board}:${id}`);
 }
