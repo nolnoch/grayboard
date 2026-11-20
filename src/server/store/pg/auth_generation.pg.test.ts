@@ -1,10 +1,11 @@
 // #807 P3 C9b: the Postgres auth generation's races (c9-scope §3.2; postgres-server.md D5): the write path's own bump
 // (0001's gb.auth_touched mark, read by store/pg/tx.ts before COMMIT), outside writes reaching a pod through NOTIFY
 // gb_auth, two pods, zero-row and non-auth writes, a fill straddling an outside bump, a dropped LISTEN connection, and a
-// COMMIT whose outcome is unknown. Each test has its own database and "pods" (tests/support/pg_auth.ts: a store, its
-// generation over a listener the test controls, the auth cache over both). Waits have deadlines that name what they
-// waited for; races assert the end state first. The heartbeat, first-LISTEN retry and re-listen ordering rows
-// (T-C9-7..9) are C9b2's. Without GRAYBOARD_TEST_PG_URL it skips (tests/support/pg.ts).
+// COMMIT whose outcome is unknown, a silently dead listener (the heartbeat), a first LISTEN that fails (the retry) and
+// re-listen ordering. Each test has its own database and "pods" (tests/support/pg_auth.ts: a store, its generation over
+// a listener the test controls, the auth cache over both; the heartbeat and retry on timers the test drives, unless a
+// row says real ones). Waits have deadlines that name what they waited for; races assert the end state first. Without
+// GRAYBOARD_TEST_PG_URL it skips (tests/support/pg.ts).
 import { SQL } from "bun";
 import { expect, test } from "bun:test";
 import { createHash } from "node:crypto";
@@ -15,7 +16,7 @@ import { until } from "../../../../tests/support/until.ts";
 import { OAUTH_SCOPES } from "../../oauth-config.ts";
 import { OAUTH_TTL, type OAuthAuthorization, type ServiceTokenLimits } from "../../oauth-types.ts";
 import type { Tx } from "../tx_base.ts";
-import { AUTH_CHANNEL } from "./auth_generation.ts";
+import { AUTH_CHANNEL, RETRY_FIRST_MS, RETRY_MAX_MS } from "./auth_generation.ts";
 import { pgOf } from "./tx.ts";
 
 const RESOURCE = "https://bus.example.com/mcp";
@@ -105,8 +106,8 @@ describePg("Postgres auth generation", () => {
       `CREATE TRIGGER ${t}_auth_trunc AFTER TRUNCATE ON public.${t} FOR EACH STATEMENT EXECUTE FUNCTION gb_auth_touched()`,
       `CREATE TRIGGER ${t}_auth_upd AFTER UPDATE ON public.${t} REFERENCING NEW TABLE AS changed FOR EACH STATEMENT EXECUTE FUNCTION gb_auth_rows_touched()`,
     ];
-    expect(rows.map((r: { def: string }) => r.def)).toEqual([...want("oauth_grants"), ...want("oauth_tokens"), ...want("service_credential_secrets"), ...want("users")]);
-    expect(rows.map((r: { enabled: string }) => r.enabled)).toEqual(Array(16).fill("A"));
+    expect(rows.map((r: { def: string }) => r.def)).toEqual(["oauth_grants", "oauth_tokens", "principals", "service_credential_secrets", "service_credentials", "users"].flatMap(want));
+    expect(rows.map((r: { enabled: string }) => r.enabled)).toEqual(Array(24).fill("A"));
   });
 
   // settle() and seen() (tests/support/pg_auth.ts) end only on their own marker: an earlier notification, delivered
@@ -186,17 +187,20 @@ describePg("Postgres auth generation", () => {
       ["users INSERT", () => sql`INSERT INTO users (email, created_at) VALUES ('z@example.com', 0)`],
       ["users UPDATE", () => sql`UPDATE users SET display_name = 'Z' WHERE email = 'z@example.com'`],
       ["users DELETE", () => sql`DELETE FROM users WHERE email = 'z@example.com'`],
-      // With a service credential under it (no trigger of its own: its rows never change once written), for the secrets.
-      ["oauth_grants INSERT", async () => {
-        const r = await sql`INSERT INTO oauth_grants (id, user_id, expires_at, data) VALUES ('grant_scratch', ${u}, ${far}, '{}'::jsonb)`;
-        await sql`INSERT INTO service_credentials (client_id, user_id, grant_id, source, token_seconds, created_at) VALUES ('scratch', ${u}, 'grant_scratch', 'generic', 60, 0)`;
-        return r;
-      }],
+      ["oauth_grants INSERT", () => sql`INSERT INTO oauth_grants (id, user_id, expires_at, data) VALUES ('grant_scratch', ${u}, ${far}, '{}'::jsonb)`],
+      // A service credential under it, for the secrets.
+      ["service_credentials INSERT", () => sql`INSERT INTO service_credentials (client_id, user_id, grant_id, source, token_seconds, created_at) VALUES ('scratch', ${u}, 'grant_scratch', 'generic', 60, 0)`],
+      ["service_credentials UPDATE", () => sql`UPDATE service_credentials SET source = 'opencode' WHERE client_id = 'scratch'`],
       ["service_credential_secrets INSERT", () => sql`INSERT INTO service_credential_secrets (credential_id, hash, created_at)
         SELECT id, 'scratch-secret', 0 FROM service_credentials WHERE client_id = 'scratch'`],
       ["service_credential_secrets UPDATE", () => sql`UPDATE service_credential_secrets SET revoked_at = 1 WHERE hash = 'scratch-secret'`],
       // No token under it: no cascade fires oauth_tokens' trigger.
       ["service_credential_secrets DELETE", () => sql`DELETE FROM service_credential_secrets WHERE hash = 'scratch-secret'`],
+      // No secret left under it: no cascade fires the secrets' trigger.
+      ["service_credentials DELETE", () => sql`DELETE FROM service_credentials WHERE client_id = 'scratch'`],
+      ["principals INSERT", () => sql`INSERT INTO principals (kind, name, user_id, created_at) VALUES ('service', 'scratch-svc', ${u}, 0)`],
+      ["principals UPDATE", () => sql`UPDATE principals SET name = 'scratch-svc2' WHERE name = 'scratch-svc'`],
+      ["principals DELETE", () => sql`DELETE FROM principals WHERE name = 'scratch-svc2'`],
       ["oauth_tokens INSERT", () => sql`INSERT INTO oauth_tokens (hash, grant_id, kind, expires_at, created_at) VALUES ('scratch', 'grant_scratch', 'refresh', ${far}, 0)`],
       ["oauth_tokens UPDATE", () => sql`UPDATE oauth_tokens SET revoked_at = 1 WHERE hash = 'scratch'`],
       ["oauth_tokens DELETE", () => sql`DELETE FROM oauth_tokens WHERE hash = 'scratch'`],
@@ -228,7 +232,8 @@ describePg("Postgres auth generation", () => {
       expect(await a.auth.isDisabled(a.tx.read, u)).toBe(false);
       expect(a.counts.users).toBe(reads + 1);
     }
-    expect(ran).toHaveLength(14);
+    expect(ran).toHaveLength(cases.length);
+    expect(ran).toHaveLength(20);
   });
 
   withPods("T-C9-3 pod A revokes a token: pod B moves and refuses it, by lookup and by peek", 2, async (_db, a, b) => {
@@ -400,6 +405,223 @@ describePg("Postgres auth generation", () => {
     const reads = a.counts.accesses;
     expect(await a.auth.findActiveAccess(a.tx.read, t, RESOURCE, [], now)).toBeUndefined();
     expect(a.counts.accesses).toBe(reads + 1);
+  });
+
+  // The heartbeat (c9-scope §2.4): every tick checks the last ping arrived, then sends the next through the store's pool.
+  const on = (pod: PgAuthPod, what: string) =>
+    until(() => pod.gen.read() !== undefined, MOVE_MS, `pod ${pod.name}'s auth cache to turn on again after ${what}`);
+  // The heartbeat the last tick sent has been handled (or dropped) by the pod's listener: its send resolved and a marker
+  // sent after it arrived.
+  const pinged = async (pod: PgAuthPod, db: { sql: SQL }) => {
+    await until(() => pod.sent.length > 0, MOVE_MS, `pod ${pod.name}'s heartbeat to be sent`);
+    await (await pod.listener.marker(db.sql))(`pod ${pod.name}'s heartbeat ${pod.sent.at(-1)} to be handled`);
+  };
+
+  withPods("T-C9-7 a silently dead listener: a ping missing at the next tick turns the cache off and replaces the instance, which turns it on with a bump; the old instance's callbacks change nothing", 1, async (db, a) => {
+    const timers = a.timers!;
+    const u = await seed(a, "u7@example.com");
+    await a.settle();
+    expect(await a.auth.isDisabled(a.tx.read, u)).toBe(false); // cached
+    const g0 = a.auth.authGeneration()!;
+    const [old] = a.listener.instances;
+    // The old connection stops delivering (a hung backend: no FIN, no event). A disable committed now is lost to it.
+    old!.deaf = true;
+    await db.sql`UPDATE users SET disabled_at = ${Date.now()} WHERE id = ${u}`;
+    timers.tick();
+    await pinged(a, db);
+    // One tick with the ping outstanding: still on, the stale entry still answers (the 2H window).
+    expect(a.auth.authGeneration()).toBe(g0);
+    expect(await a.auth.isDisabled(a.tx.read, u)).toBe(false);
+    const listens = a.listener.listens;
+    timers.tick();
+    // At the second tick the ping never arrived: off at once, the old instance closed, a new one opened.
+    expect(a.auth.authGeneration()).toBeUndefined();
+    expect(a.listener.instances).toHaveLength(2);
+    expect(old!.closed).toBe(true);
+    await on(a, "the replacement's LISTEN");
+    expect(a.listener.listens).toBe(listens + 1);
+    const g1 = a.auth.authGeneration()!;
+    expect(Number(g1)).toBeGreaterThan(Number(g0));
+    // The old backend is gone: exactly one listener backend.
+    await a.listenerPid();
+    // The disable the old instance lost is refused now.
+    expect(a.auth.authPeek()?.user(u)).toBeUndefined();
+    expect(await a.auth.isDisabled(a.tx.read, u)).toBe(true);
+    // The old instance's callbacks, after the new one is on: none moves the generation or turns the cache off.
+    const g2 = a.auth.authGeneration();
+    old!.onnotify!("");
+    expect(a.auth.authGeneration()).toBe(g2);
+    old!.onlisten!();
+    expect(a.auth.authGeneration()).toBe(g2);
+    old!.onclose(new Error("test: the old instance's late close"));
+    expect(a.auth.authGeneration()).toBe(g2);
+    // Nor does an old instance's copy of the outstanding ping clear it: with the new instance deaf, the next tick
+    // finds it missing.
+    const [, current] = a.listener.instances;
+    current!.deaf = true;
+    timers.tick();
+    await pinged(a, db);
+    old!.onnotify!(a.sent.at(-1)!);
+    expect(a.auth.authGeneration()).toBe(g2);
+    timers.tick();
+    expect(a.auth.authGeneration()).toBeUndefined();
+    expect(a.listener.instances).toHaveLength(3);
+    await on(a, "the second replacement's LISTEN");
+  });
+
+  withPods("the heartbeat: a ping that arrives keeps the cache on and never bumps; nor does another pod's ping", 1, async (db, a) => {
+    const timers = a.timers!;
+    await a.settle();
+    const g0 = a.auth.authGeneration();
+    for (let k = 1; k <= 3; k++) {
+      timers.tick();
+      await until(() => a.listener.heartbeats === k, MOVE_MS, `pod a's heartbeat ${k} to arrive`);
+      expect(a.auth.authGeneration()).toBe(g0);
+    }
+    expect(new Set(a.sent).size).toBe(3);
+    expect(a.sent.every(p => p.startsWith("hb:"))).toBe(true);
+    // Another pod's ping: ignored, and it doesn't clear this pod's outstanding one.
+    a.listener.instances[0]!.deaf = false;
+    timers.tick();
+    await until(() => a.listener.heartbeats === 4, MOVE_MS, "pod a's heartbeat 4 to arrive");
+    await db.sql.notify(AUTH_CHANNEL, "hb:another-pod:1");
+    await a.settle();
+    expect(a.listener.heartbeats).toBe(5);
+    expect(a.auth.authGeneration()).toBe(g0);
+    expect(a.listener.instances).toHaveLength(1);
+  });
+
+  withPods("the heartbeat: a send that fails turns the cache off and replaces the instance; the next LISTEN turns it on", 1, async (_db, a) => {
+    const timers = a.timers!;
+    const u = await seed(a, "u7s@example.com");
+    await a.settle();
+    expect(await a.auth.isDisabled(a.tx.read, u)).toBe(false); // cached
+    const g0 = a.auth.authGeneration()!;
+    a.notifyFails = true;
+    // The replacement's LISTEN is held, so the off period can be seen.
+    a.listener.holdingListen = true;
+    try {
+      const { logged } = await capturingErrors(async () => {
+        timers.tick();
+        await until(() => a.listener.heldListen, MOVE_MS, "pod a's listener to be replaced after its heartbeat send failed, and the new LISTEN acknowledged");
+      });
+      expect(a.auth.authGeneration()).toBeUndefined();
+      expect(logged.map(l => l[0])).toEqual(["[grayboard] auth LISTEN heartbeat send failed; the auth cache is off until it listens again"]);
+      expect(a.listener.instances).toHaveLength(2);
+      expect(a.listener.instances[0]!.closed).toBe(true);
+    } finally { a.listener.holdingListen = false; a.listener.releaseListen(); a.notifyFails = false; }
+    await on(a, "the replacement's LISTEN");
+    expect(Number(a.auth.authGeneration())).toBeGreaterThan(Number(g0));
+    expect(a.auth.authPeek()?.user(u)).toBeUndefined();
+  });
+
+  test("the heartbeat on real timers: pings through the store's read-only pool keep the cache on; a deaf listener is replaced", async () => {
+    await using db = await pgDatabase({ max: 3 });
+    const a = await pgAuthPod(db, "a", { timers: "real", heartbeatMs: 250 });
+    try {
+      const g0 = a.auth.authGeneration();
+      await until(() => a.listener.heartbeats >= 3, 3000, "three heartbeats to arrive on real timers");
+      expect(a.auth.authGeneration()).toBe(g0);
+      expect(a.listener.instances).toHaveLength(1);
+      a.listener.instances[0]!.deaf = true;
+      await capturingErrors(() => until(() => a.listener.instances.length === 2 && a.gen.read() !== undefined, 3000,
+        "the deaf listener to be replaced and the cache on again"));
+      expect(Number(a.auth.authGeneration())).toBeGreaterThan(Number(g0));
+    } finally { await a.close(); }
+  });
+
+  test("T-C9-8 a first LISTEN that fails: start() resolves with the cache off, the LISTEN is retried at 1 s doubling to 30 s, logged once, and on with a bump when one succeeds", async () => {
+    await using db = await pgDatabase({ max: 3 });
+    const { value: a, logged } = await capturingErrors(async () => {
+      const a = await within(pgAuthPod(db, "a", { allowOff: true, prepare: l => { l.failListens = 8; } }), MOVE_MS, "start() with a refused LISTEN");
+      try {
+        const timers = a.timers!;
+        expect(a.gen.read()).toBeUndefined();
+        expect(a.auth.authPeek()).toBeUndefined();
+        for (let k = 1; k <= 8; k++) {
+          await until(() => timers.pending === 1, MOVE_MS, `retry ${k} to be scheduled`);
+          expect(a.gen.read()).toBeUndefined();
+          timers.fire();
+        }
+        await on(a, "the ninth LISTEN");
+      } catch (error) { await a.close(); throw error; }
+      return a;
+    });
+    try {
+      expect(a.timers!.delays).toEqual([1000, 2000, 4000, 8000, 16000, 30000, 30000, 30000]);
+      expect([RETRY_FIRST_MS, RETRY_MAX_MS]).toEqual([1000, 30000]);
+      expect(logged.map(l => l[0])).toEqual(["[grayboard] auth LISTEN failed; the auth cache stays off and the LISTEN is retried:"]);
+      // The LISTEN's own bump: a generation never handed out while the cache was off.
+      expect(Number(a.gen.read())).toBeGreaterThan(0);
+      expect(a.listener.instances).toHaveLength(9);
+      expect(a.listener.instances.slice(0, 8).every(i => i.closed)).toBe(true);
+      await a.listenerPid();
+      // An acknowledged LISTEN resets the backoff: a later failure retries at 1 s again.
+      a.listener.failListens = 1;
+      a.notifyFails = true;
+      await capturingErrors(async () => {
+        a.timers!.tick();
+        await until(() => a.timers!.pending === 1, MOVE_MS, "the retry after the heartbeat's failure and a refused LISTEN");
+      });
+      expect(a.timers!.delays.at(-1)).toBe(1000);
+      a.notifyFails = false;
+    } finally { await a.close(); }
+    // close() stops the heartbeat and the pending retry.
+    expect(a.timers!.intervals).toBe(0);
+    expect(a.timers!.pending).toBe(0);
+  });
+
+  test("T-C9-8 a first LISTEN that never answers: start() resolves after its timeout with the cache off; the attempt counts as failed after a full heartbeat interval and is retried", async () => {
+    await using db = await pgDatabase({ max: 3 });
+    const a = await within(pgAuthPod(db, "a", { allowOff: true, startTimeoutMs: 50, prepare: l => { l.hangListens = 1; } }), MOVE_MS, "start() with a LISTEN that never answers");
+    try {
+      const timers = a.timers!;
+      expect(a.gen.read()).toBeUndefined();
+      const { logged } = await capturingErrors(async () => {
+        timers.tick();
+        expect(timers.pending).toBe(0); // one tick isn't a full interval
+        timers.tick();
+      });
+      expect(logged.map(l => l[0])).toEqual(["[grayboard] auth LISTEN failed; the auth cache stays off and the LISTEN is retried:"]);
+      expect(timers.delays).toEqual([1000]);
+      expect(a.listener.instances[0]!.closed).toBe(true);
+      timers.fire();
+      await on(a, "the retried LISTEN");
+    } finally { await a.close(); }
+  });
+
+  withPods("T-C9-9 re-listen ordering: a disable committed while the new LISTEN's callback is held is refused once it runs; the generation only grows; each acknowledged LISTEN bumps", 1, async (db, a) => {
+    const u = await seed(a, "u9@example.com");
+    await a.settle();
+    expect(await a.auth.isDisabled(a.tx.read, u)).toBe(false); // cached
+    const g0 = a.auth.authGeneration()!;
+    a.listener.holdingListen = true;
+    try {
+      await capturingErrors(async () => {
+        await db.sql`SELECT pg_terminate_backend(${await a.listenerPid()})`;
+        await until(() => a.listener.heldListen, 3000, "pod A's listener to reconnect and its LISTEN to be acknowledged");
+      });
+      // Bun has the new LISTEN; the source hasn't run its callback. A disable now is delivered on the new connection.
+      await db.sql`UPDATE users SET disabled_at = ${Date.now()} WHERE id = ${u}`;
+      await a.settle();
+      expect(a.auth.authGeneration()).toBeUndefined();
+    } finally { a.listener.holdingListen = false; a.listener.releaseListen(); }
+    const g1 = a.auth.authGeneration()!;
+    expect(Number(g1)).toBeGreaterThan(Number(g0));
+    expect(a.auth.authPeek()?.user(u)).toBeUndefined(); // nothing keyed before the drop answers
+    expect(await a.auth.isDisabled(a.tx.read, u)).toBe(true);
+    expect(a.auth.authPeek()?.user(u)).toBeDefined(); // cached under g1
+    // A notification after the re-listen bumps past it.
+    await db.sql`UPDATE users SET display_name = 'after' WHERE id = ${u}`;
+    await moved(a, g1, "an outside write after the re-listen");
+    expect(Number(a.auth.authGeneration())).toBeGreaterThan(Number(g1));
+    // A LISTEN acknowledged again on the current instance with no close before it (Bun runs onlisten on every
+    // acknowledgement): it bumps too, so no entry keyed before it answers after it.
+    expect(await a.auth.isDisabled(a.tx.read, u)).toBe(true); // cached
+    const g2 = a.auth.authGeneration()!;
+    a.listener.instances.at(-1)!.onlisten!();
+    expect(Number(a.auth.authGeneration())).toBeGreaterThan(Number(g2));
+    expect(a.auth.authPeek()?.user(u)).toBeUndefined();
   });
 
   for (const mode of ["dropped", "ack lost"] as const) test(`T-C9-10 COMMIT ${mode} on a body that wrote users: the generation moves anyway`, async () => {

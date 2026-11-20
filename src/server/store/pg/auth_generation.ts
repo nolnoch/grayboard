@@ -12,20 +12,41 @@
 // through the instance's `onclose`, which fires for every connection of the instance, so on a shared pool an idle read
 // connection's close would read as a lost LISTEN. Bun reconnects and re-listens by itself (onclose, then onlisten).
 //
-// Not yet (C9b2): the heartbeat that turns the cache off when a silently dead connection stops delivering, retrying a
-// first LISTEN that failed (Bun retries only after a connection it had; until then the cache stays off), and tying
-// callbacks to the instance they came from once a heartbeat can replace it. `openListener` is their seam too.
+// Two drops Bun doesn't handle (c9-scope §2.3-2.4):
+// - A silently dead connection (a NAT or security-group idle drop, a hung backend) gives no event at all. Every
+//   `heartbeatMs` the source sends `hb:<nonce>:<seq>` through the store's pool; a listener receives notifications in
+//   commit order, so a ping that arrived proves every notification committed before it did. If the last ping hasn't
+//   arrived by the next tick, or its send failed, the cache turns off and the instance is closed and replaced (each
+//   callback acts only while its instance is the current one, so the old one's change nothing). A silent drop is
+//   therefore bounded at 2 x heartbeatMs. `hb:` payloads, other pods' included, never bump.
+// - A first LISTEN that fails is never retried by Bun (it retries only after a connection it had). The source retries
+//   it at 1 s doubling to 30 s, with the cache off meanwhile; an attempt still unanswered after a full heartbeat
+//   interval counts as failed. `start()` waits at most `startTimeoutMs` for the first.
 import { SQL } from "bun";
+import { randomUUID } from "node:crypto";
 import { errorDiagnostic } from "../../diagnostics.ts";
 import type { AuthGenerationSource } from "../auth_cache.ts";
 import type { PgTransactions } from "./tx.ts";
 
 export const AUTH_CHANNEL = "gb_auth";
+export const HEARTBEAT_PREFIX = "hb:";
+export const RETRY_FIRST_MS = 1000, RETRY_MAX_MS = 30_000;
 
 // The part of a Bun.SQL instance the source uses, in Bun's shapes, so a test can stand in for it.
 export type PgListener = Pick<SQL, "listen" | "close">;
 // Opens a listener instance; `onclose` runs whenever its connection closes.
 export type OpenListener = (onclose: (error: Error | null) => void) => PgListener;
+
+// The source's clocks: the heartbeat's interval and the retry's delay, each returning its cancel. A test drives them
+// by hand; the real ones don't keep the process alive.
+export type AuthTimers = {
+  every(ms: number, fn: () => void): () => void;
+  after(ms: number, fn: () => void): () => void;
+};
+export const realTimers: AuthTimers = {
+  every(ms, fn) { const t = setInterval(fn, ms); t.unref(); return () => clearInterval(t); },
+  after(ms, fn) { const t = setTimeout(fn, ms); t.unref(); return () => clearTimeout(t); },
+};
 
 // The production listener: one connection, labelled in pg_stat_activity.
 export function openPgListener(url: string, applicationName = "grayboard-auth-listen"): OpenListener {
@@ -35,31 +56,99 @@ export function openPgListener(url: string, applicationName = "grayboard-auth-li
 export type PgAuthGeneration = AuthGenerationSource & {
   // The write path's bump (makePgTransactions' ownAuthCommit).
   ownCommit(): void;
-  // Opens the listener and resolves once its first LISTEN is acknowledged (the cache on) or refused (the cache off,
-  // logged). Call after migrate, before serving.
+  // Opens the listener and starts the heartbeat. Resolves once the first LISTEN is acknowledged (the cache on), has
+  // failed (the cache off, logged, retried), or after startTimeoutMs (the attempt carries on). Call after migrate,
+  // before serving.
   start(): Promise<void>;
+  // Stops the heartbeat and any retry, turns the cache off and closes the listener.
   close(): Promise<void>;
 };
 
-export function makePgAuthGeneration({ url, transactions, openListener = openPgListener(url) }: {
+export function makePgAuthGeneration({ url, transactions, heartbeatMs = 5000, startTimeoutMs = 2000, openListener = openPgListener(url), timers = realTimers }: {
   url: string;
-  transactions: Pick<PgTransactions, "inTransaction" | "queue">;
+  // `notify` sends the heartbeat through the store's pool (read-only is fine: pg_notify isn't a write).
+  transactions: Pick<PgTransactions, "inTransaction" | "queue" | "notify">;
+  heartbeatMs?: number;
+  startTimeoutMs?: number;
   openListener?: OpenListener;
+  timers?: AuthTimers;
 }): PgAuthGeneration {
-  let n = 0, on = false, closed = false;
+  let n = 0, on = false, closed = false, started = false;
+  // The current instance: a callback from any other is stale and changes nothing.
   let inst: PgListener | undefined;
-  const onclose = (error: Error | null) => {
-    // Logged once per off period.
-    if (on) console.error("[grayboard] auth LISTEN connection closed; the auth cache is off until it listens again:", error && errorDiagnostic(error));
+  // The current instance's first LISTEN while unanswered, and the ticks it has waited.
+  let attempt: { i: PgListener; ticks: number } | undefined;
+  // The outstanding heartbeat token: sent, not yet received.
+  let hb: string | undefined;
+  let seq = 0;
+  const nonce = randomUUID();
+  let retryMs = RETRY_FIRST_MS;
+  let cancelRetry: (() => void) | undefined, stopHeartbeat: (() => void) | undefined;
+  // Logged once per off period, and once per run of failed attempts.
+  let offLogged = false, failLogged = false;
+
+  const off = (why: string, error?: unknown) => {
+    if (!offLogged) {
+      offLogged = true;
+      console.error(`[grayboard] auth LISTEN ${why}; the auth cache is off until it listens again`, ...(error ? [errorDiagnostic(error)] : []));
+    }
     on = false;
+    hb = undefined;
     n++;
   };
-  const onNotify = () => { n++; };
-  const onListen = () => {
+
+  // A new instance and its LISTEN. Resolves when that attempt is acknowledged or has failed.
+  function open(): Promise<void> {
+    cancelRetry?.();
+    cancelRetry = undefined;
+    const i: PgListener = openListener(error => { if (i === inst && !closed) off("connection closed", error); });
+    inst = i;
+    attempt = { i, ticks: 0 };
+    return i.listen(AUTH_CHANNEL, p => {
+      if (i !== inst || closed) return;
+      if (p.startsWith(HEARTBEAT_PREFIX)) { if (p === hb) hb = undefined; return; }
+      n++;
+    }, () => {
+      if (i !== inst || closed) return;
+      n++;
+      on = true;
+      offLogged = failLogged = false;
+      retryMs = RETRY_FIRST_MS;
+    }).then(() => { if (attempt?.i === i) attempt = undefined; }, error => failed(i, error));
+  }
+
+  // The attempt on `i` failed: drop it and retry after the backoff.
+  function failed(i: PgListener, error: unknown) {
+    if (i !== inst || closed) return;
+    if (!failLogged) {
+      failLogged = true;
+      console.error("[grayboard] auth LISTEN failed; the auth cache stays off and the LISTEN is retried:", errorDiagnostic(error));
+    }
+    inst = attempt = undefined;
+    i.close({ timeout: 0 }).catch(() => {});
+    const ms = retryMs;
+    retryMs = Math.min(retryMs * 2, RETRY_MAX_MS);
+    cancelRetry = timers.after(ms, () => { cancelRetry = undefined; if (!closed && !inst) void open(); });
+  }
+
+  // Closes a silent or unreachable instance and opens another.
+  function replace(why: string, error?: unknown) {
+    off(why, error);
+    const i = inst;
+    inst = attempt = undefined;
+    i?.close({ timeout: 0 }).catch(() => {});
+    void open();
+  }
+
+  function tick() {
     if (closed) return;
-    n++;
-    on = true;
-  };
+    if (attempt && ++attempt.ticks >= 2) failed(attempt.i, new Error(`LISTEN not acknowledged within ${heartbeatMs} ms`));
+    if (hb !== undefined) replace("heartbeat never arrived");
+    if (!on) return;
+    const token = hb = `${HEARTBEAT_PREFIX}${nonce}:${++seq}`;
+    transactions.notify(AUTH_CHANNEL, token).catch(error => { if (hb === token && !closed) replace("heartbeat send failed", error); });
+  }
+
   return {
     read: () => on ? String(n) : undefined,
     // Its task holds the store's open transaction: the pool can't see what the body wrote.
@@ -68,22 +157,23 @@ export function makePgAuthGeneration({ url, transactions, openListener = openPgL
     commit: () => undefined,
     ownCommit() { n++; },
     async start() {
-      if (closed || inst) throw new Error("auth generation already started");
-      const i = inst = openListener(onclose);
-      try {
-        await i.listen(AUTH_CHANNEL, onNotify, onListen);
-      } catch (error) {
-        console.error("[grayboard] auth LISTEN failed; the auth cache stays off:", errorDiagnostic(error));
-        inst = undefined;
-        await i.close({ timeout: 0 }).catch(() => {});
-      }
+      if (closed || started) throw new Error("auth generation already started");
+      started = true;
+      stopHeartbeat = timers.every(heartbeatMs, tick);
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const late = new Promise<void>(resolve => { timer = setTimeout(resolve, startTimeoutMs); timer.unref(); });
+      try { await Promise.race([open(), late]); } finally { clearTimeout(timer); }
     },
     async close() {
       closed = true;
       on = false;
+      hb = attempt = undefined;
+      stopHeartbeat?.();
+      cancelRetry?.();
+      stopHeartbeat = cancelRetry = undefined;
       const i = inst;
       inst = undefined;
-      await i?.close();
+      await i?.close({ timeout: 0 });
     },
   };
 }

@@ -2,9 +2,9 @@
 // row by id, keyed on a generation that every committed write able to change a cached answer moves. Written once over
 // a per-backend generation source: SQLite's is db.ts's trigger counter on oauth_tokens, oauth_grants and users joined
 // with data_version (one writer: a secret's revoke always sees, and revokes, every token minted under it); Postgres's
-// is an in-process counter its write path and a LISTEN bump (C9b), moved by 0001's triggers on those three and
-// service_credential_secrets, whose revoke alone refuses a token a racing mint committed (0001 lists each table the
-// cached reads join and why). It reads through the uncached store reads it's given, so it imports no backend: no
+// is an in-process counter its write path and a LISTEN bump (C9b), moved by 0001's triggers on every table the cached
+// reads join, service_credential_secrets among them, whose revoke alone refuses a token a racing mint committed (0001
+// lists them). It reads through the uncached store reads it's given, so it imports no backend: no
 // module here reaches db.ts or bun:sqlite.
 import { AsyncLocalStorage } from "node:async_hooks";
 import { testPauseAsync } from "../../shared/testpause.ts";

@@ -126,22 +126,20 @@ CREATE TABLE oauth_tokens (
 CREATE INDEX idx_oauth_tokens_grant ON oauth_tokens (grant_id);
 CREATE INDEX idx_oauth_tokens_secret ON oauth_tokens (secret_id);
 
--- The auth generation (postgres-server.md D5; #807 P3 C9b): a statement that changes a row of users, oauth_grants,
--- oauth_tokens or service_credential_secrets, or truncates one, marks its transaction (gb.auth_touched,
--- transaction-local, so ROLLBACK TO undoes it) and sends NOTIFY gb_auth, delivered at commit. store/pg/tx.ts reads the
--- mark before COMMIT and bumps this process's counter after it; every listening process bumps on the notification.
--- These four are every table whose later change can alter an answer store/auth_cache.ts caches: findActiveAccess
--- (store/pg/oauth.ts) joins oauth_tokens, oauth_grants, users (disabled_at) and service_credential_secrets (revoked_at:
--- a revoke whose token UPDATE matched no row, a mint racing it, changes only the secret), and users.findById
--- (store/pg/identity.ts) reads users. Two joined tables carry no trigger because nothing changes their rows once
--- written: service_credentials (findActiveAccess's source; inserted in its grant's transaction, deleted only by that
--- grant's cascade) and principals (users.findById's kind: a service's row is inserted in its users row's transaction,
--- and none is ever updated or deleted). A new write to either, or a new table a cached read joins, needs these
--- triggers. Statement triggers with transition tables: a statement that changed no rows (the OAuth cleanup's DELETEs,
--- usually) marks nothing, and a bulk one runs the function once. A transition table serves one event per trigger, so
--- each table has one per event; TRUNCATE has none. ENABLE ALWAYS: they fire under session_replication_role = replica
--- too (a restore, a replication apply), which would otherwise skip them silently; only an explicit DISABLE TRIGGER
--- stops them.
+-- The auth generation (postgres-server.md D5; #807 P3 C9b): a statement that changes a row of an auth table, or
+-- truncates one, marks its transaction (gb.auth_touched, transaction-local, so ROLLBACK TO undoes it) and sends NOTIFY
+-- gb_auth, delivered at commit. store/pg/tx.ts reads the mark before COMMIT and bumps this process's counter after it;
+-- every listening process bumps on the notification. The auth tables are every table an answer store/auth_cache.ts
+-- caches reads: findActiveAccess (store/pg/oauth.ts) joins oauth_tokens, oauth_grants, users (disabled_at),
+-- service_credential_secrets (revoked_at: a revoke whose token UPDATE matched no row, a mint racing it, changes only
+-- the secret) and service_credentials (source), and users.findById (store/pg/identity.ts) reads users and principals
+-- (a service's kind). The application never changes a service_credentials or principals row once written, but an
+-- operator's hand edit would then leave a stale answer cached; their triggers cost a cache clear only where a row is
+-- written (a team's create inserts its principal). A new table a cached read joins needs these triggers too.
+-- Statement triggers with transition tables: a statement that changed no rows (the OAuth cleanup's DELETEs, usually)
+-- marks nothing, and a bulk one runs the function once. A transition table serves one event per trigger, so each table
+-- has one per event; TRUNCATE has none. ENABLE ALWAYS: they fire under session_replication_role = replica too (a
+-- restore, a replication apply), which would otherwise skip them silently; only an explicit DISABLE TRIGGER stops them.
 CREATE FUNCTION gb_auth_touched() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
   PERFORM set_config('gb.auth_touched', '1', true);
@@ -172,10 +170,20 @@ CREATE TRIGGER service_credential_secrets_auth_ins AFTER INSERT ON service_crede
 CREATE TRIGGER service_credential_secrets_auth_upd AFTER UPDATE ON service_credential_secrets REFERENCING NEW TABLE AS changed FOR EACH STATEMENT EXECUTE FUNCTION gb_auth_rows_touched();
 CREATE TRIGGER service_credential_secrets_auth_del AFTER DELETE ON service_credential_secrets REFERENCING OLD TABLE AS changed FOR EACH STATEMENT EXECUTE FUNCTION gb_auth_rows_touched();
 CREATE TRIGGER service_credential_secrets_auth_trunc AFTER TRUNCATE ON service_credential_secrets FOR EACH STATEMENT EXECUTE FUNCTION gb_auth_touched();
+CREATE TRIGGER service_credentials_auth_ins AFTER INSERT ON service_credentials REFERENCING NEW TABLE AS changed FOR EACH STATEMENT EXECUTE FUNCTION gb_auth_rows_touched();
+CREATE TRIGGER service_credentials_auth_upd AFTER UPDATE ON service_credentials REFERENCING NEW TABLE AS changed FOR EACH STATEMENT EXECUTE FUNCTION gb_auth_rows_touched();
+CREATE TRIGGER service_credentials_auth_del AFTER DELETE ON service_credentials REFERENCING OLD TABLE AS changed FOR EACH STATEMENT EXECUTE FUNCTION gb_auth_rows_touched();
+CREATE TRIGGER service_credentials_auth_trunc AFTER TRUNCATE ON service_credentials FOR EACH STATEMENT EXECUTE FUNCTION gb_auth_touched();
+CREATE TRIGGER principals_auth_ins AFTER INSERT ON principals REFERENCING NEW TABLE AS changed FOR EACH STATEMENT EXECUTE FUNCTION gb_auth_rows_touched();
+CREATE TRIGGER principals_auth_upd AFTER UPDATE ON principals REFERENCING NEW TABLE AS changed FOR EACH STATEMENT EXECUTE FUNCTION gb_auth_rows_touched();
+CREATE TRIGGER principals_auth_del AFTER DELETE ON principals REFERENCING OLD TABLE AS changed FOR EACH STATEMENT EXECUTE FUNCTION gb_auth_rows_touched();
+CREATE TRIGGER principals_auth_trunc AFTER TRUNCATE ON principals FOR EACH STATEMENT EXECUTE FUNCTION gb_auth_touched();
 ALTER TABLE users ENABLE ALWAYS TRIGGER users_auth_ins, ENABLE ALWAYS TRIGGER users_auth_upd, ENABLE ALWAYS TRIGGER users_auth_del, ENABLE ALWAYS TRIGGER users_auth_trunc;
 ALTER TABLE oauth_grants ENABLE ALWAYS TRIGGER oauth_grants_auth_ins, ENABLE ALWAYS TRIGGER oauth_grants_auth_upd, ENABLE ALWAYS TRIGGER oauth_grants_auth_del, ENABLE ALWAYS TRIGGER oauth_grants_auth_trunc;
 ALTER TABLE oauth_tokens ENABLE ALWAYS TRIGGER oauth_tokens_auth_ins, ENABLE ALWAYS TRIGGER oauth_tokens_auth_upd, ENABLE ALWAYS TRIGGER oauth_tokens_auth_del, ENABLE ALWAYS TRIGGER oauth_tokens_auth_trunc;
 ALTER TABLE service_credential_secrets ENABLE ALWAYS TRIGGER service_credential_secrets_auth_ins, ENABLE ALWAYS TRIGGER service_credential_secrets_auth_upd, ENABLE ALWAYS TRIGGER service_credential_secrets_auth_del, ENABLE ALWAYS TRIGGER service_credential_secrets_auth_trunc;
+ALTER TABLE service_credentials ENABLE ALWAYS TRIGGER service_credentials_auth_ins, ENABLE ALWAYS TRIGGER service_credentials_auth_upd, ENABLE ALWAYS TRIGGER service_credentials_auth_del, ENABLE ALWAYS TRIGGER service_credentials_auth_trunc;
+ALTER TABLE principals ENABLE ALWAYS TRIGGER principals_auth_ins, ENABLE ALWAYS TRIGGER principals_auth_upd, ENABLE ALWAYS TRIGGER principals_auth_del, ENABLE ALWAYS TRIGGER principals_auth_trunc;
 
 CREATE TABLE oauth_requests (
   hash         text COLLATE "C" PRIMARY KEY,
