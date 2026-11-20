@@ -199,22 +199,27 @@ export function oidcProvider(o: OidcProviderOptions): IdentityProvider {
       if (typeof subject !== "string" || !subject || subject.length > MAX_SUBJECT) throw new OidcIdentityError(`${o.label} ID token sub is invalid`);
 
       // email and email_verified come from one document: the access token when configured, else the ID token when it
-      // has both (or has an email and trustEmail is on), else userinfo.
+      // has both, else userinfo (or, under trustEmail with no userinfo endpoint, the ID token's email alone). An
+      // explicit email_verified false in any document read refuses, trustEmail or not.
       let source: Record<string, unknown> = claims;
       if (o.accessTokenAudience !== undefined) {
         if (typeof tokens.access_token !== "string") throw new OidcEndpointError(`${o.label} token response has no access_token`);
         source = await verify(tokens.access_token, d, "access token", o.accessTokenAudience);
-        if (source.azp !== undefined && source.azp !== o.clientId) throw new OidcIdentityError(`${o.label} access token's azp is not this client`);
+        // The ID token's rule is azp only when present or with several audiences; an access token always names its client.
+        if (source.azp !== o.clientId) throw new OidcIdentityError(`${o.label} access token's azp is not this client`);
         if (source.sub !== subject) throw new OidcIdentityError(`${o.label} access token names another subject`);
-      } else if (claims.email === undefined || (claims.email_verified === undefined && !o.trustEmail)) {
-        if (!d.userinfo) throw new OidcIdentityError(`${o.label} ID token lacks email claims and discovery has no userinfo_endpoint`);
-        if (typeof tokens.access_token !== "string") throw new OidcEndpointError(`${o.label} token response has no access_token`);
-        source = await json(d.userinfo, { headers: { Authorization: `Bearer ${tokens.access_token}`, Accept: "application/json" } }, "userinfo", OidcEndpointError);
-        // OIDC Core §5.3.2.
-        if (source.sub !== subject) throw new OidcIdentityError(`${o.label} userinfo names another subject`);
+      } else if (claims.email === undefined || claims.email_verified === undefined) {
+        if (d.userinfo) {
+          if (typeof tokens.access_token !== "string") throw new OidcEndpointError(`${o.label} token response has no access_token`);
+          source = await json(d.userinfo, { headers: { Authorization: `Bearer ${tokens.access_token}`, Accept: "application/json" } }, "userinfo", OidcEndpointError);
+          // OIDC Core §5.3.2.
+          if (source.sub !== subject) throw new OidcIdentityError(`${o.label} userinfo names another subject`);
+        } else if (!o.trustEmail || claims.email === undefined) {
+          throw new OidcIdentityError(`${o.label} ID token lacks email claims and discovery has no userinfo_endpoint`);
+        }
       }
       if (typeof source.email !== "string" || !source.email.trim()) throw new OidcIdentityError(`${o.label} sent no email`);
-      if (source.email_verified !== true && !(o.trustEmail && source.email_verified === undefined))
+      if (claims.email_verified === false || (source.email_verified !== true && !(o.trustEmail && source.email_verified === undefined)))
         throw new OidcIdentityError(`${o.label} email is not verified`);
       const email = source.email.toLowerCase();
       const at = email.lastIndexOf("@");

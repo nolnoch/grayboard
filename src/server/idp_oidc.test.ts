@@ -459,9 +459,44 @@ test("without trustEmail an email lacking email_verified is refused; with it, an
   await expect(signIn(realmProvider(f), f)).rejects.toThrow(new OidcIdentityError("SSO email is not verified"));
 });
 
-test("trustEmail takes an ID token's email without email_verified as it stands, without userinfo", async () => {
+test("trustEmail still asks userinfo when the ID token lacks email_verified, and refuses its false", async () => {
   const f = await fake();
   f.next({ claims: { email_verified: undefined } });
+  f.userinfo({ email_verified: false });
+  await expect(signIn(provider(f, { trustEmail: true }), f)).rejects.toThrow(new OidcIdentityError("Okta email is not verified"));
+  expect(f.hits.userinfo).toBe(1);
+});
+
+test("trustEmail with no userinfo endpoint takes the ID token's email without email_verified; without trustEmail that refuses", async () => {
+  const f = await fake();
+  f.discovery({ userinfo_endpoint: undefined });
+  f.next({ claims: { email_verified: undefined } });
   expect((await signIn(provider(f, { trustEmail: true }), f)).email).toBe("you@example.com");
+  f.next({ claims: { email_verified: undefined } });
+  await expect(signIn(provider(f), f)).rejects.toThrow("discovery has no userinfo_endpoint");
   expect(f.hits.userinfo).toBe(0);
+});
+
+test("with identity from the access token, the ID token's explicit email_verified false still refuses under trustEmail", async () => {
+  const f = await realm();
+  f.next({ claims: { email_verified: false } });
+  await expect(signIn(realmProvider(f), f)).rejects.toThrow(new OidcIdentityError("SSO email is not verified"));
+});
+
+test("refuses an access token with no azp, even with several audiences", async () => {
+  const f = await realm();
+  f.nextAccess({ claims: { azp: undefined } });
+  await expect(signIn(realmProvider(f), f)).rejects.toThrow(new OidcIdentityError("SSO access token's azp is not this client"));
+});
+
+test("refuses an access token issued over ten minutes ago, though unexpired", async () => {
+  const f = await realm();
+  f.nextAccess({ claims: { iat: now() - 3600, exp: now() + 300 } });
+  await expect(signIn(realmProvider(f), f)).rejects.toBeInstanceOf(OidcIdentityError);
+});
+
+test("trustEmail refuses an email_verified that is present but not a boolean true (the string \"true\")", async () => {
+  const f = await realm();
+  f.nextAccess({ claims: { email_verified: "true" } });
+  await expect(signIn(realmProvider(f), f)).rejects.toThrow(new OidcIdentityError("SSO email is not verified"));
 });
