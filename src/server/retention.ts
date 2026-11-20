@@ -68,7 +68,7 @@ export async function runRetention(repo: Repo, config: Config, now = Date.now(),
   await step("write receipts", () => repo.write(tx => repo.writeReceipts.prune(tx, now - WRITE_DEDUP_WINDOW_MS)));
   if (stopped()) return;
   // Also finishes any sweep a crash or a failed delete left.
-  const swept = await sweepStoredBlobs(repo);
+  const swept = await sweepStoredBlobs(repo, stopped);
   if (swept) console.error(`[grayboard] retention: deleted ${swept} attachment blobs`);
   if (stopped()) return;
   try {

@@ -44,6 +44,7 @@ import { claim, claimExpiryTimer, expiryTimer, listClaims, release, sweepExpired
 import { initCoreSchema } from "./schema.ts";
 import { dropHold, holdAlias, logBinding } from "./bindings.ts";
 import { boardNotification } from "../shared/notifications.ts";
+import { until } from "../../tests/support/until.ts";
 
 let db: Database;
 
@@ -814,23 +815,20 @@ test("#1489: the expiry timer's stop resolves only once its running sweep and re
   await Bun.sleep(20);
   expect(stopped).toBe(false);
   finishRead(null);
-  for (let i = 0; i < 100 && !stopped; i++) await Bun.sleep(10);
-  expect(stopped).toBe(true);
+  await until(() => stopped, 1000, "stop settles once the read has");
 
   // A sweep already running when stop lands: stop waits for it too.
   const second = expiryTimer({
     next: () => Date.now(),
     sweep: () => { sweeping = true; return new Promise(resolve => { finishSweep = () => resolve({ wake: [], boards: [] }); }); },
   }, () => {});
-  for (let i = 0; i < 100 && !sweeping; i++) await Bun.sleep(10);
-  expect(sweeping).toBe(true);
+  await until(() => sweeping, 1000, "the sweep starts");
   let secondStopped = false;
   void second.stop().then(() => { secondStopped = true; });
   await Bun.sleep(20);
   expect(secondStopped).toBe(false);
   finishSweep();
-  for (let i = 0; i < 100 && !secondStopped; i++) await Bun.sleep(10);
-  expect(secondStopped).toBe(true);
+  await until(() => secondStopped, 1000, "stop settles once the sweep has");
 });
 
 // #1390: the timer measures its delay on the source's clock, the one its sweep reads: a server on a test clock behind

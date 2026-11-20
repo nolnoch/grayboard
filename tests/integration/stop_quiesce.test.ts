@@ -8,6 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { TestServer } from "../support/server.ts";
 import { until } from "../support/until.ts";
+import { exec, row } from "../support/repo_sql.ts";
 
 const A = "alice@example.com";
 const POINT = "http:team-members:between";
@@ -112,6 +113,9 @@ test("stop() waits for the retention pass already running, skips its remaining s
   const srv = await TestServer.open({}, { background: true, retentionFirstDelayMs: 0 });
   const closed = await closeSpy(srv);
   await until(() => logs.includes("[grayboard] test pause hit: retention:between"), 5000, "the retention pass reached its pause");
+  // An audit row long past retention, written once the pass is past its messages step: the audit step, still to come,
+  // would prune it.
+  await exec(srv, "INSERT INTO access_log (at, actor, action, target, detail) VALUES (?, NULL, ?, NULL, NULL)", 1, "test.expired");
   const stopping = srv.app.stop();
   void stopping.catch(() => {});
   await until(() => closed.at || logs.some(l => l.startsWith("[grayboard] stopping: waiting for") && l.includes("retention pass")), 5000, "stop waits or closes the store");
@@ -120,7 +124,12 @@ test("stop() waits for the retention pass already running, skips its remaining s
   await stopping;
   expect(closed.at).toBeGreaterThan(0);
   expect(logs.filter(l => /closed|failed/i.test(l) && !l.includes("stopping"))).toEqual([]);
-  await srv.stop();
+  // The pass skipped its remaining steps: the row is still there.
+  await srv.stop({ keep: true });
+  const reopened = await TestServer.open({}, { reuse: srv });
+  try {
+    expect(await row(reopened, "SELECT action FROM access_log WHERE action = ?", "test.expired")).toEqual({ action: "test.expired" });
+  } finally { await reopened.stop(); }
 });
 
 test("stop()'s drain deadline names the background pass that never finished, and the store still closes", async () => {
