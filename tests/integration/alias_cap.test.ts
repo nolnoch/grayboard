@@ -11,6 +11,7 @@ import { closeSessions } from "../support/mcp.ts";
 import { TestServer } from "../support/server.ts";
 import { seed } from "../support/seed.ts";
 import { endId } from "../support/end_id.ts";
+import { drained, row, rows, txSpy } from "../support/repo_sql.ts";
 
 const ROOT = "root@example.com";
 const B = "bob@example.com";
@@ -32,10 +33,11 @@ afterEach(async () => {
   await srv.stop();
 });
 
-const names = (ref: string) => (srv.app.db.query(`SELECT name FROM aliases WHERE scope_ref = ? ORDER BY name`).all(ref) as { name: string }[]).map((r) => r.name);
-const deleted = () => (srv.app.db.query(`SELECT actor, target, detail FROM access_log WHERE action = 'alias.deleted' ORDER BY id`).all() as { actor: string; target: string; detail: string | null }[])
-  .map((r) => ({ ...r, detail: r.detail ? JSON.parse(r.detail) : null }));
-const subs = (address: string) => srv.app.db.query(`SELECT * FROM subscriptions WHERE handle = ?`).all(address);
+const names = async (ref: string) => (await rows<{ name: string }>(srv, `SELECT name FROM aliases WHERE scope_ref = ?`, ref)).map((r) => r.name).sort();
+const deleted = async () => { await drained(srv); return (await rows<{ actor: string; target: string; detail: string | null }>(srv, `SELECT actor, target, detail FROM access_log WHERE action = 'alias.deleted' ORDER BY id`))
+  .map((r) => ({ ...r, detail: r.detail ? JSON.parse(r.detail) : null })); };
+const subs = (address: string) => rows(srv, `SELECT * FROM subscriptions WHERE handle = ?`, address);
+const bindingEvents = async (name: string) => { await drained(srv); return rows(srv, `SELECT event FROM binding_events WHERE name = ?`, name); };
 const CAPPED = /already has 2 names, the server's cap of 2/;
 
 test("a team at its cap refuses a new name by bind and by writes_as; an existing name still binds", async () => {
@@ -46,9 +48,9 @@ test("a team at its cap refuses a new name by bind and by writes_as; an existing
   }
   await expect(srv.appSession(bob, "eng/c").connect()).rejects.toMatchObject({ code: "bad_request", message: expect.stringMatching(/team "eng" already has 2 names.*grayboard team delete-alias eng <name>/) });
   // The refused bind leaves its binding event.
-  expect(srv.app.db.query(`SELECT event FROM binding_events WHERE name = 'eng/c'`).all()).toEqual([{ event: "refused" }]);
+  expect(await bindingEvents("eng/c")).toEqual([{ event: "refused" }]);
   await expect(srv.appSession(bob, "eng/c", { push: false }).connect()).rejects.toMatchObject({ code: "bad_request", message: expect.stringMatching(CAPPED) });
-  expect(names("eng")).toEqual(["a", "b"]);
+  expect(await names("eng")).toEqual(["a", "b"]);
   // A name that exists binds, and is written as, at the cap.
   expect((await srv.appSession(bob, "eng/a").connect()).bind?.alias).toBe("eng/a");
   await srv.appSession(bob, "eng/b", { push: false }).connect();
@@ -84,19 +86,19 @@ test("a team owner or an admin deletes an unused team name, freeing a slot; a me
   expect(await srv.api(alice, "POST", "/api/teams/eng/delete-alias", { name: "b" })).toMatchObject({ status: 409, body: { code: "alias_held" } });
   writer.close();
   await seed(srv.app.repo, tx => endId(srv.app.repo, tx, writer.id, "exit"));
-  expect(subs("eng/b").length).toBeGreaterThan(0);
+  expect((await subs("eng/b")).length).toBeGreaterThan(0);
   expect(await srv.api(alice, "POST", "/api/teams/eng/delete-alias", { name: "a" })).toMatchObject({ status: 409, body: { code: "alias_held", message: expect.stringContaining(held.id) } });
   expect(await srv.api(alice, "POST", "/api/teams/eng/delete-alias", { name: "zzz" })).toMatchObject({ status: 404 });
   expect(await srv.api(alice, "POST", "/api/teams/eng/delete-alias", { name: "b" })).toEqual({ status: 200, body: { ok: true, deleted: "eng/b" } });
-  expect(names("eng")).toEqual(["a"]);
-  expect(subs("eng/b")).toEqual([]);
+  expect(await names("eng")).toEqual(["a"]);
+  expect(await subs("eng/b")).toEqual([]);
 
   // The freed slot takes a new name; an admin outside the team deletes it.
   const c = srv.appSession(bob, "eng/c");
   await c.connect();
   await c.unbind("eng/c");
   expect((await srv.api(root, "POST", "/api/teams/eng/delete-alias", { name: "c" })).status).toBe(200);
-  expect(deleted()).toEqual([
+  expect(await deleted()).toEqual([
     { actor: "alice@example.com", target: "eng/b", detail: { team: "eng" } },
     { actor: ROOT, target: "eng/c", detail: { team: "eng", as_admin: true } },
   ]);
@@ -111,8 +113,8 @@ test("over hosted MCP, a new team name at the cap is refused and its refused bin
   }
   const s = await srv.hosted(B, null);
   await expect(s.call("bind", { name: "eng/c", create: true })).rejects.toMatchObject({ code: "bad_request", message: expect.stringMatching(CAPPED) });
-  expect(srv.app.db.query(`SELECT event FROM binding_events WHERE name = 'eng/c'`).all()).toEqual([{ event: "refused" }]);
-  expect(names("eng")).toEqual(["a", "b"]);
+  expect(await bindingEvents("eng/c")).toEqual([{ event: "refused" }]);
+  expect(await names("eng")).toEqual(["a", "b"]);
   // An existing name still binds over the same tool.
   expect(await s.call("bind", { name: "eng/a" })).toMatchObject({ name: "eng/a" });
 });
@@ -130,11 +132,11 @@ test("grayboard team delete-alias deletes an unused team name; a member is refus
   const refused = await runCli(["team", "delete-alias", "eng", "b"], { env: creds(B, bob) });
   expect(refused.code).toBe(1);
   expect(refused.err).toContain("forbidden");
-  expect(names("eng")).toEqual(["b"]);
+  expect(await names("eng")).toEqual(["b"]);
   const ok = await runCli(["--json", "team", "delete-alias", "eng", "b"], { env: creds("alice@example.com", alice) });
   expect(ok.code).toBe(0);
   expect(JSON.parse(ok.out)).toEqual({ ok: true, deleted: "eng/b" });
-  expect(names("eng")).toEqual([]);
+  expect(await names("eng")).toEqual([]);
 }, 20_000);
 
 // #807 P1c-13: the HTTP routes that read or write aliases inside a write body (identity add and delete, a team's
@@ -144,11 +146,12 @@ test("grayboard team delete-alias deletes an unused team name; a member is refus
 test("#807 P1c-13: HTTP alias reads and writes inside a write body run on its Tx", async () => {
   const repo = srv.app.repo;
   const checks: { route: string; op: string; inTxn: boolean; handle: "pool" | "tx" }[] = [];
+  const tx = txSpy(srv);
   let route = "";
   const spies = (["find", "lock", "lockScope", "countForScope", "listForScope", "create", "remove"] as const).map(name => {
     const original = repo.aliases[name].bind(repo.aliases) as (...a: unknown[]) => unknown;
     return spyOn(repo.aliases, name).mockImplementation(((r: unknown, ...rest: unknown[]) => {
-      checks.push({ route, op: name === "lock" ? `lock.${String(rest[1])}` : name, inTxn: srv.app.db.inTransaction, handle: r === repo.read ? "pool" : "tx" });
+      checks.push({ route, op: name === "lock" ? `lock.${String(rest[1])}` : name, inTxn: tx.open, handle: r === repo.read ? "pool" : "tx" });
       return original(r, ...rest);
     }) as never);
   });
@@ -179,7 +182,7 @@ test("#807 P1c-13: HTTP alias reads and writes inside a write body run on its Tx
     expect(ops("team.create")).toContain("listForScope:tx");
     expect(ops("team.remove")).toContain("listForScope:tx");
     expect(checks.filter(c => c.route && c.inTxn !== (c.handle === "tx"))).toEqual([]);
-  } finally { for (const spy of spies) spy.mockRestore(); }
+  } finally { for (const spy of spies) spy.mockRestore(); tx.restore(); }
 });
 
 // #807 P3 C5 decision 3: a create that loses to a same-name create committed after its pre-check gets null from the
@@ -187,12 +190,12 @@ test("#807 P1c-13: HTTP alias reads and writes inside a write body run on its Tx
 // body missing the name (on Postgres, a READ COMMITTED snapshot taken before the winner committed).
 test("#807 P3 C5: identity create answers 409 when the store's create finds the name taken", async () => {
   expect((await srv.api(bob, "POST", "/api/identities", { name: "one" })).status).toBe(201);
-  const created = () => srv.app.db.query(`SELECT count(*) AS n FROM access_log WHERE action = 'alias.created'`).get() as { n: number };
-  const before = created();
+  const created = async () => { await drained(srv); return row<{ n: number }>(srv, `SELECT count(*) AS n FROM access_log WHERE action = 'alias.created'`); };
+  const before = await created();
   const spy = spyOn(srv.app.repo.aliases, "find").mockResolvedValue(undefined);
   try {
     expect(await srv.api(bob, "POST", "/api/identities", { name: "one" })).toMatchObject({ status: 409, body: { message: 'identity "one" already exists' } });
   } finally { spy.mockRestore(); }
-  expect(created()).toEqual(before);
-  expect(names(B)).toEqual(["one"]);
+  expect(await created()).toEqual(before);
+  expect(await names(B)).toEqual(["one"]);
 });

@@ -19,6 +19,7 @@ import { NEW_RUN, StaticLogin, staticMode, type StaticMode } from "../../adapter
 import { ServerUnreachable } from "../../adapters/hosted-core/src/wire.ts";
 import { hashToken } from "../../src/server/auth.ts";
 import { hostedRowCount } from "../support/hosted_rows.ts";
+import { row as sqlRow } from "../support/repo_sql.ts";
 import { hostedServer, seedGrant, storeLogin, tokenRequests, type HostedServer } from "../support/hosted_oauth.ts";
 import { seed } from "../support/seed.ts";
 import { serviceRun } from "../support/service_token.ts";
@@ -200,7 +201,7 @@ describe("before the token is sent", () => {
 
   test("whoami must name a service, the launcher's when GRAYBOARD_PRINCIPAL is set; asking it starts no hosted session", async () => {
     const run = await serviceRun(srv);
-    const rows = hostedRowCount(srv.app.db);
+    const rows = await hostedRowCount(srv);
     const person = (await seedGrant(srv, dir, CLIENT, EMAIL)).token;
     await expect(signIn(mode({ ...run.env, GRAYBOARD_RUN_TOKEN: person })).token()).rejects.toThrow("isn't a service's");
     const second = await serviceRun(srv, { service: "billing" });
@@ -208,7 +209,7 @@ describe("before the token is sent", () => {
     // Unset, any service's token passes.
     const { GRAYBOARD_PRINCIPAL: _, ...anyService } = second.env;
     expect(await signIn(mode(anyService)).token()).toBe(second.token);
-    expect(hostedRowCount(srv.app.db)).toBe(rows);
+    expect(await hostedRowCount(srv)).toBe(rows);
   });
 });
 
@@ -242,7 +243,7 @@ describe("a run on a run token", () => {
     await root.start();
     const r = { root, client, logs };
     await until(() => record(r, "svc-root-1")?.state === "active" && record(r, "svc-root-1")?.held?.[0] === `${SVC}/w-1`, 15_000, "active as ingest/w-1");
-    const row = srv.app.db.query<{ client_id: string; lease_deadline: number | null }, [string]>("SELECT client_id, lease_deadline FROM hosted_sessions WHERE source_session_id = ?").get("svc-root-1");
+    const row = await sqlRow<{ client_id: string; lease_deadline: number | null }>(srv, "SELECT client_id, lease_deadline FROM hosted_sessions WHERE source_session_id = ?", "svc-root-1");
     expect(row?.client_id).toBe(run.clientId);
     expect(row?.lease_deadline).not.toBeNull();
     const peer = await serviceRun(srv);
@@ -309,7 +310,7 @@ describe("a run on a run token", () => {
     await until(() => record(first, "svc-restore-1")?.held?.[0] === `${SVC}/w-1`, 15_000, "the first run bound as ingest/w-1");
     await first.root.shutdown("release");
     roots.splice(roots.indexOf(first.root), 1);
-    await until(() => !srv.app.db.query("SELECT 1 FROM hosted_sessions WHERE source_session_id = 'svc-restore-1'").get(), 10_000, "the first run's session ended");
+    await until(async () => !(await sqlRow(srv, "SELECT 1 FROM hosted_sessions WHERE source_session_id = 'svc-restore-1'")), 10_000, "the first run's session ended");
 
     // The next run: a fresh run token from the same credential, no BUS_IDENTITY, so the start restores the remembered name.
     const env = { ...run.env, GRAYBOARD_RUN_TOKEN: await run.mint() };
@@ -328,7 +329,7 @@ describe("a run on a run token", () => {
       // A sign-out at the resume pauses the root, as the run loop's does (#1312, L1 of #1303); the sink says it once.
       expect(record(second, "svc-restore-1")).toMatchObject({ state: "paused", message: ENDED, operation: "enroll" });
       expect(second.logs).toEqual([{ level: "warning", message: `delivery paused: ${ENDED}` }]);
-      expect(srv.app.db.query("SELECT 1 FROM alias_holds h JOIN hosted_sessions s ON s.session_id = h.id WHERE s.source_session_id = 'svc-restore-1'").get()).toBeNull();
+      expect(await sqlRow(srv, "SELECT 1 FROM alias_holds h JOIN hosted_sessions s ON s.session_id = h.id WHERE s.source_session_id = 'svc-restore-1'")).toBeNull();
       // The 401 spent the token for the process: nothing carries it again.
       const net = outgoing();
       try {
@@ -351,7 +352,7 @@ describe("a run on a run token", () => {
     await until(() => record(first, id)?.held?.[0] === held, 15_000, `the first run bound as ${held}`);
     await first.root.shutdown("release");
     roots.splice(roots.indexOf(first.root), 1);
-    await until(() => !srv.app.db.query("SELECT 1 FROM hosted_sessions WHERE source_session_id = ?").get(id), 10_000, "the first run's session ended");
+    await until(async () => !(await sqlRow(srv, "SELECT 1 FROM hosted_sessions WHERE source_session_id = ?", id)), 10_000, "the first run's session ended");
     const go = join(dir, "go"), hits: string[] = [];
     const said = spyOn(console, "error").mockImplementation((...args: unknown[]) => { hits.push(args.join(" ")); });
     process.env.BUS_TEST_PAUSE = "hosted:bind:after-commit";

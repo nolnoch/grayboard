@@ -17,6 +17,8 @@ import { cleanEnv } from "../support/env.ts";
 import { board, direct } from "../support/events.ts";
 import { HostedToolError } from "../support/hosted_session.ts";
 import { TestServer } from "../support/server.ts";
+import { accessAudits } from "../support/audit.ts";
+import { drained, row, rows } from "../support/repo_sql.ts";
 
 const A = "alice@example.com";
 const B = "bob@example.com";
@@ -199,8 +201,7 @@ test("attachments: a DM and a post carry uploaded files to their readers, and th
   expect(pushed.event.item.kind === "push" && pushed.event.item.post.attachments).toEqual([shotInfo(file)]);
   expect(await sim.download(file)).toEqual(png);
 
-  const bound = (srv.app.db.query("SELECT target, detail FROM access_log WHERE action = 'attachment.bound' ORDER BY id").all() as { target: string; detail: string }[])
-    .map((r) => ({ target: r.target, ...JSON.parse(r.detail) }));
+  const bound = (await accessAudits(srv, "attachment.bound")).map((r): Record<string, unknown> => ({ target: r.target, ...r.detail }));
   expect(bound).toEqual([
     { target: `attachment:${shot}`, identity: `${A}/be`, message_id: sent.message_id, recipient: `${B}/fe` },
     { target: `attachment:${notes}`, identity: `${A}/be`, message_id: sent.message_id, recipient: `${B}/fe` },
@@ -215,8 +216,8 @@ test("a repeat of a dm_send with `as`, holds unchanged, replays the first result
   await be.bind("ops", { create: true });
   const first = await be.send("be", "as ops", { as: "ops" });
   const retry = await be.send("be", "as ops", { as: "ops" });
-  const rows = srv.app.db.query("SELECT id, sender FROM messages WHERE body = 'as ops'").all() as { id: number; sender: string }[];
-  expect(rows).toEqual([{ id: first.message_id, sender: `${A}/ops` }]);
+  const sent = await rows<{ id: number; sender: string }>(srv, "SELECT id, sender FROM messages WHERE body = 'as ops'");
+  expect(sent).toEqual([{ id: first.message_id, sender: `${A}/ops` }]);
   expect(retry).toMatchObject({ message_id: first.message_id, replayed: { ref: { kind: "message", id: first.message_id } } });
 });
 
@@ -243,14 +244,16 @@ test("a send or post the server refuses binds none of its uploads; releasing the
   const refused = async (tool: string, args: Record<string, unknown>) => {
     const id = await be.upload("notes.md", "# notes");
     await expect(be.call(tool, { ...args, attachment_ids: [id] })).rejects.toBeInstanceOf(HostedToolError);
-    expect(srv.app.db.query("SELECT message_id, post_id FROM attachments WHERE id = ?").get(id)).toEqual({ message_id: null, post_id: null });
+    expect(await row(srv, "SELECT message_id, post_id FROM attachments WHERE id = ?", id)).toEqual({ message_id: null, post_id: null });
     await be.release(id);
   };
   await refused("dm_send", { to: "nobody@example.com/x", body: "x" });
   await refused("board_post", { board: "nope", body: "x" });
-  expect(srv.app.db.query("SELECT COUNT(*) AS n FROM attachments").get()).toEqual({ n: 0 });
-  expect(srv.app.db.query("SELECT COUNT(*) AS n FROM attachment_blobs").get()).toEqual({ n: 0 });
-  expect(srv.app.db.query("SELECT action FROM access_log WHERE action LIKE 'attachment.%' ORDER BY id").all()).toEqual([
+  expect(await row(srv, "SELECT COUNT(*) AS n FROM attachments")).toEqual({ n: 0 });
+  expect(await row(srv, "SELECT COUNT(*) AS n FROM attachment_blobs")).toEqual({ n: 0 });
+  // An audit row can be a post, queued behind the response on Postgres.
+  await drained(srv);
+  expect(await rows(srv, "SELECT action FROM access_log WHERE action LIKE 'attachment.%' ORDER BY id")).toEqual([
     { action: "attachment.uploaded" }, { action: "attachment.released" },
     { action: "attachment.uploaded" }, { action: "attachment.released" },
   ]);
@@ -272,7 +275,7 @@ test("a repeat after the session's holds changed replays while its sender is unc
   const resent = await be.send("be", "once", { resend: true });
   expect(resent).not.toHaveProperty("replayed");
   expect((await be.send("be", "once")).replayed?.ref.id).toBe(resent.message_id);
-  expect(srv.app.db.query("SELECT sender FROM messages WHERE body = 'once' ORDER BY id").all()).toEqual([
+  expect(await rows(srv, "SELECT sender FROM messages WHERE body = 'once' ORDER BY id")).toEqual([
     { sender: `${A}/be` }, { sender: `${A}/ops` }, { sender: `${A}/be` },
   ]);
 
@@ -280,6 +283,6 @@ test("a repeat after the session's holds changed replays while its sender is unc
   const post = await be.call<BoardPostResult>("board_post", { board: "e2e", body: "posted once" });
   expect(await be.call("board_post", { board: "e2e", body: "posted once" })).toMatchObject({ replayed: { ref: { kind: "post", id: post.post_id } } });
   expect(await be.call("board_post", { board: "e2e", body: "posted once", resend: true })).not.toHaveProperty("replayed");
-  expect(srv.app.db.query("SELECT COUNT(*) AS n FROM posts WHERE body = 'posted once'").get()).toEqual({ n: 2 });
+  expect(await row(srv, "SELECT COUNT(*) AS n FROM posts WHERE body = 'posted once'")).toEqual({ n: 2 });
 });
 

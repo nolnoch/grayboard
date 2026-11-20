@@ -7,6 +7,7 @@ import pkg from "../../package.json" with { type: "json" };
 import type { Config } from "../../src/server/config.ts";
 import { ROOT } from "../support/paths.ts";
 import { TestServer } from "../support/server.ts";
+import { drained, exec, row, rows } from "../support/repo_sql.ts";
 import { seed } from "../support/seed.ts";
 import { GOOGLE_ISSUER } from "../../src/server/idp_google.ts";
 
@@ -28,16 +29,23 @@ afterEach(() => srv.stop());
 
 const login = (email: string) => srv.login(email);
 const api = (token: string, method: string, path: string, body?: unknown) => srv.api(token, method, path, body);
+// access_log rows once the writes queued before the call have committed (an audit row is a post, always queued on
+// Postgres), detail parsed: Postgres keeps it as jsonb, which doesn't keep the written text's key order.
+const audits = async (where: string) => {
+  await drained(srv);
+  return (await rows<{ actor: string; action: string; target: string | null; detail: string }>(srv, `SELECT actor, action, target, detail FROM access_log WHERE ${where} ORDER BY id`))
+    .map((r) => ({ ...r, detail: JSON.parse(r.detail) as Record<string, unknown> }));
+};
 
 // #284 decision 5 (audit W8): a team can't take another principal's name.
 test("team create on another principal's name is a 409, and no team or board is made", async () => {
   const alice = await login("alice@example.com");
-  await seed(srv.app.repo, () => srv.app.db.prepare(`INSERT INTO principals (kind, name, created_at) VALUES ('service', 'ingest', 0)`).run());
+  await exec(srv, `INSERT INTO principals (kind, name, created_at) VALUES ('service', 'ingest', 0)`);
   const r = await api(alice, "POST", "/api/teams", { name: "ingest" });
   expect(r.status).toBe(409);
   expect(JSON.stringify(r.body)).toContain("ingest");
-  expect(srv.app.db.query(`SELECT COUNT(*) AS n FROM teams WHERE name = 'ingest'`).get()).toEqual({ n: 0 });
-  expect(srv.app.db.query(`SELECT COUNT(*) AS n FROM boards WHERE name = 'ingest'`).get()).toEqual({ n: 0 });
+  expect(await row(srv, `SELECT COUNT(*) AS n FROM teams WHERE name = 'ingest'`)).toEqual({ n: 0 });
+  expect(await row(srv, `SELECT COUNT(*) AS n FROM boards WHERE name = 'ingest'`)).toEqual({ n: 0 });
 });
 
 test("teams are invite-only: owners add and remove; outsiders can't join, add, or see the roster", async () => {
@@ -70,10 +78,8 @@ test("teams are invite-only: owners add and remove; outsiders can't join, add, o
   expect((await api(alice, "POST", "/api/teams/eng/remove", { email: "bob@example.com" })).status).toBe(404);
   expect((await api(bob, "GET", "/api/whoami")).body.teams).toEqual([]);
 
-  const audit = srv.app.db
-    .query("SELECT actor, action, detail FROM access_log WHERE action = 'team.member_removed'")
-    .all();
-  expect(audit).toEqual([{ actor: "alice@example.com", action: "team.member_removed", detail: '{"member":"bob@example.com"}' }]);
+  const audit = (await audits("action = 'team.member_removed'")).map(({ actor, action, detail }) => ({ actor, action, detail }));
+  expect(audit).toEqual([{ actor: "alice@example.com", action: "team.member_removed", detail: { member: "bob@example.com" } }]);
 });
 
 // Security audit F-02 (POC2): membership was flat, so any member could add
@@ -150,14 +156,14 @@ test("owners promote and demote; the last owner can't leave, be removed or demot
   expect((await api(bob, "POST", "/api/teams/eng/leave")).status).toBe(200);
 
   // Ownership changes are role bindings' rows (#927 R6), the creator's grant first.
-  const changes = srv.app.db.query("SELECT actor, action, target, json_extract(detail, '$.role') AS role, json_extract(detail, '$.scope') AS scope FROM access_log WHERE action LIKE 'role.%' ORDER BY id").all();
+  const changes = (await audits("action LIKE 'role.%'")).map(({ actor, action, target, detail }) => ({ actor, action, target, role: detail.role, scope: detail.scope }));
   expect(changes).toEqual([
     { actor: "alice@example.com", action: "role.granted", target: "alice@example.com", role: "team_owner", scope: "eng" },
     { actor: "alice@example.com", action: "role.granted", target: "bob@example.com", role: "team_owner", scope: "eng" },
     { actor: "bob@example.com", action: "role.revoked", target: "alice@example.com", role: "team_owner", scope: "eng" },
     { actor: "bob@example.com", action: "role.revoked", target: "bob@example.com", role: "team_owner", scope: "eng" },
   ]);
-  expect(srv.app.db.query("SELECT COUNT(*) AS n FROM access_log WHERE action = 'team.role_changed'").get()).toEqual({ n: 0 });
+  expect(await row(srv, "SELECT COUNT(*) AS n FROM access_log WHERE action = 'team.role_changed'")).toEqual({ n: 0 });
 });
 
 test("admin routes: refused for non-admins and when no admins are configured", async () => {
@@ -190,8 +196,8 @@ test("admin unlink-idp clears a user's IdP issuer and subject and audits them", 
   expect((await srv.app.repo.users.findByEmail(srv.app.repo.read, "bob@example.com"))).toMatchObject({ idp_issuer: null, idp_subject: null });
   expect(await signIn(okta, "okta-bob")).toMatchObject({ status: "ok", linked: true, user: { idp_issuer: okta } });
   expect((await api(root, "POST", "/api/admin/unlink-idp", { email: "nobody@example.com" })).status).toBe(404);
-  expect(srv.app.db.query("SELECT actor, target, detail FROM access_log WHERE action = 'auth.subject_cleared'").all())
-    .toEqual([{ actor: "root@example.com", target: "bob@example.com", detail: JSON.stringify({ had_subject: true, provider: "google", issuer: GOOGLE_ISSUER }) }]);
+  expect((await audits("action = 'auth.subject_cleared'")).map(({ actor, target, detail }) => ({ actor, target, detail })))
+    .toEqual([{ actor: "root@example.com", target: "bob@example.com", detail: { had_subject: true, provider: "google", issuer: GOOGLE_ISSUER } }]);
 });
 
 // Security audit F-14: the server's GRAYBOARD_CLI_TOKEN_IDLE_DAYS reaches the token check.
@@ -201,7 +207,7 @@ test("a CLI token idle past cliTokenIdleDays is refused; a fresh sign-in works",
   expect((await api(bob, "GET", "/api/whoami")).status).toBe(200);
   // The request's last-used touch runs on a later setImmediate (TouchQueue); let it land first, or it overwrites the backdate.
   await new Promise((resolve) => setImmediate(resolve));
-  await seed(srv.app.repo, () => srv.app.db.run(`UPDATE sessions SET last_used_at = ?`, [Date.now() - 2 * 86_400_000]));
+  await exec(srv, `UPDATE sessions SET last_used_at = ?`, Date.now() - 2 * 86_400_000);
   expect((await api(bob, "GET", "/api/whoami")).status).toBe(401);
   expect((await api(await login("bob@example.com"), "GET", "/api/whoami")).status).toBe(200);
 });
@@ -213,18 +219,18 @@ test("disable-user revokes CLI tokens for good; a disabled user gets no new toke
   const root = await login("root@example.com");
   const bob = await login("bob@example.com");
   expect((await api(root, "POST", "/api/admin/disable-user", { email: "bob@example.com" })).status).toBe(200);
-  const live = () => srv.app.db.query(
-    `SELECT COUNT(*) AS n FROM sessions s JOIN users u ON u.id = s.user_id WHERE u.email = 'bob@example.com' AND s.revoked_at IS NULL`).get();
-  expect(live()).toEqual({ n: 0 });
+  const live = () => row(srv,
+    `SELECT COUNT(*) AS n FROM sessions s JOIN users u ON u.id = s.user_id WHERE u.email = 'bob@example.com' AND s.revoked_at IS NULL`);
+  expect(await live()).toEqual({ n: 0 });
 
   const refused = await fetch(`${srv.base}/api/auth/dev-login`, {
     method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ email: "bob@example.com" }),
   });
   expect(refused.status).toBe(403);
   expect(await refused.json()).toMatchObject({ code: "forbidden", message: expect.stringContaining("disabled") });
-  expect(live()).toEqual({ n: 0 });
-  expect(srv.app.db.query(`SELECT actor, json_extract(detail, '$.dev') AS dev FROM access_log WHERE action = 'auth.user_refused'`).all())
-    .toEqual([{ actor: "bob@example.com", dev: 1 }]);
+  expect(await live()).toEqual({ n: 0 });
+  expect((await audits("action = 'auth.user_refused'")).map(({ actor, detail }) => ({ actor, dev: detail.dev })))
+    .toEqual([{ actor: "bob@example.com", dev: true }]);
 
   expect((await api(root, "POST", "/api/admin/enable-user", { email: "bob@example.com" })).status).toBe(200);
   expect((await api(bob, "GET", "/api/whoami")).status).toBe(401);
@@ -261,12 +267,10 @@ test("an admin can manage a team they're not in, e.g. after its last member left
   expect((await api(root, "GET", "/api/whoami")).body.teams).toEqual([]);
   expect((await api(root, "POST", "/api/teams/eng/remove", { email: "bob@example.com" })).status).toBe(200);
 
-  const audit = srv.app.db
-    .query("SELECT actor, action, detail FROM access_log WHERE action LIKE 'team.member_%' AND actor = 'root@example.com'")
-    .all();
+  const audit = (await audits("action LIKE 'team.member_%' AND actor = 'root@example.com'")).map(({ actor, action, detail }) => ({ actor, action, detail }));
   expect(audit).toEqual([
-    { actor: "root@example.com", action: "team.member_added", detail: '{"member":"bob@example.com","as_admin":true}' },
-    { actor: "root@example.com", action: "team.member_removed", detail: '{"member":"bob@example.com","as_admin":true}' },
+    { actor: "root@example.com", action: "team.member_added", detail: { member: "bob@example.com", as_admin: true } },
+    { actor: "root@example.com", action: "team.member_removed", detail: { member: "bob@example.com", as_admin: true } },
   ]);
 });
 
