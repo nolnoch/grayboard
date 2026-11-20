@@ -23,6 +23,7 @@ import type { Read } from "./store/tx.ts";
 import { sessionEndPort } from "./session_end.ts";
 import { scratchDbPath } from "../../tests/support/scratch_db.ts";
 import { seed, seedSync } from "../../tests/support/seed.ts";
+import { until } from "../../tests/support/until.ts";
 const meta = { "ai.opencode/sessionID": "test-root" };
 const issuedOAuth = (repo: Parameters<typeof issueOAuth>[0], resource: string, email = "alice@example.com", scopes = ["grayboard:tools"]) => issueOAuth(repo, resource, email, scopes, Date.now(), OPENCODE_CLIENT);
 
@@ -1612,10 +1613,11 @@ test("#899: another connection's commit reaches a stamped listen within a tick",
 // runs, then the pause releases. Resolves with `start`'s value once it settles.
 async function held<T>(point: string, start: () => Promise<T>, during: () => Promise<void>, hits = 1) {
   const dir = mkdtempSync(join(tmpdir(), "gb-mcp-pause-")), file = join(dir, "release");
-  let seen = 0;
+  let seen = 0, released = 0;
   const reached = Promise.withResolvers<void>();
   const log = spyOn(console, "error").mockImplementation((message: unknown) => {
     if (message === `[grayboard] test pause hit: ${point}` && ++seen === hits) reached.resolve();
+    if (message === `[grayboard] test pause released: ${point}`) released++;
   });
   process.env.BUS_TEST_PAUSE = point; process.env.BUS_TEST_PAUSE_FILE = file;
   const deadline = setTimeout(() => reached.reject(new Error(`pause point ${point} hit ${seen} of ${hits} times in 5 s`)), 5_000);
@@ -1627,6 +1629,8 @@ async function held<T>(point: string, start: () => Promise<T>, during: () => Pro
     await during();
     writeFileSync(file, "release");
     const value = await result;
+    // A hold off `start`'s own path (a live's re-read) may still be polling: the dir stays until it has passed.
+    await until(() => released === seen, 5_000, `every hold at ${point} released`);
     expect(seen).toBe(hits);
     return { value, failures: () => log.mock.calls.filter(args => String(args[0]).includes("mcp.stream")) };
   } finally {
@@ -1753,6 +1757,109 @@ test("#807 P3 A7h2: a legacy GET whose binding moves while its check awaits re-r
   await untilHosted(() => hosted.activeGetStreams === 0);
   abort.abort(); await get.body?.cancel().catch(() => {});
   await raw.delete();
+});
+
+// #1196: a moved read whose notice the prune dropped is still re-read: `prunedThrough` past the read's start stands in
+// for the notice, so the GET re-reads its rows once it opens and stops, with no check of its own.
+test("#1196: a legacy GET whose binding moves, and whose notice the prune drops, while its check awaits re-reads its rows and stops", async () => {
+  const { time, tickStream } = await clocked(undefined, undefined, true);
+  const access = (await issueOAuth(store.repo, oauth.resource, "alice@example.com", ["grayboard:tools"], time.now, OPENCODE_CLIENT)).token;
+  const raw = await rawLegacySession(access, meta);
+  expect((await raw.post("tools/call", { name: "board_create", arguments: { name: "pruned", purpose: "#1196" }, _meta: meta })).text).not.toContain("isError\":true");
+  expect((await raw.post("resources/subscribe", { uri: "grayboard://boards/pruned", _meta: meta })).text).not.toContain("\"error\"");
+  const abort = new AbortController();
+  const { value: get } = await held("mcp:legacy:get-checked", () => raw.get(abort.signal), async () => {
+    await seed(store.repo, async tx => { const r = await aliceRoot(tx); return store.repo.hosted.update(tx, r.session_id, { bind_gen: r.bind_gen + 1 }); });
+    // Past the prune interval with no live stamped: the prune drops the root's notice.
+    time.now += 30_000; await tickStream();
+  });
+  expect(get.status).toBe(200);
+  await untilHosted(() => hosted.activeGetStreams === 0);
+  abort.abort(); await get.body?.cancel().catch(() => {});
+  await raw.delete();
+});
+
+// #1196: a live's bound starts from its creator's rows, so a root notice during the re-read its moved read queued
+// notes into a real pair: a child's live, whose own row the notice leaves, keeps streaming.
+test("#1196: a child's legacy GET whose read moved keeps streaming through a root notice during its re-read", async () => {
+  const principal = await oauth.authenticate(new Request("http://localhost/mcp", { headers: { Authorization: `Bearer ${token}` } }));
+  if (principal instanceof Response) throw new Error("fixture authorization failed");
+  await hosted.sessions.register(principal, sessionContext(principal, meta), "test-child");
+  const childMeta = { "ai.opencode/sessionID": "test-child" };
+  const root = await rawLegacySession(token, meta);
+  expect((await root.post("tools/call", { name: "board_create", arguments: { name: "child", purpose: "#1196" }, _meta: meta })).text).not.toContain("isError\":true");
+  const raw = await rawLegacySession(token, childMeta);
+  expect((await raw.post("resources/subscribe", { uri: "grayboard://boards/child", _meta: childMeta })).text).not.toContain("\"error\"");
+  const child = (await store.repo.hosted.all(store.repo.read)).find(r => r.root_session_id)!;
+  const touch = (id: string) => seed(store.repo, tx => store.repo.hosted.update(tx, id, { last_seen_at: Date.now() }));
+  // The GET's own read is followed by a notice for the child's row: its live re-reads.
+  const readRoot = hosted.sessions.readRoot;
+  let inject = true, reads = 0;
+  const roots = spyOn(hosted.sessions, "readRoot").mockImplementation(async row => {
+    const read = await readRoot(row);
+    reads++;
+    if (inject) { inject = false; await touch(child.session_id); }
+    return read;
+  });
+  const abort = new AbortController();
+  try {
+    const { value: get } = await held("mcp:live:recheck", () => raw.get(abort.signal), async () => {
+      expect(hosted.activeGetStreams).toBe(1);
+      await touch(child.root_session_id!);
+    });
+    expect(get.status).toBe(200);
+    await untilHosted(() => reads >= 2);
+    await store.repo.write(() => {});
+    expect(hosted.activeGetStreams).toBe(1);
+    abort.abort(); await get.body?.cancel().catch(() => {});
+  } finally { roots.mockRestore(); }
+  await raw.delete(); await root.delete();
+});
+
+// #1196: an idle GET a subscription attaches adopts its re-selection's rows only when no notice for them followed
+// the selection's start; a notice after its read makes the live re-read them.
+test("#1196: an idle legacy GET whose re-selection a notice raced re-reads its rows when a subscription attaches it", async () => {
+  const raw = await rawLegacySession(token, meta);
+  expect((await raw.post("tools/call", { name: "board_create", arguments: { name: "attached", purpose: "#1196" }, _meta: meta })).text).not.toContain("isError\":true");
+  const abort = new AbortController();
+  const get = await raw.get(abort.signal);
+  expect(get.status).toBe(200);
+  expect(hosted.activeGetStreams).toBe(1);
+  // Every selection from here is followed by a notice for the root's row: the attach's re-selection among them.
+  const snapshot = hosted.sessions.snapshot;
+  const snapshots = spyOn(hosted.sessions, "snapshot").mockImplementation(async (...args) => {
+    const selected = await snapshot(...args);
+    await seed(store.repo, async tx => { const r = await aliceRoot(tx); return store.repo.hosted.update(tx, r.session_id, { last_seen_at: Date.now() }); });
+    return selected;
+  });
+  try {
+    const { value: subscribed } = await held("mcp:live:recheck", () => raw.post("resources/subscribe", { uri: "grayboard://boards/attached", _meta: meta }), async () => {});
+    expect(subscribed.text).not.toContain("\"error\"");
+  } finally { snapshots.mockRestore(); }
+  await store.repo.write(() => {});
+  expect(hosted.activeGetStreams).toBe(1);
+  expect(hosted.activeWatches).toBe(1);
+  abort.abort(); await get.body?.cancel().catch(() => {});
+  await raw.delete();
+});
+
+// #1196: the bound text's facts are read only for a selection a server is built for: a legacy session's creating POST,
+// not its later requests or the re-selection an attach makes.
+test("#1196: a legacy session reads the bound text's facts for its creating POST alone", async () => {
+  const launcher = spyOn(application, "hostedLauncher");
+  try {
+    const raw = await rawLegacySession(token, meta);
+    expect(launcher).toHaveBeenCalledTimes(1);
+    expect((await raw.post("tools/call", { name: "board_create", arguments: { name: "facts", purpose: "#1196" }, _meta: meta })).text).not.toContain("isError\":true");
+    const abort = new AbortController();
+    const get = await raw.get(abort.signal);
+    expect(get.status).toBe(200);
+    expect((await raw.post("resources/subscribe", { uri: "grayboard://boards/facts", _meta: meta })).text).not.toContain("\"error\"");
+    expect(hosted.activeWatches).toBe(1);
+    expect(launcher).toHaveBeenCalledTimes(1);
+    abort.abort(); await get.body?.cancel().catch(() => {});
+    await raw.delete();
+  } finally { launcher.mockRestore(); }
 });
 
 // #807 P3 A7d: a revoke reaches a legacy GET through two phase-B tasks, its own check and its session's sweep; the
