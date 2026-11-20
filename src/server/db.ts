@@ -1360,6 +1360,8 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
 
     boards: {
       get: async (r, name) => getBoard(sqliteOf(r), name),
+      // The single writer already orders a post's gate against an archive: a plain read.
+      lockForPost: async (tx, name) => getBoard(sqliteOf(tx), name),
       post: async (r, id) => getPost(sqliteOf(r), id),
       catalogPage: async (r, cursor) => catalogPage(sqliteOf(r), cursor),
       snapshotPage: async (r, board, opts) => snapshotPage(sqliteOf(r), board, opts),
@@ -1395,7 +1397,9 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       subscribers: async (r, board) => subscriberRows(sqliteOf(r), board),
       threadFacts: async (r, parentId) => threadFacts(sqliteOf(r), parentId),
       laneRows: async (r, board, poster) => queueLaneRows(sqliteOf(r), board, poster),
-      claimQueuePost: async (tx, board, postId, lane, now, o) => claimQueuePost(sqliteOf(tx), board, postId, lane, now, o),
+      // A post that's gone is false, as on Postgres; the single writer never gets here with one (redeliveryFacts read it).
+      claimQueuePost: async (tx, board, postId, lane, now, o) =>
+        getPost(sqliteOf(tx), postId) ? claimQueuePost(sqliteOf(tx), board, postId, lane, now, o) : false,
       insertOutbox: async (tx, postId, targets) => insertOutbox(sqliteOf(tx), postId, targets),
       redeliveryFacts: async (r, key, prevHolder) => redeliveryFacts(sqliteOf(r), key, prevHolder),
     },

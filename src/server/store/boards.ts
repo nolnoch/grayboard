@@ -28,6 +28,11 @@ export interface BoardsStore {
   // ── reads of boards and posts ──
   // The board, or undefined. An open board carries no archived_at/archived_by keys; an archived one carries both.
   get(r: Read, name: string): Promise<Board | undefined>;
+  // The board as get reads it, locked until the body ends against an archive's lock (Postgres: FOR KEY SHARE, which
+  // setArchived's FOR UPDATE waits on and another post's doesn't; SQLite: a plain read, its single writer already
+  // orders them): board_post's gate reads its board through it, so a post past the gate lands before an archive
+  // commits, and a gate behind an archive reads it archived (#807 P3 C10e2 P5).
+  lockForPost(tx: Tx, name: string): Promise<Board | undefined>;
   // The post (its reader columns: via only when a child wrote it), or undefined.
   post(r: Read, id: number): Promise<Post | undefined>;
   // Up to CATALOG_PAGE (100) boards named after `cursor` ("" for the first), in name order, archived ones included
@@ -89,7 +94,8 @@ export interface BoardsStore {
   create(tx: Tx, b: { name: string; purpose: string; scope: string | null; kind: string; createdBy: string; now: number }): Promise<Board | null>;
   // Archives the board as `by` at `now`, or with `by` null reopens it: the board after, or null when it was already in
   // that state (or there's no such board), writing nothing, so a second archive never moves the first's archived_at
-  // or archived_by (core setArchived). The conditional write is the check: two archives give one board.
+  // or archived_by (core setArchived). The conditional write is the check: two archives give one board. An archive
+  // waits for a post that passed its gate (lockForPost).
   setArchived(tx: Tx, name: string, by: string | null, now: number): Promise<Board | null>;
   // A read of a board already judged visible (core readRows), with attachments. thread: every post of the thread the
   // post is in, on this board, by id. before_id: up to `limit` (clamped to 1..200, default 20) posts before it, oldest first.
@@ -131,7 +137,8 @@ export interface BoardsStore {
   // session's principal, expiring QUEUE_CLAIM_TTL_MS after now, a take event. True when this run took the key. With
   // `push`, the lane's subscription push is written or reset (undelivered, waking) only when the lane holds the key
   // after the claim (#1357): a key another lane holds writes no claim, event or push, and returns false; a key the
-  // lane itself holds already returns false with its push reset (a re-offer reaches it, at-least-once), no event.
+  // lane itself holds already returns false with its push reset (a re-offer reaches it, at-least-once), no event. A
+  // post that's gone (pruned since the caller read it) returns false and writes nothing.
   claimQueuePost(tx: Tx, board: string, postId: number, lane: string, now: number, o: { note: string; push: boolean }): Promise<boolean>;
   // A post plan's outbox rows (core insertOutbox); a row already there for a handle stays as it is.
   insertOutbox(tx: Tx, postId: number, targets: [string, PostTarget][]): Promise<void>;

@@ -420,6 +420,36 @@ test("a decline whose redelivery fails leaves the claim held and no release even
   expect(JSON.stringify(before.claims)).toContain(`"key":"queue:q:${QLIVE}","holder":"${B}/be"`);
 });
 
+// #807 P3 C10e2 (C10e-a audit finding 3): a redelivery whose claim another lane took first (a second pod's sweep, on
+// Postgres) wrote no push for its lane, so the requeue wakes nobody; one that takes it wakes its lane.
+test("a decline's redelivery wakes its lane only when it took the claim", async () => {
+  const access = boardAccess(repo);
+  const real = repo.boards.claimQueuePost.bind(repo.boards);
+  const decline = async (took: boolean | null) => {
+    const lanes: string[] = [];
+    const spy = spyOn(repo.boards, "claimQueuePost").mockImplementation((async (tx: Tx, board: string, postId: number, lane: string, now: number, o: { note: string; push: boolean }) => {
+      lanes.push(lane);
+      const won = await real(tx, board, postId, lane, now, o);
+      return took ?? won;
+    }) as never);
+    const rollback = new Error("rolled back");
+    let wake: string[] = [];
+    try {
+      await expect(repo.write(async tx => {
+        wake = (await callClaimTool(repo, access, tx, `${B}/be`, "claim_release", { key: `queue:q:${QLIVE}` }, bob)).wake ?? [];
+        throw rollback;
+      })).rejects.toBe(rollback);
+    } finally { spy.mockRestore(); }
+    expect(lanes).toHaveLength(1);
+    return { lane: lanes[0]!, wake };
+  };
+  const won = await decline(null);
+  expect(won.wake).toContain(won.lane);
+  const lost = await decline(false);
+  expect(lost.lane).toBe(won.lane);
+  expect(lost.wake).not.toContain(lost.lane);
+});
+
 test("a refusal after a write, caught in a body that commits, leaves nothing of the call (the tool's savepoint)", async () => {
   const access = boardAccess(repo);
   const before = claimRows();

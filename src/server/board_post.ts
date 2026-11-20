@@ -15,17 +15,20 @@ import type { Read, Tx } from "./store/tx.ts";
 import type { Post } from "../shared/notifications.ts";
 
 /**
- * core postGate on `r`: the board `actor` may post on, and what its gate decided. Throws core's refusals in core's
- * order. The server has no announce board; only the system's posts ending a claim pass `allowArchived`.
+ * core postGate on `tx`: the board `actor` may post on, and what its gate decided. Throws core's refusals in core's
+ * order. The server has no announce board; only the system's posts ending a claim pass `allowArchived`. The gate
+ * judges the board as lockForPost reads it, locked against an archive until the post commits (#807 P3 C10e2 P5).
  */
 export async function postGateOn(
-  repo: Repo, access: BoardAccess, r: Read, actor: string, boardInput: string, parentId: number | null, allowArchived = false,
+  repo: Repo, access: BoardAccess, tx: Tx, actor: string, boardInput: string, parentId: number | null, allowArchived = false,
   viewer: BoardViewer = actor,
 ): Promise<{ board: Board; gate: PostGate }> {
-  const board = await readableBoard(repo, access, r, viewer, boardInput);
+  const seen = await readableBoard(repo, access, tx, viewer, boardInput);
+  // No path deletes a board, so the locked read finds the one just judged visible.
+  const board = (await repo.boards.lockForPost(tx, seen.name)) ?? seen;
   // Read before the rule needs them: reads have no effects, and the rule still throws in core's order.
-  const parent = parentId === null ? undefined : await repo.boards.post(r, parentId);
-  const human = await repo.aliases.isHuman(r, actor);
+  const parent = parentId === null ? undefined : await repo.boards.post(tx, parentId);
+  const human = await repo.aliases.isHuman(tx, actor);
   return { board, gate: postGateRule(board, parentId, allowArchived, null, () => parent, () => human) };
 }
 

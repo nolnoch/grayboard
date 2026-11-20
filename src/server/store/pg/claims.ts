@@ -36,19 +36,22 @@ const rowCols = (sql: PgSql) => sql.fragment`key, holder, note, board, acquired_
 // core expireClaims' order: lapse order, by key within a tie (JS string order, as core sorts).
 const lapseOrder = (a: ClaimRow, b: ClaimRow) => a.expires_at - b.expires_at || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0);
 
+// One claim_events row on the caller's handle (core logEvent); pg/boards.ts's claimQueuePost writes its take event
+// through it too. session_id: core logEvent's rule (#1351), the alias's holder, else the handle when it is a session
+// ID, else null.
+export async function insertClaimEvent(
+  sql: PgSql, event: ClaimEvent, handle: string, c: Partial<Claim> & { key: string }, at: number, heldBy?: string,
+): Promise<void> {
+  await sql`INSERT INTO claim_events (key, handle, event, note, board, expires_at, held_by, at, session_id)
+    VALUES (${c.key}, ${handle}, ${event}, ${c.note ?? null}, ${c.board ?? null}, ${c.expires_at ?? null}::int8, ${heldBy ?? null}, ${at},
+      COALESCE((SELECT id FROM alias_holds WHERE address = ${handle}), (SELECT id FROM ids WHERE id = ${handle})))`;
+}
+
 export function makePgClaims({ clock }: { clock: () => number }): ClaimsStore {
   async function takeWatchers(tx: Parameters<ClaimsStore["takeWatchers"]>[0], key: string): Promise<string[]> {
     const rows: Row[] = await pgOf(tx)`WITH gone AS (DELETE FROM claim_watches WHERE key = ${key} RETURNING handle)
       SELECT handle FROM gone ORDER BY handle COLLATE "C"`;
     return rows.map(x => x.handle as string);
-  }
-  async function logEvent(
-    tx: Parameters<ClaimsStore["logEvent"]>[0], event: ClaimEvent, handle: string, c: Partial<Claim> & { key: string }, at: number, heldBy?: string,
-  ): Promise<void> {
-    // session_id: core logEvent's rule (#1351), the alias's holder, else the handle when it is a session ID, else null.
-    await pgOf(tx)`INSERT INTO claim_events (key, handle, event, note, board, expires_at, held_by, at, session_id)
-      VALUES (${c.key}, ${handle}, ${event}, ${c.note ?? null}, ${c.board ?? null}, ${c.expires_at ?? null}::int8, ${heldBy ?? null}, ${at},
-        COALESCE((SELECT id FROM alias_holds WHERE address = ${handle}), (SELECT id FROM ids WHERE id = ${handle})))`;
   }
   return {
     async list(r, prefix) {
@@ -112,7 +115,7 @@ export function makePgClaims({ clock }: { clock: () => number }): ClaimsStore {
       const rows: Row[] = await sql`DELETE FROM claims WHERE expires_at <= ${now} RETURNING ${rowCols(sql)}`;
       return rows.map(toRow).sort(lapseOrder);
     },
-    logEvent,
+    logEvent: (tx, event, handle, c, at, heldBy) => insertClaimEvent(pgOf(tx), event, handle, c, at, heldBy),
     takeWatchers,
     // core holderUser: the row's own user, else holderPrincipals' two facts read in one statement, then the rule.
     async holderUser(r, c) {
@@ -129,7 +132,7 @@ export function makePgClaims({ clock }: { clock: () => number }): ClaimsStore {
       if (!row) return false;
       const gone = toRow(row);
       await takeWatchers(tx, key);
-      await logEvent(tx, "release", gone.holder, { ...gone, note: gone.expires_at <= now ? "ack (late)" : "ack" }, now);
+      await insertClaimEvent(pgOf(tx), "release", gone.holder, { ...gone, note: gone.expires_at <= now ? "ack (late)" : "ack" }, now);
       return true;
     },
     // A session end's (#807 P3 C10d2-a): by key, where SQLite's order is its scan's.
