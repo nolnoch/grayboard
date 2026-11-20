@@ -17,11 +17,11 @@ import { REFUSED_TOKEN_TTL_MS } from "../../src/server/auth_gate.ts";
 import { stubAuthRead } from "../support/auth_stub.ts";
 
 const A = "alice@example.com";
-const cleanup: (() => void)[] = [];
+const cleanup: (() => unknown)[] = [];
 
 afterEach(async () => {
   await closeSessions();
-  for (const f of cleanup.splice(0)) f();
+  for (const f of cleanup.splice(0)) await f();
 });
 
 // A server whose limiters run on a clock the test moves.

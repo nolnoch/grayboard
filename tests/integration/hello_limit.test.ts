@@ -13,11 +13,11 @@ import { TestServer, type TestServerOverrides } from "../support/server.ts";
 import { until } from "../support/until.ts";
 
 const A = "alice@example.com";
-const cleanup: (() => void)[] = [];
+const cleanup: (() => unknown)[] = [];
 
 afterEach(async () => {
   await closeSessions();
-  for (const f of cleanup.splice(0)) f();
+  for (const f of cleanup.splice(0)) await f();
 });
 
 async function serve(o: TestServerOverrides): Promise<TestServer> {
