@@ -129,7 +129,8 @@ export function aliveRows<T extends { pid: number; proc_start: string | null }>(
   return { alive, dead: rows.filter((r) => !alive.includes(r)) };
 }
 
-function parentOf(pid: number): number | null {
+/** `pid`'s parent pid now, or null when it can't be read (gone, or the process table unreadable). */
+export function parentOf(pid: number): number | null {
   if (process.platform === "linux") {
     const ppid = Number(statFields(pid)?.[1]);
     return ppid > 0 ? ppid : null;

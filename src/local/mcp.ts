@@ -53,7 +53,7 @@ import {
 import { localDbPath } from "./open.ts";
 import { deliverEnded, listenForWakeup, poke } from "./wakeup.ts";
 import { sockDir } from "../shared/sockdir.ts";
-import { ChildSessions, acquireName, displaceableHolder, attachSession, candidateNames, childFallback, conversationSnapshot, detachSession, endLocalSession, keyedHarness, liveSessions, nothingEnded, recordYields, registerChild, registerSession, releaseName, runnerRoot, runnerRootLive, setHeldMeta, SIBLING_WAIT_MS, siblingGone, thisSession, type Ended, type Leave, type SessionKind } from "./binding.ts";
+import { ChildSessions, acquireName, displaceableHolder, attachSession, candidateNames, childFallback, conversationSnapshot, detachSession, endLocalSession, keyedHarness, liveSessions, nothingEnded, recordPredecessor, recordYields, registerChild, registerSession, releaseName, runnerRoot, runnerRootLive, setHeldMeta, SIBLING_WAIT_MS, siblingGone, thisSession, type Ended, type Leave, type SessionKind } from "./binding.ts";
 import { GRAYBOARD_AGENT_META, validSourceId } from "../shared/session_meta.ts";
 import { MISSING_TEXT, TOOL_USE_META, readCurrent, takeRecord, type MissingCause } from "../shared/claude_agents.ts";
 import { listenIdentity, type IdentityRequest } from "../shared/claude_identity.ts";
@@ -502,7 +502,11 @@ if (WRITES_AS) {
   // unbind, never an invitation to take PID carry or configured identity.
   const snapshot = ORDINARY && HARNESS_SESSION ? conversationSnapshot(db, HARNESS_SESSION) : null;
   claudeGuidancePending = CLAUDE_CURRENT && snapshot !== null;
-  const rec = snapshot ?? (RECORDS ? freshRecord(RECORD_DIR, process.ppid, localDbPath()) : null);
+  const found = snapshot === null && RECORDS ? freshRecord(RECORD_DIR, process.ppid, localDbPath()) : null;
+  // A record an adapter's child under this harness left isn't this session's to restore (#1457).
+  const foreign = found !== null && !recordPredecessor(db, found.session_id, HARNESS_SESSION);
+  if (foreign) console.error(`[grayboard] the name record for harness pid ${process.ppid} is session ${found.session_id}'s, which had a harness session; not restored`);
+  const rec = snapshot ?? (foreign ? null : found);
   if (snapshot !== null || rec?.names.length) {
     await restoreNames(rec!, snapshot === null);
   } else if (EXPLICIT && !attached) {
