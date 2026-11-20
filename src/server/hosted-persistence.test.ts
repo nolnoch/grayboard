@@ -73,7 +73,7 @@ for (const revokeFirst of [false, true]) test(`forced attachment/revoke transact
     expect((await database.repo.hosted.all(database.repo.read)).every(row => row.grant_id === first.grantId)).toBe(true);
     expect(releases()).toEqual([]);
   } else {
-    expect(results.every(result => result.ok)).toBe(true);
+    expect(results).toMatchObject([{ ok: true }, { ok: true }]);   // on a failure, prints both workers' results (#1134)
     expect(hostedRowCount(database.db)).toBe(0);
     expect(releases()).toEqual([{ detail: "revoked" }]);
   }
@@ -95,7 +95,7 @@ test("forced release/bind overlap hands the name to the contender only after the
   const { principal } = await issue();
   await hosted.bind(principal, context(principal), { name: "fe", create: true });
   const results = await overlap({ operation: "end", principal, rawSession: "root" }, { operation: "bind", principal, rawSession: "other" }, "hosted:release:in-txn");
-  expect(results.every(result => result.ok)).toBe(true);
+  expect(results).toMatchObject([{ ok: true }, { ok: true }]);
   const rows = await database.repo.hosted.all(database.repo.read);
   expect(rows.map(row => row.source_session_id)).toEqual(["other"]);
   expect((await application.hostedHolds(application.repo.read, rows[0]!.session_id)).map(short)).toEqual(["fe"]);
@@ -106,7 +106,7 @@ test("forced root registration/end overlap cannot leave an orphan child", async 
   const { principal } = await issue();
   await hosted.bind(principal, context(principal), { name: "fe", create: true });
   const results = await overlap({ operation: "register", principal, child: "child" }, { operation: "end", principal }, "hosted:register:in-txn");
-  expect(results.every(result => result.ok)).toBe(true);
+  expect(results).toMatchObject([{ ok: true }, { ok: true }]);
   expect(hostedRowCount(database.db)).toBe(0);
   expect(releases()).toHaveLength(1);
 }, 15_000);
@@ -116,7 +116,7 @@ test("forced expiry/rebind overlap releases only the expired ownership", async (
   await hosted.bind(principal, context(principal), { name: "fe", create: true });
   const lease = await delivery.open(principal, context(principal));
   const results = await overlap({ operation: "sweep", principal, sweepAt: now + 30_001 }, { operation: "bind", principal }, "hosted:lease-expire:in-txn");
-  expect(results.every(result => result.ok)).toBe(true);
+  expect(results).toMatchObject([{ ok: true }, { ok: true }]);
   const rows = await database.repo.hosted.all(database.repo.read);
   expect(rows).toHaveLength(1);
   expect(rows[0]?.ownership_id).not.toBe(lease.ownership);
@@ -239,7 +239,7 @@ for (const operation of ["revoke", "bind"] as const) {
     await hosted.bind(principal, context(principal), { name: "fe", create: true });
     const message = await seed(database.repo, tx => database.repo.messages.insert(tx, "sender@example.com/be", "user", "you@example.com/fe", "admitted", null, false));
     const results = await overlap({ operation: "receipt", principal }, { operation, principal, name: "be", refreshHash: hashToken(issued.refreshToken) }, "hosted:receipt:in-txn");
-    expect(results.every(result => result.ok)).toBe(true);
+    expect(results).toMatchObject([{ ok: true }, { ok: true }]);
     expect(await database.repo.cursors.directFor(database.repo.read, "you@example.com/fe")).toBe(message.id);
   }, 15_000);
 }
