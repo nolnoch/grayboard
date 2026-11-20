@@ -25,7 +25,6 @@
 // nothing that reaches it.
 import { SQL } from "bun";
 import { errorDiagnostic } from "../../diagnostics.ts";
-import { detached, inRequest, requestOrigin } from "../../request_context.ts";
 import { queueFor, type WriteQueue } from "../queue.ts";
 import { BaseRead, BaseTx, flushEffect, isThenable, type Read, type SavepointFrame, type Tx } from "../tx_base.ts";
 import { pgFailure } from "./errors.ts";
@@ -261,9 +260,8 @@ export function makePgTransactions(url: string, { ownAuthCommit, ...opts }: Omit
 
   function write<T, R = T>(fn: (tx: Tx) => T | PromiseLike<T>, committed?: (value: T) => R): Promise<Awaited<R>> {
     if (store.open && queue.mine) return Promise.reject(new Error("write() inside an open transaction: nested code calls its Tx's savepoint"));
-    // fn and committed run as the work of the request that called write(), or of none (db.ts queued, #1042).
-    const o = requestOrigin();
-    return queue.run(() => o ? inRequest(o, body) : detached(body)).then(box => box.out) as Promise<Awaited<R>>;
+    // fn and committed run as the work of the request that called write(), or of none (db.ts queued, #1042, #1408).
+    return queue.run(body).then(box => box.out) as Promise<Awaited<R>>;
 
     async function body(): Promise<{ out: R }> {
       let root: PgTx | undefined;

@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -124,6 +125,29 @@ test("#925: a synchronous body that throws in a backlog rejects only its caller;
   expect(await a).toBe(1);
   await expect(b).rejects.toThrow("b");
   expect(await c).toBe(3);
+  expect(q.held).toBe(false);
+});
+
+test("#1408: a body that waited runs in its enqueuer's async context, not the releasing holder's, and is the holder", async () => {
+  const q = new WriteQueue();
+  const request = new AsyncLocalStorage<string>();
+  let release!: () => void;
+  const seen: Array<{ store: string | undefined; mine: boolean }> = [];
+  const look = () => { seen.push({ store: request.getStore(), mine: q.mine }); };
+  // The holder runs as request A and releases from A's continuation; the waiters were queued as B and C.
+  const head = request.run("A", () => q.run(async () => { look(); await new Promise<void>(r => { release = r; }); }));
+  const b = request.run("B", () => q.run(() => { look(); }));
+  const c = request.run("C", () => q.run(async () => { await Promise.resolve(); look(); }));
+  // One queued outside any request: it sees no store, not A's or B's.
+  const d = q.run(() => { look(); });
+  request.run("A", () => release());
+  await Promise.all([head, b, c, d]);
+  expect(seen).toEqual([
+    { store: "A", mine: true },
+    { store: "B", mine: true },
+    { store: "C", mine: true },
+    { store: undefined, mine: true },
+  ]);
   expect(q.held).toBe(false);
 });
 

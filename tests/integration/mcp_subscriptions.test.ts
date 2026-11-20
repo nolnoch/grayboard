@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
 import { TestServer } from "../support/server.ts";
 import { seed } from "../support/seed.ts";
@@ -11,6 +11,9 @@ import { OAUTH_TTL } from "../../src/server/oauth-types.ts";
 import { randomBytes } from "node:crypto";
 import { sessionContext } from "../../src/server/hosted.ts";
 import { stubAuthRead } from "../support/auth_stub.ts";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 let srv: TestServer, app: TestServer["app"], base: string, clock: number;
 const clients: Client[] = [];
@@ -316,6 +319,48 @@ for (const version of MCP_PROTOCOL_VERSIONS.slice(1)) test(`${version}: fresh sa
   await until(() => app.mcp.activeLegacySessions === 0);
   const missing = await fetch(base + "/mcp", { method: "DELETE", headers });
   expect(missing.status).toBe(404); await missing.body?.cancel();
+});
+// #1408: a resource read whose write body waits behind another request's body runs as its own exchange, not the
+// releasing holder's. Alice's read is held at `hosted:tool:in-gate` (past its gate's write, before its body's); bob's
+// tool call then takes the queue and holds it, alice's body queues behind it, and bob's release starts it. Started in
+// bob's context, it judged bob's exchange principal and refused as "resource session is closed or unauthorized".
+for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: a resource read queued behind another request's write body judges its own exchange`, async () => {
+  const c = await connect((await issue()).token, version);
+  const d = await connect((await issue("bob@example.com")).token, version, undefined, "fe");
+  await call(c, "board_create", { name: "e2e", purpose: "fixtures" });
+  type Body = (tx: unknown) => unknown;
+  const hosted = app.repo.hosted as unknown as Record<"write", (fn: Body, ...rest: unknown[]) => unknown>, write = hosted.write;
+  let queued = 0, arm = false, held = false, release!: () => void;
+  const gate = new Promise<void>(r => { release = r; });
+  hosted.write = (fn: Body, ...rest: unknown[]) => {
+    queued++;
+    const hold = arm && !held;
+    if (hold) held = true;
+    return write.call(app.repo.hosted, hold ? async (tx: unknown) => { await gate; return fn(tx); } : fn, ...rest);
+  };
+  const dir = mkdtempSync(join(tmpdir(), "gb-1408-")), go = join(dir, "go"), hits: string[] = [];
+  const said = spyOn(console, "error").mockImplementation((...args: unknown[]) => { hits.push(args.join(" ")); });
+  process.env.BUS_TEST_PAUSE = "hosted:tool:in-gate";
+  process.env.BUS_TEST_PAUSE_FILE = go;
+  try {
+    const read = c.client.readResource({ uri: boardUri }).then(r => JSON.stringify(r), (error: unknown) => String(error));
+    await until(() => hits.some(h => h.includes("test pause hit: hosted:tool:in-gate")));
+    delete process.env.BUS_TEST_PAUSE;
+    arm = true;
+    const bob = call(d, "whoami");
+    await until(() => held);
+    const before = queued;
+    writeFileSync(go, "");
+    await until(() => queued > before);
+    release();
+    await bob;
+    expect(await read).toContain("e2e");
+  } finally {
+    hosted.write = write; release(); writeFileSync(go, "");
+    said.mockRestore();
+    delete process.env.BUS_TEST_PAUSE; delete process.env.BUS_TEST_PAUSE_FILE;
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: private membership loss and background storage fault close streams`, async () => {
