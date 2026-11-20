@@ -483,6 +483,38 @@ test.each(modes.flatMap(mode => (["expired", "login_required"] as const).map(rea
     expect(o.r.named("delivery_open")).toHaveLength(o.opened);
   } finally { await o.c.close(); await o.r.controller.close(); }
 });
+// #1334: the recovery's start finds another process holding the token refresh (processes sharing one grant store).
+// It retries on restore's outage backoff, as resume's and restore's own prepares do, and opens once the lock frees.
+test.each(modes)("a recovery whose start finds the token refresh in another process retries on the outage backoff (#1334, %s)", async mode => {
+  const busy = Promise.reject(new RefreshInProgress("pi"));
+  busy.catch(() => {});
+  const o = await expiredPause(mode, (n, r) => {
+    if (n === 1) { r.expireAccess(); r.holdPrepare(busy); }
+    // restore's retry: its first wait is 500 ms; the second (1000 ms) frees the lock.
+    if (n === 2) r.holdPrepare(Promise.resolve());
+  });
+  try {
+    await until(() => o.recovering() >= 2 && o.r.root(o.c)?.state === "active");
+    const seen = o.states.map(s => [s.state, s.operation, s.code].join(":"));
+    expect(seen).toContain("retrying:recover:refresh_in_progress");
+    expect(seen).toContain("retrying:restore:refresh_in_progress");
+    expect(seen.filter(s => s.startsWith("approved:recover") || s.startsWith("paused:recover"))).toEqual([]);
+    expect(o.recovering()).toBe(2);
+    expect(o.r.named("delivery_open")).toHaveLength(o.opened + 1);
+  } finally { await o.c.close(); await o.r.controller.close(); }
+});
+// #1334: the recovery's credential check itself finds the refresh in progress: it keeps waiting, rather than pausing for good.
+test.each(modes)("a recovery check that finds the token refresh in another process keeps waiting (#1334, %s)", async mode => {
+  const o = await expiredPause(mode, (n, r) => {
+    if (n === 1) r.failCheck(() => new RefreshInProgress("pi"));
+    if (n === 2) { r.failCheck(); r.expireAccess(); }
+  });
+  try {
+    await until(() => o.recovering() >= 2 && o.r.root(o.c)?.state === "active");
+    expect(o.recovering()).toBe(2);
+    expect(o.states.some(s => s.code === "refresh_in_progress")).toBe(false);
+  } finally { await o.c.close(); await o.r.controller.close(); }
+});
 // #1294 audit M-1: pi, omp and the Claude Code plugin stop through RootDelivery, which shuts the session down
 // (queued behind the start) before it closes: the shutdown itself ends the start's wire, and its release still runs.
 test.each(modes.flatMap(mode => (["enroll", "enroll with a name", "resume"] as const).map(how => [mode, how] as const)))("shutdown then close ends a start's wire still connecting at once and still releases (#1294, %s, %s)", async (mode, how) => {
@@ -1367,6 +1399,42 @@ test("a restore that fails outside the expiry branches records a degraded root w
       await restarted.restore();
       await until(() => o.r.root(restarted)?.code === "alias_held");
       expect(o.r.root(restarted)).toMatchObject({ state: "degraded", operation: "restore", code: "alias_held" });
+    } finally { await restarted.close(); }
+  } finally { await o.c.close(); await o.r.controller.close(); }
+});
+// #1334 audit L-1: a restore's prepare finds another process holding the token refresh (processes sharing one grant
+// store restarting together): it retries on the outage backoff, as resume's does, rather than degrading.
+test("a restore whose prepare finds the token refresh in another process retries on the outage backoff (#1334)", async () => {
+  const r = runtime("approval");
+  await r.controller.enroll("R", ["be"], true);
+  await until(() => r.root(r.controller)?.state === "active");
+  await r.controller.close();
+  const busy = Promise.reject(new RefreshInProgress("pi"));
+  busy.catch(() => {});
+  r.holdPrepare(busy);
+  const waits: number[] = [];
+  const restarted: Controller = r.make({ wait: async ms => { waits.push(ms); if (waits.length === 2) r.holdPrepare(Promise.resolve()); } });
+  try {
+    await restarted.restore();
+    expect(r.root(restarted)).toMatchObject({ state: "retrying", operation: "restore", code: "refresh_in_progress" });
+    await until(() => r.root(restarted)?.state === "active");
+    expect(waits).toEqual([500, 1000]);
+  } finally { await restarted.close(); }
+});
+// The same for restore's check after an expiry pause: a refresh in progress there retries too, rather than degrading.
+test("a restore check that finds the token refresh in another process after an expiry pause retries (#1334)", async () => {
+  const o = await expiredPause("approval", () => {});
+  try {
+    await until(() => o.recovering() >= 1);
+    await o.c.close();
+    o.r.expireAccess(); o.r.failCheck(() => new RefreshInProgress("pi"));
+    const states: string[] = [];
+    const restarted = o.r.make({ wait: async () => { o.r.failCheck(); }, sink: record => { states.push(`${record.state}:${record.code ?? ""}`); } });
+    try {
+      await restarted.restore();
+      expect(o.r.root(restarted)).toMatchObject({ state: "retrying", operation: "restore", code: "refresh_in_progress" });
+      await until(() => o.r.root(restarted)?.state === "active");
+      expect(states.filter(s => s.startsWith("degraded") || s.startsWith("paused"))).toEqual([]);
     } finally { await restarted.close(); }
   } finally { await o.c.close(); await o.r.controller.close(); }
 });

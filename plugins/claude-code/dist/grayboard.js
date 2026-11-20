@@ -36643,6 +36643,7 @@ var RECOVERY_FIRST_MS = 1000;
 var RECOVERY_MAX_MS = 30000;
 var RECOVERY_BUDGET_MS = 60 * 60000;
 var UNREACHABLE_AT_RECOVER = "Server unreachable while recovering; retrying, approval retained";
+var refreshingAtRecover = (harness) => `Token refresh in progress in another ${harness} process while recovering; retrying, approval retained`;
 function sleep5(ms, signal) {
   return new Promise((resolve) => {
     if (signal.aborted)
@@ -37460,7 +37461,7 @@ class Controller {
         await this.rotated(grace, () => this.prepare(r, true, true));
       } catch (caught) {
         const r = this.roots.get(id), error = this.expired(caught);
-        if (r && error instanceof ServerUnreachable && this.restorable(r, r.epoch)) {
+        if (r && (error instanceof ServerUnreachable || error instanceof RefreshInProgress) && this.restorable(r, r.epoch)) {
           this.retrying(r, error);
           this.retryRestore(r);
         } else if (r && error instanceof AccessExpired && error.reason === "expired" && this.restorable(r, r.epoch)) {
@@ -37563,7 +37564,7 @@ class Controller {
             const error = this.expired(caught);
             if (!live())
               return true;
-            if (error instanceof AccessExpired && error.reason === "expired")
+            if (error instanceof AccessExpired && error.reason === "expired" || error instanceof RefreshInProgress)
               return false;
             r.awaiting = undefined;
             this.set(r, "paused", failureMessage(error, this.hint), "recover", failureCode(error));
@@ -37588,8 +37589,8 @@ class Controller {
               awaiting();
               return false;
             }
-            if (error instanceof ServerUnreachable && this.restorable(r, r.epoch)) {
-              this.set(r, "retrying", UNREACHABLE_AT_RECOVER, "recover", failureCode(error));
+            if ((error instanceof ServerUnreachable || error instanceof RefreshInProgress) && this.restorable(r, r.epoch)) {
+              this.set(r, "retrying", error instanceof RefreshInProgress ? refreshingAtRecover(this.port.harness) : UNREACHABLE_AT_RECOVER, "recover", failureCode(error));
               this.retryRestore(r);
               return true;
             }

@@ -84,6 +84,7 @@ type Grace = { spent: number; lease?: () => Lease | undefined };
 // restore) ask the host the same way once the server answers with the expiry, and keep their own backoff (#916).
 const RECOVERY_FIRST_MS = 1_000, RECOVERY_MAX_MS = 30_000, RECOVERY_BUDGET_MS = 60 * 60_000;
 const UNREACHABLE_AT_RECOVER = "Server unreachable while recovering; retrying, approval retained";
+const refreshingAtRecover = (harness: string) => `Token refresh in progress in another ${harness} process while recovering; retrying, approval retained`;
 function sleep(ms: number, signal: AbortSignal) {
   return new Promise<void>(resolve => {
     if (signal.aborted) return resolve();
@@ -806,7 +807,8 @@ export class Controller<E extends Enrollment = Enrollment> {
         await this.rotated(grace, () => this.prepare(r, true, true));
       } catch (caught) {
         const r = this.roots.get(id), error = this.expired(caught);
-        if (r && error instanceof ServerUnreachable && this.restorable(r, r.epoch)) {
+        // An outage, or another process holding the token refresh: retry on the outage backoff (#424 6, #895, #1334).
+        if (r && (error instanceof ServerUnreachable || error instanceof RefreshInProgress) && this.restorable(r, r.epoch)) {
           this.retrying(r, error);
           this.retryRestore(r);
         } else if (r && error instanceof AccessExpired && error.reason === "expired" && this.restorable(r, r.epoch)) {
@@ -918,7 +920,8 @@ export class Controller<E extends Enrollment = Enrollment> {
           catch (caught) {
             const error = this.expired(caught);
             if (!live()) return true;
-            if (error instanceof AccessExpired && error.reason === "expired") return false;
+            // Still expired, or another process holding the token refresh: the next check reads its outcome (#1334).
+            if ((error instanceof AccessExpired && error.reason === "expired") || error instanceof RefreshInProgress) return false;
             r.awaiting = undefined;
             this.set(r, "paused", failureMessage(error, this.hint), "recover", failureCode(error));
             return true;
@@ -933,8 +936,13 @@ export class Controller<E extends Enrollment = Enrollment> {
             const error = this.expired(caught);
             if (this.drifted || this.stopped || this.ending.has(id) || this.roots.get(id) !== r) return true;
             if (error instanceof AccessExpired && error.reason === "expired") { r.paused = true; r.awaiting = mark; awaiting(); return false; }
-            // An outage now: restore's retry, on the outage backoff (#424 6).
-            if (error instanceof ServerUnreachable && this.restorable(r, r.epoch)) { this.set(r, "retrying", UNREACHABLE_AT_RECOVER, "recover", failureCode(error)); this.retryRestore(r); return true; }
+            // An outage now, or another process holding the token refresh: restore's retry, on the outage
+            // backoff, as resume's and restore's own prepares do (#424 6, #895, #1334).
+            if ((error instanceof ServerUnreachable || error instanceof RefreshInProgress) && this.restorable(r, r.epoch)) {
+              this.set(r, "retrying", error instanceof RefreshInProgress ? refreshingAtRecover(this.port.harness) : UNREACHABLE_AT_RECOVER, "recover", failureCode(error));
+              this.retryRestore(r);
+              return true;
+            }
             // A sign-out pauses the root, as every start's does (#1325).
             if (this.signedOut(error)) r.paused = true;
             this.set(r, r.paused ? "paused" : "approved", failureMessage(error, this.hint), "recover", failureCode(error));
