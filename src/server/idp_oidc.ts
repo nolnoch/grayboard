@@ -1,4 +1,5 @@
-// A generic OpenID Connect provider behind the AS (#928, docs/architecture.md §3): Okta is its configuration.
+// A generic OpenID Connect provider behind the AS (#928, docs/architecture.md §3): Okta and `oidc` (#1418) are its
+// configurations.
 // Discovery is lazy and cached, never fetched at construction; the provider's own fetches refuse redirects, time out
 // and bound the body; JWKS is jose's, with each verification capped by an overall deadline. `exchange` returns only
 // after every check held (D1), the email's domain among them (D5).
@@ -12,7 +13,9 @@ export type OidcProviderOptions = {
   label: string;
   issuer: string;                     // exact: discovery's and every ID token's `iss` must equal it
   clientId: string;
-  clientSecret: string;
+  // Absent: a public client (#1418), which authenticates to the token endpoint by PKCE alone and names itself by
+  // client_id in the form (RFC 6749 §4.1.3). Present: client_secret_basic.
+  clientSecret?: string;
   allowedDomains: readonly string[];  // the email domains this provider may sign in (D5)
   // Tests only: loopback http: endpoints (D6), jose's JWKS cooldown, the verification deadline, the discovery clock.
   allowLoopbackHttp?: boolean;
@@ -172,11 +175,11 @@ export function oidcProvider(o: OidcProviderOptions): IdentityProvider {
     },
     async exchange({ code, verifier, redirectUri, nonce }): Promise<UpstreamIdentity> {
       const d = await discovery();
-      const tokens = await json(d.token, {
-        method: "POST",
-        headers: { Authorization: basicAuthorization(o.clientId, o.clientSecret), "Content-Type": "application/x-www-form-urlencoded", Accept: "application/json" },
-        body: new URLSearchParams({ grant_type: "authorization_code", code, redirect_uri: redirectUri, code_verifier: verifier }),
-      }, "token exchange", OidcEndpointError);
+      const form = new URLSearchParams({ grant_type: "authorization_code", code, redirect_uri: redirectUri, code_verifier: verifier });
+      const headers: Record<string, string> = { "Content-Type": "application/x-www-form-urlencoded", Accept: "application/json" };
+      if (o.clientSecret === undefined) form.set("client_id", o.clientId);
+      else headers.Authorization = basicAuthorization(o.clientId, o.clientSecret);
+      const tokens = await json(d.token, { method: "POST", headers, body: form }, "token exchange", OidcEndpointError);
       if (typeof tokens.id_token !== "string") throw new OidcEndpointError(`${o.label} token response has no id_token`);
       const claims = await verify(tokens.id_token, d);
       // Google's azp rules (verifyGoogleIdToken): a present azp is the client; several audiences need it.

@@ -5,7 +5,7 @@
 | Mode | When to use | Identity scope | Auth | Storage |
 |---|---|---|---|---|
 | **Local** (`src/local/`) | One developer, multiple Claude sessions on one machine | `BUS_IDENTITY` strings, no namespace | none — localhost only | SQLite at `~/.claude-bus/bus.db`; Unix-socket wakeup |
-| **Distributed** (`src/server/`, hosted MCP) | Multiple developers, multiple machines, team boards | `user@org/name` and `team/name` scopes; each session also has an `id:…` | Google or Okta OIDC (domain-restricted) → server-issued bearer tokens | SQLite on the backend; hosted MCP delivery to clients |
+| **Distributed** (`src/server/`, hosted MCP) | Multiple developers, multiple machines, team boards | `user@org/name` and `team/name` scopes; each session also has an `id:…` | Google, Okta or another OIDC provider (domain-restricted) → server-issued bearer tokens | SQLite on the backend; hosted MCP delivery to clients |
 
 Both modes expose the same tools. With a team server, Claude Code runs grayboard's plugin, omp and pi run grayboard's hosted extensions, and OpenCode V2 and other native clients connect directly: all talk to the server's hosted MCP endpoint themselves. `grayboard mcp` is local mode only, so a machine signed in to a server keeps its local entries working; a `--mode server` run is refused with a message to use the hosted entry. After `grayboard logout` the CLI's server commands fail with "signed out" rather than quietly switching to local; run `grayboard setup --local` to switch.
 

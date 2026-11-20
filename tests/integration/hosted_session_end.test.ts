@@ -9,7 +9,7 @@ import { DEFAULT_HELLO_LIMIT, DEFAULT_AUTH_FAIL_LIMIT } from "../../src/server/r
 import { DEFAULT_TRUSTED_PROXIES } from "../../src/server/client_addr.ts";
 import { MCP_PROTOCOL_VERSIONS } from "../../src/server/mcp.ts";
 import { MAX_CHILDREN } from "../../src/core/bindings.ts";
-import { sessionContext } from "../../src/server/hosted.ts";
+import { sessionContext, sourceContext } from "../../src/server/hosted.ts";
 import { issueOAuth } from "../helpers/oauth.ts";
 import { OPENCODE_CLIENT, OPENCODE_SESSION_META } from "../../src/server/oauth-config.ts";
 import { withMeta } from "../helpers/hosted.ts";
@@ -154,12 +154,63 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: a parked child's 
   expect(app.db.query("SELECT 1 FROM access_log WHERE action = 'hosted.child_unparked'").all()).toEqual([]);
 });
 
+// #1077: a child ID that is another principal's session is refused id_collision, and its id.collision row outlives
+// the refusal's rollback; the root keeps no child.
+test("session_register of another principal's session ID is refused id_collision and audited", async () => {
+  const grant = await issue();
+  await connect("2026-07-28", grant.token, "collide-root");
+  const principal = await app.oauth.authenticate(new Request(`${base}/mcp`, { headers: { Authorization: `Bearer ${grant.token}` } }));
+  if (principal instanceof Response) throw new Error("fixture authorization failed");
+  const rootContext = sessionContext(principal, { "ai.opencode/sessionID": "collide-root" });
+  const taken = sourceContext(principal, "taken");
+  if (!("id" in taken)) throw new Error("fixture source failed");
+  await app.repo.write(tx => app.repo.bindings.registerId(tx, { id: taken.id, principal: "bob@example.com", launcher: false }));
+  await expect(app.mcp.sessions.register(principal, rootContext, "taken")).rejects.toMatchObject({ code: "id_collision" });
+  expect(app.db.query<{ actor: string; target: string; detail: string }, []>("SELECT actor, target, detail FROM access_log WHERE action = 'id.collision'").all())
+    .toEqual([{ actor: "alice@example.com", target: taken.id, detail: JSON.stringify({ why: "is another principal's session" }) }]);
+  expect(await app.repo.hosted.get(app.repo.read, taken.id)).toBeUndefined();
+});
+
+// #1077: the same refusal at a session's start (rowFor admitting the caller's own ID) keeps its row too.
+test("a session whose own ID is another principal's is refused id_collision at its start and audited", async () => {
+  const grant = await issue();
+  const principal = await app.oauth.authenticate(new Request(`${base}/mcp`, { headers: { Authorization: `Bearer ${grant.token}` } }));
+  if (principal instanceof Response) throw new Error("fixture authorization failed");
+  const planted = sessionContext(principal, { "ai.opencode/sessionID": "planted-root" });
+  if (!("id" in planted)) throw new Error("fixture source failed");
+  await app.repo.write(tx => app.repo.bindings.registerId(tx, { id: planted.id, principal: "bob@example.com", launcher: false }));
+  await expect(app.mcp.sessions.register(principal, planted, "a-child")).rejects.toMatchObject({ code: "id_collision" });
+  expect(app.db.query<{ actor: string; target: string }, []>("SELECT actor, target FROM access_log WHERE action = 'id.collision'").all())
+    .toEqual([{ actor: "alice@example.com", target: planted.id }]);
+  expect(hostedRowCount(app.db)).toBe(0);
+});
+
+// #1101: settle (inside end's gate) ends an idle root, and its child with it; end then reports ended: false and admits
+// neither ID again: no row, no new ownership. Once from the child's context, once from the root's.
+for (const from of ["child", "root"] as const) test(`session_end from the ${from} after settle ends the idle root reports ended: false and admits nothing`, async () => {
+  const grant = await issue();
+  await connect("2026-07-28", grant.token, "idle-root");
+  const principal = await app.oauth.authenticate(new Request(`${base}/mcp`, { headers: { Authorization: `Bearer ${grant.token}` } }));
+  if (principal instanceof Response) throw new Error("fixture authorization failed");
+  const rootContext = sessionContext(principal, { "ai.opencode/sessionID": "idle-root" });
+  await app.mcp.sessions.register(principal, rootContext, "idle-child");
+  expect(hostedRowCount(app.db)).toBe(2);
+  const started = () => app.db.query<{ n: number }, []>("SELECT count(*) AS n FROM access_log WHERE action = 'hosted.ownership_started'").get()!.n;
+  const before = started();
+  skew += 900_001;
+  const context = from === "root" ? rootContext : sessionContext(principal, { "ai.opencode/sessionID": "idle-child" });
+  expect(await app.mcp.sessions.end(principal, context)).toEqual({ ended: false });
+  expect(hostedRowCount(app.db)).toBe(0);
+  expect(started()).toBe(before);
+  // The child ended with its root, not parked then evicted.
+  expect(app.db.query("SELECT 1 FROM access_log WHERE action = 'hosted.child_parked'").all()).toEqual([]);
+});
+
 // #1097: an ending call (session_end, delivery_release) under an ID the server no longer holds ends nothing and starts
-// nothing: no row, no ownership, no audit but the stale lease's own refusal row. A client's connect admits its ID as any
-// session start does (#1099; on the legacy protocols the standing GET stream too, so only the stateless protocol can
-// put the row's end between connect and the calls), so over HTTP this is the row ending after the connect (here the
-// server releases it), as the controller's release sends the two calls. The direct calls cover the tool gates for an
-// ID never seen.
+// nothing: no row, no ownership, no audit but the stale lease's own refusal row. A connect that names an ID admits it as
+// any session start does, so this raw client's row ends after its connect (here the server releases it); hosted-core's
+// ending-only wires connect naming no session and admit nothing (#1099, tests/integration/hosted_core_root.test.ts). The
+// direct calls cover the tool gates for an ID never seen.
 test("ending calls under an unknown ID write nothing; session_end reports ended: false", async () => {
   const grant = await issue();
   const stranger = await connect("2026-07-28", grant.token, "gone-before-end", { "X-Grayboard-Lease": "a".repeat(43) });

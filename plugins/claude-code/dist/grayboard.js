@@ -31822,10 +31822,13 @@ class Wire extends Connection {
       headers.set("X-Grayboard-Lease", this.capability);
   }
   meta() {
-    return { [this.wireOptions.sessionKey]: this.sessionID, ...this.declaration(), ...this.facts(this.sessionID) };
+    return this.wireOptions.ending ? {} : this.named();
+  }
+  named() {
+    return this.wireOptions.ending ? { [this.wireOptions.sessionKey]: this.sessionID } : { [this.wireOptions.sessionKey]: this.sessionID, ...this.declaration(), ...this.facts(this.sessionID) };
   }
   async read(uri) {
-    const value = await this.reachable(this.client.readResource({ uri, _meta: this.meta() }, this.options())).catch((error) => {
+    const value = await this.reachable(this.client.readResource({ uri, _meta: this.named() }, this.options())).catch((error) => {
       if (error?.code === -32602 || error?.code === -32603)
         throw subscriberError(error.data, uri === "grayboard://inbox");
       throw error;
@@ -31835,7 +31838,7 @@ class Wire extends Connection {
     return JSON.parse(value.contents[0].text);
   }
   async call(name, args = {}) {
-    const value = await this.reachable(this.client.callTool({ name, arguments: args, _meta: this.meta() }, this.options()));
+    const value = await this.reachable(this.client.callTool({ name, arguments: args, _meta: this.named() }, this.options()));
     if (value.isError) {
       throw subscriberError(value.structuredContent, name.startsWith("delivery_"));
     }
@@ -33173,6 +33176,9 @@ function pidExists(pid) {
   }
 }
 var SHELLS = new Set(["sh", "bash", "zsh", "dash", "fish", "env"]);
+var LAUNCHERS = new Set(["timeout", "nice", "ionice", "nohup", "stdbuf", "uvx"]);
+var LAUNCHER_VERBS = { direnv: new Set(["exec"]), mise: new Set(["x", "exec"]), uv: new Set(["run"]) };
+var VALUE_OPTS = new Set(["-C", "--cd", "--directory", "--project", "-E", "--env", "-p", "--python"]);
 
 // src/shared/toolguard.ts
 import { readFileSync as readFileSync3, statSync } from "fs";
@@ -36432,8 +36438,8 @@ class HostedClient {
       return;
     }
   };
-  temporary = async (sessionID, run) => {
-    const wire = new Wire(this.wireOptions("poll"), this.auth, AbortSignal.timeout(1e4), sessionID);
+  temporary = async (sessionID, run, ending) => {
+    const wire = new Wire({ ...this.wireOptions("poll"), ...ending ? { ending: true } : {} }, this.auth, AbortSignal.timeout(1e4), sessionID);
     try {
       await wire.connect();
       return await run(wire);
@@ -36443,7 +36449,7 @@ class HostedClient {
   };
   async endSession(id) {
     try {
-      await this.temporary(id, (wire) => wire.call("session_end"));
+      await this.temporary(id, (wire) => wire.call("session_end"), true);
     } catch (error) {
       this.options.log(endFailedText(id, error), "warning");
     }
@@ -36689,7 +36695,7 @@ async function register2(temporary, path) {
   await temporary(path.root, (wire) => wire.call("session_register", { child: path.child, ...path.via.length ? { via: path.via } : {} }));
 }
 async function end(temporary, path) {
-  await temporary(path.child, (wire) => wire.call("session_end"));
+  await temporary(path.child, (wire) => wire.call("session_end"), true);
 }
 
 // adapters/hosted-core/src/controller.ts
@@ -36836,6 +36842,13 @@ class Controller {
   credentialChanged() {
     this.drift(`${DRIFTED}; ${this.hint}`);
   }
+  signInChanged(error, live) {
+    if (!live || causeOf(error, Refusal)?.code !== "binding")
+      return false;
+    if (!this.drifted)
+      this.credentialChanged();
+    return true;
+  }
   async path(sessionID) {
     return this.route(await this.port.ancestry(sessionID));
   }
@@ -36868,7 +36881,7 @@ class Controller {
   async enlist(path, fetch2 = false) {
     const r = this.roots.get(path.root), live = !!r && !r.paused, releases = r?.released ?? 0, epoch = r?.epoch;
     const e = r?.e ?? await this.port.credential.capture(path.root);
-    const call = (sessionID, c) => this.temporary(e, c, sessionID);
+    const call = (sessionID, c, ending) => this.temporary(e, c, sessionID, undefined, ending);
     const shared = () => {
       const known = r && this.registered.get(path.sessionID);
       return known && known.r === r && known.epoch === r.epoch && (!known.settled || known.ownership !== undefined && known.ownership === r.lease?.ownership) ? known.done : undefined;
@@ -36968,8 +36981,7 @@ class Controller {
     };
     check();
     await this.port.credential.check(e).catch((error) => {
-      if (error instanceof Refusal && error.code === "binding" && current())
-        this.credentialChanged();
+      this.signInChanged(error, current());
       throw error;
     });
     await this.activeRoot(e.sessionID);
@@ -36982,17 +36994,17 @@ class Controller {
   wireOptions(e) {
     return { url: e.configuration.url, sessionKey: this.port.sessionKey, client: this.port.client, ...this.port.delivery ? { delivery: this.port.delivery } : {}, ...this.port.launcher ? { launcher: true } : {}, ...this.port.facts ? { facts: (id) => this.port.facts(id) } : {}, ...this.port.suggested ? { suggested: (id) => this.port.suggested(id) } : {} };
   }
-  async wire(e, sessionID = e.sessionID, signal = AbortSignal.timeout(1e4), beforeRetry) {
+  async wire(e, sessionID = e.sessionID, signal = AbortSignal.timeout(1e4), beforeRetry, ending = false) {
     let current;
-    const wire = new this.Transport(this.wireOptions(e), {
+    const wire = new this.Transport({ ...this.wireOptions(e), ...ending ? { ending: true } : {} }, {
       token: async () => current = await this.port.credential.token(e),
       onUnauthorized: async () => this.port.credential.unauthorized(e, current ?? "")
     }, signal, sessionID, beforeRetry);
     await wire.connect();
     return wire;
   }
-  async temporary(e, call, sessionID = e.sessionID, stop) {
-    const wire = await this.wire(e, sessionID, stop && AbortSignal.any([AbortSignal.timeout(1e4), stop]));
+  async temporary(e, call, sessionID = e.sessionID, stop, ending = false) {
+    const wire = await this.wire(e, sessionID, stop && AbortSignal.any([AbortSignal.timeout(1e4), stop]), undefined, ending);
     try {
       return await call(wire);
     } finally {
@@ -37059,6 +37071,8 @@ class Controller {
       } catch (error) {
         const what = this.port.approval ? r.paused ? "Root approval unavailable" : "Root approval saved" : r.paused ? "Root paused" : "Root enrolled";
         const stopped = this.stoppedBy(sessionID, error);
+        if (!stopped)
+          this.signInChanged(error, this.roots.get(sessionID) === r);
         if (!stopped && this.signedOut(error))
           r.paused = true;
         if (!this.drifted)
@@ -37091,7 +37105,7 @@ class Controller {
         if ((error instanceof ServerUnreachable || error instanceof RefreshInProgress) && this.restorable(r, r.epoch)) {
           this.retrying(r, error);
           this.retryRestore(r);
-        } else if (!this.drifted) {
+        } else if (!this.stoppedBy(sessionID, error) && this.signInChanged(error, this.roots.get(sessionID) === r)) {} else if (!this.drifted) {
           const stopped = this.stoppedBy(sessionID, error);
           if (!stopped && this.signedOut(error))
             r.paused = true;
@@ -37209,6 +37223,8 @@ class Controller {
     r.task = this.run(r, e, epoch, abort.signal, ready).catch((caught) => {
       const error = this.expired(caught);
       if (abort.signal.aborted)
+        return;
+      if (this.signInChanged(error, this.roots.get(r.e.sessionID) === r && r.epoch === epoch))
         return;
       r.paused = true;
       if (error instanceof AccessExpired && error.reason === "expired")
@@ -37455,7 +37471,7 @@ class Controller {
         await wire.call("delivery_release").catch((error) => this.failure("delivery_release", error, r));
       }
       await wire.call("session_end");
-    });
+    }, r.e.sessionID, undefined, true);
   }
   async pause(message = `Ownership ended; ${this.hint}`) {
     return this.serial(async () => {
@@ -37499,7 +37515,7 @@ class Controller {
   async endUnowned(sessionID) {
     try {
       const e = await this.port.credential.capture(sessionID);
-      await this.temporary(e, (wire) => wire.call("session_end"));
+      await this.temporary(e, (wire) => wire.call("session_end"), e.sessionID, undefined, true);
     } catch (error) {
       this.diagnostics.record({ state: "degraded", message: `session_end failed (${failureCode(error)})`, operation: "session_end", sessionID, code: failureCode(error) });
     }
@@ -37576,6 +37592,8 @@ class Controller {
         await this.rotated(grace, () => this.prepare(r, true, true));
       } catch (caught) {
         const r = this.roots.get(id), error = this.expired(caught);
+        if (r && this.watches.has(id) && (this.drifted && r.paused || this.signInChanged(error, this.restorable(r, r.epoch))))
+          continue;
         if (r && (error instanceof ServerUnreachable || error instanceof RefreshInProgress) && this.restorable(r, r.epoch)) {
           this.retrying(r, error);
           this.retryRestore(r);
@@ -37617,7 +37635,7 @@ class Controller {
             return true;
           } catch (caught) {
             const error = this.expired(caught);
-            if (!this.restorable(r, epoch))
+            if (!this.restorable(r, epoch) || this.signInChanged(error, true))
               return true;
             if (error instanceof ServerUnreachable || error instanceof RefreshInProgress) {
               this.retrying(r, error);
@@ -37681,6 +37699,8 @@ class Controller {
               return true;
             if (error instanceof AccessExpired && error.reason === "expired" || error instanceof RefreshInProgress)
               return false;
+            if (this.signInChanged(error, true))
+              return true;
             r.awaiting = undefined;
             this.set(r, "paused", failureMessage(error, this.hint), "recover", failureCode(error));
             return true;
@@ -37696,7 +37716,7 @@ class Controller {
             await this.prepare(r, true);
           } catch (caught) {
             const error = this.expired(caught);
-            if (this.drifted || this.stopped || this.ending.has(id) || this.roots.get(id) !== r)
+            if (this.drifted || this.stopped || this.ending.has(id) || this.roots.get(id) !== r || this.signInChanged(error, true))
               return true;
             if (error instanceof AccessExpired && error.reason === "expired") {
               r.paused = true;
@@ -37828,7 +37848,7 @@ class Controller {
       });
     } else {
       const e = r?.e ?? await this.port.credential.capture(path.root);
-      await end((id, call) => this.temporary(e, call, id), { child: sessionID }).catch((error) => this.failure("child_end", error, r));
+      await end((id, call, ending) => this.temporary(e, call, id, undefined, ending), { child: sessionID }).catch((error) => this.failure("child_end", error, r));
     }
   }
   backgroundFailure(operation) {

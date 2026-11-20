@@ -169,5 +169,11 @@ testSqlite("file only", () => { console.log("RAN file only"); });
     const missing = await ServerProcess.start(main, { url: pgUrl(`${db.name}_missing`) }).then(() => "listened", (e: Error) => e.message);
     expect(missing).toContain(`grayboard server: startup failed: opening postgres ${u.host}/${db.name}_missing`);
     expect(missing).not.toContain(`${u.username}:${u.password}@`);
+    // #1418: an unreachable database is waited for, each try logged, then the deadline fails the startup.
+    const refused = await ServerProcess.start(main, { url: "postgres://gb:s3cret@127.0.0.1:1/grayboard" }, { GRAYBOARD_DATABASE_CONNECT_SECONDS: "1" })
+      .then(() => "listened", (e: Error) => e.message);
+    expect(refused).toContain("grayboard server: database not reachable (ERR_POSTGRES_CONNECTION_REFUSED");
+    expect(refused).toContain("startup failed: opening postgres 127.0.0.1:1/grayboard: Error: the database did not answer within 1 s");
+    expect(refused).not.toContain("s3cret");
   });
 });

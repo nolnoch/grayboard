@@ -169,16 +169,30 @@ const WRAPPERS = /(?:^|[\s/])(npx|bunx|pnpx|uvx|npm|pnpm|yarn)(?=\s|$)/;
 export function wrapperName(pid: number): string | null {
   const comm = commandName(pid);
   if (comm && SHELLS.has(comm)) return comm;
-  const args = process.platform === "linux"
-    ? (() => {
-        try {
-          return readFileSync(`/proc/${pid}/cmdline`, "utf8").split("\0").join(" ");
-        } catch {
-          return "";
-        }
-      })()
-    : (ps("args", [pid])?.get(pid) ?? "");
-  return WRAPPERS.exec(args)?.[1] ?? null;
+  return WRAPPERS.exec(commandLine(pid))?.[1] ?? null;
+}
+
+/** `pid`'s command line, space-joined, or "" when unreadable. */
+function commandLine(pid: number): string {
+  return argv(pid).join(" ").trim();
+}
+
+/**
+ * `pid`'s argv. Linux splits /proc/<pid>/cmdline on NUL, so an argument
+ * holding spaces stays whole. Elsewhere ps gives one space-joined line, which
+ * can't be split back: it comes back as a single element.
+ */
+function argv(pid: number): string[] {
+  if (process.platform !== "linux") {
+    const line = ps("args", [pid])?.get(pid);
+    return line ? [line] : [];
+  }
+  try {
+    const raw = readFileSync(`/proc/${pid}/cmdline`, "utf8").replace(/\0$/, "");
+    return raw ? raw.split("\0") : [];
+  } catch {
+    return [];
+  }
 }
 
 /**
@@ -188,4 +202,92 @@ export function wrapperName(pid: number): string | null {
  */
 export function harnessAncestor(pid = process.pid): number | null {
   return ancestors(pid).find((p) => wrapperName(p) === null) ?? null;
+}
+
+/**
+ * Whether this process's harness is Claude Code (claudeAmong over its
+ * ancestors, read lazily, nearest first). Null when that can't be read (no
+ * ancestors readable, as where neither /proc nor ps exists, or every
+ * ancestor a wrapper or launcher): an unknown, never evidence that it isn't.
+ * CLAUDECODE and CLAUDE_CODE_SESSION_ID are inherited by anything Claude Code
+ * launches, harnesses included (#1403), so only this tells a child of Claude
+ * Code from a grandchild.
+ */
+export function claudeIsHarness(pid = process.pid): boolean | null {
+  return claudeAmong((function* () {
+    for (const p of ancestors(pid)) {
+      // macOS: argv is ps's joined line, split on spaces, so an argv[0]
+      // holding a space (an install under "Application Support") is cut;
+      // comm there is the executable's full path, whose basename
+      // (commandName) still carries the match.
+      const raw = argv(p);
+      const words = process.platform === "linux" ? raw : (raw[0]?.split(/\s+/) ?? []);
+      yield { comm: commandName(p), argv: words, wrapper: wrapperName(p) !== null };
+    }
+  })());
+}
+
+/** One ancestor as claudeAmong reads it: its command name, argv, and whether wrapperName calls it a wrapper. */
+export type AncestorFacts = { comm: string | null; argv: string[]; wrapper: boolean };
+
+// Launchers that run a command in place and say nothing about the harness:
+// claudeAmong sees through them, so Claude Code -> timeout -> grayboard is
+// still Claude Code's child. Not in WRAPPERS, which keyedHarness and omp's
+// detection (#1140) share: there a launcher may be the harness pid to keep.
+// Skipping one only moves the walk up to the real harness, so it can't make
+// omp or pi Claude Code.
+const LAUNCHERS = new Set(["timeout", "nice", "ionice", "nohup", "stdbuf", "uvx"]);
+const LAUNCHER_VERBS: Record<string, Set<string>> = { direnv: new Set(["exec"]), mise: new Set(["x", "exec"]), uv: new Set(["run"]) };
+
+// Options before a launcher's verb that take a separate value (`mise -C dir x`,
+// `uv --directory d run`); any other leading `-…` is taken as a flag.
+const VALUE_OPTS = new Set(["-C", "--cd", "--directory", "--project", "-E", "--env", "-p", "--python"]);
+
+function isLauncher(p: AncestorFacts): boolean {
+  const name = basename(p.argv[0] ?? "") || p.comm || "";
+  if (LAUNCHERS.has(name)) return true;
+  const verbs = LAUNCHER_VERBS[name];
+  return verbs !== undefined && verbs.has(firstOperand(p.argv, VALUE_OPTS) ?? "");
+}
+
+/** The first argument after argv[0] that isn't an option (or, for one in `valueOpts`, its value). */
+function firstOperand(argv: string[], valueOpts: Set<string> = new Set()): string | undefined {
+  for (let i = 1; i < argv.length; i++) {
+    const a = argv[i]!;
+    if (!a.startsWith("-")) return a;
+    if (valueOpts.has(a)) i++;
+  }
+  return undefined;
+}
+
+const basename = (path: string): string => path.split(/[\\/]/).pop() ?? "";
+
+/**
+ * Whether the first of `chain` (ancestors, nearest first) that is neither a
+ * wrapper nor a launcher is Claude Code (isClaudeCode); null when none is, or
+ * that one's comm and argv are both unreadable.
+ */
+export function claudeAmong(chain: Iterable<AncestorFacts>): boolean | null {
+  for (const p of chain) {
+    if (p.wrapper || isLauncher(p)) continue;
+    if (p.comm === null && !p.argv.length) return null;
+    return isClaudeCode(p.comm, p.argv);
+  }
+  return null;
+}
+
+/**
+ * Whether a process with command name `comm` and argv `argv` is Claude Code:
+ * its comm is `claude` (Claude Code sets process.title, which also gives
+ * "claude daemon"), its argv[0]'s basename is `claude` or `claude.exe` (the
+ * npm package's `bin/claude.exe` native binary), or it is node or bun running
+ * an older npm install's `cli.js` as its script (current releases ship no
+ * cli.js; kept for installs that predate the native binary). Only the script
+ * argument counts: another harness given that path as an argument isn't it.
+ */
+export function isClaudeCode(comm: string | null, argv: string[]): boolean {
+  if (comm !== null && /^claude(\.exe)?( |$)/.test(comm)) return true;
+  const argv0 = basename(argv[0] ?? "");
+  if (/^claude(\.exe)?$/.test(argv0)) return true;
+  return /^(node|nodejs|bun)(\.exe)?$/.test(argv0) && /[\\/]@anthropic-ai[\\/]claude-code[\\/]cli\.js$/.test(firstOperand(argv) ?? "");
 }

@@ -13,7 +13,10 @@ export const EFFORT_META = "io.github.nolnoch.grayboard/effort";
 export const SUGGESTED_META = "io.github.nolnoch.grayboard/suggested";
 // `facts` is read per request, for the session that request names, so a change mid-session (a model switch) reaches the server on the next one.
 // `suggested` too, on every wire: whichever request reaches the server first fixes the ownership's suggestion (#522).
-export type WireOptions = { url: string; sessionKey: string; client: { name: string; version: string }; delivery?: Delivery; launcher?: true; facts?: (sessionID: string) => SessionFacts | undefined; suggested?: (sessionID: string) => string | undefined };
+export type WireOptions = { url: string; sessionKey: string; client: { name: string; version: string }; delivery?: Delivery; launcher?: true; facts?: (sessionID: string) => SessionFacts | undefined; suggested?: (sessionID: string) => string | undefined;
+  // An ending-only wire (session_end, delivery_release): it names its session only in its tool calls' own `_meta`, so its
+  // connect selects no session and the server admits none for it, an already-ended id included (#1099).
+  ending?: true };
 
 export class SubscriberError extends Error {
   constructor(readonly code: string, readonly known?: string[], readonly holder?: string) { super(`Subscriber refused (${code})${known?.length ? `; known names: ${known.join(", ")}` : ""}${holder ? `; held by ${holder}` : ""}`); }
@@ -250,9 +253,13 @@ export class Wire extends Connection {
     headers.set("X-Grayboard-Client", "subscriber");
     if (this.capability) headers.set("X-Grayboard-Lease", this.capability);
   }
-  protected meta() { return { [this.wireOptions.sessionKey]: this.sessionID, ...this.declaration(), ...this.facts(this.sessionID) }; }
+  // The `_meta` every request carries by default: none on an ending-only wire, whose connect then names no session.
+  protected meta() { return this.wireOptions.ending ? {} : this.named(); }
+  // The `_meta` that names this wire's session: its reads and tool calls carry it explicitly. An ending-only
+  // wire's carries the session key alone: no facts or declaration for a session it is ending.
+  private named() { return this.wireOptions.ending ? { [this.wireOptions.sessionKey]: this.sessionID } : { [this.wireOptions.sessionKey]: this.sessionID, ...this.declaration(), ...this.facts(this.sessionID) }; }
   async read(uri: string): Promise<unknown> {
-    const value = await this.reachable(this.client.readResource({ uri, _meta: this.meta() }, this.options())).catch(error => {
+    const value = await this.reachable(this.client.readResource({ uri, _meta: this.named() }, this.options())).catch(error => {
       // The SDK reconstructs JSON-RPC errors with numeric code and domain data.code.
       if (error?.code === -32602 || error?.code === -32603) throw subscriberError(error.data, uri === "grayboard://inbox");
       throw error;
@@ -261,7 +268,7 @@ export class Wire extends Connection {
     return JSON.parse(value.contents[0]!.text as string);
   }
   async call(name: string, args: Record<string, unknown> = {}): Promise<unknown> {
-    const value = await this.reachable(this.client.callTool({ name, arguments: args, _meta: this.meta() }, this.options()));
+    const value = await this.reachable(this.client.callTool({ name, arguments: args, _meta: this.named() }, this.options()));
     if (value.isError) {
       throw subscriberError(value.structuredContent, name.startsWith("delivery_"));
     }

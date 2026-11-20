@@ -30,15 +30,17 @@ afterEach(async () => {
   srv = fake = undefined;
 });
 
+// The generic provider as a server builds it from GRAYBOARD_OIDC_* with no secret (#1418): a public client.
+const publicOidc = (f: FakeOidc): IdentityProvider => oidcProvider({ id: "oidc", label: "Example SSO", issuer: f.issuer, clientId: CLIENT_ID, allowedDomains: ["example.com"], allowLoopbackHttp: true });
 // Okta as a server builds it (defaultProviders), but for loopback http.
 const okta = (f: FakeOidc): IdentityProvider => oidcProvider({ id: "okta", label: "Okta", issuer: f.issuer, clientId: CLIENT_ID, clientSecret: CLIENT_SECRET, allowedDomains: ["example.com"], allowLoopbackHttp: true });
 let googleExchanges = 0;
 const google = () => stubProvider(async () => { googleExchanges++; return { email: EMAIL, displayName: "You", subject: "google-you" }; });
 
 // Okta's code flow: the ID token carries no email claims; userinfo does.
-async function start(providers: (f: FakeOidc) => IdentityProvider[], admins: string[] = []): Promise<{ fake: FakeOidc; srv: HostedServer }> {
+async function start(providers: (f: FakeOidc) => IdentityProvider[], admins: string[] = [], publicClient = false): Promise<{ fake: FakeOidc; srv: HostedServer }> {
   googleExchanges = 0;
-  fake = await startFakeOidc({ clientId: CLIENT_ID, clientSecret: CLIENT_SECRET, user: { sub: "okta-you", email: EMAIL, email_verified: true, name: "You" }, claimsInUserinfoOnly: true });
+  fake = await startFakeOidc({ clientId: CLIENT_ID, ...(publicClient ? {} : { clientSecret: CLIENT_SECRET }), user: { sub: "okta-you", email: EMAIL, email_verified: true, name: "You" }, claimsInUserinfoOnly: true });
   srv = await hostedServer({ admins }, EMAIL, providers(fake));
   return { fake, srv };
 }
@@ -83,6 +85,31 @@ async function token(s: HostedServer, browser: Browser, callback: Response, a: A
 }
 
 const browsers = async (s: HostedServer) => { await drained(s); return (await row<{ n: number }>(s, "SELECT COUNT(*) AS n FROM oauth_browsers"))!.n; };
+
+test("a public oidc client alone signs in through the AS by PKCE, with no client authentication, and its token makes a hosted MCP call", async () => {
+  const { fake, srv } = await start(f => [publicOidc(f)], [], true);
+  const { result, browser, callback, a } = await signIn(srv);
+  expect(result).toBe("consent");
+  expect(fake.tokenAuthorizations).toEqual([null]);
+  expect(fake.tokenForms.map(f => [f.client_id, typeof f.code_verifier])).toEqual([[CLIENT_ID, "string"]]);
+  expect(fake.tokenRefusals).toEqual([]);
+  const access = await token(srv, browser, callback, a);
+  const session = new HostedSession(`${srv.base}/mcp`, access, null);
+  sessions.push(session);
+  expect(JSON.stringify((await session.connect()).whoami)).toContain(EMAIL);
+  expect((await srv.app.repo.users.findByEmail(srv.app.repo.read, EMAIL))).toMatchObject({ idp_issuer: fake.issuer, idp_subject: "okta-you" });
+  expect((await accessAudits(srv, "oauth.upstream_authenticated")).map(r => [r.actor, r.detail])).toEqual([[EMAIL, { client_id: CLIENT, provider: "oidc" }]]);
+});
+
+test("the chooser names the oidc provider by its configured label, and its link reaches /oauth/oidc/callback's IdP", async () => {
+  const { fake, srv } = await start(f => [google(), publicOidc(f)], [], true);
+  const browser = new Browser();
+  const page = await (await browser.request(authorization(srv.issuer).url)).text();
+  expect([...page.matchAll(/>Sign in with ([^<]+)</g)].map(m => m[1])).toEqual(["Google", "Example SSO"]);
+  const links = new Map(chooserLinks(page));
+  const atIdp = new URL((await browser.request(links.get("oidc")!)).headers.get("Location")!);
+  expect([atIdp.href.startsWith(fake.issuer + "/"), atIdp.searchParams.get("redirect_uri")]).toEqual([true, `${srv.issuer}/oauth/oidc/callback`]);
+});
 
 test("Okta alone: authorize goes straight to the IdP, the real OIDC provider signs the user in, and the token makes a hosted MCP call", async () => {
   const { fake, srv } = await start(f => [okta(f)]);

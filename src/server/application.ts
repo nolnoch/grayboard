@@ -13,7 +13,7 @@ import { ALIAS_SCOPE_CAP, aliasCapRefusal } from "./alias_cap.ts";
 import { lockedUserOf } from "./alias_use.ts";
 import { DELEGATE_LIMIT, DELEGATE_OPEN_CAP, crossUserRefusal, delegateOkFields, delegateThrottled, neverConnected, resolveDelegationWith, type DelegateReach } from "../core/delegation.ts";
 import {
-  MAX_CANDIDATES, MAX_HOLDS, actingAs, aliasHeldText, childStateRefusal, closestNames,
+  MAX_CANDIDATES, MAX_HOLDS, TOUCH_EVERY_MS, actingAs, aliasHeldText, childStateRefusal, closestNames,
   orderCandidates, primaryOf, replyPeer, replyPeerError, replySender, replySenderError, tooManyHolds, unboundPeer, unknownNameError,
   type AliasUse, type Candidate,
 } from "../core/bindings.ts";
@@ -704,6 +704,17 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
   // back with it, as they did written inline); else each is its own queued write. Close stays synchronous, and its
   // callers include the write queue's holder (a reconcile apply, a commit callback), where an async post throws, so
   // the outside-a-body write is a `repo.write` not awaited, its failure logged (#807 P3 B1c).
+  // The close's last-seen touch, at most one per writer ID per TOUCH_EVERY_MS, as local mode's (#894): every hosted
+  // request closes a session, and on Postgres an unthrottled touch was ~13% of the write queue at 300 sessions (#807).
+  // ids.last_seen is shown, never judged, on a server; a touch rolled back with its body leaves it up to a window behind.
+  const touchedIds = new Map<string, number>();
+  function touchDue(id: string): boolean {
+    const t = now(), at = touchedIds.get(id);
+    if (at !== undefined && t - at < TOUCH_EVERY_MS) return false;
+    if (touchedIds.size >= 4096) for (const [k, v] of touchedIds) if (t - v >= TOUCH_EVERY_MS) touchedIds.delete(k);
+    touchedIds.set(id, t);
+    return true;
+  }
   function close(session: ApplicationSession, h: Read = repo.read) {
     const write = (row: (tx: Tx) => Promise<void>, what: string) => {
       if (isTx(h)) h.beforeCommit({}, row);
@@ -728,7 +739,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     // Close runs from sync finally blocks and commit callbacks: the touch is written at `h`'s commit or queued, not
     // awaited (#807 P1b-4b, P3 B1c).
     const writer = session.writerId;
-    if (writer) write(tx => repo.bindings.touchId(tx, writer), "last-seen touch");
+    if (writer && touchDue(writer)) write(tx => repo.bindings.touchId(tx, writer), "last-seen touch");
   }
   // The server closes the session: it leaves the hub, and its transport is
   // told why and closes. `h`: the body it runs in, whose `Tx` takes close's rows (#807 P3 A3).
@@ -1192,13 +1203,13 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     // being refused child_session; null when the ID starts as a root, which makes it an address again.
     async hostedRoot(tx: Tx, id: string, root: string | null) { await repo.hosted.setRoot(tx, id, root); },
     // `harness` comes from the principal's source mapping (#414): peer_list shows it and match:{harness} filters on it.
-    // `collided`: where a caller inside a transaction that the refusal rolls back takes the audit row
-    // (`hostedCollided`, written after the rollback); without it the row is written here.
-    async hostedRegister(tx: Tx, authed: AuthedUser, id: string, harness: string, writesAs: string | null = null, collided?: (why: string) => void, facts?: { model?: string; effort?: string }) {
+    // `collided` takes the id.collision audit row: the refusal rolls back `tx`, so a row written on it would be lost
+    // (#1077). Production callers defer it (`hostedCollided`, written after the rollback).
+    async hostedRegister(tx: Tx, authed: AuthedUser, id: string, harness: string, writesAs: string | null, collided: (why: string) => void, facts?: { model?: string; effort?: string }) {
       const prior = await repo.bindings.idRow(tx, id);
       if (prior && prior.principal !== authed.user_email) {
         const why = "is another principal's session";
-        if (collided) collided(why); else writeAudit(repo, tx, "id.collision", authed.user_email, id, { why });
+        collided(why);
         fail("id_collision", idCollisionText(id, why));
       }
       // A tools-only root's writes_as is registered here (A4): aliasUser, aliasUses and

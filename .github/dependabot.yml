@@ -44,3 +44,8 @@ updates:
       - /.github/actions/setup
     schedule:
       interval: weekly
+  # The server image's base (deploy/Dockerfile, #1418), pinned by digest.
+  - package-ecosystem: docker
+    directory: /deploy
+    schedule:
+      interval: weekly

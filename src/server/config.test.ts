@@ -1,11 +1,15 @@
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
-import { checkIdpConfig, describeStore, loadConfig } from "./config.ts";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { checkIdpConfig, describeStore, FILE_SECRETS, loadConfig } from "./config.ts";
 
 const KEYS = [
   "GRAYBOARD_DEV_AUTH", "GRAYBOARD_DB_PATH", "GRAYBOARD_DATABASE_URL", "GRAYBOARD_PUBLIC_URL", "GRAYBOARD_ORG_DOMAIN",
   "GOOGLE_OAUTH_CLIENT_ID", "GOOGLE_OAUTH_CLIENT_SECRET", "GRAYBOARD_ADMINS",
   "GRAYBOARD_MCP_GOOGLE_CLIENT_ID", "GRAYBOARD_MCP_GOOGLE_CLIENT_SECRET",
   "GRAYBOARD_IDPS", "GRAYBOARD_OKTA_ISSUER", "GRAYBOARD_OKTA_CLIENT_ID", "GRAYBOARD_OKTA_CLIENT_SECRET", "GRAYBOARD_OKTA_ALLOWED_DOMAINS",
+  "GRAYBOARD_OIDC_ISSUER", "GRAYBOARD_OIDC_CLIENT_ID", "GRAYBOARD_OIDC_CLIENT_SECRET", "GRAYBOARD_OIDC_ALLOWED_DOMAINS", "GRAYBOARD_OIDC_LABEL",
   "GRAYBOARD_ATTACHMENT_MAX_BYTES", "GRAYBOARD_ATTACHMENT_MAX_TOTAL_BYTES", "GRAYBOARD_ATTACHMENT_USER_QUOTA_BYTES", "GRAYBOARD_BLOB_DIR",
   "GRAYBOARD_MESSAGE_RETENTION_DAYS", "GRAYBOARD_AUDIT_RETENTION_DAYS", "GRAYBOARD_HTTP_PORT",
   "GRAYBOARD_HELLO_BURST", "GRAYBOARD_HELLO_PER_SEC",
@@ -20,6 +24,7 @@ const KEYS = [
   "GRAYBOARD_HOSTED_SESSIONS_PER_SERVICE", "GRAYBOARD_DELIVERY_LEASES_PER_SERVICE",
   ...["HOSTED_REQUEST_SERVICE", "HOSTED_SUBSCRIBER_SERVICE", "HELLO_SERVICE"].flatMap(p => [`GRAYBOARD_${p}_BURST`, `GRAYBOARD_${p}_PER_SEC`]),
   "GRAYBOARD_SERVICE_TOKEN_MAX_SECONDS", "GRAYBOARD_SERVICE_TOKEN_MINTS_PER_MINUTE", "GRAYBOARD_SERVICE_TOKENS_UNEXPIRED",
+  "GRAYBOARD_DATABASE_CONNECT_SECONDS", "SLACK_APP_TOKEN", "SLACK_BOT_TOKEN", ...FILE_SECRETS.map(name => `${name}_FILE`),
 ];
 
 describe("loadConfig", () => {
@@ -139,6 +144,62 @@ describe("loadConfig", () => {
     expect(describeStore({ kind: "postgres", url: "not a url s3cret" })).not.toContain("s3cret");
     delete process.env.GRAYBOARD_DATABASE_URL;
     expect(() => loadConfig()).toThrow("Required env var GRAYBOARD_DB_PATH (or GRAYBOARD_DATABASE_URL) is not set");
+  });
+
+  // #1418: the Postgres first-connection wait; unset leaves the store's default.
+  test("GRAYBOARD_DATABASE_CONNECT_SECONDS is 0 to 3600 whole seconds", () => {
+    process.env.GRAYBOARD_DEV_AUTH = "1";
+    expect(loadConfig().databaseConnectSeconds).toBeUndefined();
+    for (const ok of ["0", "15", "3600"]) {
+      process.env.GRAYBOARD_DATABASE_CONNECT_SECONDS = ok;
+      expect(loadConfig().databaseConnectSeconds).toBe(Number(ok));
+    }
+    for (const bad of ["3601", "-1", "1.5", "015", " 5", "5s"]) {
+      process.env.GRAYBOARD_DATABASE_CONNECT_SECONDS = bad;
+      expect(() => loadConfig()).toThrow(`GRAYBOARD_DATABASE_CONNECT_SECONDS must be a whole number of seconds from 0 (one try) to 3600, not "${bad}"`);
+    }
+  });
+
+  // #1418: a secret mounted as a file (Docker, Kubernetes) reads as its variable, before any check sees it.
+  test("NAME_FILE supplies a secret from a file", () => {
+    const dir = mkdtempSync(join(tmpdir(), "gb-secrets-"));
+    try {
+      const file = (name: string, body: string) => { const path = join(dir, name); writeFileSync(path, body); return path; };
+      process.env.GRAYBOARD_DEV_AUTH = "1";
+      delete process.env.GRAYBOARD_DB_PATH;
+      process.env.GRAYBOARD_BLOB_DIR = "/var/lib/grayboard/blobs";
+      const url = "postgres://gb:s3cret@db.example.com:5432/grayboard";
+      // The trailing line break an editor or `echo` leaves is not part of the secret.
+      process.env.GRAYBOARD_DATABASE_URL_FILE = file("db-url", `${url}\r\n`);
+      expect(loadConfig().store).toEqual({ kind: "postgres", url });
+      // Resolution leaves NAME set; loading again reads the same value rather than seeing two sources.
+      expect(loadConfig().store).toEqual({ kind: "postgres", url });
+      // Both forms is a refusal, not a precedence rule.
+      process.env.GRAYBOARD_DATABASE_URL = "postgres://gb:other@db.example.com:5432/grayboard";
+      expect(() => loadConfig()).toThrow("Set one of GRAYBOARD_DATABASE_URL, GRAYBOARD_DATABASE_URL_FILE, not both");
+      delete process.env.GRAYBOARD_DATABASE_URL;
+      process.env.GRAYBOARD_DATABASE_URL_FILE = file("empty", "\n");
+      expect(() => loadConfig()).toThrow(`GRAYBOARD_DATABASE_URL_FILE: ${join(dir, "empty")} is empty`);
+      process.env.GRAYBOARD_DATABASE_URL_FILE = join(dir, "missing");
+      expect(() => loadConfig()).toThrow(`GRAYBOARD_DATABASE_URL_FILE: cannot read ${join(dir, "missing")}: ENOENT`);
+      process.env.GRAYBOARD_DATABASE_URL_FILE = file("db-url", url);
+      expect(loadConfig().store).toEqual({ kind: "postgres", url });
+      delete process.env.GRAYBOARD_DATABASE_URL;
+
+      // A file-borne client secret still trips the dev-auth guard: resolution runs before every check.
+      process.env.GRAYBOARD_DATABASE_URL_FILE = file("db-url", url);
+      process.env.GRAYBOARD_OKTA_CLIENT_SECRET_FILE = file("okta", "okta-secret\n");
+      expect(() => loadConfig()).toThrow("GRAYBOARD_DEV_AUTH=1 must not be set alongside");
+      delete process.env.GRAYBOARD_OKTA_CLIENT_SECRET_FILE;
+      delete process.env.GRAYBOARD_OKTA_CLIENT_SECRET;
+      delete process.env.GRAYBOARD_DATABASE_URL;
+
+      process.env.SLACK_APP_TOKEN_FILE = file("app", "xapp-1\n");
+      process.env.SLACK_BOT_TOKEN_FILE = file("bot", "xoxb-1\n");
+      expect(loadConfig().slack).toEqual({ appToken: "xapp-1", botToken: "xoxb-1" });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   // #928 D6/D8: one pair. The primary is required only when the MCP pair is absent; with both set (a Desktop
@@ -275,6 +336,105 @@ describe("loadConfig", () => {
       expect(text).toContain("must be nonempty credentials without whitespace");
       expect(text).not.toContain("private");
     }
+  });
+
+  // #1418: the generic provider, confidential or public.
+  function oidc() {
+    process.env.GRAYBOARD_OIDC_ISSUER = "https://sso.example.com/realms/eng";
+    process.env.GRAYBOARD_OIDC_CLIENT_ID = "grayboard";
+    process.env.GRAYBOARD_OIDC_ALLOWED_DOMAINS = "Example.com";
+  }
+
+  test("oidc without a secret is a public client, under the default label", () => {
+    process.env.GRAYBOARD_IDPS = "oidc";
+    oidc();
+    const c = loadConfig();
+    expect(c).toMatchObject({ idps: ["oidc"], googleClientId: "", orgDomain: "" });
+    expect(c.oidc).toEqual({ issuer: "https://sso.example.com/realms/eng", clientId: "grayboard", allowedDomains: ["example.com"], label: "Single sign-on" });
+  });
+
+  test("oidc with a secret and a label is a confidential client, beside Okta and Google in the listed order", () => {
+    process.env.GRAYBOARD_IDPS = "oidc, okta, google";
+    oidc();
+    okta();
+    primary();
+    process.env.GRAYBOARD_OIDC_CLIENT_SECRET = "oidc-private";
+    process.env.GRAYBOARD_OIDC_LABEL = "Example SSO";
+    expect(loadConfig()).toMatchObject({ idps: ["oidc", "okta", "google"], oidc: { clientSecret: "oidc-private", label: "Example SSO" }, okta: { clientId: "okta-client" } });
+  });
+
+  test("the oidc secret can come from a file, making a confidential client", () => {
+    const dir = mkdtempSync(join(tmpdir(), "gb-oidc-"));
+    try {
+      const path = join(dir, "oidc");
+      writeFileSync(path, "oidc-private\n");
+      process.env.GRAYBOARD_IDPS = "oidc";
+      oidc();
+      process.env.GRAYBOARD_OIDC_CLIENT_SECRET_FILE = path;
+      expect(loadConfig().oidc).toMatchObject({ clientSecret: "oidc-private" });
+      // An empty path is refused, never read as "no secret" (a public client).
+      delete process.env.GRAYBOARD_OIDC_CLIENT_SECRET;
+      process.env.GRAYBOARD_OIDC_CLIENT_SECRET_FILE = "";
+      expect(() => loadConfig()).toThrow("GRAYBOARD_OIDC_CLIENT_SECRET_FILE is set but empty");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("an empty oidc secret refuses to start rather than become a public client", () => {
+    process.env.GRAYBOARD_IDPS = "oidc";
+    oidc();
+    process.env.GRAYBOARD_OIDC_CLIENT_SECRET = "";
+    expect(message()).toBe("GRAYBOARD_OIDC_CLIENT_ID and GRAYBOARD_OIDC_CLIENT_SECRET must be nonempty credentials without whitespace");
+  });
+
+  test("oidc listed needs its three variables, and any of its five set while it isn't refuses to start", () => {
+    process.env.GRAYBOARD_IDPS = "oidc";
+    for (const name of ["GRAYBOARD_OIDC_ISSUER", "GRAYBOARD_OIDC_CLIENT_ID", "GRAYBOARD_OIDC_ALLOWED_DOMAINS"]) {
+      oidc();
+      delete process.env[name];
+      expect(message()).toBe(`GRAYBOARD_IDPS lists oidc, so ${name} is required`);
+    }
+    delete process.env.GRAYBOARD_IDPS;
+    primary();
+    for (const name of ["GRAYBOARD_OIDC_ISSUER", "GRAYBOARD_OIDC_CLIENT_ID", "GRAYBOARD_OIDC_CLIENT_SECRET", "GRAYBOARD_OIDC_ALLOWED_DOMAINS", "GRAYBOARD_OIDC_LABEL"]) {
+      for (const k of ["GRAYBOARD_OIDC_ISSUER", "GRAYBOARD_OIDC_CLIENT_ID", "GRAYBOARD_OIDC_CLIENT_SECRET", "GRAYBOARD_OIDC_ALLOWED_DOMAINS", "GRAYBOARD_OIDC_LABEL"]) delete process.env[k];
+      process.env[name] = "x";
+      expect(message()).toBe(`${name} set but GRAYBOARD_IDPS doesn't list oidc: list it, or unset them`);
+    }
+  });
+
+  test("the oidc issuer, domains and label are checked as Okta's are, and its issuer can't be Okta's", () => {
+    process.env.GRAYBOARD_IDPS = "oidc";
+    for (const issuer of ["http://sso.example.com", "https://sso.example.com/", "https://sso.example.com?x=1", "https://accounts.google.com"]) {
+      oidc();
+      process.env.GRAYBOARD_OIDC_ISSUER = issuer;
+      expect(message()).toMatch(/^GRAYBOARD_OIDC_ISSUER (must be an https URL|can't be Google's issuer)/);
+    }
+    oidc();
+    process.env.GRAYBOARD_OIDC_ALLOWED_DOMAINS = "example";
+    expect(message()).toContain("GRAYBOARD_OIDC_ALLOWED_DOMAINS must be email domains");
+    for (const label of ["", " ", "x".repeat(65), "a\nb"]) {
+      oidc();
+      process.env.GRAYBOARD_OIDC_LABEL = label;
+      expect(message()).toBe("GRAYBOARD_OIDC_LABEL must be 1 to 64 characters on one line");
+    }
+    delete process.env.GRAYBOARD_OIDC_LABEL;
+    oidc();
+    okta();
+    process.env.GRAYBOARD_IDPS = "oidc,okta";
+    process.env.GRAYBOARD_OIDC_ISSUER = process.env.GRAYBOARD_OKTA_ISSUER;
+    expect(message()).toBe("GRAYBOARD_OIDC_ISSUER can't be GRAYBOARD_OKTA_ISSUER");
+  });
+
+  test("dev auth refuses to start alongside an oidc issuer, though a public client has no secret", () => {
+    process.env.GRAYBOARD_DEV_AUTH = "1";
+    process.env.GRAYBOARD_IDPS = "oidc";
+    oidc();
+    expect(message()).toBe("GRAYBOARD_DEV_AUTH=1 must not be set alongside GRAYBOARD_OIDC_ISSUER (prevents prod misconfig)");
+    const config = { idps: ["oidc" as const], devAuth: true, googleClientSecret: "", oidc: { issuer: "https://sso.example.com", clientId: "grayboard", allowedDomains: ["example.com"], label: "SSO" } };
+    expect(() => checkIdpConfig(config)).toThrow("dev auth must not coexist");
+    expect(() => checkIdpConfig({ ...config, devAuth: false })).not.toThrow();
   });
 
   test("dev auth refuses to start alongside the Okta client secret", () => {

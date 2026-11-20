@@ -1854,3 +1854,55 @@ async fn a_reopen_refused_with_another_capacity_is_an_ordinary_round_failure() {
     );
     assert_eq!(w.count("sub:delivery_open"), 2);
 }
+
+// Decision (#1394, #1397): the listen-cap retry's backoff waits under `watch`, so a Stop (here `Session::end`) during it ends the stream at once: no further listen, the lease released, then session_end. A bare sleep there would hold the end for the whole backoff, 30 s here.
+#[tokio::test]
+async fn a_stop_during_the_listen_cap_backoff_ends_the_stream_at_once() {
+    let credential = Renewing::new();
+    let mut w = World::with_credential(Bus::new(&["a"]), slow_backoff, credential.clone()).await;
+    let mut stream = w.s().deliveries();
+    w.until("the lease listens", |b| ops_count(b, "listen") == 1)
+        .await;
+    // A port an earlier swap-backoff test in this binary used may have left its endpoint recorded: drop it, or the wait below ends at once.
+    let endpoint = reqwest::Url::parse(&w.url).unwrap().to_string();
+    crate::delivery::SWAP_BACKOFFS
+        .lock()
+        .unwrap()
+        .retain(|e| e != &endpoint);
+    refuse_listens(&w, 1, "MCP listen capacity reached");
+    credential.rotate("tok-2");
+    w.until("the reopen is refused", |b| ops_count(b, "listen") == 2)
+        .await;
+    // The Stop goes out once the backoff has begun: one sent while the refused listen is in flight ends the stream through that listen's `watch` instead.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !crate::delivery::SWAP_BACKOFFS
+        .lock()
+        .unwrap()
+        .contains(&endpoint)
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the swap retry never began its backoff; ops: {:?}",
+            w.ops()
+        );
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    let session = w.session.take().unwrap();
+    tokio::time::timeout(Duration::from_secs(2), session.end())
+        .await
+        .expect("the stop ends the backoff within 2 s")
+        .unwrap();
+    assert_eq!(w.count("listen"), 2, "{:?}", w.ops());
+    let tail = after(&w.ops(), "listen", 2);
+    assert_eq!(
+        tail,
+        ["sub:delivery_release", "sub:session_end"],
+        "{:?}",
+        w.ops()
+    );
+    assert_eq!(
+        w.calls("sub:delivery_release")[0].lease.as_deref(),
+        Some(format!("c{:042}", 1).as_str())
+    );
+    ended(&mut stream).await;
+}
