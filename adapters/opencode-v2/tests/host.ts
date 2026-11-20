@@ -15,7 +15,7 @@ import { DEFAULT_TRUSTED_PROXIES } from "../../../src/server/client_addr.ts";
 import { OPENCODE_CLIENT } from "../../../src/server/oauth-config.ts";
 import { sessionContext } from "../../../src/server/hosted.ts";
 import { SESSION_ID } from "../../../src/core/session_id.ts";
-import { createBoard, post, subscribe } from "../../../src/core/boards.ts";
+import { createBoard, openAccess, post, setAccess, subscribe } from "../../../src/core/boards.ts";
 import { channelInstructions, DEFAULT_CHANNEL_SOURCE } from "../../../src/core/tools.ts";
 import { launcherInstruction } from "../../../src/core/delegation.ts";
 import { realRace, type AdmissionGate } from "./real-races.ts";
@@ -43,7 +43,9 @@ const config = { dbPath: join(root, "grayboard.sqlite"), blobDir: join(root, "bl
 const admissionCase = process.env.GRAYBOARD_TEST_REAL_RACE?.startsWith("admission");
 let admissionNow: number | undefined;
 let admissionGate: SubscriberAdmission | undefined;
-const start = () => startServer(config, { hostname: "127.0.0.1", background: false, ...(admissionCase ? { now: () => admissionNow ?? Date.now() } : {}), oauth: { providers: [stubProvider(async () => { google++; return { email, displayName: "Fixture", subject: "google-" + email }; })], ...(process.env.GRAYBOARD_TEST_CIMD_LIVE === "1" ? {} : { cimd: { resolve: async host => { assert.equal(host, "opencode.ai"); return [{ address: "93.184.216.34", family: 4 }]; }, read: async url => { assert.equal(url.href, OPENCODE_CLIENT); cimd++; return savedClientMetadata(url); } } }) } });
+const startRaw = () => startServer(config, { hostname: "127.0.0.1", background: false, ...(admissionCase ? { now: () => admissionNow ?? Date.now() } : {}), oauth: { providers: [stubProvider(async () => { google++; return { email, displayName: "Fixture", subject: "google-" + email }; })], ...(process.env.GRAYBOARD_TEST_CIMD_LIVE === "1" ? {} : { cimd: { resolve: async host => { assert.equal(host, "opencode.ai"); return [{ address: "93.184.216.34", family: 4 }]; }, read: async url => { assert.equal(url.href, OPENCODE_CLIENT); cimd++; return savedClientMetadata(url); } } }) } });
+// core seeds on a server database opt in to local mode's open Access
+const start = () => { const a = startRaw(); setAccess(a.db, openAccess(a.db)); return a; };
 let app = start();
 // The transaction races run the server as its own process (#383), so a pause inside one of its
 // transactions holds the server alone; this process's in-process server stops before anything uses it.
