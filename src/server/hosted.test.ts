@@ -476,6 +476,15 @@ test("#807 P1c-15b-2: refusal rows, place, unbind, facts and board checks run on
     logs.push({ inTxn: database.db.inTransaction, handle: h === database.repo.read ? "pool" : "tx" });
     return (log as (...a: unknown[]) => Promise<void>)(h, ...rest);
   }) as never);
+  // Place, unbind and facts went to `repo.bindings` with B1c (#1205): the coreOn spy no longer sees them, so these do.
+  const binds: { method: string; inTxn: boolean; handle: "pool" | "tx" }[] = [];
+  const bindSpies = (["setPlace", "release", "setIdFacts"] as const).map(method => {
+    const fn = (database.repo.bindings[method] as (...a: unknown[]) => unknown).bind(database.repo.bindings);
+    return spyOn(database.repo.bindings, method).mockImplementation(((h: unknown, ...rest: unknown[]) => {
+      binds.push({ method, inTxn: database.db.inTransaction, handle: h === database.repo.read ? "pool" : "tx" });
+      return fn(h, ...rest);
+    }) as never);
+  });
   const holder = ctx("p15b2-holder"), other = ctx("p15b2-other");
   const refused = () => database.db.prepare("SELECT name FROM binding_events WHERE session_id = ? AND event = 'refused'").all((other as { id: string }).id);
   try {
@@ -499,7 +508,9 @@ test("#807 P1c-15b-2: refusal rows, place, unbind, facts and board checks run on
     await delivery.receipt(generic, holder, lease.capability, items.map(i => i.id));
     expect(await hosted.unbind(generic, other, { name: "p15b2-other" })).toMatchObject({ structuredContent: { name: null } });
     expect(checks.filter(c => c.inTxn !== (c.handle === "tx"))).toEqual([]);
-  } finally { spy.mockRestore(); logSpy.mockRestore(); }
+    expect([...new Set(binds.map(b => b.method))].sort()).toEqual(["release", "setIdFacts", "setPlace"]);
+    expect(binds.filter(b => !b.inTxn || b.handle !== "tx")).toEqual([]);
+  } finally { spy.mockRestore(); logSpy.mockRestore(); for (const s of bindSpies) s.mockRestore(); }
 });
 
 // #807 P3 A2: an audit row written inside a hosted body goes on that body's Tx, never through `repo.post` (which ran it
