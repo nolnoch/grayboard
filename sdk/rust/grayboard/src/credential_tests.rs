@@ -1159,3 +1159,29 @@ async fn a_transient_mint_failure_keeps_the_rejection_mark() {
     );
     assert_eq!(auth.seen("/oauth/token").len(), 3);
 }
+
+// #1375 F4 (audit F1): a rejection's answering mint cut off mid-request keeps the mark, so the next token installed answers the rejection and its own rejection mints no further token.
+#[tokio::test]
+async fn a_cancelled_answering_mint_keeps_the_rejection_mark() {
+    let auth = Auth::start(standard, |n| issued(&format!("tok-{n}"), 3600)).await;
+    let c = auth
+        .credential()
+        .with_backoff_unit(Duration::from_millis(50));
+    assert_eq!(c.token().await.unwrap(), "tok-0");
+    auth.hold();
+    let answering = tokio::spawn({
+        let c = c.clone();
+        async move { c.unauthorized("tok-0").await }
+    });
+    auth.mints_reach(2).await;
+    answering.abort();
+    assert!(answering.await.unwrap_err().is_cancelled());
+    auth.open();
+    assert_eq!(prompt("the next mint", c.token()).await.unwrap(), "tok-2");
+    assert!(
+        c.unauthorized("tok-2").await.is_err(),
+        "{} mints",
+        auth.seen("/oauth/token").len()
+    );
+    assert_eq!(auth.seen("/oauth/token").len(), 3);
+}
