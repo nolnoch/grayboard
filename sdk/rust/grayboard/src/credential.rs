@@ -303,23 +303,38 @@ impl ClientCredentials {
         self
     }
 
-    /// Revokes the current token (RFC 7009, at the server's revocation endpoint with the same Basic auth), so a run's token ends when the run does: its sessions are refused on their next call. Call it after `Session::end`. The token is out of service from the start, so a later `token` mints a new one; if the revocation fails (`Unreachable`, or `Auth` for a refusal), calling `revoke` again retries the same token. Each pending token is sent on its own, so one that keeps failing doesn't hold back the rest. With no token to revoke nothing is sent; when the server advertises no revocation endpoint nothing is kept to retry.
+    /// Revokes the current token (RFC 7009, at the server's revocation endpoint with the same Basic auth), so a run's token ends when the run does: its sessions are refused on their next call. Call it after `Session::end`. The token is out of service from the start, so a later `token` mints a new one; if the revocation fails (`Unreachable`, or `Auth` for a refusal), calling `revoke` again retries the same token. Each pending token is sent on its own, so one that keeps failing doesn't hold back the rest. A mint in flight is waited for, so its token is revoked too. With no token to revoke nothing is sent; when the server advertises no revocation endpoint nothing is kept to retry.
     pub async fn revoke(&self) -> Result<(), Error> {
-        let pending = {
-            let mut s = self.inner.state();
-            if let Some(current) = s.current.take() {
-                // Known to be unrevocable: nothing to keep (#1271 R3).
-                let unrevocable = self
-                    .inner
-                    .endpoints
-                    .get()
-                    .is_some_and(|e| e.revocation.is_none());
-                if !unrevocable {
-                    s.revoking.push(current.token);
+        // The current token goes out of service at once; a mint in flight finishes first, so the token it installs is revoked too rather than left live. Each take shares a critical section with the check of `minting`.
+        let mut had_current = false;
+        let pending = loop {
+            let notified = self.inner.minted.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let mut s = self.inner.state();
+                if let Some(current) = s.current.take() {
+                    had_current = true;
+                    // Known to be unrevocable: nothing to keep (#1271 R3).
+                    let unrevocable = self
+                        .inner
+                        .endpoints
+                        .get()
+                        .is_some_and(|e| e.revocation.is_none());
+                    if !unrevocable {
+                        s.revoking.push(current.token);
+                    }
+                }
+                if !s.minting {
+                    break s.revoking.clone();
                 }
             }
-            s.revoking.clone()
+            notified.await;
         };
+        // Nothing to revoke: nothing sent, not even the metadata read.
+        if pending.is_empty() && !had_current {
+            return Ok(());
+        }
         let endpoints = self
             .inner
             .endpoints()
@@ -350,6 +365,12 @@ impl ClientCredentials {
     #[cfg(test)]
     pub(crate) fn pending_revocations(&self) -> usize {
         self.inner.state().revoking.len()
+    }
+
+    /// Lifts a backoff in force, so a test reaches the next mint without waiting it out.
+    #[cfg(test)]
+    pub(crate) fn skip_backoff(&self) {
+        self.inner.state().retry_at = None;
     }
 
     /// Ages the current token: into its renewal window, or past its expiry too.

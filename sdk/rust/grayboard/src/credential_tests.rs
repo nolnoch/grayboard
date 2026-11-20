@@ -761,9 +761,7 @@ async fn a_cancelled_mint_backs_off_the_next() {
     let auth = Auth::start(standard, |n| issued(&format!("tok-{n}"), 3600)).await;
     let c = auth.credential().with_backoff_unit(Duration::from_secs(5));
     auth.hold();
-    let cut = tokio::time::timeout(Duration::from_millis(100), c.token());
-    let (_, cut) = tokio::join!(auth.mints_reach(1), cut);
-    assert!(cut.is_err(), "the mint was held, so the call timed out");
+    cut_mid_mint(&auth, &c).await;
     auth.open();
     let e = prompt("the call after a cancelled mint", c.token())
         .await
@@ -785,9 +783,7 @@ async fn a_cancelled_mint_leaves_no_mint_in_flight() {
         .credential()
         .with_backoff_unit(Duration::from_millis(50));
     auth.hold();
-    let cut = tokio::time::timeout(Duration::from_millis(100), c.token());
-    let (_, cut) = tokio::join!(auth.mints_reach(1), cut);
-    assert!(cut.is_err());
+    cut_mid_mint(&auth, &c).await;
     auth.open();
     let started = tokio::time::Instant::now();
     assert_eq!(prompt("the next mint", c.token()).await.unwrap(), "tok-1");
@@ -869,4 +865,152 @@ async fn with_no_revocation_endpoint_nothing_is_queued() {
         assert_eq!(c.pending_revocations(), 0);
     }
     assert!(auth.seen("/oauth/revoke").is_empty());
+}
+
+/// Starts a `token` call, lets its mint reach the held token endpoint, then cancels the call mid-mint.
+async fn cut_mid_mint(auth: &Auth, c: &ClientCredentials) {
+    let minter = tokio::spawn({
+        let c = c.clone();
+        async move { c.token().await }
+    });
+    // Read apart from the await: a `borrow` held across it would block the server's count.
+    let next = *auth.mints.borrow() + 1;
+    auth.mints_reach(next).await;
+    minter.abort();
+    assert!(minter.await.unwrap_err().is_cancelled());
+}
+
+// #1271 F8: a cancelled minter wakes the callers waiting on its mint, which then go on by the backoff rather than hang.
+#[tokio::test]
+async fn a_cancelled_mint_wakes_its_waiters() {
+    let auth = Auth::start(standard, |n| issued(&format!("tok-{n}"), 3600)).await;
+    let c = auth
+        .credential()
+        .with_backoff_unit(Duration::from_millis(50));
+    auth.hold();
+    let minter = tokio::spawn({
+        let c = c.clone();
+        async move { c.token().await }
+    });
+    auth.mints_reach(1).await;
+    let waiter = c.token();
+    tokio::pin!(waiter);
+    assert!(
+        futures_util::poll!(&mut waiter).is_pending(),
+        "no token to serve: it waits on the mint in flight"
+    );
+    minter.abort();
+    assert!(minter.await.unwrap_err().is_cancelled());
+    auth.open();
+    assert_eq!(prompt("the waiter", waiter).await.unwrap(), "tok-1");
+}
+
+// #1263: a renewal that fails doesn't serve the token `unauthorized` took out of service while it was in flight.
+#[tokio::test]
+async fn a_failed_renewal_doesnt_serve_a_token_taken_out_of_service() {
+    let auth = Auth::start(standard, |n| match n {
+        0 => issued("tok-0", 3600),
+        _ => refused(503, "temporarily_unavailable"),
+    })
+    .await;
+    let c = auth.credential().with_backoff_unit(Duration::from_secs(5));
+    assert_eq!(c.token().await.unwrap(), "tok-0");
+    c.age_token(false);
+    auth.hold();
+    let renewing = tokio::spawn({
+        let c = c.clone();
+        async move { c.token().await }
+    });
+    auth.mints_reach(2).await;
+    let rejected = c.unauthorized("tok-0");
+    tokio::pin!(rejected);
+    assert!(futures_util::poll!(&mut rejected).is_pending());
+    auth.open();
+    let e = renewing.await.unwrap().unwrap_err();
+    assert!(e.retryable, "{e}");
+}
+
+// #1264: the rejection backoff restarts from one unit once a token lives to its renewal unrejected.
+#[tokio::test]
+async fn the_rejection_backoff_resets_once_a_token_lives_to_its_renewal() {
+    let auth = Auth::start(standard, |n| issued(&format!("tok-{n}"), 3600)).await;
+    let c = auth.credential().with_backoff_unit(Duration::from_secs(5));
+    let backoff = |e: crate::error::AuthError| {
+        e.message
+            .split_once("backing off for ")
+            .and_then(|(_, rest)| rest.split_once("s after"))
+            .map(|(secs, _)| secs.parse::<f64>().unwrap())
+            .unwrap_or_else(|| panic!("no wait in {e}"))
+    };
+    let reject_twice = async |first: &str, second: &str| {
+        c.unauthorized(first).await.unwrap();
+        assert!(c.unauthorized(second).await.is_err());
+        backoff(c.token().await.unwrap_err())
+    };
+    assert_eq!(c.token().await.unwrap(), "tok-0");
+    assert!(reject_twice("tok-0", "tok-1").await <= 5.0);
+    c.skip_backoff();
+    assert_eq!(c.token().await.unwrap(), "tok-2");
+    c.age_token(false);
+    assert_eq!(
+        c.token().await.unwrap(),
+        "tok-3",
+        "renewed: it lived unrejected"
+    );
+    assert!(
+        reject_twice("tok-3", "tok-4").await <= 5.0,
+        "one unit again, not two"
+    );
+}
+
+// #1271: `revoke` waits for a mint in flight and revokes its token too, so no fresh token outlives the run.
+#[tokio::test]
+async fn revoke_waits_for_a_mint_in_flight_and_revokes_its_token() {
+    let auth = Auth::start(standard, |n| issued(&format!("tok-{n}"), 3600)).await;
+    let c = auth.credential();
+    assert_eq!(c.token().await.unwrap(), "tok-0");
+    c.age_token(false);
+    auth.hold();
+    let renewing = tokio::spawn({
+        let c = c.clone();
+        async move { c.token().await }
+    });
+    auth.mints_reach(2).await;
+    let revoking = c.revoke();
+    tokio::pin!(revoking);
+    assert!(
+        futures_util::poll!(&mut revoking).is_pending(),
+        "waits for the mint"
+    );
+    auth.open();
+    prompt("revoke", revoking).await.unwrap();
+    assert_eq!(renewing.await.unwrap().unwrap(), "tok-1");
+    let bodies: Vec<String> = auth
+        .seen("/oauth/revoke")
+        .into_iter()
+        .map(|r| r.body)
+        .collect();
+    assert_eq!(bodies, ["token=tok-0", "token=tok-1"]);
+    assert_eq!(
+        c.token().await.unwrap(),
+        "tok-2",
+        "the revoked tok-1 is never served"
+    );
+}
+
+// With nothing to revoke, `revoke` sends nothing, not even the metadata read, and succeeds even where the server couldn't revoke.
+#[tokio::test]
+async fn revoke_with_nothing_to_revoke_sends_nothing() {
+    let auth = Auth::start(
+        |b| {
+            let mut m = standard(b);
+            m.as_object_mut().unwrap().remove("revocation_endpoint");
+            m
+        },
+        |n| issued(&format!("tok-{n}"), 3600),
+    )
+    .await;
+    let c = auth.credential();
+    c.revoke().await.unwrap();
+    assert!(auth.seen.lock().unwrap().is_empty(), "nothing sent");
 }
