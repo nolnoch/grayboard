@@ -17,7 +17,7 @@ import { callClaimTool, endedClaimText, sweepClaims } from "./claims.ts";
 import { endSessionServer } from "./session_end.ts";
 import type { Repo } from "./db.ts";
 import type { Tx } from "./store/tx.ts";
-import { B, BOB_ID, CHILD_ID, D, DAN_WRITER, diverging, E, ENDED_ID, ENG_ID, EVE_ID, inBody as inBodyOn, ONLINE, openPostParity, outcome, outcomeAsync, TAIL_ID, team, W, WADE_ID } from "../../tests/support/board_parity.ts";
+import { B, BOB_ID, CHILD_ID, D, DAN_WRITER, diverging, E, ENDED_ID, ENG_ID, EVE_ID, inBody as inBodyOn, ONLINE, openPostParity, outcome, outcomeAsync, parityRows, TAIL_ID, team, W, WADE_ID } from "../../tests/support/board_parity.ts";
 import { seed } from "../../tests/support/seed.ts";
 
 let repo: Repo;
@@ -471,6 +471,25 @@ test("a refusal after a write, caught in a body that commits, leaves nothing of 
   });
   expect(answer).toContain("attic");
   expect(claimRows()).toEqual(before);
+});
+
+// #1230: a release refused after its delete, its event and its watchers' delete (the [release] post's cc runs past
+// MAX_BODY_BYTES), caught in a body that commits, leaves nothing of the call: serverRelease's own savepoint.
+test("a release whose [release] post is refused after the delete leaves nothing of the call (the tool's savepoint)", async () => {
+  const access = boardAccess(repo);
+  const out = await inBody(async tx => {
+    const c = repo.coreOn(tx);
+    c.prepare(`INSERT INTO claims (key, holder, note, board, acquired_at, expires_at) VALUES ('ticket:crowd', ?, 'n', 'general', 1, ?)`).run(`${W}/be`, Date.now() + 3_600_000);
+    const watch = c.prepare(`INSERT INTO claim_watches (key, handle) VALUES ('ticket:crowd', ?)`);
+    for (let i = 0; i < 400; i++) watch.run(`watcher-${String(i).padStart(4, "0")}/${"x".repeat(180)}`);
+    const before = parityRows(repo, tx);
+    let answer: string;
+    try { await callClaimTool(repo, access, tx, `${W}/be`, "claim_release", { key: "ticket:crowd" }, wade); answer = "released"; }
+    catch (e) { if (e instanceof CoreError) answer = e.message; else throw e; }
+    return { answer, before };
+  }) as { out: { answer: string; before: unknown }; rows: unknown };
+  expect(out.out.answer).toContain("body exceeds");
+  expect(out.rows).toEqual(out.out.before);
 });
 
 // #807 P3 C5a F1: a lapsed claim whose key holds a NUL (written before keys refused it) doesn't lock out every take on
