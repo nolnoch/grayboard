@@ -68,8 +68,9 @@ type Legacy = { ref: string; meta?: unknown; server: McpServer; transport: WebSt
 type Checked = { row: HostedSession | undefined; root?: HostedSession; seq: number; boards?: Map<string, boolean> };
 type Bound = { row: HostedSession | undefined; root?: HostedSession };
 // `bound`: the binding's row and root as the last read or commit notice left them, which a notice judges (#807 P3
-// A7h2). `rechecking`: the context a re-read of them is in flight for.
-type Live = { context: Context; rows: Set<string>; bound: Bound; rechecking?: Context; uris: Map<string, string | null>; watches: string[]; stream?: OwnedStream; handler?: McpHttpHandler; legacy?: Legacy; stopped: boolean; hint(uri: string): void; stop(): void };
+// A7h2). `rechecking`: the context a re-read of them is in flight for. `noted`: per bound row, the seq of the last
+// notice that carried its facts into `bound`, so a raced re-read keeps those halves and takes its own for the rest (#1486).
+type Live = { context: Context; rows: Set<string>; bound: Bound; rechecking?: Context; noted?: Map<string, number>; uris: Map<string, string | null>; watches: string[]; stream?: OwnedStream; handler?: McpHttpHandler; legacy?: Legacy; stopped: boolean; hint(uri: string): void; stop(): void };
 
 export function createHostedMcp(application: Application, oauth: Pick<ReturnType<typeof createOAuthServer>, "authenticate" | "isAuthorized" | "peekAuthorized" | "isGrantActive" | "issuer" | "resource">, opts: { trustedOrigin: string; now?: () => number; limits?: McpLimits; caps?: HostedCaps; idleSeconds?: number; streamRecheckMs?: number }) {
   const now = opts.now ?? Date.now;
@@ -416,14 +417,29 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     return false;
   }
   // Every commit to a hosted row notifies, so a read no notice for its rows followed is the committed state: the live
-  // keeps it. One a notice raced is read again, as is a re-read a notice raced in turn.
-  function adopt(live: Live, checked: Checked) {
+  // keeps it. One a notice raced is read again; a re-read a notice raced in turn is merged when it can be (`merged`).
+  function adopt(live: Live, checked: Checked, merge = false) {
     if (live.stopped) return;
-    if (moved(live.rows, checked.seq)) return recheck(live);
-    live.bound = { row: checked.row, root: checked.root };
+    if (!moved(live.rows, checked.seq)) { live.bound = { row: checked.row, root: checked.root }; return; }
+    if (!merge || !merged(live, checked)) recheck(live);
   }
-  // A re-read a notice raced in turn queues another and is judged on the bound as notices left it, a real pair since
-  // the live's creation (#1196). Tests hold a re-read before its read at `mcp:live:recheck`.
+  // A re-read a notice raced, merged into the bound per row, so each half is its row's newest committed state (#1486):
+  // a row no notice followed since the read began takes the read's half; one whose latest notice since carried its
+  // row (`noted`) keeps the noted half. A notice for every row, a pruned one, or a latest one that carried no row
+  // (its full pass notes later) leaves the bound as notices left it, for another re-read.
+  function merged(live: Live, checked: Checked): boolean {
+    if (allAt > checked.seq || prunedThrough > checked.seq) return false;
+    const after = (id: string) => (changedAt.get(id) ?? 0) > checked.seq;
+    for (const id of live.rows) if (after(id) && live.noted?.get(id) !== changedAt.get(id)) return false;
+    const own = "id" in live.context.sessionContext ? live.context.sessionContext.id : undefined;
+    const rootId = [...live.rows].find(r => r !== own) ?? own;
+    if (own !== undefined && !after(own)) live.bound.row = checked.row;
+    if (rootId !== undefined && !after(rootId)) live.bound.root = checked.root;
+    return true;
+  }
+  // A re-read is merged (`merged`) and judged; one it couldn't merge queues another and is judged on the bound as
+  // notices left it, a real pair since the live's creation (#1196). Tests hold a re-read before its read at
+  // `mcp:live:recheck`.
   function recheck(live: Live) {
     const context = live.context;
     if (live.rechecking === context) return;
@@ -431,7 +447,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     track(testPauseAsync("mcp:live:recheck").then(() => rowCheck(context)).then(checked => {
       if (live.rechecking === context) live.rechecking = undefined;
       if (live.stopped || live.context !== context) return;
-      adopt(live, checked);
+      adopt(live, checked, true);
       judge(live);
     }, e => {
       if (live.rechecking === context) live.rechecking = undefined;
@@ -462,7 +478,9 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     if (changed === null) allAt = seq; else changedAt.set(changed, seq);
     // A snapshot: stop() unindexes as it goes.
     const affected = [...rowless];
-    if (changed !== null && row !== undefined) for (const live of byRow.get(changed) ?? []) { note(live, changed, row ?? undefined); affected.push(live); }
+    if (changed !== null && row !== undefined) for (const live of byRow.get(changed) ?? []) {
+      note(live, changed, row ?? undefined); (live.noted ??= new Map()).set(changed, seq); affected.push(live);
+    }
     for (const live of affected) judge(live);
   });
   const unwatchHosted = hosted.watchRows({
@@ -551,7 +569,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     live.context = next; live.rows = bindingRows(next, next.verdict?.row);
     indexRows(live);
     // The selection's rows, read after `start`, replace the previous context's pair at once, as a new live's do (#1196).
-    live.bound = { row: next.verdict?.row, root: next.verdict?.root };
+    live.bound = { row: next.verdict?.row, root: next.verdict?.root }; live.noted = undefined;
     adopt(live, { ...live.bound, seq: start });
     if (live.stream) streamContexts.set(live.stream, next);
     previous.finish();
