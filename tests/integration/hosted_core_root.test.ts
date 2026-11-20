@@ -551,13 +551,20 @@ test("the Controller's release and child end under a session the server already 
   expect(await hostedRowCount(srv)).toBe(1);
   expect(await audits()).toEqual(before);
   // The first pause stops the run loop and releases the root; a second release (a stale lease on a root the
-  // server already ended) sends delivery_release then session_end under the ended ID.
+  // server already ended) sends delivery_release then session_end under the ended ID. The live root's own
+  // delivery_release must succeed on the ending wire: release() records its failure and goes on.
+  const failed: string[] = [];
+  const failure = (Reflect.get(controller, "failure") as (...a: unknown[]) => void).bind(controller);
+  Reflect.set(controller, "failure", (...a: unknown[]) => { failed.push(String(a[0])); failure(...a); });
+  const root = (Reflect.get(controller, "roots") as Map<string, { lease?: { capability: string } }>).get("release-1")!;
+  expect(root.lease).toBeDefined();
   await controller.pause();
+  expect(failed).toEqual([]);
   expect(await hostedRowCount(srv)).toBe(0);
   const released = await audits();
-  const root = (Reflect.get(controller, "roots") as Map<string, { lease?: { capability: string } }>).get("release-1")!;
   root.lease = { capability: "a".repeat(43) } as never;
   await controller.pause();
+  expect(failed).toEqual(["delivery_release"]);
   expect(await hostedRowCount(srv)).toBe(0);
   expect(await audits()).toEqual([...released, "hosted.stale_capability"]);
 }, 30_000);
