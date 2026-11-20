@@ -864,6 +864,34 @@ function queue(it: It): void {
     expect(await h.boards.laneRows(h.read, "jobs", [])).toEqual([FE, BE]);
   });
 
+  // #1461: a push still unread when its alias moved is the reader's. OPS's queue post was taken and pushed while S1 held
+  // OPS (the fixtures' session S1); S2 holds OPS now and receives it, by acknowledge or by a read that shows it. Its
+  // outbox row and its take then name S2, so the rotation credits S2's lane (FE), not S1's (BE).
+  for (const via of ["acknowledge", "read"] as const) {
+    it(`a push delivered (${via}) after its alias moved: the outbox row and the take re-record the reader's session`, async h => {
+      await board(h, "jobs", { kind: "queue" });
+      for (const a of [BE, FE, OPS]) await h.alias(a);
+      await h.session(S1, ME);
+      await h.session(S2, ME);
+      await h.hold(BE, S1, T0);
+      await h.hold(FE, S2, T0);
+      await h.hold(OPS, S2, T0 + 1); // S2's lane stays FE, its older hold
+      await sub(h, S1, "jobs", "push");
+      await sub(h, S2, "jobs", "push");
+      const p = await write(h, np("jobs", QA, "job", T0 + 50));
+      await h.claimEvent({ key: `queue:jobs:${p}`, handle: OPS, event: "take", board: "jobs", at: T0 + 60, session: S1 });
+      await h.push(OPS, p, S1);
+      // Undelivered, both still S1's: BE was woken (the take at T0+60, the push at T0+50), FE never.
+      expect(await h.boards.laneRows(h.read, "jobs", [])).toEqual([FE, BE]);
+      await h.write(tx => via === "acknowledge"
+        ? h.boards.acknowledge(tx, OPS, { kind: "push", post_id: p })
+        : h.boards.read(tx, "jobs", OPS, {}).then(() => {}));
+      expect(await h.outboxSessions()).toEqual([{ handle: OPS, post_id: p, session_id: S2 }]);
+      // S2 (FE) received it; S1 (BE) was never woken. A take left S1's would keep BE at T0+60, after FE's push.
+      expect(await h.boards.laneRows(h.read, "jobs", [])).toEqual([BE, FE]);
+    });
+  }
+
   it("insertOutbox and claimQueuePost record the receiving session: an alias's holder, a session ID itself, null for an alias no session holds", async h => {
     await board(h, "jobs", { kind: "queue" });
     await h.session(S1, ME);
