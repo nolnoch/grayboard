@@ -29,7 +29,12 @@ export type StartOptions = ApplicationOptions & {
   // The opened store to serve (openRepo in open_repo.ts, or a test's own makePgRepo); stop() closes it. Without one, startServer opens
   // config.store's SQLite file itself, which only tests rely on: they read the raw handle it exposes as `db`.
   repo?: Repo;
+  // How long stop() waits for the requests in flight to finish before it closes the store anyway (#218).
+  stopDrainMs?: number;
 };
+
+// stop()'s default drain deadline: inside a supervisor's usual stop grace (systemd's 90 s, Kubernetes' 30 s).
+export const STOP_DRAIN_MS = 10_000;
 
 // A start option overrides the config's limit; an explicit undefined one doesn't wipe it (#385 item 14).
 export function startLimits(config: Pick<Config, "helloLimit" | "hostedRequestLimit" | "hostedSubscriberLimit" | "delegateLimit" | "delegateOpenCap" | "hostedCaps" | "aliasScopeCap" | "serviceLimits">, opts: StartOptions) {
@@ -104,6 +109,35 @@ export function startServer(config: Config, opts: StartOptions = {}) {
   let started = false;
   ready.then(() => { started = true; }, () => {});
 
+  // Every request the listener has taken and not yet answered, by its method and path (never the query: it can
+  // carry a token). server.stop(true) closes their connections, but their handlers run on; stop() waits for them
+  // before it closes the store, or one resumes from an await onto a closed database (#218).
+  const inFlight = new Map<Promise<Response>, string>();
+  const track = (what: string, response: Promise<Response>): Promise<Response> => {
+    inFlight.set(response, what);
+    void response.then(() => inFlight.delete(response), () => inFlight.delete(response));
+    return response;
+  };
+  async function drain(ms: number): Promise<void> {
+    if (inFlight.size === 0) return;
+    const plural = (n: number) => `${n} request${n === 1 ? "" : "s"}`;
+    // Bounded: unauthenticated requests are tracked too, so the list and each path are capped.
+    const named = () => { const all = [...inFlight.values()].map(w => w.length > 120 ? `${w.slice(0, 120)}…` : w); return all.length > 10 ? `${all.slice(0, 10).join(", ")} +${all.length - 10} more` : all.join(", "); };
+    console.error(`[grayboard] stopping: waiting for ${plural(inFlight.size)} in flight: ${named()}`);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const expired = new Promise<"expired">(resolve => { timer = setTimeout(() => resolve("expired"), ms); });
+    try {
+      while (inFlight.size) {
+        if (await Promise.race([Promise.allSettled([...inFlight.keys()]), expired]) === "expired") {
+          // Said here as well: main.ts redacts a failed stop's error, and a method and path carry no secret.
+          const message = `stop: ${plural(inFlight.size)} never finished within ${ms} ms: ${named()}`;
+          console.error(`[grayboard] ${message}`);
+          throw new Error(message);
+        }
+      }
+    } finally { clearTimeout(timer); }
+  }
+
   async function route(req: Request, caller: Caller): Promise<Response> {
     const url = new URL(req.url);
     const path = url.pathname;
@@ -156,11 +190,13 @@ export function startServer(config: Config, opts: StartOptions = {}) {
     maxRequestBodySize: repo.attachmentLimits.file + MAX_BODY_BYTES,
 
     async fetch(req, server) {
-      if (!started) await ready;
-      // First, before anything reads the database (#240).
-      const caller = authGate.caller(req, server.requestIP(req)?.address);
-      // Every audit row this request writes carries where it came from (security audit F-19).
-      return inRequest({ ip: caller.ip, ua: userAgent(req) }, () => route(req, caller));
+      return track(`${req.method} ${new URL(req.url).pathname}`, (async () => {
+        if (!started) await ready;
+        // First, before anything reads the database (#240).
+        const caller = authGate.caller(req, server.requestIP(req)?.address);
+        // Every audit row this request writes carries where it came from (security audit F-19).
+        return inRequest({ ip: caller.ip, ua: userAgent(req) }, () => route(req, caller));
+      })());
     },
 
     // A route that throws something other than a refusal it maps itself. Bun's
@@ -223,10 +259,13 @@ export function startServer(config: Config, opts: StartOptions = {}) {
       stopExpiry();
       touches.cancelAll();
       void server.stop(true);
-      // After the startup writes settle: closing the database under a queued one would fail it mid-flight.
-      stopPromise = ready.catch(() => {}).then(() => Promise.allSettled([mcp.close(), attachments.close()])).then(outcomes => {
+      // After the startup writes settle: closing the database under a queued one would fail it mid-flight. Then the
+      // requests still in flight, once hosted MCP and the attachment routes have refused theirs (#218).
+      stopPromise = ready.catch(() => {}).then(() => Promise.allSettled([mcp.close(), attachments.close()])).then(async outcomes => {
+        const drained = await drain(opts.stopDrainMs ?? STOP_DRAIN_MS).then(() => undefined, (error: unknown) => error);
         const failure = outcomes.find(outcome => outcome.status === "rejected");
         if (failure?.status === "rejected") throw failure.reason;
+        if (drained) throw drained;
       }).finally(async () => {
         // Awaited (#807 P3 C11a): a Postgres Repo's pool and LISTEN connection close over the network, and a caller
         // that exits once stop() settles would otherwise cut them off and leave its database in use. The Repo closes
