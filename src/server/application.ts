@@ -312,6 +312,7 @@ function drainBoards(session: ApplicationSession, hub: Hub, all = false): Promis
 
 async function drainBoardsOnce(session: ApplicationSession, hub: Hub, all: boolean, acked: Set<string>): Promise<void> {
   for (const address of [...session.addresses]) {
+    await testPauseAsync("server:drain-boards:before-read");
     const items = await pendingOf(hub.repo, hub.access, hub.repo.read, address, all, lostAck(hub, hub.repo.read, address, receiverOf(session)));
     // Closed while the read awaited: nothing more to send. Unbound from this address: the holds change dropped its
     // in-flight items.

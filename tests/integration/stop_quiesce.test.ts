@@ -23,11 +23,18 @@ beforeEach(() => {
   logs = [];
   log = spyOn(console, "error").mockImplementation((...args: unknown[]) => { logs.push(args.map(String).join(" ")); });
 });
-afterEach(() => {
+// A test that failed while it held a pause releases it here, and waits for the held work to leave the pause before its
+// dir goes: abandoned, that work would fail into the next test's logs and fail it too.
+afterEach(async () => {
   writeFileSync(release, "release");
-  delete process.env.BUS_TEST_PAUSE; delete process.env.BUS_TEST_PAUSE_FILE;
-  log.mockRestore();
-  rmSync(dir, { recursive: true, force: true });
+  const count = (what: string) => logs.filter(l => l.startsWith(`[grayboard] test pause ${what}:`)).length;
+  try {
+    await until(() => count("released") >= count("hit"), 5000, "the held work left its pause");
+  } finally {
+    delete process.env.BUS_TEST_PAUSE; delete process.env.BUS_TEST_PAUSE_FILE;
+    log.mockRestore();
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 // Opens a server with a team, then starts a roster read held at POINT. Returns the server, the read, and a flag that
@@ -199,7 +206,8 @@ async function stopAround(srv: TestServer, closed: { at: number }, point: string
 
 for (const { point, name } of [
   { point: "board-change:observers-read", name: "claim expiry board change" },
-  { point: "background:claim expiry wake", name: "claim expiry wake" },
+  // Held inside the subscriber's drain, before its read: the wake's tracked promise is its drains'.
+  { point: "server:drain-boards:before-read", name: "claim expiry wake" },
 ]) {
   const boards = name.endsWith("board change");
   test(`stop() waits for a claim expiry sweep's ${name.slice("claim expiry ".length)}${boards ? ", and starts no other once stopping" : ""}`, async () => {
@@ -219,7 +227,8 @@ for (const { point, name } of [
     await be.call("claim_list");
     // A board change asked for once stop has begun is skipped, so it never reaches the same pause.
     await stopAround(srv, closed, point, name, boards ? () => srv.app.application.boardsChanged(["lobby"]) : undefined);
-    expect(pauseHits(point)).toBe(1);
+    // The drain reads once per address of the subscriber's (its alias and its ID), each read held at the pause.
+    if (boards) expect(pauseHits(point)).toBe(1);
     await srv.stop();
   });
 }
