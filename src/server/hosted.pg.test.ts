@@ -45,7 +45,7 @@ describePg("hosted delivery across two instances (Postgres)", () => {
   // pull and its receipt read the row B committed, so both are refused before A has heard of the unbind: its holder
   // still carries the old generation and the lease is still open, so the refusal is the fence's, not a finished lease's.
   // Mutations: delivery.ts `matches` without its bind_gen comparison (A's pull answers the item again); that and
-  // receipt's `r.bind_gen !== row.bind_gen` both dropped (the receipt credits fe's cursor); no unbind (A pulls again).
+  // receipt's `r.bind_gen !== row.bind_gen` both dropped (the receipt credits fe's cursor); no unbind (the bind_gen precondition fails).
   test("an unbind another instance committed refuses this instance's lease's pull and its receipt of the pulled item; the cursor stays (#1479)", async () => {
     await using db = await pgDatabase({ max: 2 });
     await using a = await instance(db.url, "a");
