@@ -59,23 +59,30 @@ async function parseBody<T>(req: Request): Promise<T | null> {
 // ── route handlers ────────────────────────────────────────────────────────────
 
 // /healthz is unauthenticated, so its database probe is cached per repo for HEALTH_TTL_MS, success and failure
-// alike (#275): a flood costs one probe a second, and a down database logs one line a second. The probe is a
-// synchronous read, so no request can arrive while one is in flight and the cache alone is single-flight.
+// alike (#275): a flood costs one probe a second, and a down database logs one line a second. The probe is an awaited
+// store read on the read handle (#807 P3 C10d2-a); requests that arrive while one is in flight share it. It probes the
+// reader connection only: a writer that can no longer write passes it.
 export const HEALTH_TTL_MS = 1000;
 const health = new WeakMap<Repo, { at: number; ok: boolean; lagging?: boolean }>();
-export function healthz(repo: Repo, now = performance.now(), gate: LagGate = DEFAULT_LAG_GATE, windows: readonly LagWindow[] = lagWindows(), sampler: LagSampler | null = lagSampler() ?? null): Response {
-  let cached = health.get(repo);
-  if (!cached || now - cached.at >= HEALTH_TTL_MS) {
-    let ok = true;
-    try {
-      repo.policyNow.userByEmail("__healthz__");
-    } catch (e) {
+const probing = new WeakMap<Repo, Promise<boolean>>();
+function probe(repo: Repo): Promise<boolean> {
+  let p = probing.get(repo);
+  if (!p) {
+    p = (async () => { await repo.users.findByEmail(repo.read, "__healthz__"); })().then(() => true, (e: unknown) => {
       // A deploy check that sees this 503 needs the cause in the journal.
       console.error(`[grayboard] healthz: ${(e as Error).stack ?? e}`);
-      ok = false;
-    }
+      return false;
+    }).finally(() => probing.delete(repo));
+    probing.set(repo, p);
+  }
+  return p;
+}
+export async function healthz(repo: Repo, now = performance.now(), gate: LagGate = DEFAULT_LAG_GATE, windows: readonly LagWindow[] = lagWindows(), sampler: LagSampler | null = lagSampler() ?? null): Promise<Response> {
+  let cached = health.get(repo);
+  if (!cached || now - cached.at >= HEALTH_TTL_MS) {
+    const ok = await probe(repo);
     // The lag verdict outlives the probe's window, so its state-change log line fires once, not every second.
-    health.set(repo, cached = { at: now, ok, lagging: cached?.lagging });
+    health.set(repo, cached = { at: now, ok, lagging: health.get(repo)?.lagging });
   }
   if (!cached.ok) return jsonErr("internal", "db not reachable", 503);
   // Sustained event-loop lag fails the check (#805), with the version kept so a deploy check still

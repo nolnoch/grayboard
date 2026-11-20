@@ -1,5 +1,6 @@
 import { MAX_BODY_BYTES } from "../core/boards.ts";
 import { openDatabase } from "./db.ts";
+import { sessionEndPort } from "./session_end.ts";
 import { createApplication, type ApplicationOptions } from "./application.ts";
 import { handleHttp, isJsonRequest, signInRoute } from "./http.ts";
 import { AuthGate, type Caller } from "./auth_gate.ts";
@@ -42,7 +43,7 @@ export function startLimits(config: Pick<Config, "helloLimit" | "hostedRequestLi
 
 export function startServer(config: Config, opts: StartOptions = {}) {
   const humanReach = config.humanReach ?? "team";
-  const { db: testDb, repo } = openDatabase(config.dbPath, { blobDir: config.blobDir, humanReach, attachmentLimits: config.attachmentLimits, attachmentUserQuota: config.attachmentUserQuota, ...(opts.now ? { now: opts.now } : {}) });
+  const { db: testDb, repo } = openDatabase(config.dbPath, { blobDir: config.blobDir, sessionEnd: sessionEndPort(humanReach), attachmentLimits: config.attachmentLimits, attachmentUserQuota: config.attachmentUserQuota, ...(opts.now ? { now: opts.now } : {}) });
   let slack: SlackBridge | undefined;
   // Dev sign-in mints tokens for any email; they must not outlive it (#805 F-04). A
   // server started without dev auth revokes them, so a re-enable doesn't revive them.

@@ -63,7 +63,7 @@ export function sessionEndRecorder() {
           (${id}, 'user', ${id}, 'not bounced', ${now}, false, NULL),
           (${id}, 'user', 'them@example.com/b', 'bounced too', ${now}, false, 'bounce')`;
       }
-      audit("id.ended", id, id, { principal: (row?.principal as string | null | undefined) ?? null, held: [], why, bounced: 0 });
+      await audit("id.ended", id, id, { principal: (row?.principal as string | null | undefined) ?? null, held: [], why, bounced: 0 });
       return { ended: true, held: [], wake: [] };
     },
   };

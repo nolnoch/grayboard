@@ -17,8 +17,9 @@
 //   only its own row. Not bounded: every lock the session-end port takes past those ids rows (core endSession's
 //   claims, messages, aliases and attachments on C10d2's port), so a capped end or childEnd can still wait inside the
 //   port. The flag is per Tx handle: hosted.ts runs that sweep on the Tx it took the lock on.
-// - A released child's ID ends through the injected session-end port (hosted_port.ts PgSessionEndPort, C10d2's), on
-//   the caller's Tx, with an audit sink that writes its id.ended row to access_log as db.ts coreAudit does on SQLite;
+// - A released child's ID ends through the injected session-end port (hosted_port.ts PgSessionEndPort, the server's
+//   composed end), on the caller's Tx, with an awaited audit sink that writes its id.ended row to access_log as db.ts
+//   hostedEnds does on SQLite;
 //   its wakes and bounces reach `takeEnded` after commit (afterCommitOf), never on rollback.
 // - The lost-hold takes are one UPDATE … RETURNING each, ordered by (at, seq) in JS: `seq` stands for SQLite's rowid.
 // - int8 columns through the mappers, booleans as booleans, `held_aliases_json` jsonb; SQLite's unary-`+` planner

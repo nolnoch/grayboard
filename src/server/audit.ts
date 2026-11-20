@@ -1,5 +1,4 @@
 import type { Repo } from "./db.ts";
-import type { AuditSink } from "../core/audit.ts";
 import { isTx, type Read } from "./store/tx.ts";
 
 export type AuditAction =
@@ -141,6 +140,3 @@ export function writeAudit(
   if (isTx(h)) { repo.audit.write(h, row); return; }
   repo.post((tx) => repo.audit.write(tx, row), undefined, `audit ${action}`);
 }
-
-/** Core's audit rows, written on the server: access_log through the Repo (#342), on `h` as writeAudit writes. */
-export const serverAuditSink = (repo: Repo, h: Read): AuditSink => (action, actor, target, detail) => writeAudit(repo, h, action, actor, target, detail);

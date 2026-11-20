@@ -8,7 +8,7 @@ import { isThenable } from "./store/tx_base.ts";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 
-import { acknowledge, redeliveryFacts, aliasScopeRows, authorAddresses, claimQueuePost, humansAmong, insertOutbox, insertPost, queueLaneRows, subscriberRows, threadFacts, insertBoard, isHuman, readRows, setArchived, setMute, threadRoot, type AliasScopeRow, ALIAS_SESSION_SQL, boardViewRows, openSummaryRows, setQueueParticipation, whoRows, writeStatus, type UnboundFacts, ensureBoard, forgetHandle, isSubscribed, markHuman, prunePosts, setSubscription, unsubscribeScope, catalogPage, getBoard, getPost, HOLD_ORDER, lastSeen, pendingDigests, pendingPushes, snapshotPage, pruneEndedIds, registerId, setAccess, writeAliasMeta, setIdFacts, setPlace, touchAlias, touchId, type CoreDb } from "../core/boards.ts";
+import { acknowledge, redeliveryFacts, aliasScopeRows, authorAddresses, claimQueuePost, humansAmong, insertOutbox, insertPost, queueLaneRows, subscriberRows, threadFacts, insertBoard, isHuman, readRows, setArchived, setMute, threadRoot, type AliasScopeRow, ALIAS_SESSION_SQL, boardViewRows, openSummaryRows, setQueueParticipation, whoRows, writeStatus, type UnboundFacts, ensureBoard, forgetHandle, isSubscribed, markHuman, prunePosts, setSubscription, unsubscribeScope, catalogPage, getBoard, getPost, HOLD_ORDER, lastSeen, pendingDigests, pendingPushes, snapshotPage, pruneEndedIds, registerId, writeAliasMeta, setIdFacts, setPlace, touchAlias, touchId, type CoreDb, setAccess, type Access } from "../core/boards.ts";
 import { ackQueueClaim, addClaimWatch, claimRow, claimWatchers, expireClaims, holderUser, listClaims, liveClaim, logEvent, recentClaimEvents, releaseClaim, removeClaimWatch, takeClaim, takeClaimWatchers } from "../core/claims.ts";
 import { addressSet, aliasUser, aliasUses, dropHold, holderOf, holdsOf, idRow, idStatuses, logBinding, unendedIds } from "../core/bindings.ts";
 import type { AuditAction } from "./audit.ts";
@@ -19,14 +19,11 @@ import type { Principal } from "../core/resolver.ts";
 import { initCoreSchema } from "../core/schema.ts";
 import { addressUser, countOpenDelegations, everConnected, isLauncher, launchers } from "../core/delegation.ts";
 import { delegationFacts, type DelegationStore } from "./store/delegation.ts";
-import type { SessionEndStore } from "./store/session_end.ts";
-import { endSession, undeliverableId, type MailPort } from "../core/session_end.ts";
-import type { AuditSink } from "../core/audit.ts";
+import type { EndAuditSink, SessionEndPort, SessionEndStore } from "./store/session_end.ts";
+import { undeliverableId } from "../core/session_end.ts";
 import { afterCommit, type Boundary, onCommit, openBoundary, openReader, openSqlite, ownsTx, ownWriter, reclaimFreePages, routeReads } from "../core/sqlite.ts";
 import type { WriteTx } from "../core/write_tx.ts";
 import { isTx, type Read, type Tx, sqliteOf, sqliteRead, sqliteTx } from "./store/tx.ts";
-import { serverAccess } from "./access.ts";
-import type { AccessReadsSync, HumanReach, PolicyReadsSync } from "./policy.ts";
 import { DEFAULT_ATTACHMENT_LIMITS, DEFAULT_ATTACHMENT_USER_QUOTA, type AttachmentLimits } from "../shared/attachments.ts";
 import { DiskBlobs } from "./blobs.ts";
 import { detached, inRequest, requestOrigin } from "./request_context.ts";
@@ -220,7 +217,7 @@ export interface Repo {
   post<T>(fn: (tx: Tx) => T | Promise<T>, committed?: (value: T) => unknown, what?: string): boolean;
   // The store's read handle outside any transaction (#807 P1c): reads committed state. The task holding an open
   // transaction can't use it (sqliteOf refuses, #807 P3 A7e2): it passes its body's Tx. A Postgres Read is a pool
-  // handle and must never resolve to a transaction's connection. Ambient `db` reads (policyNow) aren't guarded.
+  // handle and must never resolve to a transaction's connection.
   read: Read;
   // Runs fn, which writes none of the generation's tables, with the auth cache's generation read once for its whole
   // body (#881): one authorization's token and user reads share it, across its awaits (#807 P3 A7c). Inside the
@@ -249,11 +246,6 @@ export interface Repo {
   users: UsersStore;
   sessions: SessionsStore;
   principals: PrincipalsStore;
-  // Policy's reads (and resolveMention's alias reads), synchronously on the SQLite connection (#807 P3 A7e1): the
-  // loader authorizeNow drives, and the core Access seam's, until #807 B makes them async. Inside the caller's own
-  // transaction they read its writes. principalOf is principals.of. SQLite only: a Postgres Repo won't have it.
-  // policy.test.ts ratchets its callers.
-  policyNow: PolicyReadsSync & AccessReadsSync;
   // Names in scopes, keyed by address (store/aliases.ts).
   aliases: AliasesStore;
   // Holds, session rows and presence (store/bindings.ts).
@@ -299,7 +291,9 @@ export interface Repo {
 }
 
 // `now` is the hub's clock (application.ts): rows, audit and write receipts read one clock, so a test clock moves them together (#297).
-export type OpenOptions = { blobDir: string; humanReach?: HumanReach; attachmentLimits?: AttachmentLimits; attachmentUserQuota?: number; now?: () => number };
+// `sessionEnd`: the session end a released hosted child's ID ends through (session_end.ts sessionEndPort), made from
+// the Repo on first use; a child end without it throws.
+export type OpenOptions = { blobDir: string; attachmentLimits?: AttachmentLimits; attachmentUserQuota?: number; now?: () => number; sessionEnd?: (repo: Repo) => SessionEndPort };
 
 // undeliveredFrom: messages a sender has sent that the recipient's read point
 // hasn't reached. The read point is the last delivered-and-handled message id
@@ -356,13 +350,23 @@ export function openDatabase(path: string, opts: OpenOptions): { db: Database; r
     seedSchema(d, first, firstRoles);
   });
   authGenerationTriggers(db);
+  // Core's board and claim functions judge visibility through the Access installed on their connection, and fall back
+  // to local mode's open one. No server path calls them (its ports check the async boardAccess), so a server database
+  // installs one that refuses every use: a future caller fails loudly instead of skipping team and service visibility.
+  // A test that seeds through core opts in with setAccess(db, openAccess(db)), or the parity oracle.
+  setAccess(db, SERVER_REFUSES_CORE_ACCESS);
   routeReads(db, openReader(path));
   const queue = queueFor(db);
   ownWriter(db, { holds: () => queue.mine, check: () => queue.assertMine() });
-  const repo = makeRepo(db, new DiskBlobs(opts.blobDir), opts.attachmentLimits ?? DEFAULT_ATTACHMENT_LIMITS, opts.attachmentUserQuota ?? DEFAULT_ATTACHMENT_USER_QUOTA, opts.now);
-  setAccess(db, serverAccess(repo, db, opts.humanReach ?? "team"));
+  let port: SessionEndPort | undefined;
+  const sessionEnd = () => port ??= opts.sessionEnd?.(repo) ?? (() => { throw new Error("no session-end port: pass OpenOptions.sessionEnd to end a hosted child"); })();
+  const repo = makeRepo(db, new DiskBlobs(opts.blobDir), opts.attachmentLimits ?? DEFAULT_ATTACHMENT_LIMITS, opts.attachmentUserQuota ?? DEFAULT_ATTACHMENT_USER_QUOTA, sessionEnd, opts.now);
   return { db, repo };
 }
+
+const SERVER_REFUSES_CORE_ACCESS = new Proxy({} as Access, {
+  get(_t, key) { throw new Error(`core Access.${String(key)} on a server database: server paths use boardAccess (src/server/access.ts)`); },
+});
 
 // #853: a connection-local counter every write to the authorization tables bumps, by trigger, so no
 // write site can forget to. TEMP objects live and die with this connection, outside the schema, and
@@ -847,7 +851,7 @@ export const INVOKE_BINDING_SQL = `SELECT id, team FROM (
           WHERE ?2 = 'user' AND h.name = ?1 AND h.kind = 'user')
        ORDER BY team IS NOT NULL, team LIMIT 1`;
 
-function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLimits, attachmentUserQuota: number, clock: () => number = Date.now): Repo {
+function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLimits, attachmentUserQuota: number, sessionEnd: () => SessionEndPort, clock: () => number = Date.now): Repo {
   const att = (c: Database, rows: MessageRow[]) => withAttachments(c, "message", rows);
   // Role bindings (#927). Every read and write is one statement on the caller's handle; grant and revoke re-check
   // the granter's authority in their own statement, and revoke holds the last-owner guard, so every writer
@@ -987,8 +991,8 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
   // Every marked op takes its Tx first.
   const marks = <A extends [Tx, ...unknown[]], R>(fn: (...args: A) => R, id: (...args: A) => string) => (...args: A): R =>
     then(fn(...args), () => { const at = id(...args); readFacts(args[0], at); changed(at); });
-  const hosted = makeHostedStore(db);
-  const { writesOn: _writesOn, ...hostedStore } = hosted;
+  const hosted = makeHostedStore(db, sessionEnd);
+  const { ends: _ends, ...hostedStore } = hosted;
   const oauth = makeOAuthStore(hosted);
   // The trigger counter (this connection's commits) and data_version (another connection's) (#853).
   // Two plain statements: a pragma_data_version subselect costs over twice as much per call, and this runs
@@ -1019,8 +1023,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
     // The store's uncached read: Repo's oauth.findActiveAccess is the cache's wrapper over it.
     { findActiveAccess: (...a) => oauth.findActiveAccess(...a), userById: async (r, userId) => userById(sqliteOf(r), userId), check: r => { sqliteOf(r); } },
   );
-  // One SQL statement per read, on whichever connection the caller gives: a store read's sqliteOf(r), or policyNow's
-  // routed `db` (#807 P3 A7e1).
+  // One SQL statement per read, on the connection a store read's handle names (sqliteOf(r)).
   const aliasAt = (c: Database, address: string): Alias | undefined =>
     c.query<Alias, [string]>(`SELECT ${ALIAS_COLS} FROM aliases WHERE address = ?`).get(address) ?? undefined;
   const aliasesNamed = (c: Database, name: string): Alias[] =>
@@ -1133,19 +1136,20 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       isDisabled: auth.isDisabled,
       active: auth.active,
       async setDisabled(tx, userId, disabled) {
-        const db = sqliteOf(tx);
-        db.transaction(() => {
+        sqliteOf(tx); // refuses a settled Tx or a non-store handle before the savepoint opens
+        await tx.savepoint(async sp => {
+          const db = sqliteOf(sp);
           const now = clock();
           db.run("UPDATE users SET disabled_at = ? WHERE id = ?", [disabled ? now : null, userId]);
           if (disabled) {
             // CLI tokens too, so enable-user doesn't revive them (security audit F-14).
             db.run("UPDATE sessions SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL", [now, userId]);
-            endHostedWhere(hosted, db, "disabled", now, row => row.user_id === userId);
+            await endHostedWhere(hosted, sp, "disabled", now, row => row.user_id === userId);
             db.run("UPDATE oauth_grants SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL", [now, userId]);
             db.run("DELETE FROM oauth_browsers WHERE user_id = ?", [userId]);
             db.run("DELETE FROM oauth_codes WHERE user_id = ? AND grant_id IS NULL", [userId]);
           }
-        }).immediate();
+        });
         changed(null);
       },
     },
@@ -1169,14 +1173,15 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
         sqliteOf(tx).run("UPDATE sessions SET revoked_at = ? WHERE id = ?", [clock(), sessionId]);
       },
       async revokeAllForUser(tx, userId) {
-        const db = sqliteOf(tx);
-        db.transaction(() => {
+        sqliteOf(tx); // refuses a settled Tx or a non-store handle before the savepoint opens
+        await tx.savepoint(async sp => {
+          const db = sqliteOf(sp);
           const now = clock();
           db.run("UPDATE sessions SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL", [now, userId]);
-          endHostedWhere(hosted, db, "revoked", now, row => row.user_id === userId);
+          await endHostedWhere(hosted, sp, "revoked", now, row => row.user_id === userId);
           db.run("UPDATE oauth_grants SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL", [now, userId]);
           db.run("DELETE FROM oauth_codes WHERE user_id = ? AND grant_id IS NULL", [userId]);
-        }).immediate();
+        });
         changed(null);
       },
       async revokeDev(tx) {
@@ -1190,21 +1195,6 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
     principals: {
       async findByName(r, name) { return principalByName(sqliteOf(r), name); },
       async of(r, address) { return principalOf(sqliteOf(r), address); },
-    },
-
-    policyNow: {
-      principalByName: name => principalByName(db, name),
-      principalOf: address => principalOf(db, address),
-      teamByName: name => teamByName(db, name),
-      isMember: (teamId, userId) => isMember(db, teamId, userId),
-      roleBinding: (userId, role, teamId) => roleBinding(db, userId, role, teamId),
-      invokeBinding: (holder, service) => invokeBinding(db, holder, service),
-      shareAny: (userA, userB) => sharePolicy(db, userA, userB),
-      shareCollaborative: (userA, userB) => shareCollaborative(db, userA, userB),
-      shareDelegating: (userA, userB) => shareDelegating(db, userA, userB),
-      userByEmail: email => userByEmail(db, email),
-      alias: address => aliasAt(db, address),
-      aliasesNamed: name => aliasesNamed(db, name),
     },
 
     aliases: {
@@ -1326,6 +1316,9 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       pruneUnbound: async (tx, olderThanMs) => pruneUnbound(sqliteOf(tx), olderThanMs),
       insertUpload: async (tx, upload) => insertUpload(sqliteOf(tx), upload),
       remove: async (tx, id) => removeUpload(sqliteOf(tx), id),
+      async dropUnboundOf(tx, uploader) {
+        sqliteOf(tx).run(`DELETE FROM attachments WHERE uploader = ? AND message_id IS NULL AND post_id IS NULL`, [uploader]);
+      },
       unnamedBlobs: async (r) => unnamedBlobs(sqliteOf(r)),
       named: async (r, sha256) => blobNamed(sqliteOf(r), sha256),
       dropBlobEntry: async (tx, sha256) => dropBlobEntry(sqliteOf(tx), sha256),
@@ -1347,6 +1340,8 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       takeWatchers: async (tx, key) => takeClaimWatchers(sqliteOf(tx), key),
       holderUser: async (r, c) => holderUser(sqliteOf(r), c),
       ackQueue: async (tx, addresses, key, now) => ackQueueClaim(sqliteOf(tx), addresses, key, now),
+      heldBy: async (r, holder, now) => sqliteOf(r).query<{ key: string }, [string, number]>(
+        `SELECT key FROM claims WHERE holder = ? AND expires_at > ?`).all(holder, now).map(c => c.key),
     },
 
     delegation: {
@@ -1410,7 +1405,16 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
     },
 
     sessionEnd: {
-      end: async (tx, id, opts) => { const w = sqliteOf(tx); return endSession(w, mailPort(w), id, opts); },
+      // core endSession's first statements (#807 P3 C10d2-a); the single writer is the row's lock.
+      async end(tx, id, now) {
+        const db = sqliteOf(tx);
+        const row = db.query<{ ended_at: number | null; principal: string | null }, [string]>(`SELECT ended_at, principal FROM ids WHERE id = ?`).get(id);
+        if (row?.ended_at != null) return null;
+        const held = [...new Set(holdsOf(db, id))];
+        db.run(`UPDATE ids SET ended_at = ?, held_aliases_json = ? WHERE id = ?`, [now, JSON.stringify(held), id]);
+        const children = db.query<{ id: string }, [string]>(`SELECT id FROM ids WHERE root_id = ? AND ended_at IS NULL ORDER BY id`).all(id).map(r => r.id);
+        return { principal: row?.principal ?? null, held, children };
+      },
       refusal: async (tx, id) => undeliverableId(sqliteOf(tx), id),
       pruneEnded: async (tx, olderThanMs, now) => pruneEndedIds(sqliteOf(tx), olderThanMs, now),
     },
@@ -1748,6 +1752,24 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
           db.run("DELETE FROM messages WHERE created_at < ?", [olderThanMs]);
         })();
       },
+      // A session end's (#807 P3 C10d2-a): core endSession's MailPort statements, which the server's end now calls here.
+      unreadFor: async (tx, id) => sqliteOf(tx).query<{ id: number; sender: string }, [string]>(
+        `SELECT m.id, m.sender FROM messages m
+          WHERE m.recipient_type = 'user' AND m.recipient = ?1 AND m.sender <> ?1
+            AND m.id > COALESCE((SELECT last_seen_id FROM mailbox_cursors
+                                  WHERE address = ?1 AND stream_type = 'direct' AND stream_ref = ?1), 0)
+          ORDER BY m.id`,
+      ).all(id),
+      // A system DM: never the human mark (#1364). The single writer keeps the parent the end just read.
+      bounce: async (tx, from, to, parentId, body, now) => sqliteOf(tx).query<MessageRow, [string, string, string, number, number]>(
+        `INSERT INTO messages (sender, sender_id, recipient_type, recipient, body, parent_id, created_at, pending, kind, human)
+         VALUES (?1, ?1, 'user', ?2, ?3, ?4, ?5, 0, 'bounce', 0) RETURNING ${MSG_COLS}`,
+      ).get(from, to, body, parentId, now),
+      async dropReader(tx, id) {
+        const db = sqliteOf(tx);
+        db.run(`DELETE FROM mailbox_cursors WHERE address = ?`, [id]);
+        db.run(`DELETE FROM dm_acks WHERE reader = ?`, [id]);
+      },
     },
 
     coreOn: (h) => sqliteOf(h),
@@ -1967,27 +1989,37 @@ function makeOAuthStore(hosted: HostedStoreOf): OAuthStore {
     revokeBrowserSession: async (tx, ...a) => on(tx).revokeBrowserSession(...a),
     decideRequest: async (tx, ...a) => on(tx).decideRequest(...a),
     findCodeScopes: async (r, ...a) => on(r).findCodeScopes(...a),
-    redeemCode: async (tx, ...a) => on(tx).redeemCode(...a),
+    redeemCode: (tx, ...a) => settledOn(() => on(tx).redeemCode(tx, ...a)),
     redeemLoginCode: async (tx, ...a) => on(tx).redeemLoginCode(...a),
     findRefreshGrant: async (r, ...a) => on(r).findRefreshGrant(...a),
-    rotateRefresh: async (tx, ...a) => on(tx).rotateRefresh(...a),
-    revokeToken: async (tx, ...a) => on(tx).revokeToken(...a),
+    rotateRefresh: (tx, ...a) => settledOn(() => on(tx).rotateRefresh(tx, ...a)),
+    revokeToken: (tx, ...a) => settledOn(() => on(tx).revokeToken(tx, ...a)),
     findActiveAccess: async (r, ...a) => on(r).findActiveAccess(...a),
     isGrantActive: async (r, ...a) => on(r).isGrantActive(...a),
-    revokePreBuiltinGrants: async (tx, ...a) => on(tx).revokePreBuiltinGrants(...a),
+    revokePreBuiltinGrants: (tx, ...a) => settledOn(() => on(tx).revokePreBuiltinGrants(tx, ...a)),
     cleanup: async (tx, ...a) => on(tx).cleanup(...a),
     addServiceCredential: async (tx, ...a) => on(tx).addServiceCredential(...a),
     rotateServiceCredential: async (tx, ...a) => on(tx).rotateServiceCredential(...a),
-    revokeServiceCredential: async (tx, ...a) => on(tx).revokeServiceCredential(...a),
+    revokeServiceCredential: (tx, ...a) => settledOn(() => on(tx).revokeServiceCredential(tx, ...a)),
     revokeServiceSecret: async (tx, ...a) => on(tx).revokeServiceSecret(...a),
     findServiceCredential: async (r, ...a) => on(r).findServiceCredential(...a),
     mintServiceToken: async (tx, ...a) => on(tx).mintServiceToken(...a),
   };
 }
 
+// A call's promise, its synchronous throw (a settled Tx, a foreign handle) as a rejection: the five revoking OAuth
+// methods are forwarded without an async wrapper, whose extra hop would hold the write queue a tick longer.
+function settledOn<T>(f: () => Promise<T>): Promise<T> {
+  try { return f(); } catch (e) { return Promise.reject(e); }
+}
+
 // The store's methods without their handle, bound to one connection.
-// Synchronous: the store wraps each async method's result in a promise.
-type OAuthOps = { [K in keyof OAuthStore]: OAuthStore[K] extends (h: never, ...a: infer A) => infer R ? (...a: A) => Awaited<R> : never };
+// Synchronous: the store wraps each async method's result in a promise. The five that can revoke a grant are the
+// store's own async methods, on the caller's Tx: a revoked grant ends its hosted sessions, whose released children's
+// IDs end through the async session-end port (#807 P3 C10d2-a).
+type OAuthRevokes = "redeemCode" | "rotateRefresh" | "revokeToken" | "revokePreBuiltinGrants" | "revokeServiceCredential";
+type OAuthOps = { [K in Exclude<keyof OAuthStore, OAuthRevokes>]: OAuthStore[K] extends (h: never, ...a: infer A) => infer R ? (...a: A) => Awaited<R> : never }
+  & Pick<OAuthStore, OAuthRevokes>;
 function oauthOps(db: Database, hosted: HostedStoreOf): OAuthOps {
   const createSession = (userId: number, tokenHash: string, label: string | null, now: number) => insertSession(db, userId, tokenHash, label, now);
   const audit = (action: AuditAction, g: OAuthGrant, now: number, detail: Record<string, unknown> = {}) => {
@@ -2026,10 +2058,10 @@ function oauthOps(db: Database, hosted: HostedStoreOf): OAuthOps {
         [h, id, kind, expiry, now, kind === "access" ? JSON.stringify(p.scopes) : null]);
     }
   };
-  const revokeGrant = (id: string, now: number) => {
+  const revokeGrant = async (sp: Tx, id: string, now: number) => {
     testPause("hosted:revoke:in-txn");
     db.run("UPDATE oauth_grants SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL", [now, id]);
-    endHostedWhere(hosted, db, "revoked", now, row => row.grant_id === id);
+    await endHostedWhere(hosted, sp, "revoked", now, row => row.grant_id === id);
   };
   // A credential whose grant is live and whose service is enabled (#270 D2).
   const liveCredential = (clientId: string, now: number) => !clientLookup(clientId, now) ? undefined :
@@ -2068,10 +2100,10 @@ function oauthOps(db: Database, hosted: HostedStoreOf): OAuthOps {
     !!db.query<{ hash: string }, [string | number, string]>(
       `UPDATE oauth_codes SET ${column} = ? WHERE hash = ? AND grant_id IS NULL AND session_id IS NULL RETURNING hash`).get(minted, h);
   // A replayed code revokes what it minted: the code leaked, so the grant or session may have too.
-  const grantCodeReplay = (id: string, now: number) => {
+  const grantCodeReplay = async (sp: Tx, id: string, now: number) => {
     const g = grant(id);
     if (!g || g.expiresAt <= now) return missing;
-    revokeGrant(g.id, now);
+    await revokeGrant(sp, g.id, now);
     audit("oauth.code_replay_revoked", g, now, { level: "warning" });
     return { status: "replay" } as const;
   };
@@ -2080,8 +2112,8 @@ function oauthOps(db: Database, hosted: HostedStoreOf): OAuthOps {
     sessionAudit("oauth.code_replay_revoked", c, sessionId, now, { level: "warning" });
     return { status: "replay" } as const;
   };
-  const refreshReplay = (g: OAuthGrant, now: number) => {
-    revokeGrant(g.id, now);
+  const refreshReplay = async (sp: Tx, g: OAuthGrant, now: number) => {
+    await revokeGrant(sp, g.id, now);
     audit("oauth.refresh_replay_revoked", g, now, { level: "warning" });
     return { status: "replay" } as const;
   };
@@ -2154,14 +2186,14 @@ function oauthOps(db: Database, hosted: HostedStoreOf): OAuthOps {
       if (row.grant_id !== null ? !live(grant(row.grant_id), now) : row.session_id !== null ? !liveSession(row.session_id) : row.expires_at <= now) return undefined;
       return [...c.scopes];
     },
-    redeemCode(input, now) {
-      return db.transaction(() => {
+    redeemCode(tx, input, now) {
+      return tx.savepoint(async sp => {
         const p = presented(input, now);
         if ("status" in p) return p;
         const { c, row } = p;
         // A login code, spent or not, never becomes a grant (#928 D8).
         if (row.session_id !== null || c.scopes.includes(LOGIN_SCOPE)) return invalid;
-        if (row.grant_id !== null) return grantCodeReplay(row.grant_id, now);
+        if (row.grant_id !== null) return grantCodeReplay(sp, row.grant_id, now);
         const unusable = usable(c, row, now);
         if (unusable) return unusable;
         if (!grantInput(input, c, now)) return invalid;
@@ -2174,12 +2206,12 @@ function oauthOps(db: Database, hosted: HostedStoreOf): OAuthOps {
         if (!spendCode("grant_id", g.id, input.codeHash)) {
           db.run("DELETE FROM oauth_grants WHERE id = ?", [g.id]);
           const winner = codeRow(input.codeHash)?.grant_id;
-          return winner ? grantCodeReplay(winner, now) : missing;
+          return winner ? grantCodeReplay(sp, winner, now) : missing;
         }
         insertPair(input.tokens, g.id, now);
         audit("oauth.grant_issued", g, now);
         return ok({ grant: g, tokens: input.tokens });
-      }).immediate();
+      });
     },
     redeemLoginCode(input, now) {
       return db.transaction(() => {
@@ -2211,9 +2243,9 @@ function oauthOps(db: Database, hosted: HostedStoreOf): OAuthOps {
       const g: OAuthGrant = JSON.parse(row.data);
       return g.clientId === clientId && g.resource === resource ? g : undefined;
     },
-    rotateRefresh(input, now) {
+    async rotateRefresh(tx, input, now) {
       if (!lookup(input.refreshHash, now)) return invalid;
-      return db.transaction(() => {
+      return tx.savepoint(async sp => {
         testPause("oauth:refresh:in-txn");
         const t = token(input.refreshHash);
         if (!t || t.kind !== "refresh") return missing;
@@ -2221,7 +2253,7 @@ function oauthOps(db: Database, hosted: HostedStoreOf): OAuthOps {
         if (!g || !rotationBinding(g, input)) return invalid;
         if (!live(g, now)) return invalid;
         // A recognized ancestor revokes even after its sliding expiry; tombstones outlive it.
-        if (t.spent_at !== null) return refreshReplay(g, now);
+        if (t.spent_at !== null) return refreshReplay(sp, g, now);
         if (t.revoked_at !== null || t.expires_at <= now || !successorInput(input, now)) return invalid;
         const tokens = clampPair(input.tokens, g.expiresAt);
         insertPair(tokens, g.id, now);
@@ -2231,23 +2263,23 @@ function oauthOps(db: Database, hosted: HostedStoreOf): OAuthOps {
           WHERE hash = ? AND kind = 'refresh' AND spent_at IS NULL AND revoked_at IS NULL AND expires_at > ? RETURNING hash`).get(now, input.refreshHash, now);
         if (!spent) {
           db.run("DELETE FROM oauth_tokens WHERE hash IN (?, ?)", [tokens.accessHash, tokens.refreshHash]);
-          return token(input.refreshHash)?.spent_at != null ? refreshReplay(g, now) : invalid;
+          return token(input.refreshHash)?.spent_at != null ? refreshReplay(sp, g, now) : invalid;
         }
         audit("oauth.refreshed", g, now);
         return ok({ grant: g, tokens });
-      }).immediate();
+      });
     },
-    revokeToken(h, clientId, now) {
+    async revokeToken(tx, h, clientId, now) {
       if (!lookup(h, now)) return;
-      db.transaction(() => {
+      await tx.savepoint(async sp => {
         const t = token(h);
         if (!t) return;
         const g = grant(t.grant_id);
         if (!g || g.clientId !== clientId) return;
-        if (t.kind === "refresh") revokeGrant(g.id, now);
+        if (t.kind === "refresh") await revokeGrant(sp, g.id, now);
         else db.run("UPDATE oauth_tokens SET revoked_at = ? WHERE hash = ? AND revoked_at IS NULL", [now, h]);
         audit("oauth.revoked", g, now, { kind: t.kind });
-      }).immediate();
+      });
     },
     findActiveAccess(h, resource, requiredScopes, now) {
       if (!accessLookup(h, requiredScopes, now)) return undefined;
@@ -2276,25 +2308,35 @@ function oauthOps(db: Database, hosted: HostedStoreOf): OAuthOps {
       return !!db.query(`SELECT 1 FROM oauth_grants g JOIN users u ON u.id = g.user_id
         WHERE g.id = ? AND g.revoked_at IS NULL AND g.expires_at > ? AND u.disabled_at IS NULL`).get(id, now);
     },
-    revokePreBuiltinGrants(clientIds, now, key = "builtin_clients") {
-      if (!time(now)) throw new RangeError("invalid OAuth cutover time");
-      return db.transaction(() => {
-        // The key is claimed first: a second run, or on Postgres a second pod booting at once, finds it taken and returns
-        // 0 without revoking or auditing anything (postgres-server.md D3, the boot cutover row; pg/oauth.pg.test.ts T-C4-10).
-        // Its value is the time of the first run.
-        if (!db.query("INSERT INTO server_state(key, value) VALUES (?, ?) ON CONFLICT(key) DO NOTHING RETURNING key").get(key, now)) return 0;
-        const ids = JSON.stringify(clientIds);
-        // An operator client could use these IDs before #429; its grants and codes must not
-        // become a built-in's (write-capable, refreshed with no secret).
-        const grants = db.query<{ id: string }, [string]>(
-          "SELECT id FROM oauth_grants WHERE revoked_at IS NULL AND json_extract(data, '$.clientId') IN (SELECT value FROM json_each(?))").all(ids);
+    // Not async: its no-grant run answers with an already-resolved promise, so a boot holds the write queue no longer
+    // than before C10d2-a (a request's posted audit row lands as it did).
+    revokePreBuiltinGrants(tx, clientIds, now, key = "builtin_clients") {
+      if (!time(now)) return Promise.reject(new RangeError("invalid OAuth cutover time"));
+      // The key is claimed first: a second run, or on Postgres a second pod booting at once, finds it taken and returns
+      // 0 without revoking or auditing anything (postgres-server.md D3, the boot cutover row; pg/oauth.pg.test.ts T-C4-10).
+      // Its value is the time of the first run. A run with no grant to revoke writes synchronously, as before C10d2-a,
+      // so a boot holds the write queue no longer than it did.
+      const ids = JSON.stringify(clientIds);
+      const claim = () => !!db.query("INSERT INTO server_state(key, value) VALUES (?, ?) ON CONFLICT(key) DO NOTHING RETURNING key").get(key, now);
+      const dropCodes = () => db.run("DELETE FROM oauth_codes WHERE grant_id IS NULL AND json_extract(data, '$.clientId') IN (SELECT value FROM json_each(?))", [ids]);
+      // An operator client could use these IDs before #429; its grants and codes must not
+      // become a built-in's (write-capable, refreshed with no secret).
+      const live = () => db.query<{ id: string }, [string]>(
+        "SELECT id FROM oauth_grants WHERE revoked_at IS NULL AND json_extract(data, '$.clientId') IN (SELECT value FROM json_each(?))").all(ids);
+      if (!live().length) {
+        try { db.transaction(() => { if (claim()) dropCodes(); })(); } catch (e) { return Promise.reject(e); }
+        return Promise.resolve(0);
+      }
+      return tx.savepoint(async sp => {
+        if (!claim()) return 0;
+        const grants = live();
         for (const { id } of grants) {
-          revokeGrant(id, now);
+          await revokeGrant(sp, id, now);
           audit("oauth.builtin_client_grant_revoked", grant(id)!, now);
         }
-        db.run("DELETE FROM oauth_codes WHERE grant_id IS NULL AND json_extract(data, '$.clientId') IN (SELECT value FROM json_each(?))", [ids]);
+        dropCodes();
         return grants.length;
-      }).immediate();
+      });
     },
     cleanup(now) {
       if (!time(now)) throw new RangeError("invalid OAuth cleanup time");
@@ -2338,16 +2380,16 @@ function oauthOps(db: Database, hosted: HostedStoreOf): OAuthOps {
         return secret ? ok({ secretId: secret.id, userId: c.userId }) : { status: "capacity" } as const;
       }).immediate();
     },
-    revokeServiceCredential(clientId, now) {
+    async revokeServiceCredential(tx, clientId, now) {
       if (!clientLookup(clientId, now)) return invalid;
-      return db.transaction(() => {
+      return tx.savepoint(async sp => {
         const c = db.query<{ grant_id: string; user_id: number }, [string]>(`SELECT c.grant_id, c.user_id FROM service_credentials c
           JOIN oauth_grants g ON g.id = c.grant_id WHERE c.client_id = ? AND g.revoked_at IS NULL`).get(clientId);
         if (!c) return missing;
         // The grant's revocation ends every session attached to it here, in this transaction (D2, #226 §3.4).
-        revokeGrant(c.grant_id, now);
+        await revokeGrant(sp, c.grant_id, now);
         return ok({ userId: c.user_id });
-      }).immediate();
+      });
     },
     revokeServiceSecret(secretId, now) {
       if (!secretLookup(secretId, now)) return invalid;
@@ -2402,38 +2444,13 @@ function oauthOps(db: Database, hosted: HostedStoreOf): OAuthOps {
   };
 }
 
-// The server's mail as core's session end reads it (a MailPort): repo.sessionEnd.end's, and the hosted store's child
-// ends (#475). Exported for its test.
-export function mailPort(db: Database): MailPort {
-  return {
-    unread(id) {
-      return db.query<{ id: number; sender: string }, [string]>(
-        `SELECT m.id, m.sender FROM messages m
-          WHERE m.recipient_type = 'user' AND m.recipient = ?1 AND m.sender <> ?1
-            AND m.id > COALESCE((SELECT last_seen_id FROM mailbox_cursors
-                                  WHERE address = ?1 AND stream_type = 'direct' AND stream_ref = ?1), 0)
-          ORDER BY m.id`,
-      ).all(id);
-    },
-    bounce(from, to, parentId, body, now) {
-      db.query(
-        // A system DM: never the human mark (#1364).
-        `INSERT INTO messages (sender, sender_id, recipient_type, recipient, body, parent_id, created_at, pending, kind, human)
-         VALUES (?1, ?1, 'user', ?2, ?3, ?4, ?5, 0, 'bounce', 0)`,
-      ).run(from, to, body, parentId, now);
-    },
-    dropReader(id) {
-      db.query(`DELETE FROM mailbox_cursors WHERE address = ?`).run(id);
-      db.query(`DELETE FROM dm_acks WHERE reader = ?`).run(id);
-    },
-  };
-}
-
 // The writes take the body's `Tx` (#807 P1c-11), resolved to its connection before any argument is read, so a
 // kept `Tx` is refused whatever the call; the reads take a `Read` the same way (P1c-12).
-// `writesOn`: the writes bound to a connection a store already resolved from its caller's handle (the users, sessions and OAuth stores).
-type HostedStoreOf = RepoHosted & { writesOn(c: Database): HostedWrites };
-function makeHostedStore(db: Database): HostedStoreOf {
+// `ends`: the store's two ends unwrapped (no change notice), for the users, sessions and OAuth stores' revokes, which
+// notify themselves.
+type HostedStoreOf = RepoHosted & { ends: HostedEnds };
+// `port`: the session end a released child's ID ends through (SessionEndPort), injected by openDatabase's caller.
+function makeHostedStore(db: Database, port: () => SessionEndPort): HostedStoreOf {
   // The child IDs ended since the last take, queued at commit by whichever connection ended them (#475 item 1).
   const ended: { list: EndedChild[] } = { list: [] };
   const ops = new WeakMap<Database, HostedWrites>();
@@ -2444,8 +2461,9 @@ function makeHostedStore(db: Database): HostedStoreOf {
   };
   const on = (tx: Tx): HostedWrites => writesOn(sqliteOf(tx));
   const lockOn = (tx: Tx) => { const conn = sqliteOf(tx); if (!isTx(tx)) throw new Error("a hosted lock needs the body's Tx, not a pool Read"); return conn; };
+  const ends = hostedEnds(ended, port);
   const store: HostedStoreOf = {
-    writesOn,
+    ends,
     write: (fn, committed) => queued(db, fn, committed),
     subscribe: () => () => {},
     get: async (r, id) => hostedRow(sqliteOf(r), id),
@@ -2480,13 +2498,13 @@ function makeHostedStore(db: Database): HostedStoreOf {
       AND (h.root_session_id IS NOT NULL OR (h.lease_deadline IS NULL AND NOT EXISTS (SELECT 1 FROM alias_holds a WHERE a.id = h.session_id)))`).all(cutoff),
     disabled: async (r) => sqliteOf(r).query<HostedSession, []>(
       "SELECT * FROM hosted_sessions WHERE user_id IN (SELECT id FROM users WHERE disabled_at IS NOT NULL) AND +root_session_id IS NULL").all(),
-    childEnd: async (tx, ...a) => on(tx).childEnd(...a),
+    childEnd: ends.childEnd,
     takeEnded() {
       const taken = ended.list;
       ended.list = [];
       return taken;
     },
-    end: async (tx, ...a) => on(tx).end(...a),
+    end: ends.end,
     lose: async (tx, ...a) => on(tx).lose(...a),
     lost: async (r, session, reader) => hostedLostOf(sqliteOf(r))(session, `${LOST_READ[reader]} IS NULL`),
     tellLost: async (tx, ...a) => on(tx).tellLost(...a),
@@ -2515,30 +2533,77 @@ const hostedLostOf = (db: Database) => (session: string, where: string): HostedL
   `SELECT alias, reason, was_primary FROM hosted_alias_lost WHERE session_id = ? AND ${where} ORDER BY at, rowid`,
 ).all(session).map(r => ({ alias: r.alias, reason: r.reason, primary: r.was_primary === 1 }));
 
-type HostedWriteName = "park" | "unpark" | "start" | "insert" | "update" | "touch" | "childEnd" | "end" | "lose" | "tellLost" | "reportLost" | "seeLost" | "forgetLost" | "heartbeat";
-// The hosted store's writes without their handle, bound to one connection.
-// Synchronous: `endHostedWhere` runs them inside the users and OAuth stores' synchronous transactions (#807 P3 A6e1).
+type HostedWriteName = "park" | "unpark" | "start" | "insert" | "update" | "touch" | "lose" | "tellLost" | "reportLost" | "seeLost" | "forgetLost" | "heartbeat";
+// The hosted store's synchronous writes without their handle, bound to one connection.
 type HostedWrites = { [K in HostedWriteName]: HostedStore[K] extends (tx: Tx, ...a: infer A) => infer R ? (...a: A) => Awaited<R> : never };
-function hostedWrites(db: Database, ended: { list: EndedChild[] }): HostedWrites {
-  const get = (id: string) => hostedRow(db, id);
-  const audit = (session: string, action: AuditAction, detail: Record<string, unknown>, now: number) => {
-    const owner = db.query<{ email: string; client_id: string }, [string]>(`SELECT u.email, o.client_id FROM hosted_ownerships o JOIN users u ON u.id = o.user_id
-      WHERE o.session_id = ? ORDER BY o.id DESC LIMIT 1`).get(session);
-    insertAudit(db, now, owner?.email ?? null, action, session, JSON.stringify({ ...detail, client_id: owner?.client_id ?? null }));
-  };
+// db.ts hostedWrites' audit: the session's latest ownership names the actor and the client.
+function hostedAudit(db: Database, session: string, action: AuditAction, detail: Record<string, unknown>, now: number): void {
+  const owner = db.query<{ email: string; client_id: string }, [string]>(`SELECT u.email, o.client_id FROM hosted_ownerships o JOIN users u ON u.id = o.user_id
+    WHERE o.session_id = ? ORDER BY o.id DESC LIMIT 1`).get(session);
+  insertAudit(db, now, owner?.email ?? null, action, session, JSON.stringify({ ...detail, client_id: owner?.client_id ?? null }));
+}
+
+type HostedEnds = Pick<HostedStore, "childEnd" | "end">;
+// The hosted store's two ends, on the caller's Tx (#807 P3 C10d2-a): async, since a released child's ID ends through
+// the session-end port, the server's end composed over the Repo's groups.
+function hostedEnds(ended: { list: EndedChild[] }, port: () => SessionEndPort): HostedEnds {
   // A released child's ID ends in the release's transaction, with its reason (#475 item 1): left unended,
   // nothing owns it, and the next start would end it as a WSS leftover. The ends' wakes wait in `ended`,
-  // queued at commit, for the application to run (`takeEnded`).
-  const mail = mailPort(db);
-  const coreAudit = (now: number): AuditSink => (action, actor, target, detail) =>
-    insertAudit(db, now, actor, action, target, detail ? JSON.stringify(detail) : null);
-  const endChild = (child: string, why: string, now: number) => {
-    const end = endSession(db, mail, child, { why, now, audit: coreAudit(now) });
+  // queued at commit, for the application to run (`takeEnded`). Its id.ended row goes to access_log at `now`.
+  const endChild = async (tx: Tx, db: Database, child: string, why: string, now: number) => {
+    const audit: EndAuditSink = async (action, actor, target, detail) => insertAudit(db, now, actor, action, target, detail ? JSON.stringify(detail) : null);
+    const end = await port().end(tx, child, { why, now, audit });
     if (!end.ended) return;
     const bounces = db.query<MessageRow, [string, number]>(`SELECT ${MSG_COLS} FROM messages WHERE sender = ? AND kind = 'bounce' AND created_at >= ? ORDER BY id`).all(child, now);
     // Queued at commit, so a rolled-back release wakes nobody and bounces nothing.
     afterCommit(db, () => { ended.list.push({ id: child, at: now, wake: end.wake, bounces }); });
   };
+  return {
+    async childEnd(tx, session, now, reason) {
+      const db = sqliteOf(tx);
+      const row = hostedRow(db, session);
+      // An eviction re-checks the row it ends: a request that woke the child since the sweep's read keeps it (#807 P3 C8).
+      if (!row?.root_session_id || (reason === "evicted" && row.parked_at === null)) return;
+      db.run("DELETE FROM hosted_sessions WHERE session_id = ?", [session]);
+      hostedAudit(db, row.root_session_id, "hosted.child_released", { child: session, reason }, now);
+      await endChild(tx, db, session, reason, now);
+    },
+    async end(tx, session, reason, now, deadline, idleBefore) {
+      const db = sqliteOf(tx);
+      const row = hostedRow(db, session);
+      if (!row || row.root_session_id || (deadline !== undefined && row.lease_deadline !== deadline)) return false;
+      // An idle end re-checks idleness on the row it ends: a touch since the sweep's read keeps it (#807 P3 C8).
+      if (idleBefore !== undefined && !(row.last_seen_at < idleBefore)) return false;
+      testPause(reason === "expired" ? "hosted:lease-expire:in-txn" : "hosted:release:in-txn");
+      // The children in start order, whatever order the DELETE returns them in.
+      const children = db.query<HostedSession, [number]>("DELETE FROM hosted_sessions WHERE ownership_id = ? RETURNING *").all(row.ownership_id)
+        .sort((a, b) => a.created_at - b.created_at || (a.session_id < b.session_id ? -1 : a.session_id > b.session_id ? 1 : 0));
+      db.run("UPDATE hosted_ownerships SET ended_at = ?, end_reason = ? WHERE id = ? AND ended_at IS NULL", [now, reason, row.ownership_id]);
+      // A hosted root's ID row is never ended (the ID is the store's), so a tools-only root's writes_as would keep the
+      // alias in use (aliasUser, aliasUses) after its ownership ends; the next ownership restates it. The
+      // launcher flag (#473) is the ownership's too: a resumed session that no longer declares one isn't one. Clearing
+      // it is audited as its setting is (#532), so the trail shows when a hosted launcher stopped being one.
+      const launcher = db.query<{ launcher: number | null }, [string]>("SELECT launcher FROM ids WHERE id = ?").get(session)?.launcher === 1;
+      db.run("UPDATE ids SET writes_as = NULL, launcher = 0 WHERE id = ?", [session]);
+      if (launcher) hostedAudit(db, session, "handle.launcher_set", { on: false, ownership: row.ownership_id, reason }, now);
+      // Every hold the ownership has, not one name's (#451): ending it releases them all, oldest first (HOLD_ORDER), so
+      // its binding events land in the order Postgres writes them (pg/hosted.ts).
+      for (const { address } of db.query<{ address: string }, [string]>(`SELECT address FROM alias_holds WHERE id = ? ${HOLD_ORDER}`).all(session)) {
+        dropHold(db, address, session);
+        logBinding(db, session, address, "released", reason, now);
+      }
+      for (const child of children) if (child.root_session_id) {
+        hostedAudit(db, session, "hosted.child_released", { child: child.session_id, reason }, now);
+        await endChild(tx, db, child.session_id, reason, now);
+      }
+      if (row.lease_deadline !== null) hostedAudit(db, session, "hosted.lease_closed", { reason, ownership: row.ownership_id }, now);
+      return true;
+    },
+  };
+}
+
+function hostedWrites(db: Database, ended: { list: EndedChild[] }): HostedWrites {
+  const audit = (session: string, action: AuditAction, detail: Record<string, unknown>, now: number) => hostedAudit(db, session, action, detail, now);
   const lostOf = hostedLostOf(db);
   // Marks `where`'s rows' `column` in one statement and returns what it marked, oldest first, so two takers get each row
   // once between them (#807 P3 C8); then deletes the rows both readers took.
@@ -2577,44 +2642,6 @@ function hostedWrites(db: Database, ended: { list: EndedChild[] }): HostedWrites
     touch(session, now) {
       db.run("UPDATE hosted_sessions SET last_seen_at = ? WHERE session_id = ?", [now, session]);
     },
-    childEnd(session, now, reason) {
-      const row = get(session);
-      // An eviction re-checks the row it ends: a request that woke the child since the sweep's read keeps it (#807 P3 C8).
-      if (!row?.root_session_id || (reason === "evicted" && row.parked_at === null)) return;
-      db.run("DELETE FROM hosted_sessions WHERE session_id = ?", [session]);
-      audit(row.root_session_id, "hosted.child_released", { child: session, reason }, now);
-      endChild(session, reason, now);
-    },
-    end(session, reason, now, deadline, idleBefore) {
-      const row = get(session);
-      if (!row || row.root_session_id || (deadline !== undefined && row.lease_deadline !== deadline)) return false;
-      // An idle end re-checks idleness on the row it ends: a touch since the sweep's read keeps it (#807 P3 C8).
-      if (idleBefore !== undefined && !(row.last_seen_at < idleBefore)) return false;
-      testPause(reason === "expired" ? "hosted:lease-expire:in-txn" : "hosted:release:in-txn");
-      // The children in start order, whatever order the DELETE returns them in.
-      const children = db.query<HostedSession, [number]>("DELETE FROM hosted_sessions WHERE ownership_id = ? RETURNING *").all(row.ownership_id)
-        .sort((a, b) => a.created_at - b.created_at || (a.session_id < b.session_id ? -1 : a.session_id > b.session_id ? 1 : 0));
-      db.run("UPDATE hosted_ownerships SET ended_at = ?, end_reason = ? WHERE id = ? AND ended_at IS NULL", [now, reason, row.ownership_id]);
-      // A hosted root's ID row is never ended (the ID is the store's), so a tools-only root's writes_as would keep the
-      // alias in use (aliasUser, aliasUses) after its ownership ends; the next ownership restates it. The
-      // launcher flag (#473) is the ownership's too: a resumed session that no longer declares one isn't one. Clearing
-      // it is audited as its setting is (#532), so the trail shows when a hosted launcher stopped being one.
-      const launcher = db.query<{ launcher: number | null }, [string]>("SELECT launcher FROM ids WHERE id = ?").get(session)?.launcher === 1;
-      db.run("UPDATE ids SET writes_as = NULL, launcher = 0 WHERE id = ?", [session]);
-      if (launcher) audit(session, "handle.launcher_set", { on: false, ownership: row.ownership_id, reason }, now);
-      // Every hold the ownership has, not one name's (#451): ending it releases them all, oldest first (HOLD_ORDER), so
-      // its binding events land in the order Postgres writes them (pg/hosted.ts).
-      for (const { address } of db.query<{ address: string }, [string]>(`SELECT address FROM alias_holds WHERE id = ? ${HOLD_ORDER}`).all(session)) {
-        dropHold(db, address, session);
-        logBinding(db, session, address, "released", reason, now);
-      }
-      for (const child of children) if (child.root_session_id) {
-        audit(session, "hosted.child_released", { child: child.session_id, reason }, now);
-        endChild(child.session_id, reason, now);
-      }
-      if (row.lease_deadline !== null) audit(session, "hosted.lease_closed", { reason, ownership: row.ownership_id }, now);
-      return true;
-    },
     lose(session, lost, now) {
       db.run(`INSERT INTO hosted_alias_lost(session_id, alias, reason, was_primary, at) VALUES (?, ?, ?, ?, ?)
         ON CONFLICT(session_id, alias) DO UPDATE SET reason = excluded.reason, was_primary = excluded.was_primary, at = excluded.at, told_at = NULL, reported_at = NULL, seen_at = NULL`,
@@ -2639,7 +2666,7 @@ function hostedWrites(db: Database, ended: { list: EndedChild[] }): HostedWrites
 // which the application drains (#475 item 1).
 // `db`: the connection of the caller's transaction, already resolved from its handle; the candidates are read on it
 // too (the same rows `all` reads).
-function endHostedWhere(hosted: HostedStoreOf, db: Database, reason: HostedEnd, now: number, predicate: (row: HostedSession) => boolean) {
-  const w = hosted.writesOn(db);
-  for (const row of db.query<HostedSession, []>("SELECT * FROM hosted_sessions WHERE parked_at IS NULL").all()) if (!row.root_session_id && predicate(row)) w.end(row.session_id, reason, now);
+async function endHostedWhere(hosted: HostedStoreOf, tx: Tx, reason: HostedEnd, now: number, predicate: (row: HostedSession) => boolean): Promise<void> {
+  const rows = sqliteOf(tx).query<HostedSession, []>("SELECT * FROM hosted_sessions WHERE parked_at IS NULL").all();
+  for (const row of rows) if (!row.root_session_id && predicate(row)) await hosted.ends.end(tx, row.session_id, reason, now);
 }

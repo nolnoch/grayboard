@@ -10,7 +10,7 @@ import { startServer } from "../../src/server/app.ts";
 import { DEFAULT_AUTH_FAIL_LIMIT, DEFAULT_HELLO_LIMIT } from "../../src/server/rate_limit.ts";
 import { DEFAULT_TRUSTED_PROXIES } from "../../src/server/client_addr.ts";
 import { OPENCODE_CLIENT } from "../../src/server/oauth-config.ts";
-import { createBoard, post, subscribe } from "../../src/core/boards.ts";
+import { createBoard, openAccess, post, setAccess, subscribe } from "../../src/core/boards.ts";
 import { seed } from "../support/seed.ts";
 import { stubProvider } from "../support/stub_provider.ts";
 
@@ -36,6 +36,7 @@ assert.equal(setupOpenCode(options, "").changed, false);
 assert.equal(readFileSync(configPath, "utf8"), generated);
 let google = 0, cimd = 0, receipts = 0, models = 0, callbackOrigin = "";
 const app = startServer({ dbPath: join(root, "config.sqlite"), blobDir: join(root, "config-blobs"), httpPort: 0, googleClientId: "fixture", googleClientSecret: "fixture-secret", orgDomain: "example.com", publicUrl: issuer, messageRetentionDays: 90, auditRetentionDays: 90, devAuth: false, admins: [], oauthClients: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES }, { hostname: "127.0.0.1", background: false, oauth: { providers: [stubProvider(async () => { google++; return { email: "you@example.com", displayName: "Fixture", subject: "google-you@example.com" }; })], cimd: { resolve: async host => { assert.equal(host, "opencode.ai"); return [{ address: "93.184.216.34", family: 4 }]; }, read: async url => { assert.equal(url.href, OPENCODE_CLIENT); cimd++; return JSON.stringify({ client_id: OPENCODE_CLIENT, client_name: "OpenCode", token_endpoint_auth_method: "none", redirect_uris: ["http://127.0.0.1/callback"], grant_types: ["authorization_code", "refresh_token"], response_types: ["code"] }); } } } });
+setAccess(app.db, openAccess(app.db)); // core seeds on a server database opt in to local mode's open Access
 const fetch0 = globalThis.fetch;
 globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
   const req = new Request(input, init), url = new URL(req.url);

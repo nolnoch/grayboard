@@ -135,5 +135,10 @@ export function makePgClaims({ clock }: { clock: () => number }): ClaimsStore {
       await insertClaimEvent(pgOf(tx), "release", gone.holder, { ...gone, note: gone.expires_at <= now ? "ack (late)" : "ack" }, now);
       return true;
     },
+    // A session end's (#807 P3 C10d2-a): by key, where SQLite's order is its scan's.
+    async heldBy(r, holder, now) {
+      const rows: Row[] = await pgOf(r)`SELECT key FROM claims WHERE holder = ${holder} AND expires_at > ${now} ORDER BY key COLLATE "C"`;
+      return rows.map(x => x.key as string);
+    },
   };
 }

@@ -1,13 +1,14 @@
 import { createApplication } from "../../src/server/application.ts";
 import { createDelivery } from "../../src/server/delivery.ts";
 import { openDatabase } from "../../src/server/db.ts";
+import { sessionEndPort } from "../../src/server/session_end.ts";
 import { createHostedSessions, sessionContext } from "../../src/server/hosted.ts";
 import { OPENCODE_SESSION_META } from "../../src/server/oauth-config.ts";
 import type { OAuthPrincipal } from "../../src/server/oauth.ts";
 
 const [path, blobs, raw] = process.argv.slice(2);
 const input = JSON.parse(raw!) as { principal: OAuthPrincipal; operation: "bind" | "register" | "end" | "revoke" | "sweep" | "receipt"; now: number; name?: string; rawSession?: string; child?: string; refreshHash?: string; sweepAt?: number };
-const { db, repo } = openDatabase(path!, { blobDir: blobs! });
+const { db, repo } = openDatabase(path!, { blobDir: blobs!, sessionEnd: sessionEndPort("team") });
 const application = createApplication(repo);
 let now = input.now;
 const isAuthorized = (p: OAuthPrincipal, r = repo.read) => repo.oauth.isGrantActive(r, p.grantId, now);

@@ -1,19 +1,21 @@
 // The server's board parity fixture (#807 P3 B5a0, B5b1b1): four users, two teams of different policies, person and
 // team aliases, a live and an ended session ID, a live one bound to a team's name (#1273 L4), a tools-only one writing
 // as a team's name, and a service one user may invoke (#1286). The async board access and the ported board tools are each compared
-// against the sync seam core still runs over it (src/server/board-access-parity.test.ts, board-tools-parity.test.ts).
+// against core run over it with the synchronous access oracle (tests/support/sync_access.ts; src/server/board-access-parity.test.ts,
+// board-tools-parity.test.ts).
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { idAddress } from "../../src/core/bindings.ts";
 import { insertUpload } from "../../src/core/attachments.ts";
 import { holdAlias } from "../../src/core/bindings.ts";
-import { archiveBoard, createBoard, markHuman, muteThread, post, registerId, setSubscription, subscribe, touchAlias, type Board, type CoreDb } from "../../src/core/boards.ts";
+import { archiveBoard, createBoard, markHuman, muteThread, post, registerId, setAccess, setSubscription, subscribe, touchAlias, type Board, type CoreDb } from "../../src/core/boards.ts";
 import type { AliasScopeOf } from "../../src/server/access.ts";
 import { openDatabase, type Repo } from "../../src/server/db.ts";
 import type { Read, Tx } from "../../src/server/store/tx.ts";
 import { scratchDbPath } from "./scratch_db.ts";
 import { seed } from "./seed.ts";
+import { serverAccess } from "./sync_access.ts";
 import { grantOwner } from "./roles.ts";
 
 export const person = (email: string, name: string) => ({ scope_kind: "person" as const, scope_ref: email, name });
@@ -48,6 +50,9 @@ export const AUTHORS = [`${W}/be`, `${B}/be`, `${E}/be`, `${D}/be`, WADE_ID, "en
  */
 export async function openBoardParity(): Promise<{ repo: Repo; db: CoreDb }> {
   const { repo, db } = openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
+  // Core's functions run over this database as the oracle the server's ports are compared against: the synchronous
+  // access the server installed until #807 P3 C10d2-a (tests/support/sync_access.ts).
+  setAccess(db, serverAccess(repo, db));
   await seed(repo, async tx => {
     const [wade, bob, eve] = [await repo.users.upsertByEmail(tx, W, null), await repo.users.upsertByEmail(tx, B, null), await repo.users.upsertByEmail(tx, E, null)];
     await repo.users.upsertByEmail(tx, D, null);
@@ -74,7 +79,8 @@ export async function openBoardParity(): Promise<{ repo: Repo; db: CoreDb }> {
     repo.coreOn(tx).prepare(`INSERT INTO role_bindings (principal_id, role, scope_id, granted_by, granted_at)
       SELECT h.id, 'service_invoke', s.id, NULL, 0 FROM principals h, principals s WHERE h.name = ? AND s.name = 'svc'`).run(W);
   });
-  await seed(repo, tx => repo.sessionEnd.end(tx, ENDED_ID, { why: "test", now: 5 }));
+  // Its row only: it holds, owns and was sent nothing.
+  await seed(repo, tx => repo.sessionEnd.end(tx, ENDED_ID, 5));
   return { repo, db };
 }
 

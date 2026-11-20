@@ -15,7 +15,7 @@ import { issueOAuth } from "../../../tests/helpers/oauth.ts";
 import { OPENCODE_CLIENT } from "../../../src/server/oauth-config.ts";
 import { DEFAULT_HELLO_LIMIT, DEFAULT_AUTH_FAIL_LIMIT } from "../../../src/server/rate_limit.ts";
 import { DEFAULT_TRUSTED_PROXIES } from "../../../src/server/client_addr.ts";
-import { createBoard, post, subscribe } from "../../../src/core/boards.ts";
+import { createBoard, openAccess, post, setAccess, subscribe } from "../../../src/core/boards.ts";
 
 const ORIGIN = "https://grayboard.example.com", ROOT = `ses_${"a".repeat(64)}`;
 
@@ -25,6 +25,7 @@ const ORIGIN = "https://grayboard.example.com", ROOT = `ses_${"a".repeat(64)}`;
 test("a real access-expiry stream close with OpenCode's refresh landing after it keeps the ownership and push delivery (#472)", async () => {
   const dir = mkdtempSync(join(tmpdir(), "rollover-472-"));
   const app = startServer({ dbPath: join(dir, "bus.db"), blobDir: join(dir, "blobs"), httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl: ORIGIN, messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES }, { hostname: "127.0.0.1", background: false });
+  setAccess(app.db, openAccess(app.db)); // core seeds on a server database opt in to local mode's open Access
   const fetch0 = globalThis.fetch;
   globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
     const req = new Request(input, init), url = new URL(req.url);

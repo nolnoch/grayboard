@@ -62,6 +62,7 @@ export function attachmentsContract(backend: AttachmentsBackend): void {
   quota(it);
   unsentAndDrops(it);
   catalog(it);
+  dropUnboundOf(it);
 }
 
 type It = (name: string, fn: (h: AttachmentsHarness) => Promise<void>) => void;
@@ -235,5 +236,24 @@ function catalog(it: It): void {
     expect(await h.write(tx => h.attachments.dropBlobEntry(tx, SHA("z")))).toBe(0);
     expect((await h.blobs()).map(b => b.sha256)).toEqual([SHA("a"), SHA("c")]);
     expect(await h.attachments.unnamedBlobs(h.read)).toEqual([SHA("c")]);
+  });
+}
+
+function dropUnboundOf(it: It): void {
+  // A-E1 (#807 P3 C10d2-a): a session end's uploads.
+  it("dropUnboundOf deletes the uploader's unbound uploads only: bound ones, and other uploaders', stay; the catalog stays", async h => {
+    const m = await h.message(), p = await h.post();
+    const gone = await h.upload(fixture({}));
+    const sent = await h.upload(fixture({ message_id: m }));
+    const posted = await h.upload(fixture({ post_id: p }));
+    const theirs = await h.upload(fixture({ uploader: SIM, principal: THEM }));
+    const sibling = await h.upload(fixture({ uploader: BE }));
+    await h.write(tx => h.attachments.dropUnboundOf(tx, FE));
+    expect((await h.rows()).map(r => r.id)).toEqual([sent, posted, theirs, sibling]);
+    expect((await h.rows()).some(r => r.id === gone)).toBe(false);
+    expect((await h.blobs()).map(b => b.sha256)).toEqual([SHA("a")]);
+    // It rolls back with its body.
+    await expect(h.write(async tx => { await h.attachments.dropUnboundOf(tx, BE); throw new Error("rolled back"); })).rejects.toThrow("rolled back");
+    expect((await h.rows()).map(r => r.id)).toContain(sibling);
   });
 }

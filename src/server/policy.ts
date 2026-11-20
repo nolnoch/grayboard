@@ -2,8 +2,7 @@
 // server makes about who may do what is `decide()`'s, writing nothing. Its rules
 // are generators that yield each storage read they need (#807 P3 A7e): one set of
 // rule bodies, driven by `authorize` over the store's reads on the caller's
-// handle, synchronously over `repo.policyNow` by `authorizeNow` (the SQLite-only
-// loader, for the callers that can't await yet: #807 A7g, B, C for healthz), or with no reads at all by `decidePure`.
+// handle, or with no reads at all by `decidePure`.
 // The caller that owns a requested act records its decision with
 // `recordDecision` (an `authz.decision` row: every deny, and the allows of
 // team management and admin routes); filter checks (board visibility, mention
@@ -14,10 +13,10 @@
 import type { Read } from "./store/tx.ts";
 import { addressParts, type ScopeKind } from "../core/addresses.ts";
 import type { AttachmentReach } from "../core/attachments.ts";
-import type { Principal, Resolver } from "../core/resolver.ts";
+import type { Principal } from "../core/resolver.ts";
 import { HUMAN_NAME, HUMAN_RESERVED } from "../shared/addressing.ts";
 import { writeAudit } from "./audit.ts";
-import type { Alias, InvokeBinding, PrincipalRow, Repo, Team, User } from "./db.ts";
+import type { InvokeBinding, PrincipalRow, Repo, Team, User } from "./db.ts";
 import { RateLimiter, type RateLimit } from "./rate_limit.ts";
 
 // Who besides you can reach your human (your phone, through the Slack
@@ -28,7 +27,7 @@ export type PolicyContext = { humanReach?: HumanReach; admins?: readonly string[
 
 export type ActScope = { scope_kind: ScopeKind; scope_ref: string };
 
-// The verb fixes the resource. msg.send: a requested DM (canSend);
+// The verb fixes the resource. msg.send: a requested DM;
 // human.reach: the same rule as a filter (mentions, thread replies);
 // alias.bind / act_as / scope.act: principal p acting in a scope, for a bind
 // or writes_as, an HTTP `as`, and visibility or the alias sweep (a bind and an
@@ -118,49 +117,32 @@ export type Actor = { user: string | null; address?: string; session?: string };
 const allow = (rule: string, facts: RoleFacts = {}): Decision => ({ allow: true, rule, ...facts });
 const deny = (rule: string, reason: string, code: "forbidden" | "not_found" = "forbidden", facts: Omit<RoleFacts, "binding"> = {}): Decision => ({ allow: false, code, reason, rule, ...facts });
 
-// Every storage read a rule makes, synchronously. `repo.policyNow` implements it (and AccessReadsSync) over the
-// SQLite connection (#807 P3 A7e1): reads in the caller's own transaction see its writes, as routeReads gives them.
-// `PolicyReads` is the same reads as promises, on one handle (A7e3).
-export interface PolicyReadsSync extends Resolver {
-  principalByName(name: string): PrincipalRow | undefined;
-  teamByName(name: string): Team | undefined;
-  isMember(teamId: number, userId: number): boolean;
+// Every storage read a rule makes, on one handle (#807 P3 A7e3): `policyReads` gives them over a Repo's groups.
+export interface PolicyReads {
+  principalOf(address: string): Promise<Principal | null>;
+  principalByName(name: string): Promise<PrincipalRow | undefined>;
+  teamByName(name: string): Promise<Team | undefined>;
+  isMember(teamId: number, userId: number): Promise<boolean>;
   // A user's binding id for a role on the org (teamId null) or a team, if held (#927).
-  roleBinding(userId: number, role: Role, teamId: number | null): number | undefined;
+  roleBinding(userId: number, role: Role, teamId: number | null): Promise<number | undefined>;
   // A principal's service_invoke binding on a service, its own or a team's it's a member of (#270 D6).
-  invokeBinding(holder: Principal, service: string): InvokeBinding | undefined;
-  shareAny(userA: number, userB: number): boolean;
-  shareCollaborative(userA: number, userB: number): boolean;
-  shareDelegating(userA: number, userB: number): boolean;
-  userByEmail(email: string): User | undefined;
+  invokeBinding(holder: Principal, service: string): Promise<InvokeBinding | undefined>;
+  shareAny(userA: number, userB: number): Promise<boolean>;
+  shareCollaborative(userA: number, userB: number): Promise<boolean>;
+  shareDelegating(userA: number, userB: number): Promise<boolean>;
+  userByEmail(email: string): Promise<User | undefined>;
 }
 
-// The alias reads serverAccess's resolveMention makes beside its policy decisions (B5b moves them).
-export interface AccessReadsSync {
-  alias(address: string): Alias | undefined;
-  aliasesNamed(name: string): Alias[];
-}
-
-type ReadName = keyof PolicyReadsSync;
-export type PolicyReads = { [K in ReadName]: (...args: Parameters<PolicyReadsSync[K]>) => Promise<ReturnType<PolicyReadsSync[K]>> };
-type Op = { [K in ReadName]: { read: K; args: Parameters<PolicyReadsSync[K]> } }[ReadName];
+type ReadName = keyof PolicyReads;
+type Op = { [K in ReadName]: { read: K; args: Parameters<PolicyReads[K]> } }[ReadName];
 // A rule: yields the reads it needs, one at a time, and returns its answer.
-type Rule<T> = Generator<Op, T, unknown>;
+export type Rule<T> = Generator<Op, T, unknown>;
 
-function* ask<K extends ReadName>(read: K, ...args: Parameters<PolicyReadsSync[K]>): Generator<Op, ReturnType<PolicyReadsSync[K]>, unknown> {
-  return (yield { read, args } as Op) as ReturnType<PolicyReadsSync[K]>;
+function* ask<K extends ReadName>(read: K, ...args: Parameters<PolicyReads[K]>): Generator<Op, Awaited<ReturnType<PolicyReads[K]>>, unknown> {
+  return (yield { read, args } as Op) as Awaited<ReturnType<PolicyReads[K]>>;
 }
 
-// Runs a rule to its answer, each yielded read answered synchronously from `reads`. A read that throws propagates.
-function drive<T>(g: Rule<T>, reads: PolicyReadsSync): T {
-  for (let s = g.next(); ; ) {
-    if (s.done) return s.value;
-    const { read, args } = s.value;
-    s = g.next((reads[read] as (...a: unknown[]) => unknown).apply(reads, args));
-  }
-}
-
-// The same, each read awaited. The rule resumes only after its read settles, so the reads stay sequential.
+// Runs a rule to its answer, each read awaited. The rule resumes only after its read settles, so the reads stay sequential.
 async function driveAsync<T>(g: Rule<T>, reads: PolicyReads): Promise<T> {
   for (let s = g.next(); ; ) {
     if (s.done) return s.value;
@@ -174,7 +156,7 @@ export type PolicyStores = Pick<Repo, "principals" | "teams" | "roles"> & { user
 
 // Policy's reads on one handle: `r` is the caller's body's `Tx` inside a transaction, so the rule sees its writes,
 // else `repo.read`, committed state (#807 P3 A7e3).
-function policyReads(repo: PolicyStores, r: Read): PolicyReads {
+export function policyReads(repo: PolicyStores, r: Read): PolicyReads {
   return {
     principalByName: (name) => repo.principals.findByName(r, name),
     principalOf: (address) => repo.principals.of(r, address),
@@ -193,12 +175,6 @@ function policyReads(repo: PolicyStores, r: Read): PolicyReads {
 // decision is recorded here, so nothing it returns depends on state an await could change underneath the caller.
 export function authorize(repo: PolicyStores, r: Read, ctx: PolicyContext, req: AuthzRequest): Promise<Decision> {
   return driveAsync(decide(ctx, req), policyReads(repo, r));
-}
-
-// The decision over the SQLite connection's reads, synchronously: the form for callers that can't await yet (#807
-// P3 A7f converts them to `authorize`). The reads see the caller's own transaction when it holds one.
-export function authorizeNow(repo: Repo, ctx: PolicyContext, req: AuthzRequest): Decision {
-  return drive(decide(ctx, req), repo.policyNow);
 }
 
 // The verbs whose rules read no storage: their callers hand over every fact.
@@ -498,24 +474,3 @@ function* humanRule(reach: HumanReach, from: string, to: string): Rule<{ allow: 
   return { allow: yield* ask("shareAny", me.id, them.id), rule: "human.teammates" };
 }
 
-// The pre-seam entry points, as authorizeNow() answers them, for the unit tests
-// that exercise each rule directly (can_send.test.ts, access.test.ts). Nothing
-// outside this module and tests calls them.
-export type SendContext = { db: Repo; now: number; humanReach: HumanReach };
-export type SendTarget = { kind: "user"; address: string };
-export type SendDecision = { allow: true } | { allow: false; code: "forbidden" | "not_found"; reason: string };
-
-const plain = (d: Decision): SendDecision => (d.allow ? { allow: true } : { allow: false, code: d.code, reason: d.reason });
-
-export function canSend(from: string, target: SendTarget, ctx: SendContext): SendDecision {
-  return plain(authorizeNow(ctx.db, { humanReach: ctx.humanReach }, { verb: "msg.send", from, to: target.address }));
-}
-
-export function reachesHuman(repo: Repo, reach: HumanReach, from: string, to: string): boolean {
-  return authorizeNow(repo, { humanReach: reach }, { verb: "human.reach", from, to }).allow;
-}
-
-export function mayActIn(repo: Repo, p: Principal, scope: ActScope): string | null {
-  const d = authorizeNow(repo, {}, { verb: "scope.act", principal: p, scope });
-  return d.allow ? null : d.reason;
-}

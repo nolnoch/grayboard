@@ -13,10 +13,9 @@
 // writer orders the two whatever db.ts does.
 //
 // Also the hosted store's own port: a released child's ID end (PgSessionEndPort).
-import type { AuditSink } from "../../../core/audit.ts";
-import type { EndedSession } from "../../../core/session_end.ts";
 import type { HostedEnd } from "../../hosted-types.ts";
 import type { HostedStore } from "../hosted.ts";
+import type { SessionEndPort } from "../session_end.ts";
 import type { Tx } from "../tx_base.ts";
 import { pgOf } from "./tx.ts";
 
@@ -28,14 +27,13 @@ export type PgHostedEnds = {
 // For stores whose tests don't exercise hosted sessions: ends nothing.
 export const noHosted: PgHostedEnds = { endForGrant: async () => {}, endForUser: async () => {} };
 
-// The session end the Postgres hosted store ends a released child's ID through (#807 P3 C8 decision 7): Repo's
-// `sessionEnd.end` signature (db.ts), restated here so the store needs nothing of db.ts. The real one is the Postgres
-// session end (C10d2), which C11 wires; tests pass a recorder (tests/support/pg_hosted.ts). `audit` is required: core
-// endSession writes id.ended to audit_log without one, a table Postgres doesn't have, so the store always passes the
-// sink that writes it to access_log (pg/audit.ts pgCoreAuditSink, db.ts coreAudit's), and the port writes through it.
-export type PgSessionEndPort = {
-  end(tx: Tx, id: string, opts: { why: string; now: number; audit: AuditSink }): Promise<EndedSession>;
-};
+// The session end the Postgres hosted store ends a released child's ID through (#807 P3 C8 decision 7): the server's
+// end composed over the Repo's groups (src/server/session_end.ts sessionEndPort), injected so the store imports no
+// application code; the same port SQLite's hosted store takes (store/session_end.ts SessionEndPort). C11 wires it once
+// Postgres's sessionEnd.end lands (C10d2-b); tests pass a recorder (tests/support/pg_hosted.ts). Its `audit` is
+// awaited (#807 P3 C10 Q3): the store passes the sink that writes id.ended to access_log on the end's Tx (pg/audit.ts
+// pgCoreAuditSink).
+export type PgSessionEndPort = SessionEndPort;
 
 // The revokes' ends over the hosted store's `end`: every root on the grant, or of the user, locked in session_id order
 // (one order against another revoke), then each ended with its children. Roots only: a child's grant is its root's

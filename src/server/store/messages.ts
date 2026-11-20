@@ -80,4 +80,13 @@ export interface MessagesStore {
   retract(tx: Tx, sender: string, id: number, by: { actor: string | null; session: string | null }): Promise<RetractResult>;
   // Deletes messages older than olderThanMs with their acks and attachments; their replies stay, as roots.
   prune(tx: Tx, olderThanMs: number): Promise<void>;
+  // A session end's reads and writes (#807 P3 C10d2-a). The direct mail to `id` it never read: past its read point
+  // and not sent by itself, acked or not, by id.
+  unreadFor(tx: Tx, id: string): Promise<{ id: number; sender: string }[]>;
+  // A bounce from `from` (the ended ID) to `to`, threaded under the bounced message `parentId`, at `now`: kind
+  // 'bounce', never pending, never the human mark (#1364). The written row, or null when the parent is gone (on
+  // Postgres a retract that committed first; the bounce locks the parent FOR KEY SHARE and writes nothing then).
+  bounce(tx: Tx, from: string, to: string, parentId: number, body: string, now: number): Promise<MessageRow | null>;
+  // Drops `id`'s read points (every stream) and its acks.
+  dropReader(tx: Tx, id: string): Promise<void>;
 }

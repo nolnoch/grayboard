@@ -2,7 +2,7 @@
 // with a fake Slack, and agents as hosted MCP sessions (#282). Linking, the
 // human identity's round trip, who may reach it, and unlinking.
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
-import { subscribe, type ReadResult } from "../../src/core/boards.ts";
+import { type ReadResult } from "../../src/core/boards.ts";
 import type { BoardPostResult } from "../../src/core/tools.ts";
 import { ApplicationError } from "../../src/server/application.ts";
 import type { SendResult } from "../../src/shared/protocol.ts";
@@ -470,7 +470,7 @@ test("#807: a Slack digest the human's replay drains is marked sent", async () =
   await fe.call("board_create", { name: "noise", purpose: "chatter" });
   const repo = srv.app.repo;
   const human = "alice@example.com/human";
-  await seed(repo, tx => subscribe(repo.coreOn(tx), human, "noise", "digest"));
+  await seed(repo, tx => repo.boards.setSubscription(tx, human, "noise", "digest"));
   // A digest-board post wakes nobody: the digest waits for the human's next drain.
   const chatter = await fe.call<BoardPostResult>("board_post", { board: "noise", body: "chatter" });
   const notified = () => (srv.app.db.prepare(`SELECT notified_id FROM subscriptions WHERE handle = ? AND board = 'noise'`).get(human) as { notified_id: number }).notified_id;
@@ -490,7 +490,7 @@ test("#807: a Slack digest drained by a mention's wake, from the queue's holder,
   await be.call("board_create", { name: "desk", purpose: "questions" });
   const repo = srv.app.repo;
   const human = "alice@example.com/human";
-  await seed(repo, tx => subscribe(repo.coreOn(tx), human, "noise", "digest"));
+  await seed(repo, tx => repo.boards.setSubscription(tx, human, "noise", "digest"));
   const chatter = await be.call<BoardPostResult>("board_post", { board: "noise", body: "chatter" });
   const notified = () => (srv.app.db.prepare(`SELECT notified_id FROM subscriptions WHERE handle = ? AND board = 'noise'`).get(human) as { notified_id: number }).notified_id;
   expect(notified()).toBeLessThan(chatter.post_id);

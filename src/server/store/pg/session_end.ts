@@ -10,7 +10,8 @@
 // - pruneEnded is three statements on the caller's Tx with no nested transaction: a keyed row's tombstone is an
 //   upsert (ON CONFLICT (id) DO UPDATE, SQLite's INSERT OR REPLACE), keyed and viewer are booleans, and the count is
 //   the DELETE's. Its DELETE of an ended row waits on a send's KEY SHARE, and that send has read the ID ended.
-// - end is not here yet: it throws until C10d2 composes the end at the server (c10-scope §4).
+// - end (the row-level step of the server's composed end, src/server/session_end.ts) is not here yet: it throws until
+//   C10d2-b (FOR UPDATE of the row, the held aliases as jsonb, the children).
 //
 // Runtime imports stay off bun:sqlite, db.ts and core's SQLite modules (pg/isolation.test.ts): the SQL is restated.
 import { undeliverableFrom } from "../../../core/undeliverable.ts";
@@ -41,7 +42,7 @@ const heldAliases = (v: unknown): string[] => Array.isArray(v) ? v as string[] :
 export function makePgSessionEnd(): SessionEndStore {
   return {
     async end() {
-      throw new Error("sessionEnd.end is not implemented on Postgres until #807 P3 C10d2 (the server-level end, c10-scope §4)");
+      throw new Error("sessionEnd.end is not implemented on Postgres until #807 P3 C10d2-b (the end's row step, c10-scope §4)");
     },
     async refusal(tx, id) {
       const sql = pgOf(tx);

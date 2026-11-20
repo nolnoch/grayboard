@@ -7,7 +7,7 @@ import { pruneMessages, pruneAudit, reclaimFreePages, runRetention } from "./ret
 import { openDatabase, queuedTx, type Repo } from "./db.ts";
 import type { Config } from "./config.ts";
 import { storeAttachment } from "../core/attachments.ts";
-import { createBoard, post, snapshot } from "../core/boards.ts";
+import { createBoard, post, snapshot, openAccess, setAccess } from "../core/boards.ts";
 import { scratchDbPath } from "../../tests/support/scratch_db.ts";
 import { seed } from "../../tests/support/seed.ts";
 
@@ -83,6 +83,7 @@ describe("retention pruning", () => {
   test("post retention signals actual committed boards, isolates failed callbacks, and skips empty runs", async () => {
     const { db, repo: r } = open();
     const config = { messageRetentionDays: 1, auditRetentionDays: 1 } as Config;
+    setAccess(db, openAccess(db)); // core seeds on a server database opt in to local mode's open Access
     // A board reads as missing to an address no principal owns (#284).
     await seed(r, async tx => {
       await r.users.upsertByEmail(tx, "a@example.com", null);

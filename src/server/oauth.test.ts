@@ -25,6 +25,7 @@ import { stubProvider } from "../../tests/support/stub_provider.ts";
 import { GOOGLE_ISSUER } from "./idp_google.ts";
 import { DomainRefused } from "./idp.ts";
 import { REFUSED } from "./oauth.ts";
+import { sessionEndPort } from "./session_end.ts";
 import { exportJWK, generateKeyPair, SignJWT, type JWK, type KeyLike } from "jose";
 import { stubAuthRead } from "../../tests/support/auth_stub.ts";
 
@@ -59,7 +60,7 @@ function makeService(cimd?: import("./oauth-cimd.ts").CimdOptions) {
 beforeEach(() => {
   clock = Date.now(); exchanges = 0;
   dir = mkdtempSync(join(tmpdir(), "gb-oauth-http-"));
-  storage = openDatabase(join(dir, "db.sqlite"), { blobDir: join(dir, "blobs") });
+  storage = openDatabase(join(dir, "db.sqlite"), { blobDir: join(dir, "blobs") , sessionEnd: sessionEndPort("team") });
   server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(req) {
     const handled = await service.fetch(req);
     if (handled) return handled;
@@ -776,7 +777,7 @@ test("explicit consent and code survive service/database restart; distinct grant
   expect((await decide(browser, a.consent)).status).toBe(400);
   const oldCookies = [...browser.jar];
   service.close(); storage.db.close();
-  storage = openDatabase(config.dbPath, { blobDir: config.blobDir }); service = makeService();
+  storage = openDatabase(config.dbPath, { blobDir: config.blobDir , sessionEnd: sessionEndPort("team") }); service = makeService();
   const tokens = await redeem(a); const p = await principal(tokens);
   expect(p.authed.session_id).toBe(0); expect(tokens.expires_in).toBe(3600); expect(tokens.token_type).toBe("Bearer");
   const b = await issue("subscriber", "grayboard:delivery", browser);
@@ -1415,7 +1416,7 @@ test("#881: one authorization reads the auth generation once, and a write betwee
     if (sql === "PRAGMA data_version") { const get = statement.get.bind(statement); statement.get = (...args: never[]) => { reads++; return get(...args); }; }
     return statement;
   } as typeof query);
-  const counted = (() => { try { return openDatabase(config.dbPath, { blobDir: config.blobDir }); } finally { spy.mockRestore(); } })();
+  const counted = (() => { try { return openDatabase(config.dbPath, { blobDir: config.blobDir , sessionEnd: sessionEndPort("team") }); } finally { spy.mockRestore(); } })();
   const saved = storage;
   storage = counted;
   const counting = makeService();
