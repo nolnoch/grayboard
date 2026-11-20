@@ -1,9 +1,34 @@
 // The boards store on Postgres (#807 P3 C10e1, docs/future/postgres-server.md D3, D6): store/boards.ts's BoardsStore,
-// each method on its caller's handle through pgOf. This slice is the reads and the pure writes, plus serial forms of
-// five designed writes (insertPost, bindAttachments, setSubscription, acknowledge, read: core's statements, each
-// marked `C10e2:` with what it still owes, if anything) so the store runs end to end; C10e2 adds insertPost's locks
-// and the post gate, and forget, prunePosts and claimQueuePost, which refuse for now after checking their handle. The SQLite store (db.ts makeRepo's boards, over
-// core/boards.ts's SQL) is the reference; what differs, and why:
+// each method on its caller's handle through pgOf (C10e1 the reads and pure writes, C10e2 the designed writes). The
+// SQLite store (db.ts makeRepo's boards, over core/boards.ts's SQL) is the reference; what differs, and why:
+// - Under READ COMMITTED each statement sees a new snapshot, and one that waits on a row lock re-checks only that
+//   row. So a write that depends on a row other writers change reads it under a lock first (#807 P3 C10 §2):
+//   - insertPost locks a reply's parent FOR KEY SHARE by id before it writes and refuses MissingPost when it's gone
+//     (P1): a prune holding it FOR UPDATE makes the reply wait and then find nothing, so a caller that catches the
+//     refusal and commits commits nothing. A 23503 on posts_parent_id_fkey maps to MissingPost too, as a backstop,
+//     though by then the transaction is aborted.
+//   - prunePosts locks its batch FOR UPDATE, by id, first (P1): a reply inserted under an old parent holds the
+//     parent's KEY SHARE (its own lock or its FK check's), so the prune waits, and its null-the-children UPDATE then
+//     sees the reply. ORDER BY id is the lock order against another prune.
+//   - board_post's gate reads its board through lockForPost, FOR KEY SHARE, and setArchived locks the board FOR UPDATE
+//     before its conditional UPDATE (P5): an archive waits for a post that passed the gate, and a post whose gate
+//     waits on an archive reads the board archived. A plain UPDATE of archived_at takes only FOR NO KEY UPDATE, which
+//     doesn't conflict with KEY SHARE (probe D5); two posts' KEY SHAREs don't conflict either (probe D6).
+//   - claimQueuePost locks its post FOR KEY SHARE first and returns false when it's gone, then claims,
+//     `ON CONFLICT (key) DO NOTHING RETURNING` (P3/P4): a second redelivery waits on the first's uncommitted claim and
+//     gets no row, so it logs no take; its push, a later statement, sees the winner's committed row and reaches only
+//     the key's holder. The post lock keeps a sweep's order posts, then outbox, as a prune's is: a push reset (an
+//     outbox UPDATE, no FK check) would otherwise hold the row a prune's outbox delete waits on while the sweep's next
+//     post write waits on the prune's batch, a deadlock (c10e2 audit 1).
+//   - Lock order across tables: posts, then outbox, then subscriptions. forget, read and acknowledge each write a
+//     handle's outbox rows before its subscriptions, so a handle's forget racing its read waits rather than deadlocks
+//     (c10e2 audit 2); prunePosts locks posts first and touches no subscription.
+//   - acknowledge's and read's GREATEST is re-evaluated on the newest row version after the row lock, so a cursor or
+//     notified_id never moves back; setSubscription reads the tip in its insert's statement (a post committing beside
+//     it lands either side of the cursor, as on SQLite); bindAttachments locks its uploads first (attachment_rows.ts);
+//     forget is five deletes keyed by the handle, none read first.
+//   Accepted (PS D4): two posts picking the same lane, a subscribe's tip missing an uncommitted post, and ids that
+//   commit out of order behind a reader's cursor; the one write queue rules them out until Stage 4 (#808).
 // - A Read is the autocommit pool: each statement is its own snapshot. So a read whose parts must agree is one
 //   statement (§7 Q10): pendingDigests joins each digest's latest post where core reads it after with getPost(...)!,
 //   which a prune committing between the two would turn into a crash; threadFacts reads root, authors, the parent's
@@ -23,9 +48,7 @@
 // - Every text column is COLLATE "C" (0001), so name and handle order is byte order, as SQLite's BINARY; each ORDER BY
 //   that SQLite runs in byte order says COLLATE "C" anyway, so the order doesn't hang on a column's declaration.
 // - ensure, read and acknowledge stamp the store's clock where core reads Date.now().
-// - insertPost runs in a savepoint: a parent that isn't there fails posts_parent_id_fkey, which would abort the whole
-//   transaction; rolled back to the savepoint it refuses MissingPost (as db.ts maps SQLite's FK failure) and the body
-//   stays usable.
+// - prunePosts' nested immediate transaction (SQLite's) is the caller's body here.
 //
 // Runtime imports stay off bun:sqlite, db.ts, core/boards.ts and core/attachments.ts (pg/isolation.test.ts): the SQL
 // is restated, and so are normalizeBoard and the catalog page size (pinned to core's by the contract runner).
@@ -33,10 +56,11 @@ import { CoreError } from "../../../core/errors.ts";
 import type { Post } from "../../../shared/notifications.ts";
 import type { Board, BoardSummary, BoardsStore, DigestRow, PushRow, SubMode, ThreadFacts, WhoRow } from "../boards.ts";
 import { MissingPost } from "../errors.ts";
-import type { Read, Tx } from "../tx_base.ts";
-import { bindLocked, lockUnsent, withAttachments } from "./attachment_rows.ts";
+import type { Read } from "../tx_base.ts";
+import { bindLocked, dropAttachments, lockUnsent, withAttachments } from "./attachment_rows.ts";
 import { foreignKeyViolation } from "./errors.ts";
 import { int8, int8OrNull } from "./sql.ts";
+import { insertClaimEvent } from "./claims.ts";
 import { pgOf, type PgFragment, type PgSql } from "./tx.ts";
 
 type Row = Record<string, unknown>;
@@ -148,11 +172,8 @@ const rootOfUp = (sql: PgSql) => sql.fragment`SELECT COALESCE(parent_id, id) AS 
 const POST_PARENT_CONSTRAINT = "posts_parent_id_fkey";
 const SUB_MODES: readonly string[] = ["push", "digest", "quiet"];
 
-// The C10e2 methods, until C10e2: the handle is checked first, as every method's is.
-const c10e2 = async (r: Read, what: string): Promise<never> => {
-  pgOf(r);
-  throw new Error(`C10e2: boards.${what} on Postgres is not implemented yet`);
-};
+// core QUEUE_CLAIM_TTL_MS, restated.
+const QUEUE_CLAIM_TTL_MS = 30 * 60_000;
 
 // core authorAddresses' UNION (a set; its order is the database's).
 async function authorAddresses(r: Read, author: string, authorId: string | null): Promise<string[]> {
@@ -169,6 +190,12 @@ export function makePgBoards({ clock }: { clock: () => number }): BoardsStore {
     async get(r, name) {
       const sql = pgOf(r);
       const [row] = await sql`SELECT ${boardCols(sql)} FROM boards b WHERE b.name = ${name}`;
+      return row ? toBoard(row) : undefined;
+    },
+    // board_post's gate read (header, P5): the board as get reads it, FOR KEY SHARE until the body ends.
+    async lockForPost(tx, name) {
+      const sql = pgOf(tx);
+      const [row] = await sql`SELECT ${boardCols(sql)} FROM boards b WHERE b.name = ${name} FOR KEY SHARE`;
       return row ? toBoard(row) : undefined;
     },
     async post(r, id) {
@@ -218,8 +245,7 @@ export function makePgBoards({ clock }: { clock: () => number }): BoardsStore {
         WHERE d.unread > 0`;
       return rows.map((x): DigestRow => ({ board: x.digest_board as string, unread: int8(x.unread), latest: toPost(x) }));
     },
-    // C10e2: owes nothing under concurrency: under READ COMMITTED each GREATEST is re-evaluated on the newest row
-    // version after the row lock, so the cursor never moves back. Core acknowledge.
+    // Core acknowledge; each GREATEST re-evaluates after the row lock (header).
     async acknowledge(tx, handle, ref) {
       const sql = pgOf(tx);
       if (ref.kind === "digest") {
@@ -245,8 +271,7 @@ export function makePgBoards({ clock }: { clock: () => number }): BoardsStore {
     async isSubscribed(r, handle, board) {
       return (await pgOf(r)`SELECT 1 FROM subscriptions WHERE board = ${board} AND handle = ${handle}`).length > 0;
     },
-    // C10e2: owes nothing under concurrency: the tip is read in the insert's own statement, and a post committing
-    // beside it lands either side of the cursor, as on SQLite. Core setSubscription.
+    // Core setSubscription; the tip is read in the insert's own statement (header).
     async setSubscription(tx, handle, board, mode) {
       const sql = pgOf(tx);
       if (mode === "off") {
@@ -261,8 +286,32 @@ export function makePgBoards({ clock }: { clock: () => number }): BoardsStore {
     async unsubscribeScope(tx, handle, scope) {
       await pgOf(tx)`DELETE FROM subscriptions WHERE handle = ${handle} AND board IN (SELECT name FROM boards WHERE scope = ${scope})`;
     },
-    forget: (tx: Tx) => c10e2(tx, "forget"),
-    prunePosts: (tx: Tx) => c10e2(tx, "prunePosts"),
+    // core forgetHandle.
+    async forget(tx, handle) {
+      const sql = pgOf(tx);
+      await sql`DELETE FROM outbox WHERE handle = ${handle}`;
+      await sql`DELETE FROM subscriptions WHERE handle = ${handle}`;
+      await sql`DELETE FROM thread_mutes WHERE handle = ${handle}`;
+      await sql`DELETE FROM claim_watches WHERE handle = ${handle}`;
+      await sql`DELETE FROM alias_holds WHERE address = ${handle}`;
+    },
+    // core prunePosts, its batch locked first (header, P1). Expired claims are left to the sweep, which announces them.
+    async prunePosts(tx, olderThan) {
+      const sql = pgOf(tx);
+      await sql`SELECT count(*) FROM (SELECT id FROM posts WHERE created_at < ${olderThan} ORDER BY id FOR UPDATE) batch`;
+      const boards: Row[] = await sql`SELECT board FROM posts WHERE created_at < ${olderThan} GROUP BY board ORDER BY board COLLATE "C"`;
+      const old = () => sql.fragment`SELECT id FROM posts WHERE created_at < ${olderThan}`;
+      await sql`UPDATE posts SET parent_id = NULL WHERE parent_id IN (${old()})`;
+      await sql`DELETE FROM outbox WHERE post_id IN (${old()})`;
+      await sql`DELETE FROM thread_mutes WHERE root_id IN (${old()})`;
+      await dropAttachments(sql, "post", old());
+      await sql`DELETE FROM posts WHERE created_at < ${olderThan}`;
+      await sql`DELETE FROM claim_events WHERE at < ${olderThan}`;
+      // Each name's latest bound or moved event outlives retention (core #211).
+      await sql`DELETE FROM binding_events WHERE COALESCE(last_at, at) < ${olderThan} AND id NOT IN
+        (SELECT MAX(id) FROM binding_events WHERE event IN ('bound', 'moved') GROUP BY name)`;
+      return boards.map(b => b.board as string);
+    },
 
     // core boardViewRows, one statement over the handles: their order (ordinality), then the board's name.
     async views(r, handles, board) {
@@ -326,17 +375,18 @@ export function makePgBoards({ clock }: { clock: () => number }): BoardsStore {
         SELECT ${boardCols(sql)} FROM made b`;
       return row ? toBoard(row) : null;
     },
-    // The conditional write is the check (A1): a second archive waits on the first's row lock, re-checks
-    // `archived_at IS NULL` against the committed row and updates nothing.
+    // The board locked FOR UPDATE first, so a post past its gate (lockForPost's KEY SHARE) makes this wait and a gate
+    // after it waits and reads it archived (P5). The conditional write is the check (A1): a second archive waits on
+    // the first's lock, then its UPDATE's WHERE re-reads the committed row and updates nothing.
     async setArchived(tx, name, by, now) {
       const sql = pgOf(tx);
+      await sql`SELECT 1 FROM boards WHERE name = ${name} FOR UPDATE`;
       const state = by === null ? sql.fragment`b.archived_at IS NOT NULL` : sql.fragment`b.archived_at IS NULL`;
       const [row] = await sql`UPDATE boards b SET archived_at = ${by === null ? null : now}::int8, archived_by = ${by}::text
         WHERE b.name = ${name} AND ${state} RETURNING ${boardCols(sql)}`;
       return row ? toBoard(row) : null;
     },
-    // C10e2: owes nothing under concurrency: the cursor's GREATEST is re-evaluated after the row lock under READ
-    // COMMITTED, so a racing read or acknowledge never moves it back. Core readRows.
+    // Core readRows; the cursor's GREATEST re-evaluates after the row lock (header).
     async read(tx, board, handle, opts) {
       const sql = pgOf(tx);
       const limit = Math.min(Math.max(opts.limit ?? 20, 1), 200);
@@ -363,11 +413,11 @@ export function makePgBoards({ clock }: { clock: () => number }): BoardsStore {
       const h = param(sql, handle);
       const maxId = posts.reduce((m, p) => Math.max(m, p.id), 0);
       if (maxId > 0) {
-        await sql`UPDATE subscriptions SET cursor = GREATEST(cursor, ${maxId}::int8) WHERE board = ${board} AND handle = ${handle}`;
         // What this read showed no longer needs pushing; what it skipped (a pending push it filters out, a post
-        // outside the thread) still does.
+        // outside the thread) still does. Outbox before the cursor: the header's lock order (core runs the reverse).
         await sql`UPDATE outbox SET delivered_at = ${clock()} WHERE handle = ${handle} AND delivered_at IS NULL
           AND post_id = ANY(${posts.map(p => p.id)}::int8[])`;
+        await sql`UPDATE subscriptions SET cursor = GREATEST(cursor, ${maxId}::int8) WHERE board = ${board} AND handle = ${handle}`;
       }
       const [n] = await sql`SELECT COUNT(*) AS n FROM posts p JOIN subscriptions s ON s.board = p.board AND s.handle = ${handle}
         WHERE p.board = ${board} AND p.id > s.cursor AND ${notOwn(sql, h)} AND ${notPushedYet(sql, h)}`;
@@ -384,25 +434,25 @@ export function makePgBoards({ clock }: { clock: () => number }): BoardsStore {
       else await sql`DELETE FROM thread_mutes WHERE handle = ${handle} AND root_id = ${root}`;
     },
 
-    // C10e2: owes the parent's FOR KEY SHARE (reply vs prune, P1) and the gate's board FOR KEY SHARE (post vs archive,
-    // P5). Core insertPost; the 23503-to-MissingPost savepoint is here already. human is bound on every insert (#1355/#1366): marked only when given true.
+    // Core insertPost, the parent locked by id first (header, P1); human is bound on every insert (#1355/#1366): marked
+    // only when given true.
     async insertPost(tx, p) {
-      pgOf(tx);
+      const sql = pgOf(tx);
+      if (p.parentId !== null && (await sql`SELECT 1 FROM posts WHERE id = ${p.parentId} FOR KEY SHARE`).length === 0) {
+        throw new MissingPost(p.parentId, p.board);
+      }
       try {
-        return await tx.savepoint(async sp => {
-          const sql = pgOf(sp);
-          const [row] = await sql`INSERT INTO posts AS p (board, author, body, parent_id, created_at, expires_at, author_id, via, author_user, human)
-            VALUES (${p.board}, ${p.author}, ${p.body}, ${p.parentId}::int8, ${p.now}, ${p.expiresAt}::int8, ${p.authorId}::text, ${p.via}::text,
-              ${p.authorUser}::text, ${p.human === true}) RETURNING ${postCols(sql)}`;
-          return toPost(row);
-        });
+        const [row] = await sql`INSERT INTO posts AS p (board, author, body, parent_id, created_at, expires_at, author_id, via, author_user, human)
+          VALUES (${p.board}, ${p.author}, ${p.body}, ${p.parentId}::int8, ${p.now}, ${p.expiresAt}::int8, ${p.authorId}::text, ${p.via}::text,
+            ${p.authorUser}::text, ${p.human === true}) RETURNING ${postCols(sql)}`;
+        return toPost(row);
       } catch (e) {
         if (p.parentId !== null && foreignKeyViolation(e) === POST_PARENT_CONSTRAINT) throw new MissingPost(p.parentId, p.board);
         throw e;
       }
     },
-    // C10e2: owes nothing under concurrency: lockUnsent takes the rows FOR UPDATE and bindLocked re-checks them unsent,
-    // so a concurrent bind of the same uploads refuses. Core bindAttachments: locked in id order, returned in call order.
+    // Core bindAttachments: locked in id order (attachment_rows.ts lockUnsent, so a concurrent bind of the same uploads
+    // refuses), returned in call order.
     async bindAttachments(tx, ids, from, postId, limits) {
       const sql = pgOf(tx);
       const files = await lockUnsent(sql, ids, from, limits);
@@ -437,7 +487,28 @@ export function makePgBoards({ clock }: { clock: () => number }): BoardsStore {
       const sql = pgOf(r);
       return (await sql`${laneRowsStatement(sql, board, poster)}`).map((x: Row) => x.handle as string);
     },
-    claimQueuePost: (tx: Tx) => c10e2(tx, "claimQueuePost"),
+    // core claimQueuePost, the post locked and then the claim first (header, P3/P4); a post that's gone (pruned) is
+    // false, writing nothing. The take event only when this run inserted the claim; the push
+    // (written or reset, undelivered and waking) only when the lane holds the key after it, in a later statement that
+    // sees a winner's committed row.
+    async claimQueuePost(tx, board, postId, lane, now, { note, push }) {
+      const sql = pgOf(tx);
+      if ((await sql`SELECT 1 FROM posts WHERE id = ${postId} FOR KEY SHARE`).length === 0) return false;
+      const key = `queue:${board}:${postId}`;
+      const expires = now + QUEUE_CLAIM_TTL_MS;
+      const took = await sql`INSERT INTO claims (key, holder, note, board, acquired_at, expires_at, holder_user)
+        VALUES (${key}, ${lane}, ${note}, ${board}, ${now}, ${expires}, COALESCE((SELECT principal FROM ids WHERE id = ${lane}),
+          (SELECT i.principal FROM alias_holds h JOIN ids i ON i.id = h.id WHERE h.address = ${lane})))
+        ON CONFLICT (key) DO NOTHING RETURNING key`;
+      if (push) {
+        await sql`INSERT INTO outbox (handle, post_id, reason, wake)
+          SELECT ${lane}::text, ${postId}::int8, 'subscription', true WHERE EXISTS (SELECT 1 FROM claims WHERE key = ${key} AND holder = ${lane})
+          ON CONFLICT (handle, post_id) DO UPDATE SET delivered_at = NULL, wake = true`;
+      }
+      if (took.length === 0) return false;
+      await insertClaimEvent(sql, "take", lane, { key, note, board, expires_at: expires }, now);
+      return true;
+    },
     // core insertOutbox as one statement; a handle given twice keeps its first target, as core's row-by-row insert does.
     async insertOutbox(tx, postId, targets) {
       const sql = pgOf(tx);

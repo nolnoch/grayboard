@@ -499,7 +499,7 @@ test("#807 P1c-5: cursors, writeReceipts, bindings and boards refuse a handle fr
     () => b.ensure(fx, "hall", "p", null, fe), () => b.isSubscribed(foreign, fe, "hall"), () => b.setSubscription(fx, fe, "hall", "push"),
     () => b.unsubscribeScope(fx, fe, "team:x"), () => b.forget(fx, fe), () => b.prunePosts(fx, 0), () => b.views(foreign, [fe], null),
     () => b.openSummaries(foreign), () => b.roster(foreign, null), () => b.create(fx, { name: "x", purpose: "p", scope: null, kind: "broadcast", createdBy: fe, now: 1 }),
-    () => b.setArchived(fx, "hall", fe, 1), () => b.read(fx, "hall", fe, {}), () => b.threadRoot(foreign, 1), () => b.mute(fx, fe, 1, true),
+    () => b.setArchived(fx, "hall", fe, 1), () => b.read(fx, "hall", fe, {}), () => b.threadRoot(foreign, 1), () => b.mute(fx, fe, 1, true), () => b.lockForPost(fx, "hall"),
     () => b.insertPost(fx, { board: "hall", author: fe, body: "x", parentId: null, now: 1, expiresAt: null, authorId: null, via: null, authorUser: null, human: false }),
     () => b.bindAttachments(fx, [1], { addresses: [fe], principal: null }, 1, { file: 1, total: 1 }), () => b.authorAddresses(foreign, fe, null),
     () => b.subscribers(foreign, "hall"), () => b.threadFacts(foreign, 1), () => b.laneRows(foreign, "hall", [fe]),

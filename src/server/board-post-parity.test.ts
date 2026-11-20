@@ -176,3 +176,27 @@ test("board_post gives core's answers and leaves its rows, for every caller and 
     expect(all).toContain(refusal);
   }
 }, 180_000);
+
+// c10e2 audit 3: the gate judges the board lockForPost read on the body's Tx (on Postgres, under its KEY SHARE), not
+// the visibility read before it. An archive that commits between the two shows only in the locked read.
+test("the post gate judges the board lockForPost returned on the body's Tx", async () => {
+  const access = boardAccess(repo);
+  const real = repo.boards.lockForPost.bind(repo.boards);
+  const calls: { tx: Tx; name: string; board: unknown }[] = [];
+  let archive = false;
+  repo.boards.lockForPost = async (tx, name) => {
+    const b = await real(tx, name);
+    const board = b && archive ? { ...b, archived_at: T1, archived_by: `${W}/be` } : b;
+    calls.push({ tx, name, board });
+    return board;
+  };
+  const gated = (tx: Tx) => postGateOn(repo, access, tx, `${W}/be`, "general", null);
+  const open = await inBody(async tx => {
+    const r = await gated(tx);
+    return { calls: calls.map(c => [c.tx === tx, c.name]), same: r.board === calls[0]?.board };
+  }) as { out: unknown };
+  expect(open.out).toEqual({ calls: [[true, "general"]], same: true });
+  archive = true;
+  const late = await inBody(tx => outcomeAsync(() => gated(tx))) as { out: { error?: string } };
+  expect(late.out.error).toContain("archived");
+});

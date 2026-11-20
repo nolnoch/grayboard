@@ -1,13 +1,10 @@
-// #807 P3 C10e1: the boards contract (boards.contract.ts) on Postgres: the same rows SQLite runs from db.test.ts, over
-// makePgBoards on a fixed clock. Each row gets its own database (the raw reads read whole tables). Without
-// GRAYBOARD_TEST_PG_URL it skips (tests/support/pg.ts).
-//
-// C10e1 ports the reads, the pure writes and serial forms of five designed writes; forget, prunePosts and
-// claimQueuePost are C10e2's (pg/boards.ts throws "C10e2"), so the rows whose subject or setup is one of them are
-// pending by name, the rollback row among them (it sets up through claimQueuePost). C10e2 deletes the pending list.
-// Also here: the restated normalizeBoard is core's, and laneRows' take subquery keeps idx_claim_events_take.
+// #807 P3 C10e1, C10e2: the boards contract (boards.contract.ts) on Postgres: the same rows SQLite runs from db.test.ts,
+// over makePgBoards on a fixed clock. Each row gets its own database (the raw reads read whole tables). Without
+// GRAYBOARD_TEST_PG_URL it skips (tests/support/pg.ts). The races are pg/boards.pg.test.ts's.
+// Also here: the store's clock stamps (ensure's created_at, read's and acknowledge's delivered_at), the restated
+// normalizeBoard is core's, and laneRows' take subquery keeps idx_claim_events_take.
 import { expect, test } from "bun:test";
-import { describePg, pgDatabase } from "../../../../tests/support/pg.ts";
+import { describePg, pgDatabase, type PgDatabase } from "../../../../tests/support/pg.ts";
 import { normalizeBoard as coreNormalizeBoard } from "../../../core/boards.ts";
 import { boardsContract, type BoardsBackend, type BoardsHarness } from "../boards.contract.ts";
 import { laneRowsStatement, makePgBoards, normalizeBoard } from "./boards.ts";
@@ -18,142 +15,111 @@ type Row = Record<string, unknown>;
 // The store's clock: ensure's created_at, and read's and acknowledge's delivered_at stamps.
 const CLOCK = 1_800_000_000_000;
 
-// C10e2: forget, claimQueuePost and prunePosts throw until C10e2 implements them.
-const C10E2 = "C10e2: it runs forget, claimQueuePost or prunePosts, which pg/boards.ts doesn't implement yet";
-const PENDING: Record<string, string> = Object.fromEntries([
-  "a body's reads see its writes, and a body that throws leaves none of them",
-  "forget deletes a handle's pushes, subscriptions, mutes, watches and hold; its posts and claims and others' rows stay",
-  "claimQueuePost on a free key: the claim with its holder's user, a take event and the lane's waking push; push false writes no push",
-  "claimQueuePost on a key another lane holds: false, and no claim, event or outbox row for the lane",
-  "claimQueuePost on a key the lane already holds: false, no new event, and its push reset to undelivered and waking",
-  "prunePosts: old posts with their pushes, mutes and attachments go, a reply becomes a root; old claim events and binding events go but each name's latest bind",
-].map(name => [name, C10E2]));
-
 const pgBoardsBackend: BoardsBackend = {
   kind: "postgres",
-  pending: PENDING,
-  async open(): Promise<BoardsHarness> {
-    const db = await pgDatabase({ max: 2 });
-    const s = makePgTransactions(db.url, { max: 4, applicationName: "gb-test-boards" });
-    // Fixture writes and raw reads on the database's own read-write pool, each its own transaction.
-    const sql = db.sql;
-    let blob = 0;
-    const rows = async <T>(q: Promise<Row[]>, f: (r: Row) => T) => (await q).map(f);
-    return {
-      boards: makePgBoards({ clock: () => CLOCK }),
-      write: fn => s.write(fn),
-      read: s.read,
-      async alias(address, o = {}) {
-        const cut = address.lastIndexOf("/");
-        await sql`INSERT INTO aliases (address, scope_kind, scope_ref, name, human, queue_off, created_at, last_seen)
-          VALUES (${address}, 'person', ${address.slice(0, cut)}, ${address.slice(cut + 1)}, ${o.human ? true : null}::boolean,
-            ${o.queueOff ? true : null}::boolean, 0, ${o.lastSeen ?? null}::int8)`;
-      },
-      async session(id, principal, o = {}) {
-        await sql`INSERT INTO ids (id, principal, started_at, last_seen, ended_at, viewer, root_id, status, status_at)
-          VALUES (${id}, ${principal}::text, 0, 0, ${o.endedAt ?? null}::int8, ${o.viewer === true}, ${o.rootId ?? null}::text,
-            ${o.status ?? null}::text, ${o.status === undefined ? null : 1}::int8)`;
-      },
-      async hold(address, id, boundAt) { await sql`INSERT INTO alias_holds (address, id, bound_at) VALUES (${address}, ${id}, ${boundAt})`; },
-      async claim(c) {
-        await sql`INSERT INTO claims (key, holder, note, board, acquired_at, expires_at, holder_user)
-          VALUES (${c.key}, ${c.holder}, 'held', ${c.board}::text, ${c.at}, ${c.at + 60_000}, NULL)`;
-      },
-      async claimEvent(e) {
-        await sql`INSERT INTO claim_events (key, handle, event, board, at, session_id)
-          VALUES (${e.key}, ${e.handle}, ${e.event}, ${e.board}::text, ${e.at}, ${e.session ?? null}::text)`;
-      },
-      async bindingEvent(e) {
-        await sql`INSERT INTO binding_events (session_id, name, event, at) VALUES (${e.session}, ${e.name}, ${e.event}, ${e.at})`;
-      },
-      async watch(key, handle) { await sql`INSERT INTO claim_watches (key, handle) VALUES (${key}, ${handle})`; },
-      upload: (uploader, principal, size) => sql.begin(async t => {
-        const sha = `sha-${++blob}`;
-        await t`INSERT INTO attachment_blobs (sha256, size, created_at) VALUES (${sha}, ${size}, 0)`;
-        const [r] = await t`INSERT INTO attachments (sha256, filename, type, size, uploader, uploader_principal, created_at)
-          VALUES (${sha}, 'f.txt', 'text/plain', ${size}, ${uploader}, ${principal}::text, 0) RETURNING id`;
-        return int8(r.id);
-      }),
-      subscription: async (board, handle) => (await rows(sql`SELECT mode, cursor, notified_id FROM subscriptions WHERE board = ${board} AND handle = ${handle}`,
-        r => ({ mode: r.mode as string, cursor: int8(r.cursor), notified_id: int8(r.notified_id) })))[0],
-      outboxRows: () => rows(sql`SELECT handle, post_id, reason, wake, delivered_at IS NOT NULL AS delivered FROM outbox ORDER BY post_id, handle COLLATE "C"`,
-        r => ({ handle: r.handle as string, post_id: int8(r.post_id), reason: r.reason as string, wake: r.wake === true, delivered: r.delivered === true })),
-      muteRows: () => rows(sql`SELECT handle, root_id FROM thread_mutes ORDER BY handle COLLATE "C", root_id`,
-        r => ({ handle: r.handle as string, root_id: int8(r.root_id) })),
-      postRow: async id => (await rows(sql`SELECT parent_id, human FROM posts WHERE id = ${id}`,
-        r => ({ parent_id: int8OrNull(r.parent_id), human: r.human as boolean | null })))[0],
-      claimRows: () => rows(sql`SELECT key, holder, note, board, acquired_at, expires_at, holder_user FROM claims ORDER BY key COLLATE "C"`,
-        r => ({ key: r.key as string, holder: r.holder as string, note: r.note as string | null, board: r.board as string | null,
-          acquired_at: int8(r.acquired_at), expires_at: int8(r.expires_at), holder_user: r.holder_user as string | null })),
-      eventRows: () => rows(sql`SELECT key, handle, event, note, board, at FROM claim_events ORDER BY id`,
-        r => ({ key: r.key as string, handle: r.handle as string, event: r.event as string, note: r.note as string | null, board: r.board as string | null, at: int8(r.at) })),
-      watchRows: () => rows(sql`SELECT key, handle FROM claim_watches ORDER BY key COLLATE "C", handle COLLATE "C"`,
-        r => ({ key: r.key as string, handle: r.handle as string })),
-      holdRows: () => rows(sql`SELECT address, id FROM alias_holds ORDER BY address COLLATE "C"`, r => ({ address: r.address as string, id: r.id as string })),
-      bindingEventRows: () => rows(sql`SELECT name, event, at FROM binding_events ORDER BY id`, r => ({ name: r.name as string, event: r.event as string, at: int8(r.at) })),
-      attachmentRows: () => rows(sql`SELECT id, post_id FROM attachments ORDER BY id`, r => ({ id: int8(r.id), post_id: int8OrNull(r.post_id) })),
-      async close() {
-        await s.close();
-        await db[Symbol.asyncDispose]();
-      },
-    };
-  },
+  open: async () => (await openPg()).h,
 };
+
+// The harness, and its database's read-write pool for the clock checks' raw reads.
+async function openPg(): Promise<{ h: BoardsHarness; sql: PgDatabase["sql"] }> {
+  const db = await pgDatabase({ max: 2 });
+  const s = makePgTransactions(db.url, { max: 4, applicationName: "gb-test-boards" });
+  // Fixture writes and raw reads on the database's own read-write pool, each its own transaction.
+  const sql = db.sql;
+  let blob = 0;
+  const rows = async <T>(q: Promise<Row[]>, f: (r: Row) => T) => (await q).map(f);
+  const h: BoardsHarness = {
+    boards: makePgBoards({ clock: () => CLOCK }),
+    write: fn => s.write(fn),
+    read: s.read,
+    async alias(address, o = {}) {
+      const cut = address.lastIndexOf("/");
+      await sql`INSERT INTO aliases (address, scope_kind, scope_ref, name, human, queue_off, created_at, last_seen)
+        VALUES (${address}, 'person', ${address.slice(0, cut)}, ${address.slice(cut + 1)}, ${o.human ? true : null}::boolean,
+          ${o.queueOff ? true : null}::boolean, 0, ${o.lastSeen ?? null}::int8)`;
+    },
+    async session(id, principal, o = {}) {
+      await sql`INSERT INTO ids (id, principal, started_at, last_seen, ended_at, viewer, root_id, status, status_at)
+        VALUES (${id}, ${principal}::text, 0, 0, ${o.endedAt ?? null}::int8, ${o.viewer === true}, ${o.rootId ?? null}::text,
+          ${o.status ?? null}::text, ${o.status === undefined ? null : 1}::int8)`;
+    },
+    async hold(address, id, boundAt) { await sql`INSERT INTO alias_holds (address, id, bound_at) VALUES (${address}, ${id}, ${boundAt})`; },
+    async claim(c) {
+      await sql`INSERT INTO claims (key, holder, note, board, acquired_at, expires_at, holder_user)
+        VALUES (${c.key}, ${c.holder}, 'held', ${c.board}::text, ${c.at}, ${c.at + 60_000}, NULL)`;
+    },
+    async claimEvent(e) {
+      await sql`INSERT INTO claim_events (key, handle, event, board, at, session_id)
+        VALUES (${e.key}, ${e.handle}, ${e.event}, ${e.board}::text, ${e.at}, ${e.session ?? null}::text)`;
+    },
+    async bindingEvent(e) {
+      await sql`INSERT INTO binding_events (session_id, name, event, at) VALUES (${e.session}, ${e.name}, ${e.event}, ${e.at})`;
+    },
+    async watch(key, handle) { await sql`INSERT INTO claim_watches (key, handle) VALUES (${key}, ${handle})`; },
+    upload: (uploader, principal, size) => sql.begin(async t => {
+      const sha = `sha-${++blob}`;
+      await t`INSERT INTO attachment_blobs (sha256, size, created_at) VALUES (${sha}, ${size}, 0)`;
+      const [r] = await t`INSERT INTO attachments (sha256, filename, type, size, uploader, uploader_principal, created_at)
+        VALUES (${sha}, 'f.txt', 'text/plain', ${size}, ${uploader}, ${principal}::text, 0) RETURNING id`;
+      return int8(r.id);
+    }),
+    subscription: async (board, handle) => (await rows(sql`SELECT mode, cursor, notified_id FROM subscriptions WHERE board = ${board} AND handle = ${handle}`,
+      r => ({ mode: r.mode as string, cursor: int8(r.cursor), notified_id: int8(r.notified_id) })))[0],
+    outboxRows: () => rows(sql`SELECT handle, post_id, reason, wake, delivered_at IS NOT NULL AS delivered FROM outbox ORDER BY post_id, handle COLLATE "C"`,
+      r => ({ handle: r.handle as string, post_id: int8(r.post_id), reason: r.reason as string, wake: r.wake === true, delivered: r.delivered === true })),
+    muteRows: () => rows(sql`SELECT handle, root_id FROM thread_mutes ORDER BY handle COLLATE "C", root_id`,
+      r => ({ handle: r.handle as string, root_id: int8(r.root_id) })),
+    postRow: async id => (await rows(sql`SELECT parent_id, human FROM posts WHERE id = ${id}`,
+      r => ({ parent_id: int8OrNull(r.parent_id), human: r.human as boolean | null })))[0],
+    claimRows: () => rows(sql`SELECT key, holder, note, board, acquired_at, expires_at, holder_user FROM claims ORDER BY key COLLATE "C"`,
+      r => ({ key: r.key as string, holder: r.holder as string, note: r.note as string | null, board: r.board as string | null,
+        acquired_at: int8(r.acquired_at), expires_at: int8(r.expires_at), holder_user: r.holder_user as string | null })),
+    eventRows: () => rows(sql`SELECT key, handle, event, note, board, at FROM claim_events ORDER BY id`,
+      r => ({ key: r.key as string, handle: r.handle as string, event: r.event as string, note: r.note as string | null, board: r.board as string | null, at: int8(r.at) })),
+    watchRows: () => rows(sql`SELECT key, handle FROM claim_watches ORDER BY key COLLATE "C", handle COLLATE "C"`,
+      r => ({ key: r.key as string, handle: r.handle as string })),
+    holdRows: () => rows(sql`SELECT address, id FROM alias_holds ORDER BY address COLLATE "C"`, r => ({ address: r.address as string, id: r.id as string })),
+    bindingEventRows: () => rows(sql`SELECT name, event, at FROM binding_events ORDER BY id`, r => ({ name: r.name as string, event: r.event as string, at: int8(r.at) })),
+    attachmentRows: () => rows(sql`SELECT id, post_id FROM attachments ORDER BY id`, r => ({ id: int8(r.id), post_id: int8OrNull(r.post_id) })),
+    async close() {
+      await s.close();
+      await db[Symbol.asyncDispose]();
+    },
+  };
+  return { h, sql };
+}
 
 describePg("boards contract (Postgres)", () => boardsContract(pgBoardsBackend));
 
-// The shared rollback row ("a body's reads see its writes, and a body that throws leaves none of them") is pending:
-// it sets up through claimQueuePost. This is its body without that line, so a body's writes stay atomic with it on
-// Postgres meanwhile. C10e2 deletes this when it un-skips the shared row.
-describePg("boards store rollback (Postgres)", () => {
-  test("a body's reads see its writes, and a body that throws leaves none of them (without claimQueuePost)", async () => {
-    const h = await pgBoardsBackend.open();
+// The contract asserts only that ensure, read and acknowledge stamp a time (SQLite's core reads Date.now()); the
+// Postgres store's is its clock.
+describePg("boards store clock (Postgres)", () => {
+  test("ensure stamps created_at from the store's clock", async () => {
+    const { h } = await openPg();
     try {
-      const b = h.boards;
-      const BE = "a@example.com/be", FE = "a@example.com/fe", T0 = CLOCK;
-      const np = (board: string, author: string, body: string, now: number) =>
-        ({ board, author, body, parentId: null, now, expiresAt: null, authorId: null, via: null, authorUser: null, human: false });
-      await h.write(tx => b.create(tx, { name: "hall", purpose: "p", scope: null, kind: "broadcast", createdBy: BE, now: T0 }));
-      const root = (await h.write(tx => b.insertPost(tx, np("hall", BE, "root", T0)))).id;
-      await expect(h.write(async tx => {
-        expect(await b.ensure(tx, "team", "p", "team:x", BE)).toBe(true);
-        expect((await b.create(tx, { name: "fresh", purpose: "p", scope: null, kind: "queue", createdBy: BE, now: T0 }))?.name).toBe("fresh");
-        expect(await b.get(tx, "fresh")).toMatchObject({ purpose: "p", created_by: BE, kind: "queue" });
-        expect((await b.setArchived(tx, "hall", BE, T0 + 1))?.archived_by).toBe(BE);
-        await b.setSubscription(tx, FE, "hall", "push");
-        expect(await b.isSubscribed(tx, FE, "hall")).toBe(true);
-        const p = await b.insertPost(tx, np("fresh", BE, "job", T0 + 2));
-        expect(await b.post(tx, p.id)).toMatchObject({ body: "job" });
-        await b.insertOutbox(tx, root, [[FE, { reason: "subscription", wake: true }]]);
-        expect((await b.pendingPushes(tx, FE)).map(r => r.post.id)).toEqual([root]);
-        await b.acknowledge(tx, FE, { kind: "push", post_id: root });
-        await b.mute(tx, FE, root, true);
-        expect((await b.read(tx, "hall", FE, {})).posts.map(x => x.id)).toEqual([root]);
-        throw new Error("rolled back");
-      })).rejects.toThrow("rolled back");
-      expect(await b.get(h.read, "team")).toBeUndefined();
-      expect(await b.get(h.read, "fresh")).toBeUndefined();
-      expect((await b.get(h.read, "hall"))?.archived_at).toBeUndefined();
-      expect(await b.isSubscribed(h.read, FE, "hall")).toBe(false);
-      expect(await h.subscription("hall", FE)).toBeUndefined();
-      expect((await b.snapshotPage(h.read, "hall", {})).posts.map(x => x.id)).toEqual([root]);
-      expect(await h.outboxRows()).toEqual([]);
-      expect(await h.muteRows()).toEqual([]);
-      expect(await h.claimRows()).toEqual([]);
-      expect(await h.eventRows()).toEqual([]);
+      expect(await h.write(tx => h.boards.ensure(tx, "#Hall", "p", null, "a@example.com/be"))).toBe(true);
+      expect((await h.boards.get(h.read, "hall"))?.created_at).toBe(CLOCK);
     } finally {
       await h.close();
     }
   });
-});
 
-// The contract asserts only that ensure stamps a time (SQLite's core reads Date.now()); the Postgres store's is its clock.
-describePg("boards store clock (Postgres)", () => {
-  test("ensure stamps created_at from the store's clock", async () => {
-    const h = await pgBoardsBackend.open();
+  test("read and acknowledge stamp delivered_at from the store's clock", async () => {
+    const { h, sql } = await openPg();
     try {
-      expect(await h.write(tx => h.boards.ensure(tx, "#Hall", "p", null, "a@example.com/be"))).toBe(true);
-      expect((await h.boards.get(h.read, "hall"))?.created_at).toBe(CLOCK);
+      const b = h.boards, BE = "a@example.com/be", FE = "a@example.com/fe", T0 = 1_700_000_000_000;
+      const np = (body: string) => ({ board: "hall", author: BE, body, parentId: null, now: T0, expiresAt: null, authorId: null, via: null, authorUser: null, human: false });
+      await h.write(tx => b.create(tx, { name: "hall", purpose: "p", scope: null, kind: "broadcast", createdBy: BE, now: T0 }));
+      await h.write(tx => b.setSubscription(tx, FE, "hall", "push"));
+      const read = (await h.write(tx => b.insertPost(tx, np("read")))).id;
+      const acked = (await h.write(tx => b.insertPost(tx, np("acked")))).id;
+      await h.write(tx => b.insertOutbox(tx, read, [[FE, { reason: "subscription", wake: false }]]));
+      await h.write(tx => b.insertOutbox(tx, acked, [[FE, { reason: "mention", wake: true }]]));
+      await h.write(tx => b.acknowledge(tx, FE, { kind: "push", post_id: acked }));
+      await h.write(tx => b.read(tx, "hall", FE, { before_id: acked }));
+      const stamps = (await sql`SELECT post_id, delivered_at FROM outbox WHERE handle = ${FE} ORDER BY post_id`)
+        .map((r: Row) => [int8(r.post_id), int8OrNull(r.delivered_at)]);
+      expect(stamps).toEqual([[read, CLOCK], [acked, CLOCK]]);
     } finally {
       await h.close();
     }
