@@ -134,8 +134,9 @@ export class ApplicationSession {
   // Set while a replay's direct-message drain is in flight (drainDirect): live DMs held for it, the ids its drains
   // sent, how many are running, and the chain that runs them one at a time.
   draining: { held: MessageRow[]; sent: Set<number>; runs: number; chain: Promise<void> } | null = null;
-  // Gates raised by a push session's registering commit (a bind, the Slack bridge's attach) for the replay its caller
-  // makes next (#1090): each counts as a run in `draining` until that replay's direct drain is done.
+  // Gates raised by a push session's registering commit (a bind or the Slack bridge's attach whose caller said it
+  // replays, #1090): each counts as a run in `draining` until a replay's direct drain is done. A replay settles one
+  // whichever commit raised it; a replay no commit owed would settle another's early, so callers pair them.
   owedDrains = 0;
   // Set while a board drain runs (drainBoards, #807 P3 B5a1): a wake meanwhile asks for one more run (`all` when any
   // asks for it), and a receipt committed meanwhile names what the running drain read before it and mustn't resend.
@@ -369,8 +370,10 @@ function endDrainRun(session: ApplicationSession, d: NonNullable<ApplicationSess
 }
 
 // A push session became deliverable at a commit whose caller replays next (#1090): the gate goes up now, in the
-// commit's effects, before the queue's next body can commit a message to it. Otherwise a send committed before the
-// replay is pushed live and then read again by its drain (the cursor hasn't moved): m3, m1, m2, m3.
+// commit's effects. On SQLite those run before the queue's next body, so no send commits in between; otherwise one
+// committed before the replay is pushed live and then read again by its drain (the cursor hasn't moved): m3, m1, m2,
+// m3. On Postgres a bind registers the session in its body, so a concurrent commit can still land before the gate:
+// #1090 part 2.
 function owe(session: ApplicationSession): void {
   if (!session.push) return;
   session.owedDrains++;
@@ -1033,7 +1036,9 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
   // A refusal's binding row goes to the session's `afterRollback` when it has one: a hosted bind runs inside a
   // transaction the refusal's throw rolls back, and the row is written after it.
   // `tx`: the body the bind runs in; its alias reads and lazy create run on it.
-  async function bindNow(tx: Tx, session: ApplicationSession, m: Omit<BindRequest, "type" | "req_id">): Promise<BindResult> {
+  // `replays`: the caller replays the alias next, so a push session's commit raises its drain gate (#1090), as
+  // attachHuman's does; a caller that never replays leaves it down, or live direct messages would wait forever.
+  async function bindNow(tx: Tx, session: ApplicationSession, m: Omit<BindRequest, "type" | "req_id">, replays = false): Promise<BindResult> {
     await valid(session, true, tx);
     const { authed } = session;
     if (session.human) fail("bad_request", `the Slack bridge's connection is its user's "${HUMAN_NAME}"; it binds nothing`);
@@ -1071,7 +1076,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     if (session.holds.includes(address)) {
       // No binding event, and bound_at stays: the session already holds it.
       if (meta) await setAliasLabels(repo, tx, address, meta, id, authed.user_email);
-      tx.afterCommit(() => owe(session));
+      if (replays) tx.afterCommit(() => owe(session));
       return { alias: address, held: [...session.holds] };
     }
     if (session.holds.length >= MAX_HOLDS) {
@@ -1139,8 +1144,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     // The first bind of a user's session after the bridge died carries the death notice, once.
     const owed = await owedBridgeNotice(repo, tx, authed.user_email);
     const notices = await noticesFor(hub, tx, session.addresses, owed ? [owed] : []);
-    // A push session's caller replays the new alias next (#1090): each successful bind owes it one gate.
-    tx.afterCommit(() => owe(session));
+    if (replays) tx.afterCommit(() => owe(session));
     return { alias: address, held: [...session.holds], ...(notices.length ? { notices } : {}) };
   }
 
