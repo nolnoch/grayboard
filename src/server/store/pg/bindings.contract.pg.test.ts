@@ -41,7 +41,7 @@ const pgBindingsBackend: BindingsBackend = {
         })),
       aliasRow: async address => (await sql`SELECT last_seen, queue_off, task, owner, source_board, spec_hash, description FROM aliases WHERE address = ${address}`)
         .map((r: Row) => ({
-          last_seen: int8OrNull(r.last_seen), queue_off: r.queue_off === true, task: r.task as string | null, owner: r.owner as string | null,
+          last_seen: int8OrNull(r.last_seen), queue_off: r.queue_off as boolean | null, task: r.task as string | null, owner: r.owner as string | null,
           source_board: r.source_board as string | null, spec_hash: r.spec_hash as string | null, description: r.description as string | null,
         }))[0],
       idColumns: async id => (await sql`SELECT harness, cwd, delivery, keyed, local_resume, root_id, harness_session, started_at, last_seen FROM ids WHERE id = ${id}`)

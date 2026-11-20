@@ -13,6 +13,7 @@ import type { IdFacts } from "../bindings.ts";
 import type { Tx } from "../tx_base.ts";
 import { makePgAliases } from "./aliases.ts";
 import { makePgBindings } from "./bindings.ts";
+import { makePgSessionEnd } from "./session_end.ts";
 import { pgOf } from "./tx.ts";
 
 const CLOCK = 1_800_000_000_000;
@@ -21,6 +22,7 @@ const X = `${U}/x`;
 const [S1, S2] = ["id:0000000000001", "id:0000000000002"];
 const al = makePgAliases({ clock: () => CLOCK });
 const b = makePgBindings({ clock: () => CLOCK, aliases: al });
+const ends = makePgSessionEnd();
 
 type Row = Record<string, unknown>;
 const holds = async (p: PgPair) => (await p.db.sql`SELECT address, id, bound_at::int4 AS bound_at FROM alias_holds ORDER BY address`).map((r: Row) => ({ ...r }));
@@ -110,19 +112,15 @@ describePg("bindings store races (Postgres)", () => {
     }
   });
 
-  // A stand-in for C10d1's sessionEnd.pruneEnded (core pruneEndedIds' two statements, as its Postgres form writes them):
-  // the tombstone, then the delete. Mutation: registerId reads (consumes) the tombstone before its insert (it reads
-  // none under the uncommitted prune and returns null, and the tombstone stays for an ID that is live again).
+  // C10d1's sessionEnd.pruneEnded (core pruneEndedIds' statements: the tombstone, then the delete). Mutation:
+  // registerId reads (consumes) the tombstone before its insert (it reads none under the uncommitted prune and returns
+  // null, and the tombstone stays for an ID that is live again).
   test("T5: a registration racing a prune of the same keyed ID waits on the delete and returns the tombstone", async () => {
     await using p = await pgPair();
     const K = "id:000000000000K";
     await p.a.write(tx => b.registerId(tx, facts(K, { keyed: true })));
     await p.db.sql`UPDATE ids SET ended_at = 5 WHERE id = ${K}`;
-    const prune = async (tx: Tx) => {
-      await pgOf(tx)`INSERT INTO pruned_ids (id, ended_at, pruned_at) SELECT id, ended_at, 9 FROM ids WHERE ended_at < 10 AND keyed
-        ON CONFLICT (id) DO UPDATE SET ended_at = EXCLUDED.ended_at, pruned_at = EXCLUDED.pruned_at`;
-      return (await pgOf(tx)`DELETE FROM ids WHERE ended_at < 10 RETURNING id`).length;
-    };
+    const prune = (tx: Tx) => ends.pruneEnded(tx, 10, 9);
     const r = await race(p, prune, tx => b.registerId(tx, facts(K, { keyed: true })));
     expect(committed(r.a)).toBe(1);
     expect(outcome(r.b)).toEqual({ ended_at: 5, pruned_at: 9 });

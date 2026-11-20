@@ -46,7 +46,9 @@ export interface BindingsStore {
   // stays after the ID's other holds, so two takes in one millisecond keep their order (HOLD_ORDER). The check and
   // the upsert are one method, so a store whose transactions interleave locks the alias row first (C10a-b). A re-take
   // at or before its own bound_at stamps now (only the ID's other holds bound it), even moving the stamp back. A take
-  // by an ended ID is not pinned: SQLite writes the hold; Postgres (C10a-b, E4) returns null.
+  // by an ended ID is not pinned: SQLite writes the hold; Postgres (C10a-b, E4) returns null. Nor is a take with no
+  // alias row or no ids row: SQLite writes the hold, Postgres returns null; neither is reachable today, since the one
+  // caller (application.ts bind) creates the alias and checks the session live just before it takes.
   take(tx: Tx, address: string, id: string, principal: string, now: number): Promise<{ bound_at: number } | null>;
   // Drops id's hold on address; a hold another session took since stays.
   release(tx: Tx, address: string, id: string): Promise<void>;
@@ -63,7 +65,9 @@ export interface BindingsStore {
   // carrying the existing row's ended_at, when the ID has a row, writing nothing. An ID's tombstone (only keyed IDs
   // leave one, at prune) is consumed and returned (ReusedId) whether or not this registration is keyed, for the
   // caller to audit as id.reused; null otherwise. A child (rootId) of an ended root is not pinned: SQLite registers
-  // it; Postgres (C10a-b, E3) refuses it.
+  // it; Postgres (C10a-b, E3) refuses it, and refuses an existing ID under an ended root with id_ended before
+  // IdCollision; neither is reachable today, since the one caller (application.ts) registers only an ID with no row,
+  // and never a child.
   registerId(tx: Tx, facts: IdFacts): Promise<ReusedId | null>;
   // Sets the named facts (undefined leaves one alone), cleaned; the before and after of both when either changed,
   // null when nothing did (no write) or there's no such ID.

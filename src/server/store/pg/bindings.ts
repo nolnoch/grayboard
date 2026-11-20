@@ -7,7 +7,8 @@
 //   the taking ID's ids row FOR KEY SHARE, unended (E4): an end locks that row FOR UPDATE first, so a take waits for it
 //   and then reads it ended (null), or the end waits for the take and releases its hold. KEY SHARE, not SHARE: it
 //   doesn't conflict with a presence touch's UPDATE (FOR NO KEY UPDATE). Then core's upsert, its 2-argument MAX as
-//   GREATEST; its conflict WHERE (the same ID's re-take) is the backstop the locks make unreachable.
+//   GREATEST; its conflict WHERE (only the same ID re-takes) is what refuses a take by another ID of the same
+//   principal, since userOf skips the taker's own principal.
 // - registerId inserts if absent (ON CONFLICT (id) DO NOTHING RETURNING): a second registration of one ID waits on the
 //   first's uncommitted row and gets no row, then re-reads its ended_at for IdCollision, where a plain insert fails
 //   23505 and aborts its whole body. The tombstone is consumed after the insert, so a registration racing a prune of
