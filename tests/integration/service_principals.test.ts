@@ -304,7 +304,8 @@ describe("audit fixes (#270 step 2)", () => {
     expect(there.status).toBe(403);
     expect(there.body.message).toBe(missing.body.message.replaceAll("nosvc", SVC));
     // The deny rows say why (#1402): the service's scope is refused to every user by scope.service, before any team
-    // lookup, and the missing one is a scope nobody owns.
+    // lookup, and the missing one is a scope nobody owns. The rule name is the only observable trace of scope.service:
+    // the 403 reads the same with or without it, so this assert is what pins that check.
     expect((await accessAudits(srv, "authz.decision")).filter(r => r.detail.verb === "act_as").map(r => [r.actor, r.detail.address, r.detail.allow, r.detail.rule])).toEqual([
       [A, `${SVC}/x`, false, "scope.service"],
       [A, "nosvc/x", false, "scope.ownerless"],
