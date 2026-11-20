@@ -1,5 +1,6 @@
 // repo_sql.ts, audit.ts and hosted_rows.ts on each backend (#807 P3 C11c): the same SQL, the same rows.
 import { describe, expect, test } from "bun:test";
+import { writeAudit } from "../../src/server/audit.ts";
 import { accessAudits, auditOrigins } from "./audit.ts";
 import { hostedRowCount } from "./hosted_rows.ts";
 import { exec, execOn, pgText, row, rows, txSpy } from "./repo_sql.ts";
@@ -19,8 +20,11 @@ describe.each(backends)("on %s", (backend) => {
     await srv.app.ready;
     await exec(srv, "INSERT INTO access_log (at, actor, action, target, detail) VALUES (?, ?, ?, ?, ?)", 5, "a@example.com", "test.thing", "t", JSON.stringify({ k: 1 }));
     expect(await rows(srv, "SELECT at, actor, count(*) OVER () AS n FROM access_log WHERE action = ?", "test.thing")).toEqual([{ at: 5, actor: "a@example.com", n: 1 }]);
-    const detail = (await row<{ detail: string }>(srv, "SELECT detail FROM access_log WHERE action = 'test.thing'"))!.detail;
-    expect(JSON.parse(detail)).toEqual({ k: 1 });
+    // A detail the store wrote (a jsonb object on Postgres, not the JSON string `exec` above binds) reads as its text.
+    await srv.app.repo.write(tx => writeAudit(srv.app.repo, tx, "team.created", "a@example.com", "team:eng", { k: 1 }));
+    const detail = (await row<{ detail: unknown }>(srv, "SELECT detail FROM access_log WHERE action = 'team.created'"))!.detail;
+    expect(typeof detail).toBe("string");
+    expect(JSON.parse(detail as string)).toEqual({ k: 1 });
     expect(await row(srv.app.repo, "SELECT 1 AS one FROM access_log WHERE action = ?", "nothing")).toBeNull();
     expect(await row(srv.app, "SELECT (1 = 1) AS t, (1 = 0) AS f")).toEqual({ t: 1, f: 0 });
     expect(await accessAudits(srv, "test.thing")).toEqual([{ at: 5, actor: "a@example.com", target: "t", detail: { k: 1 } }]);

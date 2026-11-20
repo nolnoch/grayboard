@@ -6,7 +6,12 @@
 // (Postgres's LIKE is case sensitive).
 //
 // Rows come back as SQLite's would: an int8 column as a number, a boolean as 1 or 0, a json/jsonb column as its text.
-// So a row compares equal on both backends.
+// So a row compares equal on both backends. On Postgres, `exec` binding JSON text into a jsonb column stores a JSON
+// string value, not an object (the stores parse first: src/server/store/pg/audit.ts); seed such a row through the
+// store (writeAudit) when the test needs an object there.
+//
+// pgText numbers every `?` outside '…' and "…": it doesn't handle a `?` in a `--` comment, a `$$` block or an E'' string,
+// nor the jsonb operators ?, ?| and ?&. Don't write those here.
 import type { Repo } from "../../src/server/db.ts";
 import { pgOf } from "../../src/server/store/pg/tx.ts";
 import { isTx, sqliteOf, type Read, type Tx } from "../../src/server/store/tx.ts";

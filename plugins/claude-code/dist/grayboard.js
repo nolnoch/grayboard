@@ -31663,6 +31663,14 @@ function unreachable(error) {
   }
   return false;
 }
+var LISTEN_CAPACITY = "MCP listen capacity reached";
+function listenCapacity(error) {
+  for (let e = error, depth = 0;e && depth < 8; e = e.cause, depth++) {
+    if (e instanceof SdkHttpError && e.status === 429 && e.data.text === LISTEN_CAPACITY)
+      return true;
+  }
+  return false;
+}
 function outcome(error) {
   for (let e = error, depth = 0;e && depth < 8; e = e.cause, depth++) {
     if (e instanceof ServerUnreachable)
@@ -36702,6 +36710,7 @@ var ROTATION_GRACE_MS = 1e4;
 var LEASE_MARGIN_MS = 2000;
 var RENEW_MS = 1e4;
 var SWAP_CLOSE_MS = 1000;
+var SWAP_CAPACITY_RETRIES = 5;
 var RECOVERY_FIRST_MS = 1000;
 var RECOVERY_MAX_MS = 30000;
 var RECOVERY_BUDGET_MS = 60 * 60000;
@@ -37292,7 +37301,17 @@ class Controller {
                 bound.abort();
               }
               await this.guard(r, epoch, signal);
-              await listen();
+              for (let retry = 0;; retry++) {
+                try {
+                  await listen();
+                  break;
+                } catch (error) {
+                  if (signal.aborted || retry >= SWAP_CAPACITY_RETRIES || !listenCapacity(error))
+                    throw error;
+                }
+                await this.wait(Math.min(4000, 250 * 2 ** retry), signal);
+                await this.guard(r, epoch, signal);
+              }
               dirty = true;
             }
             if (dirty) {
