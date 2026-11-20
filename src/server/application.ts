@@ -1545,6 +1545,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
         return false;
       })));
       for (const [i, id] of ids.entries()) if (disabled[i]) application.disconnectUser(id);
+      await testPauseAsync("revalidate:between");
       return recheckAliases(null, null);
     },
     sweepHellos: () => {
@@ -1555,10 +1556,12 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     // Each tier's keys counted with its kind's (#270 D4): a service's bucket is a user's, sized apart.
     limiterSizes: () => ({ bind: hub.helloLimiter.size + hub.serviceHelloLimiter.size, hosted: hostedRequestLimiter.size + serviceRequestLimiter.size,
       subscriber: hostedSubscriberLimiter.size + serviceSubscriberLimiter.size, delegate: hub.delegateLimiter.size }),
-    stopExpiry() {
-      expiry.stop();
+    // Resolves once a claim expiry sweep or read already running has settled (#1489).
+    stopExpiry(): Promise<void> {
+      const running = expiry.stop();
       unsubscribeEnds();
       for (const observer of [...observers]) removeObserver(observer);
+      return running;
     },
   };
   // boardsVisible for addresses already snapshotted, with no session check: a stopped live's prune of its lost boards

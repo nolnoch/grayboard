@@ -800,6 +800,39 @@ test("#807 P3 B2: an asynchronous expiry read arms when it resolves, and a stop 
   } finally { timer.stop(); }
 });
 
+// #1489: a server closes its store once stop() settles, so stop() waits out a sweep or a read already running.
+test("#1489: the expiry timer's stop resolves only once its running sweep and read have settled", async () => {
+  let finishSweep!: () => void, finishRead!: (next: number | null) => void;
+  let sweeping = false;
+  const timer = expiryTimer({
+    next: () => new Promise<number | null>(resolve => { finishRead = resolve; }),
+    sweep: () => { sweeping = true; return new Promise(resolve => { finishSweep = () => resolve({ wake: [], boards: [] }); }); },
+  }, () => {});
+  // The first arm's read is running: stop waits for it.
+  let stopped = false;
+  void timer.stop().then(() => { stopped = true; });
+  await Bun.sleep(20);
+  expect(stopped).toBe(false);
+  finishRead(null);
+  for (let i = 0; i < 100 && !stopped; i++) await Bun.sleep(10);
+  expect(stopped).toBe(true);
+
+  // A sweep already running when stop lands: stop waits for it too.
+  const second = expiryTimer({
+    next: () => Date.now(),
+    sweep: () => { sweeping = true; return new Promise(resolve => { finishSweep = () => resolve({ wake: [], boards: [] }); }); },
+  }, () => {});
+  for (let i = 0; i < 100 && !sweeping; i++) await Bun.sleep(10);
+  expect(sweeping).toBe(true);
+  let secondStopped = false;
+  void second.stop().then(() => { secondStopped = true; });
+  await Bun.sleep(20);
+  expect(secondStopped).toBe(false);
+  finishSweep();
+  for (let i = 0; i < 100 && !secondStopped; i++) await Bun.sleep(10);
+  expect(secondStopped).toBe(true);
+});
+
 // #1390: the timer measures its delay on the source's clock, the one its sweep reads: a server on a test clock behind
 // wall time would otherwise fire at once, find nothing lapsed at its own clock, and re-arm in a loop.
 test("#1390: the expiry timer's delay is measured on the source's clock", () => {

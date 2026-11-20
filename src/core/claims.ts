@@ -621,22 +621,28 @@ export function claimExpiryTimer(
 // claimExpiryTimer over any source. An asynchronous next() resolves after the arm that asked: a read that started
 // before a commit may miss that commit's claim, but the commit's own arm reads after it; a stale earlier time only
 // fires an empty sweep, which re-arms. A failed sweep or read retries after `retryMs`: a transient store error
-// mustn't leave live claims' lapses unannounced until the next arm.
+// mustn't leave live claims' lapses unannounced until the next arm. stop() resolves once a sweep or read already
+// running has settled (#1489): a server awaits it before it closes the store.
 export function expiryTimer(
   source: ExpirySource,
   onWake: (handles: string[]) => void,
   onBoardsChanged?: (boards: string[]) => void | Promise<void>,
   retryMs = 5_000,
-): { arm(): void; stop(): void } {
+): { arm(): void; stop(): Promise<void> } {
   let timer: ReturnType<typeof setTimeout> | undefined;
   let at = Infinity;
   let stopped = false;
+  const running = new Set<Promise<unknown>>();
+  const track = (p: Promise<unknown>) => {
+    const settled = p.then(() => {}, () => {}).finally(() => running.delete(settled));
+    running.add(settled);
+  };
   const clock = () => (source.now ? source.now() : Date.now());
   const set = (when: number) => {
     if (stopped) return;
     clearTimeout(timer);
     at = when;
-    timer = setTimeout(() => void fire().catch(e => console.error("[grayboard] claim expiry timer failed:", e)), Math.max(0, when - clock()));
+    timer = setTimeout(() => track(fire().catch(e => console.error("[grayboard] claim expiry timer failed:", e))), Math.max(0, when - clock()));
     timer.unref?.();
   };
   const fire = async () => {
@@ -665,7 +671,7 @@ export function expiryTimer(
     const next = source.next();
     if (!(next instanceof Promise)) return moveTo(next);
     // set() checks stopped, so a stop while the read waited arms nothing.
-    next.then(moveTo, e => { console.error("[grayboard] claim expiry arm failed:", e); moveTo(clock() + retryMs); });
+    track(next.then(moveTo, e => { console.error("[grayboard] claim expiry arm failed:", e); moveTo(clock() + retryMs); }));
   };
   arm();
   return {
@@ -675,6 +681,7 @@ export function expiryTimer(
       clearTimeout(timer);
       timer = undefined;
       at = Infinity;
+      return Promise.all([...running]).then(() => {});
     },
   };
 }
