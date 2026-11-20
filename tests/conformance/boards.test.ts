@@ -163,8 +163,8 @@ conformance("boards", [
     peers: ["be"],
     async run(ctx) {
       const { ok, refused, peers } = ctx;
-      // No code asserted: hosted refuses this at the input schema, without one (#1220).
-      refused(await peers.be!.call("peer_status", { text: "busy", queue: "maybe" }));
+      // Hosted refuses this at the input schema, local in the tool; both answer bad_request (#1220).
+      refused(await peers.be!.call("peer_status", { text: "busy", queue: "maybe" }), "bad_request");
       const me = (ok(await peers.be!.call("peer_list")) as any).peers.find((p: any) => p.handle === "be");
       expect(me?.status ?? null).toBeNull();
       ok(await peers.be!.call("peer_status", { text: "busy" }));

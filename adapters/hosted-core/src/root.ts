@@ -17,7 +17,7 @@ import type { Lock } from "./lock.js";
 import { accessExpiry, DeliveryHeldElsewhere, Refusal, type AccessExpired, type Identity, type Item } from "./model.js";
 import type { HostPort } from "./port.js";
 import { CallAborted, failure, hostTools, snapshotTools, type NativeTool, type ToolProxy } from "./proxy.js";
-import { outputOf } from "./results.js";
+import { refusalOf } from "./results.js";
 import { end, register } from "./children.js";
 import { AncestryError } from "./sessions.js";
 import { deliveryPath, FileStorage, sessionPath, tryDelivery, waitDelivery } from "./storage.js";
@@ -192,9 +192,7 @@ export class RootDelivery {
       const result = await this.client.call(proxy, "bind", { name, create: true, where: this.o.place() }, this.o.sessionID);
       if (this.closed) return;
       if (!result.isError) { this.configuring = undefined; return; }
-      const output = outputOf(result) as { code?: unknown; message?: unknown } | string | undefined;
-      const code = typeof output === "object" && typeof output?.code === "string" ? output.code : undefined;
-      const why = typeof output === "object" ? (typeof output?.message === "string" ? output.message : "no reason given") : String(output ?? "no reason given").replace(/^error: /, "");
+      const { code, why } = refusalOf(result);
       if (code && REFUSED.has(code)) this.configuring = undefined;
       this.configuredMissed(name, code ? `${code}: ${why}` : why, !this.configuring);
     } catch (error) {

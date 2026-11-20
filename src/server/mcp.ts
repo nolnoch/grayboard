@@ -1226,6 +1226,36 @@ export class HostedMcpServer extends McpServer {
   }
 }
 
+// An input-schema refusal carries `code: "bad_request"` as a handler's own refusal does (#1220; local's code, #954).
+// The SDK's tools/call validates arguments (validateToolInput) before the handler runs and turns its InvalidParams
+// ProtocolError into an isError result with text only (createToolError, which sees just the message). So the
+// validateToolInput override still throws, its message tagged, and the createToolError override strips the tag and
+// adds the code. It fails closed: whatever the SDK does with the throw, the handler never runs on invalid input, and at
+// worst the tag shows in the refusal's text. Both methods are private in the SDK's types, so they're replaced on the
+// prototype, after checking at load that the SDK still defines them; hosted_tools.test.ts pins the result.
+const SCHEMA_REFUSAL = "\u0000grayboard:bad_request\u0000";
+type ToolInternals = {
+  validateToolInput(tool: unknown, args: unknown, name: string): Promise<unknown>;
+  createToolError(message: string): CallToolResult;
+};
+{
+  const sdk = McpServer.prototype as unknown as ToolInternals, ours = HostedMcpServer.prototype as unknown as ToolInternals;
+  for (const method of ["validateToolInput", "createToolError"] as const) {
+    if (typeof sdk[method] !== "function") throw new Error(`@modelcontextprotocol/server ${pkg.dependencies["@modelcontextprotocol/server"]} has no McpServer.${method}: the #1220 schema-refusal override in src/server/mcp.ts needs updating for this SDK`);
+  }
+  ours.validateToolInput = async function (this: ToolInternals, tool, args, name) {
+    try { return await sdk.validateToolInput.call(this, tool, args, name); }
+    catch (e) {
+      if (e instanceof ProtocolError && e.code === ProtocolErrorCode.InvalidParams) throw new ProtocolError(e.code, SCHEMA_REFUSAL + e.message, e.data);
+      throw e;
+    }
+  };
+  ours.createToolError = function (this: ToolInternals, message) {
+    if (message.startsWith(SCHEMA_REFUSAL)) return { ...text(message.slice(SCHEMA_REFUSAL.length)), structuredContent: { code: "bad_request" }, isError: true };
+    return sdk.createToolError.call(this, message);
+  };
+}
+
 function registerNativeTools(server: McpServer, application: Application, hosted: HostedSessions, current: (ctx: ServerContext) => Promise<Context>, report: (error: unknown, tool: string) => void, refuse: (code: string) => void) {
   // A pending alias_lost notice (#453) rides after the result, success or refusal, as the plugin's do; `_meta`
   // marks it, so a host caching this session's instructions fetches them again.

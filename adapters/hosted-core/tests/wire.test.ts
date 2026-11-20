@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { SdkError, SdkErrorCode } from "@modelcontextprotocol/client";
 import { AccessExpired, accessExpiry } from "../src/model.js";
-import { abortOf, unreachable, Wire } from "../src/wire.js";
+import { abortOf, ConnectRefused, subscriberError, unreachable, Wire } from "../src/wire.js";
 
 // #424 item 5: a host's token() that finds its access token expired (OpenCode's native grant) throws inside the
 // MCP SDK's connect. The SDK pinned now rethrows it as is (it wraps fetch failures, not this); the Controller's
@@ -37,4 +37,14 @@ test("abortOf matches only the signal's own abort", () => {
   expect(abortOf(new SdkError(SdkErrorCode.RequestTimeout, "Request timed out"), stop.signal)).toBe(false);
   expect(abortOf(other.signal.reason, stop.signal)).toBe(false);
   expect(abortOf(new SdkError(SdkErrorCode.RequestTimeout, String(other.signal.reason)), stop.signal)).toBe(false);
+});
+
+// #1349: session_register's refusals keep their own code, on a tool result and on a refused connect's body;
+// a code outside the set (or none) is still invalid_response.
+test("subscriberError keeps session_register's refusal codes; an unknown code is invalid_response", () => {
+  const codes = ["child_bound", "child_registered_elsewhere", "has_children", "root_is_child", "invalid_registration"];
+  expect(codes.map(code => subscriberError({ code }, false).code)).toEqual(codes);
+  expect(codes.map(code => new ConnectRefused(400, JSON.stringify({ code, message: "refused" })).code)).toEqual(codes);
+  expect([{ code: "child_unknown" }, { code: 7 }, {}, undefined].map(value => subscriberError(value, false).code)).toEqual(Array(4).fill("invalid_response"));
+  expect(new ConnectRefused(400, JSON.stringify({ code: "child_unknown" })).code).toBe("invalid_response");
 });
