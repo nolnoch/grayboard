@@ -2,16 +2,17 @@
 // each in T-P12's shape (tests/support/pg_race.ts): A's body holds its transaction open at a gate, B's starts, and the
 // race waits until B is blocked on a lock or done. The end state is asserted before `waited`, so a race whose lock is
 // gone fails on what it broke (a scope past its cap, a hold on a deleted alias, two users on one alias), not on a
-// timeout. The bindings side (take, a tools-only root's writes_as) is C10a's: until then T-C5-4…6 race the real
-// aliases.lock against raw-SQL stand-ins for it, which C10a replaces with the real methods. Without
-// GRAYBOARD_TEST_PG_URL they skip.
+// timeout. T-C5-4…6 race the real bindings.take (C10a-b) and a tools-only root's writes_as (lockedUserOf, then
+// registerId) against a delete's stand-in and each other. Without GRAYBOARD_TEST_PG_URL they skip.
 import { expect, test } from "bun:test";
 import { describePg } from "../../../../tests/support/pg.ts";
 import { committed, outcome, pgPair, race, type PgPair } from "../../../../tests/support/pg_race.ts";
 import { aliasCapRefusal } from "../../alias_cap.ts";
 import type { AliasTarget } from "../aliases.ts";
 import type { Tx } from "../tx_base.ts";
+import { lockedUserOf } from "../../alias_use.ts";
 import { makePgAliases } from "./aliases.ts";
+import { makePgBindings } from "./bindings.ts";
 import { pgFailure } from "./errors.ts";
 import { pgOf } from "./tx.ts";
 
@@ -19,6 +20,7 @@ const ME = "you@example.com";
 const person = (name: string): AliasTarget => ({ scope_kind: "person", scope_ref: ME, name });
 const X = `${ME}/x`;
 const al = makePgAliases({ clock: () => 1_800_000_000_000 });
+const b = makePgBindings({ clock: () => 1_800_000_000_000, aliases: al });
 
 const count = async (p: PgPair, table: "aliases" | "alias_holds") => Number((await p.db.sql`SELECT count(*) AS n FROM ${p.db.sql(table)}`)[0].n);
 
@@ -63,20 +65,17 @@ describePg("aliases store races (Postgres)", () => {
     expect(r.waited).toBe(true);
   });
 
-  // Stand-ins for C10a's bindings.take and registerId's writes_as: aliases.lock "use", then aliasUser's check (another
-  // user holds or writes as the alias), then the hold or the writes_as.
-  const otherUser = async (tx: Tx, user: string) => (await pgOf(tx)`SELECT 1 FROM ids WHERE writes_as = ${X} AND principal IS DISTINCT FROM ${user}
-    UNION ALL SELECT 1 FROM alias_holds h JOIN ids i ON i.id = h.id WHERE h.address = ${X} AND i.principal IS DISTINCT FROM ${user}`).length > 0;
+  // The real bindings.take (C10a-b), and a tools-only root's writes_as as the hosted create path runs it: hostedWritesAs'
+  // check under the alias's "use" lock (lockedUserOf), then hostedRegister's registerId with the writes_as.
   const take = (session: string, user: string) => async (tx: Tx) => {
-    if (!await al.lock(tx, X, "use")) return "gone";
-    if (await otherUser(tx, user)) return "held";
-    await pgOf(tx)`INSERT INTO alias_holds (address, id, bound_at) VALUES (${X}, ${session}, 0)`;
-    return "took";
+    if (await b.take(tx, X, session, user, 1)) return "took";
+    return await al.find(tx, X) ? "held" : "gone";
   };
   const writesAs = (session: string, user: string) => async (tx: Tx) => {
-    if (!await al.lock(tx, X, "use")) return "gone";
-    if (await otherUser(tx, user)) return "held";
-    await pgOf(tx)`UPDATE ids SET writes_as = ${X} WHERE id = ${session}`;
+    const other = await lockedUserOf({ aliases: al, bindings: b }, tx, X, user);
+    if (other === undefined) return "gone";
+    if (other) return "held";
+    await b.registerId(tx, { id: session, principal: user, launcher: false, writesAs: X });
     return "wrote";
   };
   // identityDelete, teamDeleteAlias, adminServiceDeleteAlias and the Slack unlink: lock "delete", the holds check, remove.
@@ -89,6 +88,7 @@ describePg("aliases store races (Postgres)", () => {
   async function world(p: PgPair) {
     await p.a.write(tx => al.create(tx, person("x"), ME));
     await p.db.sql`INSERT INTO ids (id, principal, started_at, last_seen) VALUES ('id:s1', 'u1@example.com', 0, 0), ('id:s2', 'u2@example.com', 0, 0)`;
+    // id:w1 is the tools-only root, registered by its writes_as.
   }
   const holds = async (p: PgPair) => [...await p.db.sql`SELECT address, id FROM alias_holds`];
   const writers = async (p: PgPair) => (await p.db.sql`SELECT id FROM ids WHERE writes_as IS NOT NULL ORDER BY id`).map((x: { id: string }) => x.id);
@@ -104,7 +104,8 @@ describePg("aliases store races (Postgres)", () => {
     expect(r.waited).toBe(true);
   });
 
-  // Mutation: "use" a plain read (the take reads the alias before the delete commits and holds a deleted alias).
+  // Mutation: "use" a plain read, or take's aliases.lock call removed (the take reads the alias before the delete
+  // commits and holds a deleted alias).
   test("T-C5-5: a delete racing a bind's take, delete first: the take finds the alias gone and holds nothing", async () => {
     await using p = await pgPair();
     await world(p);
@@ -115,21 +116,22 @@ describePg("aliases store races (Postgres)", () => {
     expect(r.waited).toBe(true);
   });
 
-  // Mutation: "use" as FOR KEY SHARE, which doesn't conflict with itself (both pass their check: two users on X).
+  // Mutation: "use" as FOR KEY SHARE, which doesn't conflict with itself, or the lock call removed from take (writes_as
+  // first) or from lockedUserOf, hostedWritesAs' check (take first): both pass their check, two users on X.
   test("T-C5-6: a tools-only root's writes_as and another user's take: the second is refused, in either order", async () => {
     {
       await using p = await pgPair();
       await world(p);
-      const r = await race(p, writesAs("id:s1", "u1@example.com"), take("id:s2", "u2@example.com"));
+      const r = await race(p, writesAs("id:w1", "u1@example.com"), take("id:s2", "u2@example.com"));
       expect([outcome(r.a), outcome(r.b)]).toEqual(["wrote", "held"]);
-      expect(await writers(p)).toEqual(["id:s1"]);
+      expect(await writers(p)).toEqual(["id:w1"]);
       expect(await holds(p)).toEqual([]);
       expect(r.waited).toBe(true);
     }
     {
       await using p = await pgPair();
       await world(p);
-      const r = await race(p, take("id:s2", "u2@example.com"), writesAs("id:s1", "u1@example.com"));
+      const r = await race(p, take("id:s2", "u2@example.com"), writesAs("id:w1", "u1@example.com"));
       expect([outcome(r.a), outcome(r.b)]).toEqual(["took", "held"]);
       expect(await writers(p)).toEqual([]);
       expect(await holds(p)).toEqual([{ address: X, id: "id:s2" }]);
