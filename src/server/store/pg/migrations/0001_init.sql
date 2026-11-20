@@ -16,7 +16,9 @@
 -- access_log), hosted_sessions.name (#451), ids.token_session (unused since #282). Added: ids.seq and
 -- hosted_alias_lost.seq, the insertion order the SQLite queries read from rowid.
 --
--- Editable in place until the first release that runs a server on Postgres (P5); append-only after that.
+-- Editable in place only until a kept database applies it (a pilot under GRAYBOARD_UNRELEASED_POSTGRES=1, or the
+-- first release that runs a server on Postgres, P5). That database records this file's sha256, and migrate.ts refuses
+-- to boot on a changed file, so every schema change after that goes in 0002 onward. Append-only after that.
 
 CREATE TABLE users (
   id           int8 GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
