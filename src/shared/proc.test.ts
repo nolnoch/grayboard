@@ -1,7 +1,7 @@
 // Liveness (#182 audit 9): a row is dead only on evidence, the pid gone or a
 // start time that differs; an unknown start time counts as alive.
 import { afterEach, expect, spyOn, test } from "bun:test";
-import { aliveRows, claudeAmong, isAlive, isClaudeCode, procStart, type AncestorFacts } from "./proc.ts";
+import { aliveRows, claudeAmong, isAlive, isClaudeCode, parentOf, parentsOf, procStart, type AncestorFacts } from "./proc.ts";
 import { until } from "../../tests/support/until.ts";
 
 const PATH = process.env.PATH;
@@ -71,6 +71,47 @@ test.skipIf(process.platform === "linux")("macOS: when ps can't run, a present p
     expect(err.mock.calls.some((c) => String(c[0]).includes("ps failed to run"))).toBe(true);
   } finally {
     err.mockRestore();
+  }
+});
+
+// #1463: parent reads for adapter displacement, several pids in one call.
+test.skipIf(process.platform !== "linux")("Linux: parentsOf reads each pid's parent, and none for a gone pid", async () => {
+  const child = Bun.spawn(["sleep", "30"]);
+  try {
+    const gone = deadPid();
+    const parents = parentsOf([process.pid, gone, child.pid]);
+    expect([...parents.keys()]).toEqual([process.pid, gone, child.pid]);
+    expect(parents.get(process.pid)).toBe(process.ppid);
+    expect(parents.get(gone)).toBeNull();
+    expect(parents.get(child.pid)).toBe(process.pid);
+    expect(parentOf(process.pid)).toBe(process.ppid);
+    expect(parentOf(gone)).toBeNull();
+    expect(parentsOf([])).toEqual(new Map());
+  } finally {
+    child.kill();
+    await child.exited;
+  }
+});
+
+test.skipIf(process.platform === "linux")("macOS: parentsOf reads every pid's parent with one ps, and none when ps can't run", async () => {
+  const child = Bun.spawn(["sleep", "30"]);
+  const spawn = spyOn(Bun, "spawnSync");
+  const err = spyOn(console, "error").mockImplementation(() => {});
+  try {
+    const gone = deadPid();
+    spawn.mockClear();
+    const parents = parentsOf([process.pid, gone, child.pid]);
+    expect(spawn).toHaveBeenCalledTimes(1);
+    expect(parents.get(process.pid)).toBe(process.ppid);
+    expect(parents.get(gone)).toBeNull();
+    expect(parents.get(child.pid)).toBe(process.pid);
+    process.env.PATH = "/nonexistent";
+    expect(parentsOf([process.pid, child.pid])).toEqual(new Map([[process.pid, null], [child.pid, null]]));
+  } finally {
+    spawn.mockRestore();
+    err.mockRestore();
+    child.kill();
+    await child.exited;
   }
 });
 

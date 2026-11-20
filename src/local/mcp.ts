@@ -53,7 +53,7 @@ import {
 import { localDbPath } from "./open.ts";
 import { deliverEnded, listenForWakeup, poke } from "./wakeup.ts";
 import { sockDir } from "../shared/sockdir.ts";
-import { ChildSessions, acquireName, displaceableHolder, attachSession, candidateNames, childFallback, conversationSnapshot, detachSession, endLocalSession, keyedHarness, liveSessions, nothingEnded, recordPredecessor, recordYields, registerChild, registerSession, releaseName, runnerRoot, runnerRootLive, setHeldMeta, SIBLING_WAIT_MS, siblingGone, thisSession, type Ended, type Leave, type SessionKind } from "./binding.ts";
+import { ChildSessions, acquireName, displaceableHolder, attachSession, candidateNames, childFallback, conversationSnapshot, detachSession, endLocalSession, keyedHarness, liveSessions, nothingEnded, recordPredecessor, recordYieldReads, recordYields, registerChild, registerSession, releaseName, runnerRoot, runnerRootLive, setHeldMeta, SIBLING_WAIT_MS, siblingGone, thisSession, type Ended, type Leave, type SessionKind } from "./binding.ts";
 import { GRAYBOARD_AGENT_META, validSourceId } from "../shared/session_meta.ts";
 import { MISSING_TEXT, TOOL_USE_META, readCurrent, takeRecord, type MissingCause } from "../shared/claude_agents.ts";
 import { listenIdentity, type IdentityRequest } from "../shared/claude_identity.ts";
@@ -408,7 +408,8 @@ const RECORDS = PUSH && !HUMAN && !KEYED && PARENT_SESSION === undefined;
 // to that child while it lives (#1404, recordYields): a displaced sibling's
 // stale start-time write or later bind would otherwise overwrite the child's.
 // A session with a harness session never yields, so it takes no lock; the
-// harness's start time is read before the lock either way.
+// harness's start time and the yield's process reads (#1463) are read before
+// the lock either way.
 const writeNames = () => {
   if (!RECORDS) return;
   try {
@@ -418,8 +419,9 @@ const writeNames = () => {
       writeRecord(RECORD_DIR, rec, start);
       return;
     }
+    const pre = recordYieldReads(db, SESSION_ID, process.ppid);
     db.transaction(() => {
-      if (!recordYields(db, SESSION_ID, process.ppid)) writeRecord(RECORD_DIR, rec, start);
+      if (!recordYields(db, SESSION_ID, process.ppid, pre)) writeRecord(RECORD_DIR, rec, start);
     }).immediate();
   } catch (e) {
     console.error(`[grayboard] name record for harness pid ${process.ppid} not written:`, e);
