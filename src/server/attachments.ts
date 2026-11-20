@@ -7,6 +7,7 @@ import { sha256Hex } from "../shared/hash.ts";
 import { participant, type Repo } from "./db.ts";
 import type { Read } from "./store/tx.ts";
 import { boardAccess } from "./access.ts";
+import { testPauseAsync } from "../shared/testpause.ts";
 import { visibleBoards } from "./board_reads.ts";
 import { decidePure, recordDecision, type Actor, type PureRequest } from "./policy.ts";
 
@@ -161,6 +162,7 @@ export async function sweepStoredBlobs(repo: Repo, stopped: () => boolean = () =
     console.error(`[grayboard] blob sweep: ${(e as Error).message}`);
     return 0;
   }
+  await testPauseAsync("blobs:listed");
   let swept = 0;
   for (const sha256 of shas) {
     if (stopped()) break;

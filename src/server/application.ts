@@ -111,6 +111,10 @@ export type ApplicationOptions = {
   // The hub's clock: the rate limiters' and the write-dedup window's
   // (src/server/write_dedup.ts). Tests move it instead of sleeping.
   now?: () => number;
+  // Runs work a commit or a background pass starts and nobody awaits (a wake's drains, a board change's fan-out, the
+  // blob sweep after ends), so a server's stop() can wait for it or, once stopping, skip it (#1493). `run` never
+  // rejects (it logs its own failure); `stopped` says the stop has begun. Absent, it runs at once, untracked.
+  runBackground?: (what: string, run: (stopped: () => boolean) => Promise<unknown>) => void;
 };
 // What a session's user facts are: the bridge's human attach answers them.
 export type HelloResult = { id: string } & SessionFacts;
@@ -396,11 +400,14 @@ function settleOwed(session: ApplicationSession): void {
 
 // A human's session has no wakes to save: it gets deferred pushes and
 // digests at once.
+// The effect's promise settles once the drains have (a Commit run in the background tracks it, #1493); none rejects.
 function wake(hub: Hub, on: Commit, handles: string[]): void {
   on(() => {
+    const drains: Promise<unknown>[] = [];
     for (const session of new Set(handles.map((h) => hub.registry.get(h)))) {
-      if (session?.active) void drainBoards(session, hub, session.human).catch((error) => console.error("postcommit effect failed", error));
+      if (session?.active) drains.push(drainBoards(session, hub, session.human).catch((error) => console.error("postcommit effect failed", error)));
     }
+    return Promise.all(drains).then(() => {});
   });
 }
 
@@ -600,6 +607,15 @@ function sessionActor(session: ApplicationSession, address?: string): Actor {
 
 export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
   const now = opts.now ?? Date.now;
+  const background = opts.runBackground ?? ((_what: string, run: (stopped: () => boolean) => Promise<unknown>) => { void run(() => false); });
+  // A Commit outside any body that runs its effect now, as onCommit(repo.read) does, as background work `what`; a
+  // test holds it once the effect is done at "background:<what>".
+  const backgroundCommit = (what: string): Commit => effect => background(what, () => {
+    let done: Promise<unknown>;
+    try { done = Promise.resolve(effect()).catch((error) => console.error("postcommit effect failed", error)); }
+    catch (error) { console.error("postcommit effect failed", error); done = Promise.resolve(); }
+    return done.then(() => testPauseAsync(`background:${what}`)).catch((error) => console.error(`[grayboard] ${what} failed:`, error));
+  });
   // A bind spends the hello bucket inside its caller's transaction (hosted's `owning`, #467): while it does, this
   // holds the bind's `Tx` and the session's `afterRollback`; a streak's audit row is written on that `Tx`, where a
   // commit keeps it, and handed to `afterRollback` as well, to be written again if the transaction rolls back. A
@@ -648,6 +664,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
       on(async () => {
         // A copy: liveObservers removes a dead observer from the set mid-walk.
         const live = await liveObservers(board, [...observersByBoard.get(board) ?? []]);
+        await testPauseAsync("board-change:observers-read");
         // Still observing after the await: a close meanwhile isn't notified.
         for (const observer of live) if (observers.has(observer)) notify(() => observer.hooks.changed());
       });
@@ -717,8 +734,8 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
   function boardsChanged(on: Commit, boards: string[]) {
     for (const board of new Set(boards)) hub.boardChanged(on, board);
   }
-  // Core's claim expiry calls back after its sweep's write has committed, outside any body: its effects run now.
-  const expiryCommit = onCommit(repo.read);
+  // Core's claim expiry calls back after its sweep's write has committed, outside any body: its effects run now, as
+  // background work a server's stop waits for (#1493).
   // Announces claims that lapse on their boards.
   // Armed from requests, it fires for every holder: detached, so its rows
   // don't carry the arming request's address (security audit F-19).
@@ -728,7 +745,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     next: () => repo.claims.nextExpiry(repo.read),
     sweep: () => repo.write(tx => sweepClaims(repo, hub.access, tx, repo.now())),
     now: () => repo.now(),
-  }, handles => wake(hub, expiryCommit, handles), boards => boardsChanged(expiryCommit, boards));
+  }, handles => wake(hub, backgroundCommit("claim expiry wake"), handles), boards => boardsChanged(backgroundCommit("claim expiry board change"), boards));
   const expiry = { arm: () => detached(() => claimTimer.arm()), stop: () => claimTimer.stop() };
   // The session leaves the hub's registry: superseded, revoked or closed.
   function detach(session: ApplicationSession): void {
@@ -869,13 +886,14 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
   // resend that session's unacked messages too), the woken handles drain, and the freed upload bytes go. The
   // bounces were read in the ends' transaction (#807 P3 A7i), so they're pushed at the commit, synchronously, before
   // a newer message to their senders can be.
+  // The drains and the sweep are background work a server's stop waits for, and skips once stopping (#1493).
   function afterEnds(woken: Set<string>, bounces: MessageRow[]): void {
     for (const b of bounces) {
       const to = hub.registry.get(b.recipient);
       if (to) deliverDirect(to, b);
     }
-    wake(hub, onCommit(repo.read), [...woken]);
-    void sweepStoredBlobs(repo);
+    wake(hub, backgroundCommit("session end wake"), [...woken]);
+    background("blob sweep", stopped => sweepStoredBlobs(repo, stopped));
   }
   // The hosted store ends a released child's ID in the release's transaction (#475 item 1); this runs its
   // after-commit half for every hosted commit, whichever path released it.
@@ -1514,10 +1532,11 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     // The server's one BoardAccess: HTTP's claim calls judge boards with it, as the hub's tools do (#807 P3 B5b3c).
     access: hub.access,
     // Trusted committed domain operations, not client-supplied invalidations; called after their commit, so effects run now.
-    boardsChanged: (boards: string[]) => boardsChanged(onCommit(repo.read), boards),
+    // Its fan-out is background work a server's stop waits for (#1493): the retention pass's posts step starts one.
+    boardsChanged: (boards: string[]) => boardsChanged(backgroundCommit("board change"), boards),
     wake(handles: string[]) {
       expiry.arm();
-      wake(hub, onCommit(repo.read), handles);
+      wake(hub, backgroundCommit("wake"), handles);
     },
     // An admin revoked or disabled a user: every session of theirs closes.
     // The hosted store ends them (disabled users) on its sweep.
