@@ -33,8 +33,8 @@ export type IdpId = (typeof IDP_IDS)[number];
 // The Okta org behind the generic OIDC provider (src/server/idp_oidc.ts): one per server.
 export type OktaConfig = { issuer: string; clientId: string; clientSecret: string; allowedDomains: string[] };
 
-// The server's database (#807 P3 C11b): a SQLite file, or a Postgres URL behind GRAYBOARD_UNRELEASED_POSTGRES=1 until
-// the cutover (docs/future/postgres-server.md D8 P3, P5).
+// The server's database (#807): a SQLite file, or a Postgres URL. Both ship until the SQLite store is deleted after
+// the pilot deploys (docs/future/postgres-server.md D8).
 export type Store = { kind: "sqlite"; path: string } | { kind: "postgres"; url: string };
 
 export type Config = {
@@ -375,14 +375,12 @@ function urlHostname(raw: string): string {
 }
 
 // One of GRAYBOARD_DATABASE_URL and GRAYBOARD_DB_PATH: both set would hide a misconfigured deploy behind a silent
-// precedence. The URL needs the unreleased gate (PS D8: the two stores never coexist in a release, so a release cut
-// before P5 must not honour it) and an explicit blob directory (no database directory to put it beside).
+// precedence. The URL needs an explicit blob directory (no database directory to put it beside).
 function storeConfig(env: Record<string, string | undefined>): { store: Store; blobDir: string } {
   const url = env.GRAYBOARD_DATABASE_URL, path = env.GRAYBOARD_DB_PATH, blobDir = env.GRAYBOARD_BLOB_DIR;
   if (url && path) throw new Error("Set one of GRAYBOARD_DATABASE_URL, GRAYBOARD_DB_PATH, not both");
   if (path) return { store: { kind: "sqlite", path }, blobDir: blobDir || join(dirname(path), "blobs") };
   if (!url) throw new Error("Required env var GRAYBOARD_DB_PATH (or GRAYBOARD_DATABASE_URL) is not set");
-  if (env.GRAYBOARD_UNRELEASED_POSTGRES !== "1") throw new Error("GRAYBOARD_DATABASE_URL needs GRAYBOARD_UNRELEASED_POSTGRES=1: the Postgres store is unreleased");
   if (!blobDir) throw new Error("GRAYBOARD_DATABASE_URL needs GRAYBOARD_BLOB_DIR: there's no database directory to keep attachments beside");
   return { store: { kind: "postgres", url }, blobDir };
 }
