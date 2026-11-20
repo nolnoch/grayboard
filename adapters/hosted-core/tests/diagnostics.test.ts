@@ -5,6 +5,7 @@
 import { expect, test } from "bun:test";
 import { Diagnostics, failureCode, failureMessage, logFields, type RecordStatus } from "../src/diagnostics.js";
 import { DeliveryHeldElsewhere, RefreshInProgress, ServerOutdated } from "../src/model.js";
+import { subscriberError } from "../src/wire.js";
 
 test("failureCode and failureMessage name a delivery held elsewhere, an outdated server and a busy refresh", () => {
   const hint = "run /grayboard resume";
@@ -36,4 +37,14 @@ test("login, login link, logout, refresh and tool-proxy records keep their opera
   expect(emitted.map(r => ({ operation: r.operation, code: r.code, message: r.message }))).toEqual(expected);
   const stored = saved.get("diagnostics:v1") as unknown[];
   expect(stored.map(r => logFields(r))).toEqual(written.map(w => expect.objectContaining({ operation: w.operation, code: w.code, root: w.sessionID })));
+});
+
+// #1349: a session_register refusal is recorded, emitted and restored under its own code.
+test("session_register's refusal codes are diagnostic codes a record keeps", () => {
+  for (const code of ["child_bound", "child_registered_elsewhere", "has_children", "root_is_child", "invalid_registration"]) {
+    const error = subscriberError({ code }, false);
+    expect([code, failureCode(error), failureMessage(error, "run /grayboard resume")]).toEqual([code, code, `Operation refused (${code})`]);
+    expect(logFields({ state: "degraded", message: "child_register failed", operation: "child_register", time: Date.now(), code })).toMatchObject({ code });
+    expect(logFields({ state: "active", message: "ok", operation: "child_register", time: Date.now(), failure: { operation: "child_register", code, time: Date.now() } })).toBeDefined();
+  }
 });
