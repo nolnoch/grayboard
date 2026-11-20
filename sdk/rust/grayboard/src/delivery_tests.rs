@@ -29,6 +29,8 @@ type Script = Box<dyn FnOnce(&Req, &mut Bus) -> Reply + Send>;
 struct Call {
     op: String,
     lease: Option<String>,
+    /// The bearer token the request carried.
+    auth: Option<String>,
     args: Value,
     at: std::time::Instant,
 }
@@ -146,6 +148,7 @@ impl Bus {
                 self.log.push(Call {
                     op: "cancel".into(),
                     lease: req.headers.get("x-grayboard-lease").cloned(),
+                    auth: req.headers.get("authorization").cloned(),
                     args: Value::Null,
                     at: std::time::Instant::now(),
                 });
@@ -156,6 +159,7 @@ impl Bus {
         self.log.push(Call {
             op: op.clone(),
             lease: req.headers.get("x-grayboard-lease").cloned(),
+            auth: req.headers.get("authorization").cloned(),
             args: req.body["params"]["arguments"].clone(),
             at: std::time::Instant::now(),
         });
@@ -1569,4 +1573,151 @@ async fn a_terminal_credential_failure_at_a_reopen_stops_the_stream() {
     }
     ended(&mut stream).await;
     assert_eq!(w.count("listen"), 1);
+}
+
+/// A credential whose token the test replaces, reporting each replacement through `changes` as `ClientCredentials` does on a renewal.
+#[derive(Clone)]
+struct Rotating {
+    token: Arc<Mutex<String>>,
+    generation: Arc<tokio::sync::watch::Sender<u64>>,
+}
+
+impl Rotating {
+    fn new() -> Self {
+        Self {
+            token: Arc::new(Mutex::new("tok-1".into())),
+            generation: Arc::new(tokio::sync::watch::Sender::new(0)),
+        }
+    }
+
+    fn rotate(&self, token: &str) {
+        *self.token.lock().unwrap() = token.into();
+        self.generation.send_modify(|g| *g += 1);
+    }
+}
+
+impl Credential for Rotating {
+    fn token(&self) -> BoxFuture<'_, Result<String, AuthError>> {
+        let token = self.token.lock().unwrap().clone();
+        Box::pin(async move { Ok(token) })
+    }
+    fn unauthorized<'a>(&'a self, _: &'a str) -> BoxFuture<'a, Result<(), AuthError>> {
+        Box::pin(async { Err(AuthError::terminal("no")) })
+    }
+    fn changes(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+        Some(self.generation.subscribe())
+    }
+}
+
+/// Backoffs far longer than any wait here: a reopen that lands at all within `until`'s deadline took none.
+fn slow_backoff(t: &mut Timeouts) {
+    t.backoff_unit = Duration::from_secs(30);
+    t.backoff_max = Duration::from_secs(60);
+}
+
+// Decision (#1265): a renewed token reopens the listen stream at once on the new token, under the same lease: no whoami, delivery_open or backoff, and the inbox is re-read. Exactly one reopen per renewal.
+#[tokio::test]
+async fn a_renewed_token_reopens_the_listen_stream_at_once_under_the_same_lease() {
+    let credential = Rotating::new();
+    let w = World::with_credential(Bus::new(&["a"]), slow_backoff, credential.clone()).await;
+    let mut stream = w.s().deliveries();
+    w.until("the lease listens", |b| ops_count(b, "listen") == 1)
+        .await;
+    let reads = w.count("read");
+    credential.rotate("tok-2");
+    w.until("the stream listens again", |b| ops_count(b, "listen") == 2)
+        .await;
+    let listens = w.calls("listen");
+    assert_eq!(listens[0].auth.as_deref(), Some("Bearer tok-1"));
+    assert_eq!(listens[1].auth.as_deref(), Some("Bearer tok-2"));
+    assert_eq!(w.count("sub:whoami"), 1, "the lease is kept: {:?}", w.ops());
+    assert_eq!(w.count("sub:delivery_open"), 1);
+    // The old listen is cancelled before the new one opens.
+    let ops = w.ops();
+    let tail = after(&ops, "listen", 1);
+    assert_eq!(
+        tail.iter().position(|o| o == "cancel"),
+        Some(tail.iter().position(|o| o == "listen").unwrap() - 1),
+        "{ops:?}"
+    );
+    w.until("the inbox is re-read", |b| ops_count(b, "read") > reads)
+        .await;
+    // The new stream carries hints; the reopen happened once.
+    w.bus().direct(1);
+    w.bus().hint();
+    let d = next(&mut stream).await.unwrap();
+    assert_eq!(d.id, "direct:1");
+    d.receipt().await.unwrap();
+    assert_eq!(w.count("listen"), 2, "{:?}", w.ops());
+    assert_eq!(w.count("sub:delivery_open"), 1);
+}
+
+// Decision (#1265): with an item out, a renewal reopens the listen stream too, and the handle still receipts under the same lease.
+#[tokio::test]
+async fn a_renewal_with_an_item_out_reopens_the_listen_stream_and_keeps_the_handle() {
+    let credential = Rotating::new();
+    let mut bus = Bus::new(&["a"]);
+    bus.direct(1);
+    let w = World::with_credential(bus, slow_backoff, credential.clone()).await;
+    let mut stream = w.s().deliveries();
+    let d = next(&mut stream).await.unwrap();
+    credential.rotate("tok-2");
+    w.until("the stream listens again", |b| ops_count(b, "listen") == 2)
+        .await;
+    assert_eq!(w.calls("listen")[1].auth.as_deref(), Some("Bearer tok-2"));
+    d.receipt().await.unwrap();
+    assert_eq!(w.count("sub:delivery_open"), 1);
+    let receipts = w.calls("sub:delivery_receipt");
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(receipts[0].auth.as_deref(), Some("Bearer tok-2"));
+}
+
+// Decision (#1265): a credential that reports no changes (a static token) never reopens on its own: idle renews pass on the one listen stream.
+#[tokio::test]
+async fn a_static_token_never_reopens_the_listen_stream() {
+    assert!(StaticBearer::new("tok-1").changes().is_none());
+    let w = World::with(Bus::new(&["a"]), |t| t.renew = Duration::from_millis(10)).await;
+    let _stream = w.s().deliveries();
+    w.until("five idle renews", |b| {
+        ops_count(b, "sub:delivery_renew") >= 5
+    })
+    .await;
+    assert_eq!(w.count("listen"), 1, "{:?}", w.ops());
+    assert_eq!(w.count("sub:whoami"), 1);
+}
+
+// Decision (#1265): a reopen after a renewal that fails is an ordinary outage: the lease is dropped, the stream backs off, and the next round starts from whoami.
+#[tokio::test]
+async fn a_failed_reopen_after_a_renewal_backs_off_like_any_outage() {
+    let credential = Rotating::new();
+    let unit = Duration::from_millis(100);
+    let w = World::with_credential(
+        Bus::new(&["a"]),
+        |t| {
+            t.backoff_unit = unit;
+            t.backoff_max = Duration::from_secs(1);
+        },
+        credential.clone(),
+    )
+    .await;
+    let mut stream = w.s().deliveries();
+    w.until("the lease listens", |b| ops_count(b, "listen") == 1)
+        .await;
+    w.bus().on("listen", |_, _| Reply::status(503, "down"));
+    credential.rotate("tok-2");
+    w.until("a new round listens", |b| ops_count(b, "listen") == 3)
+        .await;
+    assert_eq!(w.count("sub:whoami"), 2, "{:?}", w.ops());
+    assert_eq!(w.count("sub:delivery_open"), 2);
+    let failed = &w.calls("listen")[1];
+    let whoami = &w.calls("sub:whoami")[1];
+    // The first outage's backoff: twice the unit.
+    assert!(
+        whoami.at.duration_since(failed.at) >= 2 * unit,
+        "backed off {:?}",
+        whoami.at.duration_since(failed.at)
+    );
+    w.bus().direct(1);
+    w.bus().hint();
+    assert_eq!(next(&mut stream).await.unwrap().id, "direct:1");
 }

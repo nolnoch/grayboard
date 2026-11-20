@@ -319,6 +319,8 @@ enum Wake {
     Event(Option<Event>),
     Receipt(Option<Answer>),
     Renew,
+    /// The credential installed a new token (#1265).
+    Token,
 }
 
 enum Event {
@@ -355,6 +357,45 @@ async fn read_hints(
             },
         }
     }
+}
+
+/// The round's listen stream: its reader task and the hints it sends.
+struct Listener {
+    events: mpsc::UnboundedReceiver<Event>,
+    stop: CancellationToken,
+    /// `None` once closed: a reopen that failed leaves it so, and the round's own close then has nothing to wait for.
+    reader: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Listener {
+    fn start(subscription: Subscription) -> Self {
+        let (events_tx, events) = mpsc::unbounded_channel();
+        let stop = CancellationToken::new();
+        let reader = tokio::spawn(read_hints(subscription, events_tx, stop.clone()));
+        Self {
+            events,
+            stop,
+            reader: Some(reader),
+        }
+    }
+
+    /// Cancels the listen (its `notifications/cancelled` goes out before this returns) and waits for the reader.
+    async fn close(&mut self) {
+        self.stop.cancel();
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.await;
+        }
+    }
+}
+
+/// Resolves when the credential's token changes; never for a credential that reports no changes, or once its sender is gone.
+async fn token_changed(changes: &mut Option<tokio::sync::watch::Receiver<u64>>) {
+    if let Some(rx) = changes
+        && rx.changed().await.is_ok()
+    {
+        return;
+    }
+    std::future::pending().await
 }
 
 struct Task {
@@ -681,21 +722,41 @@ impl Task {
             );
         }
         self.lease = Some(lease);
+        // Watched from before the listen opens, so a token installed while it opens reopens it (at worst once needlessly).
+        let mut changes = sub.shared.credential.changes();
+        if let Some(rx) = &mut changes {
+            rx.mark_unchanged();
+        }
         let subscription = call!(&mut self.ctl, sub.listen(&[INBOX]), Fail::Err);
-        let (events_tx, mut events) = mpsc::unbounded_channel();
-        let stop = CancellationToken::new();
-        let reader = tokio::spawn(read_hints(subscription, events_tx, stop.clone()));
-        let fail = self.serve(&sub, &mut events).await;
+        let mut listener = Listener::start(subscription);
+        let fail = self.serve(&sub, &mut listener, &mut changes).await;
         // The reader's cancel notification goes out before anything that follows (a release, `session_end`): one sent after the session ended would start a new one under the same ID.
-        stop.cancel();
-        let _ = reader.await;
+        listener.close().await;
         fail
+    }
+
+    /// The credential installed a new token: the server closes this listen stream when the token it was opened with expires, so it is replaced now, under the same lease (#1265). Close, then open: listens count against a per-user cap, and every session on one credential renews at once, so opening first could need twice the slots. Hints are nonconsuming and the server keeps the inbox position, so the caller re-reads afterwards and a hint lost in the gap costs nothing. Not an outage, failure, lease loss or throttle, and no backoff; a reopen that fails is an ordinary round failure.
+    async fn relisten(
+        &mut self,
+        sub: &Arc<Connection>,
+        listener: &mut Listener,
+    ) -> Result<(), Fail> {
+        listener.close().await;
+        match watch(&mut self.ctl, sub.listen(&[INBOX])).await {
+            Err(f) => Err(f),
+            Ok(Err(e)) => Err(Fail::Err(e)),
+            Ok(Ok(subscription)) => {
+                *listener = Listener::start(subscription);
+                Ok(())
+            }
+        }
     }
 
     async fn serve(
         &mut self,
         sub: &Arc<Connection>,
-        events: &mut mpsc::UnboundedReceiver<Event>,
+        listener: &mut Listener,
+        changes: &mut Option<tokio::sync::watch::Receiver<u64>>,
     ) -> Fail {
         // The first read is unconditional: hints are nonconsuming, and the server keeps the position.
         let mut dirty = true;
@@ -741,7 +802,8 @@ impl Task {
                 let wake = tokio::select! {
                     biased;
                     c = self.ctl.recv() => Wake::Control(c),
-                    e = events.recv() => Wake::Event(e),
+                    _ = token_changed(changes) => Wake::Token,
+                    e = listener.events.recv() => Wake::Event(e),
                     r = rx => Wake::Receipt(r.ok()),
                     _ = sleep_until(renew_at) => Wake::Renew,
                 };
@@ -784,6 +846,12 @@ impl Task {
                         renew_at = Instant::now() + self.t.renew;
                         self.recoveries = 0;
                         self.unreachable = 0;
+                    }
+                    Wake::Token => {
+                        if let Err(f) = self.relisten(sub, listener).await {
+                            return f;
+                        }
+                        dirty = true;
                     }
                 }
                 continue;
@@ -881,7 +949,8 @@ impl Task {
             let wake = tokio::select! {
                 biased;
                 c = self.ctl.recv() => Wake::Control(c),
-                e = events.recv() => Wake::Event(e),
+                _ = token_changed(changes) => Wake::Token,
+                e = listener.events.recv() => Wake::Event(e),
                 _ = sleep_until(renew_at) => Wake::Renew,
             };
             match wake {
@@ -900,6 +969,12 @@ impl Task {
                     renew_at = Instant::now() + self.t.renew;
                     self.recoveries = 0;
                     self.unreachable = 0;
+                    dirty = true;
+                }
+                Wake::Token => {
+                    if let Err(f) = self.relisten(sub, listener).await {
+                        return f;
+                    }
                     dirty = true;
                 }
             }

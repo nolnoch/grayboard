@@ -1014,3 +1014,27 @@ async fn revoke_with_nothing_to_revoke_sends_nothing() {
     c.revoke().await.unwrap();
     assert!(auth.seen.lock().unwrap().is_empty(), "nothing sent");
 }
+
+// #1265: every token a mint installs moves `changes`, the first, a renewal and a 401's replacement alike; a cached token doesn't.
+#[tokio::test]
+async fn each_installed_token_moves_the_change_generation() {
+    let auth = Auth::start(standard, |n| issued(&format!("tok-{n}"), 3600)).await;
+    let c = auth.credential();
+    let mut changes = c.changes().expect("a minting credential reports changes");
+    assert!(!changes.has_changed().unwrap());
+    assert_eq!(c.token().await.unwrap(), "tok-0");
+    assert!(changes.has_changed().unwrap(), "the first mint");
+    changes.mark_unchanged();
+    assert_eq!(c.token().await.unwrap(), "tok-0");
+    assert!(
+        !changes.has_changed().unwrap(),
+        "a cached token is no change"
+    );
+    c.age_token(false);
+    assert_eq!(c.token().await.unwrap(), "tok-1");
+    assert!(changes.has_changed().unwrap(), "a renewal");
+    changes.mark_unchanged();
+    c.unauthorized("tok-1").await.unwrap();
+    assert!(changes.has_changed().unwrap(), "a rejection's replacement");
+    assert_eq!(c.token().await.unwrap(), "tok-2");
+}

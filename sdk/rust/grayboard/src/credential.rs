@@ -15,6 +15,10 @@ pub trait Credential: Send + Sync + 'static {
     fn token(&self) -> BoxFuture<'_, Result<String, AuthError>>;
     /// The server answered 401 to `rejected`. Return `Ok` once a fresh token is ready (the request is retried once), or an error to fail it: `Unauthorized` when terminal, `Unreachable` when `retryable`.
     fn unauthorized<'a>(&'a self, rejected: &'a str) -> BoxFuture<'a, Result<(), AuthError>>;
+    /// A generation counter that moves whenever the credential installs a new token, or `None` (the default) for one whose token never changes on its own. The delivery stream watches it and reopens its listen stream on the new token at once (#1265): the server closes a stream when the token it was opened with expires.
+    fn changes(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+        None
+    }
 }
 
 /// A fixed token: a CI token or a run token a launcher minted. A 401 is terminal.
@@ -82,6 +86,8 @@ struct Inner {
     state: std::sync::Mutex<State>,
     /// Woken when a mint ends, however it ends, for callers that had no valid token to serve.
     minted: tokio::sync::Notify,
+    /// Bumped whenever a mint installs a new token (`Credential::changes`, #1265).
+    generation: tokio::sync::watch::Sender<u64>,
 }
 
 /// The secret: never printed.
@@ -291,6 +297,7 @@ impl ClientCredentials {
                 endpoints: tokio::sync::OnceCell::new(),
                 state: std::sync::Mutex::default(),
                 minted: tokio::sync::Notify::new(),
+                generation: tokio::sync::watch::Sender::new(0),
             }),
         })
     }
@@ -596,6 +603,8 @@ impl Inner {
                 s.current = Some(minted);
                 s.failures = 0;
                 s.retry_at = None;
+                // Under the lock, so a watcher woken by it reads this token or a later one.
+                self.generation.send_modify(|g| *g = g.wrapping_add(1));
                 Ok(token)
             }
             Err(MintError::Terminal(message)) => {
@@ -728,5 +737,8 @@ impl Credential for ClientCredentials {
     }
     fn unauthorized<'a>(&'a self, rejected: &'a str) -> BoxFuture<'a, Result<(), AuthError>> {
         Box::pin(self.inner.unauthorized(rejected))
+    }
+    fn changes(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+        Some(self.inner.generation.subscribe())
     }
 }
