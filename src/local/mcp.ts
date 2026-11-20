@@ -564,6 +564,11 @@ function localInstructions(general: boolean, notes: string[] = []): string[] {
 // an unbind leaves it holding nothing.
 let unboundCandidates = !WRITES_AS && liveParent === null && !held.length ? await candidateNames(db, SUGGESTED) : [];
 
+// Initialize's instructions, built when the result is sent (the transport.send rewrite below), so they're current
+// then; the Server takes none, since a constructor copy would never reach the wire (#1423). Unbound: the session acts
+// as its ID, with a line on binding a name.
+const initInstructions = (): string => [...(CHANNELS_OFF_NOTICE ? [CHANNELS_OFF_NOTICE] : []), ...(ATTRIBUTION_OFF ? [ATTRIBUTION_OFF_NOTE] : []), ...localInstructions(true, startNotes)].join(" ");
+
 const mcp = new Server(
   { name: DEFAULT_CHANNEL_SOURCE, version: pkg.version },
   {
@@ -571,8 +576,6 @@ const mcp = new Server(
       experimental: { "claude/channel": {} },
       tools: {},
     },
-    // Unbound: the session acts as its ID, with a line on binding a name.
-    instructions: [...(CHANNELS_OFF_NOTICE ? [CHANNELS_OFF_NOTICE] : []), ...(ATTRIBUTION_OFF ? [ATTRIBUTION_OFF_NOTE] : []), ...localInstructions(true, startNotes)].join(" "),
   },
 );
 
@@ -1523,7 +1526,7 @@ if (CLAUDE_CURRENT) {
 const sendTransport = transport.send.bind(transport);
 transport.send = async message => {
   // Keep the SDK's negotiation and capabilities; only initialize's guidance is live.
-  if ("result" in message && "serverInfo" in message.result) message = { ...message, result: { ...message.result, instructions: [...(CHANNELS_OFF_NOTICE ? [CHANNELS_OFF_NOTICE] : []), ...(ATTRIBUTION_OFF ? [ATTRIBUTION_OFF_NOTE] : []), ...localInstructions(true, startNotes)].join(" ") } };
+  if ("result" in message && "serverInfo" in message.result) message = { ...message, result: { ...message.result, instructions: initInstructions() } };
   await sendTransport(message);
   if (claudeReady && !claudeActivationStarted && "result" in message && "tools" in message.result) {
     claudeActivationStarted = true;
