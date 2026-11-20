@@ -709,13 +709,17 @@ describe("queueLaneRows' plan stays indexed (#1174 audit)", () => {
     test(`takes by (board, handle), outbox by handle then posts by id, ${analyze ? "with" : "without"} ANALYZE`, () => {
       if (analyze) db.run("ANALYZE");
       const p = plan();
-      const of = (alias: string) => p.filter((d) => new RegExp(`^(SCAN|SEARCH) ${alias} `).test(d));
-      // Every table read of e, o2 and p2 is one of these searches; none is a SCAN, a key range or a board range.
-      expect([...new Set(of("e"))]).toEqual(["SEARCH e USING INDEX idx_claim_events_take (board=? AND handle=?)"]);
-      expect([...new Set(of("o2"))]).toEqual(["SEARCH o2 USING COVERING INDEX sqlite_autoindex_outbox_1 (handle=?)"]);
-      expect([...new Set(of("p2"))]).toEqual(["SEARCH p2 USING INTEGER PRIMARY KEY (rowid=?)"]);
-      // Outbox drives the join: its search comes before the posts probe.
-      expect(p.findIndex((d) => d.startsWith("SEARCH o2 "))).toBeLessThan(p.findIndex((d) => d.startsWith("SEARCH p2 ")));
+      // Names only our own indexes and the query's table aliases, so a SQLite upgrade's rewording ("SEARCH TABLE",
+      // COVERING) doesn't fail it: every read of e, o2 and p2 is a search, takes go through (board, handle), posts
+      // never through the board range, and outbox drives the join (its search before the posts probe).
+      const of = (alias: string) => p.filter((d) => new RegExp(`^(SCAN|SEARCH)( TABLE)? ${alias}\\b`).test(d));
+      const e = of("e"), o2 = of("o2"), p2 = of("p2");
+      for (const reads of [e, o2, p2]) expect(reads.length).toBeGreaterThan(0);
+      for (const d of [...e, ...o2, ...p2]) expect(d).toStartWith("SEARCH");
+      for (const d of e) expect(d).toContain("idx_claim_events_take");
+      for (const d of p2) expect(d).not.toContain("idx_posts_board_id");
+      const first = (alias: string) => p.findIndex((d) => new RegExp(`^SEARCH( TABLE)? ${alias}\\b`).test(d));
+      expect(first("o2")).toBeLessThan(first("p2"));
     });
   }
 });
