@@ -11,6 +11,9 @@ test("#1220: a refusal's reason is its structured message, else its text, so a s
   expect(refusalOf({ content: text("other"), structuredContent: { code: "alias_held", message: "held by you@example.com/be" }, isError: true })).toEqual({ code: "alias_held", why: "held by you@example.com/be" });
   // Text only, as an older server answers: no code, the text without its "error: " prefix.
   expect(refusalOf({ content: text("error: name taken"), isError: true })).toEqual({ code: undefined, why: "name taken" });
+  // A domain refusal: no structured message, its text the pretty-printed payload; never shown.
+  const payload = JSON.stringify({ code: "alias_held", message: "held", holder: "the hosted session id:x" }, null, 2);
+  expect(refusalOf({ content: text(payload), structuredContent: { code: "alias_held", holder: "the hosted session id:x" }, isError: true })).toEqual({ code: "alias_held", why: "no reason given" });
   // Nothing to show.
   expect(refusalOf({ content: [], structuredContent: { code: "refused" }, isError: true })).toEqual({ code: "refused", why: "no reason given" });
   expect(refusalOf({ content: [], isError: true })).toEqual({ code: undefined, why: "no reason given" });

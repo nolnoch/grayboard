@@ -36009,7 +36009,15 @@ function refusalOf2(result) {
   if (typeof output === "object" && typeof output?.message === "string")
     return { code, why: output.message };
   const text = typeof output === "string" ? output : result.content.find((c) => c.type === "text")?.text;
-  return { code, why: text ? text.replace(/^error: /, "") : "no reason given" };
+  return { code, why: text && !isJson(text) ? text.replace(/^error: /, "") : "no reason given" };
+}
+function isJson(text) {
+  try {
+    JSON.parse(text);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 // src/shared/session_meta.ts
