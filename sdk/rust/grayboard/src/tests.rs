@@ -519,9 +519,10 @@ async fn gateway_statuses_unreachable_for_reads_outcome_unknown_for_writes() {
 
 #[tokio::test]
 async fn connect_failure_is_unreachable_even_for_a_write() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("http://{}/mcp", listener.local_addr().unwrap());
-    drop(listener);
+    // Bound but never listening, and held to the end: a connect is refused, and no other test's fake can take the port. A released port was retaken under load (#1383): this call then reached a stranger's fake, and its board_post landed in that test's counts.
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let url = format!("http://{}/mcp", socket.local_addr().unwrap());
     let c = Client::new(&url, StaticBearer::new("t"), ClientInfo::new("t", "0"))
         .unwrap()
         .with_timeouts(fast());
@@ -531,6 +532,7 @@ async fn connect_failure_is_unreachable_even_for_a_write() {
         .await
         .unwrap_err();
     assert!(matches!(err, Error::Unreachable(_)), "{err:?}");
+    drop(socket);
 }
 
 #[tokio::test]

@@ -619,7 +619,8 @@ async fn a_redirect_from_the_token_or_revocation_endpoint_is_not_followed() {
     let e = auth.credential().token().await.unwrap_err();
     assert!(e.message.contains("307"), "{e}");
     assert!(!e.retryable, "a redirect is terminal");
-    assert!(other.seen.lock().unwrap().is_empty(), "not followed");
+    // By the redirect's target path: any other request there is a stranger's, not this redirect followed (#1383).
+    assert!(other.seen("/oauth/token").is_empty(), "not followed");
 
     let auth = Auth::start(standard, |n| issued(&format!("tok-{n}"), 3600)).await;
     auth.revoke.lock().unwrap().push_back((
@@ -630,7 +631,8 @@ async fn a_redirect_from_the_token_or_revocation_endpoint_is_not_followed() {
     let c = auth.credential();
     c.token().await.unwrap();
     assert!(c.revoke().await.is_err());
-    assert!(other.seen.lock().unwrap().is_empty(), "not followed");
+    assert!(other.seen("/oauth/token").is_empty(), "not followed");
+    assert!(other.seen("/oauth/revoke").is_empty(), "not followed");
 }
 
 #[tokio::test]
@@ -790,10 +792,11 @@ async fn a_cancelled_mint_leaves_no_mint_in_flight() {
     let c = auth
         .credential()
         .with_backoff_unit(Duration::from_millis(50));
+    // Taken before the cut, so the backoff (from the cancellation) can't start before it: under load the cut and `open` can outlast the 50 ms backoff, and a clock started after them saw no wait (#1383).
+    let started = tokio::time::Instant::now();
     auth.hold();
     cut_mid_mint(&auth, &c).await;
     auth.open();
-    let started = tokio::time::Instant::now();
     assert_eq!(prompt("the next mint", c.token()).await.unwrap(), "tok-1");
     assert!(
         started.elapsed() >= Duration::from_millis(40),
