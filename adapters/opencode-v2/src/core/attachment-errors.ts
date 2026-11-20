@@ -23,3 +23,19 @@ export class BlobMissing extends Error {
     super(`attachment bytes ${sha256} are missing`);
   }
 }
+
+/** The id_collision refusal's text, both modes: `id` and why it's taken. */
+export function idCollisionText(id: string, why: string): string {
+  return `id_collision: ${id} ${why}; start with a new session key`;
+}
+
+/** The refusal for a session ID that already has a row (#284 decision 2): a reused key, or a collision. */
+export class IdCollision extends CoreError {
+  // Why the ID can't be this session's: its id.collision audit's `why`.
+  readonly why: string;
+  constructor(readonly id: string, readonly endedAt: number | null) {
+    const why = endedAt === null ? "is a live session's" : `ended at ${new Date(endedAt).toISOString()}`;
+    super(idCollisionText(id, why));
+    this.why = why;
+  }
+}

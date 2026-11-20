@@ -2,7 +2,7 @@ import type { Database } from "bun:sqlite";
 import { describeLocation } from "../shared/identity.ts";
 import type { Pending, Post } from "../shared/notifications.ts";
 import { bindAttachments, dropAttachments, withAttachments, type FileSend } from "./attachments.ts";
-import { CoreError } from "./errors.ts";
+import { CoreError, IdCollision } from "./errors.ts";
 import { ackQueueClaim, logEvent } from "./claims.ts";
 import { addressParts, aliasScope, type AliasScope, type ScopeKind } from "./addresses.ts";
 import { writeCoreAudit, type AuditSink } from "./audit.ts";
@@ -228,21 +228,8 @@ export type IdFacts = {
   localResume?: boolean;
 };
 
-/** The id_collision refusal's text, both modes: `id` and why it's taken. */
-export function idCollisionText(id: string, why: string): string {
-  return `id_collision: ${id} ${why}; start with a new session key`;
-}
-
-/** The refusal for a session ID that already has a row (#284 decision 2): a reused key, or a collision. */
-export class IdCollision extends CoreError {
-  // Why the ID can't be this session's: its id.collision audit's `why`.
-  readonly why: string;
-  constructor(readonly id: string, readonly endedAt: number | null) {
-    const why = endedAt === null ? "is a live session's" : `ended at ${new Date(endedAt).toISOString()}`;
-    super(idCollisionText(id, why));
-    this.why = why;
-  }
-}
+// The id_collision refusal (#284 decision 2) lives in errors.ts, so a Postgres store can throw it (#807 P3 C10a).
+export { IdCollision, idCollisionText } from "./errors.ts";
 
 /**
  * How long a pruned keyed ID's tombstone lasts (#333): a key re-presented
@@ -845,8 +832,9 @@ export type PostOpts = {
   via?: string;
   ttl_ms?: number;
   attachments?: { ids: number[]; send?: FileSend };
-  // An author's own words: an @id: that can't receive refuses the post.
-  // Unset (system posts), it goes unresolved.
+  // An author's own words: an @id: that can't receive refuses the post, and
+  // a declared human's bears the human mark (postMark). Unset (system posts),
+  // it goes unresolved, and the post never bears the mark.
   strictIds?: boolean;
   // A system post ending something already announced on the board (a claim's
   // release, update or expiry) still lands once the board is archived (#635).
@@ -1145,17 +1133,20 @@ export function post(
   parentId: number | null = null,
   opts: PostOpts = {},
 ): PostResult {
-  const { b, a, announce, human, announcement } = postGate(db, handle, boardInput, parentId, opts.allowArchived, opts.seenBy);
-  const board = b.name;
-  postPreChecks(board, body, announcement, opts);
-  const files = opts.attachments ?? { ids: [] };
-  const isViewer = viewers(db);
-
+  // The gate reads inside the write's transaction, IMMEDIATE so its write lock is held from the start: the human it
+  // judges, which the row's mark records (#1355), is the declaration when the row lands; a `grayboard human` can't
+  // slip between the two. Nested in a caller's transaction (a claim's system post) it's a savepoint.
   return db.transaction((): PostResult => {
+    const { b, a, announce, human, announcement } = postGate(db, handle, boardInput, parentId, opts.allowArchived, opts.seenBy);
+    const board = b.name;
+    postPreChecks(board, body, announcement, opts);
+    const files = opts.attachments ?? { ids: [] };
+    const isViewer = viewers(db);
     const now = Date.now();
     const p = insertPost(db, {
       board, author: handle, body, parentId, now, expiresAt: opts.ttl_ms ? now + opts.ttl_ms : null,
       authorId: opts.author_id ?? null, via: opts.via ?? null, authorUser: opts.author_user ?? null,
+      human: postMark({ human }, opts.strictIds === true),
     });
     const { send } = files;
     const attachments = send ? bindAttachments(db, files.ids, { addresses: opts.addresses ?? [handle], principal: send.principal }, { post_id: p.id }, send.limits) : [];
@@ -1200,7 +1191,7 @@ export function post(
       ...postWakes(plan.targets),
       unresolved: plan.unresolved,
     };
-  })();
+  }).immediate();
 }
 
 /** Who a post reaches and why. Highest-priority reason wins per handle: mention > thread > subscription. */
@@ -1373,20 +1364,38 @@ export function postWakes(targets: [string, PostTarget][]): { wake: string[]; de
   };
 }
 
-/** A post's row before it's written. */
+/** A post's row before it's written. `human`: the post bears the human mark (postMark), judged at write time. */
 export type NewPost = {
   board: string; author: string; body: string; parentId: number | null; now: number; expiresAt: number | null;
-  authorId: string | null; via: string | null; authorUser: string | null;
+  authorId: string | null; via: string | null; authorUser: string | null; human: boolean;
 };
 
 /** Writes a post's row. */
 export function insertPost(db: Database, p: NewPost): Post {
   return showPost(db
     .prepare(
-      `INSERT INTO posts (board, author, body, parent_id, created_at, expires_at, author_id, via, author_user)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING ${POST_COLS}`,
+      `INSERT INTO posts (board, author, body, parent_id, created_at, expires_at, author_id, via, author_user, human)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING ${POST_COLS}`,
     )
-    .get(p.board, p.author, p.body, p.parentId, p.now, p.expiresAt, p.authorId, p.via, p.authorUser) as PostRow);
+    .get(p.board, p.author, p.body, p.parentId, p.now, p.expiresAt, p.authorId, p.via, p.authorUser, p.human ? 1 : 0) as PostRow);
+}
+
+/**
+ * Whether a post being written bears the human mark (#1355): only a declared human's own words (`ownWords`, the
+ * strict write a tool or `grayboard announce` makes), its gate having judged the author human at write time. A system
+ * post (a claim's `[release]`/`[expired]`/`[unclaimed]`) never does, whoever it's written as (principle 10,
+ * docs/slack-bridge.md §3).
+ */
+export const postMark = (gate: Pick<PostGate, "human">, ownWords: boolean): boolean => ownWords && gate.human;
+
+/**
+ * Whether a delivered post bears the human mark: as its row recorded it when written (#1355), so a handle declared
+ * human later never marks what it wrote before. A row from before the column (null), or one already pruned, bears
+ * none: losing a pre-upgrade human post's mark is harmless, forging one onto a system post isn't.
+ */
+export function postHuman(db: Database, post: Pick<Post, "id">): boolean {
+  const row = db.prepare(`SELECT human FROM posts WHERE id = ?`).get(post.id) as { human: number | null } | undefined;
+  return row?.human === 1;
 }
 
 /** A board's subscriptions, unjudged, by handle. */
@@ -1476,23 +1485,37 @@ export function parseAliasMeta(v: unknown): AliasMetaSet {
   return out;
 }
 
+/** What an alias label write changed: each changed key's value before and after (null: unset). */
+export type AliasMetaDiff = { before: AliasMetaSet; after: AliasMetaSet };
+
 /**
- * Set an alias's labels from a parsed `meta`, as `session` binding it.
- * Only the fields whose value changes are written, and audited as one
- * alias.meta_set. Call inside the bind's write transaction. `actor` is who the row names: the
- * signed-in user on a server (#373), the session locally, where no user is.
+ * Write an alias's labels from a parsed `meta`: only the fields whose value
+ * changes are written. Returns what changed, or null when nothing did (no
+ * write). Throws when the alias has no row. The server audits the diff itself
+ * (#807 P3 C10a); local mode through setAliasMeta.
  */
-export function setAliasMeta(db: Database, address: string, meta: AliasMetaSet, session: string, audit: AuditSink, actor: string = session): void {
+export function writeAliasMeta(db: Database, address: string, meta: AliasMetaSet): AliasMetaDiff | null {
   const keys = Object.keys(meta) as (keyof AliasMetaSet)[];
-  if (!keys.length) return;
+  if (!keys.length) return null;
   const cur = db.prepare(`SELECT ${ALIAS_META_KEYS.join(", ")} FROM aliases WHERE address = ?`).get(address) as Record<string, string | null> | null;
   if (!cur) throw new Error(`grayboard: no alias "${address}" to label`);
-  const fields: AliasMetaSet = {};
-  for (const k of keys) if ((meta[k] ?? null) !== cur[k]) fields[k] = meta[k] ?? null;
-  const changed = Object.keys(fields) as (keyof AliasMetaSet)[];
-  if (!changed.length) return;
-  db.prepare(`UPDATE aliases SET ${changed.map((k) => `${k} = ?`).join(", ")} WHERE address = ?`).run(...changed.map((k) => fields[k] ?? null), address);
-  audit("alias.meta_set", actor, address, { address, fields, session });
+  const before: AliasMetaSet = {}, after: AliasMetaSet = {};
+  for (const k of keys) if ((meta[k] ?? null) !== cur[k]) { before[k] = cur[k] ?? null; after[k] = meta[k] ?? null; }
+  const changed = Object.keys(after) as (keyof AliasMetaSet)[];
+  if (!changed.length) return null;
+  db.prepare(`UPDATE aliases SET ${changed.map((k) => `${k} = ?`).join(", ")} WHERE address = ?`).run(...changed.map((k) => after[k] ?? null), address);
+  return { before, after };
+}
+
+/**
+ * Set an alias's labels from a parsed `meta`, as `session` binding it
+ * (writeAliasMeta), auditing what changed as one alias.meta_set. Call inside
+ * the bind's write transaction. `actor` is who the row names: the session
+ * locally, where no user is.
+ */
+export function setAliasMeta(db: Database, address: string, meta: AliasMetaSet, session: string, audit: AuditSink, actor: string = session): void {
+  const diff = writeAliasMeta(db, address, meta);
+  if (diff) audit("alias.meta_set", actor, address, { address, fields: diff.after, session });
 }
 
 // A session's self-reported facts (#284 S12), shown on its rows.

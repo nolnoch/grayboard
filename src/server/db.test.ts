@@ -33,9 +33,14 @@ import { sqliteSlackBackend } from "./store/slack.contract.sqlite.ts";
 import { hostedContract } from "./store/hosted.contract.ts";
 import { sqliteHostedBackend } from "./store/hosted.contract.sqlite.ts";
 import { authCacheContract } from "./store/auth_cache.contract.ts";
+import { bindingsContract } from "./store/bindings.contract.ts";
+import { sqliteBindingsBackend } from "./store/bindings.contract.sqlite.ts";
 import { sqliteAuthCacheBackend } from "./store/auth_cache.contract.sqlite.ts";
 import { attachmentsContract } from "./store/attachments.contract.ts";
 import { sqliteAttachmentsBackend } from "./store/attachments.contract.sqlite.ts";
+import { sessionEndContract } from "./store/session_end.contract.ts";
+import { delegationContract } from "./store/delegation.contract.ts";
+import { sqliteIdsBackend } from "./store/session_end.contract.sqlite.ts";
 import { claimsContract } from "./store/claims.contract.ts";
 import { sqliteClaimsBackend } from "./store/claims.contract.sqlite.ts";
 
@@ -245,6 +250,7 @@ describe("identity contract (SQLite)", () => identityContract(sqliteIdentityBack
 // The aliases and messages groups' rows, shared with the Postgres store (#807 P3 C5).
 describe("aliases contract (SQLite)", () => aliasesContract(sqliteAliasesBackend));
 describe("messages contract (SQLite)", () => messagesContract(sqliteMessagesBackend));
+describe("bindings contract (SQLite)", () => bindingsContract(sqliteBindingsBackend));
 // The cursors, write receipts, audit and Slack groups' rows, shared with the Postgres store (#807 P3 C67a).
 describe("cursors contract (SQLite)", () => cursorsContract(sqliteCursorsBackend));
 describe("write receipts contract (SQLite)", () => writeReceiptsContract(sqliteWriteReceiptsBackend));
@@ -254,6 +260,8 @@ describe("slack contract (SQLite)", () => slackContract(sqliteSlackBackend));
 describe("hosted contract (SQLite)", () => hostedContract(sqliteHostedBackend));
 describe("auth cache contract (SQLite)", () => authCacheContract(sqliteAuthCacheBackend));
 describe("attachments contract (SQLite)", () => attachmentsContract(sqliteAttachmentsBackend));
+describe("session end contract (SQLite)", () => sessionEndContract(sqliteIdsBackend));
+describe("delegation contract (SQLite)", () => delegationContract(sqliteIdsBackend));
 describe("claims contract (SQLite)", () => claimsContract(sqliteClaimsBackend));
 
 // Sign-in fixtures for the rows below (security audit F-13, #928 D4).
@@ -466,7 +474,7 @@ test("audit.last orders by (at, id), newest first", () => {
 
 // #807 P1c-5: a leaf store refuses a value that isn't a SQLite store handle. A settled Tx's refusal is a contract row
 // on every backend (cursors.contract.ts K4, write_receipts.contract.ts), as are the store's answers.
-test("#807 P1c-5: cursors and writeReceipts refuse a handle from another store", async () => {
+test("#807 P1c-5: cursors, writeReceipts and bindings refuse a handle from another store", async () => {
   const { repo } = openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
   const foreign = {} as typeof repo.read;
   await expect(repo.cursors.directFor(foreign, "a@example.com/fe")).rejects.toThrow("not a SQLite store handle");
@@ -474,6 +482,8 @@ test("#807 P1c-5: cursors and writeReceipts refuse a handle from another store",
   await expect(repo.writeReceipts.refExists(foreign, "message", 1)).rejects.toThrow("not a SQLite store handle");
   await expect(repo.writeReceipts.claim(foreign as Tx, { session: "s", sender: "a@example.com/fe", fp: "f" }, "dm_send", 1)).rejects.toThrow("not a SQLite store handle");
   await expect(repo.audit.lock(foreign as Tx, "bridge.notified", "a@example.com/human")).rejects.toThrow("not a SQLite store handle");
+  await expect(repo.bindings.holdsOf(foreign, "id:0000000000001")).rejects.toThrow("not a SQLite store handle");
+  await expect(repo.bindings.take(foreign as Tx, "a@example.com/fe", "id:0000000000001", "a@example.com", 1)).rejects.toThrow("not a SQLite store handle");
   expect(() => repo.audit.write(foreign as Tx, { at: 1, actor: null, action: "auth.login", target: null, detail: null })).toThrow("not a SQLite store handle");
 });
 
@@ -764,88 +774,7 @@ test("#807 P1c-14b: the messages reads and aliases.seen run on the handle they'r
   expect((await repo.aliases.seen(r, [peer, "b@example.com/none"]))).toEqual(new Map([[peer, { last_seen: 1000, cwd: null, place: null }]]));
 });
 
-test("#807 P3 B1a: the bindings reads run on the handle they're given; the batched ones keep HOLD_ORDER and leave misses out", async () => {
-  const { repo, db } = openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
-  const [s1, s2, idle] = ["id:0000000000001", "id:0000000000002", "id:0000000000003"];
-  const [fe, be, ops, zz] = ["b@example.com/fe", "b@example.com/be", "b@example.com/ops", "b@example.com/zz"];
-  const b = repo.bindings;
-  const kept = await seed(repo, async tx => {
-    await repo.users.upsertByEmail(tx, "b@example.com", null);
-    for (const n of ["fe", "be", "ops", "zz"]) await repo.aliases.create(tx, person("b@example.com", n), "b@example.com");
-    const core = repo.coreOn(tx);
-    for (const id of [s1, s2, idle]) registerId(core, { id, principal: "b@example.com", launcher: false });
-    // s1's be is bound after its fe, and in the same millisecond: HOLD_ORDER keeps fe first.
-    holdAlias(core, fe, s1, 500);
-    holdAlias(core, be, s1, 500);
-    holdAlias(core, ops, s2, 100);
-    // s2's zz is written after its ops but bound before it: HOLD_ORDER disagrees with rowid and address order.
-    holdAlias(core, zz, s2, 100);
-    db.run("UPDATE alias_holds SET bound_at = 50 WHERE address = ?", [zz]);
-    db.run("UPDATE ids SET status = 'busy', status_at = 7, last_seen = 900 WHERE id = ?", [s2]);
-    db.run("UPDATE aliases SET last_seen = 1000 WHERE address = ?", [fe]);
-    // Inside the body that wrote them, on its Tx.
-    expect(await b.holdsOf(tx, s1)).toEqual([fe, be]);
-    expect(await b.holderOf(tx, ops)).toBe(s2);
-    return tx;
-  });
-  const settled = /used after its transaction settled/;
-  await expect(b.holdsOf(kept, s1)).rejects.toThrow(settled);
-  await expect(b.holdsOfMany(kept, [s1])).rejects.toThrow(settled);
-  await expect(b.holderOf(kept, fe)).rejects.toThrow(settled);
-  await expect(b.holdersOf(kept, [fe])).rejects.toThrow(settled);
-  await expect(b.userOf(kept, fe)).rejects.toThrow(settled);
-  await expect(b.addressSet(kept, fe, "b@example.com")).rejects.toThrow(settled);
-  await expect(b.idRow(kept, s1)).rejects.toThrow(settled);
-  await expect(b.unendedIds(kept)).rejects.toThrow(settled);
-  await expect(b.idStatuses(kept, [s2])).rejects.toThrow(settled);
-  await expect(b.aliasUses(kept, null)).rejects.toThrow(settled);
-  await expect(b.lastSeen(kept, [fe])).rejects.toThrow(settled);
-  await expect(b.holdsOf({} as Tx, s1)).rejects.toThrow("not a SQLite store handle");
-  const r = repo.read;
-  expect(await b.holdsOfMany(r, [s1, s2, idle])).toEqual(new Map([[s1, [fe, be]], [s2, [zz, ops]], [idle, []]]));
-  expect(await b.holdersOf(r, [fe, ops, "b@example.com/none"])).toEqual(new Map([[fe, s1], [ops, s2]]));
-  expect(await b.userOf(r, fe)).toBe(s1);
-  expect(await b.userOf(r, fe, "b@example.com")).toBeNull();
-  expect(await b.addressSet(r, be, "b@example.com")).toEqual([be, fe, s1]);
-  expect(await b.addressSet(r, be, "c@example.com")).toEqual([be]);
-  expect((await b.idRow(r, s1))?.principal).toBe("b@example.com");
-  expect(await b.idRow(r, "id:000000000000Z")).toBeUndefined();
-  expect((await b.unendedIds(r)).sort()).toEqual([s1, s2, idle]);
-  expect(await b.idStatuses(r, [s1, s2])).toEqual(new Map([[s2, { status: "busy", status_at: 7 }]]));
-  expect((await b.aliasUses(r, "b@example.com")).map(u => u.address).sort()).toEqual([be, fe, ops, zz]);
-  // An alias's and a session's last-seen, a repeat once, a never-seen alias absent (an ids row always has one).
-  expect(await b.lastSeen(r, [fe, s2, fe, be])).toEqual(new Map([[fe, 1000], [s2, 900]]));
-});
-
-test("#807 P3 B1c: bindings.take refuses another ID's hold and another user's writer, re-takes its own, and orders one ID's takes", async () => {
-  const { repo, db } = openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
-  const [s1, s2, bWriter, cWriter] = ["id:0000000000001", "id:0000000000002", "id:0000000000003", "id:0000000000004"];
-  const [fe, be, ops, qa] = ["b@example.com/fe", "b@example.com/be", "b@example.com/ops", "b@example.com/qa"];
-  const holds = () => db.query("SELECT address, id, bound_at FROM alias_holds ORDER BY address").all();
-  await seed(repo, async tx => {
-    for (const u of ["b@example.com", "c@example.com"]) await repo.users.upsertByEmail(tx, u, null);
-    for (const n of ["fe", "be", "ops", "qa"]) await repo.aliases.create(tx, person("b@example.com", n), "b@example.com");
-    const core = repo.coreOn(tx);
-    for (const id of [s1, s2]) registerId(core, { id, principal: "b@example.com", launcher: false });
-    // A tools-only writer as fe of another user, and one as be of the same user.
-    registerId(core, { id: cWriter, principal: "c@example.com", launcher: false, writesAs: fe });
-    registerId(core, { id: bWriter, principal: "b@example.com", launcher: false, writesAs: be });
-    holdAlias(core, ops, s2, 100);
-  });
-  const take = (address: string, id: string, now: number) => repo.write(tx => repo.bindings.take(tx, address, id, "b@example.com", now));
-  // Another ID's hold, the same user's: no take, and its row stays as it was.
-  expect(await take(ops, s1, 200)).toBeNull();
-  // Another user's unended writer: no take.
-  expect(await take(fe, s1, 200)).toBeNull();
-  expect(holds()).toEqual([{ address: ops, id: s2, bound_at: 100 }]);
-  // The same user's writer shares the alias with a holder.
-  expect(await take(be, s1, 300)).toEqual({ bound_at: 300 });
-  // Two takes by one ID in one millisecond keep their order (holdAlias's contract).
-  expect(await take(qa, s1, 300)).toEqual({ bound_at: 301 });
-  // The same ID's re-take restamps its own hold.
-  expect(await take(be, s1, 400)).toEqual({ bound_at: 400 });
-  expect(holds()).toEqual([{ address: be, id: s1, bound_at: 400 }, { address: ops, id: s2, bound_at: 100 }, { address: qa, id: s1, bound_at: 301 }]);
-});
+// #807 P3 B1a, B1c: the bindings group is a contract (store/bindings.contract.ts), registered above.
 
 // #807 P3 B4a: repo.sessionEnd runs on the handle it's given: a kept Tx and a non-store handle are refused, and an end
 // rolls back with its body (its bounce, cursor drop and ended_at with it).
@@ -1152,7 +1081,7 @@ test("#807 P3 B5b2b: board_post's repo reads and writes run on the handle they'r
   const settled = /used after its transaction settled/;
   const stranger = /not a SQLite store handle/;
   const [b, al, cl] = [repo.boards, repo.aliases, repo.claims];
-  const np = (board: string, body: string) => ({ board, author: be, body, parentId: null, now: 900, expiresAt: null, authorId: null, via: null, authorUser: null });
+  const np = (board: string, body: string) => ({ board, author: be, body, parentId: null, now: 900, expiresAt: null, authorId: null, via: null, authorUser: null, human: false });
   const limits = { file: 1 << 20, total: 1 << 20 };
   const target = [[fe, { reason: "subscription", wake: true }]] as [string, { reason: "subscription"; wake: boolean }][];
   for (const h of [kept, {} as Tx]) {
@@ -1187,6 +1116,10 @@ test("#807 P3 B5b2b: board_post's repo reads and writes run on the handle they'r
     return p.id;
   });
   expect(db.query<{ handle: string }, [number]>("SELECT handle FROM outbox WHERE post_id = ?").all(landed)).toEqual([{ handle: fe }]);
+  // The row's human mark is what the write said (#1355), not whether the author is human now.
+  expect(db.query<{ human: number | null }, [number]>("SELECT human FROM posts WHERE id = ?").get(landed)).toEqual({ human: 0 });
+  const marked = await seed(repo, async tx => (await b.insertPost(tx, { ...np("hall", "mine"), human: true })).id);
+  expect(db.query<{ human: number | null }, [number]>("SELECT human FROM posts WHERE id = ?").get(marked)).toEqual({ human: 1 });
   expect(await b.subscribers(repo.read, "hall")).toEqual([{ handle: be, mode: "push" }, { handle: fe, mode: "push" }]);
 });
 
@@ -1205,61 +1138,6 @@ test("#807 P3 B5b1: a team follow refuses an alias that can't see the team board
   await expect(seed(repo, tx => onTeamJoined(repo, tx, team, "b@example.com"))).rejects.toThrow("no such board #crew; see board_list");
   expect(await repo.boards.get(repo.read, "crew")).toBeUndefined();
   expect(await repo.boards.isSubscribed(repo.read, "b@example.com/be", "crew")).toBe(false);
-});
-
-// #807 P3 B4b: repo.delegation reads on the handle it's given, and its facts answer only what they read: a question
-// about anything else throws rather than reading as false or zero.
-test("#807 P3 B4b: repo.delegation runs on the handle it's given; its facts answer only what they read", async () => {
-  const { repo } = openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
-  const [s1, s2, idle] = ["id:0000000000001", "id:0000000000002", "id:0000000000003"];
-  const [be, ops, sim] = ["b@example.com/be", "b@example.com/ops", "c@example.com/sim"];
-  const d = repo.delegation;
-  const kept = await seed(repo, async tx => {
-    await repo.users.upsertByEmail(tx, "b@example.com", null);
-    await repo.users.upsertByEmail(tx, "c@example.com", null);
-    for (const n of ["be", "ops"]) await repo.aliases.create(tx, person("b@example.com", n), "b@example.com");
-    await repo.aliases.create(tx, person("c@example.com", "sim"), "c@example.com");
-    const core = repo.coreOn(tx);
-    registerId(core, { id: s1, principal: "b@example.com", launcher: true });
-    registerId(core, { id: s2, principal: "c@example.com", launcher: false });
-    registerId(core, { id: idle, principal: "b@example.com", launcher: true });
-    holdAlias(core, be, s1, 100);
-    holdAlias(core, sim, s2, 100);
-    // sim is on the roster (it has been seen); ops never connected.
-    touchAlias(core, sim);
-    // Inside the body that wrote them, on its Tx.
-    expect(await d.addressUser(tx, be)).toBe("b@example.com");
-    expect((await d.facts(tx, { since: 0 })).launchers()).toEqual([be, idle]);
-    return tx;
-  });
-  const settled = /used after its transaction settled/;
-  await expect(d.addressUser(kept, be)).rejects.toThrow(settled);
-  await expect(d.facts(kept, { since: 0 })).rejects.toThrow(settled);
-  await expect(d.facts({} as Tx, { since: 0 })).rejects.toThrow("not a SQLite store handle");
-  const r = repo.read;
-  expect(await d.addressUser(r, sim)).toBe("c@example.com");
-  expect(await d.addressUser(r, s2)).toBe("c@example.com");
-  expect(await d.addressUser(r, ops)).toBeUndefined();
-  // Auto-pick: every launcher (the named one, then the unbound ID), each one's user and open count.
-  const auto = await d.facts(r, { since: 0 });
-  expect(auto.launchers()).toEqual([be, idle]);
-  expect([auto.userOf(be), auto.userOf(idle)]).toEqual(["b@example.com", "b@example.com"]);
-  expect([auto.open(be), auto.open(idle)]).toEqual([0, 0]);
-  expect(() => auto.userOf(sim)).toThrow(/the user of "c@example.com\/sim" was not read/);
-  expect(() => auto.open(sim)).toThrow(/the open count of "c@example.com\/sim" was not read/);
-  expect(() => auto.everConnected(be)).toThrow(/was not read/);
-  expect(() => auto.humanHandles()).toThrow(/the human handles was not read/);
-  expect(() => auto.lastSeen(be)).toThrow(/was not read/);
-  // A named target: its own facts only.
-  const named = await d.facts(r, { to: sim, since: 0 });
-  expect([named.everConnected(sim), named.isLauncher(sim), named.userOf(sim), named.open(sim)]).toEqual([true, false, "c@example.com", 0]);
-  expect((await d.facts(r, { to: idle, since: 0 })).isLauncher(idle)).toBe(true);
-  expect((await d.facts(r, { to: "b@example.com/none", since: 0 })).everConnected("b@example.com/none")).toBe(false);
-  expect(() => named.launchers()).toThrow(/the launcher list was not read/);
-  expect(() => named.open(be)).toThrow(/was not read/);
-  // The target's facts answer for that address only.
-  expect(() => named.everConnected(be)).toThrow(/whether "b@example.com\/be" connected was not read/);
-  expect(() => named.isLauncher(be)).toThrow(/whether "b@example.com\/be" is a launcher was not read/);
 });
 
 // #807 P3 B5b3b: the sweep's repo steps (claims.expire, logEvent, takeWatchers, holderUser; boards.redeliveryFacts)

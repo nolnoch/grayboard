@@ -8,18 +8,20 @@ import { isThenable } from "./store/tx_base.ts";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 
-import { acknowledge, redeliveryFacts, type RedeliveryFacts, aliasScopeRows, authorAddresses, claimQueuePost, humansAmong, insertOutbox, insertPost, queueLaneRows, subscriberRows, threadFacts, type NewPost, type PostTarget, type ThreadFacts, insertBoard, isHuman, readRows, setArchived, setMute, threadRoot, type AliasScopeRow, type ReadResult, ALIAS_SESSION_SQL, boardViewRows, openSummaryRows, setQueueParticipation, whoRows, writeStatus, type BoardSummary, type BoardView, type UnboundFacts, type WhoRow, ensureBoard, forgetHandle, isSubscribed, markHuman, prunePosts, setSubscription, unsubscribeScope, type SubMode, catalogPage, getBoard, getPost, HOLD_ORDER, lastSeen, pendingDigests, pendingPushes, snapshotPage, type Board, type BoardSnapshot, type DigestRow, type PendingRef, type PushRow, type SnapshotOptions, pruneEndedIds, registerId, setAccess, setAliasMeta, setIdFacts, setPlace, touchAlias, touchId, type AliasMetaSet, type CoreDb, type IdFacts, type IdSessionFacts, type ReusedId } from "../core/boards.ts";
+import { acknowledge, redeliveryFacts, type RedeliveryFacts, aliasScopeRows, authorAddresses, claimQueuePost, humansAmong, insertOutbox, insertPost, queueLaneRows, subscriberRows, threadFacts, type NewPost, type PostTarget, type ThreadFacts, insertBoard, isHuman, readRows, setArchived, setMute, threadRoot, type AliasScopeRow, type ReadResult, ALIAS_SESSION_SQL, boardViewRows, openSummaryRows, setQueueParticipation, whoRows, writeStatus, type BoardSummary, type BoardView, type UnboundFacts, type WhoRow, ensureBoard, forgetHandle, isSubscribed, markHuman, prunePosts, setSubscription, unsubscribeScope, type SubMode, catalogPage, getBoard, getPost, HOLD_ORDER, lastSeen, pendingDigests, pendingPushes, snapshotPage, type Board, type BoardSnapshot, type DigestRow, type PendingRef, type PushRow, type SnapshotOptions, pruneEndedIds, registerId, setAccess, writeAliasMeta, setIdFacts, setPlace, touchAlias, touchId, type CoreDb } from "../core/boards.ts";
 import type { Post } from "../shared/notifications.ts";
 import { ackQueueClaim, addClaimWatch, claimRow, claimWatchers, expireClaims, holderUser, listClaims, liveClaim, logEvent, recentClaimEvents, releaseClaim, removeClaimWatch, takeClaim, takeClaimWatchers } from "../core/claims.ts";
-import { addressSet, aliasUser, aliasUses, dropHold, holderOf, holdsOf, idRow, idStatuses, logBinding, unendedIds, type AliasUse, type BindingEvent, type IdRow } from "../core/bindings.ts";
+import { addressSet, aliasUser, aliasUses, dropHold, holderOf, holdsOf, idRow, idStatuses, logBinding, unendedIds } from "../core/bindings.ts";
 import type { AuditAction } from "./audit.ts";
 import { bindAttachments, blobNamed, dropAttachments, dropBlobEntry, dropUnsentUploads, getAttachment, insertUpload, pruneUnbound, removeUpload, unnamedBlobs, uploadDigests, withAttachments, type BlobStore, type Uploader } from "../core/attachments.ts";
 import { addressParts } from "../core/addresses.ts";
 import { HUMAN_NAME } from "../shared/addressing.ts";
 import type { Principal } from "../core/resolver.ts";
 import { initCoreSchema } from "../core/schema.ts";
-import { addressUser, countOpenDelegations, everConnected, isLauncher, launchers, type DelegationFacts } from "../core/delegation.ts";
-import { endSession, undeliverableId, type EndedSession, type MailPort, type Undeliverable } from "../core/session_end.ts";
+import { addressUser, countOpenDelegations, everConnected, isLauncher, launchers } from "../core/delegation.ts";
+import { delegationFacts, type DelegationStore } from "./store/delegation.ts";
+import type { SessionEndStore } from "./store/session_end.ts";
+import { endSession, undeliverableId, type MailPort } from "../core/session_end.ts";
 import type { AuditSink } from "../core/audit.ts";
 import { afterCommit, type Boundary, onCommit, openBoundary, openReader, openSqlite, ownsTx, ownWriter, reclaimFreePages, routeReads } from "../core/sqlite.ts";
 import type { WriteTx } from "../core/write_tx.ts";
@@ -39,6 +41,7 @@ import { AuthorityLost, LastOwner, MissingParent, PrincipalTaken } from "./store
 import type { Alias, AliasesStore } from "./store/aliases.ts";
 import type { MessageRow, MessagesStore, RetractResult } from "./store/messages.ts";
 import type { AttachmentsStore } from "./store/attachments.ts";
+import type { BindingsStore } from "./store/bindings.ts";
 import type { ClaimsStore } from "./store/claims.ts";
 import type { CursorsStore } from "./store/cursors.ts";
 import type { WriteReceipt, WriteReceiptsStore } from "./store/write_receipts.ts";
@@ -54,6 +57,8 @@ export type { User, IdpSignIn, Session, PrincipalRow, Team, TeamPolicy, TeamRole
 export type { Alias, AliasTarget, AliasesStore, AliasScopeRow } from "./store/aliases.ts";
 export type { MessageRow, MessageFiles, ServicePost, RetractResult, MessagesStore } from "./store/messages.ts";
 export type { AttachmentsStore } from "./store/attachments.ts";
+// The bindings group's in store/bindings.ts (#807 P3 C10a-a).
+export type { AliasMetaDiff, BindingsStore } from "./store/bindings.ts";
 export type { ClaimsStore } from "./store/claims.ts";
 // The cursors, write receipts, audit and Slack groups' in store/cursors.ts, write_receipts.ts, audit.ts and slack.ts (#807 P3 C67a).
 export type { CursorStream, CursorsStore } from "./store/cursors.ts";
@@ -62,6 +67,9 @@ export { AUDIT_WRITE_ON_READ, type AccessLogRow, type AuditStore } from "./store
 export type { SlackLink, SlackProgress, SlackThread, SlackStore } from "./store/slack.ts";
 // The hosted group's in store/hosted.ts (#807 P3 C8a); its row types in hosted-types.ts.
 export type { HostedPatch, HostedStore } from "./store/hosted.ts";
+// The session end and delegation groups' in store/session_end.ts and store/delegation.ts (#807 P3 C10d1).
+export type { SessionEndStore } from "./store/session_end.ts";
+export type { DelegationStore, ReadDelegationFacts } from "./store/delegation.ts";
 
 // Row types
 // Every read of a user row goes through this, so `kind` is never missing (a "SELECT *" would type-check without it).
@@ -248,55 +256,8 @@ export interface Repo {
   policyNow: PolicyReadsSync & AccessReadsSync;
   // Names in scopes, keyed by address (store/aliases.ts).
   aliases: AliasesStore;
-  // Holds, session rows and presence (#807 P3 B1): every read returns a promise on the caller's handle (B1a), and every
-  // write on the caller's Tx (B1c).
-  bindings: {
-    // The aliases a session holds, oldest hold first (HOLD_ORDER).
-    holdsOf(r: Read, id: string): Promise<string[]>;
-    // holdsOf for each of ids in one statement; an ID that holds nothing maps to [].
-    holdsOfMany(r: Read, ids: string[]): Promise<Map<string, string[]>>;
-    // The session holding an address now, or null.
-    holderOf(r: Read, address: string): Promise<string | null>;
-    // holderOf for each of addresses in one statement; a free address is absent.
-    holdersOf(r: Read, addresses: string[]): Promise<Map<string, string>>;
-    // A session acting as an address, live or in its grace (core aliasUser): with exceptPrincipal, only another principal's.
-    userOf(r: Read, address: string, exceptPrincipal?: string | null): Promise<string | null>;
-    // The address set a caller acting as address reads as (core addressSet).
-    addressSet(r: Read, address: string, principal: string | null): Promise<string[]>;
-    idRow(r: Read, id: string): Promise<IdRow | undefined>;
-    // The sessions not yet ended (viewers aside).
-    unendedIds(r: Read): Promise<string[]>;
-    idStatuses(r: Read, ids: string[]): Promise<Map<string, { status: string; status_at: number | null }>>;
-    // The aliases unended sessions act as, every principal's or one's.
-    aliasUses(r: Read, principal: string | null): Promise<AliasUse[]>;
-    // When each handle (an alias or a session ID) was last seen; one never seen is absent.
-    lastSeen(r: Read, handles: string[]): Promise<Map<string, number>>;
-    // Holds address for id (D3): null, writing nothing, when another session holds it or another principal's
-    // session acts as it (userOf with exceptPrincipal = principal). A same-ID re-take moves its bound_at. bound_at
-    // stays after the ID's other holds, so two takes in one millisecond keep their order (HOLD_ORDER).
-    take(tx: Tx, address: string, id: string, principal: string, now: number): Promise<{ bound_at: number } | null>;
-    release(tx: Tx, address: string, id: string): Promise<void>;
-    // A binding_events row (core logBinding: a repeated refusal is one row with a count).
-    log(tx: Tx, id: string, name: string, event: BindingEvent, detail?: string | null, at?: number): Promise<void>;
-    touchAlias(tx: Tx, address: string, now?: number): Promise<void>;
-    touchId(tx: Tx, id: string, now?: number): Promise<void>;
-    // Rejects with IdCollision when the ID has a row; a pruned ID's tombstone comes back as ReusedId.
-    registerId(tx: Tx, facts: IdFacts): Promise<ReusedId | null>;
-    // null: no such ID.
-    setIdFacts(tx: Tx, id: string, facts: { model?: string | null; effort?: string | null }): Promise<{ before: IdSessionFacts; after: IdSessionFacts } | null>;
-    setPlace(tx: Tx, id: string, place: string | null): Promise<void>;
-    // An alias's labels (core setAliasMeta), audited through `audit`.
-    setMeta(tx: Tx, address: string, meta: AliasMetaSet, session: string, audit: AuditSink, actor: string): Promise<void>;
-    // The board tools' session reads and writes (#807 P3 B5b1b1). The viewer sessions' IDs (core viewers).
-    viewerIds(r: Read): Promise<Set<string>>;
-    // Each of ids' facts peer_list shows for an unbound session (core unboundRows' read); an ID with no row is absent.
-    idFacts(r: Read, ids: string[]): Promise<Map<string, UnboundFacts>>;
-    // Touches `handle` and sets the status of the session holding it (an ID: its own, while unended) to `text`,
-    // already cleaned (core statusText); empty clears it. false: no live session holds it (core setStatus).
-    setStatus(tx: Tx, handle: string, text: string, now: number): Promise<boolean>;
-    // A name's queue-board opt-out, touching it (core setQueueParticipation).
-    setQueueParticipation(tx: Tx, handle: string, on: boolean): Promise<void>;
-  };
+  // Holds, session rows and presence (store/bindings.ts).
+  bindings: BindingsStore;
   // Uploads and the blob catalog (store/attachments.ts).
   attachments: AttachmentsStore;
   // Claims, their watches and events (store/claims.ts).
@@ -368,28 +329,10 @@ export interface Repo {
     // A queue post's redelivery facts for a claim on `key` that `prevHolder` held (core redeliveryFacts), or null.
     redeliveryFacts(r: Read, key: string, prevHolder: string): Promise<RedeliveryFacts | null>;
   };
-  // A session's end and its ID's deliverability (#807 P3 B4a), on the caller's handle.
-  sessionEnd: {
-    // Ends `id` and its children in the caller's transaction (core endSession over the server's mail, #284 decision 4):
-    // holds and claims released, unread mail bounced, cursors and acks dropped. One method: its claim releases post
-    // through core under the synchronous Access seam until B5b.
-    end(tx: Tx, id: string, opts: { why: string; now: number; audit?: AuditSink }): Promise<EndedSession>;
-    // Why `id` can't receive a send or @mention (core undeliverableId), or null. On the send's Tx: on Postgres it is
-    // the send side of an end's race (D3).
-    refusal(tx: Tx, id: string): Promise<Undeliverable | null>;
-    // Deletes the ended ids rows ended before `olderThanMs`, leaving keyed tombstones (core pruneEndedIds); returns how many.
-    pruneEnded(tx: Tx, olderThanMs: number, now: number): Promise<number>;
-  };
-  // What a delegate decides on (#807 P3 B4b), on the caller's handle: read first, then core's synchronous decision
-  // (resolveDelegationWith) runs over it.
-  delegation: {
-    // The user behind an address (core addressUser): an ID's principal, an alias's holder's or last holder's;
-    // undefined with no session behind it.
-    addressUser(r: Read, address: string): Promise<string | null | undefined>;
-    // Everything the decision can ask for this call: with `to`, that target's; without, every launcher's user and
-    // open count (requests since `since` it hasn't taken, #252). A fact not read throws when asked.
-    facts(r: Read, q: { to?: string; since: number }): Promise<ReadDelegationFacts>;
-  };
+  // A session's end and its ID's deliverability (store/session_end.ts).
+  sessionEnd: SessionEndStore;
+  // What a delegate decides on (store/delegation.ts).
+  delegation: DelegationStore;
   teams: TeamsStore;
   roles: RolesStore;
   services: ServicesStore;
@@ -1421,7 +1364,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       registerId: async (tx, facts) => registerId(sqliteOf(tx), facts),
       setIdFacts: async (tx, id, facts) => setIdFacts(sqliteOf(tx), id, facts),
       setPlace: async (tx, id, place) => setPlace(sqliteOf(tx), id, place),
-      setMeta: async (tx, address, meta, session, audit, actor) => setAliasMeta(sqliteOf(tx), address, meta, session, audit, actor),
+      setMeta: async (tx, address, meta) => writeAliasMeta(sqliteOf(tx), address, meta),
       viewerIds: async (r) => new Set(sqliteOf(r).query<{ id: string }, []>(`SELECT id FROM ids WHERE viewer = 1`).all().map(({ id }) => id)),
       async idFacts(r, ids) {
         const rows = sqliteOf(r).query<UnboundFacts & { id: string }, [string]>(
@@ -2504,32 +2447,6 @@ function oauthOps(db: Database, hosted: HostedStoreOf): OAuthOps {
         return ok({ expiresAt: row.expires_at });
       }).immediate();
     },
-  };
-}
-
-// A delegate's facts, read first (repo.delegation.facts): the decision's reads, and each candidate's open count.
-export interface ReadDelegationFacts extends DelegationFacts {
-  open(handle: string): number;
-}
-
-// Maps over what was read; a question about anything else throws, so a decision that asks for a fact the read left
-// out fails loudly instead of reading as false or zero. The human fallback's reads are local mode's only.
-function delegationFacts(read: {
-  launchers?: string[];
-  to?: { address: string; everConnected: boolean; isLauncher: boolean };
-  users: Map<string, string | null | undefined>;
-  open: Map<string, number>;
-}): ReadDelegationFacts {
-  const missing = (what: string): never => { throw new Error(`delegation facts: ${what} was not read`); };
-  const from = <T>(m: Map<string, T>, what: string) => (h: string): T => m.has(h) ? m.get(h) as T : missing(`${what} of "${h}"`);
-  return {
-    launchers: () => read.launchers ?? missing("the launcher list"),
-    userOf: from(read.users, "the user"),
-    everConnected: (h) => read.to?.address === h ? read.to.everConnected : missing(`whether "${h}" connected`),
-    isLauncher: (h) => read.to?.address === h ? read.to.isLauncher : missing(`whether "${h}" is a launcher`),
-    open: from(read.open, "the open count"),
-    humanHandles: () => missing("the human handles"),
-    lastSeen: () => missing("a last-seen"),
   };
 }
 
