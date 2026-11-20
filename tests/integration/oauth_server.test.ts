@@ -22,7 +22,7 @@ let exchanges = 0;
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "gb-oauth-server-"));
   exchanges = 0;
-  app = startServer({ dbPath: join(dir, "db.sqlite"), blobDir: join(dir, "blobs"), httpPort: 0,
+  app = startServer({ store: { kind: "sqlite" as const, path: join(dir, "db.sqlite") }, blobDir: join(dir, "blobs"), httpPort: 0,
     googleClientId: "test-upstream", googleClientSecret: "", orgDomain: "example.com", publicUrl: issuer,
     messageRetentionDays: 90, auditRetentionDays: 90, devAuth: false, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES,
     oauthClients: [{ clientId: OPENCODE_CLIENT, name: "Native fixture", redirectUris: [redirectUrl], scopes: ["grayboard:tools", "grayboard:delivery"], tokenEndpointAuthMethod: "none", allowRefresh: true }],

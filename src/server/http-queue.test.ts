@@ -54,7 +54,7 @@ test("#807: a session touch that fires while another body holds the write queue 
 });
 
 test("#807: a team route that arrives while another body holds the write queue waits, then writes in its own transaction", async () => {
-  const srv = new TestServer();
+  const srv = await TestServer.open();
   cleanups.push(() => srv.stop());
   const token = await srv.login("you@example.com");
   const write = spyOn(srv.app.repo, "write");
@@ -77,7 +77,7 @@ for (const [route, action] of [["revoke-session", "auth.session_revoked"], ["dis
     const touches = createTouchQueue();
     cleanups.push(() => touches.cancelAll());
     const config: Config = {
-      dbPath: join(dir, "db.sqlite"), blobDir: join(dir, "blobs"), httpPort: 0,
+      store: { kind: "sqlite" as const, path: join(dir, "db.sqlite") }, blobDir: join(dir, "blobs"), httpPort: 0,
       devAuth: true, publicUrl: "http://localhost", googleClientId: "dev", googleClientSecret: "",
       messageRetentionDays: 90, auditRetentionDays: 90, admins: ["root@example.com"], helloLimit: DEFAULT_HELLO_LIMIT,
       authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES, orgDomain: "example.com",
@@ -116,7 +116,7 @@ for (const [route, action] of [["revoke-session", "auth.session_revoked"], ["dis
 // P3 B5b1: the identity, team and Slack-free alias routes write boards through `repo.boards` and never reach core.
 // B5b3c: nor does the claim call, which runs the server's claim port (callClaimTool) on its body's Tx.
 test("#807 P1c-15c-1: claim, identity and team routes reach the store on their body's Tx", async () => {
-  const srv = new TestServer();
+  const srv = await TestServer.open();
   cleanups.push(() => srv.stop());
   const { repo, db } = srv.app;
   const you = await srv.login("you@example.com"), bob = await srv.login("bob@example.com");
@@ -190,7 +190,7 @@ test("#807 P1c-15c-1: claim, identity and team routes reach the store on their b
 // `Tx` inside it (the upload's and release's writes, the guarded download's recheck, retention's prunes), the pool
 // outside (the download's first access check, the blob sweep's reads). P3 B3: the attachment rows through repo.attachments.
 test("#807 P1c-15c-2: attachment routes and retention reach the store on their body's Tx, the pool outside one", async () => {
-  const srv = new TestServer();
+  const srv = await TestServer.open();
   cleanups.push(() => srv.stop());
   const { repo, db } = srv.app;
   const you = await srv.login("you@example.com");

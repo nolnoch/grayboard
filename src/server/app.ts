@@ -26,8 +26,8 @@ export type StartOptions = ApplicationOptions & {
   retentionFirstDelayMs?: number;
   // Trusted test dependency injection; never populated from configuration.
   oauth?: OAuthOptions;
-  // An opened store to serve instead of config.dbPath's SQLite file (#807 P3 C11a: a Postgres Repo from pg_repo.ts
-  // makePgRepo, for tests until C11b selects it by URL). stop() closes it.
+  // The opened store to serve (openRepo in open_repo.ts, or a test's own makePgRepo); stop() closes it. Without one, startServer opens
+  // config.store's SQLite file itself, which only tests rely on: they read the raw handle it exposes as `db`.
   repo?: Repo;
 };
 
@@ -44,14 +44,19 @@ export function startLimits(config: Pick<Config, "helloLimit" | "hostedRequestLi
   };
 }
 
+function sqlitePath(store: Config["store"]): string {
+  if (store.kind !== "sqlite") throw new Error("startServer: a Postgres store is opened with openRepo, then passed as `repo`");
+  return store.path;
+}
+
 export function startServer(config: Config, opts: StartOptions = {}) {
   const humanReach = config.humanReach ?? "team";
   const { db: testDb, repo } = opts.repo
-    // No SQLite handle behind an injected Repo: `db` (tests only) is undefined there, typed as SQLite's until C11b-d
+    // No SQLite handle behind an injected Repo: `db` (tests only) is undefined there, typed as SQLite's until C11c-d
     // move the tests that read it onto the Repo. The injected Repo's own attachment limits and session-end reach apply,
-    // not config's: its maker sets them (C11b opens it from config).
+    // not config's: openRepo sets them from the same config.
     ? { db: undefined as unknown as ReturnType<typeof openDatabase>["db"], repo: opts.repo }
-    : openDatabase(config.dbPath, { blobDir: config.blobDir, sessionEnd: sessionEndPort(humanReach), attachmentLimits: config.attachmentLimits, attachmentUserQuota: config.attachmentUserQuota, ...(opts.now ? { now: opts.now } : {}) });
+    : openDatabase(sqlitePath(config.store), { blobDir: config.blobDir, sessionEnd: sessionEndPort(humanReach), attachmentLimits: config.attachmentLimits, attachmentUserQuota: config.attachmentUserQuota, ...(opts.now ? { now: opts.now } : {}) });
   let slack: SlackBridge | undefined;
   // Dev sign-in mints tokens for any email; they must not outlive it (#805 F-04). A
   // server started without dev auth revokes them, so a re-enable doesn't revive them.

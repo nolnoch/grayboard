@@ -38,7 +38,7 @@ const google = () => stubProvider(async () => { googleExchanges++; return { emai
 async function start(providers: (f: FakeOidc) => IdentityProvider[], admins: string[] = []): Promise<{ fake: FakeOidc; srv: HostedServer }> {
   googleExchanges = 0;
   fake = await startFakeOidc({ clientId: CLIENT_ID, clientSecret: CLIENT_SECRET, user: { sub: "okta-you", email: EMAIL, email_verified: true, name: "You" }, claimsInUserinfoOnly: true });
-  srv = hostedServer({ admins }, EMAIL, providers(fake));
+  srv = await hostedServer({ admins }, EMAIL, providers(fake));
   return { fake, srv };
 }
 

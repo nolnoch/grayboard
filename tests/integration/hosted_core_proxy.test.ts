@@ -29,8 +29,8 @@ import { until } from "../support/until.ts";
 const CLIENT = "grayboard-pi";
 let srv: TestServer, dir: string;
 const proxies: ToolProxy[] = [];
-beforeEach(() => {
-  srv = new TestServer({ hostedRequestLimit: { burst: 10_000, perSec: 10_000 } });
+beforeEach(async () => {
+  srv = await TestServer.open({ hostedRequestLimit: { burst: 10_000, perSec: 10_000 } });
   // Resolved: attachment paths are compared after symlinks (macOS /var → /private/var).
   dir = realpathSync(mkdtempSync(join(tmpdir(), "gb-proxy-")));
 });
@@ -508,7 +508,7 @@ test("unlessAborted with an already-aborted signal leaves the work's later rejec
 
 test("attachment_get cancels an oversized download before saving it", async () => {
   await srv.stop();
-  srv = new TestServer({ hostedRequestLimit: { burst: 10_000, perSec: 10_000 }, attachmentLimits: { file: 16, total: 32 } });
+  srv = await TestServer.open({ hostedRequestLimit: { burst: 10_000, perSec: 10_000 }, attachmentLimits: { file: 16, total: 32 } });
   const alice = await issue(), p = proxy({ token: async () => alice.token });
   await p.call("bind", { name: "download-cap", create: true }, "pi-cap");
   writeFileSync(join(dir, "small.txt"), "small file");
@@ -531,7 +531,7 @@ test("attachment_get cancels an oversized download before saving it", async () =
 
 test("uploads are checked against the server's published caps; a server that publishes none gets the defaults", async () => {
   await srv.stop();
-  srv = new TestServer({ hostedRequestLimit: { burst: 10_000, perSec: 10_000 }, attachmentLimits: { file: 16, total: 32 } });
+  srv = await TestServer.open({ hostedRequestLimit: { burst: 10_000, perSec: 10_000 }, attachmentLimits: { file: 16, total: 32 } });
   const alice = await issue("alice@example.com");
   const p = proxy({ token: async () => alice.token });
   await p.call("bind", { name: "proxy-caps", create: true }, "pi-caps");

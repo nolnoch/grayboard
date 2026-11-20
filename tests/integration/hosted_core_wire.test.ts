@@ -3,15 +3,17 @@
 // revision, the server's own status and body for a refusal at initialize, and
 // a scope refusal classified for a new sign-in.
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { abortOf, ConnectRefused, DELIVERY_META, EFFORT_META, InsufficientScope, LAUNCHER_META, MODEL_META, NativeWire, SERVER_TEXT_LIMIT, SUGGESTED_META, Wire, type WireOptions } from "../../adapters/hosted-core/src/wire.ts";
+import { abortOf, ConnectRefused, DELIVERY_META, EFFORT_META, InsufficientScope, LAUNCHER_META, LISTEN_CAPACITY, listenCapacity, MODEL_META, NativeWire, SERVER_TEXT_LIMIT, SUGGESTED_META, Wire, type WireOptions } from "../../adapters/hosted-core/src/wire.ts";
 import { GRAYBOARD_DELIVERY_META, GRAYBOARD_EFFORT_META, GRAYBOARD_LAUNCHER_META, GRAYBOARD_MODEL_META, GRAYBOARD_SESSION_META, GRAYBOARD_SUGGESTED_META } from "../../src/shared/session_meta.ts";
 import { issueOAuth } from "../helpers/oauth.ts";
+import { DEFAULT_MCP_LIMITS } from "../../src/server/config.ts";
 import { TestServer } from "../support/server.ts";
+import { until } from "../support/until.ts";
 
 const CLIENT = "grayboard-pi";
 let srv: TestServer;
 const wires: { close(): Promise<void> }[] = [];
-beforeEach(() => { srv = new TestServer({ hostedRequestLimit: { burst: 10_000, perSec: 10_000 } }); });
+beforeEach(async () => { srv = await TestServer.open({ hostedRequestLimit: { burst: 10_000, perSec: 10_000 } }); });
 afterEach(async () => {
   await Promise.all(wires.splice(0).map(w => w.close().catch(() => {})));
   await srv.stop();
@@ -19,8 +21,8 @@ afterEach(async () => {
 const options = (delivery: unknown = { mode: "push", source: "grayboard-pi" }): WireOptions =>
   ({ url: `${srv.base}/mcp`, sessionKey: GRAYBOARD_SESSION_META, client: { name: "grayboard-pi", version: "1.0.0" }, delivery: delivery as WireOptions["delivery"] });
 const issue = async (scopes = ["grayboard:tools", "grayboard:delivery"]) => (await issueOAuth(srv.app.repo, srv.app.oauth.resource, "alice@example.com", scopes, Date.now(), CLIENT)).token;
-function subscriber(token: string, wireOptions = options()) {
-  const wire = new Wire(wireOptions, { token: async () => token }, new AbortController().signal, "raw-root");
+function subscriber(token: string, wireOptions = options(), sessionID = "raw-root") {
+  const wire = new Wire(wireOptions, { token: async () => token }, new AbortController().signal, sessionID);
   wires.push(wire);
   return wire;
 }
@@ -193,4 +195,32 @@ test.each(["whoami", "bind"] as const)("an aborted %s on a real wire is its stop
   expect(error).toBeDefined();
   expect(abortOf(error, stop.signal)).toBe(true);
   expect(abortOf(error, new AbortController().signal)).toBe(false);
+});
+
+// #1394: the Controller retries a swap's listen only on the listen cap's refusal, which it recognizes by the server's
+// plain-text body as the SDK raises it. Pins both ends: a second listen past the per-user cap, through the real wire
+// and SDK, is exactly what listenCapacity matches, and the first listen's slot is held until it closes.
+test("a listen past the per-user listen cap is the refusal listenCapacity matches", async () => {
+  await srv.stop();
+  srv = await TestServer.open({ hostedRequestLimit: { burst: 10_000, perSec: 10_000 }, mcpLimits: { ...DEFAULT_MCP_LIMITS, listen: { global: 128, perUser: 1 } } });
+  const token = await issue();
+  const open = async (sessionID: string, name: string) => {
+    const wire = subscriber(token, options(), sessionID);
+    await wire.connect();
+    await wire.call("bind", { name, create: true });
+    wire.capability = (await wire.call("delivery_open") as { capability: string }).capability;
+    return wire;
+  };
+  const first = await open("raw-root", "be"), second = await open("raw-root-2", "fe");
+  const held = await first.listen();
+  const refused = await second.listen().then(() => undefined, e => e);
+  expect(listenCapacity(refused)).toBe(true);
+  // The Rust SDK matches the same body (`delivery.rs` `relisten`); cargo isn't in this suite, so its constant is pinned here.
+  expect(await Bun.file(new URL("../../sdk/rust/grayboard/src/delivery.rs", import.meta.url)).text()).toContain(`const LISTEN_CAPACITY: &str = "${LISTEN_CAPACITY}";`);
+  await held.close();
+  await until(async () => {
+    const subscription = await second.listen().catch(() => undefined);
+    await subscription?.close();
+    return subscription;
+  }, 5000, "the freed slot admits the second listen");
 });

@@ -15,7 +15,7 @@ let srv: TestServer;
 
 beforeEach(async () => {
   // Inbox polling spends hosted requests.
-  srv = new TestServer({ hostedRequestLimit: { burst: 10_000, perSec: 10_000 } });
+  srv = await TestServer.open({ hostedRequestLimit: { burst: 10_000, perSec: 10_000 } });
   await srv.login(A);
   await srv.login(B);
 });

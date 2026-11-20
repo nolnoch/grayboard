@@ -5,7 +5,7 @@ import { afterAll, expect, test } from "bun:test";
 import { TestServer } from "../support/server.ts";
 
 const unlimited = { burst: 1e12, perSec: 1e12 };
-const srv = new TestServer({ hostedRequestLimit: unlimited, helloLimit: unlimited });
+const srv = await TestServer.open({ hostedRequestLimit: unlimited, helloLimit: unlimited });
 afterAll(() => srv.stop());
 
 const liveHeapMB = () => { Bun.gc(true); Bun.gc(true); return process.memoryUsage().heapUsed / 1048576; };

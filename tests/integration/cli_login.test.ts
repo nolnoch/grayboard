@@ -16,8 +16,8 @@ import { until } from "../support/until.ts";
 const EMAIL = "alice@example.com";
 let srv: HostedServer, dir: string, env: Record<string, string>, opened: string;
 
-beforeEach(() => {
-  srv = hostedServer({}, EMAIL);
+beforeEach(async () => {
+  srv = await hostedServer({}, EMAIL);
   dir = mkdtempSync(join(tmpdir(), "gb-cli-login-"));
   const bin = join(dir, "bin");
   mkdirSync(bin);

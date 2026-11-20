@@ -1,12 +1,18 @@
-// An in-process grayboard server on port 0 with dev auth and an in-memory DB.
-// It owns a temp dir: its blobs (unless overridden) and the files of every
+// An in-process grayboard server on port 0 with dev auth. It owns a temp dir:
+// its SQLite database and blobs (unless overridden) and the files of every
 // session it starts live there, and stop() removes it.
+//
+// GRAYBOARD_TEST_BACKEND=pg (with GRAYBOARD_TEST_PG_URL) puts each server on a
+// Postgres database of its own, cloned from the test template (pg.ts) and
+// dropped by its final stop (#807 P3 C11b); default sqlite.
+import { describe, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Subprocess } from "bun";
 import { DEFAULT_RETENTION_DAYS } from "../../src/core/boards.ts";
 import { startServer, type StartOptions } from "../../src/server/app.ts";
+import { openRepo } from "../../src/server/open_repo.ts";
 import { DEFAULT_SERVICE_LIMITS, type Config } from "../../src/server/config.ts";
 import { DEFAULT_AUTH_FAIL_LIMIT, DEFAULT_HELLO_LIMIT } from "../../src/server/rate_limit.ts";
 import { DEFAULT_TRUSTED_PROXIES } from "../../src/server/client_addr.ts";
@@ -18,9 +24,41 @@ import { issueOAuth } from "../helpers/oauth.ts";
 import { type AppSession, type AppSessionOptions, signedIn } from "./app_session.ts";
 import { HOSTED_CLIENT, HOSTED_SCOPES, HostedSession, type HostedOptions } from "./hosted_session.ts";
 
+export const TEST_BACKEND: "sqlite" | "pg" = process.env.GRAYBOARD_TEST_BACKEND === "pg" ? "pg" : "sqlite";
+if (process.env.GRAYBOARD_TEST_BACKEND && !["sqlite", "pg"].includes(process.env.GRAYBOARD_TEST_BACKEND)) {
+  throw new Error(`GRAYBOARD_TEST_BACKEND is sqlite or pg, not ${process.env.GRAYBOARD_TEST_BACKEND}`);
+}
+if (TEST_BACKEND === "pg" && !process.env.GRAYBOARD_TEST_PG_URL) throw new Error("GRAYBOARD_TEST_BACKEND=pg needs GRAYBOARD_TEST_PG_URL");
+
+// Tests that are SQLite by nature (a second connection to the server's file, the
+// file's own behaviour, the sync_access oracle): skipped on pg, and named in the
+// run's output (bun's summary counts a skip without naming it).
+const sqliteOnly = (name: string) => console.log(`skip (SQLite only): ${name}`);
+export const describeSqlite = (name: string, fn: () => void) => {
+  if (TEST_BACKEND !== "pg") return describe(name, fn);
+  sqliteOnly(name);
+  return describe.skip(`${name} [SQLite only]`, fn);
+};
+export const testSqlite = (name: string, fn: () => unknown, timeout?: number) => {
+  if (TEST_BACKEND !== "pg") return test(name, fn as () => void, timeout);
+  sqliteOnly(name);
+  return test.skip(`${name} [SQLite only]`, fn as () => void);
+};
+
+// A server's config overrides. `dbPath` puts it on a SQLite file there whatever the backend: a test that names the
+// file reads it as SQLite (an upgrade test's release-written database).
+export type TestServerOverrides = Partial<Config> & { dbPath?: string };
+// `reuse`: a server stopped with stop({ keep: true }), whose database (and dir) this one takes over: a restart.
+// `backend`: this server's, in place of GRAYBOARD_TEST_BACKEND's.
+export type TestServerStart = StartOptions & { reuse?: TestServer; backend?: "sqlite" | "pg" };
+
+// The database a TestServer owns: dropped (pg) with its dir on the final stop, kept by stop({ keep: true }).
+// `injected`: the Repo came in through `start.repo`; `store` is then only a placeholder, so nothing may reuse it.
+type Owned = { store: Config["store"]; drop(): Promise<void>; injected?: boolean };
+
 function serverConfig(dir: string, overrides: Partial<Config>): Config {
   return {
-    dbPath: join(dir, "bus.db"),
+    store: { kind: "sqlite", path: join(dir, "bus.db") },
     blobDir: join(dir, "blobs"),
     httpPort: 0,
     googleClientId: "dev",
@@ -52,18 +90,52 @@ export async function devLogin(base: string, email: string): Promise<string> {
 }
 
 export class TestServer {
-  readonly app: ReturnType<typeof startServer>;
   readonly base: string;
-  readonly config: Config;
-  readonly dir = mkdtempSync(join(tmpdir(), "gb-server-"));
   private appSessions: AppSession[] = [];
   private hostedSessions: HostedSession[] = [];
+  private kept = false;
+  // Its database and dir passed to the server that reused them: that one drops them.
+  private handedOver = false;
 
-  // Tests skip the background timers unless they pass `background`.
-  constructor(overrides: Partial<Config> = {}, opts: StartOptions = {}) {
-    this.config = serverConfig(this.dir, overrides);
-    this.app = startServer(this.config, { background: false, ...opts });
+  private constructor(readonly app: ReturnType<typeof startServer>, readonly config: Config, readonly dir: string, private readonly owned: Owned) {
     this.base = `http://localhost:${this.app.server.port}`;
+  }
+
+  // Tests skip the background timers unless they pass `background`. A Repo in `opts` is served as given (pg_server.ts).
+  static async open(overrides: TestServerOverrides = {}, opts: TestServerStart = {}): Promise<TestServer> {
+    const { reuse, backend = TEST_BACKEND, ...start } = opts;
+    const { dbPath, ...rest } = overrides;
+    if (reuse && (!reuse.kept || reuse.handedOver)) throw new Error("TestServer.open: reuse takes a server stopped with stop({ keep: true })");
+    if (reuse?.owned.injected) throw new Error("TestServer.open: a server opened with an injected repo can't be reused; inject the repo again");
+    if (reuse) reuse.handedOver = true;
+    const dir = reuse?.dir ?? mkdtempSync(join(tmpdir(), "gb-server-"));
+    let owned: Owned = reuse?.owned ?? { store: { kind: "sqlite", path: dbPath ?? join(dir, "bus.db") }, drop: async () => {}, ...(start.repo ? { injected: true } : {}) };
+    let repo = start.repo;
+    try {
+      if (!reuse && !start.repo && !rest.store && !dbPath && backend === "pg") {
+        const { pgDatabase } = await import("./pg.ts");
+        const db = await pgDatabase({ max: 1 });
+        owned = { store: { kind: "postgres", url: db.url }, drop: () => db[Symbol.asyncDispose]() };
+      }
+      const config = serverConfig(dir, { store: owned.store, ...rest });
+      repo ??= config.store.kind === "postgres" ? await openRepo(config, { ...(start.now ? { now: start.now } : {}), pool: { applicationName: "gb-test", max: 4 } }) : undefined;
+      try {
+        return new TestServer(startServer(config, { background: false, ...start, ...(repo ? { repo } : {}) }), config, dir, owned);
+      } catch (error) {
+        if (repo && !start.repo) await repo.close();
+        throw error;
+      }
+    } catch (error) {
+      await owned.drop().catch(() => {});
+      rmSync(dir, { recursive: true, force: true });
+      throw error;
+    }
+  }
+
+  // The SQLite file under this server, for the tests that open it themselves (SQLite only by nature: describeSqlite).
+  get dbPath(): string {
+    if (this.config.store.kind !== "sqlite") throw new Error("TestServer.dbPath: this server is on Postgres; the test is SQLite only (describeSqlite)");
+    return this.config.store.path;
   }
 
   login(email: string): Promise<string> {
@@ -147,21 +219,40 @@ export class TestServer {
   }
 
   // Every driver closes before the app stops; a hosted close that failed is
-  // reported once the server is down and its dir removed.
-  async stop(): Promise<void> {
+  // reported once the server is down and its dir removed. `keep` leaves the
+  // database and dir for a server that reuses them (open's `reuse`).
+  async stop({ keep = false }: { keep?: boolean } = {}): Promise<void> {
     for (const s of this.appSessions.splice(0)) s.close();
     const hosted = await Promise.allSettled(this.hostedSessions.splice(0).map((s) => s.close()));
-    await this.app.stop();
-    rmSync(this.dir, { recursive: true, force: true });
+    try {
+      await this.app.stop();
+    } finally {
+      if (keep) this.kept = true;
+      else if (!this.handedOver) {
+        await this.owned.drop();
+        rmSync(this.dir, { recursive: true, force: true });
+      }
+    }
     const failed = hosted.find((r) => r.status === "rejected");
     if (failed?.status === "rejected") throw failed.reason;
+  }
+
+  // Stop, keeping the database, and start again on it: a server restart.
+  async restart(overrides: TestServerOverrides = {}, opts: StartOptions = {}): Promise<TestServer> {
+    await this.stop({ keep: true });
+    return TestServer.open(overrides, { ...opts, reuse: this, backend: this.config.store.kind === "postgres" ? "pg" : "sqlite" });
+  }
+
+  [Symbol.asyncDispose](): Promise<void> {
+    return this.stop();
   }
 }
 
 // A grayboard server as its own process: a compiled binary (a release, or the
 // build under test), or a command line (this tree's src/server/main.ts under
 // bun, so a sync testPause blocks only the server). Dev auth, port 0, its DB
-// at `dbPath` and its blobs beside it. Ready
+// at `dbPath` and its blobs beside it, or on a Postgres `url` (behind the
+// unreleased gate) with `blobDir`, or a temp dir it removes on stop. Ready
 // once it prints the port it listens on. Its stdout and stderr are drained
 // into one log as they arrive, so it never blocks on a full pipe and log()
 // mid-run has both.
@@ -171,11 +262,25 @@ export class ServerProcess {
     readonly base: string,
     private readonly out: { text: string },
     private readonly drained: Promise<unknown>,
+    private readonly ownedBlobs?: string,
   ) {}
 
-  static async start(bin: string | string[], dbPath: string, extra: Record<string, string> = {}): Promise<ServerProcess> {
+  static async start(bin: string | string[], store: { dbPath: string } | { url: string; blobDir?: string }, extra: Record<string, string> = {}): Promise<ServerProcess> {
+    const ownedBlobs = "url" in store && !store.blobDir ? mkdtempSync(join(tmpdir(), "gb-proc-blobs-")) : undefined;
+    const storeEnv: Record<string, string> = "url" in store
+      ? { GRAYBOARD_DATABASE_URL: store.url, GRAYBOARD_UNRELEASED_POSTGRES: "1", GRAYBOARD_BLOB_DIR: store.blobDir ?? ownedBlobs! }
+      : { GRAYBOARD_DB_PATH: store.dbPath };
+    try {
+      return await ServerProcess.spawn(bin, { ...storeEnv, ...extra }, ownedBlobs);
+    } catch (error) {
+      if (ownedBlobs) rmSync(ownedBlobs, { recursive: true, force: true });
+      throw error;
+    }
+  }
+
+  private static async spawn(bin: string | string[], env: Record<string, string>, ownedBlobs: string | undefined): Promise<ServerProcess> {
     const proc = Bun.spawn(Array.isArray(bin) ? bin : [bin], {
-      env: cleanEnv({ GRAYBOARD_DEV_AUTH: "1", GRAYBOARD_DB_PATH: dbPath, GRAYBOARD_PUBLIC_URL: "http://localhost", GRAYBOARD_HTTP_PORT: "0", ...extra }),
+      env: cleanEnv({ GRAYBOARD_DEV_AUTH: "1", GRAYBOARD_PUBLIC_URL: "http://localhost", GRAYBOARD_HTTP_PORT: "0", ...env }),
       stdin: "ignore",
       stdout: "pipe",
       stderr: "pipe",
@@ -196,7 +301,7 @@ export class ServerProcess {
     try {
       for (;;) {
         const port = /listening on port (\d+)\n/.exec(out.text)?.[1];
-        if (port) return new ServerProcess(proc, `http://localhost:${port}`, out, drained);
+        if (port) return new ServerProcess(proc, `http://localhost:${port}`, out, drained, ownedBlobs);
         const done = await Promise.race([exited, Bun.sleep(20)]);
         if (done) {
           await drained;
@@ -228,6 +333,7 @@ export class ServerProcess {
       await this.drained;
     } finally {
       clearTimeout(force);
+      if (this.ownedBlobs) rmSync(this.ownedBlobs, { recursive: true, force: true });
     }
   }
 }

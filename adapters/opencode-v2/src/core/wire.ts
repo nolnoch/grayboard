@@ -113,6 +113,17 @@ export function unreachable(error: unknown): boolean {
   return false;
 }
 
+// The server's listen cap refused a listen (`src/server/mcp.ts` `reserve`): a plain-text 429 with this exact body and
+// no `rate_limited` data, so the fetch wrapper hands it back unretried and the SDK raises it as an SdkHttpError. Only
+// this body: another plain 429 (request or exchange capacity) is no listen-slot race (#1394).
+export const LISTEN_CAPACITY = "MCP listen capacity reached";
+export function listenCapacity(error: unknown): boolean {
+  for (let e = error, depth = 0; e && depth < 8; e = (e as { cause?: unknown }).cause, depth++) {
+    if (e instanceof SdkHttpError && e.status === 429 && e.data.text === LISTEN_CAPACITY) return true;
+  }
+  return false;
+}
+
 // A tool call's raw failure, before reachable() classifies it: an outage
 // after its request may have left (anything but a socket that never opened)
 // is OutcomeUnknown. A ServerUnreachable already is the credential's (a

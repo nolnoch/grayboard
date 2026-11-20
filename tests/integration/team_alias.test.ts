@@ -22,7 +22,7 @@ let bob: string;
 
 beforeEach(async () => {
   // Inbox polling spends hosted requests.
-  srv = new TestServer({ hostedRequestLimit: { burst: 10_000, perSec: 10_000 } });
+  srv = await TestServer.open({ hostedRequestLimit: { burst: 10_000, perSec: 10_000 } });
   alice = await srv.login("alice@example.com");
   bob = await srv.login(B);
   expect((await srv.api(alice, "POST", "/api/teams", { name: "eng" })).status).toBe(201);

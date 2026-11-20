@@ -33,9 +33,13 @@ export type IdpId = (typeof IDP_IDS)[number];
 // The Okta org behind the generic OIDC provider (src/server/idp_oidc.ts): one per server.
 export type OktaConfig = { issuer: string; clientId: string; clientSecret: string; allowedDomains: string[] };
 
+// The server's database (#807 P3 C11b): a SQLite file, or a Postgres URL behind GRAYBOARD_UNRELEASED_POSTGRES=1 until
+// the cutover (docs/future/postgres-server.md D8 P3, P5).
+export type Store = { kind: "sqlite"; path: string } | { kind: "postgres"; url: string };
+
 export type Config = {
-  dbPath: string;
-  // Where attachment bytes are kept (src/server/blobs.ts); default blobs/ beside the database.
+  store: Store;
+  // Where attachment bytes are kept (src/server/blobs.ts); default blobs/ beside a SQLite database, required with a URL.
   blobDir: string;
   httpPort: number;
   googleClientId: string;
@@ -103,7 +107,7 @@ export function loadConfig(): Config {
     );
   }
 
-  const dbPath    = requireEnv("GRAYBOARD_DB_PATH");
+  const { store, blobDir } = storeConfig(process.env);
   const publicUrl = requireEnv("GRAYBOARD_PUBLIC_URL");
 
   // Dev sign-in lets anyone who reaches the server act as anyone (#805 F-04): a
@@ -128,8 +132,8 @@ export function loadConfig(): Config {
   checkIdpConfig(identity);
 
   return {
-    dbPath,
-    blobDir: process.env.GRAYBOARD_BLOB_DIR || join(dirname(dbPath), "blobs"),
+    store,
+    blobDir,
     httpPort: parsePort(process.env.GRAYBOARD_HTTP_PORT),
     googleClientId,
     googleClientSecret,
@@ -368,6 +372,30 @@ function parseList(raw: string | undefined): string[] {
 
 function urlHostname(raw: string): string {
   try { return new URL(raw).hostname; } catch { return ""; }
+}
+
+// One of GRAYBOARD_DATABASE_URL and GRAYBOARD_DB_PATH: both set would hide a misconfigured deploy behind a silent
+// precedence. The URL needs the unreleased gate (PS D8: the two stores never coexist in a release, so a release cut
+// before P5 must not honour it) and an explicit blob directory (no database directory to put it beside).
+function storeConfig(env: Record<string, string | undefined>): { store: Store; blobDir: string } {
+  const url = env.GRAYBOARD_DATABASE_URL, path = env.GRAYBOARD_DB_PATH, blobDir = env.GRAYBOARD_BLOB_DIR;
+  if (url && path) throw new Error("Set one of GRAYBOARD_DATABASE_URL, GRAYBOARD_DB_PATH, not both");
+  if (path) return { store: { kind: "sqlite", path }, blobDir: blobDir || join(dirname(path), "blobs") };
+  if (!url) throw new Error("Required env var GRAYBOARD_DB_PATH (or GRAYBOARD_DATABASE_URL) is not set");
+  if (env.GRAYBOARD_UNRELEASED_POSTGRES !== "1") throw new Error("GRAYBOARD_DATABASE_URL needs GRAYBOARD_UNRELEASED_POSTGRES=1: the Postgres store is unreleased");
+  if (!blobDir) throw new Error("GRAYBOARD_DATABASE_URL needs GRAYBOARD_BLOB_DIR: there's no database directory to keep attachments beside");
+  return { store: { kind: "postgres", url }, blobDir };
+}
+
+// What the startup line names: the backend and where, never a URL's credentials.
+export function describeStore(store: Store): string {
+  if (store.kind === "sqlite") return `sqlite ${store.path}`;
+  try {
+    const u = new URL(store.url);
+    return `postgres ${u.host}${u.pathname}`;
+  } catch {
+    return "postgres (unparsable URL)";
+  }
 }
 
 function requireEnv(name: string): string {

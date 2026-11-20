@@ -6,29 +6,23 @@
 // revoked tools-only alias (why "revoked"). An end bounces the ID's unread
 // mail to live senders and releases its claims.
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import { runRetention } from "../../src/server/retention.ts";
 import { direct } from "../support/events.ts";
 import { TestServer } from "../support/server.ts";
-import { scratchDbPath } from "../support/scratch_db.ts";
 
 const A = "alice@example.com";
 let srv: TestServer;
 let clock: number;
-let dbDir: string;
 
-const start = (dbPath = scratchDbPath()) => new TestServer({ dbPath, admins: ["root@example.com"] }, { now: () => clock });
+const OVERRIDES = { admins: ["root@example.com"] };
+const start = () => TestServer.open(OVERRIDES, { now: () => clock });
 
-beforeEach(() => {
+beforeEach(async () => {
   clock = Date.now();
-  dbDir = mkdtempSync(join(tmpdir(), "gb-end-"));
-  srv = start();
+  srv = await start();
 });
 afterEach(async () => {
   await srv.stop();
-  rmSync(dbDir, { recursive: true, force: true });
 });
 
 const row = (id: string) => srv.app.db.prepare(`SELECT ended_at, held_aliases_json FROM ids WHERE id = ?`).get(id) as { ended_at: number | null; held_aliases_json: string | null } | null;
@@ -39,15 +33,12 @@ const ended = (id: string) => srv.app.db.prepare(`SELECT detail FROM access_log 
 // The server restarts on its database: every session the hosted store doesn't
 // own, which nothing can reattach, is ended as it starts.
 async function restart(): Promise<void> {
-  await srv.stop();
-  srv = start(join(dbDir, "bus.db"));
+  srv = await srv.restart(OVERRIDES, { now: () => clock });
   await srv.app.ready;
 }
 
 // hosted twin: #451 (end)
 test("a restart ends a leftover session: holds released, claims of its ID released, unread mail bounced to a sender's next holder", async () => {
-  await srv.stop();
-  srv = start(join(dbDir, "bus.db"));
   let alice = await srv.login(A);
   let bob = await srv.login("bob@example.com");
   const a = await srv.connected(alice, "be");
@@ -120,8 +111,6 @@ test("a session whose end fails is audited and retried at the next revalidate; t
 // does; the keyed tombstone and id.reused are core's, in
 // src/local/retention.test.ts and session_key.test.ts.
 test("retention prunes ended sessions, never a live one, and leaves no tombstone", async () => {
-  await srv.stop();
-  srv = start(join(dbDir, "bus.db"));
   let alice = await srv.login(A);
   const first = await srv.connected(alice, "be");
   const second = await srv.connected(alice, "fe");
@@ -149,8 +138,6 @@ test("retention prunes ended sessions, never a live one, and leaves no tombstone
 // The ended ID is a session a restart ended.
 // hosted twin: #451 (tools-only)
 test("a send or @id: mention to an ID that can't receive carries its code: not_found, id_ended, no_delivery", async () => {
-  await srv.stop();
-  srv = start(join(dbDir, "bus.db"));
   let alice = await srv.login(A);
   const gone = await srv.connected(alice, null);
   await restart();
@@ -192,8 +179,6 @@ test("a hold session registers delivery push: a send to its ID is accepted and w
 // it. A restart ends it (a closed one keeps both holds) and releases both.
 // hosted twin: #451 (multi-alias holds)
 test("a two-hold session is delivered to on each hold; a restart ends it and releases both", async () => {
-  await srv.stop();
-  srv = start(join(dbDir, "bus.db"));
   const alice = await srv.login(A);
   const s = await srv.connected(alice, "be");
   expect(await s.bind("be2", { create: true })).toMatchObject({ held: [`${A}/be`, `${A}/be2`] });

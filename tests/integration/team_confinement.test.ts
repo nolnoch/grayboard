@@ -15,7 +15,7 @@ let sessions: HostedSession[] = [];
 let bob: string;
 
 beforeEach(async () => {
-  srv = new TestServer({ hostedRequestLimit: { burst: 10_000, perSec: 10_000 } });
+  srv = await TestServer.open({ hostedRequestLimit: { burst: 10_000, perSec: 10_000 } });
   bob = await srv.login(B);
   for (const team of ["eng", "qa"]) expect((await srv.api(bob, "POST", "/api/teams", { name: team })).status).toBe(201);
 });

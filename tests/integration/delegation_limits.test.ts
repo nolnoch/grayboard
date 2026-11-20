@@ -30,7 +30,7 @@ const rows = (srv: TestServer, action: string) =>
 
 test("server: the user's bucket refuses past the burst, audits one streak, and charges neither a replay nor a refusal", async () => {
   let clock = Date.now();
-  const srv = new TestServer({ hostedRequestLimit: { burst: 10_000, perSec: 10_000 }, delegateLimit: { burst: 2, perSec: 1 / 60 } }, { now: () => clock });
+  const srv = await TestServer.open({ hostedRequestLimit: { burst: 10_000, perSec: 10_000 }, delegateLimit: { burst: 2, perSec: 1 / 60 } }, { now: () => clock });
   try {
     const token = await srv.login("you@example.com");
     await launcher(srv, token, "be");
@@ -70,7 +70,7 @@ test("server: the user's bucket refuses past the burst, audits one streak, and c
 }, 30_000);
 
 test("server: a user's sessions share one bucket, so a fresh session can't reset it; another user's is their own", async () => {
-  const srv = new TestServer({ hostedRequestLimit: { burst: 10_000, perSec: 10_000 }, delegateLimit: { burst: 2, perSec: 0.1 } }, { now: () => 1_000_000 });
+  const srv = await TestServer.open({ hostedRequestLimit: { burst: 10_000, perSec: 10_000 }, delegateLimit: { burst: 2, perSec: 0.1 } }, { now: () => 1_000_000 });
   try {
     const you = await srv.login("you@example.com");
     await launcher(srv, you, "be");
@@ -103,7 +103,7 @@ test("server: a user's sessions share one bucket, so a fresh session can't reset
 }, 30_000);
 
 test("server, hosted: the throttled row survives the tool call's rolled-back transaction", async () => {
-  const srv = new TestServer({ hostedRequestLimit: { burst: 10_000, perSec: 10_000 }, delegateLimit: { burst: 1, perSec: 1 / 60 } });
+  const srv = await TestServer.open({ hostedRequestLimit: { burst: 10_000, perSec: 10_000 }, delegateLimit: { burst: 1, perSec: 1 / 60 } });
   try {
     const token = await srv.login("you@example.com");
     await launcher(srv, token, "be");
@@ -119,7 +119,7 @@ test("server, hosted: the throttled row survives the tool call's rolled-back tra
 }, 30_000);
 
 test("server: a full launcher is skipped by the auto-pick and refused by name; its reply or ack frees a slot", async () => {
-  const srv = new TestServer({ hostedRequestLimit: { burst: 10_000, perSec: 10_000 }, delegateLimit: { burst: 100, perSec: 100 }, delegateOpenCap: 2 });
+  const srv = await TestServer.open({ hostedRequestLimit: { burst: 10_000, perSec: 10_000 }, delegateLimit: { burst: 100, perSec: 100 }, delegateOpenCap: 2 });
   try {
     const token = await srv.login("you@example.com");
     const be = await launcher(srv, token, "be");

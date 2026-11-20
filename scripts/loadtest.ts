@@ -206,7 +206,7 @@ async function main() {
   // A driver killed by a signal (the scope's OOM killer) keeps a null exitCode.
   const exited = (d: Driver) => d.proc.exitCode !== null || d.proc.signalCode !== null;
   try {
-    srv = await ServerProcess.start(o.server, dbPath, env);
+    srv = await ServerProcess.start(o.server, { dbPath: dbPath }, env);
     const server = srv;
     let metricsUrl: string | undefined;
     for (const deadline = Date.now() + 10_000; !metricsUrl; await Bun.sleep(50)) {

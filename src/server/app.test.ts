@@ -24,7 +24,7 @@ for (const trusted of [true, false]) test(`OAuth address limits use the actual a
   let clock = Date.now();
   try {
     app = startServer({
-      dbPath: scratchDbPath(), blobDir: dir, httpPort: 0,
+      store: { kind: "sqlite" as const, path: scratchDbPath() }, blobDir: dir, httpPort: 0,
       googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl: "https://rate.example.com",
       messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT,
       trustedProxies: trusted ? DEFAULT_TRUSTED_PROXIES : [], oauthLimit: { burst: 1, perSec: 1 }, oauthGlobalLimit: { burst: 10, perSec: 1 },
@@ -47,7 +47,7 @@ for (const trusted of [true, false]) test(`OAuth address limits use the actual a
   }
 });
 
-const restartConfig = (dir: string) => ({ dbPath: join(dir, "bus.db"), blobDir: join(dir, "blobs"), httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl: "https://restart.example.com", messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES });
+const restartConfig = (dir: string) => ({ store: { kind: "sqlite" as const, path: join(dir, "bus.db") }, blobDir: join(dir, "blobs"), httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl: "https://restart.example.com", messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES });
 
 // A bound root with a child and an open delivery lease on a real server.
 async function leasedRoot(app: ReturnType<typeof startServer>) {
@@ -75,7 +75,7 @@ for (const scenario of ["credited", "capped", "idle", "expired", "no-heartbeat"]
     const { principal, context, lease } = await leasedRoot(app);
     await app.stop(); app = undefined;
     const alive = Date.now() - (scenario === "idle" ? 20 * 60_000 : 300_000);
-    const outage = new Database(config.dbPath);
+    const outage = new Database(config.store.path);
     try {
       if (scenario === "no-heartbeat") outage.run("DELETE FROM server_state");
       else outage.run("UPDATE server_state SET value = ? WHERE key = 'alive_at'", [alive]);
@@ -155,7 +155,7 @@ test("a clean stop records its time, so a quick restart credits nothing", async 
     const stopping = Date.now();
     await app.stop(); app = undefined;
     const stopped = Date.now();
-    const outage = new Database(config.dbPath);
+    const outage = new Database(config.store.path);
     try {
       const alive = outage.query<{ value: number }, []>("SELECT value FROM server_state WHERE key = 'alive_at'").get()!.value;
       expect(alive).toBeGreaterThanOrEqual(stopping);
@@ -176,7 +176,7 @@ test("a second opener during a credited restart doesn't credit the outage again"
     await leasedRoot(app);
     await app.stop(); app = undefined;
     const alive = Date.now() - 300_000;
-    const outage = new Database(config.dbPath);
+    const outage = new Database(config.store.path);
     try {
       outage.run("UPDATE server_state SET value = ? WHERE key = 'alive_at'", [alive]);
       outage.run("UPDATE hosted_sessions SET lease_deadline = ? WHERE root_session_id IS NULL", [alive + 20_000]);
@@ -221,7 +221,7 @@ test("an explicit startup hostname binds the application's own fixture URL", asy
   let app: ReturnType<typeof startServer> | undefined;
   try {
     app = startServer({
-      dbPath: scratchDbPath(), blobDir: dir, httpPort: 0,
+      store: { kind: "sqlite" as const, path: scratchDbPath() }, blobDir: dir, httpPort: 0,
       googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl,
       messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES,
     }, { hostname, background: false });
@@ -314,7 +314,7 @@ test("a startup write that fails rejects ready, and the server stops and serves 
   try {
     app = startServer(config, { hostname, background: false }); await app.ready;
     await app.stop(); app = undefined;
-    const db = new Database(config.dbPath);
+    const db = new Database(config.store.path);
     db.run("CREATE TRIGGER fail_state_insert BEFORE INSERT ON server_state BEGIN SELECT RAISE(ABORT, 'startup write refused'); END");
     db.run("CREATE TRIGGER fail_state_update BEFORE UPDATE ON server_state BEGIN SELECT RAISE(ABORT, 'startup write refused'); END");
     db.close();

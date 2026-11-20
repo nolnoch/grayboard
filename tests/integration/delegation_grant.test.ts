@@ -9,11 +9,11 @@ import { expect, test } from "bun:test";
 import { refusal, type AppSession } from "../support/app_session.ts";
 import { direct } from "../support/events.ts";
 import { seed } from "../support/seed.ts";
-import { TestServer } from "../support/server.ts";
+import { TestServer, type TestServerOverrides } from "../support/server.ts";
 import { until } from "../support/until.ts";
 
-const serve = (o: ConstructorParameters<typeof TestServer>[0] = {}) =>
-  new TestServer({ hostedRequestLimit: { burst: 10_000, perSec: 10_000 }, delegateLimit: { burst: 100, perSec: 100 }, ...o });
+const serve = (o: TestServerOverrides = {}) =>
+  TestServer.open({ hostedRequestLimit: { burst: 10_000, perSec: 10_000 }, delegateLimit: { burst: 100, perSec: 100 }, ...o });
 const launcher = (srv: TestServer, token: string, identity: string): Promise<AppSession> => srv.connected(token, identity, { launcher: true });
 
 // Alice and Bob in team `eng`, with the given policy.
@@ -32,7 +32,7 @@ const decisions = (srv: TestServer, rule: string) =>
     .filter((d) => d.rule === rule);
 
 test("server: a delegating team lets a member name another member's launcher; collaborative alone doesn't", async () => {
-  const srv = serve();
+  const srv = await serve();
   try {
     const { alice, bob } = await team(srv, "collaborative");
     const bobLauncher = await launcher(srv, bob, "eng/launcher");
@@ -58,7 +58,7 @@ test("server: a delegating team lets a member name another member's launcher; co
 }, 30_000);
 
 test("server: a delegate replay after the team's policy went back to open is refused, not replayed", async () => {
-  const srv = serve();
+  const srv = await serve();
   try {
     const { alice, bob } = await team(srv, "delegating");
     await launcher(srv, bob, "eng/launcher");
@@ -81,7 +81,7 @@ test("server: a delegate replay after the team's policy went back to open is ref
 // A replay whose launcher name no session holds now (its holder released it
 // but is still live) is refused, not read as the requester's own (#878 audit).
 test("server: a delegate replay whose launcher name is unheld is refused, not replayed", async () => {
-  const srv = serve();
+  const srv = await serve();
   try {
     const { alice, bob } = await team(srv, "delegating");
     const bobLauncher = await launcher(srv, bob, "eng/launcher");
@@ -102,7 +102,7 @@ test("server: a delegate replay whose launcher name is unheld is refused, not re
 // Removing the launcher's user from the delegating team revokes the grant: the
 // next fresh call and the replay are both refused.
 test("server: removing a member from the delegating team revokes delegation to their launcher", async () => {
-  const srv = serve();
+  const srv = await serve();
   try {
     const { alice, bob } = await team(srv, "delegating");
     await launcher(srv, bob, "bob-launcher");
@@ -121,7 +121,7 @@ test("server: removing a member from the delegating team revokes delegation to t
 // alias that moves to a user alice shares no delegating team with is refused,
 // on a replay as on a fresh call.
 test("server: a granted launcher name that changed hands is judged by its new holder", async () => {
-  const srv = serve();
+  const srv = await serve();
   try {
     const alice = await srv.login("alice@example.com");
     const bob = await srv.login("bob@b.com");
@@ -151,7 +151,7 @@ test("server: a granted launcher name that changed hands is judged by its new ho
 }, 30_000);
 
 test("server: another user's request is refused once a launcher holds half its open cap; its own user keeps the rest", async () => {
-  const srv = serve({ delegateOpenCap: 4 });
+  const srv = await serve({ delegateOpenCap: 4 });
   try {
     const { alice, bob } = await team(srv, "delegating");
     await launcher(srv, bob, "eng/launcher");
@@ -173,7 +173,7 @@ test("server: another user's request is refused once a launcher holds half its o
 // a plain dm_send with a forged header never does, and a grant revoked since
 // the write takes the mark off the next read (principle 11).
 test("server: a granted delegation reads as delegated; a forged one and a revoked grant's don't", async () => {
-  const srv = serve();
+  const srv = await serve();
   try {
     const { alice, bob } = await team(srv, "delegating");
     const bobLauncher = await launcher(srv, bob, "eng/launcher");
@@ -227,7 +227,7 @@ test("server: a granted delegation reads as delegated; a forged one and a revoke
 test("server: delegate's msg.send deny leaves a decision row on a fresh call and on a replay's recheck", async () => {
   const { FakeSlack } = await import("./fake_slack.ts");
   const slack = new FakeSlack({ channel: "D0ALICE", owner: "U0ALICE", channelType: "im" });
-  const srv = serve({ slack: { appToken: "xapp-1-t", botToken: "xoxb-t", apiUrl: slack.api } });
+  const srv = await serve({ slack: { appToken: "xapp-1-t", botToken: "xoxb-t", apiUrl: slack.api } });
   try {
     await srv.app.slackReady;
     const alice = await srv.login("alice@example.com");
