@@ -140,7 +140,7 @@ jobs:
 
   # The server suite on Postgres (#807 P3 C11b): TestServer.open() clones a
   # database per server from the migrated template. The files already green on
-  # Postgres (less mcp_subscriptions, a load flake candidate); C11c/C11d widen this to ./src/server ./tests/integration
+  # Postgres; C11c/C11d widen this to ./src/server ./tests/integration
   # ./tests/conformance. Non-required until C11d.
   test-pg:
     needs: scope
@@ -317,6 +317,7 @@ jobs:
             tests/integration/local_resume.test.ts
             tests/integration/local_shutdown.test.ts
             tests/integration/mcp_resources.test.ts
+            tests/integration/mcp_subscriptions.test.ts
             tests/integration/mentions.test.ts
             tests/integration/oauth_attachments.test.ts
             tests/integration/oauth_server.test.ts
