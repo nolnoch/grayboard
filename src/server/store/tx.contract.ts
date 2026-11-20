@@ -350,6 +350,38 @@ function handles(backend: TxBackend, it: It): void {
     expect(await h.rows(h.read)).toEqual(["a", "b", "c", "d"]);
   });
 
+  // D4 (#1054): a timer a suspended body starts inherits the body's queue ownership, so every ambient way to the
+  // writer refuses it: a write, a post and the store's Read. The only way in is the body's Tx, captured by name: its
+  // row is the body's, committed with it or rolled back with it.
+  it("D4: a timer a suspended body starts reaches the writer only through the Tx it captured (#1054)", async h => {
+    const fromTimer = (tx: Tx) => new Promise<{ write: string; post: string; read: string }>(resolve => setTimeout(() => {
+      void (async () => {
+        const write = await failure(() => h.write(t => h.put(t, "ambient write")));
+        const post = await failure(() => h.post(t => h.put(t, "ambient post"), undefined, "timer write"));
+        const read = await failure(() => h.rows(h.read));
+        await h.put(tx, "captured");
+        resolve({ write, post, read });
+      })();
+    }, 0));
+    let seen!: { write: string; post: string; read: string };
+    await h.write(async tx => {
+      await h.put(tx, "body");
+      seen = await fromTimer(tx);
+    });
+    expect(seen.write).toContain("write() inside an open transaction");
+    expect(seen.post).toContain("post inside an open transaction (timer write)");
+    expect(seen.read).toContain("repo.read inside the caller's own transaction");
+    await h.drain();
+    expect(await h.rows(h.read)).toEqual(["body", "captured"]);
+    // The captured Tx's row rolls back with the body that owns it.
+    await expect(h.write(async tx => {
+      await fromTimer(tx);
+      throw new Error("boom");
+    })).rejects.toThrow("boom");
+    await h.drain();
+    expect(await h.rows(h.read)).toEqual(["body", "captured"]);
+  });
+
   // #807 P3 A7g: Tx.beforeCommit.
   it("beforeCommit runs once per key after the body, before COMMIT, on the root Tx with the queue held", async h => {
     const seen: string[] = [];
