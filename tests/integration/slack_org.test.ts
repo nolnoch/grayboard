@@ -585,6 +585,78 @@ test("#807: a Slack delivery receipt waits for the write queue, then stamps the 
   } finally { repo.post = post; slack.onPost = null; holder?.release(); }
 });
 
+// #1091: a receipt that waits behind the write queue takes its item out of the outbox when posted. If its body then
+// refuses (here the human's session ended while it waited: a bridge stop), the receipt and the progress clear roll
+// back and the failure is logged; the cursor doesn't move, so the next bridge start resends the item, and the
+// surviving progress row tells the relay what Slack already has.
+async function refusedReceipt(body: string): Promise<{ sent: SendResult; userId: number; errors: { mock: { calls: unknown[][] }; mockRestore(): void } }> {
+  const alice = await login("alice@example.com");
+  await link(alice);
+  const userId = (await srv.app.repo.users.findByEmail(srv.app.repo.read, "alice@example.com"))!.id;
+  const be = await hosted("alice@example.com", "be");
+  const repo = srv.app.repo;
+  const { post } = repo;
+  let receipts = 0;
+  repo.post = (fn, committed, what) => {
+    if (what === "Slack receipt") receipts++;
+    return (post as (...a: unknown[]) => boolean).call(repo, fn, committed, what);
+  };
+  const errors = spyOn(console, "error");
+  let holder: ReturnType<typeof holdQueue> | undefined;
+  // Held as Slack takes the post, so the progress write and the receipt both queue behind it.
+  slack.onPost = (b) => { if (!holder && String(b.markdown_text ?? b.text).includes(body)) holder = holdQueue(); };
+  try {
+    const sent = await be.call<SendResult>("dm_send", { to: "human", body });
+    await until(() => receipts > 0, 5000, "the relay posted the receipt");
+    srv.app.slack!.stop();
+    holder!.release();
+    await holder!.done;
+    await drained(srv);
+    return { sent, userId, errors };
+  } finally { repo.post = post; slack.onPost = null; holder?.release(); }
+}
+
+// A second bridge on the same server: the restart analog.
+async function restartBridge(): Promise<{ stop: () => void }> {
+  const { SlackBridge } = await import("../../src/server/slack.ts");
+  const next = new SlackBridge({ repo: srv.app.repo, application: srv.app.application, appToken: "xapp-1-t", botToken: "xoxb-t", apiUrl: slack.api });
+  await next.start();
+  return next;
+}
+
+test("#1091: a refused Slack receipt is logged, keeps its progress, and the next start acks the item without reposting it", async () => {
+  const { sent, userId, errors } = await refusedReceipt("refused receipt fixture");
+  let next: { stop: () => void } | undefined;
+  try {
+    expect(errors.mock.calls.some((c) => String(c[0]).includes("Slack receipt failed") && c[1] instanceof ApplicationError)).toBe(true);
+    const deliveredAt = async () => (await row<{ delivered_at: number | null }>(srv, `SELECT delivered_at FROM messages WHERE id = ?`, sent.message_id))!.delivered_at;
+    expect(await deliveredAt()).toBeNull();
+    expect(await srv.app.repo.cursors.directFor(srv.app.repo.read, "alice@example.com/human")).toBeLessThan(sent.message_id);
+    expect(await srv.app.repo.slack.progress(srv.app.repo.read, userId, `dm:${sent.message_id}`)).toMatchObject({ posted: true });
+    next = await restartBridge();
+    await until(async () => (await deliveredAt()) !== null, 5000, "the restarted bridge acked the item");
+    expect(slack.posts().filter((p) => String(p.markdown_text).includes("refused receipt fixture"))).toHaveLength(1);
+    expect(await srv.app.repo.cursors.directFor(srv.app.repo.read, "alice@example.com/human")).toBeGreaterThanOrEqual(sent.message_id);
+    await until(async () => (await srv.app.repo.slack.progress(srv.app.repo.read, userId, `dm:${sent.message_id}`)) === undefined, 5000, "the receipt cleared the progress");
+  } finally { errors.mockRestore(); next?.stop(); }
+}, 30_000);
+
+// #470's give-up is re-derived at the resend: Slack refuses the post again, so the cursor moves and the message stays
+// unstamped.
+test("#1091: a refused receipt for a message Slack refused gives it up again at the next start, unstamped", async () => {
+  slack.refusePosts = "msg_too_long";
+  const { sent, errors } = await refusedReceipt("refused too long fixture");
+  let next: { stop: () => void } | undefined;
+  try {
+    expect(errors.mock.calls.some((c) => String(c[0]).includes("Slack receipt failed") && c[1] instanceof ApplicationError)).toBe(true);
+    expect(await srv.app.repo.cursors.directFor(srv.app.repo.read, "alice@example.com/human")).toBeLessThan(sent.message_id);
+    next = await restartBridge();
+    await until(async () => (await srv.app.repo.cursors.directFor(srv.app.repo.read, "alice@example.com/human")) >= sent.message_id, 5000, "the restarted bridge gave the item up");
+    await drained(srv);
+    expect((await row<{ delivered_at: number | null }>(srv, `SELECT delivered_at FROM messages WHERE id = ?`, sent.message_id))!.delivered_at).toBeNull();
+  } finally { errors.mockRestore(); next?.stop(); slack.refusePosts = null; }
+}, 30_000);
+
 // #1016: the relay's thread row is a posted write. A Slack reply that arrives while the row waits in the write queue
 // reads it from the store's pending writes, so it reaches the agent rather than being refused as an unconnected thread.
 test("#1016: a Slack reply in a thread whose row waits in the write queue reaches the agent", async () => {
