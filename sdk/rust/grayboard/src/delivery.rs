@@ -37,6 +37,9 @@ const THROTTLE_LIMIT: u32 = 8;
 const SWAP_CAPACITY_RETRIES: u32 = 5;
 /// The server's body for a listen past the listen cap (`src/server/mcp.ts` `reserve`), a plain-text 429 (`Error::Capacity`). Only this one is the reopen's slot race: request or exchange capacity is not.
 const LISTEN_CAPACITY: &str = "MCP listen capacity reached";
+/// The endpoints whose swap retry has begun a listen-cap backoff, one entry per wait: a test sends its control once the wait is under way, not while the refused listen is still in flight (#1397).
+#[cfg(test)]
+pub(crate) static SWAP_BACKOFFS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 /// The `stable_id` hash's own version. hosted-core's `stableID` is version 4 and hashes the issuer too; this one doesn't (one endpoint has one issuer), so the two never collide.
 const STABLE_ID_VERSION: u32 = 1;
 /// An address as `model.ts` accepts it: no whitespace, control or bidi characters, at most 160 characters.
@@ -754,6 +757,11 @@ impl Task {
                     if text == LISTEN_CAPACITY && retry < SWAP_CAPACITY_RETRIES =>
                 {
                     let wait = self.backoff(retry, self.t.backoff_unit);
+                    #[cfg(test)]
+                    SWAP_BACKOFFS
+                        .lock()
+                        .unwrap()
+                        .push(sub.shared.endpoint.to_string());
                     watch(&mut self.ctl, sleep(wait)).await?;
                     retry += 1;
                 }
