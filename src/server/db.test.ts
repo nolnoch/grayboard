@@ -7,8 +7,7 @@ import { Glob } from "bun";
 import { ACCESS_LOG_LAST_SQL, INVOKE_BINDING_SQL, mailPort, openDatabase, QUEUED_TO_SQL, RETRACTABLE_SQL, SENT_PENDING_SQL, UNDELIVERED_FROM_SQL, type Repo } from "./db.ts";
 import type { Tx } from "./store/tx.ts";
 import { scratchDbPath } from "../../tests/support/scratch_db.ts";
-import { holdAlias } from "../core/bindings.ts";
-import { createBoard, post, registerId, subscribe, touchAlias } from "../core/boards.ts";
+import { createBoard, post, registerId, subscribe } from "../core/boards.ts";
 import { claim, watch } from "../core/claims.ts";
 import { seed } from "../../tests/support/seed.ts";
 import { GOOGLE_ISSUER } from "./idp_google.ts";
@@ -43,6 +42,8 @@ import { delegationContract } from "./store/delegation.contract.ts";
 import { sqliteIdsBackend } from "./store/session_end.contract.sqlite.ts";
 import { claimsContract } from "./store/claims.contract.ts";
 import { sqliteClaimsBackend } from "./store/claims.contract.sqlite.ts";
+import { boardsContract } from "./store/boards.contract.ts";
+import { sqliteBoardsBackend } from "./store/boards.contract.sqlite.ts";
 
 const person = (email: string, name: string) => ({ scope_kind: "person" as const, scope_ref: email, name });
 
@@ -263,6 +264,7 @@ describe("attachments contract (SQLite)", () => attachmentsContract(sqliteAttach
 describe("session end contract (SQLite)", () => sessionEndContract(sqliteIdsBackend));
 describe("delegation contract (SQLite)", () => delegationContract(sqliteIdsBackend));
 describe("claims contract (SQLite)", () => claimsContract(sqliteClaimsBackend));
+describe("boards contract (SQLite)", () => boardsContract(sqliteBoardsBackend));
 
 // Sign-in fixtures for the rows below (security audit F-13, #928 D4).
 const G = GOOGLE_ISSUER, OKTA = "https://example.okta.com";
@@ -474,7 +476,7 @@ test("audit.last orders by (at, id), newest first", () => {
 
 // #807 P1c-5: a leaf store refuses a value that isn't a SQLite store handle. A settled Tx's refusal is a contract row
 // on every backend (cursors.contract.ts K4, write_receipts.contract.ts), as are the store's answers.
-test("#807 P1c-5: cursors, writeReceipts and bindings refuse a handle from another store", async () => {
+test("#807 P1c-5: cursors, writeReceipts, bindings and boards refuse a handle from another store", async () => {
   const { repo } = openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
   const foreign = {} as typeof repo.read;
   await expect(repo.cursors.directFor(foreign, "a@example.com/fe")).rejects.toThrow("not a SQLite store handle");
@@ -484,6 +486,25 @@ test("#807 P1c-5: cursors, writeReceipts and bindings refuse a handle from anoth
   await expect(repo.audit.lock(foreign as Tx, "bridge.notified", "a@example.com/human")).rejects.toThrow("not a SQLite store handle");
   await expect(repo.bindings.holdsOf(foreign, "id:0000000000001")).rejects.toThrow("not a SQLite store handle");
   await expect(repo.bindings.take(foreign as Tx, "a@example.com/fe", "id:0000000000001", "a@example.com", 1)).rejects.toThrow("not a SQLite store handle");
+  const [i, fx] = [repo.bindings, foreign as Tx];
+  for (const call of [() => i.viewerIds(foreign), () => i.idFacts(foreign, ["id:0000000000001"]), () => i.setStatus(fx, "a@example.com/fe", "x", 1), () => i.setQueueParticipation(fx, "a@example.com/fe", false)]) {
+    await expect(call()).rejects.toThrow("not a SQLite store handle");
+  }
+  // Every boards method (#807 P3 C10e-a; the settled-Tx refusals are boards.contract.ts's).
+  const b = repo.boards;
+  const fe = "a@example.com/fe";
+  for (const call of [
+    () => b.get(foreign, "hall"), () => b.post(foreign, 1), () => b.catalogPage(foreign, ""), () => b.snapshotPage(foreign, "hall", {}),
+    () => b.pendingPushes(foreign, fe), () => b.pendingDigests(foreign, fe), () => b.acknowledge(fx, fe, { kind: "push", post_id: 1 }),
+    () => b.ensure(fx, "hall", "p", null, fe), () => b.isSubscribed(foreign, fe, "hall"), () => b.setSubscription(fx, fe, "hall", "push"),
+    () => b.unsubscribeScope(fx, fe, "team:x"), () => b.forget(fx, fe), () => b.prunePosts(fx, 0), () => b.views(foreign, [fe], null),
+    () => b.openSummaries(foreign), () => b.roster(foreign, null), () => b.create(fx, { name: "x", purpose: "p", scope: null, kind: "broadcast", createdBy: fe, now: 1 }),
+    () => b.setArchived(fx, "hall", fe, 1), () => b.read(fx, "hall", fe, {}), () => b.threadRoot(foreign, 1), () => b.mute(fx, fe, 1, true),
+    () => b.insertPost(fx, { board: "hall", author: fe, body: "x", parentId: null, now: 1, expiresAt: null, authorId: null, via: null, authorUser: null, human: false }),
+    () => b.bindAttachments(fx, [1], { addresses: [fe], principal: null }, 1, { file: 1, total: 1 }), () => b.authorAddresses(foreign, fe, null),
+    () => b.subscribers(foreign, "hall"), () => b.threadFacts(foreign, 1), () => b.laneRows(foreign, "hall", [fe]),
+    () => b.claimQueuePost(fx, "hall", 1, fe, 1, { note: "n", push: true }), () => b.insertOutbox(fx, 1, []), () => b.redeliveryFacts(foreign, "queue:hall:1", fe),
+  ]) await expect(call()).rejects.toThrow("not a SQLite store handle");
   expect(() => repo.audit.write(foreign as Tx, { at: 1, actor: null, action: "auth.login", target: null, detail: null })).toThrow("not a SQLite store handle");
 });
 
@@ -808,319 +829,39 @@ test("#807 P3 B4a: sessionEnd runs on the Tx it's given and rolls back with its 
   expect((await seed(repo, tx => e.refusal(tx, id)))?.code).toBe("id_ended");
 });
 
-// #807 P3 B5a1: repo.boards runs on the handle it's given: a kept Tx and a non-store handle are refused, a read inside
-// a body sees that body's writes, and an acknowledge rolls back with its body.
-test("#807 P3 B5a1: repo.boards runs on the handle it's given; acknowledge rolls back with its body", async () => {
-  const { repo } = fresh();
-  const [be, fe] = ["a@example.com/be", "a@example.com/fe"];
-  const { kept, id } = await seed(repo, async tx => {
-    // A board reads as missing to an address no principal owns (#284).
-    await repo.users.upsertByEmail(tx, "a@example.com", null);
-    for (const name of ["be", "fe"]) await repo.aliases.create(tx, person("a@example.com", name), "a@example.com");
-    const core = repo.coreOn(tx);
-    createBoard(core, be, "hall", "tests");
-    subscribe(core, fe, "hall", "push");
-    return { kept: tx, id: post(core, be, "hall", "hi").post.id };
-  });
-  const settled = /used after its transaction settled/;
-  const b = repo.boards;
-  const ref = { kind: "push" as const, post_id: id };
-  await expect(b.get(kept, "hall")).rejects.toThrow(settled);
-  await expect(b.post(kept, id)).rejects.toThrow(settled);
-  await expect(b.catalogPage(kept, "")).rejects.toThrow(settled);
-  await expect(b.snapshotPage(kept, "hall", {})).rejects.toThrow(settled);
-  await expect(b.pendingPushes(kept, fe)).rejects.toThrow(settled);
-  await expect(b.pendingDigests(kept, fe)).rejects.toThrow(settled);
-  await expect(b.acknowledge(kept, fe, ref)).rejects.toThrow(settled);
-  await expect(b.get({} as Tx, "hall")).rejects.toThrow("not a SQLite store handle");
-  expect((await b.get(repo.read, "hall"))?.name).toBe("hall");
-  expect((await b.post(repo.read, id))?.body).toBe("hi");
-  expect((await b.catalogPage(repo.read, "")).map(x => x.name)).toContain("hall");
-  expect((await b.snapshotPage(repo.read, "hall", {})).posts.map(p => p.id)).toEqual([id]);
-  const pushed = async (r: Parameters<typeof b.pendingPushes>[0]) => (await b.pendingPushes(r, fe)).map(p => p.post.id);
-  expect(await pushed(repo.read)).toEqual([id]);
-  await expect(seed(repo, async tx => {
-    await b.acknowledge(tx, fe, ref);
-    expect(await pushed(tx)).toEqual([]);
-    throw new Error("rolled back");
-  })).rejects.toThrow("rolled back");
-  expect(await pushed(repo.read)).toEqual([id]);
-  await seed(repo, tx => b.acknowledge(tx, fe, ref));
-  expect(await pushed(repo.read)).toEqual([]);
-});
-
-// #807 P3 B5b1: the board writes outside the tools run on the handle they're given: a kept Tx and a non-store handle are
-// refused, and a body that ensures a board and subscribes, then throws, leaves neither.
-test("#807 P3 B5b1: repo.boards writes run on the Tx they're given and roll back with their body", async () => {
+// #807 P3 B5a1..B5b2b's rows for the groups the board tools call besides boards (whose rows moved to
+// boards.contract.ts): the aliases and claims methods refuse a kept Tx and a non-store handle, and roll back with
+// their body.
+test("#807 P3 B5: the aliases and claims methods the board tools call run on the handle they're given", async () => {
   const { repo, db } = fresh();
   const [be, fe] = ["a@example.com/be", "a@example.com/fe"];
   const kept = await seed(repo, async tx => {
     await repo.users.upsertByEmail(tx, "a@example.com", null);
     for (const name of ["be", "fe"]) await repo.aliases.create(tx, person("a@example.com", name), "a@example.com");
-    return tx;
-  });
-  const settled = /used after its transaction settled/;
-  const b = repo.boards;
-  await expect(b.ensure(kept, "hall", "p", null, be)).rejects.toThrow(settled);
-  await expect(b.isSubscribed(kept, be, "hall")).rejects.toThrow(settled);
-  await expect(b.setSubscription(kept, be, "hall", "push")).rejects.toThrow(settled);
-  await expect(b.unsubscribeScope(kept, be, "team:x")).rejects.toThrow(settled);
-  await expect(b.forget(kept, be)).rejects.toThrow(settled);
-  await expect(b.prunePosts(kept, 0)).rejects.toThrow(settled);
-  await expect(repo.aliases.markHuman(kept, be, true)).rejects.toThrow(settled);
-  const stranger = /not a SQLite store handle/;
-  await expect(b.ensure({} as Tx, "hall", "p", null, be)).rejects.toThrow(stranger);
-  await expect(b.isSubscribed({} as Tx, be, "hall")).rejects.toThrow(stranger);
-  await expect(b.setSubscription({} as Tx, be, "hall", "push")).rejects.toThrow(stranger);
-  await expect(b.unsubscribeScope({} as Tx, be, "team:x")).rejects.toThrow(stranger);
-  await expect(b.forget({} as Tx, be)).rejects.toThrow(stranger);
-  await expect(b.prunePosts({} as Tx, 0)).rejects.toThrow(stranger);
-  await expect(repo.aliases.markHuman({} as Tx, be, true)).rejects.toThrow(stranger);
-  const human = async () => db.query<{ human: number | null }, [string]>("SELECT human FROM aliases WHERE address = ?").get(fe)?.human ?? null;
-  await expect(seed(repo, async tx => {
-    expect(await b.ensure(tx, "hall", "p", "team:x", be)).toBe(true);
-    expect(await b.ensure(tx, "hall", "other", null, fe)).toBe(false);
-    await b.setSubscription(tx, fe, "hall", "digest");
-    expect(await b.isSubscribed(tx, fe, "hall")).toBe(true);
-    await repo.aliases.markHuman(tx, fe, true);
-    throw new Error("rolled back");
-  })).rejects.toThrow("rolled back");
-  expect(await b.get(repo.read, "hall")).toBeUndefined();
-  expect(await b.isSubscribed(repo.read, fe, "hall")).toBe(false);
-  expect(await human()).toBeFalsy();
-  // Committed: a subscription starts at the tip, so the post before it is no backlog; "off" and a scope's drop delete it.
-  const id = await seed(repo, async tx => {
-    await b.ensure(tx, "hall", "p", null, be);
-    await b.ensure(tx, "crew", "p", "team:x", be);
-    const id = post(repo.coreOn(tx), be, "hall", "before").post.id;
-    await b.setSubscription(tx, fe, "hall", "push");
-    await repo.aliases.markHuman(tx, fe, true);
-    return id;
-  });
-  expect((await b.get(repo.read, "hall"))?.purpose).toBe("p");
-  expect(db.query("SELECT cursor, notified_id FROM subscriptions WHERE handle = ? AND board = 'hall'").get(fe)).toEqual({ cursor: id, notified_id: id });
-  expect(await human()).toBeTruthy();
-  await seed(repo, tx => b.setSubscription(tx, fe, "hall", "off"));
-  expect(await b.isSubscribed(repo.read, fe, "hall")).toBe(false);
-  await seed(repo, tx => b.setSubscription(tx, fe, "crew", "digest"));
-  await seed(repo, tx => b.unsubscribeScope(tx, fe, "team:other"));
-  expect(await b.isSubscribed(repo.read, fe, "crew")).toBe(true);
-  await seed(repo, tx => b.unsubscribeScope(tx, fe, "team:x"));
-  expect(await b.isSubscribed(repo.read, fe, "crew")).toBe(false);
-  await seed(repo, tx => b.setSubscription(tx, fe, "hall", "push"));
-  await seed(repo, tx => b.forget(tx, fe));
-  expect(await b.isSubscribed(repo.read, fe, "hall")).toBe(false);
-  // The prune names the boards that lost posts, and the post goes.
-  expect(await seed(repo, tx => b.prunePosts(tx, Date.now() + 1))).toEqual(["hall"]);
-  expect(await b.post(repo.read, id)).toBeUndefined();
-  await seed(repo, tx => repo.aliases.markHuman(tx, fe, false));
-  expect(await human()).toBeFalsy();
-});
-
-// #807 P3 B5b1b1: the board tools' reads and session writes run on the handle they're given: a kept Tx and a non-store
-// handle are refused, a read inside a body sees that body's writes, and a status or queue opt-out rolls back with its body.
-test("#807 P3 B5b1b1: the board tools' repo reads and writes run on the handle they're given", async () => {
-  const { repo, db } = fresh();
-  const [be, fe] = ["a@example.com/be", "a@example.com/fe"];
-  const [s1, tail, solo] = ["id:0000000000001", "id:0000000000002", "id:0000000000003"];
-  const kept = await seed(repo, async tx => {
-    await repo.users.upsertByEmail(tx, "a@example.com", null);
-    for (const name of ["be", "fe"]) await repo.aliases.create(tx, person("a@example.com", name), "a@example.com");
     const core = repo.coreOn(tx);
-    registerId(core, { id: s1, principal: "a@example.com", launcher: false, harness: "pi", model: "m1" });
-    registerId(core, { id: tail, principal: "a@example.com", launcher: false, viewer: true });
-    registerId(core, { id: solo, principal: "a@example.com", launcher: true });
-    holdAlias(core, be, s1, 100);
-    touchAlias(core, be, 100);
-    createBoard(core, be, "hall", "tests");
-    subscribe(core, fe, "hall", "digest");
-    post(core, be, "hall", "hi");
+    createBoard(core, be, "jobs", "work", null, { kind: "queue" });
+    subscribe(core, fe, "jobs", "push");
     return tx;
   });
-  const settled = /used after its transaction settled/;
-  const stranger = /not a SQLite store handle/;
-  const [b, i] = [repo.boards, repo.bindings];
-  await expect(b.views(kept, [fe], null)).rejects.toThrow(settled);
-  await expect(b.openSummaries(kept)).rejects.toThrow(settled);
-  await expect(b.roster(kept, null)).rejects.toThrow(settled);
-  await expect(i.viewerIds(kept)).rejects.toThrow(settled);
-  await expect(i.idFacts(kept, [s1])).rejects.toThrow(settled);
-  await expect(i.setStatus(kept, be, "x", 1)).rejects.toThrow(settled);
-  await expect(i.setQueueParticipation(kept, be, false)).rejects.toThrow(settled);
-  await expect(b.views({} as Tx, [fe], null)).rejects.toThrow(stranger);
-  await expect(b.openSummaries({} as Tx)).rejects.toThrow(stranger);
-  await expect(b.roster({} as Tx, null)).rejects.toThrow(stranger);
-  await expect(i.viewerIds({} as Tx)).rejects.toThrow(stranger);
-  await expect(i.idFacts({} as Tx, [s1])).rejects.toThrow(stranger);
-  await expect(i.setStatus({} as Tx, be, "x", 1)).rejects.toThrow(stranger);
-  await expect(i.setQueueParticipation({} as Tx, be, false)).rejects.toThrow(stranger);
-  // The reads: fe's view carries its subscription and the unread post; be's, its creator's, not its own post; a board
-  // filter narrows them.
-  const views = await b.views(repo.read, [fe, be], null);
-  expect(views.map(v => [v.handle, v.row.name, v.row.mode, v.row.unread])).toEqual([[fe, "hall", "digest", 1], [be, "hall", "push", 0]]);
-  expect(await b.views(repo.read, [fe], "nope")).toEqual([]);
-  expect((await b.openSummaries(repo.read)).map(r => [r.name, r.mode, r.unread])).toEqual([["hall", null, 0]]);
-  expect((await b.roster(repo.read, "hall")).map(r => [r.handle, r.mode])).toEqual([[be, "push"], [fe, "digest"]]);
-  expect((await b.roster(repo.read, null)).find(r => r.handle === be)?.id).toBe(s1);
-  expect(await i.viewerIds(repo.read)).toEqual(new Set([tail]));
-  // A missing ID is absent; a repeat once.
-  expect(await i.idFacts(repo.read, [s1, "id:0000000000009", s1])).toEqual(new Map([[s1, { principal: "a@example.com", harness: "pi", model: "m1", effort: null, launcher: 0 }]]));
-  const statusOf = (id: string) => db.query<{ status: string | null; status_at: number | null }, [string]>("SELECT status, status_at FROM ids WHERE id = ?").get(id);
-  const queueOff = () => db.query<{ queue_off: number | null }, [string]>("SELECT queue_off FROM aliases WHERE address = ?").get(be)?.queue_off ?? null;
-  await expect(seed(repo, async tx => {
-    expect(await i.setStatus(tx, be, "busy", 500)).toBe(true);
-    await i.setQueueParticipation(tx, be, false);
-    expect((await b.roster(tx, null)).find(r => r.handle === be)).toMatchObject({ status: "busy", queue_off: 1 });
-    throw new Error("rolled back");
-  })).rejects.toThrow("rolled back");
-  expect(statusOf(s1)).toEqual({ status: null, status_at: null });
-  expect(queueOff()).toBeNull();
-  // Committed: the holder's status and the opt-out land; an unheld name has no session to set, an ID-only one its own.
-  expect(await seed(repo, tx => i.setStatus(tx, be, "busy", 500))).toBe(true);
-  expect(statusOf(s1)).toEqual({ status: "busy", status_at: 500 });
-  expect(db.query<{ last_seen: number }, [string]>("SELECT last_seen FROM aliases WHERE address = ?").get(be)?.last_seen).toBe(500);
-  expect(await seed(repo, tx => i.setStatus(tx, fe, "x", 600))).toBe(false);
-  expect(await seed(repo, tx => i.setStatus(tx, solo, "own", 600))).toBe(true);
-  expect(statusOf(solo)).toEqual({ status: "own", status_at: 600 });
-  expect(await seed(repo, tx => i.setStatus(tx, be, "", 700))).toBe(true);
-  expect(statusOf(s1)).toEqual({ status: null, status_at: null });
-  await seed(repo, tx => i.setQueueParticipation(tx, be, false));
-  expect(queueOff()).toBe(1);
-  await seed(repo, tx => i.setQueueParticipation(tx, be, true));
-  expect(queueOff()).toBeNull();
-});
-
-// #807 P3 B5b1b2: the board tools' writes and the reads they add run on the handle they're given: a kept Tx and a
-// non-store handle are refused, a create, archive, read or mute rolls back with its body, and committed they land.
-test("#807 P3 B5b1b2: the board tools' repo writes and reads run on the handle they're given", async () => {
-  const { repo, db } = fresh();
-  const [be, fe, ghost] = ["a@example.com/be", "a@example.com/fe", "a@example.com/ghost"];
-  let root = 0, reply = 0;
-  const kept = await seed(repo, async tx => {
-    await repo.users.upsertByEmail(tx, "a@example.com", null);
-    for (const name of ["be", "fe"]) await repo.aliases.create(tx, person("a@example.com", name), "a@example.com");
-    const core = repo.coreOn(tx);
-    createBoard(core, be, "hall", "tests");
-    subscribe(core, fe, "hall", "push");
-    root = post(core, be, "hall", "root").post.id;
-    reply = post(core, be, "hall", "reply", root).post.id;
-    return tx;
-  });
-  await seed(repo, tx => repo.aliases.markHuman(tx, fe, true));
-  const settled = /used after its transaction settled/;
-  const stranger = /not a SQLite store handle/;
-  const [b, al] = [repo.boards, repo.aliases];
-  const nb = { name: "fresh", purpose: "p", scope: null, kind: "broadcast", createdBy: be, now: 900 };
-  for (const h of [kept, {} as Tx]) {
-    const want = h === kept ? settled : stranger;
-    await expect(b.create(h, nb)).rejects.toThrow(want);
-    await expect(b.setArchived(h, "hall", be, 1)).rejects.toThrow(want);
-    await expect(b.read(h, "hall", fe, {})).rejects.toThrow(want);
-    await expect(b.threadRoot(h, reply)).rejects.toThrow(want);
-    await expect(b.mute(h, fe, root, true)).rejects.toThrow(want);
+  const [al, cl] = [repo.aliases, repo.claims];
+  for (const [h, want] of [[kept, /used after its transaction settled/], [{} as Tx, /not a SQLite store handle/]] as const) {
+    await expect(al.markHuman(h, fe, true)).rejects.toThrow(want);
     await expect(al.isHuman(h, fe)).rejects.toThrow(want);
     await expect(al.scopesOf(h, [be])).rejects.toThrow(want);
-  }
-  // The reads: a reply's root, the human mark, each address's scope columns (an address with no row absent).
-  expect(await b.threadRoot(repo.read, reply)).toBe(root);
-  expect(await b.threadRoot(repo.read, root)).toBe(root);
-  expect(await al.isHuman(repo.read, fe)).toBe(true);
-  expect(await al.isHuman(repo.read, be)).toBe(false);
-  expect(await al.scopesOf(repo.read, [be, ghost])).toEqual(new Map([[be, { scope_kind: "person", scope_ref: "a@example.com" }]]));
-  const cursor = () => db.query<{ cursor: number }, [string]>("SELECT cursor FROM subscriptions WHERE board = 'hall' AND handle = ?").get(fe)?.cursor;
-  const muted = () => db.query<{ n: number }, [string]>("SELECT count(*) AS n FROM thread_mutes WHERE handle = ?").get(fe)!.n;
-  const archivedAt = () => db.query<{ archived_at: number | null }, []>("SELECT archived_at FROM boards WHERE name = 'hall'").get()!.archived_at;
-  const before = cursor();
-  // Inside a body each write is seen by the body's reads, and all of it rolls back.
-  await expect(seed(repo, async tx => {
-    expect((await b.create(tx, nb))?.name).toBe("fresh");
-    expect(await b.create(tx, nb)).toBeNull();
-    expect(await b.get(tx, "fresh")).toMatchObject({ purpose: "p", created_by: be });
-    expect((await b.setArchived(tx, "hall", be, 1000))?.archived_by).toBe(be);
-    expect(await b.setArchived(tx, "hall", be, 1001)).toBeNull();
-    expect((await b.read(tx, "hall", fe, {})).posts.map(p => p.id)).toEqual([root, reply]);
-    await b.mute(tx, fe, root, true);
-    throw new Error("rolled back");
-  })).rejects.toThrow("rolled back");
-  expect(await b.get(repo.read, "fresh")).toBeUndefined();
-  expect(archivedAt()).toBeNull();
-  expect(cursor()).toBe(before);
-  expect(muted()).toBe(0);
-  // Committed: they land; a null-handle read (a peek) leaves the cursor; a reopen clears the stamp.
-  expect((await seed(repo, tx => b.read(tx, "hall", null, {}))).posts.length).toBe(2);
-  expect(cursor()).toBe(before);
-  await seed(repo, tx => b.read(tx, "hall", fe, {}));
-  expect(cursor()).toBe(reply);
-  await seed(repo, tx => b.mute(tx, fe, root, true));
-  expect(muted()).toBe(1);
-  await seed(repo, tx => b.mute(tx, fe, root, false));
-  expect(muted()).toBe(0);
-  expect((await seed(repo, tx => b.setArchived(tx, "hall", be, 1000)))?.archived_at).toBe(1000);
-  expect(archivedAt()).toBe(1000);
-  expect((await seed(repo, tx => b.setArchived(tx, "hall", null, 1100)))?.archived_at ?? null).toBeNull();
-  expect(archivedAt()).toBeNull();
-});
-
-// #807 P3 B5b2b: board_post's repo reads and writes run on the handle they're given: a kept Tx and a non-store handle
-// are refused, the writes roll back with their body, and committed they land.
-test("#807 P3 B5b2b: board_post's repo reads and writes run on the handle they're given", async () => {
-  const { repo, db } = fresh();
-  const [be, fe] = ["a@example.com/be", "a@example.com/fe"];
-  let root = 0;
-  const kept = await seed(repo, async tx => {
-    await repo.users.upsertByEmail(tx, "a@example.com", null);
-    for (const name of ["be", "fe"]) await repo.aliases.create(tx, person("a@example.com", name), "a@example.com");
-    const core = repo.coreOn(tx);
-    createBoard(core, be, "hall", "tests");
-    createBoard(core, be, "jobs", "work", null, { kind: "queue" });
-    subscribe(core, fe, "hall", "push");
-    subscribe(core, fe, "jobs", "push");
-    root = post(core, be, "hall", "root").post.id;
-    return tx;
-  });
-  const settled = /used after its transaction settled/;
-  const stranger = /not a SQLite store handle/;
-  const [b, al, cl] = [repo.boards, repo.aliases, repo.claims];
-  const np = (board: string, body: string) => ({ board, author: be, body, parentId: null, now: 900, expiresAt: null, authorId: null, via: null, authorUser: null, human: false });
-  const limits = { file: 1 << 20, total: 1 << 20 };
-  const target = [[fe, { reason: "subscription", wake: true }]] as [string, { reason: "subscription"; wake: boolean }][];
-  for (const h of [kept, {} as Tx]) {
-    const want = h === kept ? settled : stranger;
     await expect(al.humansAmong(h, [fe])).rejects.toThrow(want);
     await expect(cl.ackQueue(h, [fe], "queue:jobs:1", 1)).rejects.toThrow(want);
-    await expect(b.insertPost(h, np("hall", "x"))).rejects.toThrow(want);
-    await expect(b.bindAttachments(h, [1], { addresses: [be], principal: "a@example.com" }, root, limits)).rejects.toThrow(want);
-    await expect(b.authorAddresses(h, be, null)).rejects.toThrow(want);
-    await expect(b.subscribers(h, "hall")).rejects.toThrow(want);
-    await expect(b.threadFacts(h, root)).rejects.toThrow(want);
-    await expect(b.laneRows(h, "jobs", [be])).rejects.toThrow(want);
-    await expect(b.claimQueuePost(h, "jobs", root, fe, 1, { note: "n", push: true })).rejects.toThrow(want);
-    await expect(b.insertOutbox(h, root, target)).rejects.toThrow(want);
   }
-  const count = (sql: string) => db.query<{ n: number }, []>(sql).get()!.n;
-  const before = { posts: count("SELECT count(*) AS n FROM posts"), outbox: count("SELECT count(*) AS n FROM outbox"), claims: count("SELECT count(*) AS n FROM claims") };
-  // Inside a body the writes are seen by its reads, and all of it rolls back.
+  const human = () => db.query<{ human: number | null }, [string]>("SELECT human FROM aliases WHERE address = ?").get(fe)?.human ?? null;
+  const claims = () => db.query<{ n: number }, []>("SELECT count(*) AS n FROM claims").get()!.n;
   await expect(seed(repo, async tx => {
-    const p = await b.insertPost(tx, np("jobs", "build"));
-    expect(await b.laneRows(tx, "jobs", [be])).toEqual([fe]);
-    expect(await b.claimQueuePost(tx, "jobs", p.id, fe, 901, { note: "n", push: true })).toBe(true);
-    await b.insertOutbox(tx, p.id, target);
-    expect(await cl.ackQueue(tx, [fe], `queue:jobs:${p.id}`, 902)).toBe(true);
+    const p = post(repo.coreOn(tx), be, "jobs", "build").post.id;
+    expect(await cl.ackQueue(tx, [fe], `queue:jobs:${p}`, 2)).toBe(true);
+    await al.markHuman(tx, fe, true);
+    expect(await al.isHuman(tx, fe)).toBe(true);
     throw new Error("rolled back");
   })).rejects.toThrow("rolled back");
-  expect({ posts: count("SELECT count(*) AS n FROM posts"), outbox: count("SELECT count(*) AS n FROM outbox"), claims: count("SELECT count(*) AS n FROM claims") }).toEqual(before);
-  // Committed: they land.
-  const landed = await seed(repo, async tx => {
-    const p = await b.insertPost(tx, np("hall", "later"));
-    await b.insertOutbox(tx, p.id, target);
-    return p.id;
-  });
-  expect(db.query<{ handle: string }, [number]>("SELECT handle FROM outbox WHERE post_id = ?").all(landed)).toEqual([{ handle: fe }]);
-  // The row's human mark is what the write said (#1355), not whether the author is human now.
-  expect(db.query<{ human: number | null }, [number]>("SELECT human FROM posts WHERE id = ?").get(landed)).toEqual({ human: 0 });
-  const marked = await seed(repo, async tx => (await b.insertPost(tx, { ...np("hall", "mine"), human: true })).id);
-  expect(db.query<{ human: number | null }, [number]>("SELECT human FROM posts WHERE id = ?").get(marked)).toEqual({ human: 1 });
-  expect(await b.subscribers(repo.read, "hall")).toEqual([{ handle: be, mode: "push" }, { handle: fe, mode: "push" }]);
+  expect(human()).toBeFalsy();
+  expect(claims()).toBe(0);
 });
 
 // #807 P3 B5b1: a team's follow judges the board for the alias before subscribing it, as core's subscribe did: an
@@ -1140,26 +881,23 @@ test("#807 P3 B5b1: a team follow refuses an alias that can't see the team board
   expect(await repo.boards.isSubscribed(repo.read, "b@example.com/be", "crew")).toBe(false);
 });
 
-// #807 P3 B5b3b: the sweep's repo steps (claims.expire, logEvent, takeWatchers, holderUser; boards.redeliveryFacts)
-// run on the handle they're given, and the writes roll back with their body.
+// #807 P3 B5b3b: the sweep's repo steps (claims.expire, logEvent, takeWatchers, holderUser) run on the handle they're
+// given, and the writes roll back with their body. boards.redeliveryFacts' rows are in boards.contract.ts.
 test("#807 P3 B5b3b: the claim sweep's repo reads and writes run on the handle they're given", async () => {
   const { repo, db } = fresh();
   const [be, fe] = ["a@example.com/be", "a@example.com/fe"];
-  let qkey = "";
   const kept = await seed(repo, async tx => {
     await repo.users.upsertByEmail(tx, "a@example.com", null);
     for (const name of ["be", "fe"]) await repo.aliases.create(tx, person("a@example.com", name), "a@example.com");
     const core = repo.coreOn(tx);
     createBoard(core, be, "hall", "tests");
-    createBoard(core, be, "jobs", "work", null, { kind: "queue" });
-    qkey = `queue:jobs:${post(core, be, "jobs", "build").post.id}`;
     claim(core, be, "ticket:1", { board: "hall", ttl_minutes: 5 });
     watch(core, fe, "ticket:1");
     return tx;
   });
   const settled = /used after its transaction settled/;
   const stranger = /not a SQLite store handle/;
-  const [b, cl] = [repo.boards, repo.claims];
+  const cl = repo.claims;
   const row = (await cl.list(repo.read))[0]!;
   const later = row.expires_at + 1;
   for (const h of [kept, {} as Tx]) {
@@ -1168,7 +906,6 @@ test("#807 P3 B5b3b: the claim sweep's repo reads and writes run on the handle t
     await expect(cl.logEvent(h, "expire", be, row, later)).rejects.toThrow(want);
     await expect(cl.takeWatchers(h, "ticket:1")).rejects.toThrow(want);
     await expect(cl.holderUser(h, { ...row, holder_user: null })).rejects.toThrow(want);
-    await expect(b.redeliveryFacts(h, qkey, fe)).rejects.toThrow(want);
   }
   const count = (sql: string) => db.query<{ n: number }, []>(sql).get()!.n;
   const tally = () => ({ claims: count("SELECT count(*) AS n FROM claims"), watches: count("SELECT count(*) AS n FROM claim_watches"), events: count("SELECT count(*) AS n FROM claim_events") });
@@ -1192,9 +929,6 @@ test("#807 P3 B5b3b: the claim sweep's repo reads and writes run on the handle t
     await cl.takeWatchers(tx, "ticket:1");
   });
   expect(tally()).toEqual({ claims: before.claims - 1, watches: before.watches - 1, events: before.events + 1 });
-  const facts = await b.redeliveryFacts(repo.read, qkey, fe);
-  expect(facts && { board: facts.board.name, takers: facts.takers, held: facts.held.has(fe) }).toEqual({ board: "jobs", takers: 1, held: true });
-  expect(await b.redeliveryFacts(repo.read, "ticket:1", fe)).toBeNull();
 });
 
 // #807 P3 B5b3c: the claim tools' repo steps (claims.get, take, release, recentEvents, watchers, liveForWatch, addWatch,

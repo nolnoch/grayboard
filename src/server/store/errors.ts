@@ -1,5 +1,6 @@
 // Store refusals shared by the SQLite store (db.ts) and the Postgres store (store/pg/), so the Postgres store never
 // imports db.ts, which imports bun:sqlite and goes at P5 (#807).
+import { CoreError, notAPostText } from "../../core/errors.ts";
 
 // A revoke that would leave a team with members and no owner, or a service with no owner at all (#270 D1: every
 // service has an owner binding held by a user). `scope` is the team's or service's name.
@@ -23,6 +24,14 @@ export class PrincipalTaken extends Error {
 export class AuthorityLost extends Error {
   constructor() {
     super("the role that allowed this membership change is no longer held");
+  }
+}
+
+// A post insert whose parent_id names no post (#807 P3 C10e-a): pruned after board_post's gate read it (C10e2 P1),
+// or never there. Answered with the gate's own refusal, never as a constraint failure.
+export class MissingPost extends CoreError {
+  constructor(readonly parentId: number, readonly board: string) {
+    super(notAPostText(parentId, board));
   }
 }
 
