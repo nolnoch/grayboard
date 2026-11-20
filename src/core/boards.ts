@@ -3,11 +3,11 @@ import { describeLocation } from "../shared/identity.ts";
 import type { Pending, Post } from "../shared/notifications.ts";
 import { bindAttachments, dropAttachments, withAttachments, type FileSend } from "./attachments.ts";
 import { CoreError, IdCollision, notAPostText } from "./errors.ts";
+import { cleanFact, cleanPlace, oneLine } from "./text.ts";
 import { ackQueueClaim, logEvent } from "./claims.ts";
 import { addressParts, aliasScope, type AliasScope, type ScopeKind } from "./addresses.ts";
 import { writeCoreAudit, type AuditSink } from "./audit.ts";
 import { SESSION_ID_PATTERN } from "./session_id.ts";
-import { SESSION_FACT_MAX } from "../shared/protocol.ts";
 import { undeliverableId } from "./session_end.ts";
 
 // For callers outside the storage seam (src/server/*) that pass the handle through.
@@ -230,6 +230,8 @@ export type IdFacts = {
 
 // The id_collision refusal (#284 decision 2) lives in errors.ts, so a Postgres store can throw it (#807 P3 C10a).
 export { IdCollision, idCollisionText } from "./errors.ts";
+// The text cleaners live in text.ts, so a Postgres store can run them (#807 P3 C10a-b).
+export { cleanFact, cleanPlace, oneLine } from "./text.ts";
 
 /**
  * How long a pruned keyed ID's tombstone lasts (#333): a key re-presented
@@ -271,15 +273,6 @@ export function pruneEndedIds(db: Database, olderThanMs: number, now = Date.now(
   }).immediate();
 }
 
-// A self-reported session fact (harness, model, effort; #284 S12) as stored:
-// one line of at most SESSION_FACT_MAX characters, since peer_list puts it in
-// other agents' prompts. Format characters (\p{Cf}: the bidi controls that
-// could reorder what follows, direction marks, zero-width characters) go
-// first, then the line is folded, then NFC, so match:{model} compares what a
-// reader sees: a hosted client sends it over the network (#364). Empty is none.
-export function cleanFact(v: string | null | undefined): string | null {
-  return v ? oneLine(v.replace(/\p{Cf}/gu, "")).normalize("NFC").slice(0, SESSION_FACT_MAX).trim() || null : null;
-}
 
 /**
  * Set a session's model and effort to the latest it reported (#364): only a
@@ -351,8 +344,6 @@ export function humanHandles(db: Database): string[] {
   return (db.prepare(`SELECT address FROM aliases WHERE human = 1 ORDER BY address`).all() as { address: string }[]).map((r) => r.address);
 }
 
-export const cleanPlace = (place: string | null): string | null => (place === null ? "" : oneLine(place)).slice(0, 200) || null;
-
 // Server mode: where the session runs, as its client described it.
 export function setPlace(db: Database, id: string, place: string | null): void {
   db.prepare(`UPDATE ids SET place = ? WHERE id = ?`).run(cleanPlace(place), id);
@@ -360,17 +351,6 @@ export function setPlace(db: Database, id: string, place: string | null): void {
 
 const MAX_STATUS = 200;
 
-// Bidi marks, embeddings, overrides and isolates (U+061C, U+200E-F,
-// U+202A-E, U+2066-9) and zero-width characters (U+200B, U+2060, U+FEFF):
-// they reorder or hide what a peer reads (#372). ZWJ (U+200D) builds emoji
-// sequences and ZWNJ (U+200C) is orthographic in Persian and Indic text, so
-// both stay; that's why this isn't all of \p{Cf}.
-const INVISIBLE = /[\u061c\u200b\u200e\u200f\u202a-\u202e\u2060\u2066-\u2069\ufeff]/gu;
-
-/** Text as one line: whitespace runs to a space, other control and bidi/zero-width characters dropped, trimmed. */
-export function oneLine(text: string): string {
-  return text.replace(INVISIBLE, "").replace(/\s+/g, " ").replace(/\p{Cc}/gu, "").trim();
-}
 
 // One line saying what the session holding `handle` is doing; empty clears
 // it. Status is the session's (#284), so it goes to the alias's holder: a

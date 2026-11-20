@@ -36,7 +36,7 @@ export type BindingsHarness = {
   // session's columns the reads above don't return; every tombstone by id; an action's access_log rows.
   holdRows(): Promise<{ address: string; id: string; bound_at: number }[]>;
   events(): Promise<{ session_id: string; name: string; event: string; at: number; detail: string | null; count: number | null; last_at: number | null }[]>;
-  aliasRow(address: string): Promise<{ last_seen: number | null; queue_off: boolean; task: string | null; owner: string | null; source_board: string | null; spec_hash: string | null; description: string | null } | undefined>;
+  aliasRow(address: string): Promise<{ last_seen: number | null; queue_off: boolean | null; task: string | null; owner: string | null; source_board: string | null; spec_hash: string | null; description: string | null } | undefined>;
   idColumns(id: string): Promise<{ harness: string | null; cwd: string | null; delivery: string; keyed: boolean; local_resume: boolean; root_id: string | null; harness_session: string | null; started_at: number; last_seen: number } | undefined>;
   tombstones(): Promise<{ id: string; ended_at: number; pruned_at: number }[]>;
   audits(action: string): Promise<unknown[]>;
@@ -207,10 +207,11 @@ function takes(it: It): void {
   it("userOf picks the holder, then the earliest started, then the first registered", async h => {
     const x = await h.alias(B, "x");
     const [cZ, cA, bH] = ["id:000000000000Z", "id:000000000000A", "id:000000000000M"];
-    // Registered Z then A, with one started_at: the first registered wins, whichever ID sorts first.
+    // Registered Z then A, with one started_at: the first registered wins, whichever ID sorts first. A's stamp is
+    // written first, so a store whose rows move on update (Postgres) doesn't keep Z first by physical order alone.
     await register(h, { id: cZ, principal: C, launcher: false, writesAs: x });
     await register(h, { id: cA, principal: C, launcher: false, writesAs: x });
-    for (const id of [cZ, cA]) await h.started(id, 1000);
+    for (const id of [cA, cZ]) await h.started(id, 1000);
     expect(await h.bindings.userOf(h.read, x)).toBe(cZ);
     expect(await h.bindings.userOf(h.read, x, B)).toBe(cZ);
     expect(await h.bindings.userOf(h.read, x, C)).toBeNull();
@@ -409,11 +410,12 @@ function writes(it: It): void {
     expect(await h.write(tx => b.setStatus(tx, s2, "late", 800))).toBe(false);
     expect(await h.write(tx => b.setStatus(tx, s1, "", 900))).toBe(true);
     expect(await b.idStatuses(h.read, [s1, s2])).toEqual(new Map([[s2, { status: "busy", status_at: 400 }]]));
-    // Queue participation: off then on again, on the alias row (touching it at the wall clock).
+    // Queue participation: off then on again, on the alias row (touching it at the wall clock). On again is null, not
+    // false: core's queue-lane reader filters queue_off IS NULL.
     await h.write(tx => b.setQueueParticipation(tx, fe, false));
     expect((await h.aliasRow(fe))?.queue_off).toBe(true);
     await h.write(tx => b.setQueueParticipation(tx, fe, true));
-    expect((await h.aliasRow(fe))?.queue_off).toBe(false);
+    expect((await h.aliasRow(fe))?.queue_off).toBeNull();
     // A settled Tx is refused for each write, which changes nothing.
     const seen = await b.lastSeen(h.read, [fe, s1]);
     const kept = await h.write(async tx => tx);
@@ -422,7 +424,7 @@ function writes(it: It): void {
       () => b.setPlace(kept, s1, "z"), () => b.setStatus(kept, s1, "z", 1), () => b.setQueueParticipation(kept, fe, false),
     ]) expect(await failure(write)).toContain(SETTLED);
     expect(await b.lastSeen(h.read, [fe, s1])).toEqual(seen);
-    expect((await h.aliasRow(fe))?.queue_off).toBe(false);
+    expect((await h.aliasRow(fe))?.queue_off).toBeNull();
     expect(await b.idRow(h.read, s1)).toMatchObject({ place: null });
   });
 }
