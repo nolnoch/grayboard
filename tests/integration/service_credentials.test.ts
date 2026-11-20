@@ -23,7 +23,7 @@ import { hostedRowCount } from "../support/hosted_rows.ts";
 import { ROOT as REPO_ROOT } from "../support/paths.ts";
 import { ServerProcess, TestServer, testSqlite } from "../support/server.ts";
 import { until } from "../support/until.ts";
-import { exec, row, rows as sqlRows } from "../support/repo_sql.ts";
+import { drained, exec, row, rows as sqlRows } from "../support/repo_sql.ts";
 
 const A = "alice@example.com", ROOT = "root@example.com", SVC = "ingest";
 const LIMIT = { burst: 10_000, perSec: 10_000 };
@@ -56,8 +56,10 @@ function everyRow(dbPath: string): string {
   } finally { db.close(); }
 }
 
-// The same over the server's own database, whichever backend it's on.
+// The same over the server's own database, whichever backend it's on, once every queued write (an audit row the
+// request posted, which on Postgres can commit after the response) has landed.
 async function everyRowIn(srv: TestServer): Promise<string> {
+  await drained(srv);
   if (srv.config.store.kind === "sqlite") return everyRow(srv.dbPath);
   const tables = await sqlRows<{ name: string }>(srv, "SELECT tablename AS name FROM pg_tables WHERE schemaname = current_schema()");
   expect(tables.length).toBeGreaterThan(10);
