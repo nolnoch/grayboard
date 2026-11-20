@@ -683,6 +683,35 @@ test("a handle declared human after it wrote: its post and its claim's [release]
   }
 }, 20_000);
 
+test("a DM's human mark is its sender's at send time: one queued before the sender is declared human arrives unmarked (#1364)", async () => {
+  await stop(await start("be"));
+  const fe = await start("fe");
+  const before = await call(fe, "dm_send", { to: "be", body: "selector ready" });
+  await stop(fe);
+  expect((await cli("human", "alex")).code).toBe(0);
+  const alex = await localSession(dir, "alex", { extra: { BUS_HUMAN: "1" } });
+  const own = await call(alex.c, "dm_send", { to: "be", body: "merge it" });
+  const older = await call(alex.c, "dm_send", { to: "be", body: "from before the column" });
+  await stop(alex.c);
+  const db = new Database(join(dir, "bus.db"));
+  const stored = (id: number) => (db.prepare(`SELECT human FROM messages WHERE id = ?`).get(id) as { human: number | null }).human;
+  expect([stored(before.message_id), stored(own.message_id), stored(older.message_id)]).toEqual([0, 1, 1]);
+  // A row from before the column (or an older binary's) bears no mark, even from the declared human.
+  db.exec(`UPDATE messages SET human = NULL WHERE id = ${older.message_id}`);
+  db.close();
+  // Declaring another handle neither marks what it sent before nor unmarks the human's own words.
+  expect((await cli("human", "fe")).code).toBe(0);
+
+  const again = await session("be");
+  const pushOf = (id: number) => again.pushes.find((p) => p.meta.message_id === String(id));
+  await until(() => [before, own, older].every((m) => pushOf(m.message_id) !== undefined), 10_000, "the three DMs to push to be");
+  expect(pushOf(before.message_id)!.meta).toMatchObject({ from: "fe" });
+  expect(pushOf(before.message_id)!.meta.human).toBeUndefined();
+  expect(pushOf(own.message_id)!.meta).toMatchObject({ from: "alex", human: "true" });
+  expect(pushOf(older.message_id)!.meta).toMatchObject({ from: "alex" });
+  expect(pushOf(older.message_id)!.meta.human).toBeUndefined();
+}, 20_000);
+
 test("attachments: sent with a DM or post, shown on reads and pushes, fetched by readers only", async () => {
   const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 7, 7]);
   writeFileSync(join(dir, "shot.png"), png);

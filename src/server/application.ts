@@ -1706,7 +1706,10 @@ async function writeSend(hub: Hub, tx: Tx, session: ApplicationSession, p: Prepa
       const why = await repo.sessionEnd.refusal(tx, p.to);
       if (why) throw why;
     }
-    msg = await repo.messages.insert(tx, p.from, "user", p.to, p.body, p.parentId, p.pending, { ids: p.ids, uploader: uploaderOf(session) }, session.writerId ?? null, session.via ?? null, session.authed.user_email);
+    // Every send is its sender's own words (dm_send, delegate): the row records whether the sender bears the human
+    // mark now, in the write's transaction (#1364), as a post's does (#1355).
+    const human = await repo.aliases.isHuman(tx, p.from);
+    msg = await repo.messages.insert(tx, p.from, "user", p.to, p.body, p.parentId, p.pending, { ids: p.ids, uploader: uploaderOf(session) }, session.writerId ?? null, session.via ?? null, session.authed.user_email, human);
   } catch (e) {
     if (e instanceof CoreError) throw coreRefusal(e);
     // The parent went (a retract or a prune) after prepareSend's check: the refusal that check gives.

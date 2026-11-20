@@ -47,8 +47,9 @@ test("unread mail to an ended ID bounces to its senders; nothing else does", () 
   const r = end(db);
   expect(r).toEqual({ ended: true, held: ["fe"], wake: ["be"] });
   expect(JSON.parse((db.prepare(`SELECT detail FROM audit_log WHERE action = 'id.ended'`).get() as { detail: string }).detail)).toMatchObject({ bounced: 1, unbounced: 1 });
-  expect(db.prepare(`SELECT sender, sender_id, recipient, parent_id, kind, body FROM messages WHERE kind IS NOT NULL`).all()).toEqual([
-    { sender: ID, sender_id: ID, recipient: "be", parent_id: unread, kind: "bounce", body: `\`${ID}\` ended at 1970-01-01T00:00:10.000Z before reading this; it held \`fe\`.` },
+  // A bounce is a system DM: it never bears the human mark (#1364).
+  expect(db.prepare(`SELECT sender, sender_id, recipient, parent_id, kind, body, human FROM messages WHERE kind IS NOT NULL`).all()).toEqual([
+    { sender: ID, sender_id: ID, recipient: "be", parent_id: unread, kind: "bounce", body: `\`${ID}\` ended at 1970-01-01T00:00:10.000Z before reading this; it held \`fe\`.`, human: 0 },
   ]);
 });
 

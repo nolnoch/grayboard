@@ -13,7 +13,7 @@ import type { Post } from "../shared/notifications.ts";
 import { ackQueueClaim, addClaimWatch, claimRow, claimWatchers, expireClaims, holderUser, listClaims, liveClaim, logEvent, recentClaimEvents, releaseClaim, removeClaimWatch, takeClaim, takeClaimWatchers } from "../core/claims.ts";
 import { addressSet, aliasUser, aliasUses, dropHold, holderOf, holdsOf, idRow, idStatuses, logBinding, unendedIds } from "../core/bindings.ts";
 import type { AuditAction } from "./audit.ts";
-import { bindAttachments, blobNamed, dropAttachments, dropBlobEntry, dropUnsentUploads, getAttachment, insertUpload, pruneUnbound, removeUpload, unnamedBlobs, uploadDigests, withAttachments, type AttachmentRow, type BlobStore, type NewUpload, type Uploader } from "../core/attachments.ts";
+import { bindAttachments, blobNamed, dropAttachments, dropBlobEntry, dropUnsentUploads, getAttachment, insertUpload, pruneUnbound, removeUpload, unnamedBlobs, uploadDigests, withAttachments, type BlobStore, type Uploader } from "../core/attachments.ts";
 import { addressParts } from "../core/addresses.ts";
 import { HUMAN_NAME } from "../shared/addressing.ts";
 import type { Principal } from "../core/resolver.ts";
@@ -40,6 +40,7 @@ import { accessFits, accessLookup, BROWSER_SESSIONS, browserData, browserSession
 import { AuthorityLost, LastOwner, MissingParent, PrincipalTaken } from "./store/errors.ts";
 import type { Alias, AliasesStore } from "./store/aliases.ts";
 import type { MessageRow, MessagesStore, RetractResult } from "./store/messages.ts";
+import type { AttachmentsStore } from "./store/attachments.ts";
 import type { BindingsStore } from "./store/bindings.ts";
 import type { ClaimsStore } from "./store/claims.ts";
 import type { CursorsStore } from "./store/cursors.ts";
@@ -55,6 +56,7 @@ export type { User, IdpSignIn, Session, PrincipalRow, Team, TeamPolicy, TeamRole
 // The aliases and messages groups' row types and interfaces live in store/aliases.ts and store/messages.ts (#807 P3 C5a).
 export type { Alias, AliasTarget, AliasesStore, AliasScopeRow } from "./store/aliases.ts";
 export type { MessageRow, MessageFiles, ServicePost, RetractResult, MessagesStore } from "./store/messages.ts";
+export type { AttachmentsStore } from "./store/attachments.ts";
 // The bindings group's in store/bindings.ts (#807 P3 C10a-a).
 export type { AliasMetaDiff, BindingsStore } from "./store/bindings.ts";
 export type { ClaimsStore } from "./store/claims.ts";
@@ -256,25 +258,8 @@ export interface Repo {
   aliases: AliasesStore;
   // Holds, session rows and presence (store/bindings.ts).
   bindings: BindingsStore;
-  // Uploads and the blob catalog (#807 P3 B3), on the caller's handle. Messages' attachments stay inside the messages
-  // store; posts' go with the board writes (B5b). The flows over these (store, release, sweep) are in attachments.ts.
-  attachments: {
-    get(r: Read, id: number): Promise<AttachmentRow | undefined>;
-    // The blob digests of `from`'s unsent uploads `ids`, in call order; rejects with CoreError on an id that isn't one.
-    unsentDigests(r: Read, ids: number[], from: Uploader): Promise<string[]>;
-    // Deletes `from`'s unsent uploads among `ids`, returning them.
-    dropUnsent(tx: Tx, ids: number[], from: Uploader): Promise<AttachmentRow[]>;
-    // Deletes the uploads left unbound since before `olderThanMs`; returns how many.
-    pruneUnbound(tx: Tx, olderThanMs: number): Promise<number>;
-    // Prunes, checks the quota (rejects with TooLargeError), and inserts the catalog entry and the row (core
-    // insertUpload). On Postgres the quota check holds the principal's lock (D3).
-    insertUpload(tx: Tx, upload: NewUpload): Promise<{ row: AttachmentRow; pruned: boolean }>;
-    remove(tx: Tx, id: number): Promise<void>;
-    // The catalog's blobs no attachment names; whether one is named; its entry dropped while unnamed (0 or 1).
-    unnamedBlobs(r: Read): Promise<string[]>;
-    named(r: Read, sha256: string): Promise<boolean>;
-    dropBlobEntry(tx: Tx, sha256: string): Promise<number>;
-  };
+  // Uploads and the blob catalog (store/attachments.ts).
+  attachments: AttachmentsStore;
   // Claims, their watches and events (store/claims.ts).
   claims: ClaimsStore;
   // Board reads and the delivery acknowledgement (#807 P3 B5a1), on the caller's handle. Visibility is the caller's
@@ -809,6 +794,10 @@ function initSchema(db: Database): void {
   // sender_user: the writer's signed-in user (security audit F-10), so a
   // recipient of another user can be told so; null before it and for bounces.
   if (!msgCols.some((c) => c.name === "sender_user")) db.exec(`ALTER TABLE messages ADD COLUMN sender_user TEXT`);
+  // human: whether the DM bears the human mark (#1364), judged when it's written: 1 when its sender bore the human
+  // mark then (writeSend), 0 for every other DM (a bounce among them); null before it. Never shown on reads (MSG_COLS).
+  // Hosted delivery reads no column: adapters mark by the reserved `<email>/human` sender (own-human.ts).
+  if (!msgCols.some((c) => c.name === "human")) db.exec(`ALTER TABLE messages ADD COLUMN human INTEGER`);
   // role: 'owner' or 'member' (security audit F-02); null on rows from
   // before it. Read once, by the #927 seed (seedSchema); role_bindings holds
   // ownership since, and nothing reads or writes this column.
@@ -1640,15 +1629,15 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
     },
 
     messages: {
-      async insert(tx, sender, recipientType, recipient, body, parentId, pending = false, files, senderId = null, via = null, senderUser = null) {
+      async insert(tx, sender, recipientType, recipient, body, parentId, pending = false, files, senderId = null, via = null, senderUser = null, human = false) {
         const db = sqliteOf(tx);
         return db.transaction(() => {
           // Before the insert, as Postgres's classified foreign-key failure refuses it (#807 P3 C5 decision 5).
           if (parentId !== null && !db.query<{ id: number }, [number]>("SELECT id FROM messages WHERE id = ?").get(parentId)) throw new MissingParent(parentId);
-          const row = db.query<MessageRow, [string, string | null, string, string, string, number | null, number, number, string | null, string | null]>(
-            `INSERT INTO messages (sender, sender_id, recipient_type, recipient, body, parent_id, created_at, pending, via, sender_user)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING ${MSG_COLS}`,
-          ).get(sender, senderId, recipientType, recipient, body, parentId, clock(), pending ? 1 : 0, via, senderUser)!;
+          const row = db.query<MessageRow, [string, string | null, string, string, string, number | null, number, number, string | null, string | null, number]>(
+            `INSERT INTO messages (sender, sender_id, recipient_type, recipient, body, parent_id, created_at, pending, via, sender_user, human)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING ${MSG_COLS}`,
+          ).get(sender, senderId, recipientType, recipient, body, parentId, clock(), pending ? 1 : 0, via, senderUser, human ? 1 : 0)!;
           const attachments = files ? bindAttachments(db, files.ids, files.uploader, { message_id: row.id }, attachmentLimits) : [];
           return attachments.length ? { ...row, attachments } : row;
         })();
@@ -2480,8 +2469,9 @@ export function mailPort(db: Database): MailPort {
     },
     bounce(from, to, parentId, body, now) {
       db.query(
-        `INSERT INTO messages (sender, sender_id, recipient_type, recipient, body, parent_id, created_at, pending, kind)
-         VALUES (?1, ?1, 'user', ?2, ?3, ?4, ?5, 0, 'bounce')`,
+        // A system DM: never the human mark (#1364).
+        `INSERT INTO messages (sender, sender_id, recipient_type, recipient, body, parent_id, created_at, pending, kind, human)
+         VALUES (?1, ?1, 'user', ?2, ?3, ?4, ?5, 0, 'bounce', 0)`,
       ).run(from, to, body, parentId, now);
     },
     dropReader(id) {

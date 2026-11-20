@@ -141,6 +141,10 @@ function initLocalSchema(db: Database): void {
   // via: the child session (a harness subagent, #523) that wrote it, acting
   // under its root's addresses; null for a root's own message.
   if (!msgCols.some((c) => c.name === "via")) db.exec(`ALTER TABLE messages ADD COLUMN via TEXT`);
+  // human: whether the DM bears the human mark (#1364), judged when it's written: 1 when its sender was the declared
+  // human then (a dm_send or delegate, the sender's own words), 0 for every other DM (a bounce among them); null for
+  // DMs from before it, and from a process still running an older binary, which bear no mark (dmHuman, db.ts).
+  if (!msgCols.some((c) => c.name === "human")) db.exec(`ALTER TABLE messages ADD COLUMN human INTEGER`);
   // The attachment model (#284 PR 2, S2). For a keyed session (BUS_SESSION_KEY)
   // pid + proc_start are its harness's, whose exit ends the session, and
   // attached_pid + attached_start are the grayboard mcp child serving it (null
