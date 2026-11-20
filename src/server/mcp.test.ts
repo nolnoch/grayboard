@@ -1824,7 +1824,8 @@ async function teamFixture() {
     return t;
   });
   const remove = () => seed(store.repo, tx => store.repo.teams.removeMember(tx, team.id, grant.authed.user_id));
-  return { ...clock, grant, bob, remove };
+  const readd = () => seed(store.repo, tx => store.repo.teams.addMember(tx, team.id, grant.authed.user_id));
+  return { ...clock, grant, bob, remove, readd };
 }
 const boardChecked = "mcp:board:checked";
 
@@ -1922,5 +1923,89 @@ for (const stop of ["the stream tick", "the watch's close", "the stream tick (pr
   await untilHosted(() => hosted.activeGetStreams === 1);
   expect(hosted.activeWatches).toBe(1);
   second.abort(); await again.body?.cancel().catch(() => {});
+  await raw.delete();
+});
+
+// #1216: forcing tests for B5a2's board-check windows.
+// `authorizeFor` reads a legacy GET's registrations after its awaits: a subscribe that lands while the GET's board
+// read holds adds a board that read missed, so the GET reads again rather than refusing it.
+test("#1216: a board a legacy subscribe registers while a GET's board read holds is read again, and the GET opens with it", async () => {
+  await teamFixture();
+  const raw = await rawLegacySession(token, meta);
+  for (const name of ["first", "second"]) expect((await raw.post("tools/call", { name: "board_create", arguments: { name, purpose: "#1216" }, _meta: meta })).text).not.toContain("isError\":true");
+  expect((await raw.post("resources/subscribe", { uri: "grayboard://boards/first", _meta: meta })).text).not.toContain("\"error\"");
+  const abort = new AbortController();
+  const { value: get } = await held("mcp:authorize:facts", () => raw.get(abort.signal), async () => {
+    // The GET's read covered `first` alone. The subscribe's own checks pass through the same point: unpaused.
+    delete process.env.BUS_TEST_PAUSE;
+    expect((await raw.post("resources/subscribe", { uri: "grayboard://boards/second", _meta: meta })).text).not.toContain("\"error\"");
+  });
+  // Read once, the GET would judge `second` unread and refuse it.
+  expect(get.status).toBe(200);
+  await untilHosted(() => hosted.activeGetStreams === 1 && hosted.activeWatches === 2);
+  abort.abort(); await get.body?.cancel().catch(() => {});
+  await raw.delete();
+});
+
+// A stopped stream's prune judged its boards before a subscribe that lands after the board came back: the subscribe
+// waits out the prune, so the prune can't delete the registration it makes.
+test("#1216: a subscribe after a lost board comes back, while the stopped stream's prune holds, survives the prune", async () => {
+  const f = await teamFixture();
+  const raw = await rawLegacySession(token, meta);
+  for (const args of [{ name: "open" }, { name: "private", team: "private" }]) expect((await raw.post("tools/call", { name: "board_create", arguments: { ...args, purpose: "#1216" }, _meta: meta })).text).not.toContain("isError\":true");
+  for (const uri of ["grayboard://boards/private", "grayboard://boards/open"]) expect((await raw.post("resources/subscribe", { uri, _meta: meta })).text).not.toContain("\"error\"");
+  const first = new AbortController();
+  const get = await raw.get(first.signal);
+  expect(get.status).toBe(200);
+  await untilHosted(() => hosted.activeGetStreams === 1 && hosted.activeWatches === 2);
+  await f.tickStream(); await f.tickStream();
+  await f.remove();
+  const subscribed = Promise.withResolvers<string>();
+  subscribed.promise.catch(() => {});
+  const second = new AbortController();
+  // `start` settles with the subscribe and then the next GET, which waits out the prune: the pause (in the prune,
+  // which no caller awaits) stays until the prune has run, whether or not the subscribe waited for it.
+  const { value: reopened } = await held("mcp:legacy:pruned", () => f.tickStream().then(() => subscribed.promise).then(() => raw.get(second.signal)), async () => {
+    // The prune read `private` as lost; alice rejoins the team and subscribes to it again.
+    await untilHosted(() => hosted.activeGetStreams === 0);
+    first.abort(); await get.body?.cancel().catch(() => {});
+    await f.readd();
+    const again = raw.post("resources/subscribe", { uri: "grayboard://boards/private", _meta: meta }).then(r => r.text);
+    again.then(subscribed.resolve, subscribed.reject);
+    // The pause forces the overlap; this window only gives a subscribe that didn't wait the time to register.
+    expect(await Promise.race([again.then(() => "answered", () => "answered"), Bun.sleep(200).then(() => "waiting")])).toBe("waiting");
+  });
+  expect(await subscribed.promise).not.toContain("\"error\"");
+  // The next GET carries both registrations.
+  expect(reopened.status).toBe(200);
+  await untilHosted(() => hosted.activeGetStreams === 1 && hosted.activeWatches === 2);
+  second.abort(); await reopened.body?.cancel().catch(() => {});
+  await raw.delete();
+});
+
+// `checkBoards` judges each uri whose board it read: a subscribe adding an unread board while the check holds leaves
+// the read ones judged, so a team removal the read saw stops the stream on that tick.
+test("#1216: a team removal stops a legacy stream on the tick whose board check a subscribe to another board overlaps", async () => {
+  const f = await teamFixture();
+  const raw = await rawLegacySession(token, meta);
+  for (const args of [{ name: "open" }, { name: "private", team: "private" }]) expect((await raw.post("tools/call", { name: "board_create", arguments: { ...args, purpose: "#1216" }, _meta: meta })).text).not.toContain("isError\":true");
+  expect((await raw.post("resources/subscribe", { uri: "grayboard://boards/private", _meta: meta })).text).not.toContain("\"error\"");
+  const abort = new AbortController();
+  const get = await raw.get(abort.signal);
+  expect(get.status).toBe(200);
+  await untilHosted(() => hosted.activeGetStreams === 1 && hosted.activeWatches === 1);
+  await f.tickStream(); await f.tickStream();
+  // Committed before the tick's read, which sees `private` lost; `open` joins the stream while the check holds.
+  await f.remove();
+  const { failures } = await held(boardChecked, f.tickStream, async () => {
+    expect((await raw.post("resources/subscribe", { uri: "grayboard://boards/open", _meta: meta })).text).not.toContain("\"error\"");
+    expect(hosted.activeWatches).toBe(2);
+  });
+  // Skipping the whole judgement once the uri set changed would leave the stream to the next tick.
+  expect(hosted.activeGetStreams).toBe(0);
+  await store.repo.write(() => {});
+  expect(streamClosedReasons()).toEqual(["not_found"]);
+  expect(failures()).toEqual([]);
+  abort.abort(); await get.body?.cancel().catch(() => {});
   await raw.delete();
 });
