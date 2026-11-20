@@ -428,7 +428,8 @@ CREATE TABLE posts (
   expires_at  int8,
   author_id   text COLLATE "C",
   via         text COLLATE "C",
-  author_user text COLLATE "C"
+  author_user text COLLATE "C",
+  human       boolean
 );
 CREATE INDEX idx_posts_board_id ON posts (board, id);
 CREATE INDEX idx_posts_parent ON posts (parent_id);

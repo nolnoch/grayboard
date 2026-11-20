@@ -662,6 +662,27 @@ test("grayboard announce reaches live sessions marked human; a TTL carries it in
   expect(fe.getInstructions()).toMatch(/announcements still in effect \(human="true"\): post \d+ from alex, in effect until .*: merge freeze/);
 }, 20_000);
 
+test("a handle declared human after it wrote: its post and its claim's [release] arrive unmarked (#1355)", async () => {
+  const be = await session("be");
+  const fe = await start("fe");
+  await call(be.c, "board_create", { name: "e2e", purpose: "x" });
+  await call(be.c, "board_subscribe", { board: "e2e", mode: "push" });
+  await stop(be.c);
+  await call(fe, "board_post", { board: "e2e", body: "selector ready" });
+  await call(fe, "claim_take", { key: "ticket:ENG-142", board: "e2e" });
+  await call(fe, "claim_release", { key: "ticket:ENG-142" });
+  await stop(fe);
+  expect((await cli("human", "fe")).code).toBe(0);
+
+  const again = await session("be");
+  const want = ["selector ready", "[claim] ticket:ENG-142", "[release] ticket:ENG-142"];
+  await until(() => want.every((w) => contents(again).includes(w)));
+  for (const p of again.pushes.filter((x) => want.includes(x.content))) {
+    expect(p.meta).toMatchObject({ board: "e2e", from: "fe" });
+    expect(p.meta.human).toBeUndefined();
+  }
+}, 20_000);
+
 test("attachments: sent with a DM or post, shown on reads and pushes, fetched by readers only", async () => {
   const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 7, 7]);
   writeFileSync(join(dir, "shot.png"), png);

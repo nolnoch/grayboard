@@ -311,6 +311,10 @@ export function initCoreSchema(db: Database): void {
   // of another user can be told so; null locally, for posts from before it,
   // and for system posts. Never shown on reads (POST_COLS).
   if (!postCols.some((c) => c.name === "author_user")) db.exec(`ALTER TABLE posts ADD COLUMN author_user TEXT`);
+  // Whether the post bears the human mark (#1355): 1 for a declared human's own words, judged when it's written, 0
+  // for every other post (a system post written as a human's handle among them); null for posts from before it, which
+  // fall back to whether the author is the declared human at delivery (postHuman). Never shown on reads (POST_COLS).
+  if (!postCols.some((c) => c.name === "human")) db.exec(`ALTER TABLE posts ADD COLUMN human INTEGER`);
 
   // The principal an upload counts against (#284 decision 13): a server
   // user's email, null in local mode. Backfilled from the uploader's "email/"

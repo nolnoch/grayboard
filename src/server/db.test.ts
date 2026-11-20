@@ -1073,7 +1073,7 @@ test("#807 P3 B5b2b: board_post's repo reads and writes run on the handle they'r
   const settled = /used after its transaction settled/;
   const stranger = /not a SQLite store handle/;
   const [b, al, cl] = [repo.boards, repo.aliases, repo.claims];
-  const np = (board: string, body: string) => ({ board, author: be, body, parentId: null, now: 900, expiresAt: null, authorId: null, via: null, authorUser: null });
+  const np = (board: string, body: string) => ({ board, author: be, body, parentId: null, now: 900, expiresAt: null, authorId: null, via: null, authorUser: null, human: false });
   const limits = { file: 1 << 20, total: 1 << 20 };
   const target = [[fe, { reason: "subscription", wake: true }]] as [string, { reason: "subscription"; wake: boolean }][];
   for (const h of [kept, {} as Tx]) {
@@ -1108,6 +1108,10 @@ test("#807 P3 B5b2b: board_post's repo reads and writes run on the handle they'r
     return p.id;
   });
   expect(db.query<{ handle: string }, [number]>("SELECT handle FROM outbox WHERE post_id = ?").all(landed)).toEqual([{ handle: fe }]);
+  // The row's human mark is what the write said (#1355), not whether the author is human now.
+  expect(db.query<{ human: number | null }, [number]>("SELECT human FROM posts WHERE id = ?").get(landed)).toEqual({ human: 0 });
+  const marked = await seed(repo, async tx => (await b.insertPost(tx, { ...np("hall", "mine"), human: true })).id);
+  expect(db.query<{ human: number | null }, [number]>("SELECT human FROM posts WHERE id = ?").get(marked)).toEqual({ human: 1 });
   expect(await b.subscribers(repo.read, "hall")).toEqual([{ handle: be, mode: "push" }, { handle: fe, mode: "push" }]);
 });
 
