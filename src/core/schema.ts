@@ -336,6 +336,12 @@ export function initCoreSchema(db: Database): void {
   // next push that does (0): a thread reply to a bystander.
   const outboxCols = db.prepare(`PRAGMA table_info(outbox)`).all() as { name: string }[];
   if (!outboxCols.some((c) => c.name === "wake")) db.exec(`ALTER TABLE outbox ADD COLUMN wake INTEGER NOT NULL DEFAULT 1`);
+  // The session holding the row's handle when the push was written (#1370), by claim_events.session_id's rule (#1351):
+  // the alias's holder, else the handle when it is a session ID; null for an alias no session held, and for rows from
+  // before it. A queue lane's push history follows it while that session is live (queueLaneRowsSql). The index after
+  // the ALTER, as claim_events'.
+  if (!outboxCols.some((c) => c.name === "session_id")) db.exec(`ALTER TABLE outbox ADD COLUMN session_id TEXT`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_outbox_session ON outbox(session_id, post_id) WHERE session_id IS NOT NULL`);
 
   // A refused binding event's repeats (#210): NULL count means 1, NULL
   // last_at means at.

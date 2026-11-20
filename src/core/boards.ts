@@ -830,10 +830,10 @@ export type PostOpts = {
 // (never-woken first, then by handle). A lane was last woken at its latest
 // queue take on the board (a delivery or redelivery, #221: an old post's
 // redelivery counts when it was handed over, not when it was written), or at
-// the newest board post in its outbox (a mention or a thread reply), whichever is later. A take counts for the lane of
-// the session that made it while that session is live (#1351); any other take, and every push (an outbox row has no
-// session), counts under any address of its session now (its ID or an alias it holds, #1174: a take as its ID before
-// it bound counts). A lane is a push subscriber who isn't
+// the newest board post in its outbox (a mention or a thread reply), whichever is later. A take or push counts for the
+// lane of the session it went to while that session is live (#1351, #1370); any other counts under any address of its
+// session now (its ID or an alias it holds, #1174: a take as its ID before it bound counts). A lane is a push
+// subscriber who isn't
 // one of the poster's addresses (its address set: a session's own lane never
 // takes its own post, whichever alias it posted as), hasn't opted out (peer_status queue:"off"), isn't a
 // declared human (#1175: a human isn't a work lane, so no queue claim, and no system text written as its holder,
@@ -885,11 +885,20 @@ export function laneSessionSql(h: string): string {
 }
 
 /**
- * SQL that is true when `sid` (an SQL expression) names a live session (#1351). A claim_events row whose session_id
- * passes is session-keyed: it belongs to that session whatever its handle names now. NULL, or a session that has
- * ended (a restart mints a new ID and rebinds the name), makes the row address-keyed: it maps through who holds its
- * handle now (laneSessionSql), so a name's successor inherits its history and a restart can't re-open #220's
- * ping-pong.
+ * SQL for the session holding address `h` (an SQL expression) as a row is written (#1351, #1370): the alias's holder,
+ * else `h` when it is a session ID (live or ended), else NULL (an alias no session holds). claim_events.session_id
+ * (logEvent) and outbox.session_id record it, so a take or push can follow its session across an alias move.
+ */
+export function holdingSessionSql(h: string): string {
+  return `COALESCE((SELECT id FROM alias_holds WHERE address = ${h}), (SELECT id FROM ids WHERE id = ${h}))`;
+}
+
+/**
+ * SQL that is true when `sid` (an SQL expression) names a live session (#1351). A claim_events or outbox (#1370) row
+ * whose session_id passes is session-keyed: it belongs to that session whatever its handle names now. NULL, or a
+ * session that has ended (a restart mints a new ID and rebinds the name), makes the row address-keyed: it maps through
+ * who holds its handle now (laneSessionSql), so a name's successor inherits its history and a restart can't re-open
+ * #220's ping-pong.
  */
 function liveSessionSql(sid: string): string {
   return `EXISTS (SELECT 1 FROM ids x WHERE x.id = ${sid} AND x.ended_at IS NULL)`;
@@ -911,14 +920,15 @@ export function queueLaneRows(db: Database, board: string, poster: string[]): st
 /**
  * queueLaneRows' query (?1 board, ?2 JSON array of poster handles), exported for its plan test. A lane's takes are two
  * subqueries, never one OR (#1351): `es`, its session's session-keyed takes by idx_claim_events_take_sid (board,
- * session_id), and `e`, the address-keyed takes under its addresses now by idx_claim_events_take (board, handle). The
- * outbox half (`o2`) is address-mapped only: an outbox row records no session (#1370). It runs inside every
+ * session_id), and `e`, the address-keyed takes under its addresses now by idx_claim_events_take (board, handle). Its
+ * pushes split the same way (#1370): `os`, its session's session-keyed outbox rows by idx_outbox_session (session_id),
+ * and `o2`, the address-keyed ones under its addresses now by the outbox key (handle). It runs inside every
  * queue post's and requeue's write transaction, so its plan must stay indexed as history grows (#1174 audit H1); two
  * planner pins keep it there, with or without ANALYZE stats:
  * - `+e.key`, `+es.key`: the unary plus keeps idx_claim_events_key out. With stats the planner otherwise ranges that
  *   index on the GLOB prefix and reads every queue take on every board per lane, instead of the take indexes.
- * - `outbox o2 CROSS JOIN posts p2`: pins outbox as the outer loop, searched by handle. Without stats the planner
- *   otherwise drives from every post on the board and probes outbox per post.
+ * - `outbox o2 CROSS JOIN posts p2` (and `os`, `ps`): pins outbox as the outer loop, searched by handle or session.
+ *   Without stats the planner otherwise drives from every post on the board and probes outbox per post.
  */
 export function queueLaneRowsSql(): string {
   return `WITH lanes AS (
@@ -937,8 +947,12 @@ export function queueLaneRowsSql(): string {
              COALESCE((SELECT MAX(e.at) FROM claim_events e
                        WHERE e.board = ?1 AND e.handle IN ${laneAddressesSql("l.lane")} AND e.event = 'take' AND +e.key GLOB 'queue:*'
                          AND NOT ${liveSessionSql("e.session_id")}), 0),
+             COALESCE((SELECT MAX(ps.created_at) FROM outbox os CROSS JOIN posts ps ON ps.id = os.post_id
+                       WHERE os.session_id = ${laneSessionSql("l.lane")} AND ps.board = ?1
+                         AND ${liveSessionSql("os.session_id")}), 0),
              COALESCE((SELECT MAX(p2.created_at) FROM outbox o2 CROSS JOIN posts p2 ON p2.id = o2.post_id
-                       WHERE o2.handle IN ${laneAddressesSql("l.lane")} AND p2.board = ?1), 0)), 0) ASC NULLS FIRST, l.lane ASC`;
+                       WHERE o2.handle IN ${laneAddressesSql("l.lane")} AND p2.board = ?1
+                         AND NOT ${liveSessionSql("o2.session_id")}), 0)), 0) ASC NULLS FIRST, l.lane ASC`;
 }
 
 // The claim IS the delivery: the picked lane holds the post until it acks (a
@@ -966,11 +980,12 @@ export function claimQueuePost(
     .run(key, lane, note, board, now, expires);
   // Redelivery to a lane that already had this post resets its push, so the
   // re-offer actually reaches it (at-least-once): when this run took the key,
-  // or the lane already holds it.
+  // or the lane already holds it. A reset re-records the receiving session (#1370): the re-offer is a push to whoever
+  // holds the lane now.
   if (push) db.prepare(
-    `INSERT INTO outbox (handle, post_id, reason, wake)
-     SELECT ?1, ?2, 'subscription', 1 WHERE EXISTS (SELECT 1 FROM claims WHERE key = ?3 AND holder = ?1)
-     ON CONFLICT(handle, post_id) DO UPDATE SET delivered_at = NULL, wake = 1`,
+    `INSERT INTO outbox (handle, post_id, reason, wake, session_id)
+     SELECT ?1, ?2, 'subscription', 1, ${holdingSessionSql("?1")} WHERE EXISTS (SELECT 1 FROM claims WHERE key = ?3 AND holder = ?1)
+     ON CONFLICT(handle, post_id) DO UPDATE SET delivered_at = NULL, wake = 1, session_id = excluded.session_id`,
   ).run(lane, postId, key);
   // The claim is the idempotency token: when a row already holds the key,
   // this run isn't the lane's delivery and must not read as one in the
@@ -1458,10 +1473,11 @@ export function threadFacts(db: Database, parentId: number): ThreadFacts {
   };
 }
 
-/** A plan's outbox rows, in its order; a row already there stays as it is. */
+/** A plan's outbox rows, in its order; a row already there stays as it is. Each records its handle's session (#1370):
+ * any board push counts toward a queue lane's rotation place, a mention or thread reply as much as a delivery. */
 export function insertOutbox(db: Database, postId: number, targets: [string, PostTarget][]): void {
   const ins = db.prepare(
-    `INSERT INTO outbox (handle, post_id, reason, wake) VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING`,
+    `INSERT INTO outbox (handle, post_id, reason, wake, session_id) VALUES (?1, ?2, ?3, ?4, ${holdingSessionSql("?1")}) ON CONFLICT DO NOTHING`,
   );
   for (const [h, t] of targets) ins.run(h, postId, t.reason, t.wake ? 1 : 0);
 }
