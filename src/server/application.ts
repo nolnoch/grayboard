@@ -693,7 +693,8 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
   // on the pool (#807 P3 B2).
   const claimTimer = expiryTimer({
     next: () => repo.claims.nextExpiry(repo.read),
-    sweep: () => repo.write(tx => sweepClaims(repo, hub.access, tx, Date.now())),
+    sweep: () => repo.write(tx => sweepClaims(repo, hub.access, tx, repo.now())),
+    now: () => repo.now(),
   }, handles => wake(hub, expiryCommit, handles), boards => boardsChanged(expiryCommit, boards));
   const expiry = { arm: () => detached(() => claimTimer.arm()), stop: () => claimTimer.stop() };
   // The session leaves the hub's registry: superseded, revoked or closed.

@@ -9,8 +9,9 @@ import type { HumanReach } from "../../src/server/policy.ts";
 import { endSessionServer } from "../../src/server/session_end.ts";
 import type { Tx } from "../../src/server/store/tx.ts";
 
-export function endId(repo: Repo, tx: Tx, id: string, why: string, humanReach: HumanReach = "team"): Promise<EndedSession> {
+// `now`: the end's clock reading, the Repo's by default.
+export function endId(repo: Repo, tx: Tx, id: string, why: string, humanReach: HumanReach = "team", now = repo.now()): Promise<EndedSession> {
   return endSessionServer(repo, boardAccess(repo, humanReach), tx, id, {
-    why, now: Date.now(), audit: async (action, actor, target, detail) => writeAudit(repo, tx, action, actor, target, detail),
+    why, now, audit: async (action, actor, target, detail) => writeAudit(repo, tx, action, actor, target, detail),
   });
 }

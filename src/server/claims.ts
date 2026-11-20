@@ -22,7 +22,8 @@ import type { Read, Tx } from "./store/tx.ts";
  * claimant's user (endReach, #1286) are the system's: no hook.
  */
 export type Announced = (sp: Tx, as: string, board: string, postId: number) => Promise<void>;
-type ServerClaimCtx = ClaimCtx & { announced?: Announced };
+// `now`: the caller's clock reading, when its transaction already took one (a session end); else the Repo's.
+type ServerClaimCtx = ClaimCtx & { announced?: Announced; now?: number };
 
 /**
  * core sweepChanges on `tx`: delete the claims lapsed at `now` and, per claim in lapse order, log its expiry, then
@@ -161,7 +162,7 @@ async function holderHidden(repo: Repo, access: BoardAccess, r: Read, seer: stri
 export async function serverClaim(
   repo: Repo, access: BoardAccess, tx: Tx, handle: string, keyInput: string, opts: TakeOpts & ServerClaimCtx = {},
 ): Promise<ClaimResult> {
-  const { key, board } = checkTake(keyInput, opts);
+  const { key, board } = checkTake(keyInput, opts, opts.now ?? repo.now());
   const addresses = opts.addresses ?? [handle];
   // The acting ID's row first, under the lock a session end waits for (E4, bindings.lockLive; session_end.ts's lock
   // order: ids before claims): a take racing the ID's end lands before it (and the end releases it) or refuses after.
@@ -170,7 +171,7 @@ export async function serverClaim(
   return tx.savepoint(async (sp): Promise<ClaimResult> => {
     // A board that doesn't exist, or that `handle` can't see, refuses as a post to it would (#81).
     if (board && !(await boardVisible(repo, access, sp, handle, board))) throw new CoreError(`no such board #${board}; see board_list`);
-    const now = Date.now();
+    const now = opts.now ?? repo.now();
     // Announce a lapsed claim before anyone takes it over.
     const lapsed = await sweepClaims(repo, access, sp, now);
     const held = async (cur: Claim): Promise<ClaimResult> => {
@@ -217,7 +218,7 @@ export async function serverRelease(
   const key = checkRelease(keyInput, note);
   const addresses = ctx.addresses ?? [handle];
   return tx.savepoint(async (sp) => {
-    const now = Date.now();
+    const now = ctx.now ?? repo.now();
     const refuse = async (cur: ClaimRow | undefined) => {
       const releasedAt = releasedByRule(await repo.claims.recentEvents(sp, key), key, addresses);
       if (releasedAt !== undefined) return { wake: [], boards: [], releasedAt };
@@ -265,7 +266,7 @@ export async function serverWatch(
     await repo.claims.unwatch(tx, key, handle);
     return notWatching(key);
   }
-  const cur = await repo.claims.liveForWatch(tx, key, Date.now());
+  const cur = await repo.claims.liveForWatch(tx, key, repo.now());
   // A queue post's claim on a board the caller can't see answers as no claim: its key names the board (#270 D5).
   if (!cur || (isQueueKey(key) && !(cur.board && (await boardVisible(repo, access, tx, handle, cur.board))))) throw watchNoClaim(key);
   if (addresses.includes(cur.holder)) throw watchOwn(key);

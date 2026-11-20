@@ -79,7 +79,7 @@ async function writePost(
   const { body, parentId, strict } = w;
   const isViewer = await viewerCheck(repo, tx);
 
-  const now = Date.now();
+  const now = repo.now();
   const p = await repo.boards.insertPost(tx, {
     board: b.name, author: actor, body, parentId, now, expiresAt: null,
     authorId: w.session ?? null, via: w.via ?? null, authorUser: w.user ?? null, human: postMark(gate, strict),
