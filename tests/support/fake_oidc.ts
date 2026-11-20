@@ -20,6 +20,9 @@ export type FakeOidcOptions = {
   user: OidcUser;
   // Okta's code flow: the ID token carries no email claims, only userinfo does.
   claimsInUserinfoOnly?: boolean;
+  // A Keycloak realm whose resource-scope mappers write identity only into the access token (#1418): the access token
+  // is a JWT with these audiences, azp, email and name (no email_verified); the ID token and userinfo carry only sub.
+  claimsInAccessTokenFor?: string[];
 };
 
 export type FakeOidc = {
@@ -31,7 +34,11 @@ export type FakeOidc = {
   tokenForms: Record<string, string>[];
   // Refusals the token endpoint answered, by reason.
   tokenRefusals: string[];
+  // The scope parameter of each authorize request, as sent.
+  authorizeScopes: string[];
   next(t: NextToken): void;
+  // The next access token's shape, as next() for the ID token (claimsInAccessTokenFor only).
+  nextAccess(t: NextToken): void;
   // A patch on the discovery document (a key set to undefined removes it), or "fail" for an HTTP 500; null resets.
   discovery(patch: Record<string, unknown> | "fail" | null): void;
   // A patch on every userinfo answer (another `sub`, say); null resets.
@@ -62,6 +69,8 @@ export async function startFakeOidc(o: FakeOidcOptions): Promise<FakeOidc> {
   let key = await newKey("k1");
   const foreign = await newKey("foreign");
   let nextToken: NextToken | undefined;
+  let nextAccess: NextToken | undefined;
+  const authorizeScopes: string[] = [];
   let discoveryPatch: Record<string, unknown> | "fail" | null = null;
   let userinfoPatch: Record<string, unknown> | null = null;
   let stall: Promise<void> | undefined;
@@ -101,6 +110,7 @@ export async function startFakeOidc(o: FakeOidcOptions): Promise<FakeOidc> {
       if (req.method === "GET" && path === "/authorize") {
         hits.authorize++;
         const p = u.searchParams;
+        authorizeScopes.push(p.get("scope") ?? "");
         if (p.get("client_id") !== o.clientId || p.get("response_type") !== "code" || p.get("code_challenge_method") !== "S256" || !p.get("code_challenge") ||
             !p.get("redirect_uri") || !p.get("state") || !p.get("scope")?.split(" ").includes("openid")) return new Response("bad authorize request", { status: 400 });
         const code = randomBytes(16).toString("hex");
@@ -138,7 +148,9 @@ export async function startFakeOidc(o: FakeOidcOptions): Promise<FakeOidc> {
         if (!grant) return refuse("invalid_grant", "unknown or used code");
         if (form.get("redirect_uri") !== grant.redirectUri) return refuse("invalid_grant", "redirect_uri");
         if (createHash("sha256").update(form.get("code_verifier") ?? "").digest("base64url") !== grant.challenge) return refuse("invalid_grant", "PKCE verifier");
-        const accessToken = randomBytes(16).toString("hex");
+        const accessShape = nextAccess ?? {};
+        nextAccess = undefined;
+        const accessToken = o.claimsInAccessTokenFor ? await mintAccess(accessShape) : randomBytes(16).toString("hex");
         accessTokens.add(accessToken);
         const shape = nextToken ?? {};
         nextToken = undefined;
@@ -149,7 +161,7 @@ export async function startFakeOidc(o: FakeOidcOptions): Promise<FakeOidc> {
         if (answers.userinfo) return answers.userinfo(issuer);
         const token = /^Bearer (\S+)$/.exec(req.headers.get("authorization") ?? "")?.[1];
         if (!token || !accessTokens.has(token)) return Response.json({ error: "invalid_token" }, { status: 401 });
-        return Response.json(patched({ ...o.user }, userinfoPatch ?? {}));
+        return Response.json(patched(o.claimsInAccessTokenFor ? { sub: o.user.sub } : { ...o.user }, userinfoPatch ?? {}));
       }
       hits.other++;
       return new Response("not served by the fake OIDC issuer", { status: 404 });
@@ -175,8 +187,8 @@ export async function startFakeOidc(o: FakeOidcOptions): Promise<FakeOidc> {
 
   async function mint(nonce: string | null, shape: NextToken): Promise<string> {
     const t = Math.floor(Date.now() / 1000);
-    const identity: Record<string, unknown> = { sub: o.user.sub, name: o.user.name };
-    if (!o.claimsInUserinfoOnly) Object.assign(identity, { email: o.user.email, email_verified: o.user.email_verified });
+    const identity: Record<string, unknown> = { sub: o.user.sub, ...(o.claimsInAccessTokenFor ? {} : { name: o.user.name }) };
+    if (!o.claimsInUserinfoOnly && !o.claimsInAccessTokenFor) Object.assign(identity, { email: o.user.email, email_verified: o.user.email_verified });
     const payload = patched({ iss: issuer, aud: o.clientId, iat: t, exp: t + 300, ...(nonce === null ? {} : { nonce }), ...identity }, shape.claims ?? {});
     for (const k of Object.keys(payload)) if (payload[k] === undefined) delete payload[k];
     const alg = shape.alg ?? "RS256";
@@ -186,13 +198,23 @@ export async function startFakeOidc(o: FakeOidcOptions): Promise<FakeOidc> {
     return new SignJWT(payload as JWTPayload).setProtectedHeader({ alg, kid }).sign((shape.foreignKey ? foreign : key).privateKey);
   }
 
+  async function mintAccess(shape: NextToken): Promise<string> {
+    const t = Math.floor(Date.now() / 1000);
+    const payload = patched({ iss: issuer, aud: o.claimsInAccessTokenFor, azp: o.clientId, typ: "Bearer", iat: t, exp: t + 300,
+      sub: o.user.sub, email: o.user.email, name: o.user.name, groups: ["eng"] }, shape.claims ?? {});
+    for (const k of Object.keys(payload)) if (payload[k] === undefined) delete payload[k];
+    return new SignJWT(payload as JWTPayload).setProtectedHeader({ alg: shape.alg ?? "RS256", kid: shape.kid ?? key.kid }).sign((shape.foreignKey ? foreign : key).privateKey);
+  }
+
   return {
     issuer,
     hits,
+    authorizeScopes,
     tokenAuthorizations,
     tokenForms,
     tokenRefusals,
     next(t) { nextToken = t; },
+    nextAccess(t) { nextAccess = t; },
     discovery(patch) { discoveryPatch = patch; },
     userinfo(patch) { userinfoPatch = patch; },
     answer(endpoint, make) { if (make) answers[endpoint] = make; else delete answers[endpoint]; },

@@ -9,7 +9,7 @@ const KEYS = [
   "GOOGLE_OAUTH_CLIENT_ID", "GOOGLE_OAUTH_CLIENT_SECRET", "GRAYBOARD_ADMINS",
   "GRAYBOARD_MCP_GOOGLE_CLIENT_ID", "GRAYBOARD_MCP_GOOGLE_CLIENT_SECRET",
   "GRAYBOARD_IDPS", "GRAYBOARD_OKTA_ISSUER", "GRAYBOARD_OKTA_CLIENT_ID", "GRAYBOARD_OKTA_CLIENT_SECRET", "GRAYBOARD_OKTA_ALLOWED_DOMAINS",
-  "GRAYBOARD_OIDC_ISSUER", "GRAYBOARD_OIDC_CLIENT_ID", "GRAYBOARD_OIDC_CLIENT_SECRET", "GRAYBOARD_OIDC_ALLOWED_DOMAINS", "GRAYBOARD_OIDC_LABEL",
+  "GRAYBOARD_OIDC_ISSUER", "GRAYBOARD_OIDC_CLIENT_ID", "GRAYBOARD_OIDC_CLIENT_SECRET", "GRAYBOARD_OIDC_ALLOWED_DOMAINS", "GRAYBOARD_OIDC_LABEL", "GRAYBOARD_OIDC_SCOPES", "GRAYBOARD_OIDC_AUDIENCE", "GRAYBOARD_OIDC_TRUST_EMAIL",
   "GRAYBOARD_ATTACHMENT_MAX_BYTES", "GRAYBOARD_ATTACHMENT_MAX_TOTAL_BYTES", "GRAYBOARD_ATTACHMENT_USER_QUOTA_BYTES", "GRAYBOARD_BLOB_DIR",
   "GRAYBOARD_MESSAGE_RETENTION_DAYS", "GRAYBOARD_AUDIT_RETENTION_DAYS", "GRAYBOARD_HTTP_PORT",
   "GRAYBOARD_HELLO_BURST", "GRAYBOARD_HELLO_PER_SEC",
@@ -366,6 +366,33 @@ describe("loadConfig", () => {
     expect(loadConfig()).toMatchObject({ idps: ["oidc", "okta", "google"], oidc: { clientSecret: "oidc-private", label: "Example SSO" }, okta: { clientId: "okta-client" } });
   });
 
+  // #1418: an IdP whose identity is in the access token, for a resource scope, with no email_verified.
+  test("oidc scopes, access-token audience and trust-email are read, and malformed ones refused", () => {
+    process.env.GRAYBOARD_IDPS = "oidc";
+    oidc();
+    expect(loadConfig().oidc).not.toHaveProperty("trustEmail");
+    process.env.GRAYBOARD_OIDC_SCOPES = "grayboard:read, extra";
+    process.env.GRAYBOARD_OIDC_AUDIENCE = "grayboard-mcp";
+    process.env.GRAYBOARD_OIDC_TRUST_EMAIL = "1";
+    expect(loadConfig().oidc).toMatchObject({ scopes: ["grayboard:read", "extra"], accessTokenAudience: "grayboard-mcp", trustEmail: true });
+    process.env.GRAYBOARD_OIDC_TRUST_EMAIL = "0";
+    expect(loadConfig().oidc).not.toHaveProperty("trustEmail");
+    for (const bad of ["true", "yes", ""]) {
+      process.env.GRAYBOARD_OIDC_TRUST_EMAIL = bad;
+      expect(message()).toBe(`GRAYBOARD_OIDC_TRUST_EMAIL must be 1 or 0, not "${bad}"`);
+    }
+    delete process.env.GRAYBOARD_OIDC_TRUST_EMAIL;
+    for (const bad of ["", " , ", "a\"b"]) {
+      process.env.GRAYBOARD_OIDC_SCOPES = bad;
+      expect(message()).toBe("GRAYBOARD_OIDC_SCOPES must be scope names separated by spaces or commas");
+    }
+    delete process.env.GRAYBOARD_OIDC_SCOPES;
+    for (const bad of ["", "two words"]) {
+      process.env.GRAYBOARD_OIDC_AUDIENCE = bad;
+      expect(message()).toBe("GRAYBOARD_OIDC_AUDIENCE must be one audience (a client ID or URL) without whitespace");
+    }
+  });
+
   test("the oidc secret can come from a file, making a confidential client", () => {
     const dir = mkdtempSync(join(tmpdir(), "gb-oidc-"));
     try {
@@ -400,8 +427,8 @@ describe("loadConfig", () => {
     }
     delete process.env.GRAYBOARD_IDPS;
     primary();
-    for (const name of ["GRAYBOARD_OIDC_ISSUER", "GRAYBOARD_OIDC_CLIENT_ID", "GRAYBOARD_OIDC_CLIENT_SECRET", "GRAYBOARD_OIDC_ALLOWED_DOMAINS", "GRAYBOARD_OIDC_LABEL"]) {
-      for (const k of ["GRAYBOARD_OIDC_ISSUER", "GRAYBOARD_OIDC_CLIENT_ID", "GRAYBOARD_OIDC_CLIENT_SECRET", "GRAYBOARD_OIDC_ALLOWED_DOMAINS", "GRAYBOARD_OIDC_LABEL"]) delete process.env[k];
+    for (const name of ["GRAYBOARD_OIDC_ISSUER", "GRAYBOARD_OIDC_CLIENT_ID", "GRAYBOARD_OIDC_CLIENT_SECRET", "GRAYBOARD_OIDC_ALLOWED_DOMAINS", "GRAYBOARD_OIDC_LABEL", "GRAYBOARD_OIDC_SCOPES", "GRAYBOARD_OIDC_AUDIENCE", "GRAYBOARD_OIDC_TRUST_EMAIL"]) {
+      for (const k of ["GRAYBOARD_OIDC_ISSUER", "GRAYBOARD_OIDC_CLIENT_ID", "GRAYBOARD_OIDC_CLIENT_SECRET", "GRAYBOARD_OIDC_ALLOWED_DOMAINS", "GRAYBOARD_OIDC_LABEL", "GRAYBOARD_OIDC_SCOPES", "GRAYBOARD_OIDC_AUDIENCE", "GRAYBOARD_OIDC_TRUST_EMAIL"]) delete process.env[k];
       process.env[name] = "x";
       expect(message()).toBe(`${name} set but GRAYBOARD_IDPS doesn't list oidc: list it, or unset them`);
     }

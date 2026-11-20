@@ -17,6 +17,14 @@ export type OidcProviderOptions = {
   // client_id in the form (RFC 6749 §4.1.3). Present: client_secret_basic.
   clientSecret?: string;
   allowedDomains: readonly string[];  // the email domains this provider may sign in (D5)
+  // Scopes asked for beside `openid email profile` (#1418): a resource server's scope, say, that brings the claims.
+  scopes?: readonly string[];
+  // Set: email and name come from the access token, a JWT verified like the ID token but with this audience, for an
+  // IdP that puts identity claims only there (#1418). Its `sub` must be the ID token's.
+  accessTokenAudience?: string;
+  // An absent email_verified counts as verified (#1418): only for an IdP that asserts emails it got from a trusted
+  // SSO. An explicit false still refuses.
+  trustEmail?: boolean;
   // Tests only: loopback http: endpoints (D6), jose's JWKS cooldown, the verification deadline, the discovery clock.
   allowLoopbackHttp?: boolean;
   cooldownDuration?: number;
@@ -57,6 +65,7 @@ export function oidcProvider(o: OidcProviderOptions): IdentityProvider {
   const domains = o.allowedDomains.map(d => d.toLowerCase());
   if (!domains.length) throw new Error(`${o.id}: allowedDomains is required`);
   const deadline = o.verifyDeadlineMs ?? VERIFY_DEADLINE_MS;
+  const scope = [...new Set(["openid", "email", "profile", ...o.scopes ?? []])].join(" ");
 
   const endpoint = (raw: unknown, what: string): URL => {
     let u: URL;
@@ -131,12 +140,12 @@ export function oidcProvider(o: OidcProviderOptions): IdentityProvider {
   // needs a reload until it settles. So each verification has its own overall deadline, its timer cleared on every
   // path, and a miss drops that key set: the next sign-in starts a fresh one rather than waiting on the stalled fetch
   // (one replacement per stall; the orphaned fetch ends at Bun's socket idle timeout).
-  async function verify(idToken: string, d: Discovery): Promise<JWTPayload> {
+  async function verify(token: string, d: Discovery, what = "ID token", audience = o.clientId): Promise<JWTPayload> {
     let timer: ReturnType<typeof setTimeout> | undefined;
     const get = keys(d);
-    const verifying = jwtVerify(idToken, get, {
+    const verifying = jwtVerify(token, get, {
       issuer: o.issuer,
-      audience: o.clientId,
+      audience,
       algorithms: d.algorithms,
       requiredClaims: ["exp", "iat", "sub"],
       clockTolerance: 60,
@@ -147,7 +156,7 @@ export function oidcProvider(o: OidcProviderOptions): IdentityProvider {
       const { payload } = await Promise.race([verifying, new Promise<never>((_, reject) => {
         timer = setTimeout(() => {
           if (jwks?.get === get) jwks = undefined;
-          reject(new OidcKeysError(`${o.label} ID token verification exceeded ${deadline} ms`));
+          reject(new OidcKeysError(`${o.label} ${what} verification exceeded ${deadline} ms`));
         }, deadline);
       })]);
       return payload;
@@ -157,7 +166,7 @@ export function oidcProvider(o: OidcProviderOptions): IdentityProvider {
       // error or bad body) is the IdP's keys.
       const code = (error as { code?: unknown }).code;
       const Refusal = typeof code === "string" && TOKEN_CODES.test(code) ? OidcIdentityError : OidcKeysError;
-      throw new Refusal(`${o.label} ID token refused: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
+      throw new Refusal(`${o.label} ${what} refused: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
     } finally { clearTimeout(timer); }
   }
 
@@ -169,7 +178,7 @@ export function oidcProvider(o: OidcProviderOptions): IdentityProvider {
     callbackParams: ["code", "state", "iss", "error", "error_description", "error_uri", "session_state"],
     async authorizeUrl({ redirectUri, state, nonce, challenge }) {
       const url = new URL((await discovery()).authorization);
-      for (const [k, v] of Object.entries({ client_id: o.clientId, redirect_uri: redirectUri, response_type: "code", scope: "openid email profile",
+      for (const [k, v] of Object.entries({ client_id: o.clientId, redirect_uri: redirectUri, response_type: "code", scope: scope,
         state, nonce, code_challenge: challenge, code_challenge_method: "S256" })) url.searchParams.set(k, v);
       return url.href;
     },
@@ -189,9 +198,15 @@ export function oidcProvider(o: OidcProviderOptions): IdentityProvider {
       const subject = claims.sub;
       if (typeof subject !== "string" || !subject || subject.length > MAX_SUBJECT) throw new OidcIdentityError(`${o.label} ID token sub is invalid`);
 
-      // email and email_verified come from one document: the ID token when it has both, else userinfo.
+      // email and email_verified come from one document: the access token when configured, else the ID token when it
+      // has both (or has an email and trustEmail is on), else userinfo.
       let source: Record<string, unknown> = claims;
-      if (claims.email === undefined || claims.email_verified === undefined) {
+      if (o.accessTokenAudience !== undefined) {
+        if (typeof tokens.access_token !== "string") throw new OidcEndpointError(`${o.label} token response has no access_token`);
+        source = await verify(tokens.access_token, d, "access token", o.accessTokenAudience);
+        if (source.azp !== undefined && source.azp !== o.clientId) throw new OidcIdentityError(`${o.label} access token's azp is not this client`);
+        if (source.sub !== subject) throw new OidcIdentityError(`${o.label} access token names another subject`);
+      } else if (claims.email === undefined || (claims.email_verified === undefined && !o.trustEmail)) {
         if (!d.userinfo) throw new OidcIdentityError(`${o.label} ID token lacks email claims and discovery has no userinfo_endpoint`);
         if (typeof tokens.access_token !== "string") throw new OidcEndpointError(`${o.label} token response has no access_token`);
         source = await json(d.userinfo, { headers: { Authorization: `Bearer ${tokens.access_token}`, Accept: "application/json" } }, "userinfo", OidcEndpointError);
@@ -199,7 +214,8 @@ export function oidcProvider(o: OidcProviderOptions): IdentityProvider {
         if (source.sub !== subject) throw new OidcIdentityError(`${o.label} userinfo names another subject`);
       }
       if (typeof source.email !== "string" || !source.email.trim()) throw new OidcIdentityError(`${o.label} sent no email`);
-      if (source.email_verified !== true) throw new OidcIdentityError(`${o.label} email is not verified`);
+      if (source.email_verified !== true && !(o.trustEmail && source.email_verified === undefined))
+        throw new OidcIdentityError(`${o.label} email is not verified`);
       const email = source.email.toLowerCase();
       const at = email.lastIndexOf("@");
       if (at < 1) throw new OidcIdentityError(`${o.label} sent an invalid email`);

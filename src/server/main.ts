@@ -57,4 +57,6 @@ console.log(`grayboard server: operator clients with sessionSource: ${sourced.le
 console.log(`grayboard server: built-in clients: ${BUILTIN_CLIENT_IDS.join(", ")}`);
 const cimdClients = config.oauthCimdClients ?? [];
 console.log(`grayboard server: metadata-document clients: ${cimdClients.length ? cimdClients.join(", ") : "none"}`);
+// A weakened sign-in check (#1418); say so every start.
+if (config.oidc?.trustEmail) console.warn(`grayboard server: GRAYBOARD_OIDC_TRUST_EMAIL=1: ${config.oidc.label} emails without email_verified count as verified`);
 

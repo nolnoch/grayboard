@@ -35,7 +35,12 @@ export type IdpId = (typeof IDP_IDS)[number];
 export type OktaConfig = { issuer: string; clientId: string; clientSecret: string; allowedDomains: string[] };
 // Any other OpenID Connect issuer (#1418), one per server, under the chooser label it names: a confidential client, or
 // a public one (no secret) that the token endpoint knows by PKCE alone.
-export type OidcConfig = { issuer: string; clientId: string; clientSecret?: string; allowedDomains: string[]; label: string };
+// For an IdP that puts identity only in the access token: extra `scopes` to bring it, the `accessTokenAudience` that
+// token carries, and `trustEmail` when it never asserts email_verified.
+export type OidcConfig = {
+  issuer: string; clientId: string; clientSecret?: string; allowedDomains: string[]; label: string;
+  scopes?: string[]; accessTokenAudience?: string; trustEmail?: boolean;
+};
 
 // The server's database (#807 P3 C11b): a SQLite file, or a Postgres URL behind GRAYBOARD_UNRELEASED_POSTGRES=1 until
 // the cutover (docs/future/postgres-server.md D8 P3, P5).
@@ -299,7 +304,7 @@ function oktaConfig(listed: boolean): OktaConfig | undefined {
 }
 
 const OIDC_VARS = ["GRAYBOARD_OIDC_ISSUER", "GRAYBOARD_OIDC_CLIENT_ID", "GRAYBOARD_OIDC_ALLOWED_DOMAINS"] as const;
-const OIDC_OPTIONAL = ["GRAYBOARD_OIDC_CLIENT_SECRET", "GRAYBOARD_OIDC_LABEL"] as const;
+const OIDC_OPTIONAL = ["GRAYBOARD_OIDC_CLIENT_SECRET", "GRAYBOARD_OIDC_LABEL", "GRAYBOARD_OIDC_SCOPES", "GRAYBOARD_OIDC_AUDIENCE", "GRAYBOARD_OIDC_TRUST_EMAIL"] as const;
 const OIDC_LABEL = "Single sign-on";
 
 // The generic provider's variables, as Okta's: three required when oidc is listed, any set while it isn't refused. An
@@ -315,12 +320,19 @@ function oidcConfig(listed: boolean): OidcConfig | undefined {
   if (process.env.GRAYBOARD_OIDC_CLIENT_SECRET_FILE === "")
     throw new Error("GRAYBOARD_OIDC_CLIENT_SECRET_FILE is set but empty: give the secret's path, or unset it for a public client");
   const secret = process.env.GRAYBOARD_OIDC_CLIENT_SECRET;
+  const scopes = process.env.GRAYBOARD_OIDC_SCOPES;
+  const audience = process.env.GRAYBOARD_OIDC_AUDIENCE;
+  const trust = process.env.GRAYBOARD_OIDC_TRUST_EMAIL;
+  if (trust !== undefined && trust !== "0" && trust !== "1") throw new Error(`GRAYBOARD_OIDC_TRUST_EMAIL must be 1 or 0, not "${trust.slice(0, 20)}"`);
   return {
     issuer: process.env.GRAYBOARD_OIDC_ISSUER!,
     clientId: process.env.GRAYBOARD_OIDC_CLIENT_ID!,
     ...(secret !== undefined ? { clientSecret: secret } : {}),
     allowedDomains: process.env.GRAYBOARD_OIDC_ALLOWED_DOMAINS!.split(",").map(d => d.trim().toLowerCase()),
     label: process.env.GRAYBOARD_OIDC_LABEL ?? OIDC_LABEL,
+    ...(scopes !== undefined ? { scopes: scopes.split(/[\s,]+/).filter(Boolean) } : {}),
+    ...(audience !== undefined ? { accessTokenAudience: audience } : {}),
+    ...(trust === "1" ? { trustEmail: true } : {}),
   };
 }
 
@@ -347,6 +359,11 @@ export function checkIdpConfig(config: Pick<Config, "idps" | "okta" | "oidc" | "
     if (!/^[^\p{Cc}]{1,64}$/u.test(oidc.label) || !oidc.label.trim()) throw new Error("GRAYBOARD_OIDC_LABEL must be 1 to 64 characters on one line");
     // Each provider's issuer keys its accounts (idpSignIn): two providers on one issuer would share them.
     if (okta && idps.includes("okta") && okta.issuer === oidc.issuer) throw new Error("GRAYBOARD_OIDC_ISSUER can't be GRAYBOARD_OKTA_ISSUER");
+    // RFC 6749 §3.3 scope-tokens; set but empty is refused, not read as none.
+    if (oidc.scopes && (!oidc.scopes.length || oidc.scopes.some(t => !/^[\x21\x23-\x5b\x5d-\x7e]{1,256}$/.test(t))))
+      throw new Error("GRAYBOARD_OIDC_SCOPES must be scope names separated by spaces or commas");
+    if (oidc.accessTokenAudience !== undefined && !CREDENTIAL.test(oidc.accessTokenAudience))
+      throw new Error("GRAYBOARD_OIDC_AUDIENCE must be one audience (a client ID or URL) without whitespace");
   }
   // A public oidc client has no secret, so its presence alone refuses dev auth.
   if (config.devAuth && (config.googleClientSecret || config.mcpGoogle?.clientSecret || okta?.clientSecret || oidc))
