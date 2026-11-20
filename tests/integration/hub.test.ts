@@ -15,7 +15,8 @@ import { board, direct } from "../support/events.ts";
 import { TestServer } from "../support/server.ts";
 import { until } from "../support/until.ts";
 import { seed } from "../support/seed.ts";
-import { queueFor } from "../../src/server/store/queue.ts";
+import { exec, row } from "../support/repo_sql.ts";
+import { holdWrites } from "../support/write_hold.ts";
 
 const A = "alice@example.com";
 const B = "bob@example.com";
@@ -66,17 +67,17 @@ test("#807: a push on a board its reader lost is acknowledged through the write 
   await a.call("board_post", { board: "eng", body: `@${C}/sim ping` });
   const pushed = await c.next(board());
   const id = postOf(pushed.item).id;
-  const deliveredAt = () => (srv.app.db.prepare(`SELECT delivered_at FROM outbox WHERE handle = ? AND post_id = ?`).get(`${C}/sim`, id) as { delivered_at: number | null }).delivered_at;
+  const deliveredAt = async () => (await row<{ delivered_at: number | null }>(srv, `SELECT delivered_at FROM outbox WHERE handle = ? AND post_id = ?`, `${C}/sim`, id))!.delivered_at;
   expect((await api(alice, "POST", "/api/teams/eng/remove", { email: C })).status).toBe(200);
-  expect(deliveredAt()).toBeNull();
-  let release!: () => void;
-  const held = queueFor(srv.app.db).run(() => new Promise<void>((r) => { release = r; }));
+  expect(await deliveredAt()).toBeNull();
+  const held = holdWrites(srv);
+  await until(() => held.started, 5000, "the write hold started");
   try {
     expect(await c.pending(100)).toEqual([]);
-    expect(deliveredAt()).toBeNull();
-  } finally { release(); }
-  await held;
-  await until(() => deliveredAt() !== null, 5000, "the lost push was acknowledged");
+    expect(await deliveredAt()).toBeNull();
+  } finally { held.release(); }
+  await held.done;
+  await until(async () => (await deliveredAt()) !== null, 5000, "the lost push was acknowledged");
 });
 
 // hosted twin: #451 (a reconnect on the session's key)
@@ -237,7 +238,7 @@ test("a bind's notices carry active claims and DMs undelivered after a day", asy
   await a.call("claim_take", { key: "ticket:ENG-2", note: "on it" });
   const old = await a.send(`${B}/fe`, "stale");
   await a.send(`${B}/fe`, "fresh");
-  await seed(srv.app.repo, () => srv.app.db.prepare("UPDATE messages SET created_at = ? WHERE id = ?").run(Date.now() - 2 * 86_400_000, old.message_id));
+  await exec(srv, "UPDATE messages SET created_at = ? WHERE id = ?", Date.now() - 2 * 86_400_000, old.message_id);
   await a.unbind("be");
   a.close();
 

@@ -8,15 +8,16 @@ import { afterEach, expect, test } from "bun:test";
 import { FakeSlack } from "./fake_slack.ts";
 import { refusal } from "../support/app_session.ts";
 import { closeSessions } from "../support/mcp.ts";
+import { drained, row, rows } from "../support/repo_sql.ts";
 import { TestServer, type TestServerOverrides } from "../support/server.ts";
 import { until } from "../support/until.ts";
 
 const A = "alice@example.com";
-const cleanup: (() => void)[] = [];
+const cleanup: (() => unknown)[] = [];
 
 afterEach(async () => {
   await closeSessions();
-  for (const f of cleanup.splice(0)) f();
+  for (const f of cleanup.splice(0)) await f();
 });
 
 async function serve(o: TestServerOverrides): Promise<TestServer> {
@@ -25,7 +26,12 @@ async function serve(o: TestServerOverrides): Promise<TestServer> {
   return srv;
 }
 
-const count = (srv: TestServer, sql: string, ...args: string[]) => (srv.app.db.query(sql).get(...args) as { n: number }).n;
+// Once the writes queued before the call have committed (an audit row is a post, always queued on Postgres).
+const count = async (srv: TestServer, sql: string, ...args: string[]) => { await drained(srv); return (await row<{ n: number }>(srv, sql, ...args))!.n; };
+const detail = async (srv: TestServer, action: string) => {
+  await drained(srv);
+  return JSON.parse((await row<{ detail: string }>(srv, `SELECT detail FROM access_log WHERE action = ?`, action))!.detail);
+};
 
 
 test("a bind over the user's bucket is refused with a wait, writes nothing about the name, and passes after the wait", async () => {
@@ -45,17 +51,19 @@ test("a bind over the user's bucket is refused with a wait, writes nothing about
   expect(r.extra.retry_after_ms).toBeGreaterThan(0);
   expect(r.extra.retry_after_ms).toBeLessThanOrEqual(250);
   expect(r.message).toMatch(/too many binds for this user; retry in \ds/);
-  expect(count(srv, `SELECT COUNT(*) AS n FROM binding_events WHERE name = ?`, `${A}/fe`)).toBe(0);
-  expect(count(srv, `SELECT COUNT(*) AS n FROM aliases WHERE address = ?`, `${A}/fe`)).toBe(0);
 
   // Another user's bucket is their own.
   await srv.appSession(bob, "be").connect();
 
-  // A second refusal in the same run is audited once.
+  // A second refusal in the same run is audited once. The reads come after it: the whole run has to fit in the
+  // 250ms one token takes to refill, and a Postgres read's round trips would spend that window.
   expect((await refusal(a.bind("fe"))).code).toBe("rate_limited");
-  expect(count(srv, `SELECT COUNT(*) AS n FROM access_log WHERE action = 'bind.rate_limited' AND actor = ?`, A)).toBe(1);
+  // Neither refusal wrote anything about the name.
+  expect(await count(srv, `SELECT COUNT(*) AS n FROM binding_events WHERE name = ?`, `${A}/fe`)).toBe(0);
+  expect(await count(srv, `SELECT COUNT(*) AS n FROM aliases WHERE address = ?`, `${A}/fe`)).toBe(0);
+  expect(await count(srv, `SELECT COUNT(*) AS n FROM access_log WHERE action = 'bind.rate_limited' AND actor = ?`, A)).toBe(1);
   // The start row names the session that tripped it and the wait it was given.
-  const start = JSON.parse((srv.app.db.query(`SELECT detail FROM access_log WHERE action = 'bind.rate_limited'`).get() as { detail: string }).detail);
+  const start = await detail(srv, "bind.rate_limited");
   expect(start).toMatchObject({ session_id: a.id });
   expect(start.retry_after_ms).toBe(r.extra.retry_after_ms);
 
@@ -65,8 +73,8 @@ test("a bind over the user's bucket is refused with a wait, writes nothing about
   const fullAt = Date.now() + 800;
   await until(() => Date.now() >= fullAt);
   expect((await a.bind("fe")).alias).toBe(`${A}/fe`);
-  expect(count(srv, `SELECT COUNT(*) AS n FROM access_log WHERE action = 'bind.rate_limit_ended'`)).toBe(1);
-  expect(JSON.parse((srv.app.db.query(`SELECT detail FROM access_log WHERE action = 'bind.rate_limit_ended'`).get() as { detail: string }).detail).refused).toBeGreaterThanOrEqual(2);
+  expect(await count(srv, `SELECT COUNT(*) AS n FROM access_log WHERE action = 'bind.rate_limit_ended'`)).toBe(1);
+  expect((await detail(srv, "bind.rate_limit_ended")).refused).toBeGreaterThanOrEqual(2);
 });
 
 test("the heartbeat's sweep ends a run nobody binds after, and drops the refilled bucket (#247)", async () => {
@@ -80,19 +88,19 @@ test("the heartbeat's sweep ends a run nobody binds after, and drops the refille
   await a.bind("ops");
   expect((await refusal(a.bind("fe"))).code).toBe("rate_limited");
   expect((await refusal(a.bind("fe"))).code).toBe("rate_limited");
-  const ended = () => srv.app.db.query(`SELECT actor, detail FROM access_log WHERE action = 'bind.rate_limit_ended'`).all() as { actor: string; detail: string }[];
+  const ended = async () => { await drained(srv); return rows<{ actor: string; detail: string }>(srv, `SELECT actor, detail FROM access_log WHERE action = 'bind.rate_limit_ended'`); };
   // Not yet full (one token back of two): the run goes on and the bucket stays.
   clock.t += 10_000;
   srv.app.sweepLimits();
-  expect(ended()).toEqual([]);
+  expect(await ended()).toEqual([]);
   expect(srv.app.application.limiterSizes().bind).toBe(1);
   // Full again: one sweep writes the end and drops the bucket, and a second writes nothing more.
   clock.t += 10_000;
   srv.app.sweepLimits();
-  expect(ended().map((r) => [r.actor, JSON.parse(r.detail)])).toEqual([[A, { refused: 2 }]]);
+  expect((await ended()).map((r) => [r.actor, JSON.parse(r.detail)])).toEqual([[A, { refused: 2 }]]);
   expect(srv.app.application.limiterSizes().bind).toBe(0);
   srv.app.sweepLimits();
-  expect(ended()).toHaveLength(1);
+  expect(await ended()).toHaveLength(1);
 });
 
 test("the Slack bridge's human connection is exempt", async () => {
@@ -109,7 +117,7 @@ test("the Slack bridge's human connection is exempt", async () => {
   const r = await srv.api(alice, "POST", "/api/slack/link");
   slack.emails.set("U0ALICE", A);
   slack.say(`link ${r.body.code}`);
-  await until(() => count(srv, `SELECT COUNT(*) AS n FROM binding_events WHERE name = ? AND event = 'bound'`, `${A}/human`) === 1);
+  await until(async () => (await count(srv, `SELECT COUNT(*) AS n FROM binding_events WHERE name = ? AND event = 'bound'`, `${A}/human`)) === 1);
 });
 
 test("a bind spends the user's bucket and the next is refused, writing no alias", async () => {
@@ -122,5 +130,5 @@ test("a bind spends the user's bucket and the next is refused, writing no alias"
   const bind = await refusal(a.bind("ops"));
   expect(bind).toMatchObject({ code: "rate_limited", message: expect.stringMatching(/too many binds for this user; retry in \d+s/) });
   expect(bind.extra.retry_after_ms).toBeGreaterThan(0);
-  expect(count(srv, `SELECT COUNT(*) AS n FROM aliases WHERE address = ?`, `${A}/ops`)).toBe(0);
+  expect(await count(srv, `SELECT COUNT(*) AS n FROM aliases WHERE address = ?`, `${A}/ops`)).toBe(0);
 });

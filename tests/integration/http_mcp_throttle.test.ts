@@ -7,6 +7,11 @@ import { hostedRowCount } from "../support/hosted_rows.ts";
 import { issueOAuth } from "../helpers/oauth.ts";
 import { OPENCODE_CLIENT } from "../../src/server/oauth-config.ts";
 import { seed } from "../support/seed.ts";
+import { accessAudits } from "../support/audit.ts";
+import { drained, rows } from "../support/repo_sql.ts";
+
+// Every board row, in a stable order, once the writes queued before the call have committed.
+const boards = async (srv: TestServer) => { await drained(srv); return rows(srv, "SELECT * FROM boards ORDER BY name"); };
 
 // The per-user bind bucket (helloLimit: the hello that shared it is gone, #282)
 // is the application's, separate from the hosted request bucket; the binds are
@@ -52,8 +57,8 @@ test("hosted traffic at 5 requests/s cannot starve same-user binds; exhaustion i
     await srv.appSession(token, "qa").connect();
     const response = await fetch(`${srv.base}/mcp`, { headers: { Authorization: `Bearer ${otherHostedToken}` } });
     expect(response.status).toBe(405);
-    expect(srv.app.db.query("SELECT * FROM access_log WHERE action = 'bind.rate_limited'").all()).toHaveLength(0);
-    expect(srv.app.db.query("SELECT * FROM access_log WHERE action = 'hosted.rate_limited'").all()).toHaveLength(1);
+    expect(await accessAudits(srv, "bind.rate_limited")).toHaveLength(0);
+    expect(await accessAudits(srv, "hosted.rate_limited")).toHaveLength(1);
   } finally { await client.close(); await srv.stop(); }
 }, 60_000);
 
@@ -94,20 +99,20 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: hosted admission 
     expect(last!.body).not.toContain(user.email);
     expect(srv.app.mcp.activeContexts).toBe(srv.app.mcp.activeGetStreams);
     expect(() => srv.app.application.admitHosted(authed, null, "native")).toThrow(expect.objectContaining({ code: "rate_limited" }));
-    expect(hostedRowCount(srv.app.db)).toBe(0);
-    const before = srv.app.db.query("SELECT * FROM boards").all();
+    expect(await hostedRowCount(srv)).toBe(0);
+    const before = await boards(srv);
     await expect(client.callTool({ name: "board_create", arguments: { name: "refused", purpose: "must not dispatch" } })).rejects.toThrow();
     expect(last!.status).toBe(429);
-    expect(srv.app.db.query("SELECT * FROM boards").all()).toEqual(before);
-    expect(srv.app.db.query("SELECT * FROM access_log WHERE action = 'binding.bound'").all()).toEqual([]);
-    expect(srv.app.db.query("SELECT * FROM access_log WHERE action = 'hosted.rate_limited'").all()).toHaveLength(1);
+    expect(await boards(srv)).toEqual(before);
+    expect(await accessAudits(srv, "binding.bound")).toEqual([]);
+    expect(await accessAudits(srv, "hosted.rate_limited")).toHaveLength(1);
     await until(async () => {
       try { return await client.callTool({ name: "board_list", arguments: {} }); }
       catch { expect(last!.status).toBe(429); return false; }
     }, 3000, "hosted request bucket to refill");
     expect(last!.status).toBe(200);
     expect(last!.retryAfter).toBeNull();
-    expect(srv.app.db.query("SELECT * FROM boards").all()).toEqual(before);
+    expect(await boards(srv)).toEqual(before);
     expect(srv.app.mcp.activeContexts).toBe(srv.app.mcp.activeGetStreams);
   } finally {
     await client.close();
@@ -144,7 +149,7 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: native hosted pre
     const second = await call("bee", 2);
     expect(second.response.status).toBe(200);
     expect(second.text).toContain('"tools"');
-    expect(hostedRowCount(srv.app.db)).toBe(0);
+    expect(await hostedRowCount(srv)).toBe(0);
     expect((await srv.app.repo.aliases.listForScope(srv.app.repo.read, "person", "alice@example.com")).map(alias => alias.name)).toEqual(["be"]);
     const before = [finds, lists];
     expect(finds).toBe(0);
@@ -163,7 +168,7 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: native hosted pre
       await blocked.text();
       expect([finds, lists]).toEqual(before);
     }
-    expect(srv.app.db.query("SELECT * FROM access_log WHERE action = 'hosted.rate_limited'").all()).toHaveLength(1);
+    expect(await accessAudits(srv, "hosted.rate_limited")).toHaveLength(1);
     now += 1000;
     expect((await call("be", 5)).response.status).toBe(200);
     const after = [finds, lists];
@@ -193,8 +198,8 @@ test("the hosted attachment byte routes charge a refused bearer to the address g
     const blocked = await bytes("B".repeat(43));
     expect(blocked.status).toBe(429);
     expect((await fetch(`${srv.base}/api/whoami`, { headers: { Authorization: `Bearer ${token}` } })).status).toBe(429);
-    expect(srv.app.db.query("SELECT target, detail FROM access_log WHERE action = 'auth.rate_limited'").all()).toEqual([
-      expect.objectContaining({ detail: expect.stringContaining('"path":"/mcp/attachments/1"') }),
+    expect(await accessAudits(srv, "auth.rate_limited")).toEqual([
+      expect.objectContaining({ detail: expect.objectContaining({ path: "/mcp/attachments/1" }) }),
     ]);
   } finally {
     await srv.stop();
@@ -217,7 +222,7 @@ test("native HTTP charges only presented invalid tokens in the shared address ga
     const blocked = await fetch(`${srv.base}/api/whoami`, { headers: { Authorization: `Bearer ${token}` } });
     expect(blocked.status).toBe(429);
     expect(Number(blocked.headers.get("Retry-After"))).toBeGreaterThan(0);
-    expect(srv.app.db.query("SELECT * FROM access_log WHERE action = 'auth.rate_limited'").all()).toHaveLength(1);
+    expect(await accessAudits(srv, "auth.rate_limited")).toHaveLength(1);
     now += 2000;
     expect((await fetch(`${srv.base}/api/whoami`, { headers: { Authorization: `Bearer ${token}` } })).status).toBe(200);
   } finally {
@@ -247,8 +252,8 @@ test("subscriber-role requests and tool calls draw on separate per-user buckets 
     // The tool bucket is spent; delivery upkeep still has its own three.
     expect([await call(delivery, 4, "subscriber"), await call(delivery, 5, "subscriber"), await call(delivery, 6, "subscriber"), await call(delivery, 7, "subscriber")]).toEqual([200, 200, 200, 429]);
     expect(await call(tools, 8)).toBe(429);
-    const runs = srv.app.db.query<{ detail: string }, []>("SELECT detail FROM access_log WHERE action = 'hosted.rate_limited' ORDER BY id").all();
-    expect(runs.map(r => JSON.parse(r.detail).bucket)).toEqual(["native", "subscriber"]);
+    const runs = await accessAudits(srv, "hosted.rate_limited");
+    expect(runs.map(r => r.detail.bucket)).toEqual(["native", "subscriber"]);
     now += 1000;
     expect(await call(tools, 9)).toBe(200);
     expect(await call(delivery, 10, "subscriber")).toBe(200);
@@ -257,8 +262,8 @@ test("subscriber-role requests and tool calls draw on separate per-user buckets 
     now += 10_000;
     srv.app.application.sweepHellos();
     expect(srv.app.application.limiterSizes()).toMatchObject({ hosted: 0, subscriber: 0 });
-    const ends = srv.app.db.query<{ detail: string }, []>("SELECT detail FROM access_log WHERE action = 'hosted.rate_limit_ended' ORDER BY id").all();
-    expect(ends.map(r => JSON.parse(r.detail).bucket).sort()).toEqual(["native", "subscriber"]);
+    const ends = await accessAudits(srv, "hosted.rate_limit_ended");
+    expect(ends.map(r => r.detail.bucket).sort()).toEqual(["native", "subscriber"]);
   } finally {
     await srv.stop();
   }

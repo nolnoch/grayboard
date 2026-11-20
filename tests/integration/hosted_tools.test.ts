@@ -23,7 +23,8 @@ import { HostedToolError, type HostedSession } from "../support/hosted_session.t
 import { TestServer } from "../support/server.ts";
 import { until } from "../support/until.ts";
 import { seed } from "../support/seed.ts";
-import { queueFor } from "../../src/server/store/queue.ts";
+import { drained, exec, execOn, row, rows } from "../support/repo_sql.ts";
+import { holdWrites } from "../support/write_hold.ts";
 
 const A = "alice@example.com";
 const B = "bob@example.com";
@@ -130,13 +131,13 @@ test("peer_list shows a session's facts only inside a scope the caller may act i
   const b = await srv.hosted(B, "fe");
   const c = await srv.hosted(C, "sim");
   await srv.connected(bob, "eng/deploy");
-  const facts = (address: string, model: string) =>
-    srv.app.db.prepare(`UPDATE ids SET place = 'host:/src/secret-repo (feat/x)', harness = 'claude-code', model = ?, effort = 'high', launcher = 1, status = 'on ENG-142', status_at = ?
-      WHERE id = (SELECT id FROM alias_holds WHERE address = ?)`).run(model, Date.now(), address);
-  await seed(srv.app.repo, () => {
-    facts(`${A}/be`, "model-a");
-    facts(`${B}/fe`, "model-b");
-    facts("eng/deploy", "model-d");
+  await seed(srv.app.repo, async (tx) => {
+    const facts = (address: string, model: string) =>
+      execOn(tx, `UPDATE ids SET place = 'host:/src/secret-repo (feat/x)', harness = 'claude-code', model = ?, effort = 'high', launcher = TRUE, status = 'on ENG-142', status_at = ?
+        WHERE id = (SELECT id FROM alias_holds WHERE address = ?)`, model, Date.now(), address);
+    await facts(`${A}/be`, "model-a");
+    await facts(`${B}/fe`, "model-b");
+    await facts("eng/deploy", "model-d");
   });
   const FACTS = ["where", "status", "status_age", "harness", "model", "effort", "launcher"];
   const row = (r: WhoResult, h: string) => r.peers.find((p) => p.handle === h)! as unknown as Record<string, unknown>;
@@ -174,11 +175,11 @@ test("peer_list(board) shows another user's ID subscription without its facts (F
   await b.call("peer_list");
   // A hosted session can't subscribe unbound; a row as its ID is what a
   // released alias's subscription leaves, so write it directly.
-  const { id: bobId } = srv.app.db.query(`SELECT id FROM ids WHERE principal = ?`).get(B) as { id: string };
-  await seed(srv.app.repo, () => {
-    srv.app.db.prepare(`INSERT INTO subscriptions (board, handle, mode, cursor, notified_id) VALUES ('eng', ?, 'push', 0, 0)`).run(bobId);
-    srv.app.db.prepare(`UPDATE ids SET place = 'host:/src/secret-repo (feat/x)', harness = 'claude-code', model = 'model-b', effort = 'high', status = 'on ENG-142', status_at = ? WHERE id = ?`)
-      .run(Date.now(), bobId);
+  const { id: bobId } = (await row<{ id: string }>(srv, `SELECT id FROM ids WHERE principal = ?`, B))!;
+  await seed(srv.app.repo, async (tx) => {
+    await execOn(tx, `INSERT INTO subscriptions (board, handle, mode, cursor, notified_id) VALUES ('eng', ?, 'push', 0, 0)`, bobId);
+    await execOn(tx, `UPDATE ids SET place = 'host:/src/secret-repo (feat/x)', harness = 'claude-code', model = 'model-b', effort = 'high', status = 'on ENG-142', status_at = ? WHERE id = ?`,
+      Date.now(), bobId);
   });
   const FACTS = ["where", "status", "harness", "model", "effort"];
   const shown = (r: WhoResult) => {
@@ -305,7 +306,7 @@ test("a receipt that fails inside answers an internal error and keeps the sessio
   await be.call("dm_send", { to: "fe", body: "hi" });
   const item = await fe.next(direct());
   // A read-point table gone from under the live server makes the receipt's cursor write fail.
-  await seed(srv.app.repo, () => { srv.app.db.exec(`ALTER TABLE mailbox_cursors RENAME TO mailbox_cursors_gone`); });
+  await exec(srv, `ALTER TABLE mailbox_cursors RENAME TO mailbox_cursors_gone`);
   await expect(fe.receipt([item.id])).rejects.toMatchObject({ code: "internal_error" });
   await fe.call("board_list");
 });
@@ -322,16 +323,24 @@ test("#843: a whoami, dm_ack or bind fault answers internal_error in structuredC
   const who = await unbound.callRaw("whoami", {});
   expect([who.isError, who.structuredContent, textOf(who)]).toEqual([true, { code: "internal_error" }, "error: internal error"]);
   // A hold's insert that aborts makes bind fail inside, after admission.
-  await seed(srv.app.repo, () => { srv.app.db.exec(`CREATE TRIGGER holds_fail BEFORE INSERT ON alias_holds BEGIN SELECT RAISE(ABORT, 'holds_fail'); END`); });
+  const pg = srv.config.store.kind === "postgres";
+  if (pg) {
+    await exec(srv, `CREATE FUNCTION holds_fail() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'holds_fail'; END $$`);
+    await exec(srv, `CREATE TRIGGER holds_fail BEFORE INSERT ON alias_holds FOR EACH ROW EXECUTE FUNCTION holds_fail()`);
+  } else await exec(srv, `CREATE TRIGGER holds_fail BEFORE INSERT ON alias_holds BEGIN SELECT RAISE(ABORT, 'holds_fail'); END`);
   const bind = await unbound.callRaw("bind", { name: "sim", create: true });
   expect([bind.isError, bind.structuredContent, JSON.parse(textOf(bind))]).toEqual([true, { code: "internal_error" }, { code: "internal_error", message: "internal error" }]);
   // The ack table gone from under the live server makes the ack's write fail. The first ID is missing, the
   // second faults: the fault keeps its own code rather than becoming the missing ID's not_found.
-  await seed(srv.app.repo, () => { srv.app.db.exec(`ALTER TABLE dm_acks RENAME TO dm_acks_gone`); });
+  await exec(srv, `ALTER TABLE dm_acks RENAME TO dm_acks_gone`);
   const ack = await fe.callRaw("dm_ack", { message_id: [99999, sent.message_id] });
   expect([ack.isError, ack.structuredContent, textOf(ack)]).toEqual([true, { code: "internal_error" }, "error: internal error"]);
   // Put the schema back, so the server's stop ends sessions cleanly.
-  await seed(srv.app.repo, () => { srv.app.db.exec(`ALTER TABLE dm_acks_gone RENAME TO dm_acks; DROP TRIGGER holds_fail`); });
+  await exec(srv, `ALTER TABLE dm_acks_gone RENAME TO dm_acks`);
+  if (pg) {
+    await exec(srv, `DROP TRIGGER holds_fail ON alias_holds`);
+    await exec(srv, `DROP FUNCTION holds_fail()`);
+  } else await exec(srv, `DROP TRIGGER holds_fail`);
 });
 
 // #1032: a bind refused not_found (a scope that names no team) is logged as a refusal, like the other bind codes.
@@ -422,7 +431,7 @@ test("dm_retract withdraws a queued message; one the recipient is holding or has
   const a = await srv.hosted(A, "be");
   const fresh = await a.call<SendResult>("dm_send", { to: `${B}/fe`, body: "fresh" });
   expect(fresh.note).toMatch(/^Recipient offline/);
-  await seed(srv.app.repo, () => srv.app.db.prepare("UPDATE aliases SET last_seen = ? WHERE address = ?").run(Date.now() - 22 * 3_600_000, `${B}/fe`));
+  await exec(srv, "UPDATE aliases SET last_seen = ? WHERE address = ?", Date.now() - 22 * 3_600_000, `${B}/fe`);
   const wrong = await a.call<SendResult>("dm_send", { to: `${B}/fe`, body: "wrong" });
   expect(wrong.note).toMatch(/^Queued: bob@example.com\/fe last seen 22h ago\. .*dm_retract/);
 
@@ -540,7 +549,7 @@ const PNG = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 7, 7
 const upload = (s: HostedSession, filename: string, data: Uint8Array<ArrayBuffer> | string) => s.uploadRaw(filename, data);
 const download = (s: HostedSession, id: number) => s.attachmentRaw("GET", `/${id}`);
 
-const audits = (action: string) => accessAudits(srv.app.db, action);
+const audits = (action: string) => accessAudits(srv, action);
 
 test("#385: the DM tools take local's definitions, so a bad message ID or an unknown argument is refused before any handler", async () => {
   const a = await srv.hosted(A, "be");
@@ -613,7 +622,7 @@ test("attachments on a DM: uploaded as your identity, bound by the send, pushed 
   expect(up.status).toBe(201);
   expect(up.body).toEqual({ id: expect.any(Number), filename: "shot.png", type: "image/png", size: PNG.length, sha256: expect.any(String) });
   const info = { id: up.body.id, filename: "shot.png", type: "image/png", size: PNG.length, sha256: up.body.sha256 };
-  expect(audits("attachment.uploaded")).toMatchObject([
+  expect(await audits("attachment.uploaded")).toMatchObject([
     { actor: A, target: `attachment:${up.body.id}`, detail: { identity: `${A}/be` } },
   ]);
 
@@ -642,8 +651,8 @@ test("attachments on a DM: uploaded as your identity, bound by the send, pushed 
   const refused = await download(c, up.body.id);
   expect(refused.status).toBe(404);
   expect(await refused.json()).toMatchObject({ message: `no attachment ${up.body.id} on a message or post you can read` });
-  expect(audits("attachment.download_refused")).toMatchObject([{ actor: C, target: `attachment:${up.body.id}` }]);
-  expect(audits("attachment.downloaded").map((r) => r.actor)).toEqual([B, A]);
+  expect(await audits("attachment.download_refused")).toMatchObject([{ actor: C, target: `attachment:${up.body.id}` }]);
+  expect((await audits("attachment.downloaded")).map((r) => r.actor)).toEqual([B, A]);
 });
 
 test("attachments: a failed blob read or write is audited; a swept blob is a 404, a fault a bare 500", async () => {
@@ -658,8 +667,8 @@ test("attachments: a failed blob read or write is audited; a swept blob is a 404
   const gone = await download(b, up.body.id);
   expect(gone.status).toBe(404);
   expect(await gone.json()).toEqual({ code: "not_found", message: `attachment ${up.body.id}'s bytes are gone` });
-  expect(audits("attachment.download_failed")).toMatchObject([{ actor: B, target: `attachment:${up.body.id}`, detail: { error: expect.stringContaining("are missing") } }]);
-  expect(audits("attachment.downloaded")).toEqual([]);
+  expect(await audits("attachment.download_failed")).toMatchObject([{ actor: B, target: `attachment:${up.body.id}`, detail: { error: expect.stringContaining("are missing") } }]);
+  expect(await audits("attachment.downloaded")).toEqual([]);
 
   // An unwritable blob directory: the client hears nothing of the path or errno.
   chmodSync(join(blobDir, "tmp"), 0o500);
@@ -669,7 +678,7 @@ test("attachments: a failed blob read or write is audited; a swept blob is a 404
   } finally {
     chmodSync(join(blobDir, "tmp"), 0o700);
   }
-  expect(audits("attachment.upload_failed")).toMatchObject([{ actor: A, target: null, detail: { filename: "other.png", error: expect.stringContaining("EACCES") } }]);
+  expect(await audits("attachment.upload_failed")).toMatchObject([{ actor: A, target: null, detail: { filename: "other.png", error: expect.stringContaining("EACCES") } }]);
 });
 
 test("attachments on a team board post follow the board; a retracted DM takes its files; uploads are capped", async () => {
@@ -700,7 +709,7 @@ test("attachments on a team board post follow the board; a retracted DM takes it
   await a.call("dm_retract", { message_id: queued.message_id });
   expect((await download(a, note.body.id)).status).toBe(404);
   // The retract sweeps the freed blob after its commit, not before its reply.
-  await until(() => !srv.app.db.prepare(`SELECT 1 FROM attachment_blobs WHERE sha256 = ?`).get(note.body.sha256), 5000, "the retracted DM's blob swept");
+  await until(async () => !(await row(srv, `SELECT 1 FROM attachment_blobs WHERE sha256 = ?`, note.body.sha256)), 5000, "the retracted DM's blob swept");
   // Not on the team: the board's file reads as missing.
   expect((await download(await srv.hosted(B, "fe"), up.body.id)).status).toBe(404);
 
@@ -734,17 +743,17 @@ test("#974: a retract's blob sweep waits behind another body holding the write q
   // Held once the sweep has deleted the bytes, so its catalog delete is the next write to queue.
   blobs.delete = async (s: string) => {
     await del.call(blobs, s);
-    if (s === sha && !held) held = queueFor(srv.app.db).run(() => new Promise<void>((r) => { release = r; }));
+    if (s === sha && !held) { const hold = holdWrites(srv); release = hold.release; held = hold.done; }
   };
-  const catalogued = () => Boolean(srv.app.db.prepare(`SELECT 1 FROM attachment_blobs WHERE sha256 = ?`).get(sha));
+  const catalogued = async () => Boolean(await row(srv, `SELECT 1 FROM attachment_blobs WHERE sha256 = ?`, sha));
   try {
     await a.call("dm_retract", { message_id: queued.message_id });
     await until(() => held !== undefined, 5000, "the sweep deleted the retracted DM's bytes");
     for (let i = 0; i < 5; i++) await new Promise((r) => setImmediate(r));
-    expect(catalogued()).toBe(true);
+    expect(await catalogued()).toBe(true);
     release!();
     await held;
-    await until(() => !catalogued(), 5000, "the sweep's catalog delete ran after the hold");
+    await until(async () => !(await catalogued()), 5000, "the sweep's catalog delete ran after the hold");
   } finally { blobs.delete = del; release?.(); }
 });
 
@@ -780,7 +789,7 @@ test("a user's stored attachments are capped, sent or not; an upload needs a len
   const streamed = await a.attachmentRaw("POST", "?filename=e.txt", new ReadableStream({ start: (c) => (c.enqueue(new TextEncoder().encode("e")), c.close()) }));
   expect(streamed.status).toBe(411);
 
-  expect(audits("attachment.upload_refused").map((r): Record<string, unknown> => ({ actor: r.actor, ...r.detail }))).toEqual([
+  expect((await audits("attachment.upload_refused")).map((r): Record<string, unknown> => ({ actor: r.actor, ...r.detail }))).toEqual([
     { actor: A, identity: `${A}/be`, filename: "c.txt", size: 30, reason: over.body.message },
   ]);
 });
@@ -831,8 +840,8 @@ test("disable-user ends a hosted child and pushes its bounce to a live sender (#
   // Their clients drop first (no release), so the disable's 401s reach no client; the rows stay.
   await Promise.all([be.drop(), child.drop()]);
   expect((await srv.app.repo.hosted.get(srv.app.repo.read, id))?.root_session_id).toBeTruthy();
-  await seed(srv.app.repo, () => srv.app.db.prepare(`INSERT INTO messages (sender, sender_id, recipient_type, recipient, body, parent_id, created_at, pending)
-    VALUES (?, NULL, 'user', ?, 'before it was a child', NULL, ?, 0)`).run(`${B}/fe`, id, Date.now()));
+  await exec(srv, `INSERT INTO messages (sender, sender_id, recipient_type, recipient, body, parent_id, created_at, pending)
+    VALUES (?, NULL, 'user', ?, 'before it was a child', NULL, ?, FALSE)`, `${B}/fe`, id, Date.now());
   expect((await api(admin, "POST", "/api/admin/disable-user", { email: A })).status).toBe(200);
   expect((await fe.next(direct())).message).toMatchObject({ sender: id, kind: "bounce" });
   expect(await srv.app.repo.hosted.get(srv.app.repo.read, id)).toBeUndefined();
@@ -850,10 +859,10 @@ test("#807 P3 A7i: an end's bounces are pushed at its commit with no read after 
   const { child, id } = await childOf(be, A, "reviewer-run");
   await Promise.all([be.drop(), child.drop()]);
   const orphan = "0".repeat(64);
-  await seed(srv.app.repo, () => {
-    srv.app.db.prepare(`INSERT INTO messages (sender, sender_id, recipient_type, recipient, body, parent_id, created_at, pending)
-      VALUES (?, NULL, 'user', ?, 'before it was a child', NULL, ?, 0)`).run(`${B}/fe`, id, Date.now());
-    srv.app.db.prepare(`INSERT INTO attachment_blobs (sha256, size, created_at) VALUES (?, 1, ?)`).run(orphan, Date.now());
+  await seed(srv.app.repo, async (tx) => {
+    await execOn(tx, `INSERT INTO messages (sender, sender_id, recipient_type, recipient, body, parent_id, created_at, pending)
+      VALUES (?, NULL, 'user', ?, 'before it was a child', NULL, ?, FALSE)`, `${B}/fe`, id, Date.now());
+    await execOn(tx, `INSERT INTO attachment_blobs (sha256, size, created_at) VALUES (?, 1, ?)`, orphan, Date.now());
   });
   const bounces = spyOn(srv.app.repo.messages, "bouncesFrom");
   const deleted = spyOn(srv.app.repo.blobs, "delete");
@@ -877,18 +886,18 @@ test("#523: a child's DM and post carry its ID as via in pushes, reads and board
   const pushed = await fe.next(direct((m) => m.body === "from the subagent"));
   expect(pushed.event.message).toMatchObject({ id: sent.message_id, sender: `${A}/be`, via: id });
   expect(channelOf(pushed, `${A}/fe`).meta).toMatchObject({ from: `${A}/be`, via: id });
-  expect(srv.app.db.query("SELECT sender_id, via FROM messages WHERE id = ?").get(sent.message_id)).toEqual({ sender_id: id, via: id });
+  expect(await row(srv, "SELECT sender_id, via FROM messages WHERE id = ?", sent.message_id)).toEqual({ sender_id: id, via: id });
   const own = await be.call<SendResult>("dm_send", { to: "fe", body: "from the root" });
   const ownPush = await fe.next(direct((m) => m.body === "from the root"));
   expect(ownPush.event.message).not.toHaveProperty("via");
   expect(channelOf(ownPush, `${A}/fe`).meta).not.toHaveProperty("via");
-  expect(srv.app.db.query("SELECT via FROM messages WHERE id = ?").get(own.message_id)).toEqual({ via: null });
+  expect(await row(srv, "SELECT via FROM messages WHERE id = ?", own.message_id)).toEqual({ via: null });
 
   // The post, and a claim's announcement and release: the child's posts, pushed with via; the root's without.
   const posted = await child.call<BoardPostResult>("board_post", { board: "e2e", body: "subagent post" });
   const postPush = await fe.next(board((i) => i.kind === "push" && i.post.body === "subagent post"));
   expect(channelOf(postPush, `${A}/fe`).meta).toMatchObject({ post_id: String(posted.post_id), from: `${A}/be`, via: id });
-  expect(srv.app.db.query("SELECT author_id, via FROM posts WHERE id = ?").get(posted.post_id)).toEqual({ author_id: id, via: id });
+  expect(await row(srv, "SELECT author_id, via FROM posts WHERE id = ?", posted.post_id)).toEqual({ author_id: id, via: id });
   await be.call("board_post", { board: "e2e", body: "root post" });
   const rootPush = await fe.next(board((i) => i.kind === "push" && i.post.body === "root post"));
   expect(channelOf(rootPush, `${A}/fe`).meta).not.toHaveProperty("via");
@@ -926,7 +935,7 @@ test("#523: a child's DM and post carry its ID as via in pushes, reads and board
 
   // Its end deletes its source row; what it wrote stays attributed to it.
   await child.end();
-  expect(srv.app.db.query("SELECT 1 FROM hosted_sessions WHERE session_id = ?").get(id)).toBeNull();
+  expect(await row(srv, "SELECT 1 FROM hosted_sessions WHERE session_id = ?", id)).toBeNull();
   await reads();
 });
 
@@ -944,8 +953,9 @@ test("#523: a DM or @mention to a child's ID refuses child_session naming its ro
     await expect(fe.call("board_post", { board: "e2e", body: `@${id} look` })).rejects.toMatchObject({ message });
     await expect(ops.send(id, "to the subagent")).rejects.toMatchObject({ code: "child_session", message });
     await expect(ops.call("board_post", { board: "e2e", body: `@${id} look` })).rejects.toMatchObject({ code: "child_session", message });
-    expect(srv.app.db.query("SELECT COUNT(*) AS n FROM messages").get()).toEqual({ n: 0 });
-    expect(srv.app.db.query("SELECT COUNT(*) AS n FROM posts").get()).toEqual({ n: 0 });
+    await drained(srv);
+    expect(await row(srv, "SELECT COUNT(*) AS n FROM messages")).toEqual({ n: 0 });
+    expect(await row(srv, "SELECT COUNT(*) AS n FROM posts")).toEqual({ n: 0 });
   };
   await refusesAll();
   // It acts under its root's addresses, never its own ID.
@@ -1024,13 +1034,16 @@ test("#523: a child is told it's a subagent, and reads its root's boards and mai
   const owed = await inbox();
   expect(owed).toEqual([[sent.message_id, "owed by the root"]]);
   expect(await unreadOn(fe, "ops")).toBe(1);
-  const state = () => ({
-    subscriptions: srv.app.db.query("SELECT board, mode, cursor, notified_id FROM subscriptions WHERE handle = ? ORDER BY board").all(`${A}/fe`),
-    mutes: srv.app.db.query("SELECT handle, root_id FROM thread_mutes ORDER BY handle, root_id").all(),
-    outbox: srv.app.db.query("SELECT post_id, delivered_at FROM outbox WHERE handle = ? ORDER BY post_id").all(`${A}/fe`),
-    message: srv.app.db.query("SELECT delivered_at FROM messages WHERE id = ?").get(sent.message_id),
-  });
-  const before = state();
+  const state = async () => {
+    await drained(srv);
+    return {
+      subscriptions: await rows(srv, "SELECT board, mode, cursor, notified_id FROM subscriptions WHERE handle = ? ORDER BY board", `${A}/fe`),
+      mutes: await rows(srv, "SELECT handle, root_id FROM thread_mutes ORDER BY handle, root_id"),
+      outbox: await rows(srv, "SELECT post_id, delivered_at FROM outbox WHERE handle = ? ORDER BY post_id", `${A}/fe`),
+      message: await row(srv, "SELECT delivered_at FROM messages WHERE id = ?", sent.message_id),
+    };
+  };
+  const before = await state();
   expect(before.outbox).toEqual([{ post_id: pushed.post_id, delivered_at: null }]);
 
   // Its default board_read is the latest page with no unread view; thread and before_id read as usual.
@@ -1053,7 +1066,7 @@ test("#523: a child is told it's a subagent, and reads its root's boards and mai
   await expect(child.call("board_subscribe", { board: "e2e", mode: "off", thread: pushed.post_id })).rejects.toMatchObject(subs);
 
   // Nothing the child did moved the root's read state.
-  expect(state()).toEqual(before);
+  expect(await state()).toEqual(before);
   expect(await unreadOn(fe, "ops")).toBe(1);
   expect(await inbox()).toEqual(owed);
   // The root still gets its push and DM, and its own read takes its unread post.
@@ -1083,10 +1096,12 @@ test("#523: a child's post and claim announcement are its root's own: none of th
     expect(channelOf(item, `${A}/fe`).meta).toMatchObject({ from: `${A}/qa`, via: id });
   }
   // None of the root's addresses was queued a push or counts one unread.
-  expect(srv.app.db.query("SELECT DISTINCT handle FROM outbox").all()).toEqual([{ handle: `${A}/fe` }]);
+  await drained(srv);
+  expect(await rows(srv, "SELECT DISTINCT handle FROM outbox")).toEqual([{ handle: `${A}/fe` }]);
   expect([await unreadOn(be, "e2e"), await unreadOn(be, "ops")]).toEqual([0, 0]);
   await be.none(board((i) => i.kind === "push" || i.kind === "digest"));
-  expect(srv.app.db.query("SELECT 1 FROM outbox WHERE handle IN (?, ?, ?)").all(`${A}/be`, `${A}/qa`, root)).toEqual([]);
+  await drained(srv);
+  expect(await rows(srv, "SELECT 1 FROM outbox WHERE handle IN (?, ?, ?)", `${A}/be`, `${A}/qa`, root)).toEqual([]);
   // Another session's post is the root's to read, as before.
   await fe.call("board_post", { board: "ops", body: "from fe" });
   expect(await unreadOn(be, "ops")).toBe(1);

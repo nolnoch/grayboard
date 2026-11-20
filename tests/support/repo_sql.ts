@@ -12,6 +12,7 @@
 //
 // pgText numbers every `?` outside '…' and "…": it doesn't handle a `?` in a `--` comment, a `$$` block or an E'' string,
 // nor the jsonb operators ?, ?| and ?&. Don't write those here.
+import { AsyncLocalStorage } from "node:async_hooks";
 import type { Repo } from "../../src/server/db.ts";
 import { pgOf } from "../../src/server/store/pg/tx.ts";
 import { isTx, sqliteOf, type Read, type Tx } from "../../src/server/store/tx.ts";
@@ -139,5 +140,27 @@ export function txSpy(on: RepoLike): { readonly open: boolean; restore(): void }
       wrapped.post = post;
       (repo.hosted as unknown as Record<"write", unknown>).write = hostedWrite;
     },
+  };
+}
+
+// Whether the calling code runs inside a body the server's write queue runs (repo.write, repo.post or
+// repo.hosted.write: every top-level transaction the server opens goes through one), on either backend (#807 P3 C11d):
+// what SQLite's `db.inTransaction && queueFor(db).mine` said. Each body runs in an async context of its own, so a call
+// made outside any body (while another body holds the queue) reads false. Looser than that check in one way: async
+// work a body started carries its context on, so a call from it (an afterCommit effect, an un-awaited promise) reads
+// true even after the body has committed. Stricter than txSpy, which is true while any body is open. `restore()` puts
+// the Repo's methods back.
+export function queuedBodies(on: RepoLike): { readonly inside: boolean; restore(): void } {
+  const repo = repoOf(on);
+  const als = new AsyncLocalStorage<true>();
+  const wrap = (fn: (tx: Tx) => unknown) => (tx: Tx) => als.run(true, () => fn(tx));
+  const write = repo.write, post = repo.post, hostedWrite = repo.hosted.write;
+  const r = repo as unknown as Record<"write" | "post", unknown>, h = repo.hosted as unknown as Record<"write", unknown>;
+  r.write = (fn: (tx: Tx) => unknown, ...rest: unknown[]) => (write as (...a: unknown[]) => unknown).call(repo, wrap(fn), ...rest);
+  r.post = (fn: (tx: Tx) => unknown, ...rest: unknown[]) => (post as (...a: unknown[]) => unknown).call(repo, wrap(fn), ...rest);
+  h.write = (fn: (tx: Tx) => unknown, ...rest: unknown[]) => (hostedWrite as (...a: unknown[]) => unknown).call(repo.hosted, wrap(fn), ...rest);
+  return {
+    get inside() { return als.getStore() === true; },
+    restore() { r.write = write; r.post = post; h.write = hostedWrite; },
   };
 }
