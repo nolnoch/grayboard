@@ -1,5 +1,8 @@
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
-import { checkIdpConfig, describeStore, loadConfig } from "./config.ts";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { checkIdpConfig, describeStore, FILE_SECRETS, loadConfig } from "./config.ts";
 
 const KEYS = [
   "GRAYBOARD_DEV_AUTH", "GRAYBOARD_DB_PATH", "GRAYBOARD_DATABASE_URL", "GRAYBOARD_UNRELEASED_POSTGRES", "GRAYBOARD_PUBLIC_URL", "GRAYBOARD_ORG_DOMAIN",
@@ -20,6 +23,7 @@ const KEYS = [
   "GRAYBOARD_HOSTED_SESSIONS_PER_SERVICE", "GRAYBOARD_DELIVERY_LEASES_PER_SERVICE",
   ...["HOSTED_REQUEST_SERVICE", "HOSTED_SUBSCRIBER_SERVICE", "HELLO_SERVICE"].flatMap(p => [`GRAYBOARD_${p}_BURST`, `GRAYBOARD_${p}_PER_SEC`]),
   "GRAYBOARD_SERVICE_TOKEN_MAX_SECONDS", "GRAYBOARD_SERVICE_TOKEN_MINTS_PER_MINUTE", "GRAYBOARD_SERVICE_TOKENS_UNEXPIRED",
+  "SLACK_APP_TOKEN", "SLACK_BOT_TOKEN", ...FILE_SECRETS.map(name => `${name}_FILE`),
 ];
 
 describe("loadConfig", () => {
@@ -141,6 +145,46 @@ describe("loadConfig", () => {
     expect(describeStore({ kind: "postgres", url: "not a url s3cret" })).not.toContain("s3cret");
     delete process.env.GRAYBOARD_DATABASE_URL;
     expect(() => loadConfig()).toThrow("Required env var GRAYBOARD_DB_PATH (or GRAYBOARD_DATABASE_URL) is not set");
+  });
+
+  // #1418: a secret mounted as a file (Docker, Kubernetes) reads as its variable, before any check sees it.
+  test("NAME_FILE supplies a secret from a file", () => {
+    const dir = mkdtempSync(join(tmpdir(), "gb-secrets-"));
+    try {
+      const file = (name: string, body: string) => { const path = join(dir, name); writeFileSync(path, body); return path; };
+      process.env.GRAYBOARD_DEV_AUTH = "1";
+      delete process.env.GRAYBOARD_DB_PATH;
+      process.env.GRAYBOARD_UNRELEASED_POSTGRES = "1";
+      process.env.GRAYBOARD_BLOB_DIR = "/var/lib/grayboard/blobs";
+      const url = "postgres://gb:s3cret@db.example.com:5432/grayboard";
+      // The trailing line break an editor or `echo` leaves is not part of the secret.
+      process.env.GRAYBOARD_DATABASE_URL_FILE = file("db-url", `${url}\r\n`);
+      expect(loadConfig().store).toEqual({ kind: "postgres", url });
+      // Both forms is a refusal, not a precedence rule.
+      expect(() => loadConfig()).toThrow("Set one of GRAYBOARD_DATABASE_URL, GRAYBOARD_DATABASE_URL_FILE, not both");
+      delete process.env.GRAYBOARD_DATABASE_URL;
+      process.env.GRAYBOARD_DATABASE_URL_FILE = file("empty", "\n");
+      expect(() => loadConfig()).toThrow(`GRAYBOARD_DATABASE_URL_FILE: ${join(dir, "empty")} is empty`);
+      process.env.GRAYBOARD_DATABASE_URL_FILE = join(dir, "missing");
+      expect(() => loadConfig()).toThrow(`GRAYBOARD_DATABASE_URL_FILE: cannot read ${join(dir, "missing")}: ENOENT`);
+      process.env.GRAYBOARD_DATABASE_URL_FILE = file("db-url", url);
+      expect(loadConfig().store).toEqual({ kind: "postgres", url });
+      delete process.env.GRAYBOARD_DATABASE_URL;
+
+      // A file-borne client secret still trips the dev-auth guard: resolution runs before every check.
+      process.env.GRAYBOARD_DATABASE_URL_FILE = file("db-url", url);
+      process.env.GRAYBOARD_OKTA_CLIENT_SECRET_FILE = file("okta", "okta-secret\n");
+      expect(() => loadConfig()).toThrow("GRAYBOARD_DEV_AUTH=1 must not be set alongside");
+      delete process.env.GRAYBOARD_OKTA_CLIENT_SECRET_FILE;
+      delete process.env.GRAYBOARD_OKTA_CLIENT_SECRET;
+      delete process.env.GRAYBOARD_DATABASE_URL;
+
+      process.env.SLACK_APP_TOKEN_FILE = file("app", "xapp-1\n");
+      process.env.SLACK_BOT_TOKEN_FILE = file("bot", "xoxb-1\n");
+      expect(loadConfig().slack).toEqual({ appToken: "xapp-1", botToken: "xoxb-1" });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   // #928 D6/D8: one pair. The primary is required only when the MCP pair is absent; with both set (a Desktop

@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { isLoopback, parseOAuthClients, type OAuthClient } from "./oauth-config.ts";
 import { parseCimdClients } from "./oauth-cimd.ts";
@@ -98,7 +99,35 @@ export type Config = {
   slack?: { appToken: string; botToken: string; apiUrl?: string };
 };
 
+// The secrets a deploy may mount as files (#1418): NAME_FILE names a file whose contents become NAME, the
+// Docker and Kubernetes convention, so a secret needn't sit in the process environment's source.
+export const FILE_SECRETS = [
+  "GRAYBOARD_DATABASE_URL", "GOOGLE_OAUTH_CLIENT_SECRET", "GRAYBOARD_MCP_GOOGLE_CLIENT_SECRET",
+  "GRAYBOARD_OKTA_CLIENT_SECRET", "SLACK_APP_TOKEN", "SLACK_BOT_TOKEN",
+] as const;
+
+// Resolves each NAME_FILE into env.NAME before anything reads it. Both set is refused: which one wins would be a
+// guess. Trailing line breaks are dropped (an editor or `echo` adds one); an empty or unreadable file is refused,
+// naming the variable and path, never the contents.
+export function resolveFileSecrets(env: Record<string, string | undefined>): void {
+  for (const name of FILE_SECRETS) {
+    const path = env[`${name}_FILE`];
+    if (!path) continue;
+    if (env[name]) throw new Error(`Set one of ${name}, ${name}_FILE, not both`);
+    let value: string;
+    try {
+      value = readFileSync(path, "utf8");
+    } catch (e) {
+      throw new Error(`${name}_FILE: cannot read ${path}: ${(e as NodeJS.ErrnoException).code ?? (e as Error).message}`);
+    }
+    value = value.replace(/[\r\n]+$/, "");
+    if (!value) throw new Error(`${name}_FILE: ${path} is empty`);
+    env[name] = value;
+  }
+}
+
 export function loadConfig(): Config {
+  resolveFileSecrets(process.env);
   const devAuth = process.env.GRAYBOARD_DEV_AUTH === "1";
 
   if (devAuth && (process.env.GOOGLE_OAUTH_CLIENT_SECRET || process.env.GRAYBOARD_MCP_GOOGLE_CLIENT_SECRET || process.env.GRAYBOARD_OKTA_CLIENT_SECRET)) {
