@@ -12,6 +12,7 @@ import {
   queueLaneRowsSql,
   pendingFor,
   post,
+  read,
   setAccess,
   setQueueParticipation,
   ensureAlias,
@@ -905,6 +906,85 @@ describe("a push follows its receiving session while it is live (#1370)", () => 
     holdAlias(db, "x", B, 102);
     claimQueuePost(db, "work", r.post.id, "x", Date.now());
     expect(sessionOf("x", r.post.id)).toBe(B);
+  });
+});
+
+// #1461: a push still unread when its alias moves is the reader's. Delivery (acknowledge, or a read that shows it)
+// re-records the session holding the address then on the push's outbox row and on the take that assigned it, so the
+// rotation credits the session that received the post, not the one that held the alias when it was written.
+describe("a delivered push is credited to the session that read it (#1461)", () => {
+  const A = "id:0000000001461", B = "id:0000000002461";
+  beforeEach(() => {
+    db.prepare(`DELETE FROM subscriptions WHERE handle = 'fe'`).run();
+    for (const id of [A, B]) registerId(db, { id, principal: null, launcher: false });
+    for (const h of ["x", "z"]) ensureAlias(db, h, "test");
+    holdAlias(db, "x", A, 100);
+    subscribe(db, A, "work", "push"); // A's lane is x
+    holdAlias(db, "z", B, 100);
+    subscribe(db, B, "work", "push"); // B's lane is z
+  });
+  const lanes = () => queueLanes(db, getBoard(db, "work")!, ["be"]);
+  const sessionOf = (handle: string, postId: number) =>
+    (db.prepare(`SELECT session_id FROM outbox WHERE handle = ? AND post_id = ?`).get(handle, postId) as { session_id: string | null }).session_id;
+  const takeSession = (postId: number) =>
+    (db.prepare(`SELECT session_id FROM claim_events WHERE key = ? AND event = 'take'`).get(claimKey(postId)) as { session_id: string | null }).session_id;
+  // sim woken at 500 by a rotated post; x named at 1000 while A holds it. Then A unbinds x and B binds it (B's lane
+  // stays z, its older hold); the push to x is still unread.
+  const moved = () => {
+    const first = post(db, "be", "work", "item 0");
+    expect(first.wake).toEqual(["sim"]);
+    const r = post(db, "be", "work", "@x take this", null, said);
+    expect([sessionOf("x", r.post.id), takeSession(r.post.id)]).toEqual([A, A]);
+    for (const [p, at] of [[first.post.id, 500], [r.post.id, 1000]] as const) {
+      db.prepare(`UPDATE posts SET created_at = ? WHERE id = ?`).run(at, p);
+      db.prepare(`UPDATE claim_events SET at = ? WHERE key = ?`).run(at, claimKey(p));
+    }
+    db.prepare(`DELETE FROM alias_holds WHERE address = 'x'`).run();
+    holdAlias(db, "x", B, 102);
+    return r.post.id;
+  };
+
+  test("B acknowledges the push as x: the rotation credits B's lane, and A, never woken, goes first", () => {
+    const p = moved();
+    acknowledge(db, "x", { kind: "push", post_id: p });
+    expect([sessionOf("x", p), takeSession(p)]).toEqual([B, B]);
+    // A never woken, sim at 500, B (z) at 1000 by the push it read as x.
+    expect(lanes()).toEqual([A, "sim", "z"]);
+  });
+
+  test("B reads the board as x: the read's delivery credits B the same way", () => {
+    const p = moved();
+    read(db, "x", "work");
+    expect([sessionOf("x", p), takeSession(p)]).toEqual([B, B]);
+    expect(lanes()).toEqual([A, "sim", "z"]);
+  });
+
+  test("a repeat ack after the alias moves again keeps the first delivery's session", () => {
+    const p = moved();
+    acknowledge(db, "x", { kind: "push", post_id: p });
+    db.prepare(`DELETE FROM alias_holds WHERE address = 'x'`).run();
+    holdAlias(db, "x", A, 103);
+    acknowledge(db, "x", { kind: "push", post_id: p });
+    expect([sessionOf("x", p), takeSession(p)]).toEqual([B, B]);
+  });
+
+  // Audit L1: a push read after its claim lapsed is a stale turn. x's claim lapsed (A's turn) and the post went to sim;
+  // then x moved to B, whose drain delivered the old push. The take stays A's, so A's lanes still count as having held
+  // the post: the next lapse goes to B's lane z, never back to A. Mutation: creditQueueTakes without its claims
+  // condition re-records the take to B, so the second lapse skips B and offers the post to A again.
+  test("a stale push delivered after its claim lapsed leaves the take with the session whose turn it was", () => {
+    post(db, "be", "work", "item 0"); // sim
+    const p = post(db, "be", "work", "@x take this", null, said).post.id;
+    const holder = () => (db.prepare(`SELECT holder FROM claims WHERE key = ?`).get(claimKey(p)) as { holder: string } | null)?.holder;
+    expect(holder()).toBe("x");
+    sweepExpired(db, Date.now() + 31 * 60_000);
+    expect(holder()).toBe("sim");
+    db.prepare(`DELETE FROM alias_holds WHERE address = 'x'`).run();
+    holdAlias(db, "x", B, 102);
+    acknowledge(db, "x", { kind: "push", post_id: p });
+    expect([sessionOf("x", p), takeSession(p)]).toEqual([B, A]);
+    sweepExpired(db, Date.now() + 62 * 60_000);
+    expect(holder()).toBe("z");
   });
 });
 

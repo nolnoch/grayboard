@@ -887,10 +887,27 @@ export function laneSessionSql(h: string): string {
 /**
  * SQL for the session holding address `h` (an SQL expression) as a row is written (#1351, #1370): the alias's holder,
  * else `h` when it is a session ID (live or ended), else NULL (an alias no session holds). claim_events.session_id
- * (logEvent) and outbox.session_id record it, so a take or push can follow its session across an alias move.
+ * (logEvent) and outbox.session_id record it, so a take or push can follow its session across an alias move; a push's
+ * delivery re-records it on both (#1461), for the reader holds the address then.
  */
 export function holdingSessionSql(h: string): string {
   return `COALESCE((SELECT id FROM alias_holds WHERE address = ${h}), (SELECT id FROM ids WHERE id = ${h}))`;
+}
+
+/**
+ * A queue post's push to `handle` just delivered (#1461): its take, the newest one under `handle` (claimQueuePost
+ * logged it when the post was written, for whoever held `handle` then), re-records the session holding `handle` now,
+ * as the push's outbox row does. A push read after its alias moved is the new holder's turn, not the old one's. Only
+ * while the post's claim still names `handle`: once it lapsed or was released (and maybe redelivered to another lane),
+ * that turn is over, and a stale push read later by whoever holds `handle` then must not take it from the old session.
+ */
+export function creditQueueTakes(db: Database, handle: string, board: string, postIds: number[]): void {
+  const take = db.prepare(
+    `UPDATE claim_events SET session_id = ${holdingSessionSql("?1")}
+      WHERE id = (SELECT MAX(id) FROM claim_events WHERE key = ?2 AND handle = ?1 AND event = 'take')
+        AND EXISTS (SELECT 1 FROM claims WHERE key = ?2 AND holder = ?1)`,
+  );
+  for (const id of postIds) take.run(handle, `queue:${board}:${id}`);
 }
 
 /**
@@ -2079,10 +2096,12 @@ export function readRows(db: Database, board: string, handle: string | null, opt
     ).run(maxId, board, handle);
     // What you've now read no longer needs pushing; what this read skipped
     // (a pending push it filters out, a post outside the thread) still does.
-    db.prepare(
-      `UPDATE outbox SET delivered_at = ? WHERE handle = ? AND delivered_at IS NULL
-         AND post_id IN (SELECT value FROM json_each(?))`,
-    ).run(Date.now(), handle, JSON.stringify(posts.map((p) => p.id)));
+    // The pushes it delivers are credited to the session reading them, the one holding `handle` now (#1461).
+    const fresh = db.prepare(
+      `UPDATE outbox SET delivered_at = ?1, session_id = ${holdingSessionSql("?2")} WHERE handle = ?2 AND delivered_at IS NULL
+         AND post_id IN (SELECT value FROM json_each(?3)) RETURNING post_id`,
+    ).all(Date.now(), handle, JSON.stringify(posts.map((p) => p.id))) as { post_id: number }[];
+    if (fresh.length > 0 && getBoard(db, board)?.kind === "queue") creditQueueTakes(db, handle, board, fresh.map((r) => r.post_id));
   }
 
   const remaining = db
@@ -2206,16 +2225,18 @@ export function acknowledge(db: Database, handle: string, ref: PendingRef): void
   if (ref.kind === "push") {
     const row = db
       .prepare(
-        `SELECT o.reason, p.board FROM outbox o JOIN posts p ON p.id = o.post_id
-          WHERE o.handle = ? AND o.post_id = ?`,
+        `SELECT o.reason, o.delivered_at, p.board, b.kind FROM outbox o JOIN posts p ON p.id = o.post_id
+          JOIN boards b ON b.name = p.board WHERE o.handle = ? AND o.post_id = ?`,
       )
-      .get(handle, ref.post_id) as { reason: string; board: string } | undefined;
+      .get(handle, ref.post_id) as { reason: string; delivered_at: number | null; board: string; kind: string } | undefined;
     if (!row) return;
-    db.prepare(`UPDATE outbox SET delivered_at = ? WHERE handle = ? AND post_id = ?`).run(
-      Date.now(),
-      handle,
-      ref.post_id,
-    );
+    // Delivered now: credited to the session it reached, the one holding `handle` now (#1461); a repeat ack keeps the
+    // first delivery's session.
+    db.prepare(
+      `UPDATE outbox SET delivered_at = ?1, session_id = CASE WHEN delivered_at IS NULL THEN ${holdingSessionSql("?2")} ELSE session_id END
+        WHERE handle = ?2 AND post_id = ?3`,
+    ).run(Date.now(), handle, ref.post_id);
+    if (row.delivered_at === null && row.kind === "queue") creditQueueTakes(db, handle, row.board, [ref.post_id]);
     // Push-mode subscribers have now seen it in full: count it as read.
     if (row.reason === "subscription") {
       db.prepare(
