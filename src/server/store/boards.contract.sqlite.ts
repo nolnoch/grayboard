@@ -32,7 +32,8 @@ export const sqliteBoardsBackend: BoardsBackend = {
       hold: (address, id, boundAt) => run("INSERT INTO alias_holds (address, id, bound_at) VALUES (?, ?, ?)", [address, id, boundAt]),
       claim: c => run("INSERT INTO claims (key, holder, note, board, acquired_at, expires_at, holder_user) VALUES (?, ?, 'held', ?, ?, ?, NULL)",
         [c.key, c.holder, c.board, c.at, c.at + 60_000]),
-      claimEvent: e => run("INSERT INTO claim_events (key, handle, event, board, at) VALUES (?, ?, ?, ?, ?)", [e.key, e.handle, e.event, e.board, e.at]),
+      claimEvent: e => run("INSERT INTO claim_events (key, handle, event, board, at, session_id) VALUES (?, ?, ?, ?, ?, ?)",
+        [e.key, e.handle, e.event, e.board, e.at, e.session ?? null]),
       bindingEvent: e => run("INSERT INTO binding_events (session_id, name, event, at) VALUES (?, ?, ?, ?)", [e.session, e.name, e.event, e.at]),
       watch: (key, handle) => run("INSERT INTO claim_watches (key, handle) VALUES (?, ?)", [key, handle]),
       upload: (uploader, principal, size) => repo.write(async tx => {

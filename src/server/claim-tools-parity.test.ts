@@ -275,6 +275,17 @@ test("claim_take, claim_release and claim_watch give core's answers and leave it
   expect(JSON.stringify(call("wade", "claim_take", { key: "ticket:new", board: "general" }).rows.posts)).toContain("[claim] ticket:new");
   expect(text("eve", "claim_take", { key: "ticket:new", board: "eng" })).toContain("no such board #eng");
   expect(text("wade", "claim_take", { key: "ticket:new", board: "attic" })).toContain("error");
+  // #1185: a regular claim's [claim] and [release] on a queue board are notices: no lane is handed them, no queue claim
+  // names them.
+  for (const [label, tool, args, prefix] of [
+    ["wade", "claim_take", { key: "ticket:new", board: "q" }, "[claim] ticket:new"], ["bob", "claim_release", { key: "ticket:onq" }, "[release] ticket:onq"],
+  ] as const) {
+    const { rows } = call(label, tool, args);
+    const notice = (rows.posts as { id: number; body: string }[]).find(p => p.body.startsWith(prefix))!;
+    expect(JSON.stringify(rows.claims)).not.toContain(`queue:q:${notice.id}`);
+    expect(JSON.stringify(rows.claim_events)).not.toContain(`queue:q:${notice.id}`);
+    expect((rows.outbox as { post_id: number }[]).filter(o => o.post_id === notice.id)).toEqual([]);
+  }
   // Held: the holder named when visible, hidden when not.
   expect(text("bob", "claim_take", { key: "ticket:live" })).toContain(`${W}/be`);
   expect(text("eve", "claim_take", { key: "ticket:eng" })).not.toContain("eng/deploy");

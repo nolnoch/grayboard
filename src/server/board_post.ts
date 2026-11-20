@@ -44,7 +44,7 @@ export async function serverPost(
   const files = { ids: attachmentIds(args.attachment_ids), send: ctx.files };
   postPreChecks(b.name, body, gate.announcement, { online: ctx.online, attachments: files });
   const w = await writePost(repo, access, tx, actor, b, gate, {
-    body, parentId, strict: true, addresses: ctx.addresses, session: ctx.session, via: ctx.via, user: ctx.user, online: ctx.online, files,
+    body, parentId, strict: true, system: false, addresses: ctx.addresses, session: ctx.session, via: ctx.via, user: ctx.user, online: ctx.online, files,
   });
   const { out, isViewer, tokens } = w;
   const asked = [...out.wake, ...out.deferred, ...tokens];
@@ -59,10 +59,10 @@ export async function serverPost(
 }
 
 /** What writePost writes as: the post's body and parent, and its writer's facts. `strict` (an author's own words) refuses
- * an unknown or ended `@id:` mention and bare names core refuses, and lets a single mention claim a queue post; `addresses` is the poster's address set, `[actor]` when absent (a claim
+ * an unknown or ended `@id:` mention and bare names core refuses, and lets a single mention claim a queue post; `system` (a claim's post) never rotates on a queue board (#1185); `addresses` is the poster's address set, `[actor]` when absent (a claim
  * announcement); `online` orders a rotation's live lanes first; `files` binds uploads (board_post only). */
 type PostWrite = {
-  body: string; parentId: number | null; strict: boolean; addresses?: string[];
+  body: string; parentId: number | null; strict: boolean; system: boolean; addresses?: string[];
   session?: string; via?: string; user?: string; online?: (h: string) => boolean; files?: { ids: number[]; send?: FileSend };
 };
 
@@ -88,17 +88,17 @@ async function writePost(
     : [];
   const own = [...new Set([...addresses, ...(await repo.boards.authorAddresses(tx, actor, w.session ?? null))])];
   const viewer = w.session ?? actor;
-  const branch = postBranch(b, parentId, gate.announcement);
+  const branch = postBranch(b, parentId, gate.announcement, w.system);
   const tokens = mentionTokens(body);
   const facts: PostTargetFacts = {
-    board: b, handle: actor, parentId, strict, gate, own, ackAddresses: addresses, isViewer,
+    board: b, handle: actor, parentId, strict, system: w.system, gate, own, ackAddresses: addresses, isViewer,
     isHuman: prefetched([], new Set(), "isHuman"), sees: prefetched([], new Set(), "sees"), mayLane: prefetched([], new Set(), "mayLane"),
     mentions: { handles: [], unresolved: [] },
   };
   if (branch === "queue") {
     facts.mentions = await access.resolveMentions(tx, tokens, actor, b, strict, viewer);
     const seen = await seenAmong(repo, access, tx, viewer, facts.mentions.handles);
-    facts.seenMentioned = facts.mentions.handles.filter((h) => seen.has(h));
+    facts.seenMentioned = facts.mentions.handles.filter((h) => seen.has(h) && !own.includes(h));
     facts.isHuman = prefetched(facts.seenMentioned, await repo.aliases.humansAmong(tx, facts.seenMentioned), "isHuman");
     // A claim by name asks the lane rule too (#270 D5).
     facts.mayLane = prefetched(facts.seenMentioned, await access.lanesAmong(tx, facts.seenMentioned, b), "mayLane");
@@ -150,7 +150,7 @@ export async function systemPost(
   const text = systemBody(body);
   postPreChecks(b.name, text, gate.announcement, {});
   const { post, out } = await writePost(repo, access, tx, actor, b, gate, {
-    body: text, parentId, strict: false, addresses: o.addresses, session: o.session, via: o.via, user: o.user,
+    body: text, parentId, strict: false, system: true, addresses: o.addresses, session: o.session, via: o.via, user: o.user,
   });
   return { wake: out.wake, boards: [post.board], postId: post.id };
 }

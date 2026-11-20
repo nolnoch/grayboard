@@ -15,6 +15,10 @@ pub trait Credential: Send + Sync + 'static {
     fn token(&self) -> BoxFuture<'_, Result<String, AuthError>>;
     /// The server answered 401 to `rejected`. Return `Ok` once a fresh token is ready (the request is retried once), or an error to fail it: `Unauthorized` when terminal, `Unreachable` when `retryable`.
     fn unauthorized<'a>(&'a self, rejected: &'a str) -> BoxFuture<'a, Result<(), AuthError>>;
+    /// A generation counter that moves whenever the credential installs a new token, or `None` (the default) for one whose token never changes on its own. The delivery stream watches it and reopens its listen stream on the new token at once (#1265): the server closes a stream when the token it was opened with expires.
+    fn changes(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+        None
+    }
 }
 
 /// A fixed token: a CI token or a run token a launcher minted. A 401 is terminal.
@@ -64,9 +68,26 @@ const LIFETIME_MAX: Duration = Duration::from_secs(366 * 24 * 60 * 60);
 /// It reads the server's authorization-server metadata once (RFC 8414) and refuses metadata that names another issuer, so the caller pins the issuer; then it posts `grant_type=client_credentials` with the secret in the Basic header (`client_secret_basic`) and `resource` set to the MCP endpoint. A token is cached and re-minted at 80% of its lifetime, and once more when the server rejects it. A capacity refusal (`slow_down`, 429), a 5xx or an unreachable server backs off, the current token serving while it lasts; `invalid_client` (a revoked or expired credential or secret, a disabled service) and any other refusal are terminal: every later call fails without asking the server again.
 ///
 /// Cheap to clone: clones share one cache, so several `Client`s on one credential share its token (the server caps mints per credential per minute). The secret never appears in `Debug` output or in an error.
+///
+/// Use it within one Tokio runtime: `token` spawns the 80% renewal onto the current runtime (#1375), so it panics outside one, and a renewal parked on a runtime nobody drives leaves the current token serving until it expires.
 #[derive(Clone)]
 pub struct ClientCredentials {
     inner: Arc<Inner>,
+    _owner: Arc<Owner>,
+}
+
+/// Shared by every clone; dropped with the last, it aborts a renewal still in flight (#1375 F3), whose guard records it as a cancelled mint. A `Weak`, so the task's own strong reference is all that keeps the state alive meanwhile.
+struct Owner(std::sync::Weak<Inner>);
+
+impl Drop for Owner {
+    fn drop(&mut self) {
+        if let Some(inner) = self.0.upgrade() {
+            let renewal = inner.state().renewal.take();
+            if let Some(renewal) = renewal {
+                renewal.abort();
+            }
+        }
+    }
 }
 
 struct Inner {
@@ -76,7 +97,14 @@ struct Inner {
     client_id: String,
     secret: Secret,
     backoff_unit: Duration,
-    state: tokio::sync::Mutex<State>,
+    /// The metadata's endpoints, read once; concurrent first calls share one read.
+    endpoints: tokio::sync::OnceCell<Endpoints>,
+    /// Never held across an `.await`: a mint runs unlocked, single-flighted by `State::minting` (#1263).
+    state: std::sync::Mutex<State>,
+    /// Woken when a mint ends, however it ends, for callers that had no valid token to serve.
+    minted: tokio::sync::Notify,
+    /// Bumped whenever a mint installs a new token (`Credential::changes`, #1265).
+    generation: tokio::sync::watch::Sender<u64>,
 }
 
 /// The secret: never printed.
@@ -84,16 +112,23 @@ struct Secret(String);
 
 #[derive(Default)]
 struct State {
-    endpoints: Option<Endpoints>,
     current: Option<Minted>,
+    /// A mint is in flight: other callers serve the current token while it's valid, or wait for the mint.
+    minting: bool,
     /// Tokens `revoke` took out of service whose revocation hasn't succeeded yet: never served again, and retried by the next `revoke`.
     revoking: Vec<String>,
     /// Set by a terminal refusal; every later call fails with it.
     dead: Option<String>,
     /// While set and in the future, no mint is attempted.
     retry_at: Option<Instant>,
+    /// The latest renewal task, if one was spawned (#1375 F3): aborted when the last clone drops. Never cleared when the task ends: aborting a finished task does nothing.
+    renewal: Option<tokio::task::AbortHandle>,
+    /// `unauthorized` is answering a rejection: the next token installed, whoever minted it, is that answer and takes `replaced_rejected` (#1375 F4). Cleared only by that install (or a terminal refusal): a mint that fails transiently or is cancelled leaves it, so the retry after the backoff still answers the rejection.
+    answering_rejection: bool,
     failures: u32,
     last_failure: String,
+    /// Replacement tokens the server rejected in a row (#1264): each backs off the next mint, doubling. Reset when a token that was served lives to its renewal unrejected (#1375 F5).
+    rejections: u32,
 }
 
 struct Endpoints {
@@ -105,8 +140,10 @@ struct Minted {
     token: String,
     expires_at: Instant,
     renew_at: Instant,
-    /// Minted to replace a token the server rejected: a rejection of this one is not answered with another mint.
+    /// Minted to replace a token the server rejected, or handed to a request in answer to one: a rejection of this one is not answered with another mint.
     replaced_rejected: bool,
+    /// Handed to a caller at least once. A token a background renewal installed that sat unused until its own renewal proves nothing about the server taking this credential's tokens.
+    served: bool,
 }
 
 enum MintError {
@@ -272,65 +309,163 @@ impl ClientCredentials {
             .timeout(HTTP_TIMEOUT)
             .build()
             .map_err(|e| Error::InvalidResponse(format!("HTTP client: {e}")))?;
-        Ok(Self {
-            inner: Arc::new(Inner {
-                http,
-                issuer: issuer.to_owned(),
-                resource: endpoint.to_owned(),
-                client_id,
-                secret: Secret(secret),
-                backoff_unit: BACKOFF_UNIT,
-                state: tokio::sync::Mutex::default(),
-            }),
-        })
+        Ok(Self::wrap(Inner {
+            http,
+            issuer: issuer.to_owned(),
+            resource: endpoint.to_owned(),
+            client_id,
+            secret: Secret(secret),
+            backoff_unit: BACKOFF_UNIT,
+            endpoints: tokio::sync::OnceCell::new(),
+            state: std::sync::Mutex::default(),
+            minted: tokio::sync::Notify::new(),
+            generation: tokio::sync::watch::Sender::new(0),
+        }))
+    }
+
+    fn wrap(inner: Inner) -> Self {
+        let inner = Arc::new(inner);
+        Self {
+            _owner: Arc::new(Owner(Arc::downgrade(&inner))),
+            inner,
+        }
     }
 
     #[cfg(test)]
-    pub(crate) fn with_backoff_unit(mut self, unit: Duration) -> Self {
-        Arc::get_mut(&mut self.inner)
-            .expect("set before any clone")
-            .backoff_unit = unit;
-        self
+    pub(crate) fn with_backoff_unit(self, unit: Duration) -> Self {
+        let Self { inner, _owner } = self;
+        drop(_owner);
+        let mut inner = Arc::try_unwrap(inner).ok().expect("set before any clone");
+        inner.backoff_unit = unit;
+        Self::wrap(inner)
     }
 
-    /// Revokes the current token (RFC 7009, at the server's revocation endpoint with the same Basic auth), so a run's token ends when the run does: its sessions are refused on their next call. Call it after `Session::end`. The token is out of service from the start, so a later `token` mints a new one; if the revocation fails (`Unreachable`, or `Auth` for a refusal), calling `revoke` again retries the same token. With no token to revoke nothing is sent.
+    /// Revokes the current token (RFC 7009, at the server's revocation endpoint with the same Basic auth), so a run's token ends when the run does: its sessions are refused on their next call. Call it after `Session::end`. The token is out of service from the start, so a later `token` mints a new one; if the revocation fails (`Unreachable`, or `Auth` for a refusal), calling `revoke` again retries the same token. Each pending token is sent on its own, so one that keeps failing doesn't hold back the rest. A mint in flight is waited for, so its token is revoked too. With no token to revoke nothing is sent; when the server advertises no revocation endpoint nothing is kept to retry.
     pub async fn revoke(&self) -> Result<(), Error> {
-        let mut s = self.inner.state.lock().await;
-        if let Some(current) = s.current.take() {
-            s.revoking.push(current.token);
-        }
-        if s.revoking.is_empty() {
+        // The current token goes out of service at once; a mint in flight finishes first, so the token it installs is revoked too rather than left live. Each take shares a critical section with the check of `minting`.
+        let mut had_current = false;
+        let pending = loop {
+            let notified = self.inner.minted.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let mut s = self.inner.state();
+                if let Some(current) = s.current.take() {
+                    had_current = true;
+                    // Known to be unrevocable: nothing to keep (#1271 R3).
+                    let unrevocable = self
+                        .inner
+                        .endpoints
+                        .get()
+                        .is_some_and(|e| e.revocation.is_none());
+                    if !unrevocable {
+                        s.revoking.push(current.token);
+                    }
+                }
+                if !s.minting {
+                    break s.revoking.clone();
+                }
+            }
+            notified.await;
+        };
+        // Nothing to revoke: nothing sent, not even the metadata read.
+        if pending.is_empty() && !had_current {
             return Ok(());
         }
         let endpoints = self
             .inner
-            .endpoints(&mut s)
+            .endpoints()
             .await
             .map_err(MintError::into_error)?;
+        // Nothing is queued once the endpoints are known without one, and a current token means they are.
         let Some(url) = endpoints.revocation.clone() else {
             return Err(Error::Auth(AuthError::terminal(
                 "the server's metadata names no revocation endpoint",
             )));
         };
-        while let Some(token) = s.revoking.first() {
-            let response = self
-                .inner
-                .post(url.clone(), format!("token={}", form_encode(token)))
-                .send()
-                .await
-                .map_err(|e| Error::Unreachable(format!("revoke: {}", e.without_url())))?;
-            let status = response.status();
-            if !status.is_success() {
-                let text = format!("revoke answered HTTP {}", status.as_u16());
-                return Err(if status.as_u16() == 429 || status.is_server_error() {
-                    Error::Unreachable(text)
-                } else {
-                    Error::Auth(AuthError::terminal(text))
-                });
+        // Unlocked while sending (#1263): requests keep being served meanwhile.
+        let mut first_error = None;
+        let mut revoked = Vec::new();
+        for token in pending {
+            match self.inner.revoke_one(url.clone(), &token).await {
+                Ok(()) => revoked.push(token),
+                Err(e) => {
+                    first_error.get_or_insert(e);
+                }
             }
-            s.revoking.remove(0);
         }
-        Ok(())
+        self.inner.state().revoking.retain(|t| !revoked.contains(t));
+        first_error.map_or(Ok(()), Err)
+    }
+
+    /// The tokens still waiting on a revocation.
+    #[cfg(test)]
+    pub(crate) fn pending_revocations(&self) -> usize {
+        self.inner.state().revoking.len()
+    }
+
+    /// Lifts a backoff in force, so a test reaches the next mint without waiting it out.
+    #[cfg(test)]
+    pub(crate) fn skip_backoff(&self) {
+        self.inner.state().retry_at = None;
+    }
+
+    /// Until no mint is in flight: a background renewal has installed its token or recorded its failure.
+    #[cfg(test)]
+    pub(crate) async fn settled(&self) {
+        loop {
+            let notified = self.inner.minted.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if !self.inner.state().minting {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// Ages the current token: into its renewal window, or past its expiry too.
+    #[cfg(test)]
+    pub(crate) fn age_token(&self, expired: bool) {
+        let now = Instant::now();
+        let mut s = self.inner.state();
+        let m = s.current.as_mut().expect("a token to age");
+        m.renew_at = now;
+        if expired {
+            m.expires_at = now;
+        }
+    }
+}
+
+/// What a caller does next, decided under the lock and done outside it.
+enum Step {
+    Serve(String),
+    /// Mint with no valid token to serve.
+    Mint,
+    /// Serve this still-valid token and renew it in the background (#1375 F3).
+    Renew(String),
+    /// Another caller is minting and there's no valid token: wait for it.
+    Wait,
+    /// A short backoff holds the mint.
+    Sleep(Duration),
+}
+
+/// Owned by the caller running a mint: however the mint ends, cancelled included, the flag is cleared and waiters woken (#1271 F8).
+struct MintGuard<'a> {
+    inner: &'a Inner,
+    done: bool,
+}
+
+impl Drop for MintGuard<'_> {
+    fn drop(&mut self) {
+        if !self.done {
+            // Cut off mid-mint (the transport's request bound, a caller's timeout, a renewal aborted with the credential): a transient failure, so the next mint backs off.
+            let mut s = self.inner.state();
+            s.minting = false;
+            self.inner
+                .back_off(&mut s, "a token request was cancelled".into(), None);
+        }
+        self.inner.minted.notify_waiters();
     }
 }
 
@@ -348,12 +483,33 @@ impl Inner {
             .body(body)
     }
 
+    /// The state; a panic elsewhere while it was held leaves nothing half-written that matters here.
+    fn state(&self) -> std::sync::MutexGuard<'_, State> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// The metadata's endpoints, read once.
-    async fn endpoints<'s>(&self, s: &'s mut State) -> Result<&'s Endpoints, MintError> {
-        if s.endpoints.is_none() {
-            s.endpoints = Some(self.discover().await?);
+    async fn endpoints(&self) -> Result<&Endpoints, MintError> {
+        self.endpoints.get_or_try_init(|| self.discover()).await
+    }
+
+    /// One RFC 7009 revocation.
+    async fn revoke_one(&self, url: reqwest::Url, token: &str) -> Result<(), Error> {
+        let response = self
+            .post(url, format!("token={}", form_encode(token)))
+            .send()
+            .await
+            .map_err(|e| Error::Unreachable(format!("revoke: {}", e.without_url())))?;
+        let status = response.status();
+        if status.is_success() {
+            return Ok(());
         }
-        Ok(s.endpoints.as_ref().expect("set above"))
+        let text = format!("revoke answered HTTP {}", status.as_u16());
+        Err(if status.as_u16() == 429 || status.is_server_error() {
+            Error::Unreachable(text)
+        } else {
+            Error::Auth(AuthError::terminal(text))
+        })
     }
 
     /// RFC 8414 §3: the metadata is at the issuer's origin, the issuer's path after the well-known prefix.
@@ -419,8 +575,8 @@ impl Inner {
         })
     }
 
-    async fn mint(&self, s: &mut State) -> Result<Minted, MintError> {
-        let url = self.endpoints(s).await?.token.clone();
+    async fn mint(&self) -> Result<Minted, MintError> {
+        let url = self.endpoints().await?.token.clone();
         let started = Instant::now();
         let body = format!(
             "grant_type=client_credentials&resource={}",
@@ -456,116 +612,185 @@ impl Inner {
             expires_at: started + lifetime,
             renew_at: started + lifetime.mul_f64(RENEW_AT),
             replaced_rejected: false,
+            served: false,
         })
     }
 
-    /// Mints, recording the outcome: a terminal error kills the credential, a transient one schedules the next attempt.
-    async fn mint_recorded(&self, s: &mut State) -> Result<(), AuthError> {
-        match self.mint(s).await {
-            Ok(minted) => {
+    /// Schedules the next mint attempt after a failure, doubling per failure in a row; a longer `retry_after` wins.
+    fn back_off(&self, s: &mut State, message: String, retry_after: Option<Duration>) {
+        s.failures = s.failures.saturating_add(1);
+        let wait = self
+            .doubled(s.failures)
+            .max(retry_after.unwrap_or_default())
+            .min(BACKOFF_MAX);
+        s.retry_at = Some(Instant::now() + wait);
+        s.last_failure = message;
+    }
+
+    /// The backoff unit doubled per failure after the first.
+    fn doubled(&self, failures: u32) -> Duration {
+        self.backoff_unit
+            .saturating_mul(1 << failures.saturating_sub(1).min(16))
+    }
+
+    /// Runs one mint with no lock held, then records the outcome: a terminal error kills the credential, a transient one schedules the next attempt. The caller set `minting`. `served`: the token goes straight to a caller, not a background renewal.
+    async fn mint_recorded(&self, served: bool) -> Result<String, AuthError> {
+        let mut guard = MintGuard {
+            inner: self,
+            done: false,
+        };
+        let outcome = self.mint().await;
+        let mut s = self.state();
+        s.minting = false;
+        guard.done = true;
+        match outcome {
+            Ok(mut minted) => {
+                // The mark goes with the token installed after the rejection, whichever caller minted it and however many attempts failed first (#1375 F4).
+                minted.replaced_rejected = std::mem::take(&mut s.answering_rejection);
+                minted.served = served;
+                let token = minted.token.clone();
                 s.current = Some(minted);
                 s.failures = 0;
                 s.retry_at = None;
-                Ok(())
+                // Under the lock, so a watcher woken by it reads this token or a later one.
+                self.generation.send_modify(|g| *g = g.wrapping_add(1));
+                Ok(token)
             }
             Err(MintError::Terminal(message)) => {
                 let message = format!("the service credential is refused: {message}");
                 s.dead = Some(message.clone());
                 s.current = None;
+                s.answering_rejection = false;
                 Err(AuthError::terminal(message))
             }
             Err(MintError::Transient {
                 message,
                 retry_after,
             }) => {
-                s.failures = s.failures.saturating_add(1);
-                let doubled = self
-                    .backoff_unit
-                    .saturating_mul(1 << s.failures.saturating_sub(1).min(16));
-                let wait = doubled
-                    .max(retry_after.unwrap_or_default())
-                    .min(BACKOFF_MAX);
-                s.retry_at = Some(Instant::now() + wait);
-                s.last_failure = message.clone();
+                self.back_off(&mut s, message.clone(), retry_after);
                 Err(AuthError::transient(message))
             }
         }
+        // `guard` drops here, after the lock, and wakes the waiters.
     }
 
-    /// A mint now, waiting out a short backoff first; a longer one fails at once with the last failure.
-    async fn mint_soon(&self, s: &mut State) -> Result<(), AuthError> {
-        loop {
-            if let Some(dead) = &s.dead {
-                return Err(AuthError::terminal(dead.clone()));
-            }
-            if let Some(at) = s.retry_at {
-                let wait = at.saturating_duration_since(Instant::now());
-                if wait > WAIT_MAX {
-                    return Err(AuthError::transient(format!(
-                        "minting a token is backing off for {wait:?} after: {}",
-                        s.last_failure
-                    )));
-                }
-                tokio::time::sleep(wait).await;
-            }
-            // A transient failure loops: the next pass waits or gives up by the new backoff.
-            if self.mint_recorded(s).await.is_ok() {
-                return Ok(());
-            }
-        }
-    }
-
-    async fn token(&self) -> Result<String, AuthError> {
-        // Held across the mint: concurrent callers share one mint and its token.
-        let mut s = self.state.lock().await;
+    /// The next step for a caller that wants a token, with no lock held after it returns.
+    fn step(&self) -> Result<Step, AuthError> {
+        let mut s = self.state();
         if let Some(dead) = &s.dead {
             return Err(AuthError::terminal(dead.clone()));
         }
         let now = Instant::now();
-        if let Some(m) = &s.current {
-            if now < m.renew_at {
-                return Ok(m.token.clone());
-            }
-            // Due for renewal but still valid: it serves when a backoff holds the mint or the mint fails transiently.
+        let (minting, backing_off) = (s.minting, s.retry_at.is_some_and(|at| now < at));
+        if let Some(m) = &mut s.current {
             if now < m.expires_at {
+                // Valid: served by every caller, renewing in the background once due (#1375 F3); a renewal in flight, a backoff or a failed renewal leaves it serving until it expires.
+                let used = std::mem::replace(&mut m.served, true);
                 let token = m.token.clone();
-                if s.retry_at.is_some_and(|at| now < at) {
-                    return Ok(token);
+                if now < m.renew_at || minting || backing_off {
+                    return Ok(Step::Serve(token));
                 }
-                return match self.mint_recorded(&mut s).await {
-                    Ok(()) => Ok(s.current.as_ref().expect("minted").token.clone()),
-                    Err(e) if s.dead.is_some() => Err(e),
-                    Err(_) => Ok(token),
-                };
+                s.minting = true;
+                // It lived to its renewal unrejected after a caller used it: the server takes this credential's tokens (#1375 F5).
+                if used {
+                    s.rejections = 0;
+                }
+                return Ok(Step::Renew(token));
+            }
+            s.current = None;
+        }
+        if s.minting {
+            return Ok(Step::Wait);
+        }
+        if let Some(at) = s.retry_at {
+            let wait = at.saturating_duration_since(now);
+            if wait > WAIT_MAX {
+                return Err(AuthError::transient(format!(
+                    "minting a token is backing off for {wait:?} after: {}",
+                    s.last_failure
+                )));
+            }
+            if !wait.is_zero() {
+                return Ok(Step::Sleep(wait));
             }
         }
-        s.current = None;
-        self.mint_soon(&mut s).await?;
-        Ok(s.current.as_ref().expect("minted").token.clone())
+        s.minting = true;
+        Ok(Step::Mint)
     }
 
-    async fn unauthorized(&self, rejected: &str) -> Result<(), AuthError> {
-        let mut s = self.state.lock().await;
-        if let Some(dead) = &s.dead {
-            return Err(AuthError::terminal(dead.clone()));
-        }
-        if let Some(m) = &s.current {
-            // Another request already replaced it.
-            if m.token != rejected {
-                return Ok(());
+    /// A token: the cached one, or one mint shared by every caller (#1263). A token due for renewal is served while a background task renews it (#1375 F3). With no valid token, waits out a short backoff rather than failing; a longer one fails at once with the last failure.
+    /// `serve`: the caller uses the token (`token`), rather than only wanting one ready (`unauthorized`).
+    async fn acquire(self: &Arc<Self>, serve: bool) -> Result<String, AuthError> {
+        loop {
+            // Registered before the state is read, so a mint ending in between still wakes this caller.
+            let notified = self.minted.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            match self.step()? {
+                Step::Serve(token) => return Ok(token),
+                Step::Renew(token) => {
+                    self.renew();
+                    return Ok(token);
+                }
+                Step::Wait => notified.await,
+                Step::Sleep(wait) => tokio::time::sleep(wait).await,
+                Step::Mint => match self.mint_recorded(serve).await {
+                    Ok(token) => return Ok(token),
+                    Err(e) if !e.retryable => return Err(e),
+                    // A transient failure loops: the next pass waits or gives up by the new backoff.
+                    Err(_) => {}
+                },
             }
-            // A token minted to replace a rejected one was rejected too: another mint won't help this request. The next `token` mints afresh.
-            if m.replaced_rejected {
-                s.current = None;
-                return Err(AuthError::terminal(
-                    "the server rejected a freshly minted token",
-                ));
-            }
         }
-        s.current = None;
-        self.mint_soon(&mut s).await?;
-        s.current.as_mut().expect("minted").replaced_rejected = true;
-        Ok(())
+    }
+
+    /// Spawns the renewal `step` claimed (`minting` set). The task holds the state, not the credential; the last clone's drop aborts it, and its guard records that as a cancelled mint.
+    fn renew(self: &Arc<Self>) {
+        let inner = Arc::clone(self);
+        // Spawned under the lock (spawning never blocks or awaits), so the handle is stored before the task can finish and another caller start a newer renewal: the newest handle is always the one kept. The task takes the lock only after its request.
+        let mut s = self.state();
+        let task = tokio::spawn(async move {
+            // Its outcome is recorded in the state; a failure leaves the current token serving until it expires.
+            let _ = inner.mint_recorded(false).await;
+        });
+        s.renewal = Some(task.abort_handle());
+    }
+
+    async fn token(self: &Arc<Self>) -> Result<String, AuthError> {
+        self.acquire(true).await
+    }
+
+    async fn unauthorized(self: &Arc<Self>, rejected: &str) -> Result<(), AuthError> {
+        {
+            let mut s = self.state();
+            if let Some(dead) = &s.dead {
+                return Err(AuthError::terminal(dead.clone()));
+            }
+            if let Some(m) = &mut s.current {
+                // Another caller's mint already replaced it: that token is this rejection's answer, so it takes the mark (#1375 F4).
+                if m.token != rejected {
+                    m.replaced_rejected = true;
+                    return Ok(());
+                }
+                // A token minted to replace a rejected one was rejected too: another mint won't help this request. The next `token` mints afresh, after a backoff that doubles per rejection in a row (#1264).
+                if m.replaced_rejected {
+                    s.current = None;
+                    s.rejections = s.rejections.saturating_add(1);
+                    let wait = self.doubled(s.rejections).min(BACKOFF_MAX);
+                    let at = Instant::now() + wait;
+                    s.retry_at = Some(s.retry_at.map_or(at, |r| r.max(at)));
+                    s.last_failure = "the server rejected a freshly minted token".into();
+                    return Err(AuthError::terminal(
+                        "the server rejected a freshly minted token",
+                    ));
+                }
+            }
+            s.current = None;
+            // The next token installed answers this rejection, whichever caller's mint installs it (a renewal in flight included).
+            s.answering_rejection = true;
+        }
+        // Not served: the request's retry asks `token` for it.
+        self.acquire(false).await.map(drop)
     }
 }
 
@@ -575,5 +800,8 @@ impl Credential for ClientCredentials {
     }
     fn unauthorized<'a>(&'a self, rejected: &'a str) -> BoxFuture<'a, Result<(), AuthError>> {
         Box::pin(self.inner.unauthorized(rejected))
+    }
+    fn changes(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+        Some(self.inner.generation.subscribe())
     }
 }
