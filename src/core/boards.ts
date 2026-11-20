@@ -1756,7 +1756,8 @@ export function assembleWho(rows: WhoRow[], match: PeerMatch | undefined, f: Who
     // members (#348), before `match` and the offline count, so neither probes
     // a hidden name.
     if (r.scope_kind !== null && !f.own.has(r.handle) && !f.seesName({ scope_kind: r.scope_kind, scope_ref: r.scope_ref })) continue;
-    // A session always reads back its own holds' labels, a non-primary hold's too (#1277): it set them.
+    // A session always reads its own holds' labels, a non-primary hold's too (#1277): it acts as that name. A team
+    // alias's labels can predate this holder (they pass to the next holder with the name, #836).
     const seesMeta = r.scope_kind !== null && (f.own.has(r.handle) || f.seesMeta({ scope_kind: r.scope_kind, scope_ref: r.scope_ref }));
     // The session's facts (where it runs, its status, harness, model, effort,
     // launcher) follow the labels' cut: an alias's to a caller that may act

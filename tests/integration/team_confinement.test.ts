@@ -99,6 +99,9 @@ describe("an ID is judged as its session's primary on every scoped board (#1255)
     const own = (await ops.call<{ peers: { handle: string; self?: boolean; task?: string; description?: string }[] }>("peer_list", { include_offline: true }))
       .peers.find((p) => p.handle === "eng/side");
     expect(own).toMatchObject({ self: true, task: "side task", description: "side desc" });
+    // A match on the label finds the row too.
+    const matched = await ops.call<{ peers: { handle: string }[] }>("peer_list", { include_offline: true, match: { task: "side task" } });
+    expect(matched.peers.map((p) => p.handle)).toEqual(["eng/side"]);
     // The control: only its own rows pass. Its primary is qa/ops, so another session's eng name still shows it no labels
     // or status (#1255).
     const b2 = await hosted("eng/b2");
