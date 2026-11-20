@@ -175,7 +175,7 @@ export function startServer(config: Config, opts: StartOptions = {}) {
   // Before the timers and the lag sampler: a metrics port in use fails startup with only the main listener to unwind.
   let metrics: ReturnType<typeof serveMetrics> | undefined;
   try { metrics = config.metricsAddr ? serveMetrics(config.metricsAddr, gauges) : undefined; }
-  catch (e) { server.stop(true); throw e; }
+  catch (e) { void server.stop(true); throw e; }
 
   const timers: ReturnType<typeof setInterval>[] = [];
   let stopRetention: (() => void) | undefined;
@@ -219,10 +219,10 @@ export function startServer(config: Config, opts: StartOptions = {}) {
       for (const t of timers) clearInterval(t);
       stopRetention?.();
       stopLag?.();
-      metrics?.stop(true);
+      void metrics?.stop(true);
       stopExpiry();
       touches.cancelAll();
-      server.stop(true);
+      void server.stop(true);
       // After the startup writes settle: closing the database under a queued one would fail it mid-flight.
       stopPromise = ready.catch(() => {}).then(() => Promise.allSettled([mcp.close(), attachments.close()])).then(outcomes => {
         const failure = outcomes.find(outcome => outcome.status === "rejected");

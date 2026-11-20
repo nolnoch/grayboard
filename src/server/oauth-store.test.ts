@@ -74,9 +74,9 @@ describe("OAuth domain store (SQLite only)", () => {
     const workers = [run(0), run(1)];
     try {
       await Promise.all(workers.map(w => w.wait("READY")));
-      workers[0]!.proc.stdin.end();
+      void workers[0]!.proc.stdin.end();
       await workers[0]!.wait("test pause hit: oauth:refresh:in-txn");
-      workers[1]!.proc.stdin.end();
+      void workers[1]!.proc.stdin.end();
       await workers[1]!.wait("ROTATING");
       expect(await first.repo.oauth.isGrantActive(first.repo.read, input.grantId, start + 1)).toBe(true);
       await Bun.write(release, "release");
