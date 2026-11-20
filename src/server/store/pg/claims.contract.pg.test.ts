@@ -35,7 +35,7 @@ const pgClaimsBackend: ClaimsBackend = {
         acquired_at: int8(r.acquired_at), expires_at: int8(r.expires_at), holder_user: r.holder_user as string | null,
       })),
       watchRows: async () => [...await sql`SELECT key, handle FROM claim_watches ORDER BY key, handle`],
-      eventRows: async () => (await sql`SELECT key, handle, event, note, board, expires_at, held_by, at FROM claim_events ORDER BY id`)
+      eventRows: async () => (await sql`SELECT key, handle, event, note, board, expires_at, held_by, at, session_id FROM claim_events ORDER BY id`)
         .map((r: Row) => ({ ...r, expires_at: int8OrNull(r.expires_at), at: int8(r.at) })),
       async close() {
         await s.close();
