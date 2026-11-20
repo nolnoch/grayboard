@@ -28,7 +28,7 @@ import { writeAudit } from "./audit.ts";
 import { endSessionServer } from "./session_end.ts";
 import { principalOfAuthed, type AuthedUser } from "./auth.ts";
 import {
-  age, checkBody, parseAliasMeta, pendingKey, refOf,
+  age, checkBody, parseAliasMeta, pendingKey, postPreChecks, refOf,
   cleanFact, idCollisionText, normalizeBoard, getBoard,
   type AliasMetaSet, type Board, type CoreDb, type PendingRef, type ReadResult, type SnapshotOptions, type UnboundPeer,
 } from "../core/boards.ts";
@@ -2129,6 +2129,9 @@ async function handleBoardPost(hub: Hub, tx: Tx, session: ApplicationSession, me
     }
     // Its board is reused inside the savepoint: the same transaction, so the same row (b5b2 Decision 9).
     const { board, gate } = await postGateOn(repo, hub.access, tx, me, postArgs.board, parentId);
+    // Core's order (#1225): the gate, then the body and mode checks, then the uploads, so a call with several faults
+    // is refused for the same one in both modes. serverPost runs the same checks again; they hold, so they pass.
+    postPreChecks(board.name, postArgs.body, gate.announcement, { online: ctx.online, attachments: { ids, send: ctx.files } });
     const fp = { board: normalizeBoard(postArgs.board), body: postArgs.body, parent_id: parentId, attachments: await repo.attachments.unsentDigests(tx, ids, uploaderOf(session)) };
     out = await writeOnce(hub, tx, session, "board_post", me, fp, resend === true, ids, async sp => {
       const o = await serverPost(repo, hub.access, sp, me, board, gate, postArgs, ctx);
