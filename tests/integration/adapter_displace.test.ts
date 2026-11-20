@@ -409,3 +409,28 @@ test("a sibling whose own record it is still restores its names, verified, with 
   expect(me.aliases).toEqual(["task-s"]);
   expect(status(me.id)).toBe("sibling's task");
 }, 30_000);
+
+// #1464: retention prunes an ended session's ids row (boards.ts pruneEndedIds).
+// A record whose writer has no row left can't be told an adapter's child's,
+// so it's taken at its word (recordPredecessor): restored, as before #1457.
+test("a sibling restarting on a record whose writer's ids row retention pruned restores its names", async () => {
+  const client = await localSession(dir, undefined, { extra: { [SIBLINGS]: sock } });
+  const adapter = await siblingSession(sock, adapterEnv("conv-1"));
+  await ready(adapter);
+  const adapterId = (await who(adapter)).id;
+  expect(record(client.harnessPid)).toMatchObject({ names: ["omp-local"], session_id: adapterId });
+  await adapter.c.close();
+  await until(() => ended(adapterId), 10_000, "the adapter's child ends");
+  const db = new Database(join(dir, "bus.db"));
+  try {
+    db.exec("PRAGMA busy_timeout = 10000");
+    expect(db.prepare(`DELETE FROM ids WHERE id = ?`).run(adapterId).changes).toBe(1);
+  } finally {
+    db.close();
+  }
+  const restarted = await client.restart("reconnect");
+  const me = await who(restarted);
+  expect(me.aliases).toEqual(["omp-local"]);
+  expect(holder("omp-local")).toBe(me.id);
+  expect(restarted.stderr()).not.toContain("not restored");
+}, 30_000);

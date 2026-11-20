@@ -7,7 +7,8 @@ import { join } from "node:path";
 import { DEFAULT_IDLE_SECONDS, MAX_CHILDREN, TOUCH_EVERY_MS, REFUSED_COALESCE_MS, childCapacity, childSessionId, holdAlias, idAddress, logBinding } from "../core/bindings.ts";
 import { IdCollision, createBoard, declareHuman, openAccess, prunePosts, setAccess, touchId } from "../core/boards.ts";
 import { claim, watch } from "../core/claims.ts";
-import { ChildSessions, acquireName, attachSession, candidateNames, childFallback, conversationSnapshot, endLocalSession, liveSessions, reap, registerChild, registerSession, runnerRoot, runnerRootLive, thisSession, type SessionKind, type SessionRow } from "./binding.ts";
+import { ChildSessions, acquireName, attachSession, recordYieldReads, recordYields, candidateNames, childFallback, conversationSnapshot, endLocalSession, liveSessions, reap, registerChild, registerSession, runnerRoot, runnerRootLive, thisSession, type SessionKind, type SessionRow } from "./binding.ts";
+import * as proc from "../shared/proc.ts";
 import { procStart } from "../shared/proc.ts";
 import { CoreError } from "../core/errors.ts";
 import { coreRefusalCode } from "../core/session_end.ts";
@@ -542,4 +543,101 @@ test("liveSessions probes ids through the live-row index", () => {
     const plan = (db.prepare(`EXPLAIN QUERY PLAN ${sql}`).all() as { detail: string }[]).map((r) => r.detail);
     expect(plan[0], sql).toBe("SCAN ids USING INDEX idx_ids_live");
   }
+});
+
+// #1381/#1401/#1463/#1464: a holder an adapter's child may displace, and an
+// adapter's child a sibling yields its name record to, are judged live and
+// the harness's child. This test process stands in for both, under its own
+// parent as the harness; the taker or writer is a row with a dead pid, which
+// neither judgement reads.
+const harness = process.ppid;
+function displacementBus(): { db: Database; holder: string; taker: string } {
+  const db = openLocalDb(join(mkdtempSync(join(tmpdir(), "gb-local-")), "bus.db")).db;
+  const holder = "id:0123456789aba", taker = "id:0123456789abb";
+  const me = { ...thisSession(holder), pid: process.pid, proc_start: procStart(process.pid) ?? null, harness_pid: harness, harness_rule: null };
+  registerSession(db, me);
+  holdAlias(db, "omp-local", holder);
+  registerSession(db, { ...thisSession(taker), pid: 999999, proc_start: null, harness_pid: harness, harness_rule: null }, { harnessSession: "conv-1" });
+  return { db, holder, taker };
+}
+function yieldBus(): { db: Database; writer: string } {
+  const db = openLocalDb(join(mkdtempSync(join(tmpdir(), "gb-local-")), "bus.db")).db;
+  const writer = "id:0123456789abc";
+  registerSession(db, { ...thisSession("id:0123456789abd"), pid: process.pid, proc_start: procStart(process.pid) ?? null, harness_pid: harness, harness_rule: null }, { harnessSession: "conv-1" });
+  registerSession(db, { ...thisSession(writer), pid: 999999, proc_start: null, harness_pid: harness, harness_rule: null });
+  return { db, writer };
+}
+// Every parentsOf call, and whether it ran inside a write transaction.
+function watchParents(db: Database, answer?: (pids: number[]) => Map<number, number | null>) {
+  const real = proc.parentsOf;
+  const calls: boolean[] = [];
+  const spy = spyOn(proc, "parentsOf").mockImplementation((pids: number[]) => {
+    calls.push(db.inTransaction);
+    return (answer ?? real)(pids);
+  });
+  return { calls, restore: () => spy.mockRestore() };
+}
+
+test("an adapter's child displaces its harness's sibling with the holder's parent read before the write lock (#1463)", async () => {
+  const { db, holder, taker } = displacementBus();
+  const w = watchParents(db);
+  try {
+    expect(await acquireName(db, taker, "omp-local", { create: true, displace: harness })).toMatchObject({ ok: true, ended: { wake: [holder] } });
+  } finally { w.restore(); }
+  expect(w.calls).toEqual([false]);
+});
+
+test("a holder that took the name after the pre-lock read is read inside the lock, and still displaced (#1463)", async () => {
+  const { db, taker } = displacementBus();
+  // The pre-lock read finds no holder; another sibling (this process again, a new session) takes the name before the lock.
+  db.prepare(`DELETE FROM alias_holds WHERE address = 'omp-local'`).run();
+  const late = "id:0123456789abe";
+  registerSession(db, { ...thisSession(late), pid: process.pid, proc_start: procStart(process.pid) ?? null, harness_pid: harness, harness_rule: null });
+  const w = watchParents(db);
+  const txn = db.transaction.bind(db);
+  const gap = spyOn(db, "transaction").mockImplementation(((fn: Parameters<typeof db.transaction>[0]) => {
+    holdAlias(db, "omp-local", late);
+    return txn(fn);
+  }) as typeof db.transaction);
+  try {
+    expect(await acquireName(db, taker, "omp-local", { create: true, displace: harness })).toMatchObject({ ok: true, ended: { wake: [late] } });
+  } finally { w.restore(); gap.mockRestore(); }
+  expect(w.calls).toEqual([true]);
+});
+
+test("a holder whose parent can't be read isn't displaced (#1464)", async () => {
+  const { db, holder, taker } = displacementBus();
+  const w = watchParents(db, (pids) => new Map(pids.map((p) => [p, null])));
+  try {
+    expect(await acquireName(db, taker, "omp-local", { create: true, displace: harness })).toMatchObject({ ok: false, error: expect.stringContaining(holder) });
+  } finally { w.restore(); }
+  expect(w.calls.length).toBeGreaterThan(0);
+  expect(db.prepare(`SELECT id FROM alias_holds WHERE address = 'omp-local'`).all()).toEqual([{ id: holder }]);
+});
+
+test("a sibling yields its name record to its harness's adapter's child, with the process reads taken before the lock (#1463)", () => {
+  const { db, writer } = yieldBus();
+  const pre = recordYieldReads(db, writer, harness);
+  const w = watchParents(db);
+  try {
+    expect(db.transaction(() => recordYields(db, writer, harness, pre)).immediate()).toBe(true);
+  } finally { w.restore(); }
+  expect(w.calls).toEqual([]);
+  // A candidate the read didn't see (registered since) is read inside the lock.
+  const w2 = watchParents(db);
+  try {
+    expect(db.transaction(() => recordYields(db, writer, harness, new Map())).immediate()).toBe(true);
+  } finally { w2.restore(); }
+  expect(w2.calls).toEqual([true]);
+});
+
+test("a sibling doesn't yield its name record to an adapter's child whose parent can't be read (#1464)", () => {
+  const { db, writer } = yieldBus();
+  const w = watchParents(db, (pids) => new Map(pids.map((p) => [p, null])));
+  try {
+    const pre = recordYieldReads(db, writer, harness);
+    expect(db.transaction(() => recordYields(db, writer, harness, pre)).immediate()).toBe(false);
+    expect(db.transaction(() => recordYields(db, writer, harness)).immediate()).toBe(false);
+  } finally { w.restore(); }
+  expect(w.calls).toEqual([false, true]);
 });
