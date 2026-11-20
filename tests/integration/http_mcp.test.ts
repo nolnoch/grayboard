@@ -632,7 +632,6 @@ for (const outcome of ["closing", "aborted"] as const) test(`HTTP native: a disp
     expect("error" in settled).toBe(true);
   } finally {
     writeFileSync(go, "");
-    // The held handler runs on after its answer: its write commits before the database closes in afterEach.
     // The held handler runs on after its answer: it settles (a closing server's refusal, or the aborted call's write)
     // before afterEach closes the database.
     await until(() => boardCreates() === calls + 1, 10_000, "the held board_create to settle");
