@@ -275,7 +275,7 @@ export class ServerProcess {
   static async start(bin: string | string[], store: { dbPath: string } | { url: string; blobDir?: string }, extra: Record<string, string> = {}): Promise<ServerProcess> {
     const ownedBlobs = "url" in store && !store.blobDir ? mkdtempSync(join(tmpdir(), "gb-proc-blobs-")) : undefined;
     const storeEnv: Record<string, string> = "url" in store
-      ? { GRAYBOARD_DATABASE_URL: store.url, GRAYBOARD_UNRELEASED_POSTGRES: "1", GRAYBOARD_BLOB_DIR: store.blobDir ?? ownedBlobs! }
+      ? { GRAYBOARD_DATABASE_URL: store.url, GRAYBOARD_BLOB_DIR: store.blobDir ?? ownedBlobs! }
       : { GRAYBOARD_DB_PATH: store.dbPath };
     try {
       return await ServerProcess.spawn(bin, { ...storeEnv, ...extra }, ownedBlobs);
