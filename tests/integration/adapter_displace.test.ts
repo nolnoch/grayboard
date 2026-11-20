@@ -5,7 +5,7 @@
 // first, and the sibling stops consuming the name's mail. Holders that aren't
 // such a sibling keep the name.
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { z } from "zod";
@@ -194,4 +194,41 @@ test("bind: the adapter's child binding a name its sibling holds takes it the sa
   const adapterId = (await who(adapter)).id;
   expect(holder("task-x")).toBe(adapterId);
   expect(displaced()).toEqual([expect.objectContaining({ actor: adapterId, target: clientId, name: "task-x" })]);
+}, 30_000);
+
+// #1403: a harness launched from a Claude Code shell (omp, pi) passes
+// CLAUDECODE and CLAUDE_CODE_SESSION_ID on to the grayboard it starts. That
+// session id is Claude Code's, not this harness's: the sibling records none,
+// so the adapter's child still takes the name from it.
+const inheritedClaude = { CLAUDECODE: "1", CLAUDE_CODE_SESSION_ID: "claude-shell-session" };
+const harnessSession = (id: string) => rows<{ harness_session: string | null }>(`SELECT harness_session FROM ids WHERE id = ?`, id)[0]!.harness_session;
+
+test("a sibling that inherited Claude Code's env from the shell that launched its harness records no harness session and is displaced", async () => {
+  const adapterP = localSession(dir, "omp-local", { extra: { [SIBLINGS]: sock, ...pauseEnv(dir, "mcp:before-register"), BUS_ADAPTER_OWNER: OWNER, BUS_HARNESS_SESSION: "conv-1" } });
+  const client = await siblingSession(sock, { BUS_ADAPTER_OWNER: null, BUS_HARNESS_SESSION: null, BUS_TEST_PAUSE: null, BUS_TEST_PAUSE_FILE: null, ...inheritedClaude });
+  const clientId = (await who(client)).id;
+  expect(holder("omp-local")).toBe(clientId);
+  expect(harnessSession(clientId)).toBeNull();
+  releasePause(dir, "mcp:before-register");
+  const adapter = await adapterP;
+  await ready(adapter);
+  const adapterId = (await who(adapter)).id;
+  expect(holder("omp-local")).toBe(adapterId);
+  expect(holds(clientId)).toEqual([]);
+  expect(displaced()).toEqual([expect.objectContaining({ actor: adapterId, target: clientId, name: "omp-local" })]);
+}, 30_000);
+
+test("a grayboard whose harness is Claude Code (a stand-in named claude) still records CLAUDE_CODE_SESSION_ID; BUS_HARNESS_SESSION still wins", async () => {
+  // Stand-in for Claude Code, as local.test.ts's: bun under the name
+  // `claude`, running grayboard mcp as its child on inherited stdio.
+  const fake = join(dir, "claude");
+  symlinkSync(process.execPath, fake);
+  const host = join(dir, "host.ts");
+  writeFileSync(host, `const cmd = process.argv.slice(process.argv.indexOf("::") + 1);
+Bun.spawn([process.execPath, ...cmd], { stdio: ["inherit", "inherit", "inherit"] }).exited.then((c) => process.exit(c ?? 0));`);
+  const flags = ["--dangerously-load-development-channels", "server:grayboard", "::"];
+  const cc = await localSession(dir, "cc", { extra: { ...inheritedClaude, CLAUDE_CODE_ENTRYPOINT: "cli" }, via: [fake, host, ...flags] });
+  expect(harnessSession((await who(cc)).id)).toBe("claude-shell-session");
+  const explicit = await localSession(dir, "cc2", { extra: { ...inheritedClaude, CLAUDE_CODE_ENTRYPOINT: "cli", BUS_HARNESS_SESSION: "explicit" }, via: [fake, host, ...flags] });
+  expect(harnessSession((await who(explicit)).id)).toBe("explicit");
 }, 30_000);

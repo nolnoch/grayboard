@@ -169,16 +169,17 @@ const WRAPPERS = /(?:^|[\s/])(npx|bunx|pnpx|uvx|npm|pnpm|yarn)(?=\s|$)/;
 export function wrapperName(pid: number): string | null {
   const comm = commandName(pid);
   if (comm && SHELLS.has(comm)) return comm;
-  const args = process.platform === "linux"
-    ? (() => {
-        try {
-          return readFileSync(`/proc/${pid}/cmdline`, "utf8").split("\0").join(" ");
-        } catch {
-          return "";
-        }
-      })()
-    : (ps("args", [pid])?.get(pid) ?? "");
-  return WRAPPERS.exec(args)?.[1] ?? null;
+  return WRAPPERS.exec(commandLine(pid))?.[1] ?? null;
+}
+
+/** `pid`'s command line, space-joined, or "" when unreadable. */
+function commandLine(pid: number): string {
+  if (process.platform !== "linux") return ps("args", [pid])?.get(pid) ?? "";
+  try {
+    return readFileSync(`/proc/${pid}/cmdline`, "utf8").split("\0").join(" ").trim();
+  } catch {
+    return "";
+  }
 }
 
 /**
@@ -188,4 +189,23 @@ export function wrapperName(pid: number): string | null {
  */
 export function harnessAncestor(pid = process.pid): number | null {
   return ancestors(pid).find((p) => wrapperName(p) === null) ?? null;
+}
+
+/**
+ * Whether this process's harness (harnessAncestor) is Claude Code: its command
+ * name or its argv[0]'s basename is `claude`, or it is the npm package's
+ * cli.js under node. Null when that can't be read (no ancestors readable, as
+ * where neither /proc nor ps exists, or every ancestor a wrapper): an unknown,
+ * never evidence that it isn't. CLAUDECODE and CLAUDE_CODE_SESSION_ID are
+ * inherited by anything Claude Code launches, harnesses included (#1403), so
+ * only this tells a child of Claude Code from a grandchild.
+ */
+export function claudeIsHarness(pid = process.pid): boolean | null {
+  const h = harnessAncestor(pid);
+  if (h === null) return null;
+  const comm = commandName(h);
+  const args = commandLine(h);
+  if (comm === null && !args) return null;
+  const argv0 = args.split(/\s+/)[0]?.split("/").pop() ?? "";
+  return comm === "claude" || argv0 === "claude" || /[\\/]@anthropic-ai[\\/]claude-code[\\/]cli\.js(?:\s|$)/.test(args);
 }
