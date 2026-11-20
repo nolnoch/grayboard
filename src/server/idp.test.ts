@@ -92,3 +92,25 @@ test("defaultProviders builds Okta from Config in the listed order, fetching not
   expect(defaultProviders({ ...base, idps: ["google", "okta"] }).map(p => p.id)).toEqual(["google", "okta"]);
   expect(defaultProviders({ ...base, idps: ["okta"] }).map(p => p.id)).toEqual(["okta"]);
 });
+
+// #1418: oidc from Config is the generic provider under its label and callback; with no secret, a public client.
+test("defaultProviders builds oidc from Config, a public client when it has no secret", async () => {
+  const ISSUER = "https://sso.example.com/realms/eng";
+  let token: { authorization: string | null; form: URLSearchParams } | undefined;
+  globalThis.fetch = Object.assign(async (input: string | URL | Request, init?: RequestInit) => {
+    const req = new Request(input, init);
+    if (req.url === ISSUER + "/.well-known/openid-configuration") return Response.json({ issuer: ISSUER,
+      authorization_endpoint: ISSUER + "/auth", token_endpoint: ISSUER + "/token", jwks_uri: ISSUER + "/certs",
+      code_challenge_methods_supported: ["S256"], id_token_signing_alg_values_supported: ["RS256"] });
+    if (req.url === ISSUER + "/token") { token = { authorization: req.headers.get("authorization"), form: new URLSearchParams(await req.text()) }; return Response.json({ error: "invalid_grant" }, { status: 400 }); }
+    throw new Error("unexpected request " + req.url);
+  }, { preconnect: realFetch.preconnect });
+
+  const config = { ...base, okta: undefined, idps: ["oidc", "google"], oidc: { issuer: ISSUER, clientId: "grayboard", allowedDomains: ["example.com"], label: "Example SSO" } } as unknown as Config;
+  const providers = defaultProviders(config);
+  expect(providers.map(p => [p.id, p.label, p.issuer, callbackPath(p)])).toEqual([
+    ["oidc", "Example SSO", ISSUER, "/oauth/oidc/callback"], ["google", "Google", GOOGLE_ISSUER, "/oauth/google/callback"]]);
+  await expect(providers[0]!.exchange({ code: "c", verifier: "v", redirectUri: "https://grayboard.example.com/oauth/oidc/callback", nonce: "n" })).rejects.toThrow("token");
+  expect(token!.authorization).toBeNull();
+  expect([token!.form.get("client_id"), token!.form.get("code_verifier")]).toEqual(["grayboard", "v"]);
+});

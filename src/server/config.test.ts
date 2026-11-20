@@ -375,6 +375,10 @@ describe("loadConfig", () => {
       oidc();
       process.env.GRAYBOARD_OIDC_CLIENT_SECRET_FILE = path;
       expect(loadConfig().oidc).toMatchObject({ clientSecret: "oidc-private" });
+      // An empty path is refused, never read as "no secret" (a public client).
+      delete process.env.GRAYBOARD_OIDC_CLIENT_SECRET;
+      process.env.GRAYBOARD_OIDC_CLIENT_SECRET_FILE = "";
+      expect(() => loadConfig()).toThrow("GRAYBOARD_OIDC_CLIENT_SECRET_FILE is set but empty");
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

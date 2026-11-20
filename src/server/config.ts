@@ -311,6 +311,9 @@ function oidcConfig(listed: boolean): OidcConfig | undefined {
     return undefined;
   }
   for (const name of OIDC_VARS) if (!process.env[name]) throw new Error(`GRAYBOARD_IDPS lists oidc, so ${name} is required`);
+  // resolveFileSecrets skips an empty NAME_FILE; for oidc that would silently mean a public client.
+  if (process.env.GRAYBOARD_OIDC_CLIENT_SECRET_FILE === "")
+    throw new Error("GRAYBOARD_OIDC_CLIENT_SECRET_FILE is set but empty: give the secret's path, or unset it for a public client");
   const secret = process.env.GRAYBOARD_OIDC_CLIENT_SECRET;
   return {
     issuer: process.env.GRAYBOARD_OIDC_ISSUER!,
@@ -359,7 +362,9 @@ function checkOidcClient(prefix: string, c: { issuer: string; clientId: string; 
     throw new Error(`${prefix}_ISSUER must be an https URL with no query, fragment or trailing slash (the issuer exactly as ${whose} discovery document gives it)`);
   if (c.issuer === GOOGLE_ISSUER) throw new Error(`${prefix}_ISSUER can't be Google's issuer`);
   if (!CREDENTIAL.test(c.clientId) || (c.clientSecret !== undefined && !CREDENTIAL.test(c.clientSecret)))
-    throw new Error(`${prefix}_CLIENT_ID and ${prefix}_CLIENT_SECRET must be nonempty credentials without whitespace`);
+    throw new Error(c.clientSecret === undefined
+      ? `${prefix}_CLIENT_ID must be a nonempty credential without whitespace`
+      : `${prefix}_CLIENT_ID and ${prefix}_CLIENT_SECRET must be nonempty credentials without whitespace`);
   if (!c.allowedDomains.length || c.allowedDomains.some(d => !DOMAIN.test(d)))
     throw new Error(`${prefix}_ALLOWED_DOMAINS must be email domains, comma-separated (example.com), not "${c.allowedDomains.join(",")}"`);
 }

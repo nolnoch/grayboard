@@ -472,7 +472,7 @@ elif [ "$unit_new" = "1" ]; then
     *) echo "Set your hostname in ${caddy_dest}." ;;
   esac
   echo "Create /etc/grayboard/env (GRAYBOARD_DB_PATH, GRAYBOARD_PUBLIC_URL, and the sign-in provider's"
-  echo "variables: Google's or Okta's, docs/guide/server.md §3), then \`systemctl enable --now grayboard\`."
+  echo "variables: Google's, Okta's or OIDC's, docs/guide/server.md §3), then \`systemctl enable --now grayboard\`."
   echo "For nightly backups, schedule ${backup_dest} (docs/guide/server.md §6, Backups)."
 elif [ "$INSTALL_SERVER" = "1" ]; then
   echo "Server binary installed; systemd runs no grayboard unit from it. A server already running"
