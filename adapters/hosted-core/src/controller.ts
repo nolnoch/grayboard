@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import type { Enrollment, HostPort } from "./port.js";
-import { abortOf, InsufficientScope, LeaseUnavailable, ServerUnreachable, SubscriberError, SubscriptionClosed, Wire, type WireOptions } from "./wire.js";
+import { abortOf, InsufficientScope, LeaseUnavailable, ServerUnreachable, SubscriberError, SubscriptionClosed, unreachable, Wire, type WireOptions } from "./wire.js";
 import { AccessExpired, Refusal, RefreshInProgress, accessExpiry, admitPrefix, bindingOf, itemsOf, leaseOf, sameHeld, shortOf, stableID, validHeld, type BindingState, type Lease } from "./model.js";
 import { AncestryError, SessionRoutes, type SessionPath } from "./sessions.js";
 import { end, register, type Temporary } from "./children.js";
@@ -82,6 +82,7 @@ type Grace = { spent: number; lease?: () => Lease | undefined };
 // restore) ask the host the same way once the server answers with the expiry, and keep their own backoff (#916).
 const RECOVERY_FIRST_MS = 1_000, RECOVERY_MAX_MS = 30_000, RECOVERY_BUDGET_MS = 60 * 60_000;
 const UNREACHABLE_AT_RECOVER = "Server unreachable while recovering; retrying, approval retained";
+const refreshingAtRecover = (harness: string) => `Token refresh in progress in another ${harness} process while recovering; retrying, approval retained`;
 function sleep(ms: number, signal: AbortSignal) {
   return new Promise<void>(resolve => {
     if (signal.aborted) return resolve();
@@ -95,6 +96,19 @@ function sleep(ms: number, signal: AbortSignal) {
 function causeOf<T>(error: unknown, type: abstract new (...args: never[]) => T): T | undefined {
   for (let e = error, depth = 0; e && depth < 8; e = e instanceof Error ? e.cause : undefined, depth++) if (e instanceof type) return e;
   return undefined;
+}
+// A failure an older request's own fault may explain, so a newer request may not meet it (#1176): an outage or a
+// deadline, however the SDK or a wire's own timeout signal surfaced it (a ServerUnreachable, an
+// SdkError RequestTimeout or ConnectionClosed, a gateway status, a network code, an abort's TimeoutError), a token
+// refresh another process held, or the server's `unbound` (the root's binding moved while it waited at the gate).
+// A refusal (child_bound, child_registered_elsewhere, has_children, root_is_child and invalid_registration all
+// arrive as SubscriberError invalid_response), a malformed answer, or a sign-in's is the same for every request.
+function transient(error: unknown): boolean {
+  if (unreachable(error) || causeOf(error, RefreshInProgress)) return true;
+  for (let e = error, depth = 0; e && depth < 8; e = (e as { cause?: unknown }).cause, depth++) {
+    if ((e as { name?: unknown }).name === "TimeoutError" || (e instanceof SubscriberError && e.code === "unbound")) return true;
+  }
+  return false;
 }
 // The admission target's identity when the host keeps no approval key.
 function fingerprint(e: Enrollment) {
@@ -244,9 +258,11 @@ export class Controller<E extends Enrollment = Enrollment> {
     };
     // A joined registration that fails may have failed on an older request's deadline (one held at the bind
     // gate, its 10s spent before this call began): this call then registers once on its own, as it would have
-    // unshared, joining instead any newer one a peer started first (#567). Only while nothing it registers
-    // under has moved since it began: a root stopped, paused, re-enrolled or ended, or a child ended, would
-    // have the retry start an ownership nothing then ends, so the joined failure stands.
+    // unshared, joining instead any newer one a peer started first (#567). Only on a failure that request's own
+    // fault may explain (`transient`: an outage, a deadline, a busy refresh, `unbound`); a refusal or a sign-in
+    // would refuse the retry too, so it stands (#1176). And only while nothing it registers under has moved
+    // since it began: a root stopped, paused, re-enrolled or ended, or a child ended, would have the retry
+    // start an ownership nothing then ends, so the joined failure stands.
     const unmoved = () => !this.stopped && !this.routes.isEnded(path.sessionID) && !this.routes.isEnded(path.root)
       && this.roots.get(path.root) === r && !!r && !r.paused && r.epoch === epoch;
     let done = shared(), joined = !!done;
@@ -254,7 +270,7 @@ export class Controller<E extends Enrollment = Enrollment> {
       done ??= start();
       const error = await done.then(() => undefined, (error: unknown) => ({ error }));
       if (!error) break;
-      if (joined && unmoved()) { joined = false; done = shared(); continue; }
+      if (joined && transient(error.error) && unmoved()) { joined = false; done = shared(); continue; }
       if (!fetch) this.failure("child_register", error.error, r);
       throw error.error;
     }
@@ -804,7 +820,8 @@ export class Controller<E extends Enrollment = Enrollment> {
         await this.rotated(grace, () => this.prepare(r, true, true));
       } catch (caught) {
         const r = this.roots.get(id), error = this.expired(caught);
-        if (r && error instanceof ServerUnreachable && this.restorable(r, r.epoch)) {
+        // An outage, or another process holding the token refresh: retry on the outage backoff (#424 6, #895, #1334).
+        if (r && (error instanceof ServerUnreachable || error instanceof RefreshInProgress) && this.restorable(r, r.epoch)) {
           this.retrying(r, error);
           this.retryRestore(r);
         } else if (r && error instanceof AccessExpired && error.reason === "expired" && this.restorable(r, r.epoch)) {
@@ -916,7 +933,8 @@ export class Controller<E extends Enrollment = Enrollment> {
           catch (caught) {
             const error = this.expired(caught);
             if (!live()) return true;
-            if (error instanceof AccessExpired && error.reason === "expired") return false;
+            // Still expired, or another process holding the token refresh: the next check reads its outcome (#1334).
+            if ((error instanceof AccessExpired && error.reason === "expired") || error instanceof RefreshInProgress) return false;
             r.awaiting = undefined;
             this.set(r, "paused", failureMessage(error, this.hint), "recover", failureCode(error));
             return true;
@@ -931,8 +949,13 @@ export class Controller<E extends Enrollment = Enrollment> {
             const error = this.expired(caught);
             if (this.drifted || this.stopped || this.ending.has(id) || this.roots.get(id) !== r) return true;
             if (error instanceof AccessExpired && error.reason === "expired") { r.paused = true; r.awaiting = mark; awaiting(); return false; }
-            // An outage now: restore's retry, on the outage backoff (#424 6).
-            if (error instanceof ServerUnreachable && this.restorable(r, r.epoch)) { this.set(r, "retrying", UNREACHABLE_AT_RECOVER, "recover", failureCode(error)); this.retryRestore(r); return true; }
+            // An outage now, or another process holding the token refresh: restore's retry, on the outage
+            // backoff, as resume's and restore's own prepares do (#424 6, #895, #1334).
+            if ((error instanceof ServerUnreachable || error instanceof RefreshInProgress) && this.restorable(r, r.epoch)) {
+              this.set(r, "retrying", error instanceof RefreshInProgress ? refreshingAtRecover(this.port.harness) : UNREACHABLE_AT_RECOVER, "recover", failureCode(error));
+              this.retryRestore(r);
+              return true;
+            }
             // A sign-out pauses the root, as every start's does (#1325).
             if (this.signedOut(error)) r.paused = true;
             this.set(r, r.paused ? "paused" : "approved", failureMessage(error, this.hint), "recover", failureCode(error));

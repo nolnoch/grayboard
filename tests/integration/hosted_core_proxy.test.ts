@@ -7,13 +7,15 @@
 // own OAuth issuance would.
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { createServer, type AddressInfo, type Server } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Client, SdkError, SdkErrorCode, type AuthProvider, type CallToolResult } from "@modelcontextprotocol/client";
 import { AccessExpired } from "../../adapters/hosted-core/src/model.ts";
 import type { CallOutcome } from "../../adapters/hosted-core/src/controller.ts";
 import { CallAborted, hostTools, unlessAborted, loadMode, snapshotTools, ToolProxy, type CallHooks, type NativeTool, type ProxyOptions } from "../../adapters/hosted-core/src/proxy.ts";
-import { NativeWire, ServerUnreachable } from "../../adapters/hosted-core/src/wire.ts";
+import { NativeWire, OutcomeUnknown, ServerUnreachable } from "../../adapters/hosted-core/src/wire.ts";
+import { failureText } from "../../adapters/hosted-core/src/client.ts";
 import { hashToken } from "../../src/server/auth.ts";
 import { hostedSessionId } from "../../src/server/hosted.ts";
 import { GRAYBOARD_SESSION_META } from "../../src/shared/session_meta.ts";
@@ -604,4 +606,131 @@ test("a 401 the credential's refresh doesn't fix needs a new login: tool calls, 
   expect(instructions).toMatchObject({ reason: "expired", message: "Signed out of grayboard in pi; run /grayboard login" });
   // Each refused request ran the credential's refresh once before giving up.
   expect(refreshed).toBe(3);
+});
+
+// #1345: a call whose request left before the transport failed (a gateway 503, a reset after the server ran it) may
+// have taken effect, so the agent hears "check before calling it again", never "call the tool again"; a socket that
+// never opened (refused, at the call or at the shared connect) ran nothing and stays "Server unreachable". The broken
+// connection is still dropped, and nothing sends the call again. A credential's own outage (a refresh on the
+// request's token() or in onUnauthorized) also ran nothing and stays unreachable; a call in flight when its proxy
+// closes is a stop, not an outage.
+test("a call cut off after its request left reports its outcome unknown and is sent once; a socket that never opened, a credential outage and a proxy close are not (#1345)", async () => {
+  const listening = (server: Server) => new Promise<number>(resolve => server.listen(0, "127.0.0.1", () => resolve((server.address() as AddressInfo).port)));
+  // A peer that resets every connection once the request arrives: Bun's own ECONNRESET.
+  const resetter = createServer(socket => { socket.once("data", () => socket.destroy()); });
+  const resetPort = await listening(resetter);
+  // A port nothing listens on: Bun's own ECONNREFUSED.
+  const closed = createServer();
+  const deadPort = await listening(closed);
+  await new Promise(resolve => closed.close(resolve));
+  const { token } = await issue();
+  const p = proxy({ token: async () => token });
+  const list = NativeWire.prototype.listTools, fetch0 = globalThis.fetch;
+  let lists = 0, mode: "pass" | "503" | "reset" | "refused" | "hold" = "pass";
+  const { promise: holding, resolve: held } = Promise.withResolvers<void>();
+  const { promise: released, resolve: release } = Promise.withResolvers<void>();
+  const posts: string[] = [];
+  NativeWire.prototype.listTools = async function () { lists++; return list.call(this); };
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    if (mode !== "pass" && input instanceof Request && input.method === "POST") {
+      const body = await input.clone().text();
+      if (body.includes(`"method":"tools/call"`) && body.includes(`"name":"board_post"`)) {
+        if (mode === "hold") { held(); await released; return fetch0(input, init); }
+        posts.push(mode);
+        if (mode === "503") return new Response("", { status: 503 });
+        if (mode === "refused") return fetch0(`http://127.0.0.1:${deadPort}/mcp`, { method: "POST", body: "x" });
+        // The server runs the post; its answer is lost to a reset.
+        await (await fetch0(input, init)).text();
+        return fetch0(`http://127.0.0.1:${resetPort}/mcp`, { method: "POST", body: "x" });
+      }
+    }
+    return fetch0(input, init);
+  }) as typeof fetch;
+  const failed = (body: string) => p.call("board_post", { board: "outage", body }, "pi-root").then(() => { throw new Error("expected a failure"); }, (error: unknown) => error);
+  const bodies = async () => (JSON.parse(textOf(await p.call("board_read", { board: "outage" }, "pi-root"))) as { posts: { body: string }[] }).posts.map(post => post.body);
+  const unknownText = "Server unreachable mid-call; it may have taken effect, so check (dm_history, board_read, claim_list) before calling it again";
+  try {
+    expect((await p.call("bind", { name: "proxy-outage", create: true }, "pi-root")).isError).toBeUndefined();
+    expect((await p.call("board_create", { name: "outage", purpose: "#1345" }, "pi-root")).isError).toBeUndefined();
+    expect(lists).toBe(1);
+
+    mode = "503";
+    const gateway = await failed("gateway");
+    expect(gateway).toBeInstanceOf(OutcomeUnknown);
+    expect(gateway).toBeInstanceOf(ServerUnreachable);
+    expect(failureText(gateway, "call the tool again")).toBe(unknownText);
+    mode = "pass";
+    expect(await bodies()).toEqual([]);
+    // The broken connection was dropped: that read opened and listed a new one.
+    expect(lists).toBe(2);
+
+    mode = "reset";
+    const reset = await failed("landed");
+    expect(reset).toBeInstanceOf(OutcomeUnknown);
+    expect(failureText(reset, "call the tool again")).toBe(unknownText);
+    mode = "pass";
+    // It took effect, once.
+    expect(await bodies()).toEqual(["landed"]);
+    expect(lists).toBe(3);
+
+    mode = "refused";
+    const refused = await failed("never");
+    expect(refused).toBeInstanceOf(ServerUnreachable);
+    expect(refused).not.toBeInstanceOf(OutcomeUnknown);
+    expect(failureText(refused, "call the tool again")).toBe("Server unreachable; call the tool again");
+    mode = "pass";
+    expect(await bodies()).toEqual(["landed"]);
+    expect(lists).toBe(4);
+    // One request per call: nothing resent any of them.
+    expect(posts).toEqual(["503", "reset", "refused"]);
+
+    // A credential's own outage ran nothing, so it stays unreachable: a refresh on the request's token() (after
+    // signedOut()'s), and one after the server refused a stale token with 401. Both on an open connection.
+    let armed = false, fetches = 0, current = token;
+    const refreshing = proxy({ token: async () => {
+      if (armed && ++fetches === 2) throw new ServerUnreachable(new Error("token endpoint down"));
+      return current;
+    }, onUnauthorized: async () => { throw new ServerUnreachable(new Error("token endpoint down")); } });
+    // Each refresh outage drops the shared connection, so each case first opens a new one with a good token.
+    const opened = async () => expect(JSON.parse(textOf(await refreshing.call("whoami", {}, "pi-root")))).toMatchObject({ primary: "alice@example.com/proxy-outage" });
+    await opened();
+    current = "bogus";
+    const afterRefusal = await refreshing.call("board_post", { board: "outage", body: "refused" }, "pi-root").then(() => undefined, (error: unknown) => error);
+    current = token;
+    await opened();
+    armed = true;
+    const beforeSend = await refreshing.call("board_post", { board: "outage", body: "unsent" }, "pi-root").then(() => undefined, (error: unknown) => error);
+    armed = false;
+    for (const error of [beforeSend, afterRefusal]) {
+      expect(error).toBeInstanceOf(ServerUnreachable);
+      expect(error).not.toBeInstanceOf(OutcomeUnknown);
+      expect(failureText(error, "call the tool again")).toBe("Server unreachable; call the tool again");
+    }
+    expect(fetches).toBe(2);
+    expect(await bodies()).toEqual(["landed"]);
+
+    // A call in flight when its proxy closes: the wire's own abort is a stop, never an outage (reachable()'s rule).
+    const closing = proxy({ token: async () => token });
+    expect(JSON.parse(textOf(await closing.call("whoami", {}, "pi-root")))).toMatchObject({ primary: "alice@example.com/proxy-outage" });
+    mode = "hold";
+    const inFlight = closing.call("board_post", { board: "outage", body: "held" }, "pi-root").then(() => undefined, (error: unknown) => error);
+    await holding;
+    await closing.close();
+    const stopped = await inFlight;
+    expect(stopped).toBeInstanceOf(Error);
+    expect(stopped).not.toBeInstanceOf(ServerUnreachable);
+    mode = "pass";
+
+    // A shared connect that can't open its socket: unreachable, as before.
+    const dead = proxy({ token: async () => token }, { wire: { url: `http://127.0.0.1:${deadPort}/mcp`, sessionKey: GRAYBOARD_SESSION_META, client: { name: "grayboard-pi", version: "1.0.0" } } });
+    const down = await dead.call("board_post", { board: "outage", body: "down" }, "pi-root").then(() => undefined, (error: unknown) => error);
+    expect(down).toBeInstanceOf(ServerUnreachable);
+    expect(down).not.toBeInstanceOf(OutcomeUnknown);
+    expect(failureText(down, "call the tool again")).toBe("Server unreachable; call the tool again");
+  } finally {
+    release();
+    globalThis.fetch = fetch0;
+    NativeWire.prototype.listTools = list;
+    resetter.close();
+  }
 });

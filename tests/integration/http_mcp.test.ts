@@ -14,6 +14,7 @@ import { bindFixture, withMeta } from "../helpers/hosted.ts";
 import { seed } from "../support/seed.ts";
 import { stubAuthRead } from "../support/auth_stub.ts";
 import { until } from "../support/until.ts";
+import { render as renderMetrics } from "../../src/server/metrics.ts";
 
 let srv: TestServer;
 let app: TestServer["app"];
@@ -531,7 +532,7 @@ for (const outcome of ["closing", "aborted"] as const) test(`HTTP native: a call
 // token is revoked right after the boundary's authenticate passes, so selection's authenticate draws the 401; the call
 // is held at `mcp:select:refused` with that 401 in hand while the MCP side closes or the request aborts, then
 // `refuse()` stores it and throws into fetch's catch. In process, as #1324's: the answer must be the catch's
-// fall-through (an internal error), never the stored 401.
+// fall-through (503 on a closing endpoint, else an internal error), never the stored 401.
 for (const outcome of ["closing", "aborted"] as const) test(`HTTP native: a call ${outcome} while selection's refusal is held falls through, never 401 (#1332)`, async () => {
   const issued = await issueOAuth(app.repo, app.oauth.resource, "carol@example.com", ["grayboard:tools", "grayboard:delivery"], Date.now(), OPENCODE_CLIENT);
   const statuses: number[] = [];
@@ -573,7 +574,8 @@ for (const outcome of ["closing", "aborted"] as const) test(`HTTP native: a call
     else abort.abort();
     writeFileSync(go, "");
     const settled = await call;
-    expect(statuses.slice(before)).toEqual([500]);
+    // A closing endpoint answers 503, as it does a call arriving after close (#1336); an aborted call's 500 nobody reads.
+    expect(statuses.slice(before)).toEqual([outcome === "closing" ? 503 : 500]);
     expect("error" in settled).toBe(true);
   } finally {
     app.oauth.authenticate = authenticate;
@@ -581,6 +583,101 @@ for (const outcome of ["closing", "aborted"] as const) test(`HTTP native: a call
     delete process.env.BUS_TEST_PAUSE;
     delete process.env.BUS_TEST_PAUSE_FILE;
     rmSync(dir, { recursive: true, force: true });
+    await closing;
+  }
+});
+
+// The process-wide count of board_create calls settled (the metrics registry's histogram, success or throw).
+const boardCreates = () => Number(/^grayboard_tool_call_duration_seconds_count\{tool="board_create"\} (\d+)$/m.exec(renderMetrics())?.[1] ?? 0);
+// #1342: a modern call already dispatched (held inside board_create's handler at `hosted:tool:in-gate`, before its
+// write) when the MCP side closes. The SDK unwinds it with ConnectionClosed and answers 499 through the success path,
+// never fetch's catch; a closing endpoint answers 503 there too, with a body that says the call was dispatched, over
+// real HTTP. A client abort at the same point is not a close: its 499 stays (in process, since an aborted socket
+// reads no answer).
+for (const outcome of ["closing", "aborted"] as const) test(`HTTP native: a dispatched call ${outcome === "closing" ? "cut off by close answers 503" : "aborted by its client keeps 499"} (#1342)`, async () => {
+  const issued = await issueOAuth(app.repo, app.oauth.resource, "carol@example.com", ["grayboard:tools", "grayboard:delivery"], Date.now(), OPENCODE_CLIENT);
+  const answers: { status: number; body: string }[] = [];
+  const abort = new AbortController();
+  let target = false;
+  const client = new Client({ name: "http-test", version: "1" }, { supportedProtocolVersions: ["2026-07-28"], versionNegotiation: { mode: { pin: "2026-07-28" } } });
+  clients.push(client);
+  await client.connect(new StreamableHTTPClientTransport(new URL(`${base}/mcp`), {
+    requestInit: { headers: { Authorization: `Bearer ${issued.token}` } },
+    fetch: async (input, init) => {
+      const req = await withMeta(new Request(input, init), OPENCODE_SESSION_META, `dispatched-${outcome}`);
+      const r = outcome === "aborted" && target ? await app.mcp.fetch(new Request(req, { signal: abort.signal }), "127.0.0.1") : await fetch(req);
+      if (target) answers.push({ status: r.status, body: await r.clone().text() });
+      return r;
+    },
+  }));
+  await bindFixture(client, `dispatched-${outcome}`);
+  const dir = mkdtempSync(join(tmpdir(), "gb-1342-")), go = join(dir, "go"), hits: string[] = [];
+  const said = spyOn(console, "error").mockImplementation((...args: unknown[]) => { hits.push(args.join(" ")); });
+  process.env.BUS_TEST_PAUSE = "hosted:tool:in-gate";
+  process.env.BUS_TEST_PAUSE_FILE = go;
+  let closing: Promise<void> | undefined;
+  const calls = boardCreates();
+  try {
+    target = true;
+    const call = client.callTool({ name: "board_create", arguments: { name: `cut-${outcome}`, purpose: "held" } }).then(r => ({ result: r }), (error: unknown) => ({ error }));
+    await until(() => hits.some(h => h.includes("test pause hit: hosted:tool:in-gate")), 10_000, "board_create's in-gate pause");
+    if (outcome === "closing") closing = app.mcp.close();
+    else abort.abort();
+    const settled = await call;
+    expect(answers.map(a => a.status)).toEqual([outcome === "closing" ? 503 : 499]);
+    if (outcome === "closing") {
+      expect(answers[0]!.body).toBe("MCP endpoint closed during the call");
+      expect(hits.filter(h => h.includes("hosted MCP failed") && h.includes('"class":"EndpointClosedError"'))).toHaveLength(1);
+    }
+    expect("error" in settled).toBe(true);
+  } finally {
+    writeFileSync(go, "");
+    // The held handler runs on after its answer: it settles (a closing server's refusal, or the aborted call's write)
+    // before afterEach closes the database.
+    await until(() => boardCreates() === calls + 1, 10_000, "the held board_create to settle");
+    said.mockRestore();
+    delete process.env.BUS_TEST_PAUSE;
+    delete process.env.BUS_TEST_PAUSE_FILE;
+    await closing;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// #1342: the close-time 500 the SDK makes of the modern factory's own closed check (the endpoint closed while the
+// factory's authenticate awaited). Nothing was dispatched: the pre-dispatch 503 and its body, over real HTTP.
+test("HTTP native: a call whose factory meets the close answers 503, not 500 (#1342)", async () => {
+  const issued = await issueOAuth(app.repo, app.oauth.resource, "carol@example.com", ["grayboard:tools", "grayboard:delivery"], Date.now(), OPENCODE_CLIENT);
+  const answers: { status: number; body: string }[] = [];
+  let target = false;
+  const client = new Client({ name: "http-test", version: "1" }, { supportedProtocolVersions: ["2026-07-28"], versionNegotiation: { mode: { pin: "2026-07-28" } } });
+  clients.push(client);
+  await client.connect(new StreamableHTTPClientTransport(new URL(`${base}/mcp`), {
+    requestInit: { headers: { Authorization: `Bearer ${issued.token}` } },
+    fetch: async (input, init) => {
+      const r = await fetch(await withMeta(new Request(input, init), OPENCODE_SESSION_META, "factory-closing"));
+      if (target) answers.push({ status: r.status, body: await r.clone().text() });
+      return r;
+    },
+  }));
+  const said = spyOn(console, "error").mockImplementation(() => {});
+  const authenticate = app.oauth.authenticate;
+  let seen = 0;
+  let closing: Promise<void> | undefined;
+  // The targeted call authenticates at the boundary, at selection, then in the factory: the close lands in the third.
+  app.oauth.authenticate = async (...args) => {
+    const result = await authenticate.apply(app.oauth, args);
+    if (target && ++seen === 3) closing = app.mcp.close();
+    return result;
+  };
+  try {
+    target = true;
+    const settled = await client.callTool({ name: "whoami", arguments: {} }).then(r => ({ result: r }), (error: unknown) => ({ error }));
+    expect(seen).toBe(3);
+    expect(answers).toEqual([{ status: 503, body: "MCP endpoint is closed" }]);
+    expect("error" in settled).toBe(true);
+  } finally {
+    app.oauth.authenticate = authenticate;
+    said.mockRestore();
     await closing;
   }
 });

@@ -92,5 +92,5 @@ test("issuer is fixed and HTTPS, with explicit loopback-only development exempti
     expect(oauthPublicUrl(base, true)).toBe(base);
     expect(() => oauthPublicUrl(base, false)).toThrow();
   }
-  for (const base of ["http://remote.example", "https://example.com?x=1", "https://example.com#", "https://user@example.com", "https://example.com/a/../b", "https://example.com/%2f", "https://example.com/a//b"]) expect(() => oauthPublicUrl(base, true)).toThrow();
+  for (const base of ["http://remote.example", "https://example.com?x=1", "https://example.com#", "https://user@example.com", "https://example.com/a/../b", "https://example.com/%2f", "https://example.com/a//b", "https://example.com/hosted?", "https://example.com/hosted?/", "https://example.com/hosted/?", "https://example.com:443/hosted?", "https://example.com?"]) expect(() => oauthPublicUrl(base, true)).toThrow();
 });

@@ -7,7 +7,8 @@ import { Controller, type ControllerOptions } from "../src/controller.js";
 import { AccessExpired, Refusal, RefreshInProgress, same, type AccessReason, type Item } from "../src/model.js";
 import type { ApprovalPort, CredentialPort, Enrollment, HostPort } from "../src/port.js";
 import { resolveRoot } from "../src/sessions.js";
-import { LeaseUnavailable, ServerUnreachable, SubscriberError, Wire, type WireOptions } from "../src/wire.js";
+import { SdkError, SdkErrorCode } from "@modelcontextprotocol/client";
+import { LeaseUnavailable, OutcomeUnknown, ServerUnreachable, SubscriberError, subscriberError, Wire, type WireOptions } from "../src/wire.js";
 
 type Mode = "adapter" | "approval";
 type Row = { held: string[]; ownership: number; generation: number; capability?: string };
@@ -483,6 +484,38 @@ test.each(modes.flatMap(mode => (["expired", "login_required"] as const).map(rea
     expect(o.r.named("delivery_open")).toHaveLength(o.opened);
   } finally { await o.c.close(); await o.r.controller.close(); }
 });
+// #1334: the recovery's start finds another process holding the token refresh (processes sharing one grant store).
+// It retries on restore's outage backoff, as resume's and restore's own prepares do, and opens once the lock frees.
+test.each(modes)("a recovery whose start finds the token refresh in another process retries on the outage backoff (#1334, %s)", async mode => {
+  const busy = Promise.reject(new RefreshInProgress("pi"));
+  busy.catch(() => {});
+  const o = await expiredPause(mode, (n, r) => {
+    if (n === 1) { r.expireAccess(); r.holdPrepare(busy); }
+    // restore's retry: its first wait is 500 ms; the second (1000 ms) frees the lock.
+    if (n === 2) r.holdPrepare(Promise.resolve());
+  });
+  try {
+    await until(() => o.recovering() >= 2 && o.r.root(o.c)?.state === "active");
+    const seen = o.states.map(s => [s.state, s.operation, s.code].join(":"));
+    expect(seen).toContain("retrying:recover:refresh_in_progress");
+    expect(seen).toContain("retrying:restore:refresh_in_progress");
+    expect(seen.filter(s => s.startsWith("approved:recover") || s.startsWith("paused:recover"))).toEqual([]);
+    expect(o.recovering()).toBe(2);
+    expect(o.r.named("delivery_open")).toHaveLength(o.opened + 1);
+  } finally { await o.c.close(); await o.r.controller.close(); }
+});
+// #1334: the recovery's credential check itself finds the refresh in progress: it keeps waiting, rather than pausing for good.
+test.each(modes)("a recovery check that finds the token refresh in another process keeps waiting (#1334, %s)", async mode => {
+  const o = await expiredPause(mode, (n, r) => {
+    if (n === 1) r.failCheck(() => new RefreshInProgress("pi"));
+    if (n === 2) { r.failCheck(); r.expireAccess(); }
+  });
+  try {
+    await until(() => o.recovering() >= 2 && o.r.root(o.c)?.state === "active");
+    expect(o.recovering()).toBe(2);
+    expect(o.states.some(s => s.code === "refresh_in_progress")).toBe(false);
+  } finally { await o.c.close(); await o.r.controller.close(); }
+});
 // #1294 audit M-1: pi, omp and the Claude Code plugin stop through RootDelivery, which shuts the session down
 // (queued behind the start) before it closes: the shutdown itself ends the start's wire, and its release still runs.
 test.each(modes.flatMap(mode => (["enroll", "enroll with a name", "resume"] as const).map(how => [mode, how] as const)))("shutdown then close ends a start's wire still connecting at once and still releases (#1294, %s, %s)", async (mode, how) => {
@@ -713,11 +746,107 @@ test.each(modes)("a call whose joined registration fails registers once on its o
     await until(() => r.named("session_register").length === 1);
     const calling = r.controller.beforeCall({ sessionID: "C", tool: "dm_send" });
     r.holdRegister();
-    fail(new Error("MCP request timed out"));
+    fail(new SdkError(SdkErrorCode.RequestTimeout, "Request timed out"));
     await expect(fetching).rejects.toThrow("timed out");
     await calling;
     expect(r.named("session_register")).toHaveLength(2);
     await r.controller.beforeCall({ sessionID: "C", tool: "dm_send" });
+    expect(r.named("session_register")).toHaveLength(2);
+  } finally { await r.controller.close(); }
+});
+
+// #1176: a joined registration's failure the request's own fault may explain (an outage, a deadline however it
+// surfaced, a refresh another process held, the server's `unbound`) is retried once; a refusal or a sign-in, which the
+// retry would meet too, stands with exactly one registration.
+const CHILD = { sessionID: "C", root: "R", via: [] };
+// The instructions fetch starts the registration; a call joins it; the registration then fails with `error`, and
+// the call's own retry, if any, with `retry` (or succeeds).
+async function joinedFailure(r: ReturnType<typeof runtime>, c: Controller, error: unknown, retry?: Error) {
+  let fail!: (error: unknown) => void;
+  r.holdRegister(new Promise<void>((_, reject) => { fail = reject; }));
+  const fetching = c.enlist(CHILD, true);
+  await until(() => r.named("session_register").length === 1);
+  const calling = c.enlist(CHILD);
+  const again = retry ? Promise.reject(retry) : undefined;
+  again?.catch(() => {});
+  r.holdRegister(again);
+  fail(error);
+  return Promise.allSettled([fetching, calling]);
+}
+const deterministic: [string, () => unknown][] = [
+  // The server's session_register refusals reach hosted-core as the wire makes them: codes outside its domain set
+  // read invalid_response.
+  ...["child_bound", "child_registered_elsewhere", "has_children", "root_is_child", "invalid_registration"].map(code => [code, () => subscriberError({ code }, false)] as [string, () => unknown]),
+  ["forbidden", () => subscriberError({ code: "forbidden" }, false)],
+  ["AccessExpired", () => new AccessExpired("pi", "run /grayboard login", "login_required")],
+  ["AccessExpired, wrapped by connect", () => new Error("Version negotiation probe failed", { cause: new AccessExpired("pi", "run /grayboard login", "expired") })],
+  ["auth Refusal", () => new Refusal("auth", "unauthorized")],
+  ["invalid response", () => new Error("Invalid delivery response")],
+];
+const transient: [string, () => unknown][] = [
+  ["ServerUnreachable", () => new ServerUnreachable(Object.assign(new Error("reset"), { code: "ECONNRESET" }))],
+  ["OutcomeUnknown", () => new OutcomeUnknown(new Error("socket closed"))],
+  ["SDK request timeout", () => new SdkError(SdkErrorCode.RequestTimeout, "Request timed out")],
+  ["wire deadline", () => new SdkError(SdkErrorCode.RequestTimeout, String(new DOMException("The operation timed out.", "TimeoutError")))],
+  ["abort TimeoutError", () => new DOMException("The operation timed out.", "TimeoutError")],
+  ["RefreshInProgress, wrapped by connect", () => new Error("Version negotiation probe failed", { cause: new RefreshInProgress("pi") })],
+  ["unbound", () => subscriberError({ code: "unbound" }, false)],
+];
+test.each(modes)("a joined registration's refusal stands; its transient failure is retried once (#1176) (%s)", async mode => {
+  for (const [kind, cases] of [["deterministic", deterministic], ["transient", transient]] as const) {
+    for (const [name, make] of cases) {
+      const r = runtime(mode);
+      try {
+        await r.controller.enroll("R", ["be"], true);
+        await until(() => r.root(r.controller)?.state === "active");
+        const error = make();
+        const [fetching, calling] = await joinedFailure(r, r.controller, error);
+        expect([name, fetching]).toEqual([name, { status: "rejected", reason: error }]);
+        expect([name, calling]).toEqual([name, kind === "deterministic" ? { status: "rejected", reason: error } : { status: "fulfilled", value: undefined }]);
+        expect([name, r.named("session_register").length]).toEqual([name, kind === "deterministic" ? 1 : 2]);
+      } finally { await r.controller.close(); }
+    }
+  }
+});
+
+// #1176: a retry that fails too reports one child_register failure, for the call; the fetch it joined reports none.
+// A retry that succeeds leaves no degraded record.
+test.each(modes)("a joined registration's retry reports one failure when it fails too, none when it succeeds (#1176) (%s)", async mode => {
+  for (const outcome of ["fails", "succeeds"] as const) {
+    const r = runtime(mode);
+    const records: { state: string; operation: string }[] = [];
+    const c = r.make({ sink: record => { records.push({ state: record.state, operation: record.operation }); } });
+    try {
+      await c.enroll("R", ["be"], true);
+      await until(() => r.root(c)?.state === "active");
+      const first = new ServerUnreachable(new Error("reset")), second = new ServerUnreachable(new Error("reset again"));
+      const [fetching, calling] = await joinedFailure(r, c, first, outcome === "fails" ? second : undefined);
+      expect(fetching).toEqual({ status: "rejected", reason: first });
+      expect(calling).toEqual(outcome === "fails" ? { status: "rejected", reason: second } : { status: "fulfilled", value: undefined });
+      expect(r.named("session_register")).toHaveLength(2);
+      await c.flushDiagnostics();
+      expect(records.filter(x => x.operation === "child_register")).toEqual(outcome === "fails" ? [{ state: "degraded", operation: "child_register" }] : []);
+      expect(records.filter(x => x.state === "degraded")).toHaveLength(outcome === "fails" ? 1 : 0);
+      if (outcome === "succeeds") expect(r.root(c)).toMatchObject({ state: "active" });
+    } finally { await c.close(); await r.controller.close(); }
+  }
+});
+
+// #1176: two calls that joined one failed registration share one retry: two registrations in all, not three.
+test.each(modes)("two calls whose joined registration fails share one retry (#1176) (%s)", async mode => {
+  const r = runtime(mode);
+  try {
+    await r.controller.enroll("R", ["be"], true);
+    await until(() => r.root(r.controller)?.state === "active");
+    let fail!: (error: unknown) => void;
+    r.holdRegister(new Promise<void>((_, reject) => { fail = reject; }));
+    const fetching = r.controller.enlist(CHILD, true);
+    await until(() => r.named("session_register").length === 1);
+    const calls = [r.controller.enlist(CHILD), r.controller.enlist(CHILD)];
+    r.holdRegister();
+    const timeout = new SdkError(SdkErrorCode.RequestTimeout, "Request timed out");
+    fail(timeout);
+    expect(await Promise.allSettled([fetching, ...calls])).toEqual([{ status: "rejected", reason: timeout }, { status: "fulfilled", value: undefined }, { status: "fulfilled", value: undefined }]);
     expect(r.named("session_register")).toHaveLength(2);
   } finally { await r.controller.close(); }
 });
@@ -737,9 +866,11 @@ test.each(modes)("a call whose joined registration fails after its root paused o
       const calling = r.controller.enlist({ sessionID: "C", root: "R", via: [] });
       r.holdRegister();
       if (move === "pause") await r.controller.pause(); else await r.controller.ended("C");
-      fail(new Error("MCP request timed out"));
+      // A deadline, which unmoved would retry (#1176).
+      const timeout = new SdkError(SdkErrorCode.RequestTimeout, "Request timed out");
+      fail(timeout);
       const out = await Promise.allSettled([fetching, calling]);
-      expect(out.map(o => o.status === "rejected" && String(o.reason))).toEqual(["Error: MCP request timed out", "Error: MCP request timed out"]);
+      expect(out.map(o => o.status === "rejected" && o.reason)).toEqual([timeout, timeout]);
       expect(r.named("session_register")).toHaveLength(1);
     } finally { await r.controller.close(); }
   }
@@ -1367,6 +1498,42 @@ test("a restore that fails outside the expiry branches records a degraded root w
       await restarted.restore();
       await until(() => o.r.root(restarted)?.code === "alias_held");
       expect(o.r.root(restarted)).toMatchObject({ state: "degraded", operation: "restore", code: "alias_held" });
+    } finally { await restarted.close(); }
+  } finally { await o.c.close(); await o.r.controller.close(); }
+});
+// #1334 audit L-1: a restore's prepare finds another process holding the token refresh (processes sharing one grant
+// store restarting together): it retries on the outage backoff, as resume's does, rather than degrading.
+test("a restore whose prepare finds the token refresh in another process retries on the outage backoff (#1334)", async () => {
+  const r = runtime("approval");
+  await r.controller.enroll("R", ["be"], true);
+  await until(() => r.root(r.controller)?.state === "active");
+  await r.controller.close();
+  const busy = Promise.reject(new RefreshInProgress("pi"));
+  busy.catch(() => {});
+  r.holdPrepare(busy);
+  const waits: number[] = [];
+  const restarted: Controller = r.make({ wait: async ms => { waits.push(ms); if (waits.length === 2) r.holdPrepare(Promise.resolve()); } });
+  try {
+    await restarted.restore();
+    expect(r.root(restarted)).toMatchObject({ state: "retrying", operation: "restore", code: "refresh_in_progress" });
+    await until(() => r.root(restarted)?.state === "active");
+    expect(waits).toEqual([500, 1000]);
+  } finally { await restarted.close(); }
+});
+// The same for restore's check after an expiry pause: a refresh in progress there retries too, rather than degrading.
+test("a restore check that finds the token refresh in another process after an expiry pause retries (#1334)", async () => {
+  const o = await expiredPause("approval", () => {});
+  try {
+    await until(() => o.recovering() >= 1);
+    await o.c.close();
+    o.r.expireAccess(); o.r.failCheck(() => new RefreshInProgress("pi"));
+    const states: string[] = [];
+    const restarted = o.r.make({ wait: async () => { o.r.failCheck(); }, sink: record => { states.push(`${record.state}:${record.code ?? ""}`); } });
+    try {
+      await restarted.restore();
+      expect(o.r.root(restarted)).toMatchObject({ state: "retrying", operation: "restore", code: "refresh_in_progress" });
+      await until(() => o.r.root(restarted)?.state === "active");
+      expect(states.filter(s => s.startsWith("degraded") || s.startsWith("paused"))).toEqual([]);
     } finally { await restarted.close(); }
   } finally { await o.c.close(); await o.r.controller.close(); }
 });
