@@ -1863,12 +1863,17 @@ async fn a_stop_during_the_listen_cap_backoff_ends_the_stream_at_once() {
     let mut stream = w.s().deliveries();
     w.until("the lease listens", |b| ops_count(b, "listen") == 1)
         .await;
+    // A port an earlier swap-backoff test in this binary used may have left its endpoint recorded: drop it, or the wait below ends at once.
+    let endpoint = reqwest::Url::parse(&w.url).unwrap().to_string();
+    crate::delivery::SWAP_BACKOFFS
+        .lock()
+        .unwrap()
+        .retain(|e| e != &endpoint);
     refuse_listens(&w, 1, "MCP listen capacity reached");
     credential.rotate("tok-2");
     w.until("the reopen is refused", |b| ops_count(b, "listen") == 2)
         .await;
     // The Stop goes out once the backoff has begun: one sent while the refused listen is in flight ends the stream through that listen's `watch` instead.
-    let endpoint = reqwest::Url::parse(&w.url).unwrap().to_string();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while !crate::delivery::SWAP_BACKOFFS
         .lock()
