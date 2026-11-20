@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { DEFAULT_IDLE_SECONDS, MAX_CHILDREN, TOUCH_EVERY_MS, REFUSED_COALESCE_MS, childCapacity, childSessionId, holdAlias, idAddress, logBinding } from "../core/bindings.ts";
 import { IdCollision, createBoard, declareHuman, openAccess, prunePosts, setAccess, touchId } from "../core/boards.ts";
 import { claim, watch } from "../core/claims.ts";
-import { ChildSessions, acquireName, attachSession, recordYieldReads, recordYields, candidateNames, childFallback, conversationSnapshot, endLocalSession, liveSessions, reap, registerChild, registerSession, runnerRoot, runnerRootLive, thisSession, type SessionKind, type SessionRow } from "./binding.ts";
+import { ChildSessions, acquireName, attachSession, readChildren, recordYieldReads, recordYields, candidateNames, childFallback, conversationSnapshot, endLocalSession, liveSessions, reap, registerChild, registerSession, runnerRoot, runnerRootLive, thisSession, type SessionKind, type SessionRow } from "./binding.ts";
 import * as proc from "../shared/proc.ts";
 import { procStart } from "../shared/proc.ts";
 import { CoreError } from "../core/errors.ts";
@@ -640,4 +640,51 @@ test("a sibling doesn't yield its name record to an adapter's child whose parent
     expect(db.transaction(() => recordYields(db, writer, harness)).immediate()).toBe(false);
   } finally { w.restore(); }
   expect(w.calls).toEqual([false, true]);
+});
+
+// #1463 audit L1: a pre-lock read answers only for the process it read, keyed
+// by session, pid and recorded start time. A row that changed since (a new
+// start time under the same pid, or a new session on the same process) is
+// read again inside the lock, and that read decides.
+const sibling = "id:0123456789abd";
+test("a pre-lock read isn't reused for a row whose start time changed since (#1463)", () => {
+  const { db, writer } = yieldBus();
+  const pre = recordYieldReads(db, writer, harness);
+  expect([...pre.values()]).toEqual([true]);
+  // The adapter's child is gone, and its row now names another process under the same pid.
+  db.prepare(`UPDATE bindings SET proc_start = ? WHERE session_id = ?`).run(`${procStart(process.pid)}x`, sibling);
+  expect(db.transaction(() => recordYields(db, writer, harness, pre)).immediate()).toBe(false);
+});
+
+test("a pre-lock read isn't reused for another session on the same process (#1463)", () => {
+  const { db, writer } = yieldBus();
+  const w = watchParents(db, (pids) => new Map(pids.map((p) => [p, null])));
+  let pre: Map<string, boolean>;
+  try {
+    pre = recordYieldReads(db, writer, harness);
+  } finally { w.restore(); }
+  expect([...pre.values()]).toEqual([false]);
+  // That session ends, and another registers on the same pid and start time; its parent reads as the harness.
+  db.prepare(`UPDATE ids SET ended_at = ? WHERE id = ?`).run(Date.now(), sibling);
+  registerSession(db, { ...thisSession("id:0123456789abf"), pid: process.pid, proc_start: procStart(process.pid) ?? null, harness_pid: harness, harness_rule: null }, { harnessSession: "conv-2" });
+  expect(db.transaction(() => recordYields(db, writer, harness, pre)).immediate()).toBe(true);
+});
+
+// #1463 audit L2: readChildren's answer is "live and the harness's child".
+// A crashed adapter's child whose pid a live process reuses has a parent that
+// reads as the harness (the reuser's), and is still dead: no yield to it.
+test("readChildren counts a dead row as no child, though its pid's parent reads as the harness (#1463)", () => {
+  const { db, writer } = yieldBus();
+  const start = procStart(process.pid)!;
+  db.prepare(`UPDATE bindings SET proc_start = ? WHERE session_id = ?`).run(`${start}x`, sibling);
+  const crashed = { session_id: sibling, pid: process.pid, proc_start: `${start}x` };
+  const reuser = { session_id: "id:0123456789abf", pid: process.pid, proc_start: start };
+  const pre = readChildren([crashed, reuser], harness);
+  expect([...pre.values()]).toEqual([false, true]);
+  const w = watchParents(db);
+  try {
+    expect(db.transaction(() => recordYields(db, writer, harness, pre)).immediate()).toBe(false);
+  } finally { w.restore(); }
+  // Answered from the pre-lock read: no process read under the lock.
+  expect(w.calls).toEqual([]);
 });
