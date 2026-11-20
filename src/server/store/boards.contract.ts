@@ -584,6 +584,25 @@ function reads(it: It): void {
     expect(await b.views(h.read, [], null)).toEqual([]);
   });
 
+  // #807 P3 C10e1: a push that neither woke nor was delivered (a deferred thread push) still counts as unread; one that
+  // woke doesn't. A post by a child of the reader's session is its own.
+  it("views counts a deferred push as unread, not a waking one, and leaves out a child session's posts", async h => {
+    const b = h.boards;
+    await h.session(S1, ME);
+    await h.session(CHILD, ME, { rootId: S1 });
+    await h.hold(BE, S1, T0);
+    await board(h, "hall");
+    await sub(h, BE, "hall", "digest");
+    const deferred = await write(h, np("hall", QA, "deferred", T0));
+    const woke = await write(h, np("hall", QA, "woke", T0 + 1));
+    await write(h, np("hall", `${ME}/kid`, "by a child", T0 + 2, { authorId: CHILD }));
+    await h.write(async tx => {
+      await b.insertOutbox(tx, deferred, [[BE, target("thread", false)]]);
+      await b.insertOutbox(tx, woke, [[BE, target("mention", true)]]);
+    });
+    expect((await b.views(h.read, [BE], "hall")).map(v => [v.row.posts, v.row.unread])).toEqual([[3, 1]]);
+  });
+
   // #807 P3 C10e1: the views row's subscribed readers own no post, so this pins NOT_OWN in views' and read's counts.
   it("views and read leave out a subscribed reader's own posts, as its address or as its session", async h => {
     const b = h.boards;
@@ -619,6 +638,20 @@ function roster(it: It): void {
     expect(rows.map(r => r.handle)).toEqual([BE, FE, QA].sort(bytewise));
     expect(rows.find(r => r.handle === BE)).toMatchObject({ last_seen: T0 + 1, id: S1, principal: ME, status: "busy", queue_off: 1, scope_kind: "person", scope_ref: ME });
     expect(rows.find(r => r.handle === FE)).toMatchObject({ id: null, status: null, human: 1 });
+  });
+
+  // #807 P3 C10e1: a flag never set reads null, not 0; an alias no session holds names the ended session that last
+  // bound it, but its status only while held.
+  it("roster without a board: unset flags read null; an unheld alias's last session shows no status", async h => {
+    await h.alias(QA, { lastSeen: T0 });
+    await h.alias(OPS, { lastSeen: T0 });
+    await h.session(S1, ME, { status: "busy" });
+    await h.session(S2, ME, { status: "away", endedAt: T0 });
+    await h.hold(QA, S1, T0);
+    await h.bindingEvent({ session: S2, name: OPS, event: "bound", at: T0 });
+    const rows = await h.boards.roster(h.read, null);
+    expect(rows.find(r => r.handle === QA)).toMatchObject({ id: S1, status: "busy", human: null, queue_off: null, launcher: null });
+    expect(rows.find(r => r.handle === OPS)).toMatchObject({ id: S2, status: null, status_at: null });
   });
 
   it("roster of a board: its subscribers by handle, an ID's subscription under its primary hold, one row each", async h => {
@@ -668,15 +701,26 @@ function threads(it: It): void {
     expect((await b.threadFacts(h.read, root)).muted).toEqual([OPS]);
   });
 
-  // #807 P3 C10e1: the row above is two replies deep, where a walk one level short still lands on the root.
-  it("threadRoot, threadFacts and a thread read reach the root from four replies down", async h => {
+  // #807 P3 C10e1: with nothing unread and no limit, a read is the latest 10; a limit is clamped to 1..200.
+  it("read with nothing unread and no limit is the latest 10, oldest first", async h => {
+    await board(h, "hall");
+    const ids: number[] = [];
+    for (let n = 0; n < 12; n++) ids.push(await write(h, np("hall", QA, `p${n}`, T0 + n)));
+    expect((await h.write(tx => h.boards.read(tx, "hall", null, {}))).posts.map(p => p.id)).toEqual(ids.slice(2));
+    expect((await h.write(tx => h.boards.read(tx, "hall", null, { limit: 0 }))).posts.map(p => p.id)).toEqual(ids.slice(11));
+  });
+
+  // #807 P3 C10e1: the row above is two replies deep, where a walk one level short still lands on the root; eight
+  // deep catches a walk cut off at any depth up to six.
+  it("threadRoot, threadFacts and a thread read reach the root from eight replies down", async h => {
     const b = h.boards;
     await board(h, "hall");
     let id = await write(h, np("hall", QA, "root", T0));
     const ids = [id];
-    for (const [n, who] of [[1, FE], [2, BE], [3, OPS], [4, FE]] as const) ids.push(id = await write(h, np("hall", who, `r${n}`, T0 + n, { parentId: id })));
+    for (const [n, who] of [[1, FE], [2, BE], [3, OPS], [4, FE], [5, BE], [6, OPS], [7, FE], [8, BE]] as const) ids.push(id = await write(h, np("hall", who, `r${n}`, T0 + n, { parentId: id })));
     expect(await b.threadRoot(h.read, id)).toBe(ids[0]);
-    expect(await b.threadFacts(h.read, id)).toMatchObject({ root: ids[0], authors: [QA, FE, BE, OPS], parentAuthor: FE, rootAuthor: QA });
+    expect(await b.threadFacts(h.read, id)).toMatchObject({ root: ids[0], authors: [QA, FE, BE, OPS], parentAuthor: BE, rootAuthor: QA });
+    expect(await b.threadRoot(h.read, ids[1]!)).toBe(ids[0]);
     expect((await h.write(tx => b.read(tx, "hall", null, { thread: id }))).posts.map(p => p.id)).toEqual(ids);
   });
 }
@@ -728,6 +772,24 @@ function queue(it: It): void {
 
   // #1351: the row above's takes carry no session. A live session's take counts for its lane under whatever name it
   // took it as; an ended session's counts under its handle's holder now.
+  // #807 P3 C10e1: a push of a post on another board doesn't wake a lane here.
+  it("laneRows: a push of another board's post doesn't count as waking a lane on this one", async h => {
+    await board(h, "jobs", { kind: "queue" });
+    await board(h, "hall");
+    await h.alias(BE);
+    await h.alias(FE);
+    await h.session(S1, ME);
+    await h.session(S2, ME);
+    await h.hold(BE, S1, T0);
+    await h.hold(FE, S2, T0);
+    await sub(h, S1, "jobs", "push");
+    await sub(h, S2, "jobs", "push");
+    await h.claimEvent({ key: "queue:jobs:1", handle: FE, event: "take", board: "jobs", at: T0 + 10 });
+    const elsewhere = await write(h, np("hall", QA, "elsewhere", T0 + 50));
+    await h.write(tx => h.boards.insertOutbox(tx, elsewhere, [[BE, target("mention", true)]]));
+    expect(await h.boards.laneRows(h.read, "jobs", [])).toEqual([BE, FE]);
+  });
+
   it("laneRows with session-keyed takes: a live session's take counts for its lane, an ended one's for its handle's holder now", async h => {
     await board(h, "jobs", { kind: "queue" });
     const OLD = `${ME}/old`;

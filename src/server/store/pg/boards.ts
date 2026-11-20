@@ -1,8 +1,8 @@
 // The boards store on Postgres (#807 P3 C10e1, docs/future/postgres-server.md D3, D6): store/boards.ts's BoardsStore,
 // each method on its caller's handle through pgOf. This slice is the reads and the pure writes, plus serial forms of
 // five designed writes (insertPost, bindAttachments, setSubscription, acknowledge, read: core's statements, each
-// marked `C10e2:`) so the store runs end to end; C10e2 adds their locks and race handling, and forget, prunePosts and
-// claimQueuePost, which refuse for now after checking their handle. The SQLite store (db.ts makeRepo's boards, over
+// marked `C10e2:` with what it still owes, if anything) so the store runs end to end; C10e2 adds insertPost's locks
+// and the post gate, and forget, prunePosts and claimQueuePost, which refuse for now after checking their handle. The SQLite store (db.ts makeRepo's boards, over
 // core/boards.ts's SQL) is the reference; what differs, and why:
 // - A Read is the autocommit pool: each statement is its own snapshot. So a read whose parts must agree is one
 //   statement (§7 Q10): pendingDigests joins each digest's latest post where core reads it after with getPost(...)!,
@@ -218,7 +218,8 @@ export function makePgBoards({ clock }: { clock: () => number }): BoardsStore {
         WHERE d.unread > 0`;
       return rows.map((x): DigestRow => ({ board: x.digest_board as string, unread: int8(x.unread), latest: toPost(x) }));
     },
-    // C10e2: owes GREATEST under concurrency (two acknowledges racing on one subscription row). Core acknowledge, serial.
+    // C10e2: owes nothing under concurrency: under READ COMMITTED each GREATEST is re-evaluated on the newest row
+    // version after the row lock, so the cursor never moves back. Core acknowledge.
     async acknowledge(tx, handle, ref) {
       const sql = pgOf(tx);
       if (ref.kind === "digest") {
@@ -244,7 +245,8 @@ export function makePgBoards({ clock }: { clock: () => number }): BoardsStore {
     async isSubscribed(r, handle, board) {
       return (await pgOf(r)`SELECT 1 FROM subscriptions WHERE board = ${board} AND handle = ${handle}`).length > 0;
     },
-    // C10e2: owes the tip read racing a post (the board's tip vs a concurrent insert). Core setSubscription, serial.
+    // C10e2: owes nothing under concurrency: the tip is read in the insert's own statement, and a post committing
+    // beside it lands either side of the cursor, as on SQLite. Core setSubscription.
     async setSubscription(tx, handle, board, mode) {
       const sql = pgOf(tx);
       if (mode === "off") {
@@ -333,7 +335,8 @@ export function makePgBoards({ clock }: { clock: () => number }): BoardsStore {
         WHERE b.name = ${name} AND ${state} RETURNING ${boardCols(sql)}`;
       return row ? toBoard(row) : null;
     },
-    // C10e2: owes GREATEST under concurrency (two reads moving one cursor) and a prune between its statements. Core readRows, serial.
+    // C10e2: owes nothing under concurrency: the cursor's GREATEST is re-evaluated after the row lock under READ
+    // COMMITTED, so a racing read or acknowledge never moves it back. Core readRows.
     async read(tx, board, handle, opts) {
       const sql = pgOf(tx);
       const limit = Math.min(Math.max(opts.limit ?? 20, 1), 200);
@@ -381,8 +384,8 @@ export function makePgBoards({ clock }: { clock: () => number }): BoardsStore {
       else await sql`DELETE FROM thread_mutes WHERE handle = ${handle} AND root_id = ${root}`;
     },
 
-    // C10e2: owes the parent lock (reply vs prune, P1) and the archive gate. Core insertPost, serial; the 23503-to-
-    // MissingPost savepoint is here already. human is bound on every insert (#1355/#1366): marked only when given true.
+    // C10e2: owes the parent's FOR KEY SHARE (reply vs prune, P1) and the gate's board FOR KEY SHARE (post vs archive,
+    // P5). Core insertPost; the 23503-to-MissingPost savepoint is here already. human is bound on every insert (#1355/#1366): marked only when given true.
     async insertPost(tx, p) {
       pgOf(tx);
       try {
@@ -398,7 +401,8 @@ export function makePgBoards({ clock }: { clock: () => number }): BoardsStore {
         throw e;
       }
     },
-    // C10e2: owes the race with a concurrent bind of the same uploads (P5). Core bindAttachments, serial: locked in call order, then bound.
+    // C10e2: owes nothing under concurrency: lockUnsent takes the rows FOR UPDATE and bindLocked re-checks them unsent,
+    // so a concurrent bind of the same uploads refuses. Core bindAttachments: locked in id order, returned in call order.
     async bindAttachments(tx, ids, from, postId, limits) {
       const sql = pgOf(tx);
       const files = await lockUnsent(sql, ids, from, limits);

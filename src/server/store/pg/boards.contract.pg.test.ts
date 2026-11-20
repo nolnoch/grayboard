@@ -102,6 +102,51 @@ const pgBoardsBackend: BoardsBackend = {
 
 describePg("boards contract (Postgres)", () => boardsContract(pgBoardsBackend));
 
+// The shared rollback row ("a body's reads see its writes, and a body that throws leaves none of them") is pending:
+// it sets up through claimQueuePost. This is its body without that line, so a body's writes stay atomic with it on
+// Postgres meanwhile. C10e2 deletes this when it un-skips the shared row.
+describePg("boards store rollback (Postgres)", () => {
+  test("a body's reads see its writes, and a body that throws leaves none of them (without claimQueuePost)", async () => {
+    const h = await pgBoardsBackend.open();
+    try {
+      const b = h.boards;
+      const BE = "a@example.com/be", FE = "a@example.com/fe", T0 = CLOCK;
+      const np = (board: string, author: string, body: string, now: number) =>
+        ({ board, author, body, parentId: null, now, expiresAt: null, authorId: null, via: null, authorUser: null, human: false });
+      await h.write(tx => b.create(tx, { name: "hall", purpose: "p", scope: null, kind: "broadcast", createdBy: BE, now: T0 }));
+      const root = (await h.write(tx => b.insertPost(tx, np("hall", BE, "root", T0)))).id;
+      await expect(h.write(async tx => {
+        expect(await b.ensure(tx, "team", "p", "team:x", BE)).toBe(true);
+        expect((await b.create(tx, { name: "fresh", purpose: "p", scope: null, kind: "queue", createdBy: BE, now: T0 }))?.name).toBe("fresh");
+        expect(await b.get(tx, "fresh")).toMatchObject({ purpose: "p", created_by: BE, kind: "queue" });
+        expect((await b.setArchived(tx, "hall", BE, T0 + 1))?.archived_by).toBe(BE);
+        await b.setSubscription(tx, FE, "hall", "push");
+        expect(await b.isSubscribed(tx, FE, "hall")).toBe(true);
+        const p = await b.insertPost(tx, np("fresh", BE, "job", T0 + 2));
+        expect(await b.post(tx, p.id)).toMatchObject({ body: "job" });
+        await b.insertOutbox(tx, root, [[FE, { reason: "subscription", wake: true }]]);
+        expect((await b.pendingPushes(tx, FE)).map(r => r.post.id)).toEqual([root]);
+        await b.acknowledge(tx, FE, { kind: "push", post_id: root });
+        await b.mute(tx, FE, root, true);
+        expect((await b.read(tx, "hall", FE, {})).posts.map(x => x.id)).toEqual([root]);
+        throw new Error("rolled back");
+      })).rejects.toThrow("rolled back");
+      expect(await b.get(h.read, "team")).toBeUndefined();
+      expect(await b.get(h.read, "fresh")).toBeUndefined();
+      expect((await b.get(h.read, "hall"))?.archived_at).toBeUndefined();
+      expect(await b.isSubscribed(h.read, FE, "hall")).toBe(false);
+      expect(await h.subscription("hall", FE)).toBeUndefined();
+      expect((await b.snapshotPage(h.read, "hall", {})).posts.map(x => x.id)).toEqual([root]);
+      expect(await h.outboxRows()).toEqual([]);
+      expect(await h.muteRows()).toEqual([]);
+      expect(await h.claimRows()).toEqual([]);
+      expect(await h.eventRows()).toEqual([]);
+    } finally {
+      await h.close();
+    }
+  });
+});
+
 // The contract asserts only that ensure stamps a time (SQLite's core reads Date.now()); the Postgres store's is its clock.
 describePg("boards store clock (Postgres)", () => {
   test("ensure stamps created_at from the store's clock", async () => {
