@@ -8,6 +8,7 @@ import { board } from "../support/events.ts";
 import { HostedSession, HostedToolError } from "../support/hosted_session.ts";
 import { TestServer } from "../support/server.ts";
 import { endId } from "../support/end_id.ts";
+import { exec, row, rows as sqlRows } from "../support/repo_sql.ts";
 
 const B = "bob@example.com", F = "frank@example.com", D = "dan@example.com";
 let srv: TestServer;
@@ -29,7 +30,7 @@ const hosted = async (name: string | null, email = B) => {
   sessions.push(s);
   return s;
 };
-const idHolding = (address: string) => (srv.app.db.query("SELECT id FROM alias_holds WHERE address = ?").get(address) as { id: string }).id;
+const idHolding = async (address: string) => (await row(srv, "SELECT id FROM alias_holds WHERE address = ?", address) as { id: string }).id;
 const refusal = async (p: Promise<unknown>): Promise<HostedToolError> => {
   const e = await p.then((v) => new Error(`not refused: ${JSON.stringify(v)}`), (x: unknown) => x);
   if (!(e instanceof HostedToolError)) throw e;
@@ -44,7 +45,7 @@ async function cast() {
   await ops.call("board_post", { board: "qa-room", body: "qa secret" });
   await ops.call("board_create", { name: "lobby", purpose: "org-open" });
   const build = await hosted("eng/build");
-  return { ops, build, id: idHolding("eng/build") };
+  return { ops, build, id: (await idHolding("eng/build")) };
 }
 
 describe("an ID is judged as its session's primary on every scoped board (#1255)", () => {
@@ -60,8 +61,8 @@ describe("an ID is judged as its session's primary on every scoped board (#1255)
     await missing("board_post", { body: "x", as: id });
     await missing("board_subscribe", { mode: "push", as: id });
     await missing("claim_take", { key: "ticket:QA-1", as: id });
-    expect(srv.app.db.query("SELECT count(*) AS n FROM posts WHERE board = 'qa-room'").get()).toEqual({ n: 1 });
-    expect(srv.app.db.query("SELECT count(*) AS n FROM subscriptions WHERE board = 'qa-room' AND handle = ?").get(id)).toEqual({ n: 0 });
+    expect(await row(srv, "SELECT count(*) AS n FROM posts WHERE board = 'qa-room'")).toEqual({ n: 1 });
+    expect(await row(srv, "SELECT count(*) AS n FROM subscriptions WHERE board = 'qa-room' AND handle = ?", id)).toEqual({ n: 0 });
     // An org board is everyone's: the ID posts there as before.
     expect(await build.call("board_post", { board: "lobby", body: "hi", as: id })).toBeDefined();
     // The access rule itself, and the control: a person-scoped session of bob's (its ID is bob) still sees qa's board.
@@ -70,7 +71,7 @@ describe("an ID is judged as its session's primary on every scoped board (#1255)
     expect(await access.canSee(read, id, room)).toBe(false);
     expect([...(await access.visibleTo(read, id, [room]))]).toEqual([]);
     const fe = await hosted("fe");
-    const feId = idHolding(`${B}/fe`);
+    const feId = await idHolding(`${B}/fe`);
     expect(await access.canSee(read, feId, room)).toBe(true);
     expect((await fe.call<{ name: string }[]>("board_list", {})).map((b) => b.name)).toContain("qa-room");
   });
@@ -135,7 +136,7 @@ describe("an ID is judged as its session's primary on every scoped board (#1255)
     const hidden = await call("qa-room"), none = await call("no-such-thing");
     expect(hidden.status).toBe(400);
     expect(unnamed({ message: JSON.stringify(hidden.body) }, "qa-room")).toBe(unnamed({ message: JSON.stringify(none.body) }, "no-such-thing"));
-    expect(srv.app.db.query("SELECT count(*) AS n FROM claims WHERE key LIKE 'ticket:QA-%'").get()).toEqual({ n: 0 });
+    expect(await row(srv, "SELECT count(*) AS n FROM claims WHERE key LIKE 'ticket:QA-%'")).toEqual({ n: 0 });
   });
 });
 
@@ -155,7 +156,7 @@ describe("a confined holder's claim end is announced for its user (#1286)", () =
       for (const team of ["eng", "qa"]) expect((await srv.api(bob, "POST", `/api/teams/${team}/add`, { email })).status).toBe(200);
     }
     const h = await hosted("fe", email);
-    const id = idHolding(`${email}/fe`);
+    const id = await idHolding(`${email}/fe`);
     expect(await h.call("claim_take", { key, board: "qa-room", note: "qa note", as: id })).toMatchObject({ ok: true });
     expect(await ops.call("claim_watch", { key })).toBeDefined();
     await h.bind(eng);
@@ -163,13 +164,13 @@ describe("a confined holder's claim end is announced for its user (#1286)", () =
     await h.reopen();
     const access = boardAccess(srv.app.repo), read = srv.app.repo.read;
     const room = (await srv.app.repo.boards.get(read, "qa-room"))!;
-    expect(await access.canSee(read, idHolding(eng), room)).toBe(false);
+    expect(await access.canSee(read, await idHolding(eng), room)).toBe(false);
     return { ops, h, id };
   }
   const mentioned = (key: string, start: string) => board((i) => i.kind === "push" && i.reason === "mention" && i.post.board === "qa-room" && i.post.body.startsWith(`${start} ${key}`));
   // Any delivery of `key`'s end post: a push of it, or a digest whose latest post it is.
   const ended = (key: string) => board((i) => /^\[(release|expired)\] /.test((i.kind === "push" ? i.post : i.latest).body) && (i.kind === "push" ? i.post : i.latest).body.includes(key));
-  const posts = (key: string) => srv.app.db.query("SELECT body, author, author_user, author_id FROM posts WHERE board = 'qa-room' AND body LIKE ?").all(`%${key}%`);
+  const posts = async (key: string) => await sqlRows(srv, "SELECT body, author, author_user, author_id FROM posts WHERE board = 'qa-room' AND body LIKE ?", `%${key}%`);
 
   test("an explicit release: the watcher is told without the holder's note; the holder's answer and inbox are a quiet release's", async () => {
     const c = await cast();
@@ -178,16 +179,16 @@ describe("a confined holder's claim end is announced for its user (#1286)", () =
     const got = await ops.next(mentioned("ticket:QA-R", "[release]"));
     if (got.event.kind !== "board" || got.event.item.kind !== "push") throw new Error("not a push");
     expect(got.event.item.post.body).toBe("[release] ticket:QA-R cc @qa/ops");
-    expect(posts("ticket:QA-R")).toEqual([
+    expect(await posts("ticket:QA-R")).toEqual([
       { body: "[claim] ticket:QA-R — qa note", author: id, author_user: B, author_id: id },
       { body: "[release] ticket:QA-R cc @qa/ops", author: id, author_user: B, author_id: null },
     ]);
-    expect(JSON.stringify(srv.app.db.query("SELECT body FROM posts").all())).not.toContain("eng secret");
+    expect(JSON.stringify(await sqlRows(srv, "SELECT body FROM posts"))).not.toContain("eng secret");
     // The control: frank's user lost qa too, so his release is quiet. Both holders answer alike and are told nothing.
     const quiet = await confined("ticket:QA-Q", F, c);
     expect((await srv.api(bob, "POST", "/api/teams/qa/remove", { email: F })).status).toBe(200);
     const quietAnswer = await quiet.h.call("claim_release", { key: "ticket:QA-Q", note: "eng secret" });
-    expect(posts("ticket:QA-Q")).toHaveLength(1);
+    expect(await posts("ticket:QA-Q")).toHaveLength(1);
     expect([answer, quietAnswer]).toEqual(["released ticket:QA-R", "released ticket:QA-Q"]);
     await quiet.ops.none(ended("ticket:QA-Q"));
     await h.none(ended("ticket:QA-R"));
@@ -206,11 +207,11 @@ describe("a confined holder's claim end is announced for its user (#1286)", () =
     // leftover's, a revoked tools-only session's, a released child's) is server/session_end.ts's, run here as they run it.
     // Its release has no signed-in caller (no ctx.user).
     await srv.app.repo.write(tx => endId(srv.app.repo, tx, id, "test"));
-    expect(srv.app.db.query("SELECT count(*) AS n FROM claims WHERE key = 'ticket:QA-E'").get()).toEqual({ n: 0 });
+    expect(await row(srv, "SELECT count(*) AS n FROM claims WHERE key = 'ticket:QA-E'")).toEqual({ n: 0 });
     const got = await ops.next(mentioned("ticket:QA-E", "[release]"));
     if (got.event.kind !== "board" || got.event.item.kind !== "push") throw new Error("not a push");
     expect(got.event.item.post.body).toBe(`[release] ticket:QA-E cc @${D}/w @qa/ops`);
-    expect(posts("ticket:QA-E")).toContainEqual({ body: `[release] ticket:QA-E cc @${D}/w @qa/ops`, author: expect.any(String), author_user: B, author_id: null });
+    expect(await posts("ticket:QA-E")).toContainEqual({ body: `[release] ticket:QA-E cc @${D}/w @qa/ops`, author: expect.any(String), author_user: B, author_id: null });
     await dan.none(ended("ticket:QA-E"));
   });
 
@@ -219,15 +220,15 @@ describe("a confined holder's claim end is announced for its user (#1286)", () =
     const { ops } = await confined("ticket:QA-L", B, c);
     const quiet = await confined("ticket:QA-LQ", F, c);
     expect((await srv.api(bob, "POST", "/api/teams/qa/remove", { email: F })).status).toBe(200);
-    await srv.app.repo.write(tx => srv.app.repo.coreOn(tx).prepare("UPDATE claims SET expires_at = ? WHERE key IN ('ticket:QA-L', 'ticket:QA-LQ')").run(Date.now() - 1));
+    await exec(srv, "UPDATE claims SET expires_at = ? WHERE key IN ('ticket:QA-L', 'ticket:QA-LQ')", Date.now() - 1);
     // A take sweeps the lapsed claims first.
     await ops.call("claim_take", { key: "ticket:sweep" });
     const got = await ops.next(mentioned("ticket:QA-L:", "[expired]"));
     if (got.event.kind !== "board" || got.event.item.kind !== "push") throw new Error("not a push");
     expect(got.event.item.post).toMatchObject({ body: expect.stringMatching(/ cc @qa\/ops$/) });
-    expect(posts("ticket:QA-L:")).toHaveLength(1);
-    expect(srv.app.db.query("SELECT count(*) AS n FROM claims WHERE key LIKE 'ticket:QA-L%'").get()).toEqual({ n: 0 });
-    expect(posts("ticket:QA-LQ")).toHaveLength(1);
+    expect(await posts("ticket:QA-L:")).toHaveLength(1);
+    expect(await row(srv, "SELECT count(*) AS n FROM claims WHERE key LIKE 'ticket:QA-L%'")).toEqual({ n: 0 });
+    expect(await posts("ticket:QA-LQ")).toHaveLength(1);
     await quiet.ops.none(board((i) => i.kind === "push" && i.post.body.startsWith("[expired] ticket:QA-LQ")));
   });
 });
@@ -248,10 +249,10 @@ describe("a confined holder's queue claim ends in an [unclaimed] reply for its u
     // bob comes first, so his call makes the queue board.
     if (email === B) await ops.call("board_create", { name: "qa-q", purpose: "qa queue", team: "qa", kind: "queue" });
     const h = await hosted("fe", email);
-    const id = idHolding(`${email}/fe`);
+    const id = await idHolding(`${email}/fe`);
     const { post_id: postId } = await ops.call<{ post_id: number }>("board_post", { board: "qa-q", body: `@${id} qa work ${tag}` });
     const key = `queue:qa-q:${postId}`;
-    const claim = srv.app.db.query("SELECT holder, holder_user FROM claims WHERE key = ?").get(key);
+    const claim = await row(srv, "SELECT holder, holder_user FROM claims WHERE key = ?", key);
     expect(claim).toEqual({ holder: id, holder_user: email });
     // qa/w-<tag> watches; it sees qa's board and is no lane.
     const w = await hosted(`qa/w-${tag}`);
@@ -263,13 +264,13 @@ describe("a confined holder's queue claim ends in an [unclaimed] reply for its u
     expect(await access.canSee(read, id, (await srv.app.repo.boards.get(read, "qa-q"))!)).toBe(false);
     return { ops, w, h, id, postId, key };
   }
-  const replies = (postId: number) => srv.app.db.query("SELECT body, author, author_user, author_id FROM posts WHERE parent_id = ?").all(postId);
+  const replies = async (postId: number) => await sqlRows(srv, "SELECT body, author, author_user, author_id FROM posts WHERE parent_id = ?", postId);
   const unclaimed = (key: string) => board((i) => (i.kind === "push" ? i.post : i.latest).body.startsWith(`[unclaimed] ${key}:`));
   // #1175: the reply the post's author, qa/ops, writes when neither the holder nor its user can; its watcher is told,
   // its author isn't.
   const authored = async (c: Awaited<ReturnType<typeof cast>>, q: Awaited<ReturnType<typeof confinedQueue>>) => {
     await q.w.next(board((i) => i.kind === "push" && i.reason === "mention" && i.post.body.startsWith(`[unclaimed] ${q.key}:`)));
-    expect(replies(q.postId)).toEqual([{ body: expect.stringMatching(/ cc @qa\/w-f$/), author: "qa/ops", author_user: B, author_id: idHolding("qa/ops") }]);
+    expect(await replies(q.postId)).toEqual([{ body: expect.stringMatching(/ cc @qa\/w-f$/), author: "qa/ops", author_user: B, author_id: (await idHolding("qa/ops")) }]);
     await c.ops.none(unclaimed(q.key));
   };
 
@@ -280,15 +281,15 @@ describe("a confined holder's queue claim ends in an [unclaimed] reply for its u
     const got = await w.next(board((i) => i.kind === "push" && i.reason === "mention" && i.post.body.startsWith(`[unclaimed] ${key}:`)));
     if (got.event.kind !== "board" || got.event.item.kind !== "push") throw new Error("not a push");
     expect(got.event.item.post.body).toEndWith(" cc @qa/w-b");
-    expect(replies(postId)).toEqual([{ body: expect.stringMatching(/^\[unclaimed\] /), author: id, author_user: B, author_id: null }]);
-    expect(JSON.stringify(srv.app.db.query("SELECT body FROM posts").all())).not.toContain("eng secret");
+    expect(await replies(postId)).toEqual([{ body: expect.stringMatching(/^\[unclaimed\] /), author: id, author_user: B, author_id: null }]);
+    expect(JSON.stringify(await sqlRows(srv, "SELECT body FROM posts"))).not.toContain("eng secret");
     // frank's user lost qa too, so the post's author writes his decline's reply, without his note. Both holders answer
     // alike and are told nothing.
     const quiet = await confinedQueue(F, c);
     expect((await srv.api(bob, "POST", "/api/teams/qa/remove", { email: F })).status).toBe(200);
     const quietAnswer = await quiet.h.call("claim_release", { key: quiet.key, note: "eng secret" });
     await authored(c, quiet);
-    expect(JSON.stringify(srv.app.db.query("SELECT body FROM posts").all())).not.toContain("eng secret");
+    expect(JSON.stringify(await sqlRows(srv, "SELECT body FROM posts"))).not.toContain("eng secret");
     expect([answer, quietAnswer]).toEqual([`released ${key}`, `released ${quiet.key}`]);
     await h.none(unclaimed(key));
     await quiet.h.none(unclaimed(quiet.key));
@@ -299,13 +300,13 @@ describe("a confined holder's queue claim ends in an [unclaimed] reply for its u
     const { w, id, postId, key } = await confinedQueue(B, c);
     const quiet = await confinedQueue(F, c);
     expect((await srv.api(bob, "POST", "/api/teams/qa/remove", { email: F })).status).toBe(200);
-    await srv.app.repo.write(tx => srv.app.repo.coreOn(tx).prepare("UPDATE claims SET expires_at = ? WHERE key IN (?, ?)").run(Date.now() - 1, key, quiet.key));
+    await exec(srv, "UPDATE claims SET expires_at = ? WHERE key IN (?, ?)", Date.now() - 1, key, quiet.key);
     // A take sweeps the lapsed claims first.
     await c.ops.call("claim_take", { key: "ticket:sweep" });
     const got = await w.next(board((i) => i.kind === "push" && i.reason === "mention" && i.post.body.startsWith(`[unclaimed] ${key}:`)));
     if (got.event.kind !== "board" || got.event.item.kind !== "push") throw new Error("not a push");
-    expect(replies(postId)).toEqual([{ body: expect.stringMatching(/ cc @qa\/w-b$/), author: id, author_user: B, author_id: null }]);
-    expect(srv.app.db.query("SELECT count(*) AS n FROM claims WHERE key IN (?, ?)").get(key, quiet.key)).toEqual({ n: 0 });
+    expect(await replies(postId)).toEqual([{ body: expect.stringMatching(/ cc @qa\/w-b$/), author: id, author_user: B, author_id: null }]);
+    expect(await row(srv, "SELECT count(*) AS n FROM claims WHERE key IN (?, ?)", key, quiet.key)).toEqual({ n: 0 });
     await authored(c, quiet);
   });
 
@@ -318,13 +319,13 @@ describe("a confined holder's queue claim ends in an [unclaimed] reply for its u
     expect((await srv.api(bob, "POST", "/api/teams/qa/remove", { email: F })).status).toBe(200);
     // As the #1286 session-end case runs it: the server's ID end, with no signed-in caller.
     for (const ended of [id, quiet.id]) await srv.app.repo.write(tx => endId(srv.app.repo, tx, ended, "test"));
-    expect(srv.app.db.query("SELECT count(*) AS n FROM claims WHERE key IN (?, ?)").get(key, quiet.key)).toEqual({ n: 0 });
+    expect(await row(srv, "SELECT count(*) AS n FROM claims WHERE key IN (?, ?)", key, quiet.key)).toEqual({ n: 0 });
     const got = await w.next(board((i) => i.kind === "push" && i.reason === "mention" && i.post.body.startsWith(`[unclaimed] ${key}:`)));
     if (got.event.kind !== "board" || got.event.item.kind !== "push") throw new Error("not a push");
     expect(got.event.item.post.body).toEndWith(" cc @qa/w-b");
-    expect(replies(postId)).toEqual([{ body: expect.stringMatching(/ cc @qa\/w-b$/), author: id, author_user: B, author_id: null }]);
-    expect(JSON.stringify(replies(postId))).not.toContain("session ended");
+    expect(await replies(postId)).toEqual([{ body: expect.stringMatching(/ cc @qa\/w-b$/), author: id, author_user: B, author_id: null }]);
+    expect(JSON.stringify(await replies(postId))).not.toContain("session ended");
     await authored(c, quiet);
-    expect(JSON.stringify(replies(quiet.postId))).not.toContain("session ended");
+    expect(JSON.stringify(await replies(quiet.postId))).not.toContain("session ended");
   });
 });
