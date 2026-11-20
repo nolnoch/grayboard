@@ -92,7 +92,7 @@ export function endSession(
 
   // Lapsed claims first, so they end as lapses (announced, redelivered) rather than releases.
   for (const h of sweepIn(db, now)) wake.add(h);
-  const claims = db.prepare(`SELECT key FROM claims WHERE holder = ? AND expires_at > ?`).all(id, now) as { key: string }[];
+  const claims = db.prepare(`SELECT key FROM claims WHERE holder = ? AND expires_at > ? ORDER BY key`).all(id, now) as { key: string }[];
   // A release that fails for any reason but a lapse (the sweep below takes
   // those) still frees the claim, unannounced, and the failure goes in the
   // id.ended audit: an end must not leave a claim on an ID that can't act.

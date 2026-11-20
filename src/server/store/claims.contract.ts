@@ -304,5 +304,10 @@ function heldBy(it: It): void {
       await h.claims.take(tx, take({ key: "c", as: FE, now: T0, expires: T0 + 10 }));
       return (await h.claims.heldBy(tx, FE, T0)).sort(bytewise);
     })).toEqual(["a", "b", "c"]);
+  });  // #807 P3 C11a: one order on both backends, by key bytewise (SQLite's BINARY, Postgres's "C"), whatever the insert
+  // order: a case or punctuation collation would put "a" before "B" and "a_1" before "a-1".
+  it("heldBy returns the holder's keys in bytewise key order", async h => {
+    for (const k of ["b", "a_1", "B", "a", "a-1"]) await h.claim(row(k, FE, T0 + 10));
+    expect(await h.claims.heldBy(h.read, FE, T0)).toEqual(["B", "a", "a-1", "a_1", "b"]);
   });
 }

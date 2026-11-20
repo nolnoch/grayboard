@@ -5,6 +5,7 @@ import { testPause } from "../shared/testpause.ts";
 import { makeAuthCache, type AuthPeek } from "./store/auth_cache.ts";
 import { queueFor } from "./store/queue.ts";
 import { isThenable } from "./store/tx_base.ts";
+import { makeNotices } from "./store/notices.ts";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 
@@ -269,7 +270,9 @@ export interface Repo {
   // P3 forks it): a body's `Tx` inside one, `repo.read` outside. Resolved at the call, so a settled `Tx` is refused there.
   coreOn(h: Read): CoreDb;
   // Closes the database: the reader, then the writer (#807 P1c-15c-2: the server holds no raw connection to close).
-  close(): void;
+  // Async for Postgres (#807 P3 C11a), whose pool and LISTEN connection close over the network: every caller awaits
+  // it, or a process exiting first leaves them open.
+  close(): Promise<void>;
   cursors: CursorsStore;
   audit: AuditStore;
   slack: SlackStore;
@@ -939,58 +942,9 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
     ).get(userB, ...(policies ?? []), userA);
   const principalByName = (c: Database, name: string): PrincipalRow | undefined =>
     c.query<PrincipalRow, [string]>("SELECT * FROM principals WHERE name = ?").get(name) ?? undefined;
-  // Each changed row tells the observers after its transaction commits (#399); a rollback drops the notice with
-  // the change. `null`: any row may have changed (a grant or a user), so observers check every one.
-  // An observer with `read` gets each named row's facts too, read on the committing transaction's root Tx in a
-  // beforeCommit hook (#807 P3 A7g1): the row's state as it commits, not as it was when the op ran. `pending` and
-  // `facts` are per observer, not per transaction, because the write queue runs one body at a time and holds itself
-  // from the hook through COMMIT to the notices' flush: no other transaction's marks or notices land in between. A
-  // mark deletes its id's facts first, so a notice never sees an earlier transaction's; a notice without facts (a
-  // synchronous body's Tx, which refuses the hook, or a failed read) is the observer's to handle.
-  type Observer = {
-    fn: (changed: string | null, facts?: unknown) => void;
-    read?: (tx: Tx, id: string) => Promise<unknown>;
-    pending: Set<string>;
-    facts: Map<string, unknown>;
-  };
-  const observers = new Set<Observer>();
-  const changed = (id: string | null) => afterCommit(db, () => {
-    for (const o of observers) {
-      try { o.fn(id, id === null ? undefined : o.facts.get(id)); } catch (error) { console.error("hosted invalidation failed", error); }
-    }
-  });
-  // Queues `id`'s facts read on `tx`'s transaction. Each read runs in its own savepoint and a failure is logged and
-  // leaves no facts, so a failed read never fails the commit (on Postgres an unsavepointed failure would abort it).
-  const readFacts = (tx: Tx, id: string) => {
-    for (const o of observers) {
-      const read = o.read;
-      if (!read) continue;
-      o.facts.delete(id);
-      o.pending.add(id);
-      try {
-        tx.beforeCommit(o, async root => {
-          const ids = [...o.pending];
-          o.pending.clear();
-          for (const each of ids) {
-            try { o.facts.set(each, await root.savepoint(t => read(t, each))); }
-            catch (error) { console.error("hosted facts read failed", error); }
-          }
-          // After this transaction's notices (registered before the hook ran): the facts served their flush.
-          try { root.afterCommit(() => { for (const each of ids) o.facts.delete(each); }); }
-          catch (error) { console.error("hosted facts clear failed", error); }
-        });
-      } catch { o.pending.delete(id); /* a synchronous body's Tx refuses the hook: its notices carry no facts */ }
-    }
-  };
-  // An async op's notice waits for it to fulfil (#807 P3 A6c): one that rejects changed nothing, as a sync throw didn't.
-  const then = <R>(value: R, notify: () => void): R => {
-    if (!isThenable(value)) { notify(); return value; }
-    return Promise.resolve(value).then(v => { notify(); return v; }) as R;
-  };
-  const change = <A extends unknown[], R>(fn: (...args: A) => R) => (...args: A): R => then(fn(...args), () => changed(null));
-  // Every marked op takes its Tx first.
-  const marks = <A extends [Tx, ...unknown[]], R>(fn: (...args: A) => R, id: (...args: A) => string) => (...args: A): R =>
-    then(fn(...args), () => { const at = id(...args); readFacts(args[0], at); changed(at); });
+  // The hosted change notices (store/notices.ts), each waiting on this connection's commit frames.
+  const notices = makeNotices((_tx, effect) => afterCommit(db, effect));
+  const { change, marks } = notices;
   const hosted = makeHostedStore(db, sessionEnd);
   const { ends: _ends, ...hostedStore } = hosted;
   const oauth = makeOAuthStore(hosted);
@@ -1080,11 +1034,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
     hosted: { ...hostedStore, insert: marks(hosted.insert, (_tx, row) => row.session_id), update: marks(hosted.update, (_tx, id) => id),
       end: marks(hosted.end, (_tx, session) => session), childEnd: marks(hosted.childEnd, (_tx, session) => session),
       park: marks(hosted.park, (_tx, session) => session), unpark: marks(hosted.unpark, (_tx, session) => session),
-      subscribe(fn, read) {
-        const o: Observer = { fn: fn as Observer["fn"], read, pending: new Set(), facts: new Map() };
-        observers.add(o);
-        return () => { observers.delete(o); };
-      } },
+      subscribe: notices.subscribe },
     users: {
       async upsertByEmail(tx, email, displayName) {
         return upsertUser(sqliteOf(tx), email, displayName, clock());
@@ -1150,7 +1100,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
             db.run("DELETE FROM oauth_codes WHERE user_id = ? AND grant_id IS NULL", [userId]);
           }
         });
-        changed(null);
+        notices.changed(tx, null);
       },
     },
 
@@ -1182,7 +1132,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
           db.run("UPDATE oauth_grants SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL", [now, userId]);
           db.run("DELETE FROM oauth_codes WHERE user_id = ? AND grant_id IS NULL", [userId]);
         });
-        changed(null);
+        notices.changed(tx, null);
       },
       async revokeDev(tx) {
         return sqliteOf(tx).run("UPDATE sessions SET revoked_at = ? WHERE label = ? AND revoked_at IS NULL", [clock(), DEV_SESSION_LABEL]).changes;
@@ -1346,7 +1296,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       holderUser: async (r, c) => holderUser(sqliteOf(r), c),
       ackQueue: async (tx, addresses, key, now) => ackQueueClaim(sqliteOf(tx), addresses, key, now),
       heldBy: async (r, holder, now) => sqliteOf(r).query<{ key: string }, [string, number]>(
-        `SELECT key FROM claims WHERE holder = ? AND expires_at > ?`).all(holder, now).map(c => c.key),
+        `SELECT key FROM claims WHERE holder = ? AND expires_at > ? ORDER BY key`).all(holder, now).map(c => c.key),
     },
 
     delegation: {
@@ -1778,7 +1728,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
     },
 
     coreOn: (h) => sqliteOf(h),
-    close: () => { db.close(); },
+    close: async () => { db.close(); },
 
     cursors: {
       async get(r, address, streamType, streamRef) {

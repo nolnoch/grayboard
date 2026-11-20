@@ -48,7 +48,7 @@ export interface ClaimsStore {
   // its watches and an "ack" or "ack (late)" release event (core ackQueueClaim); whether it did. A claim another
   // holder took over is left alone: Postgres deletes only a row one of `addresses` holds, in the one statement.
   ackQueue(tx: Tx, addresses: string[], key: string, now: number): Promise<boolean>;
-  // The keys of `holder`'s claims live at `now`, for a session end to release (#807 P3 C10d2-a): SQLite in its scan
-  // order (core endSession's statement), Postgres by key.
+  // The keys of `holder`'s claims live at `now`, for a session end to release (#807 P3 C10d2-a), in bytewise key order on
+  // every backend (#807 P3 C11a).
   heldBy(r: Read, holder: string, now: number): Promise<string[]>;
 }

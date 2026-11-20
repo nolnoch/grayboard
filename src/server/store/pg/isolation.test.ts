@@ -68,6 +68,8 @@ test("the walk follows relative imports and skips type-only ones", () => {
   expect(forbiddenReach([join(SRC, "server/store/tx.ts")])).toEqual(["server/store/tx.ts -> core/sqlite.ts -> bun:sqlite"]);
   // The neutral handle base a pg module may import (#807 P3 C2a): nothing at runtime.
   expect(forbiddenReach([join(SRC, "server/store/tx_base.ts")])).toEqual([]);
+  // The hosted change notices both Repos compose (#807 P3 C11a): neutral, so the Postgres Repo carries no SQLite in.
+  expect(forbiddenReach([join(SRC, "server/store/notices.ts")])).toEqual([]);
   // The identity groups' types and their Postgres implementation (#807 P3 C3): db.ts re-exports the types, never the
   // other way round, and pg/identity.ts reaches core/addresses.ts and request_context.ts, neither of which reaches
   // bun:sqlite.

@@ -1,14 +1,13 @@
 // #807 P3 C10d2-b: the server's composed session end on Postgres (session_end.ts endSessionServer over the Postgres
-// groups, tests/support/pg_repo.ts) and its races (c10-scope §3 C10d2-b: E1-E4, the hosted port, C10d2-a's open rows,
-// the lock order), each in T-P12's shape (tests/support/pg_race.ts): A's body holds its transaction open, B's starts,
-// and the race waits until B is blocked on a lock or done. The end state is asserted before `waited`, so a race whose
-// lock is gone fails on what it broke (a send, hold, claim or child left on an ended ID, a second end), not on a
-// timeout. A send is writeSend's body as far as the end bears on it (application.ts: the recipient's refusal, then the
-// insert), restated over the stores. Without GRAYBOARD_TEST_PG_URL they skip.
+// groups, pg_repo.ts makePgRepo on the race's database) and its races (c10-scope §3 C10d2-b: E1-E4, the hosted port,
+// C10d2-a's open rows, the lock order), each in T-P12's shape (tests/support/pg_race.ts): A's body holds its
+// transaction open, B's starts, and the race waits until B is blocked on a lock or done. The end state is asserted
+// before `waited`, so a race whose lock is gone fails on what it broke (a send, hold, claim or child left on an ended
+// ID, a second end), not on a timeout. A send is writeSend's body as far as the end bears on it (application.ts: the
+// recipient's refusal, then the insert), restated over the stores. Without GRAYBOARD_TEST_PG_URL they skip.
 import { expect, setDefaultTimeout, test } from "bun:test";
 import { describePg } from "../../tests/support/pg.ts";
-import { blockedOrSettled, committed, outcome, pgPair, race, settle, type PgPair } from "../../tests/support/pg_race.ts";
-import { gate, pgRepo } from "../../tests/support/pg_repo.ts";
+import { blockedOrSettled, committed, holdCall, outcome, pairRepo, pgPair, race, settle, type PgPair } from "../../tests/support/pg_race.ts";
 import { idAddress } from "../core/bindings.ts";
 import { boardAccess } from "./access.ts";
 import { serverClaim, sweepClaims } from "./claims.ts";
@@ -42,7 +41,7 @@ async function world(p: PgPair): Promise<{ repo: Repo; qp: number; mail: number 
   await sql`INSERT INTO claims (key, holder, note, board, acquired_at, expires_at) VALUES
     ('ticket:ENG-142', ${R}, 'held', 'general', ${T0}, ${T0 + 3_600_000}), (${`queue:q:${qp}`}, ${R}, 'queue post', 'q', ${T0}, ${T0 + 3_600_000})`;
   const mail = int8((await sql`INSERT INTO messages (sender, recipient_type, recipient, body, created_at) VALUES (${BBE}, 'user', ${R}, 'hello', ${T0}) RETURNING id`)[0].id);
-  return { repo: pgRepo(p, () => T0 + 10), qp, mail };
+  return { repo: await pairRepo(p, () => T0 + 10), qp, mail };
 }
 
 const end = (repo: Repo, id = R, now = T0 + 10) => (tx: Tx) =>
@@ -64,9 +63,9 @@ const claimsOf = async (p: PgPair, id: string) => (await q(p)`SELECT key FROM cl
 const ended = async (p: PgPair) => (await q(p)`SELECT target, detail FROM access_log WHERE action = 'id.ended' ORDER BY id`) as Row[];
 const mailTo = async (p: PgPair, to: string) => (await q(p)`SELECT sender, body, kind FROM messages WHERE recipient = ${to} ORDER BY id`) as Row[];
 
-// race() with A held mid-way through its body: `held` is a gate on a store method A calls (pg_repo.ts gate). B starts
+// race() with A held mid-way through its body: `held` is a hold on a store method A calls (pg_race.ts holdCall). B starts
 // once A reaches it and runs until it blocks or settles; then A goes on.
-async function midRace<TA, TB>(p: PgPair, first: (tx: Tx) => Promise<TA>, held: ReturnType<typeof gate>, second: (tx: Tx) => Promise<TB>) {
+async function midRace<TA, TB>(p: PgPair, first: (tx: Tx) => Promise<TA>, held: ReturnType<typeof holdCall>, second: (tx: Tx) => Promise<TB>) {
   const a = settle(p.a.write(first));
   let done = false, waitEvent: string | null = null, b;
   try {
@@ -252,7 +251,7 @@ describePg("session end races (Postgres)", () => {
   test("lock order: a child's take of its root's alias while the root's end is between its holds and its children: the take waits, nothing deadlocks", async () => {
     await using p = await pgPair();
     const { repo } = await world(p);
-    const held = gate(repo.sessionEnd, "end", 1);
+    const held = holdCall(repo.sessionEnd, "end", { skip: 1 });
     const r = await midRace(p, end(repo), held, take(repo, C, WBE));
     expect(outcome(r.a)).toMatchObject({ ended: true });
     expect(outcome(r.b)).toBeNull();
@@ -265,7 +264,7 @@ describePg("session end races (Postgres)", () => {
   test("a send while the end is past its unread read: it waits, then is refused id_ended", async () => {
     await using p = await pgPair();
     const { repo } = await world(p);
-    const held = gate(repo.messages, "dropReader");
+    const held = holdCall(repo.messages, "dropReader");
     const r = await midRace(p, end(repo), held, send(repo));
     expect(outcome(r.a)).toMatchObject({ ended: true });
     expect(outcome(r.b)).toBe("refused id_ended");
@@ -305,7 +304,7 @@ describePg("session end races (Postgres)", () => {
   test("a retract while the end is past its unread read: the retract waits, then finds the bounce a reply", async () => {
     await using p = await pgPair();
     const { repo, mail } = await world(p);
-    const held = gate(repo.messages, "bounce");
+    const held = holdCall(repo.messages, "bounce");
     const r = await midRace(p, end(repo), held, tx => repo.messages.retract(tx, BBE, mail, { actor: B, session: X }));
     expect(outcome(r.a)).toMatchObject({ ended: true });
     expect(outcome(r.b)).toBe("replied");
