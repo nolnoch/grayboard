@@ -10,8 +10,8 @@ export const teamScope = (name: string) => `team:${name}`;
 
 // Each takes the `Tx` of the write body that changed a membership or created
 // an alias, and writes through repo.boards on it.
-// ensureTeamBoard: false when a board of the name already existed (nothing written). Join and alias creation expect
-// the team's own; team create treats it as a refusal (#1069).
+// ensureTeamBoard: false when a board of the name already existed (nothing written). Join and alias creation ignore
+// it; team create treats it as a refusal (#1069).
 export async function ensureTeamBoard(repo: Repo, tx: Tx, team: Team, createdBy: string): Promise<boolean> {
   return repo.boards.ensure(tx, team.name, `Team ${team.name}`, teamScope(team.name), createdBy);
 }

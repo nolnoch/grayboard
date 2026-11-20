@@ -463,7 +463,7 @@ async function teamCreate(req: Request, authed: AuthedUser, repo: Repo): Promise
     try {
       // The check above reads before the insert, and on Postgres a board_create of the name can commit between them
       // (#1069): ensure's ON CONFLICT DO NOTHING would then hand the team a board it doesn't scope (public, or another
-      // team's). Its false is that create's, so the team rolls back with the savepoint and answers as the check does.
+      // team's). ensure's false means that board_create won: refuse as the check would, and roll the team back.
       team = await tx.savepoint(async sp => {
         const t = await repo.teams.create(sp, name, authed.user_id);
         if (!(await ensureTeamBoard(repo, sp, t, authed.user_email))) throw new Refused(boardTaken);
