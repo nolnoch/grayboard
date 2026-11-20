@@ -2737,6 +2737,8 @@ test("#1355: the server records the human mark at write time; a system post neve
   await call("board_post", { board: "h1355", body: "before" });
   await call("claim_take", { key: "h1355:x", board: "h1355" });
   await call("claim_release", { key: "h1355:x" });
+  // The server marks only `<email>/human` (slack.ts), never a bound alias; marking one here drives the write path's gate.
+  // Hosted delivery reads no column: adapters mark by that reserved author name (own-human.ts).
   await seed(database.repo, tx => database.repo.aliases.markHuman(tx, "you@example.com/h1355", true));
   await call("board_post", { board: "h1355", body: "after" });
   expect(mark()).toEqual([

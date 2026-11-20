@@ -62,10 +62,11 @@ test("a system post written as the declared human's handle is never marked", () 
   expect(postHuman(db, r.post)).toBe(false);
 });
 
-test("a row from before the column (null) keeps today's rule: its author is the declared human now", () => {
+test("a row from before the column (null) bears no mark, even once its author is the declared human", () => {
   const r = post(db, "fe", "e2e", "older", null, { strictIds: true });
   db.prepare(`UPDATE posts SET human = NULL WHERE id = ?`).run(r.post.id);
   expect(postHuman(db, r.post)).toBe(false);
   declareHuman(db, "fe");
-  expect(postHuman(db, r.post)).toBe(true);
+  expect(postHuman(db, r.post)).toBe(false);
+  expect(postHuman(db, { id: r.post.id + 1000 })).toBe(false);
 });

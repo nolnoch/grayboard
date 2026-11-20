@@ -1146,13 +1146,15 @@ export function post(
   parentId: number | null = null,
   opts: PostOpts = {},
 ): PostResult {
-  const { b, a, announce, human, announcement } = postGate(db, handle, boardInput, parentId, opts.allowArchived, opts.seenBy);
-  const board = b.name;
-  postPreChecks(board, body, announcement, opts);
-  const files = opts.attachments ?? { ids: [] };
-  const isViewer = viewers(db);
-
+  // The gate reads inside the write's transaction, IMMEDIATE so its write lock is held from the start: the human it
+  // judges, which the row's mark records (#1355), is the declaration when the row lands; a `grayboard human` can't
+  // slip between the two. Nested in a caller's transaction (a claim's system post) it's a savepoint.
   return db.transaction((): PostResult => {
+    const { b, a, announce, human, announcement } = postGate(db, handle, boardInput, parentId, opts.allowArchived, opts.seenBy);
+    const board = b.name;
+    postPreChecks(board, body, announcement, opts);
+    const files = opts.attachments ?? { ids: [] };
+    const isViewer = viewers(db);
     const now = Date.now();
     const p = insertPost(db, {
       board, author: handle, body, parentId, now, expiresAt: opts.ttl_ms ? now + opts.ttl_ms : null,
@@ -1202,7 +1204,7 @@ export function post(
       ...postWakes(plan.targets),
       unresolved: plan.unresolved,
     };
-  })();
+  }).immediate();
 }
 
 /** Who a post reaches and why. Highest-priority reason wins per handle: mention > thread > subscription. */
@@ -1401,12 +1403,12 @@ export const postMark = (gate: Pick<PostGate, "human">, ownWords: boolean): bool
 
 /**
  * Whether a delivered post bears the human mark: as its row recorded it when written (#1355), so a handle declared
- * human later never marks what it wrote before. A row from before the column (null), or one already pruned, falls back
- * to whether its author is the declared human now.
+ * human later never marks what it wrote before. A row from before the column (null), or one already pruned, bears
+ * none: losing a pre-upgrade human post's mark is harmless, forging one onto a system post isn't.
  */
-export function postHuman(db: Database, post: Pick<Post, "id" | "author">): boolean {
+export function postHuman(db: Database, post: Pick<Post, "id">): boolean {
   const row = db.prepare(`SELECT human FROM posts WHERE id = ?`).get(post.id) as { human: number | null } | undefined;
-  return row?.human == null ? isHuman(db, post.author) : row.human === 1;
+  return row?.human === 1;
 }
 
 /** A board's subscriptions, unjudged, by handle. */
