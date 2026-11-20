@@ -96,17 +96,17 @@ export async function endSessionServer(
   const releaseFailed: { key: string; error: string }[] = [];
   for (const key of queuePostOrder(await repo.claims.heldBy(tx, id, now), (k) => k)) {
     try {
-      for (const h of (await serverRelease(repo, access, tx, id, key, "session ended", { session: id })).wake) wake.add(h);
+      for (const h of (await serverRelease(repo, access, tx, id, key, "session ended", { session: id, now })).wake) wake.add(h);
     } catch (e) {
       if (!(e instanceof CoreError)) throw e;
-      const cur = await repo.claims.release(tx, key, id, Date.now());
+      const cur = await repo.claims.release(tx, key, id, now);
       if (!cur) continue;
       await repo.claims.takeWatchers(tx, key);
-      await repo.claims.logEvent(tx, "release", id, { ...cur, note: `session ended; announce failed: ${e.message}` }, Date.now());
+      await repo.claims.logEvent(tx, "release", id, { ...cur, note: `session ended; announce failed: ${e.message}` }, now);
       releaseFailed.push({ key, error: e.message });
     }
   }
-  for (const h of (await sweepClaims(repo, access, tx, Date.now())).wake) wake.add(h);
+  for (const h of (await sweepClaims(repo, access, tx, now)).wake) wake.add(h);
 
   await repo.boards.forget(tx, id);
   await repo.messages.dropReader(tx, id);

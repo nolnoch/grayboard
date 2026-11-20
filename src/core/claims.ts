@@ -140,7 +140,7 @@ export type TakeOpts = { ttl_minutes?: number; until?: string; note?: string; bo
 
 /** claim_take's argument checks, in order: the key, the note, the reserved queue: keyspace, the ttl or stop time,
  * the board name. Throws CoreError; reads nothing. */
-export function checkTake(keyInput: string, opts: TakeOpts): { key: string; board: string | null } {
+export function checkTake(keyInput: string, opts: TakeOpts, now = Date.now()): { key: string; board: string | null } {
   const key = validKey(keyInput);
   validNote(opts.note);
   // The queue: keyspace is the delivery machinery's: only claimQueuePost
@@ -152,7 +152,7 @@ export function checkTake(keyInput: string, opts: TakeOpts): { key: string; boar
     throw new CoreError(
       `claim keys starting "queue:" are reserved for queue-board delivery; pick up queued work through the board flow instead`,
     );
-  expiresAt(Date.now(), opts.ttl_minutes, opts.until); // validate before taking the lock
+  expiresAt(now, opts.ttl_minutes, opts.until); // validate before taking the lock
   return { key, board: opts.board ? normalizeBoard(opts.board) : null };
 }
 
@@ -600,6 +600,8 @@ export function sweepExpired(db: Database, now = Date.now()): ClaimChanges {
 export type ExpirySource = {
   next(): number | null | Promise<number | null>;
   sweep(): ClaimChanges | Promise<ClaimChanges>;
+  // The clock next() and the sweep read, which the timer's delay is measured against; Date.now when absent.
+  now?(): number;
 };
 
 // One timer, armed for the next expiry of a claim with a board, so a lapse is
@@ -631,11 +633,12 @@ export function expiryTimer(
   let timer: ReturnType<typeof setTimeout> | undefined;
   let at = Infinity;
   let stopped = false;
+  const clock = () => (source.now ? source.now() : Date.now());
   const set = (when: number) => {
     if (stopped) return;
     clearTimeout(timer);
     at = when;
-    timer = setTimeout(() => void fire().catch(e => console.error("[grayboard] claim expiry timer failed:", e)), Math.max(0, when - Date.now()));
+    timer = setTimeout(() => void fire().catch(e => console.error("[grayboard] claim expiry timer failed:", e)), Math.max(0, when - clock()));
     timer.unref?.();
   };
   const fire = async () => {
@@ -652,7 +655,7 @@ export function expiryTimer(
       if (!stopped && wake.length) onWake(wake);
     } catch (e) {
       console.error("[grayboard] claim expiry sweep failed:", e);
-      return set(Date.now() + retryMs);
+      return set(clock() + retryMs);
     }
     arm();
   };
@@ -664,7 +667,7 @@ export function expiryTimer(
     const next = source.next();
     if (!(next instanceof Promise)) return moveTo(next);
     // set() checks stopped, so a stop while the read waited arms nothing.
-    next.then(moveTo, e => { console.error("[grayboard] claim expiry arm failed:", e); moveTo(Date.now() + retryMs); });
+    next.then(moveTo, e => { console.error("[grayboard] claim expiry arm failed:", e); moveTo(clock() + retryMs); });
   };
   arm();
   return {

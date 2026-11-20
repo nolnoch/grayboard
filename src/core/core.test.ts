@@ -800,6 +800,22 @@ test("#807 P3 B2: an asynchronous expiry read arms when it resolves, and a stop 
   } finally { timer.stop(); }
 });
 
+// #1390: the timer measures its delay on the source's clock, the one its sweep reads: a server on a test clock behind
+// wall time would otherwise fire at once, find nothing lapsed at its own clock, and re-arm in a loop.
+test("#1390: the expiry timer's delay is measured on the source's clock", () => {
+  const T0 = 1_000_000;
+  const delays: number[] = [];
+  const real = globalThis.setTimeout;
+  const spied = spyOn(globalThis, "setTimeout").mockImplementation(((fn: () => void, ms?: number) => {
+    delays.push(ms ?? 0);
+    return real(fn, 3_600_000);
+  }) as typeof setTimeout);
+  const timer = expiryTimer({ next: () => T0 + 600_000, sweep: () => ({ wake: [], boards: [] }), now: () => T0 }, () => {});
+  try {
+    expect(delays).toEqual([600_000]);
+  } finally { timer.stop(); spied.mockRestore(); }
+});
+
 test("#807 P3 B2: a failed asynchronous expiry read is logged", async () => {
   const reported = spyOn(console, "error").mockImplementation(() => {});
   const timer = expiryTimer({
