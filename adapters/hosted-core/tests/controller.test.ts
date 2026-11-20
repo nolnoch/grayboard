@@ -722,6 +722,21 @@ test.each(modes.flatMap(mode => (["enroll", "resume"] as const).map(how => [mode
     expect(r.root(r.controller)?.code).toBeUndefined();
   } finally { await r.controller.close(); }
 });
+// A port that drifts with its own message before refusing (opencode-v2's mismatch()): that drift is the one every
+// root shows; the refusal doesn't drift again over it.
+test.each(modes.flatMap(mode => (["enroll", "resume"] as const).map(how => [mode, how] as const)))("a port's own drift before its binding refusal keeps its message (#1400, %s, %s)", async (mode, how) => {
+  const r = runtime(mode);
+  const own = "Native endpoint changed; explicitly enroll again";
+  try {
+    await r.controller.enroll("B", ["fe"], true);
+    await r.controller.enroll("R", ["be"], true);
+    await until(() => r.root(r.controller, "B")?.state === "active" && r.root(r.controller)?.state === "active");
+    r.failWhoami(() => { r.revoke("none"); r.controller.drift(own); return new Refusal("binding", "Grant changed"); });
+    if (how === "enroll") await r.controller.enroll("R");
+    else await r.controller.resume("R");
+    for (const id of ["R", "B"]) expect(r.root(r.controller, id)).toMatchObject({ state: "paused", message: own });
+  } finally { await r.controller.close(); }
+});
 
 test.each(modes)("an ended root releases ownership; an ended child ends only its own registration (%s)", async mode => {
   const r = runtime(mode);
