@@ -154,8 +154,7 @@ const isTemplate = (v: unknown): v is TemplateStringsArray => Array.isArray(v) &
 
 // Bun nests a fragment by its Query class; its own `then` stops it being sent alone (Bun would run it as a statement).
 function fragment(q: SQL.Query<unknown>): PgFragment {
-  Object.defineProperty(q, "then", { value() { throw new Error("a PgSql fragment awaited: it goes inside a statement (pgOf)"); } });
-  return q as unknown as PgFragment;
+  return Object.defineProperty(q, "then", { value() { throw new Error("a PgSql fragment awaited: it goes inside a statement (pgOf)"); } }) as unknown as PgFragment;
 }
 
 function statements(conn: SQL, check: () => void): PgSql {

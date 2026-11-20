@@ -337,7 +337,7 @@ test("real bearer CLI claim route hints committed posts without attention subscr
       expect(await application.pending(store.repo.read, session)).toEqual([]);
       expect(await store.repo.cursors.directFor(store.repo.read, session.identityFull)).toBe(0);
     }
-  } finally { touches.cancelAll(); server.stop(true); }
+  } finally { touches.cancelAll(); void server.stop(true); }
 });
 
 test("timer expiry independently hints with no attention subscribers", async () => {

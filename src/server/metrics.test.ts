@@ -66,7 +66,7 @@ test("a metrics port in use fails startup", async () => {
   const taken = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response("") });
   try {
     await expect(TestServer.open({ metricsAddr: { hostname: "127.0.0.1", port: taken.port! } })).rejects.toThrow();
-  } finally { taken.stop(true); }
+  } finally { void taken.stop(true); }
 });
 
 test("GRAYBOARD_METRICS_ADDR: a bare port binds loopback; host:port and [v6]:port as given", () => {

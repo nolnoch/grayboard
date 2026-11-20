@@ -48,9 +48,9 @@ async function overlap(first: Record<string, unknown>, second: Record<string, un
   const workers = [start(first, pause), start(second, "")];
   try {
     await Promise.all(workers.map(w => w.wait("READY")));
-    workers[0]!.proc.stdin.end();
+    void workers[0]!.proc.stdin.end();
     await workers[0]!.wait(`test pause hit: ${pause}`);
-    workers[1]!.proc.stdin.end();
+    void workers[1]!.proc.stdin.end();
     await workers[1]!.wait("OPERATING");
     await Bun.write(release, "release");
     await Promise.all(workers.map(async w => { expect(await w.proc.exited).toBe(0); await w.done; }));

@@ -700,9 +700,9 @@ test("#807 P1c-13: the aliases store runs on the handle it's given", async () =>
   expect((await a.countForScope(repo.read, "person", "a@example.com"))).toBe(1);
   expect((await a.findAllByName(repo.read, "fe")).map(x => x.address)).toEqual(["a@example.com/fe"]);
   // A create rolls back with its body, and a remove's read points with it.
-  await expect(seed(repo, tx => {
-    a.create(tx, person("a@example.com", "qa"), "a@example.com");
-    a.remove(tx, "a@example.com/fe");
+  await expect(seed(repo, async tx => {
+    await a.create(tx, person("a@example.com", "qa"), "a@example.com");
+    await a.remove(tx, "a@example.com/fe");
     throw new Error("rolled back");
   })).rejects.toThrow("rolled back");
   expect(await a.find(repo.read, "a@example.com/qa")).toBeUndefined();
