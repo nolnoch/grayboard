@@ -33,6 +33,10 @@ const FAILURE_LIMIT: u32 = 8;
 const RECOVERY_LIMIT: u32 = 3;
 /// Admission-throttled reopens before the stream stops with the transport's `RateLimited`.
 const THROTTLE_LIMIT: u32 = 8;
+/// Listen-cap refusals a renewal's reopen retries before it is an ordinary round failure (#1394): `backoff_unit` doubling, 7.75 s in all at the defaults, well inside the lease's 30 s TTL, which nothing renews meanwhile. A larger `backoff_unit` can outlast the TTL; the lease then lapses and costs a lease recovery, not a failure. The global listen cap returns the same body and is retried too, harmlessly: the old slot frees a global one as well.
+const SWAP_CAPACITY_RETRIES: u32 = 5;
+/// The server's body for a listen past the listen cap (`src/server/mcp.ts` `reserve`), a plain-text 429 (`Error::Capacity`). Only this one is the reopen's slot race: request or exchange capacity is not.
+const LISTEN_CAPACITY: &str = "MCP listen capacity reached";
 /// The `stable_id` hash's own version. hosted-core's `stableID` is version 4 and hashes the issuer too; this one doesn't (one endpoint has one issuer), so the two never collide.
 const STABLE_ID_VERSION: u32 = 1;
 /// An address as `model.ts` accepts it: no whitespace, control or bidi characters, at most 160 characters.
@@ -735,19 +739,29 @@ impl Task {
         fail
     }
 
-    /// The credential installed a new token: the server closes this listen stream when the token it was opened with expires, so it is replaced now, under the same lease (#1265). Close, then open: listens count against a per-user cap, and every session on one credential renews at once, so opening first could need twice the slots; the server frees the old slot when it notices the dropped request, so at the cap the new listen can still be refused (an ordinary round failure). Hints are nonconsuming and the server keeps the inbox position, so the caller re-reads afterwards and a hint lost in the gap costs nothing. Not an outage, failure, lease loss or throttle, and no backoff; a reopen that fails is an ordinary round failure.
+    /// The credential installed a new token: the server closes this listen stream when the token it was opened with expires, so it is replaced now, under the same lease (#1265). Close, then open: listens count against a per-user cap, and every session on one credential renews at once, so opening first could need twice the slots. Hints are nonconsuming and the server keeps the inbox position, so the caller re-reads afterwards and a hint lost in the gap costs nothing. Not an outage, failure, lease loss or throttle, and no backoff; a reopen that fails is an ordinary round failure, with one exception: the server frees the old slot when it notices the dropped request, so at the cap the new listen can race it and be refused (`LISTEN_CAPACITY`), and that refusal alone is retried under the same lease on a short backoff, spending no failure (#1394), up to `SWAP_CAPACITY_RETRIES` times.
     async fn relisten(
         &mut self,
         sub: &Arc<Connection>,
         listener: &mut Listener,
     ) -> Result<(), Fail> {
         listener.close().await;
-        match watch(&mut self.ctl, sub.listen(&[INBOX])).await {
-            Err(f) => Err(f),
-            Ok(Err(e)) => Err(Fail::Err(e)),
-            Ok(Ok(subscription)) => {
-                *listener = Listener::start(subscription);
-                Ok(())
+        let mut retry = 0;
+        loop {
+            match watch(&mut self.ctl, sub.listen(&[INBOX])).await {
+                Err(f) => return Err(f),
+                Ok(Err(Error::Capacity(text)))
+                    if text == LISTEN_CAPACITY && retry < SWAP_CAPACITY_RETRIES =>
+                {
+                    let wait = self.backoff(retry, self.t.backoff_unit);
+                    watch(&mut self.ctl, sleep(wait)).await?;
+                    retry += 1;
+                }
+                Ok(Err(e)) => return Err(Fail::Err(e)),
+                Ok(Ok(subscription)) => {
+                    *listener = Listener::start(subscription);
+                    return Ok(());
+                }
             }
         }
     }

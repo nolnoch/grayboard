@@ -31663,6 +31663,14 @@ function unreachable(error) {
   }
   return false;
 }
+var LISTEN_CAPACITY = "MCP listen capacity reached";
+function listenCapacity(error) {
+  for (let e = error, depth = 0;e && depth < 8; e = e.cause, depth++) {
+    if (e instanceof SdkHttpError && e.status === 429 && e.data.text === LISTEN_CAPACITY)
+      return true;
+  }
+  return false;
+}
 function outcome(error) {
   for (let e = error, depth = 0;e && depth < 8; e = e.cause, depth++) {
     if (e instanceof ServerUnreachable)
@@ -32355,9 +32363,17 @@ ${config.clientId}`)}.json`);
   }
   async token() {
     const s = await this.live();
-    if (s.accessExpiresAt - Date.now() > REFRESH_MARGIN_MS)
-      return s.access;
-    return this.refresh();
+    return this.serve(s.accessExpiresAt - Date.now() > REFRESH_MARGIN_MS ? s.access : await this.refresh());
+  }
+  served;
+  rotations = new Set;
+  serve(access) {
+    const was = this.served;
+    this.served = access;
+    if (was !== undefined && was !== access)
+      for (const changed of [...this.rotations])
+        changed();
+    return access;
   }
   async unauthorized(token) {
     const s = await this.live();
@@ -32853,6 +32869,13 @@ ${config.clientId}`)}.json`);
       unauthorized: async (e, token) => {
         await check(e);
         await this.unauthorized(token);
+      },
+      rotated: (_e, changed) => {
+        const listener = () => changed();
+        this.rotations.add(listener);
+        return { dispose: () => {
+          this.rotations.delete(listener);
+        } };
       }
     };
   }
@@ -36686,6 +36709,8 @@ var ROTATION_POLL_MS = 500;
 var ROTATION_GRACE_MS = 1e4;
 var LEASE_MARGIN_MS = 2000;
 var RENEW_MS = 1e4;
+var SWAP_CLOSE_MS = 1000;
+var SWAP_CAPACITY_RETRIES = 5;
 var RECOVERY_FIRST_MS = 1000;
 var RECOVERY_MAX_MS = 30000;
 var RECOVERY_BUDGET_MS = 60 * 60000;
@@ -37240,22 +37265,55 @@ class Controller {
         r.recovery = undefined;
         this.set(r, "active", `Subscribed as ${this.names(e)}${this.lostNote(current)}; receipts follow durable root admission`);
         ready();
-        let dirty = true, wake, closed = false;
+        let dirty = true, wake, closed = false, tokenChanged = false;
         wire.client.setNotificationHandler("notifications/resources/updated", () => {
           dirty = true;
           wake?.();
         });
-        const subscription = await wire.listen();
-        subscription.closed.then(() => {
-          closed = true;
-          wake?.();
-        }, () => {
-          closed = true;
+        let subscription;
+        const listen = async () => {
+          const opened = subscription = await wire.listen();
+          const ended = () => {
+            if (subscription === opened) {
+              closed = true;
+              wake?.();
+            }
+          };
+          opened.closed.then(ended, ended);
+        };
+        const rotation = this.port.credential.rotated?.(e, () => {
+          tokenChanged = true;
           wake?.();
         });
         let renewal = Date.now() + RENEW_MS;
         try {
+          await listen();
           while (!signal.aborted) {
+            if (tokenChanged) {
+              tokenChanged = false;
+              const old = subscription;
+              subscription = undefined;
+              closed = false;
+              if (old) {
+                const bound = new AbortController;
+                const closing = old.close().catch((error) => this.failure("subscription_close", error, r));
+                await Promise.race([closing, this.wait(SWAP_CLOSE_MS, AbortSignal.any([signal, bound.signal]))]);
+                bound.abort();
+              }
+              await this.guard(r, epoch, signal);
+              for (let retry = 0;; retry++) {
+                try {
+                  await listen();
+                  break;
+                } catch (error) {
+                  if (signal.aborted || retry >= SWAP_CAPACITY_RETRIES || !listenCapacity(error))
+                    throw error;
+                }
+                await this.wait(Math.min(4000, 250 * 2 ** retry), signal);
+                await this.guard(r, epoch, signal);
+              }
+              dirty = true;
+            }
             if (dirty) {
               dirty = false;
               const items = itemsOf(await wire.read("grayboard://inbox"));
@@ -37311,7 +37369,7 @@ class Controller {
               recoveries = 0;
               unreachable = 0;
             }
-            if (dirty)
+            if (dirty || tokenChanged)
               continue;
             const timer = new AbortController;
             await Promise.race([sleep5(1000, AbortSignal.any([signal, timer.signal])), new Promise((resolve) => {
@@ -37321,7 +37379,8 @@ class Controller {
             timer.abort();
           }
         } finally {
-          await subscription.close().catch((error) => this.failure("subscription_close", error, r));
+          rotation?.dispose();
+          await subscription?.close().catch((error) => this.failure("subscription_close", error, r));
         }
       } catch (caught) {
         if (signal.aborted)

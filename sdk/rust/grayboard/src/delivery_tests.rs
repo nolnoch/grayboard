@@ -1752,3 +1752,105 @@ async fn a_failed_reopen_after_a_renewal_backs_off_like_any_outage() {
     w.bus().hint();
     assert_eq!(next(&mut stream).await.unwrap().id, "direct:1");
 }
+
+/// The next `n` listens are refused with `body` as a plain-text 429, as the server refuses a listen past a cap.
+fn refuse_listens(w: &World, n: usize, body: &'static str) {
+    for _ in 0..n {
+        w.bus().on("listen", move |_, _| Reply::status(429, body));
+    }
+}
+
+// Decision (#1394): the server frees a replaced listen's slot only when it notices the dropped request, so at the per-user listen cap the reopen after a renewal can be refused (`MCP listen capacity reached`). That refusal is retried under the same lease, `backoff_unit` doubling: no whoami, no delivery_open, and no failure spent.
+#[tokio::test]
+async fn a_reopen_the_listen_cap_refuses_is_retried_under_the_same_lease() {
+    for n in [1, 5] {
+        let credential = Renewing::new();
+        let w = World::with_credential(Bus::new(&["a"]), |_| {}, credential.clone()).await;
+        let mut stream = w.s().deliveries();
+        w.until("the lease listens", |b| ops_count(b, "listen") == 1)
+            .await;
+        refuse_listens(&w, n, "MCP listen capacity reached");
+        credential.rotate("tok-2");
+        w.until("the reopen is acknowledged", |b| {
+            ops_count(b, "listen") == n + 2
+        })
+        .await;
+        w.bus().direct(1);
+        w.bus().hint();
+        assert_eq!(next(&mut stream).await.unwrap().id, "direct:1");
+        assert_eq!(w.count("sub:whoami"), 1, "{:?}", w.ops());
+        assert_eq!(w.count("sub:delivery_open"), 1);
+        // Each retry waited its backoff: 5 ms doubling from the first refusal.
+        let listens = w.calls("listen");
+        for i in 1..=n {
+            let gap = listens[i + 1].at.duration_since(listens[i].at);
+            let want = Duration::from_millis(5) * (1u32 << (i - 1)).min(8);
+            assert!(gap >= want, "retry {i} waited {gap:?}, not {want:?}");
+        }
+    }
+}
+
+// Decision (#1394): the issue's case, an idle stream at the cap with a refused reopen every token lifetime and no receipt between them. Were each refusal a failure, the eighth would stop the stream (`retry_exhausted`); twelve keep the one lease delivering.
+#[tokio::test]
+async fn repeated_reopens_the_listen_cap_refuses_spend_no_failures() {
+    let credential = Renewing::new();
+    let w = World::with_credential(Bus::new(&["a"]), |_| {}, credential.clone()).await;
+    let mut stream = w.s().deliveries();
+    w.until("the lease listens", |b| ops_count(b, "listen") == 1)
+        .await;
+    for i in 1..=12 {
+        refuse_listens(&w, 5, "MCP listen capacity reached");
+        credential.rotate(&format!("tok-{}", i + 1));
+        w.until("the reopen is acknowledged", |b| {
+            ops_count(b, "listen") == 1 + 6 * i
+        })
+        .await;
+    }
+    assert_eq!(w.count("sub:delivery_receipt"), 0);
+    w.bus().direct(1);
+    w.bus().hint();
+    assert_eq!(next(&mut stream).await.unwrap().id, "direct:1");
+    assert_eq!(w.count("sub:whoami"), 1, "{:?}", w.ops());
+    assert_eq!(w.count("sub:delivery_open"), 1);
+}
+
+// Decision (#1394): a user persistently at the cap: past `SWAP_CAPACITY_RETRIES`, the refusal is an ordinary round failure (the lease dropped, a backoff, a reopen from whoami), as the cap refusing a round's first listen is.
+#[tokio::test]
+async fn a_reopen_the_listen_cap_refuses_past_its_retries_is_an_ordinary_round_failure() {
+    let credential = Renewing::new();
+    let w = World::with_credential(Bus::new(&["a"]), |_| {}, credential.clone()).await;
+    let mut stream = w.s().deliveries();
+    w.until("the lease listens", |b| ops_count(b, "listen") == 1)
+        .await;
+    refuse_listens(&w, 6, "MCP listen capacity reached");
+    credential.rotate("tok-2");
+    w.until("a new round listens", |b| ops_count(b, "listen") == 8)
+        .await;
+    assert_eq!(w.count("sub:whoami"), 2, "{:?}", w.ops());
+    assert_eq!(w.count("sub:delivery_open"), 2);
+    w.bus().direct(1);
+    w.bus().hint();
+    assert_eq!(next(&mut stream).await.unwrap().id, "direct:1");
+}
+
+// Decision (#1394): only the listen cap's body is the reopen's slot race; another plain-text 429 (request capacity) is an ordinary round failure at once, with no capacity retry.
+#[tokio::test]
+async fn a_reopen_refused_with_another_capacity_is_an_ordinary_round_failure() {
+    let credential = Renewing::new();
+    let w = World::with_credential(Bus::new(&["a"]), |_| {}, credential.clone()).await;
+    let _stream = w.s().deliveries();
+    w.until("the lease listens", |b| ops_count(b, "listen") == 1)
+        .await;
+    refuse_listens(&w, 1, "MCP request capacity reached");
+    credential.rotate("tok-2");
+    w.until("a new round listens", |b| ops_count(b, "listen") == 3)
+        .await;
+    let ops = w.ops();
+    let tail = after(&ops, "listen", 2);
+    assert_eq!(
+        tail.iter().position(|o| o == "sub:whoami"),
+        Some(0),
+        "the refused listen went straight to a new round: {ops:?}"
+    );
+    assert_eq!(w.count("sub:delivery_open"), 2);
+}
