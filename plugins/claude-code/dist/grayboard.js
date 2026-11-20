@@ -36003,6 +36003,22 @@ function outputOf(result) {
     return only.text;
   }
 }
+function refusalOf2(result) {
+  const output = outputOf(result);
+  const code = typeof output === "object" && typeof output?.code === "string" ? output.code : undefined;
+  if (typeof output === "object" && typeof output?.message === "string")
+    return { code, why: output.message };
+  const text = typeof output === "string" ? output : result.content.find((c) => c.type === "text")?.text;
+  return { code, why: text && !isJson(text) ? text.replace(/^error: /, "") : "no reason given" };
+}
+function isJson(text) {
+  try {
+    JSON.parse(text);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 // src/shared/session_meta.ts
 var GRAYBOARD_SESSION_META = "io.github.nolnoch.grayboard/sessionID";
@@ -37923,9 +37939,7 @@ class RootDelivery {
         this.configuring = undefined;
         return;
       }
-      const output = outputOf(result);
-      const code = typeof output === "object" && typeof output?.code === "string" ? output.code : undefined;
-      const why = typeof output === "object" ? typeof output?.message === "string" ? output.message : "no reason given" : String(output ?? "no reason given").replace(/^error: /, "");
+      const { code, why } = refusalOf2(result);
       if (code && REFUSED.has(code))
         this.configuring = undefined;
       this.configuredMissed(name, code ? `${code}: ${why}` : why, !this.configuring);
