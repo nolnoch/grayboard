@@ -16,7 +16,7 @@ export type EndAuditSink = (action: CoreAuditAction, actor: string, target: stri
 // A whole session end (src/server/session_end.ts endSessionServer, composed over the Repo's groups), as a port: what
 // the hosted store ends a released child's ID through, on either backend, closing over the Repo and the board access
 // so a store module imports no application code. It may wait on row locks held by in-flight writes for the ended IDs
-// (claims, messages, aliases, attachments); on Postgres `lock_timeout` bounds the wait (c10-scope §7 Q9).
+// (messages, claims, posts, holds, attachments; the lock order is session_end.ts's); on Postgres the pool's `lock_timeout` bounds the wait (c10-scope §7 Q9).
 export type SessionEndPort = {
   end(tx: Tx, id: string, opts: { why: string; now: number; audit: EndAuditSink }): Promise<EndedSession>;
 };

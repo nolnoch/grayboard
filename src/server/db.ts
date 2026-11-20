@@ -1285,6 +1285,11 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
            RETURNING bound_at`,
         ).get(address, id, now);
       },
+      // The single writer is the lock: a plain read rules as Postgres's locked one does (store/bindings.ts).
+      async lockLive(tx, id) {
+        const row = sqliteOf(tx).query<{ ended_at: number | null }, [string]>("SELECT ended_at FROM ids WHERE id = ?").get(id);
+        return row ? row.ended_at === null : null;
+      },
       release: async (tx, address, id) => dropHold(sqliteOf(tx), address, id),
       // A stamp the caller doesn't give is core's default (Date.now), as when the server called core directly.
       log: async (tx, id, name, event, detail = null, at) => logBinding(sqliteOf(tx), id, name, event, detail, at),

@@ -90,6 +90,22 @@ test("TTL takeover redelivers the original post to the next lane, and the rotati
   expect(r2.wake).toEqual(["fe"]);
 });
 
+// #1387: a sweep that lapses several queue claims redelivers them in post id order, so it locks their posts in the
+// order a posts prune locks its batch. Mutation: sweepChanges without queuePostOrder (lapse order: 10 first).
+test("a sweep lapsing several queue claims redelivers them in post id order, not lapse or key order", () => {
+  const ids: number[] = [];
+  for (let i = 0; i < 10; i++) ids.push(post(db, "be", "work", `item ${i}`).post.id);
+  const [nine, ten] = [ids[8]!, ids[9]!];
+  expect([nine, ten]).toEqual([9, 10]);
+  // Only these two lapse, ten first: both lapse order and key text order put queue:work:10 first.
+  db.prepare(`UPDATE claims SET expires_at = ?`).run(Date.now() + 1e9);
+  db.prepare(`UPDATE claims SET expires_at = 100 WHERE key = ?`).run(claimKey(ten));
+  db.prepare(`UPDATE claims SET expires_at = 200 WHERE key = ?`).run(claimKey(nine));
+  sweepExpired(db, 1_000);
+  const expired = db.prepare(`SELECT key FROM claim_events WHERE event = 'expire' ORDER BY rowid`).all() as { key: string }[];
+  expect(expired.map((e) => e.key)).toEqual([claimKey(nine), claimKey(ten)]);
+});
+
 test("a declined queue post redelivers the original post to the next lane", () => {
   const r = post(db, "be", "work", "work item"); // fe claims it, declines
   release(db, "fe", claimKey(r.post.id), "not my lane");

@@ -198,13 +198,16 @@ export function makePgMessages({ clock, attachmentLimits }: { clock: () => numbe
       await dropAttachments(sql, "message", old());
       await sql`DELETE FROM messages WHERE created_at < ${olderThanMs}`;
     },
-    // A session end's (#807 P3 C10d2-a); its row lock (sessionEnd.end, C10d2-b) is what orders it against a send.
+    // A session end's (#807 P3 C10d2-a); its row lock (sessionEnd.end, C10d2-b) is what orders it against a send. The
+    // rows FOR KEY SHARE, locked in id order (the lock sits above the sort), as messages.prune locks its batch: the
+    // end's bounces then lock their parents in sender order holding them all already, so they can't deadlock against
+    // a prune (session_end.ts's lock order). A retract holding one makes this wait, and its row is then gone.
     async unreadFor(tx, id) {
       const list = await pgOf(tx)`SELECT m.id, m.sender FROM messages m
         WHERE m.recipient_type = 'user' AND m.recipient = ${id} AND m.sender <> ${id}
           AND m.id > COALESCE((SELECT last_seen_id FROM mailbox_cursors
                                 WHERE address = ${id} AND stream_type = 'direct' AND stream_ref = ${id}), 0)
-        ORDER BY m.id`;
+        ORDER BY m.id FOR KEY SHARE OF m`;
       return list.map((r: Row) => ({ id: int8(r.id), sender: r.sender as string }));
     },
     // The parent FOR KEY SHARE first, as insert's reply does: a retract that committed first leaves no parent, and the

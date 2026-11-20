@@ -1,9 +1,10 @@
 // The server's claim tools and steps (#807 P3 B5b3b, B5b3c): core's claim_take, claim_release, claim_watch, sweep and
 // queue requeue over the store's rows on the caller's Tx, judged by the async BoardAccess on that same Tx. Every rule and text is core's (expiredText, unclaimedText,
 // orderLanes, requeuePick, holderUserRule, endReachRule), so local and the server announce alike and only the reads differ.
+import { addressParts } from "../core/addresses.ts";
 import { orderLanes, REDELIVERED_NOTE, requeuePick } from "../core/boards.ts";
 import {
-  alreadyReleasedText, checkMove, endReachRule, isQueueKey, moves, checkRelease, checkTake, claimText, expiredText, heldAnswer, notWatching, releasable, releasedByRule,
+  alreadyReleasedText, checkMove, endReachRule, isQueueKey, moves, queuePostOrder, checkRelease, checkTake, claimText, expiredText, heldAnswer, notWatching, releasable, releasedByRule,
   releasedText, releaseRefusal, releaseText, renewAnnounces, takeDecision, unclaimedText, updateText, validKey, watching, watchNoBoard,
   watchNoClaim, watchOwn, type Claim, type ClaimChanges, type ClaimCtx, type ClaimResult, type ClaimRow, type TakeOpts,
 } from "../core/claims.ts";
@@ -32,7 +33,7 @@ type ServerClaimCtx = ClaimCtx & { announced?: Announced };
 export async function sweepClaims(repo: Repo, access: BoardAccess, tx: Tx, now: number): Promise<ClaimChanges> {
   const wake = new Set<string>();
   const boards = new Set<string>();
-  for (const c of await repo.claims.expire(tx, now)) {
+  for (const c of queuePostOrder(await repo.claims.expire(tx, now), (c) => c.key)) {
     await repo.claims.logEvent(tx, "expire", c.holder, c, now);
     let changed: ClaimChanges;
     if (c.key.startsWith("queue:")) {
@@ -50,6 +51,9 @@ export async function sweepClaims(repo: Repo, access: BoardAccess, tx: Tx, now: 
   }
   return { wake: [...wake], boards: [...boards] };
 }
+
+/** The refusal of a claim take by an ID that has ended (#807 P3 C10d2-b, E4). */
+export const endedClaimText = (id: string) => `session ${id} has ended; it can't take a claim`;
 
 /**
  * core requeue on `tx`: a queue post's claim ended (a lapse, or a decline in `ctx`'s name). Its watches go; the post goes
@@ -159,6 +163,10 @@ export async function serverClaim(
 ): Promise<ClaimResult> {
   const { key, board } = checkTake(keyInput, opts);
   const addresses = opts.addresses ?? [handle];
+  // The acting ID's row first, under the lock a session end waits for (E4, bindings.lockLive; session_end.ts's lock
+  // order: ids before claims): a take racing the ID's end lands before it (and the end releases it) or refuses after.
+  const acting = opts.session ?? (addressParts(handle)?.kind === "id" ? handle : undefined);
+  if (acting !== undefined && (await repo.bindings.lockLive(tx, acting)) === false) throw new CoreError(endedClaimText(acting), "id_ended");
   return tx.savepoint(async (sp): Promise<ClaimResult> => {
     // A board that doesn't exist, or that `handle` can't see, refuses as a post to it would (#81).
     if (board && !(await boardVisible(repo, access, sp, handle, board))) throw new CoreError(`no such board #${board}; see board_list`);

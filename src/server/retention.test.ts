@@ -111,6 +111,38 @@ describe("retention pruning", () => {
     expect(snapshots).toEqual([[], []]);
   });
 
+  // #1387: on Postgres a step can lose a deadlock (40P01); one step's failure must not skip the rest. Each step in
+  // turn fails; every other step still runs and the failure is logged under the step's name. Mutation: any step taken
+  // out of its own try (a later step is skipped, or runRetention throws).
+  const STEPS: [name: string, group: keyof Repo, method: string][] = [
+    ["messages", "messages", "prune"], ["posts", "boards", "prunePosts"], ["ended sessions", "sessionEnd", "pruneEnded"],
+    ["audit", "audit", "prune"], ["unbound uploads", "attachments", "pruneUnbound"], ["write receipts", "writeReceipts", "prune"],
+  ];
+  for (const [failing] of STEPS) {
+    test(`a retention step that fails (${failing}) is logged and every other step still runs`, async () => {
+      const { repo: r } = open();
+      const config = { messageRetentionDays: 1, auditRetentionDays: 1 } as Config;
+      const ran: string[] = [];
+      for (const [name, group, method] of STEPS) {
+        const g = r[group] as unknown as Record<string, (...a: unknown[]) => unknown>;
+        const orig = g[method]!;
+        g[method] = name === failing
+          ? async () => { throw new Error("deadlock detected"); }
+          : (...a: unknown[]) => { ran.push(name); return orig.apply(g, a); };
+      }
+      const errors: string[] = [];
+      const orig = console.error;
+      console.error = (...a: unknown[]) => { errors.push(a.map(String).join(" ")); };
+      try {
+        await runRetention(r, config, Date.now());
+      } finally {
+        console.error = orig;
+      }
+      expect(ran).toEqual(STEPS.map(([n]) => n).filter(n => n !== failing));
+      expect(errors.filter(e => e.includes("retention failed"))).toEqual([`[grayboard] retention failed (${failing}): Error: deadlock detected`]);
+    });
+  }
+
   test("pruneAudit does not throw", async () => {
     await seed(repo, (tx) => repo.audit.write(tx, { at: Date.now() - 1000, actor: "system", action: "auth.login", target: null, detail: null }));
     await expect(seed(repo, (tx) => pruneAudit(repo, tx, Date.now()))).resolves.toBeUndefined();
