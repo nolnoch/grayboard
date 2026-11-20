@@ -9,6 +9,7 @@ import { createHash } from "node:crypto";
 import { chmodSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { channelParams } from "../../adapters/hosted-core/src/channel.ts";
+import { SubscriberError } from "../../adapters/hosted-core/src/wire.ts";
 import type { ReadResult, WhoResult } from "../../src/core/boards.ts";
 import type { BoardPostResult } from "../../src/core/tools.ts";
 import type { DirectMessage, HistoryMessage, InboxResult, SendResult } from "../../src/server/application.ts";
@@ -581,6 +582,14 @@ test("#1220: every class of input-schema refusal carries code bad_request, local
     const text = result.content?.[0]?.type === "text" ? result.content[0].text : "";
     expect([tool, result.isError, result.structuredContent, text.startsWith(`Input validation error: Invalid arguments for tool ${tool}:`)]).toEqual([tool, true, { code: "bad_request" }, true]);
     await expect(a.call(tool, args)).rejects.toMatchObject({ code: "bad_request" });
+  }
+  // The subscriber role's tools too: hosted-core's Wire sees the code, not a code-less invalid_response.
+  for (const [tool, args] of [
+    ["delivery_receipt", { ids: "x" }], // a string for an array
+    ["bind", { name: 7 }], // a number for a string
+  ] as const) {
+    const refused = await a.subscriber.call(tool, args).then(() => undefined, (e: unknown) => e);
+    expect([tool, refused instanceof SubscriberError, (refused as SubscriberError | undefined)?.code]).toEqual([tool, true, "bad_request"]);
   }
   // The refused peer_status set nothing.
   expect((await a.call<{ peers: { handle: string; status?: string }[] }>("peer_list", {})).peers.find((p) => p.handle === "be")?.status ?? null).toBeNull();
