@@ -124,7 +124,8 @@ export function makePgAuthGeneration({ url, transactions, heartbeatMs = 5000, st
       failLogged = true;
       console.error("[grayboard] auth LISTEN failed; the auth cache stays off and the LISTEN is retried:", errorDiagnostic(error));
     }
-    inst = attempt = undefined;
+    on = false;
+    hb = inst = attempt = undefined;
     i.close({ timeout: 0 }).catch(() => {});
     const ms = retryMs;
     retryMs = Math.min(retryMs * 2, RETRY_MAX_MS);
