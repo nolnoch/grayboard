@@ -39,12 +39,15 @@ test("login, login link, logout, refresh and tool-proxy records keep their opera
   expect(stored.map(r => logFields(r))).toEqual(written.map(w => expect.objectContaining({ operation: w.operation, code: w.code, root: w.sessionID })));
 });
 
-// #1349: a session_register refusal is recorded, emitted and restored under its own code.
+// #1349: a session_register refusal keeps its own code through failureCode and the record validator (logFields runs the same projection a restore does).
 test("session_register's refusal codes are diagnostic codes a record keeps", () => {
   for (const code of ["child_bound", "child_registered_elsewhere", "has_children", "root_is_child", "invalid_registration"]) {
     const error = subscriberError({ code }, false);
     expect([code, failureCode(error), failureMessage(error, "run /grayboard resume")]).toEqual([code, code, `Operation refused (${code})`]);
     expect(logFields({ state: "degraded", message: "child_register failed", operation: "child_register", time: Date.now(), code })).toMatchObject({ code });
-    expect(logFields({ state: "active", message: "ok", operation: "child_register", time: Date.now(), failure: { operation: "child_register", code, time: Date.now() } })).toBeDefined();
+    // logFields doesn't echo `failure`, but drops the whole record when its code isn't a known one.
+    const withFailure = (c: string) => logFields({ state: "active", message: "ok", operation: "child_register", time: Date.now(), failure: { operation: "child_register", code: c, time: Date.now() } });
+    expect(withFailure(code)).toMatchObject({ operation: "child_register", state: "active" });
   }
+  expect(logFields({ state: "active", message: "ok", operation: "child_register", time: Date.now(), failure: { operation: "child_register", code: "not_a_code", time: Date.now() } })).toBeUndefined();
 });
