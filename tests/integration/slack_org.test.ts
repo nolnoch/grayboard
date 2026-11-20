@@ -16,10 +16,8 @@ import { closeSessions } from "../support/mcp.ts";
 import { TEST_BACKEND, TestServer } from "../support/server.ts";
 import { seed } from "../support/seed.ts";
 import { until } from "../support/until.ts";
-import { drained, exec, row, rows, txSpy } from "../support/repo_sql.ts";
+import { drained, exec, queuedBodies, row, rows, txSpy } from "../support/repo_sql.ts";
 import { holdWrites } from "../support/write_hold.ts";
-import { AsyncLocalStorage } from "node:async_hooks";
-import type { Tx } from "../../src/server/store/tx.ts";
 import type { Relay, RelayStore } from "../../src/bridge/relay.ts";
 const DM = "D0ALICE";
 const ALICE_SLACK = "U0ALICE";
@@ -38,32 +36,18 @@ beforeEach(async () => {
   await srv.app.slackReady;
 });
 
+// Holds a test took and didn't release (a failed assert before its release): freed first, so teardown doesn't wait
+// behind them and the server's database is dropped.
+const holds: (() => void)[] = [];
 afterEach(async () => {
-  await closeSessions();
-  await srv.stop();
-  slack.stop();
+  for (const release of holds.splice(0)) release();
+  try { await closeSessions(); } finally {
+    await srv.stop();
+    slack.stop();
+  }
 });
 
 const login = (email: string) => srv.login(email);
-
-// Whether the calling code runs inside a body the server's write queue runs (repo.write, repo.post, repo.hosted.write:
-// every top-level transaction the server opens goes through one), on either backend: what SQLite's
-// `db.inTransaction && queueFor(db).mine` said. Each body runs in an async context of its own, so a call made from
-// outside one (while another body holds the queue) reads false. `restore()` puts the Repo's methods back.
-function queuedBodies(): { readonly inside: boolean; restore(): void } {
-  const repo = srv.app.repo;
-  const als = new AsyncLocalStorage<true>();
-  const wrap = (fn: (tx: Tx) => unknown) => (tx: Tx) => als.run(true, () => fn(tx));
-  const write = repo.write, post = repo.post, hostedWrite = repo.hosted.write;
-  const r = repo as unknown as Record<"write" | "post", unknown>, h = repo.hosted as unknown as Record<"write", unknown>;
-  r.write = (fn: (tx: Tx) => unknown, ...rest: unknown[]) => (write as (...a: unknown[]) => unknown).call(repo, wrap(fn), ...rest);
-  r.post = (fn: (tx: Tx) => unknown, ...rest: unknown[]) => (post as (...a: unknown[]) => unknown).call(repo, wrap(fn), ...rest);
-  h.write = (fn: (tx: Tx) => unknown, ...rest: unknown[]) => (hostedWrite as (...a: unknown[]) => unknown).call(repo.hosted, wrap(fn), ...rest);
-  return {
-    get inside() { return als.getStore() === true; },
-    restore() { r.write = write; r.post = post; h.write = hostedWrite; },
-  };
-}
 
 // Makes the next INSERT into `table` (with `action`, for access_log) fail inside its transaction, on either backend:
 // a trigger that raises `message`, so the write's whole transaction rolls back.
@@ -391,6 +375,7 @@ function holdQueue(): { release: () => void; started: Promise<void>; done: Promi
   let begin!: () => void;
   const started = new Promise<void>((r) => { begin = r; });
   const hold = holdWrites(srv, () => begin());
+  holds.push(hold.release);
   return { release: hold.release, started, done: hold.done };
 }
 const ticks = async (n = 5) => { for (let i = 0; i < n; i++) await new Promise((r) => setImmediate(r)); };
@@ -400,8 +385,13 @@ test("#807: an HTTP unlink while another body holds the write queue waits, then 
   await link(alice);
   const userId = (await srv.app.repo.users.findByEmail(srv.app.repo.read, "alice@example.com"))!.id;
   const holder = holdQueue();
+  // The hold is a repo.write itself: taken before the spy, so the spy sees only the unlink's.
+  const write = spyOn(srv.app.repo, "write");
   const unlinked = srv.app.slack!.unlink(userId);
-  await ticks();
+  await until(() => write.mock.calls.length > 0, 5000, "the unlink reached the write queue");
+  write.mockRestore();
+  // Long enough for the unlink to commit on either backend if nothing held the queue.
+  await Bun.sleep(100);
   expect((await srv.app.repo.slack.linkFor(srv.app.repo.read, userId))).toBeDefined();
   holder.release();
   await holder.done;
@@ -418,7 +408,7 @@ test("#807: a Slack user's dm_send and board_post run inside a write-queue trans
   const app = srv.app.application;
   const { call, send } = app;
   const seen: Record<string, boolean> = {};
-  const bodies = queuedBodies();
+  const bodies = queuedBodies(srv);
   app.call = (tx, s, n, a, p) => { seen[n] = bodies.inside; return call.call(app, tx, s, n, a, p); };
   app.send = (tx, s, to, body, o) => { seen.dm_send = bodies.inside; return send.call(app, tx, s, to, body, o); };
   try {
@@ -456,7 +446,7 @@ test("#807: a Slack user's dm_thread runs inside a write-queue transaction", asy
   const app = srv.app.application;
   const { thread } = app;
   const seen: boolean[] = [];
-  const bodies = queuedBodies();
+  const bodies = queuedBodies(srv);
   app.thread = (tx, s, id) => { seen.push(bodies.inside); return thread.call(app, tx, s, id); };
   try {
     const root = await be.call<SendResult>("dm_send", { to: "human", body: "thread root" });

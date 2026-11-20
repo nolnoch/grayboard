@@ -354,10 +354,11 @@ test("dm_send with a local file uploads and attaches it; attachment_get saves it
   } finally { globalThis.fetch = fetch0; }
 
   // A refused send releases its uploads: one was made, nothing is left unsent.
-  // Uploads the server stored (each an attachments row; what SQLite's sqlite_sequence counted, on either backend).
+  // Uploads the server stored (each an attachments row whose transaction committed; what SQLite's sqlite_sequence
+  // counted, on either backend). An insert whose transaction rolls back drops its afterCommit effect, so isn't counted.
   let stores = 0;
   const insertUpload = srv.app.repo.attachments.insertUpload.bind(srv.app.repo.attachments);
-  const storeSpy = spyOn(srv.app.repo.attachments, "insertUpload").mockImplementation(async (tx, upload) => { const out = await insertUpload(tx, upload); stores++; return out; });
+  const storeSpy = spyOn(srv.app.repo.attachments, "insertUpload").mockImplementation(async (tx, upload) => { const out = await insertUpload(tx, upload); tx.afterCommit(() => { stores++; }); return out; });
   const uploads = () => stores;
   const before = uploads();
   writeFileSync(join(dir, "second.txt"), "second\n");

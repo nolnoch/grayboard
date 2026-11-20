@@ -32,10 +32,15 @@ test("#807: a session touch that fires while another body holds the write queue 
   const lastUsed = async () => (await repo.sessions.findById(repo.read, session.id))!.last_used_at;
   const touched = spyOn(repo.sessions, "touch");
   const holder = holdWrites(srv);
+  cleanups.push(() => holder.release());
+  // The hold is a repo.write itself: taken before the spy, so the spy sees only the touch's post.
+  const posted = spyOn(repo, "post");
   expect(await verifySessionToken("raw-token", repo, touches, 0)).not.toBeNull();
-  await new Promise(r => setImmediate(r)); // the scheduled touch fires
-  await new Promise(r => setImmediate(r));
+  await until(() => posted.mock.calls.length > 0, 5000, "the scheduled touch was posted");
+  // Long enough for the posted write to commit on either backend if nothing held the queue.
+  await Bun.sleep(100);
   expect(touched).not.toHaveBeenCalled();
+  posted.mockRestore();
   holder.release();
   await holder.done;
   await until(() => touched.mock.calls.length > 0, 5000, "the touch ran after the holder released");
@@ -49,9 +54,12 @@ test("#807: a team route that arrives while another body holds the write queue w
   const token = await srv.login("you@example.com");
   // The hold is a repo.write itself: taken before the spy, so the spy counts only the route's.
   const holder = holdWrites(srv);
+  cleanups.push(() => holder.release());
   const write = spyOn(srv.app.repo, "write");
   const created = srv.api(token, "POST", "/api/teams", { name: "core" });
   await until(() => write.mock.calls.length > 0, 5000, "the team route reached the write queue");
+  // Long enough for the route's write to commit on either backend if nothing held the queue.
+  await Bun.sleep(100);
   expect((await srv.app.repo.teams.findByName(srv.app.repo.read, "core"))).toBeFalsy();
   holder.release();
   await holder.done;
