@@ -21,9 +21,9 @@ import { HostedSession, HostedToolError } from "../support/hosted_session.ts";
 import { hostedPause } from "../support/hosted-pause.ts";
 import { hostedRowCount } from "../support/hosted_rows.ts";
 import { ROOT as REPO_ROOT } from "../support/paths.ts";
-import { seed } from "../support/seed.ts";
 import { ServerProcess, TestServer, testSqlite } from "../support/server.ts";
 import { until } from "../support/until.ts";
+import { exec, row, rows as sqlRows } from "../support/repo_sql.ts";
 
 const A = "alice@example.com", ROOT = "root@example.com", SVC = "ingest";
 const LIMIT = { burst: 10_000, perSec: 10_000 };
@@ -54,6 +54,14 @@ function everyRow(dbPath: string): string {
     const tables = db.query<{ name: string }, []>("SELECT name FROM sqlite_master WHERE type = 'table'").all();
     return tables.map(t => JSON.stringify(db.query(`SELECT * FROM "${t.name}"`).all())).join("\n");
   } finally { db.close(); }
+}
+
+// The same over the server's own database, whichever backend it's on.
+async function everyRowIn(srv: TestServer): Promise<string> {
+  if (srv.config.store.kind === "sqlite") return everyRow(srv.dbPath);
+  const tables = await sqlRows<{ name: string }>(srv, "SELECT tablename AS name FROM pg_tables WHERE schemaname = current_schema()");
+  expect(tables.length).toBeGreaterThan(10);
+  return (await Promise.all(tables.map(async t => JSON.stringify(await sqlRows(srv, `SELECT * FROM "${t.name}"`))))).join("\n");
 }
 
 let srv: TestServer;
@@ -100,13 +108,13 @@ describe("add: the secret reaches the launcher only", () => {
     expect(c.client_id).toMatch(/^svc_[0-9a-f]{32}$/);
     expect(c).toMatchObject({ service: SVC, source: "generic", token_seconds: 3600 });
     expect(c.client_secret.length).toBeGreaterThanOrEqual(43);
-    expect(srv.app.db.query("SELECT hash FROM service_credential_secrets WHERE id = ?").get(c.secret_id)).toEqual({ hash: sha256(c.client_secret) });
-    expect(accessAudits(srv.app.db, "service.credential_added")).toEqual([expect.objectContaining({ actor: ROOT, target: SVC,
+    expect(await row(srv, "SELECT hash FROM service_credential_secrets WHERE id = ?", c.secret_id)).toEqual({ hash: sha256(c.client_secret) });
+    expect(await accessAudits(srv, "service.credential_added")).toEqual([expect.objectContaining({ actor: ROOT, target: SVC,
       detail: { client_id: c.client_id, secret_id: c.secret_id, source: "generic", token_seconds: 3600 } })]);
     // A run token and a session later, still nowhere in the database.
     await session(await token(srv.base, c));
     const rotated = await credential(root, { rotate: c.client_id });
-    const rows = everyRow(srv.dbPath);
+    const rows = await everyRowIn(srv);
     for (const secret of [c.client_secret, rotated.client_secret]) expect(rows).not.toContain(secret);
     expect(rows).toContain(sha256(c.client_secret));
   });
@@ -119,9 +127,9 @@ describe("add: the secret reaches the launcher only", () => {
       source: "generic" as const, tokenSeconds: 3600, expiresAt: Date.now() + 86_400_000, secretHash: sha256("s") });
     const [person, svc] = [await input(A), await input(SVC)];
     expect(await repo.write(tx => repo.oauth.addServiceCredential(tx, person, Date.now()))).toMatchObject({ status: "invalid" });
-    await seed(repo, () => { srv.app.db.run("UPDATE users SET disabled_at = ? WHERE email = ?", [Date.now(), SVC]); });
+    await exec(srv, "UPDATE users SET disabled_at = ? WHERE email = ?", Date.now(), SVC);
     expect(await repo.write(tx => repo.oauth.addServiceCredential(tx, svc, Date.now()))).toMatchObject({ status: "invalid" });
-    expect(srv.app.db.query("SELECT (SELECT count(*) FROM service_credentials) AS c, (SELECT count(*) FROM oauth_grants) AS g").get()).toEqual({ c: 0, g: 0 });
+    expect(await row(srv, "SELECT (SELECT count(*) FROM service_credentials) AS c, (SELECT count(*) FROM oauth_grants) AS g")).toEqual({ c: 0, g: 0 });
   });
 
   test("the routes are org_admin's: an owner is refused with a deny row, and nothing is written", async () => {
@@ -129,7 +137,7 @@ describe("add: the secret reaches the launcher only", () => {
     const alice = await srv.login(A);
     expect((await api(alice, "POST", "/api/admin/services/credentials", { service: SVC })).status).toBe(403);
     expect((await api(alice, "POST", "/api/admin/services/credentials/revoke", { client_id: "svc_x" })).status).toBe(403);
-    expect(srv.app.db.query("SELECT count(*) AS n FROM service_credentials").get()).toEqual({ n: 0 });
+    expect(await row(srv, "SELECT count(*) AS n FROM service_credentials")).toEqual({ n: 0 });
   });
 
   test("add refuses a user, a disabled service, a bad source or lifetime; rotate refuses another service's credential and a third secret", async () => {
@@ -173,7 +181,7 @@ describe("the token route", () => {
     expect(m.body).toEqual({ access_token: expect.any(String), token_type: "Bearer", expires_in: expect.any(Number), scope: "grayboard:delivery grayboard:tools" });
     expect(m.body.expires_in).toBeGreaterThan(595);
     expect(m.body.expires_in).toBeLessThanOrEqual(600);
-    const issued = accessAudits(srv.app.db, "oauth.token_issued");
+    const issued = await accessAudits(srv, "oauth.token_issued");
     expect(issued).toEqual([expect.objectContaining({ detail: { client_id: c.client_id, secret_id: c.secret_id, expires_at: expect.any(Number) } })]);
     expect(JSON.stringify(issued)).not.toContain(m.body.access_token);
     const meta = await (await fetch(`${srv.base}/.well-known/oauth-authorization-server`)).json() as { grant_types_supported: string[] };
@@ -190,8 +198,8 @@ describe("the token route", () => {
     }
     // The bucket is spent: the right secret waits too.
     expect(await mint(srv.base, c.client_id, c.client_secret)).toMatchObject({ status: 429, body: { error: "temporarily_unavailable" } });
-    expect(accessAudits(srv.app.db, "oauth.request_refused").map(r => r.detail)).toEqual(Array(3).fill({ code: "invalid_client", status: 401 }));
-    expect(accessAudits(srv.app.db, "oauth.token_issued")).toEqual([]);
+    expect((await accessAudits(srv, "oauth.request_refused")).map(r => r.detail)).toEqual(Array(3).fill({ code: "invalid_client", status: 401 }));
+    expect(await accessAudits(srv, "oauth.token_issued")).toEqual([]);
   });
 
   test("a credential's slow_down isn't charged to the address bucket: other token posts from that address still go through (#1244)", async () => {
@@ -203,11 +211,11 @@ describe("the token route", () => {
     for (let i = 0; i < 6; i++) expect(await mint(srv.base, c.client_id, c.client_secret)).toEqual({ status: 429, body: { error: "slow_down" } });
     // The streak writes one row: its retries answer from memory, with no write transaction and no row (M-1).
     const slow = { code: "slow_down", status: 429 }, bad = { code: "invalid_client", status: 401 };
-    expect(accessAudits(srv.app.db, "oauth.request_refused").map(r => r.detail)).toEqual([slow]);
+    expect((await accessAudits(srv, "oauth.request_refused")).map(r => r.detail)).toEqual([slow]);
     // The address's whole bucket is left: three unauthenticated refusals spend it, and only then does the address wait.
     for (let i = 0; i < 3; i++) expect(await mint(srv.base, c.client_id, `${c.client_secret}x`)).toEqual({ status: 401, body: { error: "invalid_client" } });
     // A wrong secret's refusal still writes its row: the streak's quiet is the credential's, not the route's.
-    expect(accessAudits(srv.app.db, "oauth.request_refused").map(r => r.detail)).toEqual([slow, bad, bad, bad]);
+    expect((await accessAudits(srv, "oauth.request_refused")).map(r => r.detail)).toEqual([slow, bad, bad, bad]);
     expect(await mint(srv.base, c.client_id, `${c.client_secret}x`)).toMatchObject({ status: 429, body: { error: "temporarily_unavailable" } });
   });
 
@@ -221,7 +229,7 @@ describe("the token route", () => {
     // The store would mint now (its window allows 1000), so a 200 here means the retry reached it.
     tokens.mintsPerMinute = 1000;
     expect(await mint(srv.base, c.client_id, c.client_secret)).toEqual({ status: 429, body: { error: "slow_down" } });
-    expect(accessAudits(srv.app.db, "oauth.token_issued")).toHaveLength(1);
+    expect(await accessAudits(srv, "oauth.token_issued")).toHaveLength(1);
   });
 
   test("a streak that reaches the store again past its backoff still writes one row", async () => {
@@ -231,7 +239,7 @@ describe("the token route", () => {
     const c = await credential(root);
     expect((await mint(srv.base, c.client_id, c.client_secret)).status).toBe(200);
     for (let i = 0; i < 5; i++) expect(await mint(srv.base, c.client_id, c.client_secret)).toEqual({ status: 429, body: { error: "slow_down" } });
-    expect(accessAudits(srv.app.db, "oauth.request_refused").map(r => r.detail)).toEqual([{ code: "slow_down", status: 429 }]);
+    expect((await accessAudits(srv, "oauth.request_refused")).map(r => r.detail)).toEqual([{ code: "slow_down", status: 429 }]);
   });
 
   // The backoff's clock and sweep (#1282 L-3), under a test clock: the server's OAuth time is `clock`, and `tick` is the
@@ -251,7 +259,7 @@ describe("the token route", () => {
   // retry from a hold to a probe and from a streak to a new one.
   const CAPPED = { maxSeconds: 86_400, mintsPerMinute: 1000, unexpired: 1 };
   const slow = { status: 429, body: { error: "slow_down" } }, slowRow = { code: "slow_down", status: 429 };
-  const rows = () => accessAudits(srv.app.db, "oauth.request_refused").map(r => r.detail);
+  const rows = async () => (await accessAudits(srv, "oauth.request_refused")).map(r => r.detail);
   // Mint A paused inside its probe (at the store write's pause point), and mint B sent while it waits: `reached` says
   // whether B got as far as the store's write too, or answered before it.
   async function overlapping(c: Credential): Promise<{ a: Minted; b: Minted; reached: boolean }> {
@@ -288,7 +296,7 @@ describe("the token route", () => {
     expect((await mint(srv.base, c.client_id, c.client_secret)).status).toBe(200);
     expect(await mint(srv.base, c.client_id, c.client_secret)).toEqual(slow);
     // A new streak, not the old one's tail: it starts with its own row.
-    expect(rows()).toEqual([slowRow, slowRow]);
+    expect(await rows()).toEqual([slowRow, slowRow]);
   });
 
   test("a streak ends a minute past its hold: a refusal after that writes a row (#1282 L-3)", async () => {
@@ -300,11 +308,11 @@ describe("the token route", () => {
     // Within a minute of the hold: the same streak, no row.
     clock += 30_000;
     expect(await mint(srv.base, c.client_id, c.client_secret)).toEqual(slow);
-    expect(rows()).toEqual([slowRow]);
+    expect(await rows()).toEqual([slowRow]);
     // More than a minute past the last hold: a new streak.
     clock += 60_100;
     expect(await mint(srv.base, c.client_id, c.client_secret)).toEqual(slow);
-    expect(rows()).toEqual([slowRow, slowRow]);
+    expect(await rows()).toEqual([slowRow, slowRow]);
   });
 
   test("requests during a credential's probe answer slow_down from memory: one store write, one row (#1282 L-2)", async () => {
@@ -319,7 +327,7 @@ describe("the token route", () => {
     expect(reached).toBe(false);
     expect(b).toEqual(slow);
     expect(a).toEqual(slow);
-    expect(rows()).toEqual([slowRow, slowRow]);
+    expect(await rows()).toEqual([slowRow, slowRow]);
     // The probe's refusal cleared its marker: with the cap freed and the hold ended, the next mint reaches the store.
     const r = await fetch(`${srv.base}/oauth/revoke`, { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded", Authorization: `Basic ${btoa(`${c.client_id}:${c.client_secret}`)}` },
       body: new URLSearchParams({ token: first }) });
@@ -342,7 +350,7 @@ describe("the token route", () => {
     expect(m.reached).toBe(true);
     expect([m.a, m.b]).toEqual([slow, slow]);
     // Two concurrent refusals, one streak: the first sets the hold, the second reads it and writes no row (#1287 L-1).
-    expect(rows()).toEqual([{ code: "slow_down", status: 429 }, { code: "slow_down", status: 429 }]);
+    expect(await rows()).toEqual([{ code: "slow_down", status: 429 }, { code: "slow_down", status: 429 }]);
   });
 
   test("a credential's secret only in the Basic header: a form secret or no secret is refused", async () => {
@@ -364,7 +372,7 @@ describe("the token route", () => {
     expect(await mint(srv.base, c.client_id, c.client_secret, { grant_type: "refresh_token", refresh_token: "r".repeat(43) })).toEqual({ status: 400, body: { error: "unauthorized_client" } });
     expect(await mint(srv.base, c.client_id, c.client_secret, { grant_type: "authorization_code", code: "c", code_verifier: "v".repeat(43), redirect_uri: "http://127.0.0.1:9/cb" }))
       .toEqual({ status: 400, body: { error: "unauthorized_client" } });
-    expect(accessAudits(srv.app.db, "oauth.token_issued")).toEqual([]);
+    expect(await accessAudits(srv, "oauth.token_issued")).toEqual([]);
   });
 
   test("/oauth/authorize answers every svc_ ID alike, live, revoked or unknown: the page is no liveness oracle", async () => {
@@ -383,7 +391,7 @@ describe("the token route", () => {
     expect(await answer(`svc_${"0".repeat(32)}`)).toEqual(expected);
   });
 
-  testSqlite("a startup client, confidential or public, can't use client_credentials", async () => {
+  test("a startup client, confidential or public, can't use client_credentials", async () => {
     const secret = "startup-secret";
     await fresh({ oauthClients: [
       { clientId: "launcher", name: "launcher", redirectUris: ["http://127.0.0.1/cb"], scopes: ["grayboard:tools"], tokenEndpointAuthMethod: "client_secret_basic", clientSecretHash: sha256(secret), allowRefresh: true },
@@ -392,7 +400,7 @@ describe("the token route", () => {
     // A public client sends no Authorization header, and client_credentials needs one.
     const pub = await fetch(`${srv.base}/oauth/token`, { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: new URLSearchParams({ grant_type: "client_credentials", client_id: "grayboard-pi" }) });
     expect(pub.status).toBe(400);
-    expect(accessAudits(srv.app.db, "oauth.token_issued")).toEqual([]);
+    expect(await accessAudits(srv, "oauth.token_issued")).toEqual([]);
     // A configured client may not claim the svc_ prefix: parseOAuthClients refuses it (src/server/oauth-config.test.ts).
   });
 
@@ -417,7 +425,7 @@ describe("the token route", () => {
       expect(r.status).toBe(200);
     });
     expect(m).toEqual({ status: 401, body: { error: "invalid_client" } });
-    expect(srv.app.db.query("SELECT count(*) AS n FROM oauth_tokens").get()).toEqual({ n: 0 });
+    expect(await row(srv, "SELECT count(*) AS n FROM oauth_tokens")).toEqual({ n: 0 });
     // The refusal is no longer the credential's own, so it spends the address bucket as any invalid_client does.
     expect(await mint(srv.base, rotated.client_id, rotated.client_secret)).toMatchObject({ status: 429, body: { error: "temporarily_unavailable" } });
   });
@@ -437,7 +445,7 @@ describe("the token route", () => {
     const d = await credential(root, { token_seconds: 3600, expires_at: soon });
     const m = await mint(srv.base, d.client_id, d.client_secret);
     expect(m.body.expires_in).toBeLessThanOrEqual(90);
-    expect(srv.app.db.query("SELECT t.expires_at AS token, g.expires_at AS grant_ FROM oauth_tokens t JOIN oauth_grants g ON g.id = t.grant_id WHERE t.hash = ?").get(sha256(m.body.access_token)))
+    expect(await row(srv, "SELECT t.expires_at AS token, g.expires_at AS grant_ FROM oauth_tokens t JOIN oauth_grants g ON g.id = t.grant_id WHERE t.hash = ?", sha256(m.body.access_token)))
       .toEqual({ token: soon, grant_: soon });
   });
 
@@ -447,7 +455,7 @@ describe("the token route", () => {
     let c = await credential(root);
     for (let i = 0; i < 2; i++) expect((await mint(srv.base, c.client_id, c.client_secret)).status).toBe(200);
     expect(await mint(srv.base, c.client_id, c.client_secret)).toEqual({ status: 429, body: { error: "slow_down" } });
-    expect(accessAudits(srv.app.db, "oauth.token_issued")).toHaveLength(2);
+    expect(await accessAudits(srv, "oauth.token_issued")).toHaveLength(2);
 
     await fresh({ serviceTokens: { maxSeconds: 86_400, mintsPerMinute: 1000, unexpired: 2 } });
     root = await service();
@@ -473,14 +481,14 @@ describe("sessions", () => {
     expect(await (await srv.hosted(A, "fe", { delivery: false })).call("whoami")).toMatchObject({ principal: A, principal_kind: "user" });
     await s.call("board_create", { name: "svc-out", purpose: "runs" });
     await s.call("board_post", { board: "svc-out", body: "run 1 done" });
-    expect(srv.app.db.query("SELECT author FROM posts WHERE body = 'run 1 done'").get()).toEqual({ author: `${SVC}/w-1` });
+    expect(await row(srv, "SELECT author FROM posts WHERE body = 'run 1 done'")).toEqual({ author: `${SVC}/w-1` });
     const o = await credential(root, { source: "opencode" });
     const os = await session(await token(srv.base, o), "w-2", { sessionKey: OPENCODE_SESSION_META });
-    const harness = (sid: string) => (srv.app.db.query("SELECT harness FROM ids WHERE id = ?").get(sid) as { harness: string | null } | null)?.harness;
-    const svcId = (srv.app.db.query("SELECT id FROM users WHERE email = ?").get(SVC) as { id: number }).id;
-    expect(harness(hostedSessionId(svcId, o.client_id, os.sessionId))).toBe("opencode");
+    const harness = async (sid: string) => (await row(srv, "SELECT harness FROM ids WHERE id = ?", sid) as { harness: string | null } | null)?.harness;
+    const svcId = (await row(srv, "SELECT id FROM users WHERE email = ?", SVC) as { id: number }).id;
+    expect(await harness(hostedSessionId(svcId, o.client_id, os.sessionId))).toBe("opencode");
     // HostedSession's wire declares grayboard-pi, which a generic credential's session shows (#1298).
-    expect(harness(hostedSessionId(svcId, c.client_id, s.sessionId))).toBe("pi");
+    expect(await harness(hostedSessionId(svcId, c.client_id, s.sessionId))).toBe("pi");
   });
 
   test("a generic credential's session shows the built-in harness its client info declares; anything else shows svc_, and a person's client keeps its own (#1298)", async () => {
@@ -504,21 +512,21 @@ describe("sessions", () => {
     }
     // A child registered under the declaring root shows the same harness.
     await pi.subscriber.call("session_register", { child: "sub-1" });
-    const svcId = (srv.app.db.query("SELECT id FROM users WHERE email = ?").get(SVC) as { id: number }).id;
-    expect(srv.app.db.query("SELECT harness FROM ids WHERE id = ?").get(hostedSessionId(svcId, c.client_id, "sub-1"))).toEqual({ harness: "pi" });
+    const svcId = (await row(srv, "SELECT id FROM users WHERE email = ?", SVC) as { id: number }).id;
+    expect(await row(srv, "SELECT harness FROM ids WHERE id = ?", hostedSessionId(svcId, c.client_id, "sub-1"))).toEqual({ harness: "pi" });
     // A person's built-in client declaring another built-in keeps its mapped harness: only a generic credential's declaration is read.
     await srv.hosted(A, "fe", { delivery: false, clientName: "grayboard-omp" });
-    expect(srv.app.db.query("SELECT harness FROM ids WHERE principal = ?").all(A)).toEqual([{ harness: "pi" }]);
+    expect(await sqlRows(srv, "SELECT harness FROM ids WHERE principal = ?", A)).toEqual([{ harness: "pi" }]);
   });
 
   test("a service credential's session declaring a launcher is one, for its own service's requests only; session_end clears it (#1299)", async () => {
     const root = await service();
     const c = await credential(root);
-    const svcId = (srv.app.db.query("SELECT id FROM users WHERE email = ?").get(SVC) as { id: number }).id;
-    const flag = (client: string, raw: string) => (srv.app.db.query("SELECT launcher FROM ids WHERE id = ?").get(hostedSessionId(svcId, client, raw)) as { launcher: number }).launcher;
+    const svcId = (await row(srv, "SELECT id FROM users WHERE email = ?", SVC) as { id: number }).id;
+    const flag = async (client: string, raw: string) => (await row(srv, "SELECT launcher FROM ids WHERE id = ?", hostedSessionId(svcId, client, raw)) as { launcher: number }).launcher;
     const lx = await session(await token(srv.base, c), "lx", { delivery: true, launcher: true });
-    expect(flag(c.client_id, lx.sessionId)).toBe(1);
-    expect(accessAudits(srv.app.db, "handle.launcher_set")).toEqual([expect.objectContaining({ actor: SVC, detail: expect.objectContaining({ on: true, client_id: c.client_id }) })]);
+    expect(await flag(c.client_id, lx.sessionId)).toBe(1);
+    expect(await accessAudits(srv, "handle.launcher_set")).toEqual([expect.objectContaining({ actor: SVC, detail: expect.objectContaining({ on: true, client_id: c.client_id }) })]);
     // The service's own other session: auto-pick and an explicit `to` both reach the launcher.
     const w = await session(await token(srv.base, c), "w-1");
     expect(await w.call("delegate", { persona: "a researcher", task: "auto" })).toMatchObject({ to: `${SVC}/lx` });
@@ -538,16 +546,16 @@ describe("sessions", () => {
     const ow = await session(await token(srv.base, oc.body as Credential), "o-1");
     expect(await refusedText(ow.call("delegate", { persona: "p", task: "t" }))).toContain("no live launcher session of service other");
     expect(await refusedText(ow.call("delegate", { persona: "p", task: "t", to: `${SVC}/lx` }))).toBe(`no agent "${SVC}/lx" has ever connected; peer_list shows exact handles`);
-    expect(srv.app.db.query("SELECT count(*) AS n FROM messages WHERE recipient = ?").get(`${SVC}/lx`)).toEqual({ n: 2 });
+    expect(await row(srv, "SELECT count(*) AS n FROM messages WHERE recipient = ?", `${SVC}/lx`)).toEqual({ n: 2 });
     // An opencode-source credential's declaration counts too; a session that never declared is no launcher.
     const o = await credential(root, { source: "opencode" });
     const ol = await session(await token(srv.base, o), "olx", { sessionKey: OPENCODE_SESSION_META, launcher: true });
-    expect(flag(o.client_id, ol.sessionId)).toBe(1);
-    expect(flag(c.client_id, w.sessionId)).toBe(0);
+    expect(await flag(o.client_id, ol.sessionId)).toBe(1);
+    expect(await flag(c.client_id, w.sessionId)).toBe(0);
     // session_end ends the ownership, which clears the flag: one off row, and no on row from the end's own request (#532).
     await lx.end();
-    expect(flag(c.client_id, lx.sessionId)).toBe(0);
-    expect(accessAudits(srv.app.db, "handle.launcher_set").map(a => [a.detail.client_id, a.detail.on])).toEqual([[c.client_id, true], [o.client_id, true], [c.client_id, false]]);
+    expect(await flag(c.client_id, lx.sessionId)).toBe(0);
+    expect((await accessAudits(srv, "handle.launcher_set")).map(a => [a.detail.client_id, a.detail.on])).toEqual([[c.client_id, true], [o.client_id, true], [c.client_id, false]]);
   });
 
   // #1327: "your own user" is ambiguous for a service, whose agent may read its owner or an invoker as its user. A
@@ -591,16 +599,16 @@ describe("sessions", () => {
     const c = await credential(root), other = await credential(root);
     const s = await session(await token(srv.base, c));
     const kept = await session(await token(srv.base, other), "w-2");
-    expect(hostedRowCount(srv.app.db)).toBe(2);
+    expect(await hostedRowCount(srv)).toBe(2);
     const r = await api(root, "POST", "/api/admin/services/credentials/revoke", { client_id: c.client_id });
     expect(r).toMatchObject({ status: 200, body: { ok: true, client_id: c.client_id } });
     // No await between the answer and this read: the row went in the revoke's transaction, not a later sweep.
-    expect(hostedRowCount(srv.app.db)).toBe(1);
+    expect(await hostedRowCount(srv)).toBe(1);
     await refused(s.call("whoami"));
     expect(await mint(srv.base, c.client_id, c.client_secret)).toEqual({ status: 401, body: { error: "invalid_client" } });
     // The service's other credential, and its session, are untouched.
     expect(await kept.call("whoami")).toMatchObject({ primary: `${SVC}/w-2` });
-    expect(accessAudits(srv.app.db, "service.credential_revoked")).toEqual([expect.objectContaining({ actor: ROOT, target: SVC, detail: { client_id: c.client_id } })]);
+    expect(await accessAudits(srv, "service.credential_revoked")).toEqual([expect.objectContaining({ actor: ROOT, target: SVC, detail: { client_id: c.client_id } })]);
     expect((await api(root, "POST", "/api/admin/services/credentials/revoke", { client_id: c.client_id })).status).toBe(404);
   });
 
@@ -610,11 +618,11 @@ describe("sessions", () => {
     const s = await session(await token(srv.base, c));
     await session(await token(srv.base, d), "w-2");
     expect((await api(root, "POST", "/api/admin/services/disable", { name: SVC })).status).toBe(200);
-    expect(hostedRowCount(srv.app.db)).toBe(0);
+    expect(await hostedRowCount(srv)).toBe(0);
     await refused(s.call("whoami"));
     expect((await api(root, "POST", "/api/admin/services/enable", { name: SVC })).status).toBe(200);
     for (const x of [c, d]) expect(await mint(srv.base, x.client_id, x.client_secret)).toEqual({ status: 401, body: { error: "invalid_client" } });
-    expect(srv.app.db.query("SELECT count(*) AS n FROM oauth_grants g JOIN service_credentials c ON c.grant_id = g.id WHERE g.revoked_at IS NULL").get()).toEqual({ n: 0 });
+    expect(await row(srv, "SELECT count(*) AS n FROM oauth_grants g JOIN service_credentials c ON c.grant_id = g.id WHERE g.revoked_at IS NULL")).toEqual({ n: 0 });
   });
 
   test("rotation keeps the session across a token from the new secret; revoking the old secret revokes only its tokens", async () => {
@@ -627,7 +635,7 @@ describe("sessions", () => {
     current = await token(srv.base, { client_id: c.client_id, client_secret: rotated.client_secret });
     expect(await s.call("whoami")).toMatchObject({ primary: `${SVC}/w-1` });
     expect((await api(root, "POST", "/api/admin/services/credentials/revoke", { secret: c.secret_id })).status).toBe(200);
-    expect(accessAudits(srv.app.db, "service.credential_revoked").at(-1)).toMatchObject({ detail: { client_id: c.client_id, secret_id: c.secret_id } });
+    expect((await accessAudits(srv, "service.credential_revoked")).at(-1)).toMatchObject({ detail: { client_id: c.client_id, secret_id: c.secret_id } });
     // The session on the new secret's token lives; the one still on an old-secret token is refused at its next call.
     expect(await s.call("whoami")).toMatchObject({ primary: `${SVC}/w-1` });
     await refused(old.call("whoami"));
@@ -656,7 +664,7 @@ describe("sessions", () => {
     await credential(root, { rotate: c.client_id });
     const t = await token(srv.base, c);
     // Only the secret's row: the shape a mint racing the revoke leaves on Postgres at READ COMMITTED.
-    await seed(srv.app.repo, () => { srv.app.db.run("UPDATE service_credential_secrets SET revoked_at = ? WHERE id = ?", [Date.now(), c.secret_id]); });
+    await exec(srv, "UPDATE service_credential_secrets SET revoked_at = ? WHERE id = ?", Date.now(), c.secret_id);
     await refused(session(t));
   });
 
@@ -680,7 +688,7 @@ describe("sessions", () => {
     await refused(s.call("whoami"));
     // Only that token: the same credential's other run token, and its session, go on.
     expect(await k.call("whoami")).toMatchObject({ primary: `${SVC}/w-2` });
-    expect(accessAudits(srv.app.db, "oauth.revoked")).toEqual([expect.objectContaining({ detail: expect.objectContaining({ client_id: c.client_id, kind: "access" }) })]);
+    expect(await accessAudits(srv, "oauth.revoked")).toEqual([expect.objectContaining({ detail: expect.objectContaining({ client_id: c.client_id, kind: "access" }) })]);
     expect(await mint(srv.base, c.client_id, c.client_secret)).toMatchObject({ status: 200 });
   });
 
@@ -702,8 +710,8 @@ describe("sessions", () => {
     const root = await service();
     const at = Date.now() + 3_600_000;
     const c = await credential(root, { expires_at: at });
-    expect(srv.app.db.query("SELECT g.expires_at FROM oauth_grants g JOIN service_credentials c ON c.grant_id = g.id WHERE c.client_id = ?").get(c.client_id)).toEqual({ expires_at: at });
-    expect(srv.app.db.query("SELECT * FROM pragma_table_info('service_credentials') WHERE name LIKE '%expire%'").all()).toEqual([]);
+    expect(await row(srv, "SELECT g.expires_at FROM oauth_grants g JOIN service_credentials c ON c.grant_id = g.id WHERE c.client_id = ?", c.client_id)).toEqual({ expires_at: at });
+    expect(await sqlRows(srv, "SELECT * FROM pragma_table_info('service_credentials') WHERE name LIKE '%expire%'")).toEqual([]);
     const s = await session(await token(srv.base, c));
     const other = new Database(srv.dbPath);
     try {
@@ -719,15 +727,15 @@ describe("sessions", () => {
     const c = await credential(root), d = await credential(root);
     const s = await session(await token(srv.base, c));
     const t = await session(await token(srv.base, d), "w-2");
-    const svcId = (srv.app.db.query("SELECT id FROM users WHERE email = ?").get(SVC) as { id: number }).id;
+    const svcId = (await row(srv, "SELECT id FROM users WHERE email = ?", SVC) as { id: number }).id;
     const theirs = hostedSessionId(svcId, c.client_id, s.sessionId);
     await expect(t.subscriber.call("session_end", { session: theirs })).rejects.toMatchObject({ code: "not_found" });
-    expect(hostedRowCount(srv.app.db)).toBe(2);
-    const rows = accessAudits(srv.app.db, "authz.decision").filter(r => r.detail.verb === "hosted.session");
+    expect(await hostedRowCount(srv)).toBe(2);
+    const rows = (await accessAudits(srv, "authz.decision")).filter(r => r.detail.verb === "hosted.session");
     expect(rows.map(r => [r.target, r.detail.allow, r.detail.rule])).toEqual([[theirs, false, "hosted.other_client"]]);
     // The same raw session ID under the other credential is another session, not a re-attach.
     const same = await session(await token(srv.base, d), "w-3", { sessionId: s.sessionId });
-    expect(hostedRowCount(srv.app.db)).toBe(3);
+    expect(await hostedRowCount(srv)).toBe(3);
     expect(await same.call("whoami")).toMatchObject({ primary: `${SVC}/w-3` });
   });
 
@@ -737,11 +745,11 @@ describe("sessions", () => {
     await token(srv.base, c);
     await credential(root, { rotate: c.client_id });
     expect((await api(root, "POST", "/api/admin/services/credentials/revoke", { secret: c.secret_id })).status).toBe(200);
-    const count = () => (srv.app.db.query("SELECT count(*) AS n FROM service_credential_secrets").get() as { n: number }).n;
+    const count = async () => (await row(srv, "SELECT count(*) AS n FROM service_credential_secrets") as { n: number }).n;
     await srv.app.repo.write(tx => srv.app.repo.oauth.cleanup(tx, Date.now()));
-    expect(count()).toBe(2);
+    expect(await count()).toBe(2);
     await srv.app.repo.write(tx => srv.app.repo.oauth.cleanup(tx, Date.now() + 2 * 86_400_000));
-    expect(count()).toBe(1);
+    expect(await count()).toBe(1);
   });
 });
 
@@ -754,17 +762,17 @@ describe("the caps tier (D4)", () => {
     // A second service session: past perUser, inside perService.
     await srv.hosted(SVC, "w-2", { delivery: false });
     await refused(srv.hosted(SVC, "w-3", { delivery: false }));
-    expect(hostedRowCount(srv.app.db)).toBe(2);
+    expect(await hostedRowCount(srv)).toBe(2);
     await srv.hosted(A, "fe", { delivery: false });
     await refused(srv.hosted(A, "be", { delivery: false }));
-    expect(hostedRowCount(srv.app.db)).toBe(3);
+    expect(await hostedRowCount(srv)).toBe(3);
 
     await fresh({ hostedCaps: { ...DEFAULT_HOSTED_CAPS, sessions: { global: 2, perUser: 1, perService: 10 } } });
     await service();
     await srv.hosted(SVC, "w-1", { delivery: false });
     await srv.hosted(SVC, "w-2", { delivery: false });
     await refused(srv.hosted(SVC, "w-3", { delivery: false }));
-    expect(hostedRowCount(srv.app.db)).toBe(2);
+    expect(await hostedRowCount(srv)).toBe(2);
   });
 
   test("a service's delivery-lease cap is its own tier", async () => {

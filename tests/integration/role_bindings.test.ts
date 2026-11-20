@@ -14,6 +14,7 @@ import { hostedPause } from "../support/hosted-pause.ts";
 import { ROOT as REPO_ROOT } from "../support/paths.ts";
 import { seed } from "../support/seed.ts";
 import { ServerProcess, TestServer, testSqlite } from "../support/server.ts";
+import { drained, exec, row, rows as sqlRows } from "../support/repo_sql.ts";
 
 const A = "alice@example.com", B = "bob@example.com", C = "carol@example.com", ROOT = "root@example.com";
 
@@ -28,9 +29,9 @@ afterEach(() => srv.stop());
 const api = (token: string, method: string, path: string, body?: unknown) => srv.api(token, method, path, body);
 const grant = (token: string, role: string, principal: string, scope?: string) => api(token, "POST", "/api/admin/roles/grant", { role, principal, ...(scope ? { scope } : {}) });
 const revoke = (token: string, role: string, principal: string, scope?: string) => api(token, "POST", "/api/admin/roles/revoke", { role, principal, ...(scope ? { scope } : {}) });
-const bindings = () => srv.app.db.query("SELECT id, role, principal_id, scope_id, granted_by FROM role_bindings ORDER BY id").all() as { id: number; role: string; principal_id: number; scope_id: number | null; granted_by: number | null }[];
-const principalId = (name: string) => (srv.app.db.query("SELECT id FROM principals WHERE name = ?").get(name) as { id: number }).id;
-const decisions = (actor: string) => accessAudits(srv.app.db, "authz.decision").filter(r => r.actor === actor).map(r => r.detail);
+const bindings = async () => await sqlRows(srv, "SELECT id, role, principal_id, scope_id, granted_by FROM role_bindings ORDER BY id") as { id: number; role: string; principal_id: number; scope_id: number | null; granted_by: number | null }[];
+const principalId = async (name: string) => (await row(srv, "SELECT id FROM principals WHERE name = ?", name) as { id: number }).id;
+const decisions = async (actor: string) => (await accessAudits(srv, "authz.decision")).filter(r => r.actor === actor).map(r => r.detail);
 
 describe("acceptance 1: granted at runtime, revoked with no restart", () => {
   test("a bootstrap admin grants org_admin; the holder's admin route allows by its binding; a revoke refuses the next request", async () => {
@@ -42,11 +43,11 @@ describe("acceptance 1: granted at runtime, revoked with no restart", () => {
     const id = g.body.binding.id as number;
 
     expect((await api(alice, "POST", "/api/admin/enable-user", { email: A })).status).toBe(200);
-    expect(decisions(A).at(-1)).toMatchObject({ verb: "admin", allow: true, rule: "role.org_admin", binding: id, role: "org_admin", scope: null, route: "/api/admin/enable-user" });
+    expect((await decisions(A)).at(-1)).toMatchObject({ verb: "admin", allow: true, rule: "role.org_admin", binding: id, role: "org_admin", scope: null, route: "/api/admin/enable-user" });
 
     expect((await revoke(root, "org_admin", A)).status).toBe(200);
     expect((await api(alice, "POST", "/api/admin/enable-user", { email: A })).status).toBe(403);
-    expect(decisions(A).at(-1)).toMatchObject({ verb: "admin", allow: false, rule: "role.org_admin", role: "org_admin", scope: null });
+    expect((await decisions(A)).at(-1)).toMatchObject({ verb: "admin", allow: false, rule: "role.org_admin", role: "org_admin", scope: null });
   });
 
   // An operator's psql: the row deleted on another connection is the next decision's answer. A cache, even one the
@@ -108,8 +109,8 @@ describe("acceptance 2: GRAYBOARD_ADMINS is the bootstrap", () => {
   test("with no bindings a bootstrap admin is allowed by admin.env, written nowhere, listed, and can't be revoked", async () => {
     const root = await srv.login(ROOT);
     expect((await api(root, "POST", "/api/admin/enable-user", { email: ROOT })).status).toBe(200);
-    expect(decisions(ROOT).at(-1)).toMatchObject({ verb: "admin", allow: true, rule: "admin.env" });
-    expect(bindings()).toEqual([]);
+    expect((await decisions(ROOT)).at(-1)).toMatchObject({ verb: "admin", allow: true, rule: "admin.env" });
+    expect(await bindings()).toEqual([]);
     const l = await api(root, "GET", "/api/admin/roles");
     expect(l).toMatchObject({ status: 200, body: { bindings: [{ id: null, principal: ROOT, role: "org_admin", scope: null, source: "bootstrap" }], next: null } });
     const r = await revoke(root, "org_admin", ROOT);
@@ -119,15 +120,15 @@ describe("acceptance 2: GRAYBOARD_ADMINS is the bootstrap", () => {
     const root2 = await srv.login(ROOT);
     expect((await api(root2, "GET", "/api/admin/roles")).body.bindings.map((b: { principal: string }) => b.principal)).toEqual([ROOT, "later@example.com"]);
     expect((await revoke(root2, "org_admin", "later@example.com")).status).toBe(409);
-    expect(bindings()).toEqual([]);
+    expect(await bindings()).toEqual([]);
   });
 
   test("a bootstrap admin who also holds a binding is decided by admin.env; revoking the binding says the env remains", async () => {
     const root = await srv.login(ROOT);
     expect((await grant(root, "org_admin", ROOT)).status).toBe(201);
     expect((await api(root, "POST", "/api/admin/enable-user", { email: ROOT })).status).toBe(200);
-    expect(decisions(ROOT).at(-1)).toMatchObject({ rule: "admin.env" });
-    expect(decisions(ROOT).at(-1)!.binding).toBeUndefined();
+    expect((await decisions(ROOT)).at(-1)).toMatchObject({ rule: "admin.env" });
+    expect((await decisions(ROOT)).at(-1)!.binding).toBeUndefined();
     const r = await revoke(root, "org_admin", ROOT);
     expect(r).toMatchObject({ status: 200, body: { revoked: { principal: ROOT }, note: expect.stringContaining("GRAYBOARD_ADMINS") } });
   });
@@ -135,7 +136,7 @@ describe("acceptance 2: GRAYBOARD_ADMINS is the bootstrap", () => {
   test("revoking the last org_admin binding on a server with no bootstrap admin says so", async () => {
     await restart({ admins: [] });
     const alice = await srv.login(A);
-    await seed(srv.app.repo, () => srv.app.db.run("INSERT INTO role_bindings (principal_id, role, scope_id, granted_by, granted_at) SELECT id, 'org_admin', NULL, NULL, 0 FROM principals WHERE name = ?", [A]));
+    await exec(srv, "INSERT INTO role_bindings (principal_id, role, scope_id, granted_by, granted_at) SELECT id, 'org_admin', NULL, NULL, 0 FROM principals WHERE name = ?", A);
     const r = await revoke(alice, "org_admin", A);
     expect(r).toMatchObject({ status: 200, body: { warning: expect.stringContaining("no org admin remains") } });
     expect((await api(alice, "GET", "/api/admin/roles")).status).toBe(403);
@@ -149,17 +150,17 @@ describe("acceptance 3: audit rows name the binding", () => {
     const id = g.body.binding.id as number;
     const again = await grant(root, "org_admin", A);
     expect(again).toMatchObject({ status: 200, body: { created: false, binding: { id } } });
-    const granted = accessAudits(srv.app.db, "role.granted");
+    const granted = await accessAudits(srv, "role.granted");
     expect(granted).toHaveLength(1);
-    expect(granted[0]).toMatchObject({ actor: ROOT, target: A, detail: { binding: id, role: "org_admin", principal: A, principal_id: principalId(A), scope: null, scope_id: null, granted_by: principalId(ROOT) } });
+    expect(granted[0]).toMatchObject({ actor: ROOT, target: A, detail: { binding: id, role: "org_admin", principal: A, principal_id: await principalId(A), scope: null, scope_id: null, granted_by: (await principalId(ROOT)) } });
 
     expect((await api(alice, "POST", "/api/admin/enable-user", { email: A })).status).toBe(200);
-    expect(decisions(A).at(-1)).toMatchObject({ rule: "role.org_admin", binding: id });
+    expect((await decisions(A)).at(-1)).toMatchObject({ rule: "role.org_admin", binding: id });
 
     expect((await revoke(alice, "org_admin", A)).status).toBe(200);
-    const revoked = accessAudits(srv.app.db, "role.revoked");
+    const revoked = await accessAudits(srv, "role.revoked");
     expect(revoked).toHaveLength(1);
-    expect(revoked[0]).toMatchObject({ actor: A, target: A, detail: { binding: id, role: "org_admin", principal: A, principal_id: principalId(A), scope: null, granted_by: principalId(ROOT), granter: ROOT, granted_at: expect.any(Number) } });
+    expect(revoked[0]).toMatchObject({ actor: A, target: A, detail: { binding: id, role: "org_admin", principal: A, principal_id: await principalId(A), scope: null, granted_by: await principalId(ROOT), granter: ROOT, granted_at: expect.any(Number) } });
   });
 
   test("a deny names the role and scope looked for", async () => {
@@ -167,11 +168,11 @@ describe("acceptance 3: audit rows name the binding", () => {
     expect((await api(alice, "POST", "/api/teams", { name: "eng" })).status).toBe(201);
     expect((await api(alice, "POST", "/api/teams/eng/add", { email: B })).status).toBe(200);
     expect((await api(bob, "POST", "/api/teams/eng/add", { email: B, role: "owner" })).status).toBe(403);
-    expect(decisions(B).at(-1)).toMatchObject({ verb: "team.manage", allow: false, rule: "role.team_owner", role: "team_owner", scope: "eng" });
+    expect((await decisions(B)).at(-1)).toMatchObject({ verb: "team.manage", allow: false, rule: "role.team_owner", role: "team_owner", scope: "eng" });
     expect((await api(bob, "GET", "/api/admin/roles")).status).toBe(403);
-    expect(decisions(B).at(-1)).toMatchObject({ verb: "admin", allow: false, rule: "role.org_admin", role: "org_admin", scope: null });
+    expect((await decisions(B)).at(-1)).toMatchObject({ verb: "admin", allow: false, rule: "role.org_admin", role: "org_admin", scope: null });
     // The owner's allow carries the creator's binding.
-    expect(decisions(A).at(-1)).toMatchObject({ verb: "team.manage", allow: true, rule: "role.team_owner", binding: bindings()[0]!.id, role: "team_owner", scope: "eng" });
+    expect((await decisions(A)).at(-1)).toMatchObject({ verb: "team.manage", allow: true, rule: "role.team_owner", binding: (await bindings())[0]!.id, role: "team_owner", scope: "eng" });
   });
 
   test("an admin's roster read of a team they aren't in is an allow row, and their team changes carry as_admin by env or by binding", async () => {
@@ -181,13 +182,13 @@ describe("acceptance 3: audit rows name the binding", () => {
     expect((await api(root, "GET", "/api/teams/eng/members")).status).toBe(200);
     expect((await api(bob, "GET", "/api/teams/eng/members")).status).toBe(200);
     expect((await api(alice, "GET", "/api/teams/eng/members")).status).toBe(200);
-    const reads = accessAudits(srv.app.db, "authz.decision").filter(r => r.detail.verb === "team.read").map(r => [r.actor, r.detail.rule]);
+    const reads = (await accessAudits(srv, "authz.decision")).filter(r => r.detail.verb === "team.read").map(r => [r.actor, r.detail.rule]);
     // A member's read writes nothing.
     expect(reads).toEqual([[ROOT, "admin.env"], [B, "role.org_admin"]]);
 
     expect((await api(root, "POST", "/api/teams/eng/add", { email: C })).status).toBe(200);
     expect((await api(bob, "POST", "/api/teams/eng/remove", { email: C })).status).toBe(200);
-    const changes = srv.app.db.query("SELECT actor, action, detail FROM access_log WHERE action IN ('team.member_added', 'team.member_removed') AND actor != ?").all(A) as { actor: string; action: string; detail: string }[];
+    const changes = (await drained(srv), await sqlRows(srv, "SELECT actor, action, detail FROM access_log WHERE action IN ('team.member_added', 'team.member_removed') AND actor != ? ORDER BY id", A)) as { actor: string; action: string; detail: string }[];
     expect(changes.map(c => [c.actor, c.action, JSON.parse(c.detail).as_admin])).toEqual([[ROOT, "team.member_added", true], [B, "team.member_removed", true]]);
     expect(carol).toBeTruthy();
   });
@@ -198,9 +199,9 @@ describe("acceptance 4: team_owner on that team only", () => {
     const [alice, bob, carol] = [await srv.login(A), await srv.login(B), await srv.login(C)];
     // Creating a team gives its creator a binding, and the creator then manages it.
     expect((await api(alice, "POST", "/api/teams", { name: "eng" })).status).toBe(201);
-    expect(accessAudits(srv.app.db, "role.granted")).toMatchObject([{ actor: A, target: A, detail: { role: "team_owner", scope: "eng", granted_by: principalId(A) } }]);
+    expect(await accessAudits(srv, "role.granted")).toMatchObject([{ actor: A, target: A, detail: { role: "team_owner", scope: "eng", granted_by: (await principalId(A)) } }]);
     expect((await api(alice, "POST", "/api/teams/eng/add", { email: B })).status).toBe(200);
-    expect(decisions(A).at(-1)).toMatchObject({ allow: true, rule: "role.team_owner" });
+    expect((await decisions(A)).at(-1)).toMatchObject({ allow: true, rule: "role.team_owner" });
     expect((await api(bob, "POST", "/api/teams", { name: "ops" })).status).toBe(201);
     expect((await api(bob, "POST", "/api/teams/ops/add", { email: A })).status).toBe(200);
     expect((await api(carol, "POST", "/api/teams", { name: "qa" })).status).toBe(201);
@@ -215,8 +216,9 @@ describe("acceptance 4: team_owner on that team only", () => {
     const outsider = await grant(root, "team_owner", B, "eng");
     expect(outsider).toMatchObject({ status: 409, body: { message: expect.stringContaining("grayboard team add eng bob@example.com") } });
     expect((await api(alice, "POST", "/api/teams/eng/add", { email: B, role: "owner" })).status).toBe(200);
-    const bob_ = bindings().find(b => b.principal_id === principalId(B))!;
-    expect(bob_).toMatchObject({ role: "team_owner", scope_id: principalId("eng"), granted_by: principalId(A) });
+    const bobId = await principalId(B);
+    const bob_ = (await bindings()).find(b => b.principal_id === bobId)!;
+    expect(bob_).toMatchObject({ role: "team_owner", scope_id: await principalId("eng"), granted_by: (await principalId(A)) });
     // The admin route's grant of a held binding answers it, unchanged.
     expect(await grant(root, "team_owner", B, "eng")).toMatchObject({ status: 200, body: { created: false, binding: { id: bob_.id } } });
     expect(bob).toBeTruthy();
@@ -229,15 +231,15 @@ describe("acceptance 4: team_owner on that team only", () => {
 
     expect((await api(alice, "POST", "/api/teams/eng/remove", { email: B })).status).toBe(200);
     expect((await api(carol, "POST", "/api/teams/eng/leave")).status).toBe(200);
-    expect(accessAudits(srv.app.db, "role.revoked").map(r => [r.actor, r.target, r.detail.role, r.detail.scope])).toEqual([[A, B, "team_owner", "eng"], [C, C, "team_owner", "eng"]]);
-    expect(bindings().map(b => b.principal_id)).toEqual([principalId(A)]);
+    expect((await accessAudits(srv, "role.revoked")).map(r => [r.actor, r.target, r.detail.role, r.detail.scope])).toEqual([[A, B, "team_owner", "eng"], [C, C, "team_owner", "eng"]]);
+    expect((await bindings()).map(b => b.principal_id)).toEqual([await principalId(A)]);
 
     // Alice is the last owner, with bob back as a member: neither the admin route nor a demotion takes it.
     expect((await api(alice, "POST", "/api/teams/eng/add", { email: B })).status).toBe(200);
-    expect((await revoke(root, "team_owner", A, "eng"))).toMatchObject({ status: 409, body: { message: expect.stringContaining("last owner") } });
+    expect(await revoke(root, "team_owner", A, "eng")).toMatchObject({ status: 409, body: { message: expect.stringContaining("last owner") } });
     expect((await api(alice, "POST", "/api/teams/eng/add", { email: A, role: "member" })).status).toBe(409);
     expect((await api(alice, "POST", "/api/teams/eng/leave")).status).toBe(409);
-    expect(bindings().map(b => b.principal_id)).toEqual([principalId(A)]);
+    expect((await bindings()).map(b => b.principal_id)).toEqual([await principalId(A)]);
     expect(bob).toBeTruthy();
   });
 });
@@ -248,17 +250,17 @@ describe("holder kinds", () => {
   test("org_admin or team_owner to a team is refused 400 with nothing written; service_invoke goes to a user or a team", async () => {
     const [root, alice] = [await srv.login(ROOT), await srv.login(A)];
     expect((await api(alice, "POST", "/api/teams", { name: "eng" })).status).toBe(201);
-    await seed(srv.app.repo, () => srv.app.db.run("INSERT INTO principals (kind, name, created_at) VALUES ('service', 'ingest', 0)"));
-    const before = bindings();
+    await exec(srv, "INSERT INTO principals (kind, name, created_at) VALUES ('service', 'ingest', 0)");
+    const before = await bindings();
     expect(await grant(root, "org_admin", "eng")).toMatchObject({ status: 400, body: { message: expect.stringContaining('"eng" is a team') } });
     expect(await grant(root, "team_owner", "eng", "eng")).toMatchObject({ status: 400, body: { message: expect.stringContaining('"eng" is a team') } });
     expect(await grant(root, "service_invoke", A, "eng")).toMatchObject({ status: 404, body: { message: 'no service named "eng"' } });
-    expect(bindings()).toEqual(before);
+    expect(await bindings()).toEqual(before);
     // Only the creator's ownership was granted.
-    expect(accessAudits(srv.app.db, "role.granted")).toHaveLength(1);
+    expect(await accessAudits(srv, "role.granted")).toHaveLength(1);
     expect((await grant(root, "service_invoke", A, "ingest")).status).toBe(201);
     expect((await grant(root, "service_invoke", "eng", "ingest")).status).toBe(201);
-    expect(accessAudits(srv.app.db, "role.granted").map(r => r.target)).toEqual([A, A, "eng"]);
+    expect((await accessAudits(srv, "role.granted")).map(r => r.target)).toEqual([A, A, "eng"]);
   });
 });
 
@@ -267,7 +269,7 @@ describe("service_invoke", () => {
     const [root] = [await srv.login(ROOT), await srv.login(A)];
     expect(await grant(root, "service_invoke", A, "ingest")).toMatchObject({ status: 404, body: { message: 'no service named "ingest"' } });
     expect(await grant(root, "service_invoke", A)).toMatchObject({ status: 400 });
-    expect(bindings()).toEqual([]);
+    expect(await bindings()).toEqual([]);
   });
 });
 
@@ -279,8 +281,8 @@ describe("stale authority", () => {
       () => grant(alice, "org_admin", B),
       async () => { expect((await revoke(root, "org_admin", A)).status).toBe(200); });
     expect(res).toMatchObject({ status: 403, body: { message: expect.stringContaining("no longer holds") } });
-    expect(bindings()).toEqual([]);
-    expect(accessAudits(srv.app.db, "role.granted")).toHaveLength(1);
+    expect(await bindings()).toEqual([]);
+    expect(await accessAudits(srv, "role.granted")).toHaveLength(1);
   });
 
   test("an org admin revoked between the gate and the revoke's write is refused, and the binding stays", async () => {
@@ -292,8 +294,8 @@ describe("stale authority", () => {
       // Through the store: the route's own revoke would stop at the same pause point.
       async () => { await seed(srv.app.repo, tx => srv.app.repo.roles.revoke(tx, { holder: A, role: "org_admin", scope: null, byUser: null, authority: "none", actor: ROOT })); });
     expect(res).toMatchObject({ status: 403, body: { message: expect.stringContaining("no longer holds") } });
-    expect(bindings().map(b => b.principal_id)).toEqual([principalId(B)]);
-    expect(accessAudits(srv.app.db, "role.revoked").map(r => r.target)).toEqual([A]);
+    expect((await bindings()).map(b => b.principal_id)).toEqual([await principalId(B)]);
+    expect((await accessAudits(srv, "role.revoked")).map(r => r.target)).toEqual([A]);
   });
 
   // `team add` decides inside its write transaction, so on SQLite nothing lands between the decision and the write;
@@ -311,6 +313,6 @@ describe("stale authority", () => {
     expect((await api(bob, "POST", "/api/teams/eng/add", { email: A, role: "member" })).status).toBe(200);
     const out = await seed(repo, tx => grantRole(repo, tx, { holder: C, role: "team_owner", scope: "eng" }, { email: A, userId: aliceId, authority: "owner_or_admin" }));
     expect(out).toMatchObject({ refused: { status: 403 } });
-    expect(bindings().map(b => b.principal_id)).toEqual([principalId(B)]);
+    expect((await bindings()).map(b => b.principal_id)).toEqual([await principalId(B)]);
   });
 });

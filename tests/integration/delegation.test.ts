@@ -13,11 +13,11 @@ import { join } from "node:path";
 import { runCli } from "../support/cli.ts";
 import { refusal, type AppSession } from "../support/app_session.ts";
 import { direct } from "../support/events.ts";
-import { seed } from "../support/seed.ts";
 import { localEnv } from "../support/env.ts";
 import { call, closeSessions, localSession, stopSession } from "../support/mcp.ts";
 import { TestServer, type TestServerOverrides } from "../support/server.ts";
 import { until } from "../support/until.ts";
+import { drained, exec, row, rows as sqlRows, txSpy } from "../support/repo_sql.ts";
 
 let dir: string;
 
@@ -26,6 +26,10 @@ type Delegated = { to: string; message_id: number; delivered_now: boolean; human
 type Inbox = { unanswered?: { id: number; from: string }[]; promised?: { to: string }[] };
 // A server whose hosted sessions can poll their inbox freely.
 const serve = (o: TestServerOverrides = {}) => TestServer.open({ hostedRequestLimit: { burst: 10_000, perSec: 10_000 }, ...o });
+// The server's access_log rows, once the writes queued before the read have landed (an audit row is often a post,
+// which Postgres always queues).
+const logRows = async (srv: TestServer, sql: string, ...args: unknown[]): Promise<any[]> => { await drained(srv); return sqlRows(srv, sql, ...args); };
+const logRow = async (srv: TestServer, sql: string, ...args: unknown[]): Promise<any> => (await logRows(srv, sql, ...args))[0] ?? null;
 
 // A connected application session declared a launcher, as a hosted
 // request's launcher declaration does (#473).
@@ -219,7 +223,7 @@ test("server: a launcher naming itself is refused as self-delegation, and nothin
     expect((await refusal(be.delegate({ persona: "p", task: "t", to: "be" }))).message).toContain("can't delegate to itself");
     await be.bind("be2", { create: true });
     expect((await refusal(be.delegate({ persona: "p", task: "t", to: "be2" }))).message).toContain("can't delegate to itself");
-    expect((srv.app.db.query(`SELECT COUNT(*) AS n FROM messages`).get() as { n: number }).n).toBe(0);
+    expect((await row(srv, `SELECT COUNT(*) AS n FROM messages`) as { n: number }).n).toBe(0);
   } finally {
     await srv.stop();
   }
@@ -248,7 +252,7 @@ test("server: delegation stays within the requester's user (review 1-2)", async 
     await aliceBe.none(direct());
 
     // The audit names the refusals and the request (review 4).
-    const audits = srv.app.db.query(`SELECT action, actor, target FROM access_log WHERE action LIKE 'delegation.%' ORDER BY rowid`).all() as any[];
+    const audits = await logRows(srv, `SELECT action, actor, target FROM access_log WHERE action LIKE 'delegation.%' ORDER BY id`) as any[];
     expect(audits.some((a) => a.action === "delegation.requested" && a.target === "bob@b.com/be")).toBe(true);
     expect(audits.some((a) => a.action === "delegation.refused")).toBe(true);
   } finally {
@@ -293,10 +297,11 @@ test("server: a delegate reads aliases on its body's Tx (#807 P1c-13)", async ()
   const srv = await serve();
   const repo = srv.app.repo;
   const checks: { op: string; inTxn: boolean; handle: "pool" | "tx" }[] = [];
+  const tx = txSpy(srv);
   const spies = (["find", "findAllByName"] as const).map((name) => {
     const original = repo.aliases[name].bind(repo.aliases) as (...a: unknown[]) => unknown;
     return spyOn(repo.aliases, name).mockImplementation(((r: unknown, ...rest: unknown[]) => {
-      if (new Error().stack?.includes("handleDelegate")) checks.push({ op: name, inTxn: srv.app.db.inTransaction, handle: r === repo.read ? "pool" : "tx" });
+      if (new Error().stack?.includes("handleDelegate")) checks.push({ op: name, inTxn: tx.open, handle: r === repo.read ? "pool" : "tx" });
       return original(r, ...rest);
     }) as never);
   });
@@ -310,6 +315,7 @@ test("server: a delegate reads aliases on its body's Tx (#807 P1c-13)", async ()
     expect((await refusal(sim.delegate({ persona: "p", task: "t", to: "nobody" }))).code).toBe("not_found");
   } finally {
     for (const spy of spies) spy.mockRestore();
+    tx.restore();
     await srv.stop();
   }
   expect(checks.map((c) => c.op)).toEqual(expect.arrayContaining(["find", "findAllByName"]));
@@ -322,11 +328,12 @@ test("server: a delegate reads its facts and messages on its body's Tx (#807 P1c
   const srv = await serve();
   const repo = srv.app.repo;
   const checks: { op: string; inTxn: boolean; handle: "pool" | "tx" }[] = [];
+  const tx = txSpy(srv);
   let route = "";
   const spy = <S extends object>(store: S, names: readonly (keyof S & string)[]) => names.map((name) => {
     const original = (store[name] as (...a: unknown[]) => unknown).bind(store);
     return spyOn(store, name as never).mockImplementation(((r: unknown, ...rest: unknown[]) => {
-      if (route) checks.push({ op: `${route}:${name}`, inTxn: srv.app.db.inTransaction, handle: r === repo.read ? "pool" : "tx" });
+      if (route) checks.push({ op: `${route}:${name}`, inTxn: tx.open, handle: r === repo.read ? "pool" : "tx" });
       return original(r, ...rest);
     }) as never);
   });
@@ -348,6 +355,7 @@ test("server: a delegate reads its facts and messages on its body's Tx (#807 P1c
   } finally {
     for (const s of spies) s.mockRestore();
     coreOn.mockRestore();
+    tx.restore();
     await srv.stop();
   }
   const ops = checks.map((c) => c.op);
@@ -375,15 +383,15 @@ test("server: a delegate repeat after its launcher's name moved to another user 
 
     await aliceLauncher.unbind("eng/builder");
     await srv.connected(bob, "eng/builder");
-    const replays = () => (srv.app.db.query(`SELECT COUNT(*) AS n FROM access_log WHERE action = 'request.replayed'`).get() as { n: number }).n;
-    const before = replays();
+    const replays = async () => (await logRow(srv, `SELECT COUNT(*) AS n FROM access_log WHERE action = 'request.replayed'`) as { n: number }).n;
+    const before = await replays();
     await expect(aliceSim.delegate(req)).rejects.toThrow(/"eng\/builder" belongs to another user/);
-    expect(replays()).toBe(before);
-    const refused = srv.app.db.query(`SELECT detail FROM access_log WHERE action = 'delegation.refused' ORDER BY rowid DESC LIMIT 1`).get() as { detail: string };
+    expect(await replays()).toBe(before);
+    const refused = await logRow(srv, `SELECT detail FROM access_log WHERE action = 'delegation.refused' ORDER BY id DESC LIMIT 1`) as { detail: string };
     expect(JSON.parse(refused.detail)).toMatchObject({ to: "eng/builder" });
     // The first call's message stands, and the receipt with it.
-    expect(srv.app.db.query(`SELECT COUNT(*) AS n FROM messages WHERE id = ?`).get(first.message_id)).toEqual({ n: 1 });
-    expect(srv.app.db.query(`SELECT COUNT(*) AS n FROM write_receipts WHERE tool = 'delegate'`).get()).toEqual({ n: 1 });
+    expect(await row(srv, `SELECT COUNT(*) AS n FROM messages WHERE id = ?`, first.message_id)).toEqual({ n: 1 });
+    expect(await row(srv, `SELECT COUNT(*) AS n FROM write_receipts WHERE tool = 'delegate'`)).toEqual({ n: 1 });
   } finally {
     await srv.stop();
   }
@@ -406,10 +414,10 @@ test("server: an auto-pick delegate repeat after its pick moved to another user 
 
     await aliceLauncher.unbind("eng/builder");
     await srv.connected(bob, "eng/builder");
-    const refusedRows = () => srv.app.db.query(`SELECT detail FROM access_log WHERE action = 'delegation.refused'`).all() as { detail: string }[];
-    const before = refusedRows().length;
+    const refusedRows = async () => await logRows(srv, `SELECT detail FROM access_log WHERE action = 'delegation.refused' ORDER BY id`) as { detail: string }[];
+    const before = (await refusedRows()).length;
     await expect(aliceSim.delegate(req)).rejects.toThrow(/auto-picked "eng\/builder".*resend: true/);
-    const rows = refusedRows();
+    const rows = await refusedRows();
     expect(rows.length).toBe(before + 1);
     expect(JSON.parse(rows[rows.length - 1].detail)).toMatchObject({ to: "eng/builder" });
   } finally {
@@ -462,7 +470,7 @@ test("server: the human fallback checks Slack reachability (review 10)", async (
     const sim = await srv.hosted("you@example.com", "sim");
     await expect(sim.call("delegate", { persona: "p", task: "t" })).rejects.toThrow(/no live launcher session/);
     // The refusal is audited with its reason.
-    const refused = srv.app.db.query(`SELECT detail FROM access_log WHERE action = 'delegation.refused' ORDER BY rowid DESC`).get() as any;
+    const refused = await logRow(srv, `SELECT detail FROM access_log WHERE action = 'delegation.refused' ORDER BY id DESC`) as any;
     expect(JSON.parse(refused.detail).reason).toMatch(/no live launcher session/);
   } finally {
     await srv.stop();
@@ -531,7 +539,7 @@ test("server: a reachable human fallback delivers end to end, and every refusal 
     expect(req.note).toContain("settle the thread");
 
     // The request is audited with its via (review 4).
-    const audits = srv.app.db.query(`SELECT action, target, detail FROM access_log WHERE action LIKE 'delegation.%' ORDER BY rowid`).all() as any[];
+    const audits = await logRows(srv, `SELECT action, target, detail FROM access_log WHERE action LIKE 'delegation.%' ORDER BY id`) as any[];
     const requested = audits.filter((a) => a.action === "delegation.requested");
     expect(requested).toHaveLength(1);
     expect(JSON.parse(requested[0]!.detail).via).toBe("human_fallback");
@@ -540,16 +548,16 @@ test("server: a reachable human fallback delivers end to end, and every refusal 
     // A refusal never masquerades as a request: with the human's alias
     // row gone (a broken unlink's state), the send is refused — and the
     // audit says refused, with no id-less requested row beside it.
-    await seed(srv.app.repo, () => { srv.app.db.exec(`DELETE FROM aliases WHERE name = 'human'`); });
+    await exec(srv, `DELETE FROM aliases WHERE name = 'human'`);
     await expect(sim.call("delegate", { persona: "p", task: "t" })).rejects.toThrow(/not found/);
-    const after = srv.app.db.query(`SELECT action, detail FROM access_log WHERE action LIKE 'delegation.%' ORDER BY rowid`).all() as any[];
+    const after = await logRows(srv, `SELECT action, detail FROM access_log WHERE action LIKE 'delegation.%' ORDER BY id`) as any[];
     expect(after.filter((a) => a.action === "delegation.requested")).toHaveLength(1);
     const lastRefused = after.filter((a) => a.action === "delegation.refused").at(-1)!;
     expect(JSON.parse(lastRefused.detail).reason).toMatch(/not found/);
 
     // An unresolvable `to` is audited as a refusal too (review 4).
     await expect(sim.call("delegate", { persona: "p", task: "t", to: "ghost" })).rejects.toThrow();
-    const final = srv.app.db.query(`SELECT action, detail FROM access_log WHERE action = 'delegation.refused' ORDER BY rowid`).all() as any[];
+    const final = await logRows(srv, `SELECT action, detail FROM access_log WHERE action = 'delegation.refused' ORDER BY id`) as any[];
     expect(JSON.parse(final.at(-1)!.detail).reason).toBeTruthy();
   } finally {
     await srv.stop();
