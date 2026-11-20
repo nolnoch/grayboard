@@ -59,9 +59,9 @@ async function heldDrain(receiptFirst: boolean) {
     const post = () => a.call("board_post", { board: "eng", body: "@sim three" });
     if (receiptFirst) { await receipt(); await post(); } else { await post(); await receipt(); }
     release();
-    await until(() => pushes().length >= 3, 5000, "p2 and p3 were pushed");
-    const quiet = Date.now() + 300;
-    await until(() => { expect(pushes()).toHaveLength(3); return Date.now() >= quiet; }, 2000, "no push after the third");
+    // The drain ends once its last run finds nothing it hasn't sent; every wake above asked it for a run before
+    // that, so nothing can arrive after it (#1214 item 6: no quiet window).
+    await until(() => pushes().length >= 3 && s.session.boardDrain === null, 5000, "p2 and p3 were pushed and the drain ended");
     const ids = pushes();
     expect(ids[0]).toBe(p1);
     expect(ids).toHaveLength(3);
@@ -115,4 +115,87 @@ test("a board drain whose read fails still runs the rerun a post asked for meanw
     console.error = errors;
     release();
   }
+});
+
+// Holds sim's next pending-push read after it returns (#1214): the drain it belongs to has read, and not yet sent.
+function holdSimRead() {
+  const boards = srv.app.repo.boards;
+  const read = boards.pendingPushes;
+  let armed = true, held = false;
+  let release!: () => void;
+  const released = new Promise<void>(r => { release = r; });
+  boards.pendingPushes = async (r, handle) => {
+    const rows = await read.call(boards, r, handle);
+    if (armed && handle.includes("sim")) {
+      armed = false;
+      held = true;
+      await released;
+    }
+    return rows;
+  };
+  return { held: () => held, release, restore: () => { boards.pendingPushes = read; release(); } };
+}
+
+async function eng() {
+  const alice = await srv.login(A);
+  expect((await srv.api(alice, "POST", "/api/teams", { name: "eng" })).status).toBeLessThan(300);
+  const a = await srv.hosted(A, "be");
+  const s = await srv.connected(alice, "sim");
+  return { alice, a, s, pushes: () => s.events.filter(board()).map(e => postOf((e as BoardEvent).item).id) };
+}
+
+// drainBoardsOnce's re-check after its read (#1214 item 1): a session closed while the read awaits is sent nothing
+// the read found.
+test("a session closed while its board drain's read awaits is sent nothing that read found", async () => {
+  const { a, s, pushes } = await eng();
+  const hold = holdSimRead();
+  try {
+    await a.call("board_post", { board: "eng", body: "@sim one" });
+    await until(hold.held, 5000, "sim's board drain held after its read");
+    const drain = s.session.boardDrain!.done;
+    s.close();
+    expect(s.session.active).toBe(false);
+    hold.release();
+    await drain;
+    expect(pushes()).toEqual([]);
+  } finally { hold.restore(); }
+});
+
+// The same re-check for an address: one unbound while the read awaits gets none of the items read for it.
+test("an alias unbound while its board drain's read awaits is sent nothing that read found for it", async () => {
+  const { a, s, pushes } = await eng();
+  const hold = holdSimRead();
+  try {
+    await a.call("board_post", { board: "eng", body: "@sim one" });
+    await until(hold.held, 5000, "sim's board drain held after its read");
+    const drain = s.session.boardDrain!.done;
+    await s.unbind("sim");
+    expect(s.session.addresses.some(x => x.includes("sim"))).toBe(false);
+    expect(s.session.active).toBe(true);
+    hold.release();
+    await drain;
+    expect(pushes()).toEqual([]);
+  } finally { hold.restore(); }
+});
+
+// A replay asking a running drain for an `all` run (#1214 item 2, `running.all ||= all`): the rerun it waits for
+// carries the digests a plain wake's run leaves for a waking push.
+test("a replay while a board drain runs gets its all run: a pending digest arrives before the replay answers", async () => {
+  const { a, s } = await eng();
+  await a.call("board_create", { name: "news", purpose: "tests" });
+  await s.call("board_subscribe", { board: "news", mode: "digest" });
+  await a.call("board_post", { board: "news", body: "headline" });
+  const digests = () => s.events.filter(board(i => i.kind === "digest" && i.board === "news"));
+  expect(digests()).toEqual([]);
+  const hold = holdSimRead();
+  try {
+    // A plain wake's drain: not `all`, and with no waking push its runs leave the digest.
+    srv.app.application.wake(s.session.addresses);
+    await until(hold.held, 5000, "sim's board drain held after its read");
+    const replay = srv.app.application.replay(s.session);
+    await until(() => s.session.boardDrain?.rerun === true, 5000, "the replay asked the running drain for another run");
+    hold.release();
+    await replay;
+    expect(digests()).toHaveLength(1);
+  } finally { hold.restore(); }
 });

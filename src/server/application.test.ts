@@ -188,6 +188,81 @@ test("#831: board and session observer indexes: a post tells its board's observe
   expect(application.observerIndexKeys).toEqual({ boards: 0, sessions: 0 });
 });
 
+// liveObservers (#807 P3 B5a1, H3; #1214 item 3): a post's observer check reads the board's visibility once, on the
+// pool. Held there, an observer that closes meanwhile isn't told of the change; one that stays is.
+test("#1214: an observer closed while a change's visibility read awaits isn't told; the board's other observer is", async () => {
+  const a = (await connect(alice, "be", { push: false })).session;
+  await seed(store.repo, tx => application.call(tx, a, "board_create", { name: "one", purpose: "tests" }));
+  const seen: string[] = [];
+  const watch = (tag: string) =>
+    application.observeBoard(a, "one", { changed: () => { seen.push(`${tag}+`); }, closed: () => { seen.push(`${tag}-`); } });
+  const leaving = watch("x");
+  watch("y");
+  const access = application.access;
+  const check = access.canSeeMany;
+  let held = false;
+  let release!: () => void;
+  const released = new Promise<void>(r => { release = r; });
+  access.canSeeMany = async (r, handles, b) => {
+    const seeing = await check.call(access, r, handles, b);
+    if (r === store.repo.read && b.name === "one" && !held) { held = true; await released; }
+    return seeing;
+  };
+  try {
+    await seed(store.repo, tx => application.call(tx, a, "board_post", { board: "one", body: "x" }));
+    await until(() => held, 5000, "the observer check held after its read");
+    leaving();
+    expect(seen).toEqual(["x-"]);
+    release();
+    await until(() => seen.includes("y+"), 5000, "the staying observer was told");
+    expect(seen).toEqual(["x-", "y+"]);
+  } finally { access.canSeeMany = check; release(); }
+});
+
+// A failed visibility read removes every observer it was checking, as a refused check would, and tells none of the change.
+test("#1214: a failed observer visibility read removes the board's observers and tells them nothing changed", async () => {
+  const a = (await connect(alice, "be", { push: false })).session;
+  await seed(store.repo, tx => application.call(tx, a, "board_create", { name: "one", purpose: "tests" }));
+  const seen: string[] = [];
+  for (const tag of ["x", "y"]) application.observeBoard(a, "one", { changed: () => { seen.push(`${tag}+`); }, closed: () => { seen.push(`${tag}-`); } });
+  expect(application.observerCount).toBe(2);
+  const access = application.access;
+  const check = access.canSeeMany;
+  access.canSeeMany = async (r, handles, b) => {
+    if (r === store.repo.read && b.name === "one") throw new Error("injected visibility read failure");
+    return check.call(access, r, handles, b);
+  };
+  const logged = spyOn(console, "error").mockImplementation(() => {});
+  try {
+    await seed(store.repo, tx => application.call(tx, a, "board_post", { board: "one", body: "x" }));
+    await until(() => application.observerCount === 0, 5000, "the failed check removed the observers");
+    expect(seen.sort()).toEqual(["x-", "y-"]);
+    expect(application.observerIndexKeys).toEqual({ boards: 0, sessions: 0 });
+    expect(logged.mock.calls.some(c => String(c[0]).includes("observer check failed"))).toBe(true);
+  } finally { access.canSeeMany = check; logged.mockRestore(); }
+});
+
+// The server's catalog walks the async branch of core's catalogWalk (board_reads.ts boardCatalog; #1214 item 5): past a
+// page of 100 rows, filtered by the access read, a board the viewer can't see left out on every page.
+test("#1214: the server's board catalog pages past one store page and conceals a hidden board across pages", async () => {
+  const a = (await connect(alice, "be", { push: false })).session;
+  const names = Array.from({ length: 105 }, (_, i) => `b${String(i).padStart(3, "0")}`);
+  await seed(store.repo, async tx => {
+    for (const name of names) await store.repo.boards.ensure(tx, name, "catalog", null, "be");
+    // Sorts among them: the first store page's 100 rows hold it, so only 99 of them are visible.
+    await store.repo.boards.ensure(tx, "b050x", "hidden", "team:nobody", "someone");
+  });
+  const first = await application.boardCatalog(store.repo.read, a);
+  expect(first.boards).toHaveLength(100);
+  expect(first.next_after).toBe(first.boards[99]!.name);
+  const last = await application.boardCatalog(store.repo.read, a, first.next_after!);
+  expect(last.next_after).toBeNull();
+  const all = [...first.boards, ...last.boards].map(b => b.name);
+  expect(all).not.toContain("b050x");
+  expect(all.filter(n => n.startsWith("b"))).toEqual(names);
+  expect(new Set(all).size).toBe(all.length);
+});
+
 test("tools-only calls neither own nor drain deliveries nor reset the owner's status", async () => {
   const owner = await connect(alice, "be");
   await owner.call("peer_status", { text: "working" });
