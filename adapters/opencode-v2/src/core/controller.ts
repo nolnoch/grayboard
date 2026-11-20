@@ -2,7 +2,7 @@
 // Do not edit: change hosted-core, then run `bun scripts/sync_hosted_core.ts`.
 import { createHash } from "node:crypto";
 import type { Enrollment, HostPort } from "./port.js";
-import { abortOf, InsufficientScope, LeaseUnavailable, ServerUnreachable, SubscriberError, SubscriptionClosed, unreachable, Wire, type WireOptions } from "./wire.js";
+import { abortOf, InsufficientScope, LeaseUnavailable, listenCapacity, ServerUnreachable, SubscriberError, SubscriptionClosed, unreachable, Wire, type WireOptions } from "./wire.js";
 import { AccessExpired, Refusal, RefreshInProgress, accessExpiry, admitPrefix, bindingOf, itemsOf, leaseOf, sameHeld, shortOf, stableID, validHeld, type BindingState, type Lease } from "./model.js";
 import { AncestryError, SessionRoutes, type SessionPath } from "./sessions.js";
 import { end, register, type Temporary } from "./children.js";
@@ -78,6 +78,9 @@ const RENEW_MS = 10_000;
 // How long a listen swap (#1379) waits for the old stream's close: its local end is at once, but its
 // `notifications/cancelled` POST has no timeout of its own, and a server that never answers it must not stall the swap.
 const SWAP_CLOSE_MS = 1_000;
+// Listen-cap refusals a swap's replacement listen retries (#1394): 250 ms doubling, 7.75 s in all, well inside the
+// lease's 30 s TTL, which nothing renews meanwhile.
+const SWAP_CAPACITY_RETRIES = 5;
 // One rotation grace: `spent` charges each retry its poll plus the failed attempt's own time (a slow
 // reconnect counts); `lease` is the ownership it protects, if any.
 type Grace = { spent: number; lease?: () => Lease | undefined };
@@ -630,9 +633,10 @@ export class Controller<E extends Enrollment = Enrollment> {
             // Close, then open: listens count against a per-user cap, and every session on one credential renews
             // at once. Hints don't consume and the server keeps the inbox position, so the re-read finds whatever
             // arrived in between. Not an outage: no whoami, no delivery_open, no backoff; a failed open is an
-            // ordinary reopen. Ahead of `closed`: an old stream the expiry already closed is replaced the same way.
-            // The old stream ends locally at once (its `closed` settles, which the `subscription === opened` guard
-            // ignores, and its request is aborted); its cancel POST gets SWAP_CLOSE_MS, then runs on unawaited.
+            // ordinary reopen, but for the listen cap's race below. Ahead of `closed`: an old stream the expiry already
+            // closed is replaced the same way. The old stream ends locally at once (its `closed` settles, which the
+            // `subscription === opened` guard ignores, and its request is aborted); its cancel POST gets
+            // SWAP_CLOSE_MS, then runs on unawaited.
             if (tokenChanged) {
               tokenChanged = false;
               const old = subscription;
@@ -644,7 +648,16 @@ export class Controller<E extends Enrollment = Enrollment> {
                 bound.abort();
               }
               await this.guard(r, epoch, signal);
-              await listen();
+              // The server frees the old slot when it notices the dropped request, so at the listen cap (per-user or global) the
+              // new listen can race it and be refused (#1394): that refusal alone is retried here, on a short
+              // backoff under the same lease, and spends no failure. Past SWAP_CAPACITY_RETRIES it is an ordinary
+              // reopen (one failure), as a listen the cap refuses outside a swap is.
+              for (let retry = 0; ; retry++) {
+                try { await listen(); break; }
+                catch (error) { if (signal.aborted || retry >= SWAP_CAPACITY_RETRIES || !listenCapacity(error)) throw error; }
+                await this.wait(Math.min(4000, 250 * 2 ** retry), signal);
+                await this.guard(r, epoch, signal);
+              }
               dirty = true;
             }
             if (dirty) {

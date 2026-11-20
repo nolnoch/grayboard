@@ -7,7 +7,7 @@ import { Controller, type ControllerOptions } from "../src/controller.js";
 import { AccessExpired, Refusal, RefreshInProgress, same, type AccessReason, type Item } from "../src/model.js";
 import type { ApprovalPort, CredentialPort, Enrollment, HostPort } from "../src/port.js";
 import { resolveRoot } from "../src/sessions.js";
-import { SdkError, SdkErrorCode } from "@modelcontextprotocol/client";
+import { SdkError, SdkErrorCode, SdkHttpError } from "@modelcontextprotocol/client";
 import { LeaseUnavailable, OutcomeUnknown, ServerUnreachable, SubscriberError, subscriberError, Wire, type WireOptions } from "../src/wire.js";
 
 type Mode = "adapter" | "approval";
@@ -52,11 +52,13 @@ function runtime(mode: Mode, options: { rotates?: boolean } = {}) {
   const loops: FakeWire[] = [];
   // The credential's token-change listeners (#1379); every listen the run loop opened, in order, while `open`;
   // the most listens one session had open at once; the next listen waits on `listenHold` (released by its gate,
-  // or refused by its wire's abort); the next `failListen` listens throw; the next `hangClose` closes end the stream
-  // locally but never return, as a server that never answers the cancel POST.
+  // or refused by its wire's abort); the next `failListen` listens throw (an outage), then the next `refuseListen.n`
+  // throw its error; the next `hangClose` closes end the stream locally but never return, as a server that never
+  // answers the cancel POST.
   const rotations = new Set<() => void>();
   const listens: { sessionID: string; open: boolean }[] = [];
   let mostOpen = 0, listenHold: Promise<void> | undefined, failListen = 0, hangClose = 0;
+  let refuseListen: { n: number; error: () => Error } | undefined, refusedListens = 0;
   const address = (name: string) => name.includes("/") ? name : `you@example.com/${name}`;
   // A bind adds a hold; an unbind releases one and bumps the generation too (#451).
   const bind = (id: string, name: string) => { const old = rows.get(id), held = old?.held ?? []; rows.set(id, { held: held.includes(address(name)) ? held : [...held, address(name)], ownership: old?.ownership ?? ++ownership, generation: (old?.generation ?? 0) + 1 }); };
@@ -132,6 +134,7 @@ function runtime(mode: Mode, options: { rotates?: boolean } = {}) {
         await Promise.race([hold, new Promise<never>((_, reject) => this.signal.addEventListener("abort", () => reject(this.signal.reason), { once: true }))]);
       }
       if (failListen > 0) { failListen--; throw new ServerUnreachable(new Error("listen refused")); }
+      if (refuseListen && refuseListen.n > 0) { refuseListen.n--; refusedListens++; throw refuseListen.error(); }
       const { promise: closed, resolve } = Promise.withResolvers<void>();
       const entry = { sessionID: this.sessionID, open: true };
       listens.push(entry);
@@ -236,11 +239,17 @@ function runtime(mode: Mode, options: { rotates?: boolean } = {}) {
     holdListen: (gate: Promise<void>) => { listenHold = gate; },
     // The next `n` listens are refused as an outage.
     failListen: (n: number) => { failListen = n; },
+    // The next `n` listens throw `error()` (default: the server's listen-cap 429, #1394); `refusedListens` counts them.
+    refuseListen: (n: number, error: () => Error = listenCapacityRefusal) => { refuseListen = { n, error }; },
+    get refusedListens() { return refusedListens; },
     // The next `n` stream closes never answer their cancel.
     hangClose: (n: number) => { hangClose = n; },
   };
 }
 const modes: Mode[] = ["adapter", "approval"];
+// A plain-text 429 as the MCP SDK raises it for a refused POST: the body is the server's (`src/server/mcp.ts`).
+const plain429 = (text: string) => new SdkHttpError(SdkErrorCode.ClientHttpNotImplemented, `Error POSTing to endpoint: ${text}`, { status: 429, statusText: "Too Many Requests", text });
+const listenCapacityRefusal = () => plain429("MCP listen capacity reached");
 
 test.each(modes)("enroll binds, opens delivery with the port's session key and delivery declaration, admits and receipts (%s)", async mode => {
   const r = runtime(mode);
@@ -1997,4 +2006,113 @@ test.each(modes)("a credential that reports no token changes (a static run token
     expect(r.rotationListeners).toBe(0);
     expect(r.named("delivery_open")).toHaveLength(2);
   } finally { await r.controller.close(); }
+});
+
+// #1394: the server frees a replaced listen's slot only when it notices the dropped request, so at the per-user listen
+// cap the swap's new listen can be refused with the plain listen-capacity 429. That refusal is retried on a short
+// backoff under the same lease: no whoami, no delivery_open, and no failure spent.
+test.each(modes.flatMap(mode => [1, 5].map(n => [mode, n] as const)))("a swap's replacement listen the listen cap refuses is retried under the same lease (%s, %d refusals)", async (mode, n) => {
+  const r = runtime(mode);
+  const waits: number[] = [];
+  const c = r.make({ wait: async ms => { waits.push(ms); } });
+  try {
+    await c.enroll("R", ["be"], true);
+    await until(() => r.root(c)?.state === "active" && r.listens.length === 1);
+    const whoamis = r.named("whoami").length, opens = r.named("delivery_open").length;
+    r.refuseListen(n);
+    r.rotate();
+    await until(() => r.listens.length === 2 && r.listens[1]!.open);
+    expect(r.refusedListens).toBe(n);
+    // The swap's close bound, then 250 ms doubling per refusal.
+    expect(waits).toEqual([1000, ...[250, 500, 1000, 2000, 4000].slice(0, n)]);
+    expect(r.named("whoami").length).toBe(whoamis);
+    expect(r.named("delivery_open").length).toBe(opens);
+    expect(r.root(c)?.state).toBe("active");
+    r.batches.set("R", [r.item("direct:4")]);
+    r.closeStream("R");
+    await until(() => r.named("delivery_receipt").length === 1);
+    expect(r.admits.filter(a => a.item === "direct:4")).toHaveLength(1);
+  } finally { await c.close(); }
+});
+
+// The issue's case: an idle root at the cap, a refused swap every token lifetime and no receipt between them. Were each
+// refusal a failure, the eighth would stop delivery; here twelve leave the one lease delivering.
+test.each(modes)("repeated swaps the listen cap refuses spend no failures: twelve token lifetimes with no receipt keep the lease (%s)", async mode => {
+  const r = runtime(mode);
+  const c = r.make({ wait: async () => {} });
+  try {
+    await c.enroll("R", ["be"], true);
+    await until(() => r.root(c)?.state === "active" && r.listens.length === 1);
+    const opens = r.named("delivery_open").length;
+    for (let i = 1; i <= 12; i++) {
+      r.refuseListen(5);
+      r.rotate();
+      await until(() => r.listens.length === i + 1 && r.listens[i]!.open || r.root(c)?.state === "paused", 5000, `swap ${i} reopened`);
+      expect(r.root(c)).toMatchObject({ state: "active" });
+    }
+    expect(r.refusedListens).toBe(60);
+    expect(r.named("delivery_receipt")).toHaveLength(0);
+    expect(r.named("delivery_open").length).toBe(opens);
+    expect(r.root(c)?.state).toBe("active");
+    r.batches.set("R", [r.item("direct:2")]);
+    r.closeStream("R");
+    await until(() => r.named("delivery_receipt").length === 1);
+  } finally { await c.close(); }
+});
+
+// A user persistently at the cap: past the retries, the refusal is an ordinary reopen (one failure, its backoff, whoami,
+// delivery_open), as the cap refusing a first listen is.
+test.each(modes)("a swap the listen cap refuses past its retries is an ordinary reopen (%s)", async mode => {
+  const r = runtime(mode);
+  const waits: number[] = [];
+  const c = r.make({ wait: async ms => { waits.push(ms); } });
+  try {
+    await c.enroll("R", ["be"], true);
+    await until(() => r.root(c)?.state === "active" && r.listens.length === 1);
+    const whoamis = r.named("whoami").length, opens = r.named("delivery_open").length;
+    r.refuseListen(6);
+    r.rotate();
+    await until(() => r.named("delivery_open").length === opens + 1 && r.listens.length === 2 && r.root(c)?.state === "active");
+    expect(r.refusedListens).toBe(6);
+    expect(r.named("whoami").length).toBe(whoamis + 1);
+    // The close bound, five retries, then the first failure's backoff.
+    expect(waits).toEqual([1000, 250, 500, 1000, 2000, 4000, 500]);
+  } finally { await c.close(); }
+});
+
+// Only the listen-capacity body is the slot race: another plain 429 (request capacity) or an outage on the swap takes
+// the existing path at once, with no capacity retry.
+test.each(modes.flatMap(mode => [["request capacity", () => plain429("MCP request capacity reached")], ["outage", () => new ServerUnreachable(new Error("listen refused"))]].map(([what, error]) => [mode, what, error] as const)))("a swap's replacement listen refused otherwise is an ordinary reopen (%s, %s)", async (mode, _what, error) => {
+  const r = runtime(mode);
+  const waits: number[] = [];
+  const c = r.make({ wait: async ms => { waits.push(ms); } });
+  try {
+    await c.enroll("R", ["be"], true);
+    await until(() => r.root(c)?.state === "active" && r.listens.length === 1);
+    const whoamis = r.named("whoami").length, opens = r.named("delivery_open").length;
+    r.refuseListen(1, error as () => Error);
+    r.rotate();
+    await until(() => r.named("delivery_open").length === opens + 1 && r.listens.length === 2 && r.root(c)?.state === "active");
+    expect(r.named("whoami").length).toBe(whoamis + 1);
+    expect(waits[0]).toBe(1000);
+    expect(waits).not.toContain(250);
+  } finally { await c.close(); }
+});
+
+test("a close during a capacity retry's backoff ends the run loop with no further listen", async () => {
+  const r = runtime("adapter");
+  let backingOff = false;
+  const c = r.make({ wait: (ms, signal) => {
+    if (ms === 250) backingOff = true;
+    return ms === 250 ? new Promise<void>((_, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true })) : Promise.resolve();
+  } });
+  await c.enroll("R", ["be"], true);
+  await until(() => r.root(c)?.state === "active" && r.listens.length === 1);
+  r.refuseListen(1);
+  r.rotate();
+  await until(() => backingOff);
+  await c.close();
+  expect(r.listens).toHaveLength(1);
+  expect(r.refusedListens).toBe(1);
+  expect(r.named("delivery_open")).toHaveLength(1);
 });
