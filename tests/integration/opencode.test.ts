@@ -792,8 +792,9 @@ for (const mode of ["switch", "shutdown"] as const) {
       }
       await sigkill(grayboardChildPids(oc.pid)[0]!);
       await until(() => current.notices().some(n => n.includes("restarting it (3 of 3)")), 1_000, "the longest backoff scheduled");
-      // The notice is reported as the 5 s restart timer is set (RESTART_DELAYS_MS), so a prompt that waited for that
-      // restart couldn't complete before `scheduled + 5_000`; the bound below sits under it, less polling slack (#1252).
+      // The notice is reported just before the 5 s restart timer is set (RESTART_DELAYS_MS) and seen here tens of ms
+      // later, so a prompt that waited for that restart finishes after about `scheduled + 5_000`; the bound sits 500 ms
+      // under it (#1252).
       const scheduled = Date.now();
       let waiting: Promise<OpenCodeMessage> | undefined;
       if (mode === "switch") {
