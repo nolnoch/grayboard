@@ -921,10 +921,20 @@ function laneAddressesSql(lane: string): string {
 
 /** queueLanes' rows before any judgment: the board's lanes less `poster`, least-recently-woken first. */
 export function queueLaneRows(db: Database, board: string, poster: string[]): string[] {
-  return (
-    db
-      .prepare(
-        `WITH lanes AS (
+  return (db.prepare(queueLaneRowsSql()).all(board, JSON.stringify(poster)) as { handle: string }[]).map((r) => r.handle);
+}
+
+/**
+ * queueLaneRows' query (?1 board, ?2 JSON array of poster handles), exported for its plan test. It runs inside every
+ * queue post's and requeue's write transaction, so its plan must stay indexed as history grows (#1174 audit H1); two
+ * planner pins keep it there, with or without ANALYZE stats:
+ * - `+e.key`: the unary plus keeps idx_claim_events_key out. With stats the planner otherwise ranges that index on the
+ *   GLOB prefix and reads every queue take on every board per lane, instead of idx_claim_events_take (board, handle).
+ * - `outbox o2 CROSS JOIN posts p2`: pins outbox as the outer loop, searched by handle. Without stats the planner
+ *   otherwise drives from every post on the board and probes outbox per post.
+ */
+export function queueLaneRowsSql(): string {
+  return `WITH lanes AS (
            SELECT COALESCE(${primaryHoldSql("s.handle")}, s.handle) AS lane FROM subscriptions s
            WHERE s.board = ?1 AND s.mode = 'push')
          SELECT l.lane AS handle FROM lanes l LEFT JOIN aliases h ON h.address = l.lane
@@ -934,12 +944,9 @@ export function queueLaneRows(db: Database, board: string, poster: string[]): st
          GROUP BY l.lane
          ORDER BY NULLIF(MAX(
              COALESCE((SELECT MAX(e.at) FROM claim_events e
-                       WHERE e.board = ?1 AND e.handle IN ${laneAddressesSql("l.lane")} AND e.event = 'take' AND e.key GLOB 'queue:*'), 0),
-             COALESCE((SELECT MAX(p2.created_at) FROM outbox o2 JOIN posts p2 ON p2.id = o2.post_id
-                       WHERE o2.handle IN ${laneAddressesSql("l.lane")} AND p2.board = ?1), 0)), 0) ASC NULLS FIRST, l.lane ASC`,
-      )
-      .all(board, JSON.stringify(poster)) as { handle: string }[]
-  ).map((r) => r.handle);
+                       WHERE e.board = ?1 AND e.handle IN ${laneAddressesSql("l.lane")} AND e.event = 'take' AND +e.key GLOB 'queue:*'), 0),
+             COALESCE((SELECT MAX(p2.created_at) FROM outbox o2 CROSS JOIN posts p2 ON p2.id = o2.post_id
+                       WHERE o2.handle IN ${laneAddressesSql("l.lane")} AND p2.board = ?1), 0)), 0) ASC NULLS FIRST, l.lane ASC`;
 }
 
 // The claim IS the delivery: the picked lane holds the post until it acks (a
