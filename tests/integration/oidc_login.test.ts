@@ -101,23 +101,6 @@ test("a public oidc client alone signs in through the AS by PKCE, with no client
   expect((await accessAudits(srv, "oauth.upstream_authenticated")).map(r => [r.actor, r.detail])).toEqual([[EMAIL, { client_id: CLIENT, provider: "oidc" }]]);
 });
 
-test("a realm that writes identity only into the access token: a public client asking for an extra scope signs in by the access token's email, with trust-email on", async () => {
-  const AUDIENCE = "grayboard-resource";
-  fake = await startFakeOidc({ clientId: CLIENT_ID, user: { sub: "realm-you", email: EMAIL, name: "You" }, claimsInAccessTokenFor: [AUDIENCE, "account"] });
-  const f = fake;
-  srv = await hostedServer({}, EMAIL, [oidcProvider({ id: "oidc", label: "Example SSO", issuer: f.issuer, clientId: CLIENT_ID, allowedDomains: ["example.com"], allowLoopbackHttp: true,
-    scopes: ["grayboard"], accessTokenAudience: AUDIENCE, trustEmail: true })]);
-  const { result, browser, callback, a } = await signIn(srv);
-  expect(result).toBe("consent");
-  expect(f.authorizeScopes).toEqual(["openid email profile grayboard"]);
-  expect(f.tokenAuthorizations).toEqual([null]);
-  const access = await token(srv, browser, callback, a);
-  const session = new HostedSession(`${srv.base}/mcp`, access, null);
-  sessions.push(session);
-  expect(JSON.stringify((await session.connect()).whoami)).toContain(EMAIL);
-  expect((await srv.app.repo.users.findByEmail(srv.app.repo.read, EMAIL))).toMatchObject({ idp_issuer: f.issuer, idp_subject: "realm-you" });
-});
-
 test("the chooser names the oidc provider by its configured label, and its link reaches /oauth/oidc/callback's IdP", async () => {
   const { fake, srv } = await start(f => [google(), publicOidc(f)], [], true);
   const browser = new Browser();

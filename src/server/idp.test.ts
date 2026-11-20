@@ -106,9 +106,8 @@ test("defaultProviders builds oidc from Config, a public client when it has no s
     throw new Error("unexpected request " + req.url);
   }, { preconnect: realFetch.preconnect });
 
-  const config = { ...base, okta: undefined, idps: ["oidc", "google"], oidc: { issuer: ISSUER, clientId: "grayboard", allowedDomains: ["example.com"], label: "Example SSO", scopes: ["grayboard"] } } as unknown as Config;
+  const config = { ...base, okta: undefined, idps: ["oidc", "google"], oidc: { issuer: ISSUER, clientId: "grayboard", allowedDomains: ["example.com"], label: "Example SSO" } } as unknown as Config;
   const providers = defaultProviders(config);
-  expect(new URL(await providers[0]!.authorizeUrl({ redirectUri: "https://grayboard.example.com/oauth/oidc/callback", state: "s", nonce: "n", challenge: "c" })).searchParams.get("scope")).toBe("openid email profile grayboard");
   expect(providers.map(p => [p.id, p.label, p.issuer, callbackPath(p)])).toEqual([
     ["oidc", "Example SSO", ISSUER, "/oauth/oidc/callback"], ["google", "Google", GOOGLE_ISSUER, "/oauth/google/callback"]]);
   await expect(providers[0]!.exchange({ code: "c", verifier: "v", redirectUri: "https://grayboard.example.com/oauth/oidc/callback", nonce: "n" })).rejects.toThrow("token");

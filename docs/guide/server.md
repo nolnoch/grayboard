@@ -204,16 +204,6 @@ GRAYBOARD_OIDC_LABEL=Example SSO                          # the sign-in page's l
 
 The rules are Okta's: the allowed domains, the verified email (**the provider must send `email_verified: true`**; users a realm brokers from another provider or imports often have it false until it's set), the start-up checks, and contact only at sign-in. `GRAYBOARD_OIDC_CLIENT_SECRET` set but empty refuses to start rather than make a public client. The `oidc` and `okta` issuers must differ, and `GRAYBOARD_DEV_AUTH=1` refuses to start beside any `GRAYBOARD_OIDC_ISSUER`, secret or not.
 
-**Identity in the access token.** Some realms give a client only a basic scope and write email and name into the provider's access token alone, for a resource the token names in `aud`; the ID token and userinfo then carry only `sub`. Three optional variables cover that:
-
-```
-GRAYBOARD_OIDC_SCOPES=grayboard          # added to openid email profile; spaces or commas
-GRAYBOARD_OIDC_AUDIENCE=<resource client id or URL>
-GRAYBOARD_OIDC_TRUST_EMAIL=1             # 1 or 0; default 0
-```
-
-With `GRAYBOARD_OIDC_AUDIENCE` set, the server reads the email from the access token instead, and verifies it as it does the ID token: the provider's signing keys, issuer, that audience, expiry and issue time, `azp` this client, and the ID token's `sub`. The token still goes nowhere but this check; clients never send it to `/mcp`. `GRAYBOARD_OIDC_TRUST_EMAIL=1` accepts an email that comes with no `email_verified` claim at all (an explicit `false` is still refused), and the server logs a warning at every start. Set it only when the provider vouches for every email it issues, such as a realm that brokers a single trusted SSO with its email trusted; otherwise anyone who can set their own email in the realm signs in as that address.
-
 ## 4. Start and verify
 
 ```bash
