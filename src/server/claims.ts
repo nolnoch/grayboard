@@ -69,7 +69,9 @@ export async function requeue(repo: Repo, access: BoardAccess, tx: Tx, c: ClaimR
   const lanes = rows.length ? await access.lanesAmong(tx, rows, f.board) : new Set<string>();
   const lane = requeuePick(orderLanes(rows, (h) => viewers.has(h), (h) => sees.has(h), (h) => lanes.has(h)), f.held);
   if (lane) {
-    // A redelivery that finds the key taken (another pod's sweep, on Postgres) wrote no push for the lane: wake nobody.
+    // false: the key was taken (another pod's sweep, on Postgres: no push for the lane), or the lane already held it
+    // (a manual claim_take of the queue: key; its push is reset, undelivered and waking, for its next drain). Either
+    // way this run wakes nobody.
     const took = await repo.boards.claimQueuePost(tx, f.board.name, f.postId, lane, now, { note: REDELIVERED_NOTE, push: true });
     return { wake: took ? [lane] : [], boards: [] };
   }

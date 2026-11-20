@@ -56,7 +56,7 @@ export type BoardsHarness = {
   close(): void | Promise<void>;
 };
 
-// `pending`: rows a backend doesn't run yet, by name, each with its reason (Postgres's C10e2 methods until C10e2). A
+// `pending`: rows a backend doesn't run yet, by name, each with its reason (none today: every row runs on both). A
 // name that matches no row fails registration, so a renamed row can't slip out of the run.
 export type BoardsBackend = { kind: "sqlite" | "postgres"; open(): Promise<BoardsHarness>; pending?: Readonly<Record<string, string>> };
 
@@ -890,6 +890,17 @@ function queue(it: It): void {
     await h.write(tx => b.acknowledge(tx, FE, { kind: "push", post_id: p }));
     expect(await h.write(tx => b.claimQueuePost(tx, "jobs", p, FE, T0 + 6, { note: "n", push: false }))).toBe(false);
     expect((await h.outboxRows())[0]?.delivered).toBe(true);
+  });
+
+  // c10e2 audit 1: on Postgres a prune may delete the post between the sweep's read and its claim.
+  it("claimQueuePost on a post that's gone: false, and no claim, event or outbox row", async h => {
+    await board(h, "jobs", { kind: "queue" });
+    const p = await write(h, np("jobs", BE, "job", T0));
+    await h.write(tx => h.boards.prunePosts(tx, T0 + 1));
+    expect(await h.write(tx => h.boards.claimQueuePost(tx, "jobs", p, FE, T0 + 5, { note: "queue post (redelivered)", push: true }))).toBe(false);
+    expect(await h.claimRows()).toEqual([]);
+    expect(await h.eventRows()).toEqual([]);
+    expect(await h.outboxRows()).toEqual([]);
   });
 
   // From db.test.ts B5b3b. The claimEvent fixture writes no session_id, so these takes map by address as today;

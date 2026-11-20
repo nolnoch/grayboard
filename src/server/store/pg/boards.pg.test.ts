@@ -1,13 +1,13 @@
-// #807 P3 C10e2: the boards store's races on Postgres (c10-scope §2 C10e2: P1, P5, A1, P3/P4; docs/future/postgres-
-// server.md D3), each in T-P12's shape (tests/support/pg_race.ts): A's body holds its transaction open at a gate, B's
-// starts, and the race waits until B is blocked on a lock or done. The end state is asserted before `waited`, so a race
+// #807 P3 C10e2: the boards store's races on Postgres (c10-scope §2 C10e2: P1, P5, A1, P3/P4, and the c10e2 audit's
+// sweep-vs-prune and forget-vs-read; docs/future/postgres-server.md D3), each in T-P12's shape
+// (tests/support/pg_race.ts): A's body holds its transaction open at a gate, B's starts, and the race waits until B is blocked on a lock or done. The end state is asserted before `waited`, so a race
 // whose lock is gone fails on what it broke (a raw 23503, an aborted body, a post on an archived board, a second
 // archive or take), not on a timeout. The gate's board read is board_post's (postGateOn: lockForPost, then core's
 // archived refusal), restated over the store, since no Postgres Repo exists before C11. Without GRAYBOARD_TEST_PG_URL
 // they skip.
 import { expect, test } from "bun:test";
 import { describePg } from "../../../../tests/support/pg.ts";
-import { blockedOrSettled, committed, gate, outcome, pgPair, race, settle, type PgPair, type Settled } from "../../../../tests/support/pg_race.ts";
+import { committed, outcome, pgPair, race, type PgPair } from "../../../../tests/support/pg_race.ts";
 import type { NewPost } from "../boards.ts";
 import { MissingPost } from "../errors.ts";
 import type { Tx } from "../tx_base.ts";
@@ -44,25 +44,6 @@ async function gatedPost(tx: Tx, body: string): Promise<string> {
   if (b.archived_at !== undefined) return "refused archived";
   await bs.insertPost(tx, np(body, T0 + 5));
   return "posted";
-}
-
-// race() with A's body going on after B blocks or settles: `first` runs on A and holds, B's `second` starts, and once
-// B is blocked or settled A is released into `then` on the same transaction. For a post whose gate read (`first`)
-// and insert (`then`) straddle a concurrent archive.
-async function raceThrough<TA, TB>(p: PgPair, first: (tx: Tx) => Promise<void>, then: (tx: Tx) => Promise<TA>, second: (tx: Tx) => Promise<TB>):
-  Promise<{ a: Settled<TA>; b: Settled<TB>; waited: boolean }> {
-  const held = gate(), release = gate();
-  const a = settle(p.a.write(async tx => { await first(tx); held.open(); await release.wait; return then(tx); }));
-  let b: Promise<Settled<TB>>, waitEvent: string | null;
-  try {
-    await Promise.race([held.wait, a]);
-    let done = false;
-    b = settle(p.b.write(second)).finally(() => { done = true; });
-    waitEvent = await blockedOrSettled(p, () => done);
-  } finally {
-    release.open();
-  }
-  return { a: await a, b: await b, waited: waitEvent !== null };
 }
 
 describePg("boards store races (Postgres)", () => {
@@ -102,13 +83,13 @@ describePg("boards store races (Postgres)", () => {
   test("P5: a post past its gate, then an archive: the archive waits and lands after the post", async () => {
     await using p = await pgPair();
     await hall(p);
-    const r = await raceThrough(p,
+    const r = await race(p,
       async tx => { expect((await bs.lockForPost(tx, "hall"))?.archived_at).toBeUndefined(); },
-      async tx => (await bs.insertPost(tx, np("posted", T0 + 5))).id,
       async tx => {
         const after = await bs.setArchived(tx, "hall", FE, T0 + 10);
         return { archived_by: after?.archived_by, posts: (await bs.snapshotPage(tx, "hall", {})).posts.map(x => x.body) };
-      });
+      },
+      { then: async tx => (await bs.insertPost(tx, np("posted", T0 + 5))).id });
     committed(r.a);
     expect(outcome(r.b)).toEqual({ archived_by: FE, posts: ["root", "posted"] });
     expect(r.waited).toBe(true);
@@ -167,5 +148,48 @@ describePg("boards store races (Postgres)", () => {
         .map((x: Row) => [x.handle, int8(x.post_id), x.wake, x.delivered_at])).toEqual([[first, post, true, null]]);
       expect(r.waited).toBe(true);
     }
+  });
+
+  // c10e2 audit 1. Mutation: claimQueuePost's post FOR KEY SHARE dropped. A sweep resets the push of a queue post its
+  // lane already holds (an outbox UPDATE, no FK check), and a prune locks its batch and waits on that outbox row in its
+  // delete; the sweep's next claim ends in an [unclaimed] reply under another old post, which waits on the prune's
+  // batch: a deadlock, one side aborted. With the post locked first, the prune waits at its batch instead.
+  test("P1: a sweep's redelivery and reply, around a prune of both posts: the prune waits, nothing deadlocks", async () => {
+    await using p = await pgPair();
+    const p1 = await hall(p, "queue");
+    const p2 = (await p.a.write(tx => bs.insertPost(tx, np("other", T0)))).id;
+    await p.db.sql`INSERT INTO claims (key, holder, note, board, acquired_at, expires_at) VALUES (${`queue:hall:${p1}`}, ${FE}, 'queue post', 'hall', ${T0}, ${T0 + 60_000})`;
+    await p.a.write(tx => bs.insertOutbox(tx, p1, [[FE, { reason: "subscription", wake: true }]]));
+    const r = await race(p,
+      tx => bs.claimQueuePost(tx, "hall", p1, FE, T0 + 5, { note: "queue post (redelivered)", push: true }),
+      tx => bs.prunePosts(tx, T0 + 1),
+      { then: async (tx, took) => ({ took, reply: (await bs.insertPost(tx, np("[unclaimed]", T0 + 5, p2))).id }) });
+    const a = committed(r.a);
+    expect(a.took).toBe(false);
+    expect(outcome(r.b)).toEqual(["hall"]);
+    expect(await postRows(p)).toEqual([{ id: a.reply, parent_id: null, body: "[unclaimed]" }]);
+    expect((await p.db.sql`SELECT count(*)::int AS n FROM outbox`)[0].n).toBe(0);
+    expect(r.waited).toBe(true);
+  });
+
+  // c10e2 audit 2. Mutation: read's cursor UPDATE before its outbox stamp. A forget of a handle holds its outbox rows
+  // (here, its first half: an acknowledge's stamp) when the handle's read starts; a read that moved its cursor first
+  // holds the subscription row forget deletes next, then waits on the outbox row: a deadlock. Outbox first, the read
+  // waits holding nothing forget needs, and finds both rows gone.
+  test("forget against the handle's read: the read waits, nothing deadlocks", async () => {
+    await using p = await pgPair();
+    const root = await hall(p);
+    await p.a.write(async tx => {
+      await bs.setSubscription(tx, FE, "hall", "push");
+      await bs.insertOutbox(tx, root, [[FE, { reason: "mention", wake: true }]]);
+    });
+    const r = await race(p,
+      tx => bs.acknowledge(tx, FE, { kind: "push", post_id: root }),
+      async tx => (await bs.read(tx, "hall", FE, {})).posts.map(x => x.body),
+      { then: tx => bs.forget(tx, FE) });
+    committed(r.a);
+    expect(outcome(r.b)).toEqual(["root"]);
+    expect(await p.db.sql`SELECT handle FROM outbox UNION ALL SELECT handle FROM subscriptions`).toEqual([]);
+    expect(r.waited).toBe(true);
   });
 });

@@ -137,7 +137,8 @@ export interface BoardsStore {
   // session's principal, expiring QUEUE_CLAIM_TTL_MS after now, a take event. True when this run took the key. With
   // `push`, the lane's subscription push is written or reset (undelivered, waking) only when the lane holds the key
   // after the claim (#1357): a key another lane holds writes no claim, event or push, and returns false; a key the
-  // lane itself holds already returns false with its push reset (a re-offer reaches it, at-least-once), no event.
+  // lane itself holds already returns false with its push reset (a re-offer reaches it, at-least-once), no event. A
+  // post that's gone (pruned since the caller read it) returns false and writes nothing.
   claimQueuePost(tx: Tx, board: string, postId: number, lane: string, now: number, o: { note: string; push: boolean }): Promise<boolean>;
   // A post plan's outbox rows (core insertOutbox); a row already there for a handle stays as it is.
   insertOutbox(tx: Tx, postId: number, targets: [string, PostTarget][]): Promise<void>;

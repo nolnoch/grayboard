@@ -14,9 +14,15 @@
 //     before its conditional UPDATE (P5): an archive waits for a post that passed the gate, and a post whose gate
 //     waits on an archive reads the board archived. A plain UPDATE of archived_at takes only FOR NO KEY UPDATE, which
 //     doesn't conflict with KEY SHARE (probe D5); two posts' KEY SHAREs don't conflict either (probe D6).
-//   - claimQueuePost claims first, `ON CONFLICT (key) DO NOTHING RETURNING` (P3/P4): a second redelivery waits on the
-//     first's uncommitted claim and gets no row, so it logs no take; its push, a later statement, sees the winner's
-//     committed row and reaches only the key's holder.
+//   - claimQueuePost locks its post FOR KEY SHARE first and returns false when it's gone, then claims,
+//     `ON CONFLICT (key) DO NOTHING RETURNING` (P3/P4): a second redelivery waits on the first's uncommitted claim and
+//     gets no row, so it logs no take; its push, a later statement, sees the winner's committed row and reaches only
+//     the key's holder. The post lock keeps a sweep's order posts, then outbox, as a prune's is: a push reset (an
+//     outbox UPDATE, no FK check) would otherwise hold the row a prune's outbox delete waits on while the sweep's next
+//     post write waits on the prune's batch, a deadlock (c10e2 audit 1).
+//   - Lock order across tables: posts, then outbox, then subscriptions. forget, read and acknowledge each write a
+//     handle's outbox rows before its subscriptions, so a handle's forget racing its read waits rather than deadlocks
+//     (c10e2 audit 2); prunePosts locks posts first and touches no subscription.
 //   - acknowledge's and read's GREATEST is re-evaluated on the newest row version after the row lock, so a cursor or
 //     notified_id never moves back; setSubscription reads the tip in its insert's statement (a post committing beside
 //     it lands either side of the cursor, as on SQLite); bindAttachments locks its uploads first (attachment_rows.ts);
@@ -407,11 +413,11 @@ export function makePgBoards({ clock }: { clock: () => number }): BoardsStore {
       const h = param(sql, handle);
       const maxId = posts.reduce((m, p) => Math.max(m, p.id), 0);
       if (maxId > 0) {
-        await sql`UPDATE subscriptions SET cursor = GREATEST(cursor, ${maxId}::int8) WHERE board = ${board} AND handle = ${handle}`;
         // What this read showed no longer needs pushing; what it skipped (a pending push it filters out, a post
-        // outside the thread) still does.
+        // outside the thread) still does. Outbox before the cursor: the header's lock order (core runs the reverse).
         await sql`UPDATE outbox SET delivered_at = ${clock()} WHERE handle = ${handle} AND delivered_at IS NULL
           AND post_id = ANY(${posts.map(p => p.id)}::int8[])`;
+        await sql`UPDATE subscriptions SET cursor = GREATEST(cursor, ${maxId}::int8) WHERE board = ${board} AND handle = ${handle}`;
       }
       const [n] = await sql`SELECT COUNT(*) AS n FROM posts p JOIN subscriptions s ON s.board = p.board AND s.handle = ${handle}
         WHERE p.board = ${board} AND p.id > s.cursor AND ${notOwn(sql, h)} AND ${notPushedYet(sql, h)}`;
@@ -481,11 +487,13 @@ export function makePgBoards({ clock }: { clock: () => number }): BoardsStore {
       const sql = pgOf(r);
       return (await sql`${laneRowsStatement(sql, board, poster)}`).map((x: Row) => x.handle as string);
     },
-    // core claimQueuePost, claim first (header, P3/P4): the take event only when this run inserted the claim; the push
+    // core claimQueuePost, the post locked and then the claim first (header, P3/P4); a post that's gone (pruned) is
+    // false, writing nothing. The take event only when this run inserted the claim; the push
     // (written or reset, undelivered and waking) only when the lane holds the key after it, in a later statement that
     // sees a winner's committed row.
     async claimQueuePost(tx, board, postId, lane, now, { note, push }) {
       const sql = pgOf(tx);
+      if ((await sql`SELECT 1 FROM posts WHERE id = ${postId} FOR KEY SHARE`).length === 0) return false;
       const key = `queue:${board}:${postId}`;
       const expires = now + QUEUE_CLAIM_TTL_MS;
       const took = await sql`INSERT INTO claims (key, holder, note, board, acquired_at, expires_at, holder_user)
