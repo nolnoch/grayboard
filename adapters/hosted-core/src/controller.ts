@@ -101,8 +101,8 @@ function causeOf<T>(error: unknown, type: abstract new (...args: never[]) => T):
 // deadline, however the SDK or a wire's own timeout signal surfaced it (a ServerUnreachable, an
 // SdkError RequestTimeout or ConnectionClosed, a gateway status, a network code, an abort's TimeoutError), a token
 // refresh another process held, or the server's `unbound` (the root's binding moved while it waited at the gate).
-// A refusal (child_bound, child_registered_elsewhere, has_children, root_is_child and invalid_registration all
-// arrive as SubscriberError invalid_response), a malformed answer, or a sign-in's is the same for every request.
+// A refusal (child_bound, child_registered_elsewhere, has_children, root_is_child, invalid_registration, each a
+// SubscriberError with its own code), a malformed answer, or a sign-in's is the same for every request.
 function transient(error: unknown): boolean {
   if (unreachable(error) || causeOf(error, RefreshInProgress)) return true;
   for (let e = error, depth = 0; e && depth < 8; e = (e as { cause?: unknown }).cause, depth++) {

@@ -31590,7 +31590,7 @@ class LeaseUnavailable extends SubscriberError {
     super(code);
   }
 }
-var domainCodes = new Set(["identity_unknown", "alias_held", "not_found", "unbound", "refused", "internal_error", "bad_request", "unauthenticated", "forbidden", "rate_limited", "receipt_capacity"]);
+var domainCodes = new Set(["identity_unknown", "alias_held", "not_found", "unbound", "refused", "internal_error", "bad_request", "unauthenticated", "forbidden", "rate_limited", "receipt_capacity", "child_bound", "child_registered_elsewhere", "has_children", "root_is_child", "invalid_registration"]);
 function subscriberError(value, leaseOperation) {
   const code = value?.code;
   const domain = typeof code === "string" && domainCodes.has(code) ? code : "invalid_response";
@@ -35088,7 +35088,7 @@ var fields = ["state", "message", "sessionID", "time", "held", "ownership", "ope
 var states = new Set(["approved", "active", "paused", "unbound", "unenrolled", "retrying", "rebinding", "degraded"]);
 var OPERATIONS = ["diagnostic_save", "diagnostic_emit", "pause", "configured_bind", "delivery", "enroll", "prepare", "subscriber", "reopen", "restore", "event", "stream", "before_bind", "after", "hook_dispose", "rpc_dispose", "latch_save", "wire_close", "subscription_close", "delivery_release", "release_upload", "session_end", "pause_save", "child_end", "watch_dispose", "login", "logout", "refresh", "child_register", "receipt_hook", "instructions", "login_link", "recover"];
 var operations = new Set(OPERATIONS);
-var codes = new Set(["retry_exhausted", "operation_failed", "identity_unknown", "alias_held", "not_found", "unbound", "refused", "internal_error", "bad_request", "unauthenticated", "forbidden", "rate_limited", "receipt_capacity", "invalid_response", "server_unreachable", "subscription_closed", "native_access_expired", "login_required", "refresh_outcome_unknown", "server_outdated", "delivery_held_elsewhere", "refresh_in_progress", "revoke_queued"]);
+var codes = new Set(["retry_exhausted", "operation_failed", "identity_unknown", "alias_held", "not_found", "unbound", "refused", "internal_error", "bad_request", "unauthenticated", "forbidden", "rate_limited", "receipt_capacity", "child_bound", "child_registered_elsewhere", "has_children", "root_is_child", "invalid_registration", "invalid_response", "server_unreachable", "subscription_closed", "native_access_expired", "login_required", "refresh_outcome_unknown", "server_outdated", "delivery_held_elsewhere", "refresh_in_progress", "revoke_queued"]);
 function failureCode(error) {
   if (error instanceof DeliveryStopped)
     return "retry_exhausted";
@@ -36001,6 +36001,22 @@ function outputOf(result) {
     return JSON.parse(only.text);
   } catch {
     return only.text;
+  }
+}
+function refusalOf2(result) {
+  const output = outputOf(result);
+  const code = typeof output === "object" && typeof output?.code === "string" ? output.code : undefined;
+  if (typeof output === "object" && typeof output?.message === "string")
+    return { code, why: output.message };
+  const text = typeof output === "string" ? output : result.content.find((c) => c.type === "text")?.text;
+  return { code, why: text && !isJson(text) ? text.replace(/^error: /, "") : "no reason given" };
+}
+function isJson(text) {
+  try {
+    JSON.parse(text);
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -37923,9 +37939,7 @@ class RootDelivery {
         this.configuring = undefined;
         return;
       }
-      const output = outputOf(result);
-      const code = typeof output === "object" && typeof output?.code === "string" ? output.code : undefined;
-      const why = typeof output === "object" ? typeof output?.message === "string" ? output.message : "no reason given" : String(output ?? "no reason given").replace(/^error: /, "");
+      const { code, why } = refusalOf2(result);
       if (code && REFUSED.has(code))
         this.configuring = undefined;
       this.configuredMissed(name, code ? `${code}: ${why}` : why, !this.configuring);
