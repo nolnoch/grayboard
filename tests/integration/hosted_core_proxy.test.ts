@@ -611,8 +611,10 @@ test("a 401 the credential's refresh doesn't fix needs a new login: tool calls, 
 // #1345: a call whose request left before the transport failed (a gateway 503, a reset after the server ran it) may
 // have taken effect, so the agent hears "check before calling it again", never "call the tool again"; a socket that
 // never opened (refused, at the call or at the shared connect) ran nothing and stays "Server unreachable". The broken
-// connection is still dropped, and nothing sends the call again.
-test("a call cut off after its request left reports its outcome unknown and is sent once; a socket that never opened stays unreachable (#1345)", async () => {
+// connection is still dropped, and nothing sends the call again. A credential's own outage (a refresh on the
+// request's token() or in onUnauthorized) also ran nothing and stays unreachable; a call in flight when its proxy
+// closes is a stop, not an outage.
+test("a call cut off after its request left reports its outcome unknown and is sent once; a socket that never opened, a credential outage and a proxy close are not (#1345)", async () => {
   const listening = (server: Server) => new Promise<number>(resolve => server.listen(0, "127.0.0.1", () => resolve((server.address() as AddressInfo).port)));
   // A peer that resets every connection once the request arrives: Bun's own ECONNRESET.
   const resetter = createServer(socket => { socket.once("data", () => socket.destroy()); });
