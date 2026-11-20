@@ -13,6 +13,7 @@ import { accessAudits } from "../support/audit.ts";
 import { HOSTED_CLIENT, type HostedSession } from "../support/hosted_session.ts";
 import { seed } from "../support/seed.ts";
 import { TestServer } from "../support/server.ts";
+import { drained, row as sqlRow, rows } from "../support/repo_sql.ts";
 
 const A = "alice@example.com";
 const B = "bob@example.com";
@@ -33,11 +34,11 @@ const revoke = async () => expect((await srv.api(alice, "POST", "/api/teams/eng/
 const texts = (r: CallToolResult) => r.content.map((c) => (c.type === "text" ? c.text : c.type));
 const json = (r: CallToolResult) => JSON.parse(texts(r)[0]!);
 const lostNotice = (tail: string) => `This session lost its bus name "eng/build": ${REASON}. ${tail}`;
-const audits = (action: string) => accessAudits(srv.app.db, action);
+const audits = (action: string) => accessAudits(srv, action);
 const notified = () => audits("hosted.alias_lost_notified");
 const LOST = [{ alias: "eng/build", reason: REASON }];
-const rootId = (s: HostedSession) => srv.app.db.query<{ session_id: string }, [string]>("SELECT session_id FROM hosted_sessions WHERE source_session_id = ?").get(s.sessionId)!.session_id;
-const pending = () => srv.app.db.query<{ n: number }, []>("SELECT count(*) AS n FROM hosted_alias_lost").get()!.n;
+const rootId = async (s: HostedSession) => (await sqlRow<{ session_id: string }>(srv, "SELECT session_id FROM hosted_sessions WHERE source_session_id = ?", s.sessionId))!.session_id;
+const pending = async () => { await drained(srv); return (await sqlRow<{ n: number }>(srv, "SELECT count(*) AS n FROM hosted_alias_lost"))!.n; };
 
 test("the Controller's whoami reports alias_lost until its delivery_open; the native whoami carries it and the notice once; audited, then deleted", async () => {
   const b = await srv.hosted(B, "fe");
@@ -48,7 +49,7 @@ test("the Controller's whoami reports alias_lost until its delivery_open; the na
   // opens delivery: a whoami whose response was lost costs nothing.
   expect(bindingOf(await b.subscriber.call("whoami"))).toMatchObject({ held: [`${B}/fe`], alias_lost: LOST });
   expect(await b.subscriber.call("whoami")).toMatchObject({ alias_lost: LOST });
-  expect(notified()).toEqual([]);
+  expect(await notified()).toEqual([]);
 
   const told = await b.callRaw("whoami");
   expect(json(told)).toMatchObject({ held: [`${B}/fe`], primary: `${B}/fe`, alias_lost: LOST });
@@ -60,16 +61,16 @@ test("the Controller's whoami reports alias_lost until its delivery_open; the na
   expect(json(again)).not.toHaveProperty("alias_lost");
   expect(again._meta?.["io.github.nolnoch.grayboard/alias_lost"]).toBeUndefined();
   expect(texts(await b.callRaw("board_list"))).toHaveLength(1);
-  expect(pending()).toBe(1);
+  expect(await pending()).toBe(1);
 
   await b.subscriber.call("delivery_open");
   expect(await b.subscriber.call("whoami")).not.toHaveProperty("alias_lost");
-  expect(pending()).toBe(0);
+  expect(await pending()).toBe(0);
 
-  const row = (await srv.app.repo.hosted.get(srv.app.repo.read, rootId(b)))!;
+  const row = (await srv.app.repo.hosted.get(srv.app.repo.read, await rootId(b)))!;
   const detail = { aliases: ["eng/build"], ownership: row.ownership_id, client_id: HOSTED_CLIENT };
-  expect(notified()).toMatchObject([{ actor: B, target: row.session_id, detail }]);
-  expect(audits("hosted.alias_lost_seen")).toMatchObject([{ actor: B, target: row.session_id, detail }]);
+  expect(await notified()).toMatchObject([{ actor: B, target: row.session_id, detail }]);
+  expect(await audits("hosted.alias_lost_seen")).toMatchObject([{ actor: B, target: row.session_id, detail }]);
 });
 
 test("a delivery_open takes only the losses a Controller's whoami reported", async () => {
@@ -79,7 +80,7 @@ test("a delivery_open takes only the losses a Controller's whoami reported", asy
 
   // No whoami reported it: the Controller hasn't applied it, so the open leaves it pending.
   await b.subscriber.call("delivery_open");
-  expect(audits("hosted.alias_lost_seen")).toEqual([]);
+  expect(await audits("hosted.alias_lost_seen")).toEqual([]);
   expect(await b.subscriber.call("whoami")).toMatchObject({ alias_lost: LOST });
 });
 
@@ -90,7 +91,7 @@ test("a lost hold bound again is no longer lost: neither reader is told it", asy
   expect((await srv.api(alice, "POST", "/api/teams/eng/add", { email: B })).status).toBe(200);
 
   await b.bind("eng/build");
-  expect(pending()).toBe(0);
+  expect(await pending()).toBe(0);
   expect(await b.subscriber.call("whoami")).not.toHaveProperty("alias_lost");
   expect(texts(await b.callRaw("whoami"))).toHaveLength(1);
 });
@@ -108,12 +109,12 @@ test("the next tool result carries the notice once, naming the new primary when 
   expect(texts(who)).toHaveLength(1);
   expect(json(who)).toMatchObject({ held: [`${B}/fe`], primary: `${B}/fe` });
   expect(json(who)).not.toHaveProperty("alias_lost");
-  expect(notified()).toHaveLength(1);
+  expect(await notified()).toHaveLength(1);
 
   // The agent's call beat the Controller's reopen; the Controller still learns the shrunken set was a loss.
   expect(await b.subscriber.call("whoami")).toMatchObject({ held: [`${B}/fe`], alias_lost: LOST });
   await b.subscriber.call("delivery_open");
-  expect(pending()).toBe(0);
+  expect(await pending()).toBe(0);
 });
 
 test("a root that lost its only hold is told on its next call, though the write is refused as unbound", async () => {
@@ -127,12 +128,12 @@ test("a root that lost its only hold is told on its next call, though the write 
   expect(texts(who)).toHaveLength(1);
   expect(json(who)).toMatchObject({ held: [], primary: null, unbound: true });
   expect(json(who)).not.toHaveProperty("alias_lost");
-  expect(notified()).toHaveLength(1);
+  expect(await notified()).toHaveLength(1);
   expect(await b.subscriber.call("whoami")).toMatchObject({ held: [], unbound: true, alias_lost: LOST });
   // An unbound root opens no delivery, so the Controller keeps being reported it until a bind and an open.
-  expect(pending()).toBe(1);
+  expect(await pending()).toBe(1);
   await b.bind("fe");
-  expect(pending()).toBe(0);
+  expect(await pending()).toBe(0);
 });
 
 test("a root that lost a hold can't send or post as it; its other name still writes (#408)", async () => {
@@ -146,10 +147,11 @@ test("a root that lost a hold can't send or post as it; its other name still wri
     expect(refused.isError).toBe(true);
     expect(texts(refused)[0]).toContain(`"eng/build" isn't one of this session's addresses`);
   }
-  expect(srv.app.db.query("SELECT count(*) AS n FROM messages WHERE body = 'as lost'").get()).toEqual({ n: 0 });
-  expect(srv.app.db.query("SELECT count(*) AS n FROM posts WHERE body = 'as lost'").get()).toEqual({ n: 0 });
+  await drained(srv);
+  expect(await sqlRow(srv, "SELECT count(*) AS n FROM messages WHERE body = 'as lost'")).toEqual({ n: 0 });
+  expect(await sqlRow(srv, "SELECT count(*) AS n FROM posts WHERE body = 'as lost'")).toEqual({ n: 0 });
   await b.call("dm_send", { to: `${A}/be`, body: "as fe" });
-  expect(srv.app.db.query("SELECT sender FROM messages WHERE body = 'as fe'").all()).toEqual([{ sender: `${B}/fe` }]);
+  expect(await rows(srv, "SELECT sender FROM messages WHERE body = 'as fe'")).toEqual([{ sender: `${B}/fe` }]);
   await a.close();
 });
 
@@ -165,7 +167,7 @@ test("a child's whoami and tool results neither carry nor take its root's notice
   expect(json(who)).toMatchObject({ held: [`${B}/fe`], child: true });
   expect(json(who)).not.toHaveProperty("alias_lost");
   expect(texts(await child.callRaw("board_list"))).toHaveLength(1);
-  expect(notified()).toEqual([]);
+  expect(await notified()).toEqual([]);
 
   expect(texts(await b.callRaw("board_list")).slice(1)).toEqual([lostNotice(`It still sends as "fe".`)]);
 });
@@ -180,23 +182,24 @@ test("a hold lost again before both readers took it is restated: the new reason,
 
   // A second loss of the same alias (lose's ON CONFLICT path) replaces the row and clears both readers' marks.
   const again = "eng/build was revoked again";
-  await seed(srv.app.repo, tx => srv.app.repo.hosted.lose(tx, rootId(b), { alias: "eng/build", reason: again, primary: false }, Date.now()));
-  expect(pending()).toBe(1);
+  const root = await rootId(b);
+  await seed(srv.app.repo, tx => srv.app.repo.hosted.lose(tx, root, { alias: "eng/build", reason: again, primary: false }, Date.now()));
+  expect(await pending()).toBe(1);
   // The open now takes nothing: the restated row's report was cleared, so the Controller must see it again first.
   await b.subscriber.call("delivery_open");
-  expect(pending()).toBe(1);
+  expect(await pending()).toBe(1);
   expect(texts(await b.callRaw("whoami")).slice(1)).toEqual([`This session lost its bus name "eng/build": ${again}. It still sends as "fe".`]);
   expect(await b.subscriber.call("whoami")).toMatchObject({ alias_lost: [{ alias: "eng/build", reason: again }] });
   await b.subscriber.call("delivery_open");
-  expect(pending()).toBe(0);
+  expect(await pending()).toBe(0);
 });
 
 test("an ownership's end deletes its unread losses (the hosted_sessions cascade)", async () => {
   const b = await srv.hosted(B, "fe");
   await b.bind("eng/build");
   await revoke();
-  expect(pending()).toBe(1);
+  expect(await pending()).toBe(1);
 
   await b.end();
-  expect(pending()).toBe(0);
+  expect(await pending()).toBe(0);
 });

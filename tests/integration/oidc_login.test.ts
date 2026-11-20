@@ -11,6 +11,7 @@ import type { IdentityProvider } from "../../src/server/idp.ts";
 import { oidcProvider } from "../../src/server/idp_oidc.ts";
 import { REFUSED } from "../../src/server/oauth.ts";
 import { accessAudits } from "../support/audit.ts";
+import { drained, row } from "../support/repo_sql.ts";
 import { startFakeOidc, type FakeOidc } from "../support/fake_oidc.ts";
 import { HostedSession } from "../support/hosted_session.ts";
 import { chooserLinks, hostedServer, upstreamLeg, type HostedServer } from "../support/hosted_oauth.ts";
@@ -81,7 +82,7 @@ async function token(s: HostedServer, browser: Browser, callback: Response, a: A
   return ((await res.json()) as { access_token: string }).access_token;
 }
 
-const browsers = (s: HostedServer) => (s.app.db.query("SELECT COUNT(*) AS n FROM oauth_browsers").get() as { n: number }).n;
+const browsers = async (s: HostedServer) => { await drained(s); return (await row<{ n: number }>(s, "SELECT COUNT(*) AS n FROM oauth_browsers"))!.n; };
 
 test("Okta alone: authorize goes straight to the IdP, the real OIDC provider signs the user in, and the token makes a hosted MCP call", async () => {
   const { fake, srv } = await start(f => [okta(f)]);
@@ -94,7 +95,7 @@ test("Okta alone: authorize goes straight to the IdP, the real OIDC provider sig
   sessions.push(session);
   expect(JSON.stringify((await session.connect()).whoami)).toContain(EMAIL);
   expect((await srv.app.repo.users.findByEmail(srv.app.repo.read, EMAIL))).toMatchObject({ idp_issuer: fake.issuer, idp_subject: "okta-you" });
-  expect(accessAudits(srv.app.db, "oauth.upstream_authenticated").map(r => [r.actor, r.detail])).toEqual([[EMAIL, { client_id: CLIENT, provider: "okta" }]]);
+  expect((await accessAudits(srv, "oauth.upstream_authenticated")).map(r => [r.actor, r.detail])).toEqual([[EMAIL, { client_id: CLIENT, provider: "okta" }]]);
 });
 
 test("two providers: the chooser lists each in config order, each link reaches its IdP, and choosing again replaces the upstream state", async () => {
@@ -154,7 +155,7 @@ test("a code on another provider's callback path is refused before any token req
   expect((await other.request(`${srv.issuer}/oauth/okta/callback?` + new URLSearchParams({ code: "upstream-code", state: atGoogle.searchParams.get("state")! }))).status).toBe(400);
   expect((await other.request(`${srv.issuer}/oauth/google/callback?` + new URLSearchParams({ code: "upstream-code", state: atGoogle.searchParams.get("state")! }))).status).toBe(400);
   expect([googleExchanges, fake.hits.token]).toEqual([0, 0]);
-  expect(browsers(srv)).toBe(0);
+  expect(await browsers(srv)).toBe(0);
 });
 
 test("an Okta refusal is audited under oauth.upstream_* with the provider, and its failure log keeps the stage's class", async () => {
@@ -164,7 +165,7 @@ test("an Okta refusal is audited under oauth.upstream_* with the provider, and i
   const atOkta = new URL((await browser.request(a.url)).headers.get("Location")!);
   const declined = await browser.request(`${srv.issuer}/oauth/okta/callback?` + new URLSearchParams({ error: "access_denied", state: atOkta.searchParams.get("state")! }));
   expect(outcome(declined, srv.issuer, a)).toBe("");
-  expect(accessAudits(srv.app.db, "oauth.upstream_denied").map(r => r.detail)).toEqual([{ client_id: CLIENT, provider: "okta" }]);
+  expect((await accessAudits(srv, "oauth.upstream_denied")).map(r => r.detail)).toEqual([{ client_id: CLIENT, provider: "okta" }]);
 
   // An ID token from another issuer: the provider's OidcIdentityError reaches the log by class only.
   const log = spyOn(console, "error").mockImplementation(() => {});
@@ -173,14 +174,14 @@ test("an Okta refusal is audited under oauth.upstream_* with the provider, and i
     expect((await signIn(srv)).result).toBe(REFUSED.provider);
     expect(log.mock.calls.flat()).toContain('[grayboard] {"operation":"oauth.exchange","category":"failure","level":"error","class":"OidcIdentityError"}');
   } finally { log.mockRestore(); }
-  expect(accessAudits(srv.app.db, "oauth.upstream_failed").map(r => r.detail)).toEqual([{ client_id: CLIENT, provider: "okta" }]);
+  expect((await accessAudits(srv, "oauth.upstream_failed")).map(r => r.detail)).toEqual([{ client_id: CLIENT, provider: "okta" }]);
 
   // An email outside the allowed domains keeps DomainRefused's handling: oauth.domain_refused, no failure row.
   fake.userinfo({ email: "you@other.example.org" });
   expect((await signIn(srv)).result).toBe(REFUSED.domain);
-  expect(accessAudits(srv.app.db, "oauth.domain_refused").map(r => r.detail)).toEqual([{ client_id: CLIENT, provider: "okta" }]);
-  expect(accessAudits(srv.app.db, "oauth.upstream_failed")).toHaveLength(1);
-  expect(browsers(srv)).toBe(0);
+  expect((await accessAudits(srv, "oauth.domain_refused")).map(r => r.detail)).toEqual([{ client_id: CLIENT, provider: "okta" }]);
+  expect(await accessAudits(srv, "oauth.upstream_failed")).toHaveLength(1);
+  expect(await browsers(srv)).toBe(0);
 });
 
 test("an IdP whose discovery fails sends the client temporarily_unavailable, not a 500, and logs the stage's class", async () => {
@@ -196,7 +197,7 @@ test("an IdP whose discovery fails sends the client temporarily_unavailable, not
     expect([to.origin + to.pathname, to.searchParams.get("error"), to.searchParams.get("state"), to.searchParams.get("iss")]).toEqual([a.redirectUri, "temporarily_unavailable", a.state, srv.issuer]);
     expect(log.mock.calls.flat()).toContain('[grayboard] {"operation":"oauth.upstream","category":"failure","level":"error","class":"OidcDiscoveryError"}');
   } finally { log.mockRestore(); }
-  expect(accessAudits(srv.app.db, "oauth.upstream_failed").map(r => r.detail)).toEqual([{ client_id: CLIENT, provider: "okta" }]);
+  expect((await accessAudits(srv, "oauth.upstream_failed")).map(r => r.detail)).toEqual([{ client_id: CLIENT, provider: "okta" }]);
 });
 
 test("with two providers, a browser that already signed in skips the chooser and goes to consent", async () => {
@@ -215,18 +216,18 @@ for (const [first, second] of [["google", "okta"], ["okta", "google"]] as const)
     const issuer = (idp: "google" | "okta") => idp === "okta" ? fake.issuer : "https://accounts.google.com";
     const label = { google: "Google", okta: "Okta" };
     expect((await signIn(srv, first)).result).toBe("consent");
-    expect(browsers(srv)).toBe(1);
+    expect(await browsers(srv)).toBe(1);
     expect((await signIn(srv, second)).result).toBe(`${EMAIL} is linked to a ${label[first]} account, not ${label[second]}. If this ${label[second]} account should have it, an admin runs grayboard admin unlink-idp --email ${EMAIL}`);
-    expect(browsers(srv)).toBe(1);
-    expect(accessAudits(srv.app.db, "auth.subject_refused").map(r => [r.actor, r.detail])).toEqual([
+    expect(await browsers(srv)).toBe(1);
+    expect((await accessAudits(srv, "auth.subject_refused")).map(r => [r.actor, r.detail])).toEqual([
       [EMAIL, { reason: "issuer_mismatch", holding_issuer: issuer(first), provider: second, issuer: issuer(second), client_id: CLIENT }],
     ]);
-    expect(accessAudits(srv.app.db, "oauth.upstream_authenticated").map(r => r.detail)).toEqual([{ client_id: CLIENT, provider: first }]);
+    expect((await accessAudits(srv, "oauth.upstream_authenticated")).map(r => r.detail)).toEqual([{ client_id: CLIENT, provider: first }]);
 
     const root = await srv.login("root@example.com");
     expect((await srv.api(root, "POST", "/api/admin/unlink-idp", { email: EMAIL })).status).toBe(200);
     expect((await signIn(srv, second)).result).toBe("consent");
     expect((await srv.app.repo.users.findByEmail(srv.app.repo.read, EMAIL))).toMatchObject({ idp_issuer: issuer(second), idp_subject: `${second}-you` });
-    expect(browsers(srv)).toBe(2);
+    expect(await browsers(srv)).toBe(2);
   });
 }

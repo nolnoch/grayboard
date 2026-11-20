@@ -7,6 +7,7 @@
 // user's items are never marked.
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { TestServer } from "../support/server.ts";
+import { txSpy } from "../support/repo_sql.ts";
 
 const A = "alice@example.com";
 const B = "bob@example.com";
@@ -100,9 +101,10 @@ test("board_read marks another user's post, follows the grant, and leaves the re
 test("dm_history's delegation lookup for another user's DMs reads on its body's Tx (#807 P1c-14b)", async () => {
   const repo = srv.app.repo;
   const checks: string[] = [];
+  const tx = txSpy(srv);
   const original = repo.messages.delegationIds.bind(repo.messages);
   const spy = spyOn(repo.messages, "delegationIds").mockImplementation((r, ids) => {
-    checks.push(`${r === repo.read ? "pool" : "tx"}:${srv.app.db.inTransaction}`);
+    checks.push(`${r === repo.read ? "pool" : "tx"}:${tx.open}`);
     return original(r, ids);
   });
   try {
@@ -110,7 +112,7 @@ test("dm_history's delegation lookup for another user's DMs reads on its body's 
     const bfe = await srv.hosted(B, "fe");
     await bfe.call("dm_send", { to: `${A}/be`, body: "from bob" });
     expect(marks(await abe.call<Marked[]>("dm_history", {}), "from bob")).toEqual(OTHER);
-  } finally { spy.mockRestore(); }
+  } finally { spy.mockRestore(); tx.restore(); }
   expect(checks).toContain("tx:true");
   expect(checks.filter((c) => c !== "tx:true")).toEqual([]);
 });

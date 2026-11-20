@@ -8,6 +8,7 @@ import { GRAYBOARD_DELIVERY_META, GRAYBOARD_EFFORT_META, GRAYBOARD_LAUNCHER_META
 import { issueOAuth } from "../helpers/oauth.ts";
 import { DEFAULT_MCP_LIMITS } from "../../src/server/config.ts";
 import { TestServer } from "../support/server.ts";
+import { rows } from "../support/repo_sql.ts";
 import { until } from "../support/until.ts";
 
 const CLIENT = "grayboard-pi";
@@ -81,12 +82,12 @@ test("a root's later subscriber request declares the launcher its native first r
   wires.push(native);
   await native.connect();
   await native.callTool("bind", { name: "lead", create: true }, "raw-root");
-  const launcher = () => (srv.app.db.query("SELECT launcher FROM ids WHERE principal = ? AND ended_at IS NULL").all("alice@example.com") as { launcher: number }[]).map(r => r.launcher);
-  expect(launcher()).toEqual([0]);
+  const launcher = async () => (await rows<{ launcher: number }>(srv, "SELECT launcher FROM ids WHERE principal = ? AND ended_at IS NULL", "alice@example.com")).map(r => r.launcher);
+  expect(await launcher()).toEqual([0]);
   const wire = subscriber(token, { ...options(), launcher: true });
   await wire.connect();
   await wire.call("whoami");
-  expect(launcher()).toEqual([1]);
+  expect(await launcher()).toEqual([1]);
 });
 
 // The facts provider is read per request for the session the request names (#364): the native wire, shared across

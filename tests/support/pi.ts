@@ -19,6 +19,8 @@ import { attachRoots } from "../../src/shared/attachments.ts";
 import { sha256Hex } from "../../src/shared/hash.ts";
 import { issueOAuth } from "../helpers/oauth.ts";
 import { seed } from "./seed.ts";
+import { row, rows } from "./repo_sql.ts";
+import { accessAudits } from "./audit.ts";
 import { cleanEnv, localEnv } from "./env.ts";
 import { onChannelDm, messageText, promptText, startFakeModel, type ChatRequest, type Reply, type Rule } from "./fake_model.ts";
 import { browse, seedGrant, type HostedServer } from "./hosted_oauth.ts";
@@ -1282,21 +1284,27 @@ export async function statusOf(pi: Pi): Promise<string> {
   return until(() => pi.notices().slice(before).find((n) => n.startsWith("grayboard: server: ")), 5_000, "/grayboard status");
 }
 
-// The hosted session `client` keeps for the harness session `raw`.
-export const hostedRow = (srv: HostedServer, client: string, raw: string): HostedRow | undefined => srv.app.db.query<HostedRow, [string, string]>(
-  "SELECT (SELECT substr(address, instr(address, '/') + 1) FROM alias_holds WHERE id = session_id ORDER BY bound_at, address LIMIT 1) AS name, lease_deadline, ownership_id FROM hosted_sessions WHERE client_id = ? AND source_session_id = ?").get(client, raw) ?? undefined;
+// The hosted session `client` keeps for the harness session `raw`, on either backend (#807 P3 C11d): `name` is the
+// first alias it holds, less its user's prefix.
+export const hostedRow = async (srv: HostedServer, client: string, raw: string): Promise<HostedRow | undefined> => {
+  const r = await row<HostedRow & { address: string | null }>(srv,
+    "SELECT (SELECT address FROM alias_holds WHERE id = session_id ORDER BY bound_at, address LIMIT 1) AS address, lease_deadline, ownership_id FROM hosted_sessions WHERE client_id = ? AND source_session_id = ?", client, raw);
+  if (!r) return undefined;
+  const { address, ...rest } = r;
+  return { ...rest, name: address === null ? null : address.slice(address.indexOf("/") + 1) };
+};
 // `raw`'s hosted session holds `name` and the server's one delivery lease.
-export const leased = (srv: HostedServer, client: string, raw: string, name: string): boolean => {
-  const row = hostedRow(srv, client, raw);
-  return row?.name === name && row.lease_deadline !== null && srv.app.mcp.activeLeases === 1;
+export const leased = async (srv: HostedServer, client: string, raw: string, name: string): Promise<boolean> => {
+  const r = await hostedRow(srv, client, raw);
+  return r?.name === name && r.lease_deadline !== null && srv.app.mcp.activeLeases === 1;
 };
 // The model and effort the server holds for `raw`'s hosted session (#364).
-export const factsOf = (srv: HostedServer, client: string, raw: string) => srv.app.db.query<{ model: string | null; effort: string | null }, [string, string]>(
-  "SELECT model, effort FROM ids WHERE id = (SELECT session_id FROM hosted_sessions WHERE client_id = ? AND source_session_id = ?)").get(client, raw) ?? undefined;
+export const factsOf = async (srv: HostedServer, client: string, raw: string) => (await row<{ model: string | null; effort: string | null }>(srv,
+  "SELECT model, effort FROM ids WHERE id = (SELECT session_id FROM hosted_sessions WHERE client_id = ? AND source_session_id = ?)", client, raw)) ?? undefined;
 const piRow = (srv: HostedServer, raw: string) => hostedRow(srv, PI_CLIENT, raw);
 const leasedAs = (srv: HostedServer, raw: string, name: string) => leased(srv, PI_CLIENT, raw, name);
-export const ownershipEnded = (srv: HostedServer, id: number): boolean =>
-  srv.app.db.query<{ ended_at: number | null }, [number]>("SELECT ended_at FROM hosted_ownerships WHERE id = ?").get(id)?.ended_at != null;
+export const ownershipEnded = async (srv: HostedServer, id: number): Promise<boolean> =>
+  (await row<{ ended_at: number | null }>(srv, "SELECT ended_at FROM hosted_ownerships WHERE id = ?", id))?.ended_at != null;
 
 // pi in the shared hosted scenarios (tests/support/hosted_harness.ts).
 const PI_HARNESS: HostedHarness = {
@@ -1349,7 +1357,7 @@ export const answerPeer = (prefix: string): Rule => onChannelDm(PEER, (id, text)
 // identical dm_send within 10 minutes returns the first message instead.
 export async function pingPong(srv: HostedServer, peer: Peer, name: string): Promise<number> {
   const { message_id: id } = await peer.call("dm_send", { to: `alice@example.com/${name}`, body: `ping ${name}`, resend: true });
-  const reply = await until(() => srv.app.db.query<{ sender: string }, [number]>("SELECT sender FROM messages WHERE parent_id = ? AND body = 'pong'").get(id), 30_000, `pong to DM ${id}`);
+  const reply = await until(() => row<{ sender: string }>(srv, "SELECT sender FROM messages WHERE parent_id = ? AND body = 'pong'", id), 30_000, `pong to DM ${id}`);
   expect(reply.sender).toBe(`alice@example.com/${name}`);
   return id;
 }
@@ -1451,7 +1459,7 @@ export function piHostedLoadSmoke(dir: string): Promise<void> {
     expect(pi.events.filter((e) => e.type === "extension_error")).toEqual([]);
     expect(pi.notices()).not.toContain(LOGIN_NOTICE);
     expect(existsSync(deliveryPath(stateDirOf(dir), srv.resource, PI_CLIENT, sessionId))).toBe(true);
-    expect(piRow(srv, sessionId)?.name).toBeNull();
+    expect((await piRow(srv, sessionId))?.name).toBeNull();
     expect(grayboardDescendants(pi.pid)).toEqual([]);
     await pi.quit();
     await until(() => srv.app.mcp.activeLeases === 0, 10_000, "nothing leased after quit");
@@ -1498,7 +1506,7 @@ export function piHostedScenario(dir: string): Promise<void> {
     await until(() => leasedAs(srv, sessionId, "pi-task"), 15_000, "pi-task holds the lease");
     // Its requests report pi's model and thinking level (#364).
     const { thinkingLevel } = await pi.command({ type: "get_state" });
-    expect(factsOf(srv, PI_CLIENT, sessionId)).toEqual({ model: "fake/fake-1", effort: thinkingLevel });
+    expect(await factsOf(srv, PI_CLIENT, sessionId)).toEqual({ model: "fake/fake-1", effort: thinkingLevel });
     const first = model.requests[0]!.body;
     expect(requestTools(first).filter((n) => n.startsWith("mcp__grayboard__")).sort()).toEqual(GRAYBOARD_TOOLS);
     expect(systemText(first)).toContain("no bus name yet");
@@ -1515,12 +1523,12 @@ export function piHostedScenario(dir: string): Promise<void> {
     expect(messageText(woken.messages.at(-1)!)).toStartWith(`<channel source="grayboard" message_id="${ping}" from="${PEER}"`);
     expect(systemText(woken)).toContain("pi-task");
     expect((await pi.messages()).filter((m) => JSON.stringify(m).includes(`message_id=\\"${ping}\\"`))).toHaveLength(1);
-    expect(srv.app.db.query<{ n: number }, [number]>("SELECT count(*) AS n FROM messages WHERE parent_id = ?").get(ping)!.n).toBe(1);
+    expect((await row<{ n: number }>(srv, "SELECT count(*) AS n FROM messages WHERE parent_id = ?", ping))!.n).toBe(1);
 
     // dm_send with a local file uploads it with the message; the peer gets it intact.
     await pi.command({ type: "prompt", message: "send report" });
-    const sent = await until(() => srv.app.db.query<{ id: number }, []>("SELECT id FROM messages WHERE body = 'report attached' AND sender = 'alice@example.com/pi-task'").get(), 30_000, "the report DM");
-    const files = srv.app.db.query<{ id: number; filename: string; sha256: string }, [number]>("SELECT id, filename, sha256 FROM attachments WHERE message_id = ?").all(sent.id);
+    const sent = await until(() => row<{ id: number }>(srv, "SELECT id FROM messages WHERE body = 'report attached' AND sender = 'alice@example.com/pi-task'"), 30_000, "the report DM");
+    const files = await rows<{ id: number; filename: string; sha256: string }>(srv, "SELECT id, filename, sha256 FROM attachments WHERE message_id = ?", sent.id);
     expect(files).toEqual([{ id: expect.any(Number), filename: "report.txt", sha256: sha256Hex(new TextEncoder().encode(report)) }]);
     expect(readFileSync((await peer.call("attachment_get", { id: files[0]!.id })).path, "utf8")).toBe(report);
     await idle(pi);
@@ -1529,7 +1537,7 @@ export function piHostedScenario(dir: string): Promise<void> {
     // under GRAYBOARD_ATTACHMENTS_DIR, this bus's folder.
     writeFileSync(join(peer.dir, "notes.txt"), notes);
     const withFile = (await peer.call("dm_send", { to: "alice@example.com/pi-task", body: "notes attached", attachments: [join(peer.dir, "notes.txt")] })).message_id;
-    const fileId = srv.app.db.query<{ id: number }, [number]>("SELECT id FROM attachments WHERE message_id = ?").get(withFile)!.id;
+    const fileId = (await row<{ id: number }>(srv, "SELECT id FROM attachments WHERE message_id = ?", withFile))!.id;
     const saved = await toolResult(pi, "attachment_get");
     expect(saved.isError).toBeFalsy();
     const got = JSON.parse(resultText(saved)) as { path: string };
@@ -1540,7 +1548,7 @@ export function piHostedScenario(dir: string): Promise<void> {
 
     // Quitting releases the lease and ends the session.
     await pi.quit();
-    await until(() => srv.app.mcp.activeLeases === 0 && !piRow(srv, sessionId), 10_000, "released on quit");
+    await until(async () => srv.app.mcp.activeLeases === 0 && !(await piRow(srv, sessionId)), 10_000, "released on quit");
   });
 }
 
@@ -1569,8 +1577,8 @@ export function piHostedTwiceScenario(dir: string): Promise<void> {
     const b = start({ persist: true, session: state.sessionFile });
     expect((await b.command({ type: "get_state" })).sessionId).toBe(state.sessionId);
     expect(await statusOf(b)).toContain(`\ndelivery: ${HELD}`);
-    const opened = () => srv.app.db.query<{ n: number }, []>("SELECT count(*) AS n FROM access_log WHERE action = 'hosted.lease_opened'").get()!.n;
-    expect(opened()).toBe(1);
+    const opened = async () => (await accessAudits(srv, "hosted.lease_opened")).length;
+    expect(await opened()).toBe(1);
     expect(srv.app.mcp.activeLeases).toBe(1);
     await b.command({ type: "prompt", message: "check" });
     const checked = await toolResult(b, "whoami");
@@ -1578,15 +1586,15 @@ export function piHostedTwiceScenario(dir: string): Promise<void> {
     expect(resultText(checked)).toStartWith(`grayboard: ${HELD}\n`);
     expect(resultText(checked)).toMatch(/"primary":\s*"[^"]*\/pi-twice"/);
     await idle(b);
-    expect(opened()).toBe(1);
-    expect(leasedAs(srv, state.sessionId, "pi-twice")).toBe(true);
+    expect(await opened()).toBe(1);
+    expect(await leasedAs(srv, state.sessionId, "pi-twice")).toBe(true);
 
     // a quits, releasing its ownership; b takes delivery and rebinds the name
     // under a new one.
-    const held = piRow(srv, state.sessionId)!.ownership_id;
+    const held = (await piRow(srv, state.sessionId))!.ownership_id;
     await a.quit();
-    await until(() => leasedAs(srv, state.sessionId, "pi-twice") && piRow(srv, state.sessionId)!.ownership_id !== held, 20_000, "b leased as pi-twice");
-    expect(ownershipEnded(srv, held)).toBe(true);
+    await until(async () => await leasedAs(srv, state.sessionId, "pi-twice") && (await piRow(srv, state.sessionId))!.ownership_id !== held, 20_000, "b leased as pi-twice");
+    expect(await ownershipEnded(srv, held)).toBe(true);
     expect(await statusOf(b)).not.toContain(HELD);
     await pingPong(srv, peer, "pi-twice");
     await idle(b);

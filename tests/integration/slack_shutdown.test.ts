@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import { FakeSlack } from "./fake_slack.ts";
 import { TestServer } from "../support/server.ts";
 import { until } from "../support/until.ts";
+import { drained, rows } from "../support/repo_sql.ts";
 import { SlackBridge } from "../../src/server/slack.ts";
 function deferred<T = void>() { let resolve!: (v: T) => void; const promise = new Promise<T>(r => { resolve = r; }); return { promise, resolve }; }
 
@@ -45,8 +46,9 @@ for (const mode of ["stop", "receipt-failure", "stop-during-receipt"]) test(`hos
     srv.app.slack!.stop();
     expect(linked.session.active).toBe(false);
     srv.app.application.receiptDirect = receipt;
-    const before = srv.app.db.prepare("SELECT * FROM slack_progress").all();
-    const mapped = srv.app.db.prepare("SELECT * FROM slack_threads").all();
+    await drained(srv);
+    const before = await rows(srv, "SELECT * FROM slack_progress");
+    const mapped = await rows(srv, "SELECT * FROM slack_threads");
     expect(mapped).toHaveLength(1);
     restarted = new SlackBridge({ repo: srv.app.repo, application: srv.app.application, appToken: "xapp-1-test", botToken: "xoxb-test", apiUrl: slack.api });
     await restarted.start();
@@ -56,7 +58,8 @@ for (const mode of ["stop", "receipt-failure", "stop-during-receipt"]) test(`hos
     expect(q.delivered_now).toBe(true);
     expect(posts).toHaveLength(1);
     expect(before).toHaveLength(1);
-    expect(srv.app.db.prepare("SELECT * FROM slack_progress").all()).toHaveLength(0);
+    await drained(srv);
+    expect(await rows(srv, "SELECT * FROM slack_progress")).toHaveLength(0);
     expect(next.session.active).toBe(true);
     expect(next.relay.store.pending()).toHaveLength(0);
   } finally {

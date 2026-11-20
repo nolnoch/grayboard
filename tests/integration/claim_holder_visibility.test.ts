@@ -6,6 +6,7 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { HostedToolError } from "../support/hosted_session.ts";
 import { TestServer } from "../support/server.ts";
+import { drained, rows } from "../support/repo_sql.ts";
 
 const A = "alice@example.com";
 const B = "bob@example.com";
@@ -102,7 +103,8 @@ test("on a queue board, a non-member's @mention of a team alias still routes to 
   const cqa = await srv.hosted(C, "qa");
   const outcome = async (name: string) => {
     const { post_id: id, ...r } = await cqa.call<{ post_id: number }>("board_post", { board: "work", body: `@${name} go` });
-    const queued = srv.app.db.prepare("SELECT holder FROM claims WHERE key = ?").all(`queue:work:${id}`);
+    await drained(srv);
+    const queued = await rows(srv, "SELECT holder FROM claims WHERE key = ?", `queue:work:${id}`);
     return JSON.stringify({ r, queued }).replaceAll(name, "NAME");
   };
   const real = await outcome("eng/build");

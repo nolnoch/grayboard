@@ -37,6 +37,8 @@ import { describeLocation } from "../../src/shared/identity.ts";
 import { issueOAuth } from "../helpers/oauth.ts";
 import { browse, hostedServer, seedGrant, storeLogin, type HostedServer } from "../support/hosted_oauth.ts";
 import { seed } from "../support/seed.ts";
+import { accessAudits } from "../support/audit.ts";
+import { row as sqlRow } from "../support/repo_sql.ts";
 import { until } from "../support/until.ts";
 
 const CLIENT = "grayboard-pi";
@@ -130,8 +132,14 @@ const payload = (result: CallToolResult) => result.structuredContent ?? JSON.par
 
 type Row = { name: string | null; root_session_id: string | null; ownership_id: number; lease_deadline: number | null };
 const hostedId = (raw: string) => hostedSessionId(user, CLIENT, raw);
-const row = (raw: string) => srv.app.db.query<Row, [string]>(
-  "SELECT (SELECT substr(address, instr(address, '/') + 1) FROM alias_holds WHERE id = session_id ORDER BY bound_at, address LIMIT 1) AS name, root_session_id, ownership_id, lease_deadline FROM hosted_sessions WHERE session_id = ?").get(hostedId(raw));
+// `name` is the session's first alias, less its user's prefix (sliced here: no instr on Postgres).
+const row = async (raw: string): Promise<Row | null> => {
+  const r = await sqlRow<Omit<Row, "name"> & { address: string | null }>(srv,
+    "SELECT (SELECT address FROM alias_holds WHERE id = session_id ORDER BY bound_at, address LIMIT 1) AS address, root_session_id, ownership_id, lease_deadline FROM hosted_sessions WHERE session_id = ?", hostedId(raw));
+  if (!r) return null;
+  const { address, ...rest } = r;
+  return { name: address === null ? null : address.slice(address.indexOf("/") + 1), ...rest };
+};
 
 // The root's line in /grayboard status says it is subscribed under `name`.
 const active = (i: Instance, id: string, name: string, ms = 5_000) =>
@@ -191,9 +199,9 @@ test("a root binds through its bind tool; a DM arrives once as a waking <channel
   const bound = await alpha.call("bind", { name: "alpha", create: true });
   expect(bound.isError).toBeUndefined();
   expect(texts(bound)[0]).toStartWith(`Bound to "alpha"`);
-  expect(row("root-alpha")).toMatchObject({ name: "alpha", root_session_id: null });
+  expect(await row("root-alpha")).toMatchObject({ name: "alpha", root_session_id: null });
   await active(alpha, "root-alpha", "alpha");
-  expect(row("root-alpha")!.lease_deadline).not.toBeNull();
+  expect((await row("root-alpha"))!.lease_deadline).not.toBeNull();
 
   const beta = await root("root-beta", "beta");
   const sent = await beta.call("dm_send", { to: "alpha", body: "hello from beta" });
@@ -246,7 +254,7 @@ test("a root's model and effort show in peer_list and follow a switch; its child
   const child = instance({ child: true, root: "facts-root" }, undefined, () => ({ model: "anthropic/claude-haiku-5-5" }));
   await child.ext.start({ id: "facts-child", reason: "startup" });
   await child.call("whoami");
-  expect(srv.app.db.query<{ model: string | null }, [string]>("SELECT model FROM ids WHERE id = ?").get(hostedId("facts-child"))?.model).toBe("anthropic/claude-haiku-5-5");
+  expect((await sqlRow<{ model: string | null }>(srv, "SELECT model FROM ids WHERE id = ?", hostedId("facts-child")))?.model).toBe("anthropic/claude-haiku-5-5");
   expect(await peers(lead)).toContainEqual(expect.objectContaining({ handle: `${EMAIL}/lead`, model: "openai/gpt-6" }));
   expect([...asked]).toEqual(["facts-root"]);
   broken = true;
@@ -265,7 +273,7 @@ test("an explicit BUS_IDENTITY binds at a new root's start (#443), created if ne
     const i = instance();
     await i.ext.start({ id: "conf-root", reason: "startup" });
     await active(i, "conf-root", "pi-conf");
-    expect(row("conf-root")).toMatchObject({ name: "pi-conf" });
+    expect(await row("conf-root")).toMatchObject({ name: "pi-conf" });
     expect(i.notices.filter(n => n.level !== "info")).toEqual([]);
   } finally {
     if (saved === undefined) delete process.env.BUS_IDENTITY; else process.env.BUS_IDENTITY = saved;
@@ -279,8 +287,8 @@ test("a BUS_IDENTITY the naming rule refuses is said, and the extension still lo
     const i = instance();
     await i.ext.start({ id: "conf-bad-root", reason: "startup" });
     expect(i.notices).toContainEqual(expect.objectContaining({ level: "warning", message: expect.stringContaining('BUS_IDENTITY is ignored: invalid identity name "no spaces"') }));
-    await until(() => row("conf-bad-root") !== undefined, 10_000, "the root's session row");
-    expect(row("conf-bad-root")?.name ?? null).toBeNull();
+    await until(async () => (await row("conf-bad-root")) !== null, 10_000, "the root's session row");
+    expect((await row("conf-bad-root"))?.name ?? null).toBeNull();
   } finally {
     if (saved === undefined) delete process.env.BUS_IDENTITY; else process.env.BUS_IDENTITY = saved;
   }
@@ -291,13 +299,13 @@ test("/new carries the outgoing root's name, bound with this checkout as its pla
   const first = await root("carry-1", "carrier");
   await first.ext.shutdown("new");
   // The outgoing session released its ownership.
-  expect(row("carry-1")).toBeNull();
+  expect(await row("carry-1")).toBeNull();
 
   const second = instance();
   await second.ext.start({ id: "carry-2", reason: "new" });
-  expect(row("carry-2")).toMatchObject({ name: "carrier", root_session_id: null });
+  expect(await row("carry-2")).toMatchObject({ name: "carrier", root_session_id: null });
   // The Controller's bind says where, as server mode's `grayboard mcp` did.
-  expect(srv.app.db.query<{ place: string | null }, [string]>("SELECT place FROM hosted_sessions WHERE session_id = ?").get(hostedId("carry-2"))).toEqual({ place: describeLocation(process.cwd()) });
+  expect(await sqlRow<{ place: string | null }>(srv, "SELECT place FROM hosted_sessions WHERE session_id = ?", hostedId("carry-2"))).toEqual({ place: describeLocation(process.cwd()) });
   await active(second, "carry-2", "carrier");
   await sender.call("dm_send", { to: "carrier", body: "to the carried name" });
   await until(() => second.deliveries.length === 1);
@@ -314,7 +322,7 @@ test("/new carries the outgoing root's name, bound with this checkout as its pla
   finally { await thief.close(); }
   const third = instance();
   await third.ext.start({ id: "carry-3", reason: "new" });
-  expect(row("carry-3")?.name ?? null).toBeNull();
+  expect((await row("carry-3"))?.name ?? null).toBeNull();
   const result = await third.call("whoami");
   expect(texts(result)).toHaveLength(2);
   expect(texts(result)[0]).toMatch(/^grayboard: this session couldn't take the name \S+\/carrier it carried over \(.*alias_held.*\); it is unbound$/);
@@ -326,34 +334,34 @@ test("/new carries the outgoing root's name, bound with this checkout as its pla
   await srv.app.mcp.sessions.release(hostedId("carry-thief"), "expired");
   await third.ext.command("resume");
   await active(third, "carry-3", "carrier");
-  expect(row("carry-3")).toMatchObject({ name: "carrier" });
+  expect(await row("carry-3")).toMatchObject({ name: "carrier" });
 });
 
 test("reload detaches, keeping the lease the reloaded instance resumes; quit releases, and a later resume rebinds the remembered name", async () => {
   const sender = await root("reload-sender", "sender");
   const before = await root("reload-1", "reloader");
-  const leased = row("reload-1")!;
+  const leased = (await row("reload-1"))!;
   expect(leased.lease_deadline).not.toBeNull();
   await before.ext.shutdown("reload");
-  expect(row("reload-1")).toMatchObject({ name: "reloader", ownership_id: leased.ownership_id });
-  expect(row("reload-1")!.lease_deadline).not.toBeNull();
+  expect(await row("reload-1")).toMatchObject({ name: "reloader", ownership_id: leased.ownership_id });
+  expect((await row("reload-1"))!.lease_deadline).not.toBeNull();
 
   const after = instance();
   await after.ext.start({ id: "reload-1", reason: "reload" });
   await active(after, "reload-1", "reloader");
   // The same ownership: the lease was resumed, not replaced.
-  expect(row("reload-1")).toMatchObject({ name: "reloader", ownership_id: leased.ownership_id });
+  expect(await row("reload-1")).toMatchObject({ name: "reloader", ownership_id: leased.ownership_id });
   await sender.call("dm_send", { to: "reloader", body: "after reload" });
   await until(() => after.deliveries.length === 1);
   expect(after.deliveries[0]!.content).toContain("after reload");
   expect(before.deliveries).toEqual([]);
 
   await after.ext.shutdown("quit");
-  expect(row("reload-1")).toBeNull();
+  expect(await row("reload-1")).toBeNull();
   const resumed = instance();
   await resumed.ext.start({ id: "reload-1", reason: "resume" });
   await active(resumed, "reload-1", "reloader");
-  expect(row("reload-1")!.ownership_id).not.toBe(leased.ownership_id);
+  expect((await row("reload-1"))!.ownership_id).not.toBe(leased.ownership_id);
 });
 
 // #438 item 26: the harness's abort reaches the hosted call, for a root and
@@ -378,26 +386,26 @@ test("a marked child registers under its root before its first call, writes as t
   const child = instance({ child: true, root: "parent-1" });
   await child.ext.start({ id: "child-1", reason: "startup" });
   expect(await child.ext.status()).toContain("session: child-1 (subagent of parent-1)");
-  expect(row("child-1")).toBeNull();
+  expect(await row("child-1")).toBeNull();
 
   const sent = await child.call("dm_send", { to: "other", body: "from the child" });
   expect(sent.isError).toBeUndefined();
-  expect(row("child-1")).toMatchObject({ name: null, root_session_id: hostedId("parent-1") });
+  expect(await row("child-1")).toMatchObject({ name: null, root_session_id: hostedId("parent-1") });
   await until(() => other.deliveries.length === 1);
   expect(other.deliveries[0]!.content).toContain(` from="${EMAIL}/parent"`);
   expect(other.deliveries[0]!.content).toContain("from the child");
   expect(child.notices).toEqual([]);
 
   await child.ext.shutdown("quit");
-  expect(row("child-1")).toBeNull();
+  expect(await row("child-1")).toBeNull();
   // The root keeps its name and delivery.
-  expect(row("parent-1")).toMatchObject({ name: "parent" });
+  expect(await row("parent-1")).toMatchObject({ name: "parent" });
   await active(parent, "parent-1", "parent");
 });
 
 test("a child whose root's ownership lapsed and was rebound registers again on its next call instead of failing unbound; other refusals don't re-register", async () => {
-  const registrations = () => srv.app.db.query<{ n: number }, [string]>(
-    "SELECT count(*) AS n FROM access_log WHERE action = 'hosted.child_registered' AND json_extract(detail, '$.child') = ?").get(hostedId("lapse-child"))!.n;
+  // Filtered in JS: json_extract is SQLite's.
+  const registrations = async () => (await accessAudits(srv, "hosted.child_registered")).filter((r) => r.detail.child === hostedId("lapse-child")).length;
   const parent = await root("lapse-root", "lapser");
   const other = await root("lapse-other", "other");
   const child = instance({ child: true, root: "lapse-root" });
@@ -406,25 +414,25 @@ test("a child whose root's ownership lapsed and was rebound registers again on i
   // A refusal that isn't about attribution comes back as is.
   const refused = await child.call("claim_release", { key: "never-taken" });
   expect(refused.isError).toBe(true);
-  expect(registrations()).toBe(1);
-  const before = row("lapse-root")!.ownership_id;
+  expect(await registrations()).toBe(1);
+  const before = (await row("lapse-root"))!.ownership_id;
 
   // The root's lease lapses (a suspended laptop); the server ends its
   // ownership and every child registered under it.
   await srv.app.mcp.sessions.release(hostedId("lapse-root"), "expired");
-  expect(row("lapse-child")).toBeNull();
+  expect(await row("lapse-child")).toBeNull();
   // The root's Controller rebinds its name under a new ownership.
-  await until(() => { const r = row("lapse-root"); return r?.name === "lapser" && r.ownership_id !== before; });
+  await until(async () => { const r = await row("lapse-root"); return r?.name === "lapser" && r.ownership_id !== before; });
   await active(parent, "lapse-root", "lapser");
 
   const sent = await child.call("dm_send", { to: "other", body: "after the lapse" });
   expect(sent.isError).toBeUndefined();
-  expect(registrations()).toBe(2);
-  expect(row("lapse-child")).toMatchObject({ root_session_id: hostedId("lapse-root") });
+  expect(await registrations()).toBe(2);
+  expect(await row("lapse-child")).toMatchObject({ root_session_id: hostedId("lapse-root") });
   await until(() => other.deliveries.some(d => d.content.includes("after the lapse")));
   expect(other.deliveries.at(-1)!.content).toContain(` from="${EMAIL}/lapser"`);
   // Sent once: the refused attempt ran nothing.
-  expect(srv.app.db.query("SELECT count(*) AS n FROM messages WHERE body = 'after the lapse'").get()).toEqual({ n: 1 });
+  expect(await sqlRow(srv, "SELECT count(*) AS n FROM messages WHERE body = 'after the lapse'")).toEqual({ n: 1 });
 });
 
 test("a session whose parent file is a live root's is that root's child, and so is its own child; a fork started after its source shut down is a root and carries the name", async () => {
@@ -435,15 +443,15 @@ test("a session whose parent file is a live root's is that root's child, and so 
   await nested.ext.start({ id: "nested-1", reason: "startup", file: join(agentDir, "sessions", "nested.jsonl"), parentFile: file });
   expect(await nested.ext.status()).toContain("session: nested-1 (subagent of source-1)");
   expect((await nested.call("whoami")).isError).toBeUndefined();
-  expect(row("nested-1")).toMatchObject({ root_session_id: hostedId("source-1") });
+  expect(await row("nested-1")).toMatchObject({ root_session_id: hostedId("source-1") });
   // A grandchild registers directly under the top root.
   const grandchild = instance();
   await grandchild.ext.start({ id: "grandchild-1", reason: "startup", parentFile: join(agentDir, "sessions", "nested.jsonl") });
   expect((await grandchild.call("whoami")).isError).toBeUndefined();
-  expect(row("grandchild-1")).toMatchObject({ root_session_id: hostedId("source-1") });
+  expect(await row("grandchild-1")).toMatchObject({ root_session_id: hostedId("source-1") });
   await grandchild.ext.shutdown("quit");
   await nested.ext.shutdown("quit");
-  expect([row("nested-1"), row("grandchild-1")]).toEqual([null, null]);
+  expect([await row("nested-1"), await row("grandchild-1")]).toEqual([null, null]);
 
   // pi shuts the source down before the fork starts.
   await source.ext.shutdown("fork");
@@ -451,7 +459,7 @@ test("a session whose parent file is a live root's is that root's child, and so 
   await fork.ext.start({ id: "fork-1", reason: "fork", file: join(agentDir, "sessions", "fork.jsonl"), parentFile: file });
   expect(await fork.ext.status()).toContain("session: fork-1 (root)");
   await active(fork, "fork-1", "forker");
-  expect(row("fork-1")).toMatchObject({ name: "forker", root_session_id: null });
+  expect(await row("fork-1")).toMatchObject({ name: "forker", root_session_id: null });
 });
 
 // pi's RPC mode emits session_start twice for a /new or /fork's session
@@ -466,7 +474,7 @@ test("a second session_start for the same session is ignored: one root takes the
   await active(second, "dup-2", "dupper");
   expect(await second.ext.status()).not.toContain("holds delivery");
   await second.ext.shutdown("new");
-  expect(row("dup-2")).toBeNull();
+  expect(await row("dup-2")).toBeNull();
   const third = instance();
   await third.ext.start({ id: "dup-3", reason: "new" });
   await active(third, "dup-3", "dupper");
@@ -480,10 +488,10 @@ test("130 sequential children under one root each register and end, so the root 
     await child.ext.start({ id: `cap-child-${n}`, reason: "startup" });
     const result = await child.call("whoami");
     expect(result.isError).toBeUndefined();
-    expect(row(`cap-child-${n}`)).toMatchObject({ root_session_id: hostedId("cap-root") });
+    expect(await row(`cap-child-${n}`)).toMatchObject({ root_session_id: hostedId("cap-root") });
     await child.ext.shutdown("quit");
   }
-  expect(srv.app.db.query<{ n: number }, [string]>("SELECT count(*) AS n FROM hosted_sessions WHERE root_session_id = ?").get(hostedId("cap-root"))).toEqual({ n: 0 });
+  expect(await sqlRow<{ n: number }>(srv, "SELECT count(*) AS n FROM hosted_sessions WHERE root_session_id = ?", hostedId("cap-root"))).toEqual({ n: 0 });
 }, 120_000);
 
 test("the same session opened twice: the second runs tools-only, says so in its first tool result and in status, and takes delivery when the first quits", async () => {
@@ -560,12 +568,12 @@ test("a runner child with no parent session works as an unregistered session, wa
   const bound = await loose.call("bind", { name: "loner", create: true });
   expect(bound.isError).toBeUndefined();
   // Its own root on the server, without a lease: no Controller runs for it.
-  expect(row("loose-1")).toEqual({ name: "loner", root_session_id: null, ownership_id: expect.any(Number), lease_deadline: null });
+  expect(await row("loose-1")).toEqual({ name: "loner", root_session_id: null, ownership_id: expect.any(Number), lease_deadline: null });
   expect(loose.notices).toHaveLength(1);
 
   await loose.ext.shutdown("quit");
   // The name is free at once, not after the server's idle timeout.
-  expect(row("loose-1")).toBeNull();
+  expect(await row("loose-1")).toBeNull();
   await root("loner-next", "loner", {}, false);
 });
 
@@ -617,7 +625,7 @@ test("/new after a sign-in that dropped the root's name carries nothing: a remem
   await a.ext.shutdown("new");
   const b = instance();
   await b.ext.start({ id: "stale-b", reason: "new" });
-  expect(row("stale-b")?.name ?? null).toBeNull();
+  expect((await row("stale-b"))?.name ?? null).toBeNull();
   const result = await b.call("whoami");
   expect(texts(result)).toHaveLength(1);
   expect(payload(result)).toMatchObject({ unbound: true });
@@ -739,7 +747,7 @@ test("a child's system-prompt instructions are its registered session's, even fe
   const child = instance({ child: true, root: "prompt-root" });
   await child.ext.start({ id: "prompt-child", reason: "startup" });
   expect(await child.ext.instructions()).toStartWith(`You are a subagent acting as "${EMAIL}/prompter" on grayboard; what you write shows your ID ${hostedId("prompt-child")} as via.`);
-  expect(row("prompt-child")).toMatchObject({ root_session_id: hostedId("prompt-root") });
+  expect(await row("prompt-child")).toMatchObject({ root_session_id: hostedId("prompt-root") });
   expect((await child.call("whoami")).isError).toBeUndefined();
 });
 
@@ -824,7 +832,7 @@ test("a child shut down while its registration is in flight still ends it, so it
   } finally { pause.release(); }
   await down;
   await call;
-  expect(row("midreg-child")).toBeNull();
+  expect(await row("midreg-child")).toBeNull();
 });
 
 test("an item sent while a root's /new reads the carried name stays for the new session: the run loop stopped before the read, so the outgoing one neither delivers nor receipts it", async () => {
@@ -872,16 +880,16 @@ test("an idle child ends its registration, and its next call registers it under 
   const child = instance(() => marker);
   await child.ext.start({ id: "moving-child", reason: "startup" });
   expect((await child.call("whoami")).isError).toBeUndefined();
-  expect(row("moving-child")).toMatchObject({ root_session_id: hostedId("first-root") });
+  expect(await row("moving-child")).toMatchObject({ root_session_id: hostedId("first-root") });
 
   await child.ext.idle();
-  expect(row("moving-child")).toBeNull();
+  expect(await row("moving-child")).toBeNull();
 
   await root("second-root", "second");
   marker = { child: true, root: "second-root" };
   expect(await child.ext.status()).toContain("session: moving-child (subagent of second-root)");
   expect((await child.call("whoami")).isError).toBeUndefined();
-  expect(row("moving-child")).toMatchObject({ root_session_id: hostedId("second-root") });
+  expect(await row("moving-child")).toMatchObject({ root_session_id: hostedId("second-root") });
 });
 
 // omp may start a subagent's next run before the last one's agent_end
@@ -923,7 +931,7 @@ test("an idle end waits for a call already running, which completes under its re
     expect(sent.isError, texts(sent).join("\n")).toBeUndefined();
     await idling;
   } finally { spy.mockRestore(); }
-  expect(row("busy-child")).toBeNull();
+  expect(await row("busy-child")).toBeNull();
   await until(() => other.deliveries.some(d => d.content.includes("sent across the idle")), 10_000, "the DM");
 });
 
@@ -1034,9 +1042,9 @@ test("a root whose delivery lock can't be opened ends the session its calls boun
   const a = instance();
   await a.ext.start({ id: "lockquit-1", reason: "startup" });
   expect((await a.call("bind", { name: "lockquit", create: true })).isError).toBeUndefined();
-  expect(row("lockquit-1")).toMatchObject({ name: "lockquit" });
+  expect(await row("lockquit-1")).toMatchObject({ name: "lockquit" });
   await a.ext.shutdown("quit");
-  expect(row("lockquit-1")).toBeNull();
+  expect(await row("lockquit-1")).toBeNull();
 });
 
 test("/grayboard resume on a root in lock error says so when another process now holds delivery", async () => {
@@ -1066,7 +1074,7 @@ test("a held root or a child shut down before its first connect finishes doesn't
 test("a quit while a reloaded root's start is in flight still releases the lease the reload kept", async () => {
   const before = await root("inflight-1", "inflight");
   await before.ext.shutdown("reload");
-  expect(row("inflight-1")!.lease_deadline).not.toBeNull();
+  expect((await row("inflight-1"))!.lease_deadline).not.toBeNull();
   const resume = Controller.prototype.resume;
   const { promise: reached, resolve: entered } = Promise.withResolvers<void>();
   const { promise: gate, resolve: open } = Promise.withResolvers<void>();
@@ -1086,7 +1094,7 @@ test("a quit while a reloaded root's start is in flight still releases the lease
     open();
     spy.mockRestore();
   }
-  expect(row("inflight-1")).toBeNull();
+  expect(await row("inflight-1")).toBeNull();
 });
 
 test("a tools-only root (delivery held elsewhere) refuses bind and unbind: the holder owns the binding", async () => {
@@ -1098,7 +1106,7 @@ test("a tools-only root (delivery held elsewhere) refuses bind and unbind: the h
     expect(refused.isError).toBe(true);
     expect(texts(refused).at(-1)).toBe(`error: ${HELD}; bind and unbind work from the process that holds delivery`);
   }
-  expect(row("held-bind")).toMatchObject({ name: "holder" });
+  expect(await row("held-bind")).toMatchObject({ name: "holder" });
 });
 
 test("an unreadable session state file before the first start is said, each failure once", async () => {

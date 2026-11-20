@@ -5,6 +5,7 @@ import { expect, spyOn, test } from "bun:test";
 import { verifySessionToken } from "../../src/server/auth.ts";
 import { TestServer, testSqlite } from "../support/server.ts";
 import { seed } from "../support/seed.ts";
+import { drained, row } from "../support/repo_sql.ts";
 
 testSqlite("stop() closes the database it opened", async () => {
   const srv = await TestServer.open();
@@ -60,7 +61,8 @@ test("a session's deferred last-used touch lands when the server keeps running",
   // the immediate runs within the same millisecond as the snapshot.)
   await seed(srv.app.repo, tx => srv.app.repo.sessions.touch(tx, authed!.session_id, 1));
   await Bun.sleep(10);
-  const after = (srv.app.db.query("SELECT last_used_at FROM sessions WHERE id = ?").get(authed!.session_id) as { last_used_at: number }).last_used_at;
+  await drained(srv);
+  const after = (await row<{ last_used_at: number }>(srv, "SELECT last_used_at FROM sessions WHERE id = ?", authed!.session_id))!.last_used_at;
   expect(after).toBeGreaterThan(1_000_000);
   await srv.stop();
 });
@@ -77,7 +79,8 @@ test("stopping one server leaves another live server's pending touch alone", asy
   await seed(a.app.repo, tx => a.app.repo.sessions.touch(tx, authedA.session_id, 1));
   await b.stop();
   await Bun.sleep(10);
-  const after = (a.app.db.query("SELECT last_used_at FROM sessions WHERE id = ?").get(authedA.session_id) as { last_used_at: number }).last_used_at;
+  await drained(a);
+  const after = (await row<{ last_used_at: number }>(a, "SELECT last_used_at FROM sessions WHERE id = ?", authedA.session_id))!.last_used_at;
   expect(after).toBeGreaterThan(1_000_000);
   await a.stop();
 });

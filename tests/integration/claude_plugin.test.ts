@@ -35,6 +35,7 @@ import { serviceRun } from "../support/service_token.ts";
 import { issueOAuth } from "../helpers/oauth.ts";
 import { browse, hostedServer, seedGrant, storeLogin, tokenRequests, type HostedServer } from "../support/hosted_oauth.ts";
 import { accessAudits } from "../support/audit.ts";
+import { row as sqlRow } from "../support/repo_sql.ts";
 import { closeSessions, mcpSession, stopSession, type ClientShape, type Session } from "../support/mcp.ts";
 import { until } from "../support/until.ts";
 import { RESTARTED } from "../support/harness.ts";
@@ -74,14 +75,23 @@ afterEach(async () => {
   rmSync(dir, { recursive: true, force: true });
 });
 
-const user = () => srv.app.db.query<{ id: number }, [string]>("SELECT id FROM users WHERE email = ?").get(EMAIL)!.id;
+const user = async () => (await sqlRow<{ id: number }>(srv, "SELECT id FROM users WHERE email = ?", EMAIL))!.id;
 type Row = { name: string | null; lease_deadline: number | null; ownership_id: number };
-const row = (id: string) => srv.app.db.query<Row, [string]>(
-  "SELECT (SELECT substr(address, instr(address, '/') + 1) FROM alias_holds WHERE id = session_id ORDER BY bound_at, address LIMIT 1) AS name, lease_deadline, ownership_id FROM hosted_sessions WHERE session_id = ?").get(hostedSessionId(user(), CLIENT_ID, id));
-const ownership = (ownershipId: number) => srv.app.db.query<{ ended_at: number | null; end_reason: string | null }, [number]>(
-  "SELECT ended_at, end_reason FROM hosted_ownerships WHERE id = ?").get(ownershipId)!;
-const leaseClosed = (id: string) => srv.app.db.query<{ n: number }, [string]>(
-  "SELECT count(*) AS n FROM access_log WHERE action = 'hosted.lease_closed' AND target = ?").get(hostedSessionId(user(), CLIENT_ID, id))!.n;
+// `name` is the session's first alias, less its user's prefix (sliced here: no instr on Postgres).
+const row = async (id: string): Promise<Row | null> => {
+  const r = await sqlRow<Omit<Row, "name"> & { address: string | null }>(srv,
+    "SELECT (SELECT address FROM alias_holds WHERE id = session_id ORDER BY bound_at, address LIMIT 1) AS address, lease_deadline, ownership_id FROM hosted_sessions WHERE session_id = ?", hostedSessionId(await user(), CLIENT_ID, id));
+  if (!r) return null;
+  const { address, ...rest } = r;
+  return { ...rest, name: address === null ? null : address.slice(address.indexOf("/") + 1) };
+};
+const ownership = async (ownershipId: number) => (await sqlRow<{ ended_at: number | null; end_reason: string | null }>(srv,
+  "SELECT ended_at, end_reason FROM hosted_ownerships WHERE id = ?", ownershipId))!;
+// Through accessAudits: it waits out queued writes, and a lease_closed audit is a post.
+const leaseClosed = async (id: string) => {
+  const target = hostedSessionId(await user(), CLIENT_ID, id);
+  return (await accessAudits(srv, "hosted.lease_closed")).filter((r) => r.target === target).length;
+};
 
 type Elicit = { url: string; message: string };
 // completed: elicitation ids the plugin completed; withdrawn: ids whose request it
@@ -160,21 +170,21 @@ test("a flagged interactive session: discover is refused, the handshake stays be
   const bound = await texts(alpha, "bind", { name: "alpha", create: true });
   expect(bound.error).toBe(false);
   expect(bound.texts[0]).toStartWith(`Bound to "alpha"`);
-  await until(() => row("sess-alpha")?.lease_deadline != null, 10_000, "alpha's lease");
-  expect(row("sess-alpha")!.name).toBe("alpha");
+  await until(async () => (await row("sess-alpha"))?.lease_deadline != null, 10_000, "alpha's lease");
+  expect((await row("sess-alpha"))!.name).toBe("alpha");
   // Claude Code starts a turn for every channel push, so its lease withholds non-waking items (#854).
-  expect(accessAudits(srv.app.db, "hosted.lease_opened").map(r => r.detail.context)).toEqual([false]);
+  expect((await accessAudits(srv, "hosted.lease_opened")).map(r => r.detail.context)).toEqual([false]);
   expect(existsSync(deliveryPath(data, srv.resource, CLIENT_ID, "sess-alpha"))).toBe(true);
 
   const beta = await plugin("sess-beta");
   expect((await texts(beta, "bind", { name: "beta", create: true })).error).toBe(false);
   expect((await texts(beta, "dm_send", { to: "alpha", body: "hello from beta" })).error).toBe(false);
   await until(() => alpha.pushes.length > 0, 10_000, "the DM's channel push");
-  const message = srv.app.db.query<{ id: number }, []>("SELECT id FROM messages WHERE body = 'hello from beta'").get()!;
+  const message = (await sqlRow<{ id: number }>(srv, "SELECT id FROM messages WHERE body = 'hello from beta'"))!;
   expect(alpha.pushes[0]!.content).toBe("hello from beta");
   expect(alpha.pushes[0]!.meta).toMatchObject({ from: `${EMAIL}/beta`, message_id: String(message.id) });
-  await until(() => srv.app.db.query<{ last_seen_id: number }, [string]>(
-    "SELECT last_seen_id FROM mailbox_cursors WHERE stream_type = 'direct' AND address = ?").get(`${EMAIL}/alpha`)?.last_seen_id === message.id,
+  await until(async () => (await sqlRow<{ last_seen_id: number }>(srv,
+    "SELECT last_seen_id FROM mailbox_cursors WHERE stream_type = 'direct' AND address = ?", `${EMAIL}/alpha`))?.last_seen_id === message.id,
   10_000, "the receipt to advance alpha's cursor");
   await Bun.sleep(500);
   expect(alpha.pushes).toHaveLength(1);
@@ -215,8 +225,8 @@ const modelCall = async (s: Session, name: string, args: Record<string, unknown>
   const r = await s.c.callTool({ name, arguments: args, _meta: { "claudecode/toolUseId": id } });
   return { error: r.isError === true, texts: (r.content as { type: string; text: string }[]).filter(b => b.type === "text").map(b => b.text), structured: r.structuredContent as Record<string, unknown> | undefined };
 };
-const childRow = (sessionID: string, agent: string) => srv.app.db.query<{ root_session_id: string | null }, [string]>(
-  "SELECT root_session_id FROM hosted_sessions WHERE session_id = ?").get(hostedSessionId(user(), CLIENT_ID, `${sessionID}/agent/${agent}`));
+const childRow = async (sessionID: string, agent: string) => sqlRow<{ root_session_id: string | null }>(srv,
+  "SELECT root_session_id FROM hosted_sessions WHERE session_id = ?", hostedSessionId(await user(), CLIENT_ID, `${sessionID}/agent/${agent}`));
 
 for (const mode of ["push", "tools-only"] as const) {
   test(`${mode}: a subagent's call runs as a child of the root, with via; the main agent's as the root; SubagentStop ends the child's session`, async () => {
@@ -225,20 +235,20 @@ for (const mode of ["push", "tools-only"] as const) {
     const root = await plugin(id, mode === "push" ? {} : { flags: [] });
     runHook(root, "session-start", { hook_event_name: "SessionStart", source: "startup" });
     expect((await modelCall(root, "bind", { name: "lead", create: true })).error).toBe(false);
-    if (mode === "push") await until(() => row(id)?.lease_deadline != null, 10_000, "the root's lease");
-    else expect(row(id)?.lease_deadline ?? null).toBeNull();
+    if (mode === "push") await until(async () => (await row(id))?.lease_deadline != null, 10_000, "the root's lease");
+    else expect((await row(id))?.lease_deadline ?? null).toBeNull();
     const peer = await plugin("sess-sub-peer");
     expect((await texts(peer, "bind", { name: "peer", create: true })).error).toBe(false);
 
-    const child = hostedSessionId(user(), CLIENT_ID, `${id}/agent/a573e90bd84bce7ff`);
+    const child = hostedSessionId(await user(), CLIENT_ID, `${id}/agent/a573e90bd84bce7ff`);
     const sent = await modelCall(root, "dm_send", { to: "peer", body: "from the subagent" }, { agent: "a573e90bd84bce7ff" });
     expect(sent.error).toBe(false);
     const own = await modelCall(root, "dm_send", { to: "peer", body: "from the main agent" });
     expect(own.error).toBe(false);
-    const by = (body: string) => srv.app.db.query<{ sender: string; via: string | null }, [string]>("SELECT sender, via FROM messages WHERE body = ?").get(body);
-    expect(by("from the subagent")).toEqual({ sender: `${EMAIL}/lead`, via: child });
-    expect(by("from the main agent")).toEqual({ sender: `${EMAIL}/lead`, via: null });
-    expect(childRow(id, "a573e90bd84bce7ff")?.root_session_id).toBe(hostedSessionId(user(), CLIENT_ID, id));
+    const by = (body: string) => sqlRow<{ sender: string; via: string | null }>(srv, "SELECT sender, via FROM messages WHERE body = ?", body);
+    expect(await by("from the subagent")).toEqual({ sender: `${EMAIL}/lead`, via: child });
+    expect(await by("from the main agent")).toEqual({ sender: `${EMAIL}/lead`, via: null });
+    expect((await childRow(id, "a573e90bd84bce7ff"))?.root_session_id).toBe(hostedSessionId(await user(), CLIENT_ID, id));
     // The peer's push carries the child as via; the main agent's carries none.
     const push = (body: string) => peer.pushes.find((p) => p.content.includes(body));
     await until(() => push("from the subagent") && push("from the main agent"), 10_000, "the peer's pushes");
@@ -256,22 +266,22 @@ for (const mode of ["push", "tools-only"] as const) {
       // The server ends the root (the idle sweep, say), which ends its child; the
       // subagent's next call registers it again under the root, never as a root
       // of its own (#553 audit 3).
-      await srv.app.mcp.sessions.release(hostedSessionId(user(), CLIENT_ID, id), "idle");
-      await until(() => !childRow(id, "a573e90bd84bce7ff"), 10_000, "the root's end to end its child");
+      await srv.app.mcp.sessions.release(hostedSessionId(await user(), CLIENT_ID, id), "idle");
+      await until(async () => !(await childRow(id, "a573e90bd84bce7ff")), 10_000, "the root's end to end its child");
       // The end freed the root's name, so the new root is unbound: the child is
       // refused as its subagent, and its row is a child again, not a root.
       const again = await modelCall(root, "dm_send", { to: "peer", body: "after the root's end" }, { agent: "a573e90bd84bce7ff" });
       expect(again.error).toBe(true);
       expect(again.texts.join("\n")).toContain("this session is a subagent of");
-      expect(childRow(id, "a573e90bd84bce7ff")?.root_session_id).toBe(hostedSessionId(user(), CLIENT_ID, id));
-      expect(by("after the root's end")).toBeNull();
+      expect((await childRow(id, "a573e90bd84bce7ff"))?.root_session_id).toBe(hostedSessionId(await user(), CLIENT_ID, id));
+      expect(await by("after the root's end")).toBeNull();
       expect((await modelCall(root, "bind", { name: "lead", create: true })).error).toBe(false);
     }
 
     runHook(root, "subagent-stop", { hook_event_name: "SubagentStop", agent_id: "a573e90bd84bce7ff" });
-    await until(() => !childRow(id, "a573e90bd84bce7ff"), 10_000, "the child's hosted session to end");
+    await until(async () => !(await childRow(id, "a573e90bd84bce7ff")), 10_000, "the child's hosted session to end");
     // The root is untouched.
-    expect(row(id)?.name).toBe("lead");
+    expect((await row(id))?.name).toBe("lead");
   }, 60_000);
 }
 
@@ -282,17 +292,17 @@ test("a plugin restarted after a subagent's call still ends that child's session
   runHook(root, "session-start", { hook_event_name: "SessionStart", source: "startup" });
   expect((await modelCall(root, "bind", { name: "lead", create: true })).error).toBe(false);
   expect((await modelCall(root, "whoami", {}, { agent })).error).toBe(false);
-  expect(childRow(id, agent)?.root_session_id).toBe(hostedSessionId(user(), CLIENT_ID, id));
+  expect((await childRow(id, agent))?.root_session_id).toBe(hostedSessionId(await user(), CLIENT_ID, id));
   // Killed, so it ends nothing; Claude Code (its pid, so its record dir) lives
   // on, and the new process never saw the child's call.
   const claude = claudePid(root);
   root = Object.assign(await root.restart("crash", claude), { elicits: [], completed: [], withdrawn: [], aborted: [] });
-  expect(childRow(id, agent)?.root_session_id).toBe(hostedSessionId(user(), CLIENT_ID, id));
+  expect((await childRow(id, agent))?.root_session_id).toBe(hostedSessionId(await user(), CLIENT_ID, id));
   expect(claudePid(root)).toBe(claude);
   // No call after the restart: it watches the ended markers from its start.
   runHook(root, "subagent-stop", { hook_event_name: "SubagentStop", agent_id: agent });
-  await until(() => !childRow(id, agent), 10_000, "the earlier child's hosted session to end");
-  expect(row(id)?.name).toBe("lead");
+  await until(async () => !(await childRow(id, agent)), 10_000, "the earlier child's hosted session to end");
+  expect((await row(id))?.name).toBe("lead");
 }, 60_000);
 
 test("a /mcp reconnect's release ends the subagent's session and its note, so its SubagentStop later starts no session to end it (#555 item 8)", async () => {
@@ -305,13 +315,13 @@ test("a /mcp reconnect's release ends the subagent's session and its note, so it
   const claude = claudePid(root);
   expect(hasCalled(data, claude)).toBe(true);
   root = Object.assign(await root.restart("reconnect", claude), { elicits: [], completed: [], withdrawn: [], aborted: [] });
-  expect(childRow(id, agent)).toBeNull();
+  expect(await childRow(id, agent)).toBeNull();
   expect(hasCalled(data, claude)).toBe(false);
   runHook(root, "subagent-stop", { hook_event_name: "SubagentStop", agent_id: agent });
   // Another subagent's call drains the marker before it runs.
   expect((await modelCall(root, "whoami", {}, { agent: "a555000000000000a" })).error).toBe(false);
   await Bun.sleep(1_000);
-  const minted = srv.app.db.query<{ n: number }, [string]>("SELECT count(*) AS n FROM hosted_ownerships WHERE session_id = ?").get(hostedSessionId(user(), CLIENT_ID, `${id}/agent/${agent}`))!.n;
+  const minted = (await sqlRow<{ n: number }>(srv, "SELECT count(*) AS n FROM hosted_ownerships WHERE session_id = ?", hostedSessionId(await user(), CLIENT_ID, `${id}/agent/${agent}`)))!.n;
   expect(minted).toBe(0);
 }, 60_000);
 
@@ -330,7 +340,7 @@ test("a call whose PreToolUse record is missing or from a recycled pid is refuse
   writeFileSync(join(data, "claude-agents", String(claudePid(root)), "start"), "Mon Jan  1 00:00:00 2001");
   const recycled = await modelCall(root, "dm_send", { to: "solo", body: "unattributed" });
   expect(recycled.texts.join("\n")).toContain("an earlier process with the same pid");
-  expect(srv.app.db.query("SELECT count(*) AS n FROM messages WHERE body = 'unattributed'").get()).toEqual({ n: 0 });
+  expect(await sqlRow(srv, "SELECT count(*) AS n FROM messages WHERE body = 'unattributed'")).toEqual({ n: 0 });
 }, 40_000);
 
 test("a subagent whose child id would pass the server's 1024 characters is refused client-side with the length, and writes nothing (#555 item 15)", async () => {
@@ -347,8 +357,8 @@ test("a subagent whose child id would pass the server's 1024 characters is refus
   expect(refused.error).toBe(true);
   expect(refused.texts.join("\n")).toContain("is 1025 characters, over the server's 1024-character limit");
   expect(root.stderr()).toContain("subagent child id is 1025 characters");
-  expect(srv.app.db.query("SELECT count(*) AS n FROM messages WHERE body = 'over the limit'").get()).toEqual({ n: 0 });
-  expect(childRow(id, over)).toBeNull();
+  expect(await sqlRow(srv, "SELECT count(*) AS n FROM messages WHERE body = 'over the limit'")).toEqual({ n: 0 });
+  expect(await childRow(id, over)).toBeNull();
   // The main agent's calls still work.
   expect((await modelCall(root, "whoami", {})).error).toBe(false);
 }, 40_000);
@@ -357,40 +367,40 @@ test("the root reports the model and effort its hooks wrote (#545); a subagent's
   await seedGrant(srv, data, CLIENT_ID, EMAIL);
   const id = "sess-facts";
   const root = await plugin(id);
-  const facts = (session: string) => srv.app.db.query<{ model: string | null; effort: string | null }, [string]>("SELECT model, effort FROM ids WHERE id = ?").get(session);
-  const rootId = hostedSessionId(user(), CLIENT_ID, id), child = hostedSessionId(user(), CLIENT_ID, `${id}/agent/a1b2c3d4e5f6a7b8c`);
+  const facts = (session: string) => sqlRow<{ model: string | null; effort: string | null }>(srv, "SELECT model, effort FROM ids WHERE id = ?", session);
+  const rootId = hostedSessionId(await user(), CLIENT_ID, id), child = hostedSessionId(await user(), CLIENT_ID, `${id}/agent/a1b2c3d4e5f6a7b8c`);
   runHook(root, "session-start", { hook_event_name: "SessionStart", source: "startup", model: "claude-opus-5-5" });
   expect((await modelCall(root, "bind", { name: "facts", create: true }, { effort: "medium" })).error).toBe(false);
-  expect(facts(rootId)).toEqual({ model: "claude-opus-5-5", effort: "medium" });
+  expect(await facts(rootId)).toEqual({ model: "claude-opus-5-5", effort: "medium" });
   // A confirmed /model switch, then a call under /effort high.
   runHook(root, "model-switch", { hook_event_name: "PostModelSwitch", from_model: "claude-opus-5-5", to_model: "claude-sonnet-5-5", source: "command" });
   expect((await modelCall(root, "whoami", {}, { effort: "high" })).error).toBe(false);
-  expect(facts(rootId)).toEqual({ model: "claude-sonnet-5-5", effort: "high" });
+  expect(await facts(rootId)).toEqual({ model: "claude-sonnet-5-5", effort: "high" });
   // A subagent's call: its child session gets no facts, and the root's stay.
   expect((await modelCall(root, "whoami", {}, { agent: "a1b2c3d4e5f6a7b8c", effort: "low" })).error).toBe(false);
-  expect(facts(child)).toEqual({ model: null, effort: null });
-  expect(facts(rootId)).toEqual({ model: "claude-sonnet-5-5", effort: "high" });
+  expect(await facts(child)).toEqual({ model: null, effort: null });
+  expect(await facts(rootId)).toEqual({ model: "claude-sonnet-5-5", effort: "high" });
   // A model file that isn't one: the call still runs and sends the effort, and stderr says so once.
   writeFileSync(join(data, "claude-agents", String(claudePid(root)), "model"), "not a model");
   expect((await modelCall(root, "whoami", {}, { effort: "low" })).error).toBe(false);
   expect((await modelCall(root, "whoami", {}, { effort: "max" })).error).toBe(false);
-  expect(facts(rootId)).toEqual({ model: "claude-sonnet-5-5", effort: "max" });
+  expect(await facts(rootId)).toEqual({ model: "claude-sonnet-5-5", effort: "max" });
   expect(root.stderr().split("the server gets no model for this session").length - 1).toBe(1);
   expect(root.stderr()).not.toContain("couldn't read session");
   // A root call on a model without effort: the hook's none goes through this process to the server as a clear (#563 item 3).
   expect((await modelCall(root, "whoami", {})).error).toBe(false);
-  expect(facts(rootId)).toEqual({ model: "claude-sonnet-5-5", effort: null });
+  expect(await facts(rootId)).toEqual({ model: "claude-sonnet-5-5", effort: null });
 }, 40_000);
 
 test("an explicit BUS_IDENTITY binds at start (#443), created if new, with delivery; one the naming rule refuses is said in the first tool result", async () => {
   await seedGrant(srv, data, CLIENT_ID, EMAIL);
   await plugin("sess-conf", { env: { BUS_IDENTITY: "Conf-Plug" } });
-  await until(() => row("sess-conf")?.name === "conf-plug" && row("sess-conf")?.lease_deadline != null, 10_000, "the configured name's lease");
+  await until(async () => (await row("sess-conf"))?.name === "conf-plug" && (await row("sess-conf"))?.lease_deadline != null, 10_000, "the configured name's lease");
 
   const bad = await plugin("sess-conf-bad", { env: { BUS_IDENTITY: "no spaces" } });
   const first = await texts(bad, "whoami");
   expect(first.texts[0]).toMatch(/^grayboard: BUS_IDENTITY is ignored: invalid identity name "no spaces"/);
-  expect(row("sess-conf-bad")?.name ?? null).toBeNull();
+  expect((await row("sess-conf-bad"))?.name ?? null).toBeNull();
 }, 30_000);
 
 test("dm_send attaches a file from the session's directory, and attachment_get saves it in the other session", async () => {
@@ -402,7 +412,7 @@ test("dm_send attaches a file from the session's directory, and attachment_get s
   writeFileSync(join(dir, "work", "report.txt"), bytes);
   const sent = await texts(sender, "dm_send", { to: "read", body: "see attached", attachments: [join(dir, "work", "report.txt")] });
   expect(sent.error).toBe(false);
-  const stored = srv.app.db.query<{ id: number }, []>("SELECT id FROM attachments WHERE filename = 'report.txt'").get()!;
+  const stored = (await sqlRow<{ id: number }>(srv, "SELECT id FROM attachments WHERE filename = 'report.txt'"))!;
   mkdirSync(join(dir, "work", "in"));
   const got = await texts(reader, "attachment_get", { id: stored.id, dir: join(dir, "work", "in") });
   expect(got.error).toBe(false);
@@ -413,14 +423,14 @@ test("dm_send attaches a file from the session's directory, and attachment_get s
 
 test("two plugin processes on one data dir with an expired access token refresh it once", async () => {
   const seeded = await seedGrant(srv, data, CLIENT_ID, EMAIL, -1);
-  const refreshTokens = () => srv.app.db.query<{ n: number; spent: number }, [string]>(
-    "SELECT count(*) AS n, count(spent_at) AS spent FROM oauth_tokens WHERE grant_id = ? AND kind = 'refresh'").get(seeded.grantId)!;
-  expect(refreshTokens()).toEqual({ n: 1, spent: 0 });
+  const refreshTokens = async () => (await sqlRow<{ n: number; spent: number }>(srv,
+    "SELECT count(*) AS n, count(spent_at) AS spent FROM oauth_tokens WHERE grant_id = ? AND kind = 'refresh'", seeded.grantId))!;
+  expect(await refreshTokens()).toEqual({ n: 1, spent: 0 });
   const [a, b] = await Promise.all([plugin("sess-a"), plugin("sess-b")]);
   const [ra, rb] = await Promise.all([texts(a, "whoami"), texts(b, "whoami")]);
   expect(ra.error).toBe(false);
   expect(rb.error).toBe(false);
-  expect(refreshTokens()).toEqual({ n: 2, spent: 1 });
+  expect(await refreshTokens()).toEqual({ n: 2, spent: 1 });
   expect(a.elicits).toEqual([]);
   expect(b.elicits).toEqual([]);
 }, 40_000);
@@ -429,7 +439,7 @@ test("a second process on the same session id runs tools-only and says why, then
   await seedGrant(srv, data, CLIENT_ID, EMAIL);
   const first = await plugin("sess-same");
   await texts(first, "bind", { name: "same", create: true });
-  await until(() => row("sess-same")?.lease_deadline != null, 10_000, "the first process's lease");
+  await until(async () => (await row("sess-same"))?.lease_deadline != null, 10_000, "the first process's lease");
 
   const second = await plugin("sess-same");
   expect(second.c.getInstructions()).toContain(`Warning: ${HELD}`);
@@ -439,13 +449,13 @@ test("a second process on the same session id runs tools-only and says why, then
   // A tools-only process must not rebind the session the holder owns.
   const refused = await texts(second, "unbind", {});
   expect(refused.texts.join("\n")).toContain("work from the process that holds delivery");
-  expect(row("sess-same")?.name).toBe("same");
+  expect((await row("sess-same"))?.name).toBe("same");
 
   const other = await plugin("sess-other");
   await texts(other, "bind", { name: "other", create: true });
   await stopSession(first.c);
   // The second takes the lock, rebinds the name and receives the next DM.
-  await until(async () => row("sess-same")?.lease_deadline != null && row("sess-same")?.name === "same", 15_000, "the second process to take delivery");
+  await until(async () => (await row("sess-same"))?.lease_deadline != null && (await row("sess-same"))?.name === "same", 15_000, "the second process to take delivery");
   await texts(other, "dm_send", { to: "same", body: "after handover" });
   await until(() => second.pushes.some(p => p.content === "after handover"), 10_000, "the push to the second process");
 }, 50_000);
@@ -470,7 +480,7 @@ test("-p: no lease, no delivery lock, no sign-in prompt; a signed-out call names
   await seedGrant(srv, data, CLIENT_ID, EMAIL);
   const p = await plugin("sess-print", { flags: ["-p", ...FLAG] });
   expect((await texts(p, "bind", { name: "printer", create: true })).error).toBe(false);
-  const bound = row("sess-print")!;
+  const bound = (await row("sess-print"))!;
   expect(bound).toMatchObject({ name: "printer", lease_deadline: null });
   expect(existsSync(deliveryPath(data, srv.resource, CLIENT_ID, "sess-print"))).toBe(false);
   const sender = await plugin("sess-print-sender");
@@ -480,21 +490,21 @@ test("-p: no lease, no delivery lock, no sign-in prompt; a signed-out call names
   expect(p.pushes).toEqual([]);
 
   await stopSession(p.c);
-  expect(row("sess-print")).toBeNull();
-  expect(ownership(bound.ownership_id)).toMatchObject({ ended_at: expect.any(Number), end_reason: "closed" });
-  expect(leaseClosed("sess-print")).toBe(0);
+  expect(await row("sess-print")).toBeNull();
+  expect(await ownership(bound.ownership_id)).toMatchObject({ ended_at: expect.any(Number), end_reason: "closed" });
+  expect(await leaseClosed("sess-print")).toBe(0);
 }, 50_000);
 
 test("EOF on a session holding the lease releases it: the name is free at once", async () => {
   await seedGrant(srv, data, CLIENT_ID, EMAIL);
   const s = await plugin("sess-eof");
   await texts(s, "bind", { name: "eof", create: true });
-  await until(() => row("sess-eof")?.lease_deadline != null, 10_000, "the lease");
-  const ownershipId = row("sess-eof")!.ownership_id;
+  await until(async () => (await row("sess-eof"))?.lease_deadline != null, 10_000, "the lease");
+  const ownershipId = (await row("sess-eof"))!.ownership_id;
   await stopSession(s.c);
-  expect(row("sess-eof")).toBeNull();
-  expect(ownership(ownershipId)).toMatchObject({ ended_at: expect.any(Number), end_reason: "closed" });
-  expect(leaseClosed("sess-eof")).toBe(1);
+  expect(await row("sess-eof")).toBeNull();
+  expect(await ownership(ownershipId)).toMatchObject({ ended_at: expect.any(Number), end_reason: "closed" });
+  expect(await leaseClosed("sess-eof")).toBe(1);
 }, 30_000);
 
 test("sign-in by URL elicitation: offered at startup, re-offered by the next call after a decline, one prompt for concurrent calls, completed after the browser returns", async () => {
@@ -802,7 +812,7 @@ test("a lease release that fails at shutdown is said once on stderr: the server 
   await seedGrant(srv, data, CLIENT_ID, EMAIL);
   const s = await plugin("sess-downquit");
   await texts(s, "bind", { name: "downquit", create: true });
-  await until(() => row("sess-downquit")?.lease_deadline != null, 10_000, "the lease");
+  await until(async () => (await row("sess-downquit"))?.lease_deadline != null, 10_000, "the lease");
   await srv.stop();
   stopped = true;
   await stopSession(s.c);
@@ -813,7 +823,7 @@ test("a lease release that fails at shutdown is said once on stderr: a logout el
   await seedGrant(srv, data, CLIENT_ID, EMAIL);
   const s = await plugin("sess-outquit");
   await texts(s, "bind", { name: "outquit", create: true });
-  await until(() => row("sess-outquit")?.lease_deadline != null, 10_000, "the lease");
+  await until(async () => (await row("sess-outquit"))?.lease_deadline != null, 10_000, "the lease");
   await logoutElsewhere();
   await stopSession(s.c);
   expect(count(s.stderr(), "session_end failed")).toBe(1);
@@ -843,9 +853,9 @@ test("a delivery lock that can't be opened (not BUSY) is said, and the session i
   const bound = await texts(s, "bind", { name: "lockfail", create: true });
   expect(bound.error).toBe(false);
   expect(bound.texts.join("\n")).not.toContain(HELD);
-  expect(row("sess-lockfail")?.name).toBe("lockfail");
+  expect((await row("sess-lockfail"))?.name).toBe("lockfail");
   await stopSession(s.c);
-  expect(row("sess-lockfail")).toBeNull();
+  expect(await row("sess-lockfail")).toBeNull();
 }, 30_000);
 
 test("a delivery lock that couldn't be opened is retried by the next tool call: the instructions say so, and once the obstacle is gone the call's result says delivery started and a bind takes the lease", async () => {
@@ -859,7 +869,7 @@ test("a delivery lock that couldn't be opened is retried by the next tool call: 
   expect(r.error).toBe(false);
   expect(r.texts[0]).toMatch(/^grayboard: delivery couldn't start \(couldn't take delivery: .*\); retried: /);
   expect((await texts(s, "bind", { name: "relock", create: true })).error).toBe(false);
-  await until(() => row("sess-relock")?.lease_deadline != null, 10_000, "the lease");
+  await until(async () => (await row("sess-relock"))?.lease_deadline != null, 10_000, "the lease");
 }, 30_000);
 
 // In-process: the client end of the transport never initializes, so the item
@@ -915,15 +925,15 @@ async function staticServer() {
   srv = await hostedServer({ admins: ["root@example.com"] });
   return serviceRun(srv);
 }
-const svcRow = (raw: string) => srv.app.db.query<{ client_id: string; name: string | null; lease_deadline: number | null }, [string]>(
-  "SELECT client_id, (SELECT address FROM alias_holds WHERE id = session_id ORDER BY bound_at, address LIMIT 1) AS name, lease_deadline FROM hosted_sessions WHERE source_session_id = ?").get(raw);
+const svcRow = (raw: string) => sqlRow<{ client_id: string; name: string | null; lease_deadline: number | null }>(srv,
+  "SELECT client_id, (SELECT address FROM alias_holds WHERE id = session_id ORDER BY bound_at, address LIMIT 1) AS name, lease_deadline FROM hosted_sessions WHERE source_session_id = ?", raw);
 
 test("static mode: a run token binds the service's BUS_IDENTITY name with the lease and no sign-in prompt or link; a revoked credential ends the run with the new-run text and no token request", async () => {
   const run = await staticServer();
   const tokens = tokenRequests(srv);
   const s = await plugin("sess-static", { env: { ...run.env, BUS_IDENTITY: "w-1" } });
-  await until(() => svcRow("sess-static")?.name === "ingest/w-1" && svcRow("sess-static")?.lease_deadline != null, 15_000, "ingest/w-1's lease");
-  expect(svcRow("sess-static")!.client_id).toBe(run.clientId);
+  await until(async () => (await svcRow("sess-static"))?.name === "ingest/w-1" && (await svcRow("sess-static"))?.lease_deadline != null, 15_000, "ingest/w-1's lease");
+  expect((await svcRow("sess-static"))!.client_id).toBe(run.clientId);
   expect(s.c.getInstructions()).not.toContain("signed out");
   const who = await texts(s, "whoami");
   expect(who.error).toBe(false);
@@ -953,7 +963,7 @@ for (const [file, body, said] of [
     expect(r.error).toBe(true);
     expect(r.texts.join("\n")).toContain(said);
     expect(s.elicits).toEqual([]);
-    expect(svcRow("sess-refused")).toBeNull();
+    expect(await svcRow("sess-refused")).toBeNull();
   }, 30_000);
 }
 
