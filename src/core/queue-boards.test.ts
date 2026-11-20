@@ -6,6 +6,7 @@ import {
   createBoard,
   getBoard,
   queueLanes,
+  queueLaneRowsSql,
   pendingFor,
   post,
   setAccess,
@@ -17,7 +18,7 @@ import {
   touchAlias,
 } from "./boards.ts";
 import { holdAlias } from "./bindings.ts";
-import { claim, release, sweepExpired, listClaims, watch } from "./claims.ts";
+import { claim, logEvent, release, sweepExpired, listClaims, watch } from "./claims.ts";
 import { initCoreSchema } from "./schema.ts";
 
 let db: Database;
@@ -540,4 +541,185 @@ test("a redelivery of an old post moves its new holder to the back of the rotati
   expect(queueLanes(db, getBoard(db, "work")!, ["be"])).toEqual(["fe", "zed", "sim"]);
   expect(post(db, "be", "work", "item 4").wake).toEqual(["fe"]);
   expect(post(db, "be", "work", "item 5").wake).toEqual(["zed"]);
+});
+
+// #1174: a lane is its session, not the handle it held when it took a post. A session that subscribed unbound and
+// took a post as its ID, then bound a name, keeps that take in the rotation and has had its one turn at the post.
+describe("a lane's history follows its session across a bind (#1174)", () => {
+  const S = "id:0000000001174";
+  beforeEach(() => {
+    db.prepare(`DELETE FROM subscriptions WHERE handle = 'fe'`).run();
+    registerId(db, { id: S, principal: null, launcher: false });
+    ensureAlias(db, "qa", "test");
+    subscribe(db, S, "work", "push");
+  });
+
+  test("a lane that took a post unbound, then bound a name, keeps its place in the rotation", () => {
+    // Both never woken: the ID sorts before sim.
+    expect(post(db, "be", "work", "item 1").wake).toEqual([S]);
+    holdAlias(db, "qa", S);
+    // qa is the same session as the ID that took item 1: sim, never woken, is next.
+    expect(queueLanes(db, getBoard(db, "work")!, ["be"])).toEqual(["sim", "qa"]);
+    expect(post(db, "be", "work", "item 2").wake).toEqual(["sim"]);
+  });
+
+  test("a take under another alias the session holds counts for its lane", () => {
+    ensureAlias(db, "alpha", "test");
+    holdAlias(db, "qa", S, 100);
+    holdAlias(db, "alpha", S, 101);
+    const r = post(db, "be", "work", "@alpha take this", null, said);
+    expect(takes(claimKey(r.post.id))).toEqual(["alpha"]);
+    expect(post(db, "be", "work", "item 2").wake).toEqual(["sim"]);
+  });
+
+  test("a post it took unbound and declined after binding isn't offered it again, and counts it once", () => {
+    const r = post(db, "be", "work", "item 1");
+    const key = claimKey(r.post.id);
+    holdAlias(db, "qa", S);
+    release(db, "qa", key, "pass", { addresses: ["qa", S], session: S });
+    expect(listClaims(db).filter((c) => c.key === key).map((c) => c.holder)).toEqual(["sim"]);
+    release(db, "sim", key, "pass");
+    expect(takes(key)).toEqual([S, "sim"]);
+    const replies = db.prepare(`SELECT body FROM posts WHERE parent_id = ?`).all(r.post.id) as { body: string }[];
+    expect(replies.map((x) => x.body)).toEqual([`[unclaimed] ${key}: all 2 lanes passed on it, and no other lane is left; it stays here unclaimed`]);
+  });
+
+  test("a lane subscribed as a non-primary alias has had its turn when the session took the post as another", () => {
+    db.prepare(`DELETE FROM subscriptions WHERE handle = ?`).run(S);
+    ensureAlias(db, "qb", "test");
+    holdAlias(db, "qa", S, 100);
+    holdAlias(db, "qb", S, 101);
+    subscribe(db, "qb", "work", "push");
+    const r = post(db, "be", "work", "@qa take this", null, said);
+    const key = claimKey(r.post.id);
+    release(db, "qa", key, "pass", { addresses: ["qa", "qb", S], session: S });
+    // Not re-offered to the same session as qb: sim is the only other lane.
+    expect(listClaims(db).filter((c) => c.key === key).map((c) => c.holder)).toEqual(["sim"]);
+    release(db, "sim", key, "pass");
+    expect(takes(key)).toEqual(["qa", "sim"]);
+    const replies = db.prepare(`SELECT body FROM posts WHERE parent_id = ?`).all(r.post.id) as { body: string }[];
+    expect(replies.map((x) => x.body)).toEqual([`[unclaimed] ${key}: all 2 lanes passed on it, and no other lane is left; it stays here unclaimed`]);
+  });
+
+  test("a session that held a post under two addresses counts as one lane in its [unclaimed] reply", () => {
+    db.prepare(`DELETE FROM subscriptions WHERE handle IN ('sim', ?)`).run(S);
+    ensureAlias(db, "qb", "test");
+    holdAlias(db, "qa", S, 100);
+    holdAlias(db, "qb", S, 101);
+    subscribe(db, "qb", "work", "push");
+    const r = post(db, "be", "work", "@qa take this", null, said);
+    const key = claimKey(r.post.id);
+    // A take as qb the redelivery rule no longer makes (the history of an older build): one session, one lane.
+    logEvent(db, "take", "qb", { key, board: "work" }, Date.now());
+    release(db, "qa", key, "pass", { addresses: ["qa", "qb", S], session: S });
+    const replies = db.prepare(`SELECT body FROM posts WHERE parent_id = ?`).all(r.post.id) as { body: string }[];
+    expect(replies.map((x) => x.body)).toEqual([`[unclaimed] ${key}: its one lane passed on it, and no other lane is left; it stays here unclaimed`]);
+  });
+
+  test("its one turn as its only lane: declined after binding, the post ends unclaimed with one lane counted", () => {
+    db.prepare(`DELETE FROM subscriptions WHERE handle = 'sim'`).run();
+    const r = post(db, "be", "work", "item 1");
+    const key = claimKey(r.post.id);
+    holdAlias(db, "qa", S);
+    release(db, "qa", key, "pass", { addresses: ["qa", S], session: S });
+    expect(takes(key)).toEqual([S]);
+    const replies = db.prepare(`SELECT body FROM posts WHERE parent_id = ?`).all(r.post.id) as { body: string }[];
+    expect(replies.map((x) => x.body)).toEqual([`[unclaimed] ${key}: its one lane passed on it, and no other lane is left; it stays here unclaimed`]);
+  });
+});
+
+// #1174 audit L1: each half of a lane's history (its takes and its deliveries) follows its session on its own. A take
+// usually comes with an outbox row under the same handle, so each case here splits them.
+describe("each half of a lane's rotation history follows its session (#1174 audit)", () => {
+  const S = "id:0000000001174";
+  beforeEach(() => {
+    db.prepare(`DELETE FROM subscriptions WHERE handle = 'fe'`).run();
+    registerId(db, { id: S, principal: null, launcher: false });
+    ensureAlias(db, "qa", "test");
+    subscribe(db, S, "work", "push");
+  });
+  const pin = (rs: { post: { id: number } }[]) =>
+    rs.forEach((r, i) => {
+      const at = (i + 1) * 1000;
+      db.prepare(`UPDATE posts SET created_at = ? WHERE id = ?`).run(at, r.post.id);
+      db.prepare(`UPDATE claim_events SET at = ? WHERE key = ?`).run(at, claimKey(r.post.id));
+    });
+
+  test("a take of an old post's redelivery as its ID, then a bind, puts the lane last (the take, not the post's time)", () => {
+    ensureAlias(db, "zed", "test");
+    touchAlias(db, "zed");
+    subscribe(db, "zed", "work", "push");
+    const rs = [1, 2, 3].map((n) => post(db, "be", "work", `item ${n}`));
+    expect(rs.map((r) => r.wake)).toEqual([[S], ["sim"], ["zed"]]);
+    pin(rs);
+    // sim declines item 2 (written at 2000); the session, least recently woken at 1000, takes it now as its ID.
+    release(db, "sim", claimKey(rs[1]!.post.id), "pass");
+    expect(takes(claimKey(rs[1]!.post.id))).toEqual(["sim", S]);
+    holdAlias(db, "qa", S);
+    // Its outbox rows say 1000 and 2000; only its take as the ID says now.
+    expect(queueLanes(db, getBoard(db, "work")!, ["be"])).toEqual(["sim", "zed", "qa"]);
+  });
+
+  test("a delivery to its ID with no take (a thread mention), then a bind, puts the lane last", () => {
+    const rs = [1, 2].map((n) => post(db, "be", "work", `item ${n}`));
+    expect(rs.map((r) => r.wake)).toEqual([[S], ["sim"]]);
+    pin(rs);
+    // A thread reply naming the ID delivers to it now and takes no claim.
+    const reply = post(db, "be", "work", `@${S} a note on item 1`, rs[0]!.post.id, said);
+    expect(reply.wake).toEqual([S]);
+    expect(takes(claimKey(rs[0]!.post.id))).toEqual([S]);
+    holdAlias(db, "qa", S);
+    // Its take as the ID says 1000; only its delivery as the ID says now.
+    expect(queueLanes(db, getBoard(db, "work")!, ["be"])).toEqual(["sim", "qa"]);
+  });
+});
+
+// #1174 audit H1: queueLaneRows runs inside every queue post's and requeue's write transaction, so its per-lane
+// history reads must stay index searches as history grows, with or without ANALYZE stats. Its address-set subqueries
+// once knocked the planner onto idx_claim_events_key's GLOB range (with stats) or onto every post on the board,
+// probing outbox per post (without), 130x slower at 20k rows.
+describe("queueLaneRows' plan stays indexed (#1174 audit)", () => {
+  const plan = () =>
+    (db.prepare("EXPLAIN QUERY PLAN " + queueLaneRowsSql()).all("work", `["be"]`) as { detail: string }[]).map((r) => r.detail);
+  beforeEach(() => {
+    createBoard(db, "be", "other", "another queue", null, { kind: "queue" });
+    const lanes = 20;
+    for (let i = 0; i < lanes; i++) {
+      const id = "id:" + String(i).padStart(13, "0");
+      ensureAlias(db, "l" + i, "test");
+      registerId(db, { id, principal: null, launcher: false });
+      holdAlias(db, "l" + i, id);
+      subscribe(db, i % 2 ? id : "l" + i, "work", "push");
+    }
+    const insP = db.prepare(`INSERT INTO posts (board, author, body, created_at) VALUES (?, 'be', 'x', ?)`);
+    const insO = db.prepare(`INSERT OR IGNORE INTO outbox (handle, post_id, reason) VALUES (?, ?, 'subscription')`);
+    const insE = db.prepare(`INSERT INTO claim_events (key, handle, event, board, at) VALUES (?, ?, ?, ?, ?)`);
+    db.transaction(() => {
+      for (let k = 0; k < 3000; k++) {
+        const board = k % 3 ? "other" : "work";
+        const id = Number(insP.run(board, k).lastInsertRowid);
+        insO.run("l" + (k % lanes), id);
+        const handle = k % 4 ? "l" + (k % lanes) : "id:" + String(k % lanes).padStart(13, "0");
+        insE.run(`queue:${board}:${id}`, handle, k % 5 ? "take" : "release", board, k);
+      }
+    })();
+  });
+
+  for (const analyze of [false, true]) {
+    test(`takes by (board, handle), outbox by handle then posts by id, ${analyze ? "with" : "without"} ANALYZE`, () => {
+      if (analyze) db.run("ANALYZE");
+      const p = plan();
+      // Names only our own indexes and the query's table aliases, so a SQLite upgrade's rewording ("SEARCH TABLE",
+      // COVERING) doesn't fail it: every read of e, o2 and p2 is a search, takes go through (board, handle), posts
+      // never through the board range, and outbox drives the join (its search before the posts probe).
+      const of = (alias: string) => p.filter((d) => new RegExp(`^(SCAN|SEARCH)( TABLE)? ${alias}\\b`).test(d));
+      const e = of("e"), o2 = of("o2"), p2 = of("p2");
+      for (const reads of [e, o2, p2]) expect(reads.length).toBeGreaterThan(0);
+      for (const d of [...e, ...o2, ...p2]) expect(d).toStartWith("SEARCH");
+      for (const d of e) expect(d).toContain("idx_claim_events_take");
+      for (const d of p2) expect(d).not.toContain("idx_posts_board_id");
+      const first = (alias: string) => p.findIndex((d) => new RegExp(`^SEARCH( TABLE)? ${alias}\\b`).test(d));
+      expect(first("o2")).toBeLessThan(first("p2"));
+    });
+  }
 });
