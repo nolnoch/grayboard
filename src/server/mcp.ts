@@ -45,6 +45,8 @@ export function claimsModern(body: unknown): boolean {
 // Subscriber calls that end a session: their selection admits no unknown ID (#1097).
 const ENDING_CALLS = new Set<unknown>(["session_end", "delivery_release"]);
 export const MCP_PROTOCOL_VERSIONS = ["2026-07-28", "2025-11-25", "2025-06-18"];
+// The failure log's class for a dispatched modern call the endpoint's close cut off (#1342): the SDK swallowed its error.
+class EndpointClosedError extends Error { override name = "EndpointClosedError"; }
 type CallToolResult = z.infer<typeof CallToolResultSchema>;
 const id = z.number().int().positive();
 const ids = z.array(id);
@@ -156,7 +158,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
   } });
   const hosted = createHostedSessions(application, { now, caps: caps.sessions, ...(opts.idleSeconds ? { idleSeconds: opts.idleSeconds } : {}), isAuthorized: (principal, r) => oauth.isAuthorized(principal, r) });
   const delivery = createDelivery(hosted, { isAuthorized: (principal, r) => oauth.isAuthorized(principal, r), now, caps: caps.leases });
-  type Exchange = { request: Request; address: string; protocol: string; principal?: number; identity?: string; session?: string; tool?: string; logged?: boolean; failure?: ApplicationError; meta?: unknown; id?: string | number | null; method?: unknown; call?: unknown; refusal?: Response; context?: Context; legacy?: Legacy; lost?: boolean };
+  type Exchange = { request: Request; address: string; protocol: string; principal?: number; identity?: string; session?: string; tool?: string; logged?: boolean; failure?: ApplicationError; meta?: unknown; id?: string | number | null; method?: unknown; call?: unknown; refusal?: Response; context?: Context; legacy?: Legacy; lost?: boolean; closedAtFactory?: boolean };
   const exchanges = new AsyncLocalStorage<Exchange>();
   const refusalLogs = new RateLimiter({ burst: 1, perSec: 0.1 }, { start() {}, end() {} }, now, 4096);
   const report = (error: unknown, source: FailureSource = "hosted-sdk", exchange = exchanges.getStore()) => {
@@ -721,9 +723,9 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     try {
     const exchange = exchanges.getStore()!;
     if (exchange.context) {
-      if (closed || exchange.request.signal.aborted) throw new Error("MCP request is closed");
+      if (closed || exchange.request.signal.aborted) { exchange.closedAtFactory = closed; throw new Error("MCP request is closed"); }
       const principal = await oauth.authenticate(exchange.request, roleScopes(exchange.context.role));
-      if (closed || exchange.request.signal.aborted) throw new Error("MCP request is closed");
+      if (closed || exchange.request.signal.aborted) { exchange.closedAtFactory = closed; throw new Error("MCP request is closed"); }
       if (principal instanceof Response) refuse(principal);
     }
     const context = exchange.context ??= await select(exchange.request);
@@ -1136,6 +1138,15 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
               await response.body?.cancel(); live?.stop(); exchange.context?.finish();
               releaseListen?.();
               releasePost(); return refusal;
+            }
+            // A modern call the close unwound reaches here, not the catch: the SDK answers a dispatched call 499
+            // (ConnectionClosed), and the factory's own closed check 500. A closing endpoint answers both 503, as it does
+            // a call arriving after close (#1336); the dispatched one says so, since its write may have committed
+            // (#1342). A 499 on an open endpoint is the client's own abort.
+            if (closed && (response.status === 499 || response.status === 500 && exchange.closedAtFactory)) {
+              const dispatched = response.status === 499;
+              if (dispatched) report(new EndpointClosedError(), "hosted-sdk");
+              response = new Response(dispatched ? "MCP endpoint closed during the call" : "MCP endpoint is closed", { status: 503 });
             }
             const done = () => { releaseListen?.(); releasePost(); };
             return wrap(response, exchange.context, live, done);
