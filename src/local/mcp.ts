@@ -172,12 +172,15 @@ const harnessId = (key: string): string | undefined => {
   }
   return v;
 };
-// Claude Code's own, CLAUDE_CODE_SESSION_ID, only when Claude Code is this
-// process's harness: a harness launched from a Claude Code shell (omp, pi)
-// inherits it with CLAUDECODE, and a sibling recorded under it would never be
-// displaced (#1403). An unreadable harness keeps the env's word.
+// Whether Claude Code is this process's harness, decided once at start. A
+// harness launched from a Claude Code shell (omp, pi, opencode) inherits
+// CLAUDECODE and CLAUDE_CODE_SESSION_ID, so the env alone can't say; the
+// process table can (#1403, #1412). An unreadable one keeps the env's word.
+const UNDER_CLAUDE = process.env.CLAUDECODE === "1" && claudeIsHarness() !== false;
+// Claude Code's own, CLAUDE_CODE_SESSION_ID, only under Claude Code: a sibling
+// recorded under an inherited one would never be displaced (#1403).
 let HARNESS_SESSION = harnessId("BUS_HARNESS_SESSION") ??
-  (process.env.CLAUDECODE === "1" && process.env.CLAUDE_CODE_SESSION_ID && claudeIsHarness() !== false ? harnessId("CLAUDE_CODE_SESSION_ID") : undefined);
+  (UNDER_CLAUDE && process.env.CLAUDE_CODE_SESSION_ID ? harnessId("CLAUDE_CODE_SESSION_ID") : undefined);
 const PARENT_SESSION = harnessId("BUS_PARENT_SESSION");
 // A runner child stands in for a session that would own its delivery, so
 // it falls back to (or is promoted to) one.
@@ -285,8 +288,8 @@ if (PARENT_SESSION !== undefined) {
 // Read once at start: whether that hook is in user settings, and the harness
 // the records are kept under (the pid bindings hold; its start time catches a
 // recycled pid). Without the hook (settings from before it), calls act as the
-// root, audited once and said in the instructions and whoami.
-const UNDER_CLAUDE = process.env.CLAUDECODE === "1";
+// root, audited once and said in the instructions and whoami. Only under
+// Claude Code (UNDER_CLAUDE): another harness has no such hooks to miss.
 const CLAUDE_HARNESS = UNDER_CLAUDE && recordHookInstalled()
   ? { pid: HARNESS?.pid ?? process.ppid, start: HARNESS ? HARNESS.proc_start : procStart(process.ppid) ?? null }
   : null;
@@ -295,6 +298,13 @@ const CLAUDE_HARNESS = UNDER_CLAUDE && recordHookInstalled()
 const CLAUDE_CURRENT = CLAUDE_HARNESS !== null && ORDINARY && ADAPTER_OWNER === undefined && process.env.BUS_HARNESS_SESSION === undefined;
 const ATTRIBUTION_OFF = UNDER_CLAUDE && CLAUDE_HARNESS === null;
 const ATTRIBUTION_OFF_NOTE = "Claude Code subagent attribution is off: grayboard's hooks aren't in Claude Code's user settings, so subagents' calls act as this session. Run `grayboard update` (or `grayboard setup`) and restart Claude Code.";
+// Claude Code starting grayboard through a launcher claudeIsHarness doesn't
+// know (`node wrapper.js`, `bun run`): its harness pid can't be found, so no hook record
+// can be read. A call carrying Claude's tool_use_id then acts as the root,
+// audited once and said in whoami from then on (#1412). Not in the
+// instructions: at start, a harness Claude launched (omp) looks the same.
+const CLAUDE_UNRECOGNIZED = process.env.CLAUDECODE === "1" && !UNDER_CLAUDE;
+const CLAUDE_UNRECOGNIZED_NOTE = "Claude Code subagent attribution is off: grayboard can't find Claude Code among this session's parent processes (an unrecognized launcher sits between them), so subagents' calls act as this session. Start `grayboard mcp` from Claude Code directly or through a launcher grayboard recognizes (docs/child-sessions.md §Local runner children).";
 let attributionOffAudited = false;
 if (CLAUDE_CURRENT) {
   const current = readCurrent(sockDir(), CLAUDE_HARNESS.pid, CLAUDE_HARNESS.start);
@@ -782,9 +792,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req, { signal, requestId }) 
       if ("missing" in taken) return recordMissing(name, meta[TOOL_USE_META], taken.missing);
       if (taken.agent !== null) agent = taken.agent;
       if (taken.session !== undefined && taken.session !== HARNESS_SESSION) return recordMissing(name, meta[TOOL_USE_META], "bad_record");
-    } else if (ATTRIBUTION_OFF && !attributionOffAudited) {
+    } else if ((ATTRIBUTION_OFF || CLAUDE_UNRECOGNIZED) && !attributionOffAudited) {
       attributionOffAudited = true;
-      writeCoreAudit(db, "claude.attribution_off", SESSION_ID, null, { tool: name });
+      writeCoreAudit(db, "claude.attribution_off", SESSION_ID, null, ATTRIBUTION_OFF ? { tool: name } : { tool: name, reason: "harness_not_claude" });
     }
   }
   const run = async () => {
@@ -876,7 +886,7 @@ async function dispatch(name: string, a: Record<string, unknown>, signal: AbortS
   if (name === "bind") return bind(a, signal);
   if (name === "unbind") return unbind(a, signal);
   // Local mode has one implicit scope: no principal (#284 S6).
-  if (name === "whoami") return text({ id: child ?? SESSION_ID, primary: primary(), aliases: holds(), principal: null, ...(WRITES_AS ? { writes_as: WRITES_AS } : {}), ...(child !== undefined ? { root: rootId(), child: true } : {}), ...(ATTRIBUTION_OFF ? { note: ATTRIBUTION_OFF_NOTE } : {}) });
+  if (name === "whoami") return text({ id: child ?? SESSION_ID, primary: primary(), aliases: holds(), principal: null, ...(WRITES_AS ? { writes_as: WRITES_AS } : {}), ...(child !== undefined ? { root: rootId(), child: true } : {}), ...(ATTRIBUTION_OFF ? { note: ATTRIBUTION_OFF_NOTE } : CLAUDE_UNRECOGNIZED && attributionOffAudited ? { note: CLAUDE_UNRECOGNIZED_NOTE } : {}) });
   // The session the write is from (sender_id, author_id): the child making
   // the call, which its writes also name as `via` (#523), else this one.
   const WRITER = child ?? SESSION_ID;
