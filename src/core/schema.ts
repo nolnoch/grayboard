@@ -221,6 +221,13 @@ export function initCoreSchema(db: Database): void {
   // claim rows reach callers through CLAIM_COLS (src/core/claims.ts), which leaves it out.
   const claimCols = new Set((db.prepare(`PRAGMA table_info(claims)`).all() as { name: string }[]).map((c) => c.name));
   if (!claimCols.has("holder_user")) db.exec(`ALTER TABLE claims ADD COLUMN holder_user TEXT`);
+  // The session holding a claim event's handle when the row was written (#1351): the alias's holder, else the handle
+  // when it is a session ID; null for an alias no session held, and for rows from before it. A queue lane's take
+  // history follows it while that session is live (queueLaneRowsSql, redeliveryFacts). The index comes after the
+  // ALTER: on an old database the column doesn't exist until it runs.
+  const claimEventCols = new Set((db.prepare(`PRAGMA table_info(claim_events)`).all() as { name: string }[]).map((c) => c.name));
+  if (!claimEventCols.has("session_id")) db.exec(`ALTER TABLE claim_events ADD COLUMN session_id TEXT`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_claim_events_take_sid ON claim_events(board, session_id, at) WHERE event = 'take'`);
   // Session end and kinds (#284 PR 2). held_aliases_json: the aliases the ID
   // held when it ended, for the id_ended hint and bounces. delivery: 'push'
   // (default) or 'none', a tools-only process (BUS_PUSH=off) that receives

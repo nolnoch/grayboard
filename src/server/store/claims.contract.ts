@@ -35,7 +35,7 @@ export type ClaimsHarness = {
   // Raw reads: every claims row by key (byte order), every watch by key then handle, every event in insertion order.
   claimRows(): Promise<ClaimRow[]>;
   watchRows(): Promise<{ key: string; handle: string }[]>;
-  eventRows(): Promise<{ key: string; handle: string; event: string; note: string | null; board: string | null; expires_at: number | null; held_by: string | null; at: number }[]>;
+  eventRows(): Promise<{ key: string; handle: string; event: string; note: string | null; board: string | null; expires_at: number | null; held_by: string | null; at: number; session_id: string | null }[]>;
   close(): void | Promise<void>;
 };
 
@@ -214,16 +214,32 @@ function readsAndWatches(it: It): void {
       await h.claims.logEvent(tx, "take", BE, { key: "other" }, T0 + 4);
     });
     expect(await h.eventRows()).toEqual([
-      { key: "k", handle: FE, event: "take", note: "n", board: "hall", expires_at: T0 + 9, held_by: null, at: T0 + 1 },
-      { key: "k", handle: BE, event: "refused", note: null, board: null, expires_at: null, held_by: FE, at: T0 + 2 },
-      { key: "k", handle: FE, event: "release", note: null, board: null, expires_at: null, held_by: null, at: T0 + 3 },
-      { key: "other", handle: BE, event: "take", note: null, board: null, expires_at: null, held_by: null, at: T0 + 4 },
+      { key: "k", handle: FE, event: "take", note: "n", board: "hall", expires_at: T0 + 9, held_by: null, at: T0 + 1, session_id: null },
+      { key: "k", handle: BE, event: "refused", note: null, board: null, expires_at: null, held_by: FE, at: T0 + 2, session_id: null },
+      { key: "k", handle: FE, event: "release", note: null, board: null, expires_at: null, held_by: null, at: T0 + 3, session_id: null },
+      { key: "other", handle: BE, event: "take", note: null, board: null, expires_at: null, held_by: null, at: T0 + 4, session_id: null },
     ]);
     expect(await h.claims.recentEvents(h.read, "k")).toEqual([
       { handle: FE, event: "release", note: null, at: T0 + 3 },
       { handle: BE, event: "refused", note: null, at: T0 + 2 },
     ]);
     expect(await h.claims.recentEvents(h.read, "none")).toEqual([]);
+  });
+
+  // K-10b (#1351): session_id is the session holding the handle when the row is written, on every event kind.
+  it("logEvent records the holding session: an alias's holder, a session ID itself, null for an alias no session holds", async h => {
+    const sid = "id:0123456789abc", other = "id:holder0000000";
+    await h.session(sid, ME);
+    await h.session(other, ME);
+    await h.hold(FE, other);
+    await h.write(async tx => {
+      await h.claims.logEvent(tx, "take", FE, { key: "k" }, T0 + 1);
+      await h.claims.logEvent(tx, "release", sid, { key: "k" }, T0 + 2);
+      await h.claims.logEvent(tx, "take", BE, { key: "k" }, T0 + 3);
+    });
+    expect((await h.eventRows()).map(r => [r.handle, r.event, r.session_id])).toEqual([
+      [FE, "take", other], [sid, "release", sid], [BE, "take", null],
+    ]);
   });
 
   // K-11.
@@ -267,8 +283,8 @@ function ack(it: It): void {
     expect((await h.claimRows()).map(c => c.key)).toEqual(["queue:jobs:2"]);
     expect(await h.watchRows()).toEqual([{ key: "queue:jobs:2", handle: "w2" }]);
     expect(await h.eventRows()).toEqual([
-      { key: "queue:jobs:1", handle: FE, event: "release", note: "ack", board: "jobs", expires_at: T0 + 1, held_by: null, at: T0 },
-      { key: "queue:jobs:3", handle: FE, event: "release", note: "ack (late)", board: "jobs", expires_at: T0, held_by: null, at: T0 },
+      { key: "queue:jobs:1", handle: FE, event: "release", note: "ack", board: "jobs", expires_at: T0 + 1, held_by: null, at: T0, session_id: null },
+      { key: "queue:jobs:3", handle: FE, event: "release", note: "ack (late)", board: "jobs", expires_at: T0, held_by: null, at: T0, session_id: null },
     ]);
   });
 }

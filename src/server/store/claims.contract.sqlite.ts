@@ -28,7 +28,7 @@ export const sqliteClaimsBackend: ClaimsBackend = {
         [c.key, c.holder, c.note, c.board, c.acquired_at, c.expires_at, c.holder_user]),
       claimRows: async () => all<ClaimRow>("SELECT key, holder, note, board, acquired_at, expires_at, holder_user FROM claims ORDER BY key"),
       watchRows: async () => all<{ key: string; handle: string }>("SELECT key, handle FROM claim_watches ORDER BY key, handle"),
-      eventRows: async () => all("SELECT key, handle, event, note, board, expires_at, held_by, at FROM claim_events ORDER BY id"),
+      eventRows: async () => all("SELECT key, handle, event, note, board, expires_at, held_by, at, session_id FROM claim_events ORDER BY id"),
       close: () => repo.close(),
     };
   },
