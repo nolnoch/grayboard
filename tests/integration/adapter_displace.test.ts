@@ -331,3 +331,41 @@ test("a drain paused between its hold check and its mark (forced) holds the writ
   expect(adapter.pushes.filter((p) => p.content.includes("in-mark"))).toEqual([]);
   expect(client.pushes.filter((p) => p.content.includes("in-mark"))).toHaveLength(1);
 }, 30_000);
+
+// #1401: a holder's recorded harness pid can be a dead harness's, reused by
+// the adapter's child's harness while the holder (an orphan that hasn't shut
+// down) outlived it. Forced by rewriting the holder's recorded harness pid to
+// the new harness's: the holder isn't that harness's child, so it keeps the
+// name, and a session under that harness doesn't yield its record to it.
+const recordHarnessPid = (id: string, harnessPid: number): void => {
+  const db = new Database(join(dir, "bus.db"));
+  try {
+    db.exec("PRAGMA busy_timeout = 10000");
+    db.prepare(`UPDATE bindings SET harness_pid = ? WHERE session_id = ?`).run(harnessPid, id);
+  } finally {
+    db.close();
+  }
+};
+
+test("a holder whose recorded harness pid was reused by the adapter's child's harness (forced) keeps the name: it isn't that harness's child", async () => {
+  // The harness the adapter's child will run under, with an unbound session of its own.
+  const anchor = await localSession(dir, undefined, { extra: { [SIBLINGS]: sock } });
+  const other = await localSession(dir, "omp-local");
+  const otherId = (await who(other)).id;
+  recordHarnessPid(otherId, anchor.harnessPid);
+  const adapter = await siblingSession(sock, adapterEnv("conv-1"));
+  await ready(adapter);
+  expect((await who(adapter)).aliases).toEqual([]);
+  expect(holder("omp-local")).toBe(otherId);
+  expect(displaced()).toEqual([]);
+}, 30_000);
+
+test("a session doesn't yield its name record to an adapter's child whose recorded harness pid is its harness's but which isn't that harness's child (forced)", async () => {
+  const orphan = await localSession(dir, undefined, { extra: { BUS_ADAPTER_OWNER: OWNER, BUS_HARNESS_SESSION: "conv-1" } });
+  await ready(orphan);
+  const orphanId = (await who(orphan)).id;
+  const client = await localSession(dir, undefined);
+  recordHarnessPid(orphanId, client.harnessPid);
+  await client.call("bind", { name: "task-r", create: true });
+  expect(record(client.harnessPid)).toMatchObject({ names: ["task-r"], session_id: (await who(client)).id });
+}, 30_000);
