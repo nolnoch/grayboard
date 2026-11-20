@@ -93,6 +93,22 @@ describe("an ID is judged as its session's primary on every scoped board (#1255)
     for (const label of ["qa-room", "qa task", "qa status"]) expect(all, label).toContain(label);
   });
 
+  test("a session reads back the labels on its own non-primary hold (#1277)", async () => {
+    const { ops } = await cast();
+    await ops.call("bind", { name: "eng/side", create: true, meta: { task: "side task", description: "side desc" } });
+    const own = (await ops.call<{ peers: { handle: string; self?: boolean; task?: string; description?: string }[] }>("peer_list", { include_offline: true }))
+      .peers.find((p) => p.handle === "eng/side");
+    expect(own).toMatchObject({ self: true, task: "side task", description: "side desc" });
+    // The control: only its own rows pass. Its primary is qa/ops, so another session's eng name still shows it no labels
+    // or status (#1255).
+    const b2 = await hosted("eng/b2");
+    await b2.call("bind", { name: "eng/b2", meta: { task: "eng task" } });
+    await b2.call("peer_status", { text: "eng status" });
+    const listed = JSON.stringify(await ops.call("peer_list", { include_offline: true }));
+    expect(listed).toContain("eng/b2");
+    for (const leak of ["eng task", "eng status"]) expect(listed, leak).not.toContain(leak);
+  });
+
   test("a claim on qa's board shows its ID neither the board nor the note in a held answer (#1273 L1)", async () => {
     const { ops, build, id } = await cast();
     await ops.call("claim_take", { key: "ticket:QA-2", board: "qa-room", note: "qa note" });

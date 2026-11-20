@@ -1756,7 +1756,8 @@ export function assembleWho(rows: WhoRow[], match: PeerMatch | undefined, f: Who
     // members (#348), before `match` and the offline count, so neither probes
     // a hidden name.
     if (r.scope_kind !== null && !f.own.has(r.handle) && !f.seesName({ scope_kind: r.scope_kind, scope_ref: r.scope_ref })) continue;
-    const seesMeta = r.scope_kind !== null && f.seesMeta({ scope_kind: r.scope_kind, scope_ref: r.scope_ref });
+    // A session always reads back its own holds' labels, a non-primary hold's too (#1277): it set them.
+    const seesMeta = r.scope_kind !== null && (f.own.has(r.handle) || f.seesMeta({ scope_kind: r.scope_kind, scope_ref: r.scope_ref }));
     // The session's facts (where it runs, its status, harness, model, effort,
     // launcher) follow the labels' cut: an alias's to a caller that may act
     // in its scope, an ID's to one that may act in its principal's (security
