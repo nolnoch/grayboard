@@ -22,6 +22,8 @@ import { deliveryPath } from "../../adapters/hosted-core/src/storage.ts";
 import { hostedSessionId } from "../../src/server/hosted.ts";
 import { hostedServer, seedGrant, storeLogin as sharedStore, type HostedServer } from "../support/hosted_oauth.ts";
 import { until } from "../support/until.ts";
+import { hostedRowCount } from "../support/hosted_rows.ts";
+import { end, register } from "../../adapters/hosted-core/src/children.ts";
 import { row as sqlRow, rows as sqlRows } from "../support/repo_sql.ts";
 
 const CLIENT = "grayboard-pi";
@@ -505,4 +507,57 @@ test("a child already bound as its own root is refused registration, and the roo
   const code = () => { const r = record(a); return r?.operation === "child_register" ? r.code : r?.failure?.operation === "child_register" ? r.failure.code : undefined; };
   await until(() => code() !== undefined, 10_000, "the root's child_register diagnostic");
   expect(code()).toBe("child_bound");
+}, 30_000);
+
+// #1099: a wire that only ends a session (HostedClient.endSession, children's end, the Controller's release and a
+// child's end) connects naming no session, so the server admits nothing for it: an ID it never saw, or one it already
+// ended, gets no row and no audit (no id.registered, id.reopened or hosted.ownership_started), only a stale lease's own
+// refusal row. Its calls still name the session, so a live one ends; a registration still admits.
+const audits = async () => (await sqlRows<{ action: string }>(srv, "SELECT action FROM access_log ORDER BY id")).map(r => r.action);
+test("ending-only wires admit nothing for an unknown or ended session, and still end a live one; a registration still admits (#1099)", async () => {
+  const logs: { message: string; level: Level }[] = [];
+  const c = client(logs);
+  const start = await audits();
+  await c.endSession("never-seen");
+  await end(c.temporary, { child: "never-seen-child" });
+  expect(await hostedRowCount(srv)).toBe(0);
+  expect(await audits()).toEqual(start);
+
+  await register(c.temporary, { root: "reg-root", via: [], child: "reg-child" });
+  expect(await hostedRowCount(srv)).toBe(2);
+  expect((await audits()).slice(start.length)).toContain("id.registered");
+  await end(c.temporary, { child: "reg-child" });
+  expect(await hostedRowCount(srv)).toBe(1);
+  await c.endSession("reg-root");
+  expect(await hostedRowCount(srv)).toBe(0);
+  const ended = await audits();
+  await c.endSession("reg-root");
+  await end(c.temporary, { child: "reg-child" });
+  expect(await hostedRowCount(srv)).toBe(0);
+  expect(await audits()).toEqual(ended);
+  expect(logs).toEqual([]);
+}, 30_000);
+
+test("the Controller's release and child end under a session the server already ended admit nothing (#1099)", async () => {
+  const a = await live("release-1", "releaser");
+  const controller = Reflect.get(a.root, "controller") as Controller;
+  // A child the root's call registered, which the server then ends (as its own session_end would).
+  expect((await a.root.call("whoami", {}, undefined, { child: "release-child" })).isError).toBeUndefined();
+  expect(await hostedRowCount(srv)).toBe(2);
+  await a.client.endSession("release-child");
+  expect(await hostedRowCount(srv)).toBe(1);
+  const before = await audits();
+  await controller.ended("release-child");
+  expect(await hostedRowCount(srv)).toBe(1);
+  expect(await audits()).toEqual(before);
+  // The first pause stops the run loop and releases the root; a second release (a stale lease on a root the
+  // server already ended) sends delivery_release then session_end under the ended ID.
+  await controller.pause();
+  expect(await hostedRowCount(srv)).toBe(0);
+  const released = await audits();
+  const root = (Reflect.get(controller, "roots") as Map<string, { lease?: { capability: string } }>).get("release-1")!;
+  root.lease = { capability: "a".repeat(43) } as never;
+  await controller.pause();
+  expect(await hostedRowCount(srv)).toBe(0);
+  expect(await audits()).toEqual([...released, "hosted.stale_capability"]);
 }, 30_000);

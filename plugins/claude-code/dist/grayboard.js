@@ -31822,10 +31822,13 @@ class Wire extends Connection {
       headers.set("X-Grayboard-Lease", this.capability);
   }
   meta() {
-    return { [this.wireOptions.sessionKey]: this.sessionID, ...this.declaration(), ...this.facts(this.sessionID) };
+    return this.wireOptions.ending ? {} : this.named();
+  }
+  named() {
+    return this.wireOptions.ending ? { [this.wireOptions.sessionKey]: this.sessionID } : { [this.wireOptions.sessionKey]: this.sessionID, ...this.declaration(), ...this.facts(this.sessionID) };
   }
   async read(uri) {
-    const value = await this.reachable(this.client.readResource({ uri, _meta: this.meta() }, this.options())).catch((error) => {
+    const value = await this.reachable(this.client.readResource({ uri, _meta: this.named() }, this.options())).catch((error) => {
       if (error?.code === -32602 || error?.code === -32603)
         throw subscriberError(error.data, uri === "grayboard://inbox");
       throw error;
@@ -31835,7 +31838,7 @@ class Wire extends Connection {
     return JSON.parse(value.contents[0].text);
   }
   async call(name, args = {}) {
-    const value = await this.reachable(this.client.callTool({ name, arguments: args, _meta: this.meta() }, this.options()));
+    const value = await this.reachable(this.client.callTool({ name, arguments: args, _meta: this.named() }, this.options()));
     if (value.isError) {
       throw subscriberError(value.structuredContent, name.startsWith("delivery_"));
     }
@@ -36432,8 +36435,8 @@ class HostedClient {
       return;
     }
   };
-  temporary = async (sessionID, run) => {
-    const wire = new Wire(this.wireOptions("poll"), this.auth, AbortSignal.timeout(1e4), sessionID);
+  temporary = async (sessionID, run, ending) => {
+    const wire = new Wire({ ...this.wireOptions("poll"), ...ending ? { ending: true } : {} }, this.auth, AbortSignal.timeout(1e4), sessionID);
     try {
       await wire.connect();
       return await run(wire);
@@ -36443,7 +36446,7 @@ class HostedClient {
   };
   async endSession(id) {
     try {
-      await this.temporary(id, (wire) => wire.call("session_end"));
+      await this.temporary(id, (wire) => wire.call("session_end"), true);
     } catch (error) {
       this.options.log(endFailedText(id, error), "warning");
     }
@@ -36689,7 +36692,7 @@ async function register2(temporary, path) {
   await temporary(path.root, (wire) => wire.call("session_register", { child: path.child, ...path.via.length ? { via: path.via } : {} }));
 }
 async function end(temporary, path) {
-  await temporary(path.child, (wire) => wire.call("session_end"));
+  await temporary(path.child, (wire) => wire.call("session_end"), true);
 }
 
 // adapters/hosted-core/src/controller.ts
@@ -36868,7 +36871,7 @@ class Controller {
   async enlist(path, fetch2 = false) {
     const r = this.roots.get(path.root), live = !!r && !r.paused, releases = r?.released ?? 0, epoch = r?.epoch;
     const e = r?.e ?? await this.port.credential.capture(path.root);
-    const call = (sessionID, c) => this.temporary(e, c, sessionID);
+    const call = (sessionID, c, ending) => this.temporary(e, c, sessionID, undefined, ending);
     const shared = () => {
       const known = r && this.registered.get(path.sessionID);
       return known && known.r === r && known.epoch === r.epoch && (!known.settled || known.ownership !== undefined && known.ownership === r.lease?.ownership) ? known.done : undefined;
@@ -36982,17 +36985,17 @@ class Controller {
   wireOptions(e) {
     return { url: e.configuration.url, sessionKey: this.port.sessionKey, client: this.port.client, ...this.port.delivery ? { delivery: this.port.delivery } : {}, ...this.port.launcher ? { launcher: true } : {}, ...this.port.facts ? { facts: (id) => this.port.facts(id) } : {}, ...this.port.suggested ? { suggested: (id) => this.port.suggested(id) } : {} };
   }
-  async wire(e, sessionID = e.sessionID, signal = AbortSignal.timeout(1e4), beforeRetry) {
+  async wire(e, sessionID = e.sessionID, signal = AbortSignal.timeout(1e4), beforeRetry, ending = false) {
     let current;
-    const wire = new this.Transport(this.wireOptions(e), {
+    const wire = new this.Transport({ ...this.wireOptions(e), ...ending ? { ending: true } : {} }, {
       token: async () => current = await this.port.credential.token(e),
       onUnauthorized: async () => this.port.credential.unauthorized(e, current ?? "")
     }, signal, sessionID, beforeRetry);
     await wire.connect();
     return wire;
   }
-  async temporary(e, call, sessionID = e.sessionID, stop) {
-    const wire = await this.wire(e, sessionID, stop && AbortSignal.any([AbortSignal.timeout(1e4), stop]));
+  async temporary(e, call, sessionID = e.sessionID, stop, ending = false) {
+    const wire = await this.wire(e, sessionID, stop && AbortSignal.any([AbortSignal.timeout(1e4), stop]), undefined, ending);
     try {
       return await call(wire);
     } finally {
@@ -37455,7 +37458,7 @@ class Controller {
         await wire.call("delivery_release").catch((error) => this.failure("delivery_release", error, r));
       }
       await wire.call("session_end");
-    });
+    }, r.e.sessionID, undefined, true);
   }
   async pause(message = `Ownership ended; ${this.hint}`) {
     return this.serial(async () => {
@@ -37499,7 +37502,7 @@ class Controller {
   async endUnowned(sessionID) {
     try {
       const e = await this.port.credential.capture(sessionID);
-      await this.temporary(e, (wire) => wire.call("session_end"));
+      await this.temporary(e, (wire) => wire.call("session_end"), e.sessionID, undefined, true);
     } catch (error) {
       this.diagnostics.record({ state: "degraded", message: `session_end failed (${failureCode(error)})`, operation: "session_end", sessionID, code: failureCode(error) });
     }
@@ -37828,7 +37831,7 @@ class Controller {
       });
     } else {
       const e = r?.e ?? await this.port.credential.capture(path.root);
-      await end((id, call) => this.temporary(e, call, id), { child: sessionID }).catch((error) => this.failure("child_end", error, r));
+      await end((id, call, ending) => this.temporary(e, call, id, undefined, ending), { child: sessionID }).catch((error) => this.failure("child_end", error, r));
     }
   }
   backgroundFailure(operation) {

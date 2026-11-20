@@ -155,11 +155,10 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: a parked child's 
 });
 
 // #1097: an ending call (session_end, delivery_release) under an ID the server no longer holds ends nothing and starts
-// nothing: no row, no ownership, no audit but the stale lease's own refusal row. A client's connect admits its ID as any
-// session start does (#1099; on the legacy protocols the standing GET stream too, so only the stateless protocol can
-// put the row's end between connect and the calls), so over HTTP this is the row ending after the connect (here the
-// server releases it), as the controller's release sends the two calls. The direct calls cover the tool gates for an
-// ID never seen.
+// nothing: no row, no ownership, no audit but the stale lease's own refusal row. A connect that names an ID admits it as
+// any session start does, so this raw client's row ends after its connect (here the server releases it); hosted-core's
+// ending-only wires connect naming no session and admit nothing (#1099, tests/integration/hosted_core_root.test.ts). The
+// direct calls cover the tool gates for an ID never seen.
 test("ending calls under an unknown ID write nothing; session_end reports ended: false", async () => {
   const grant = await issue();
   const stranger = await connect("2026-07-28", grant.token, "gone-before-end", { "X-Grayboard-Lease": "a".repeat(43) });

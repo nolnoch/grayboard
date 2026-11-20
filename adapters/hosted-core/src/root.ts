@@ -446,9 +446,9 @@ export class RootDelivery {
   // ends now: the server's idle sweep ends only roots, so a child's session
   // otherwise lasts until its root's does. Only a child a call passed; said on
   // failure. `called`: the host knows a call passed in an earlier process of
-  // this session (the plugin's record dir survives its restart, #555): the end
-  // of a session the server no longer has starts one to end it, so the host
-  // forgets a call once its root's release ended the child. Never rejects.
+  // this session (the plugin's record dir survives its restart, #555); the
+  // host forgets a call once its root's release ended the child, which spares
+  // a request (the end's wire admits nothing, #1099). Never rejects.
   async endChild(child: string, called = false): Promise<void> {
     if (!this.children.delete(child) && !called) return;
     try { await end(this.client.temporary, { child }); }

@@ -90,8 +90,8 @@ export class HostedClient {
   };
 
   // One short-lived poll wire under `sessionID` (a child's register and end, a session's end).
-  temporary: Temporary = async (sessionID, run) => {
-    const wire = new Wire(this.wireOptions("poll"), this.auth, AbortSignal.timeout(10_000), sessionID);
+  temporary: Temporary = async (sessionID, run, ending) => {
+    const wire = new Wire({ ...this.wireOptions("poll"), ...(ending ? { ending: true as const } : {}) }, this.auth, AbortSignal.timeout(10_000), sessionID);
     try { await wire.connect(); return await run(wire); }
     finally { await wire.close().catch(() => {}); }
   };
@@ -101,7 +101,7 @@ export class HostedClient {
   // the server's idle sweep. Every failure is said, a sign-out included: the
   // session then stays bound until that sweep.
   async endSession(id: string): Promise<void> {
-    try { await this.temporary(id, wire => wire.call("session_end")); }
+    try { await this.temporary(id, wire => wire.call("session_end"), true); }
     catch (error) { this.options.log(endFailedText(id, error), "warning"); }
   }
 
