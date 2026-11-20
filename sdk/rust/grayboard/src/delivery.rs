@@ -33,7 +33,7 @@ const FAILURE_LIMIT: u32 = 8;
 const RECOVERY_LIMIT: u32 = 3;
 /// Admission-throttled reopens before the stream stops with the transport's `RateLimited`.
 const THROTTLE_LIMIT: u32 = 8;
-/// Listen-cap refusals a renewal's reopen retries before it is an ordinary round failure (#1394): `backoff_unit` doubling, 7.75 s in all at the defaults, well inside the lease's 30 s TTL, which nothing renews meanwhile.
+/// Listen-cap refusals a renewal's reopen retries before it is an ordinary round failure (#1394): `backoff_unit` doubling, 7.75 s in all at the defaults, well inside the lease's 30 s TTL, which nothing renews meanwhile. A larger `backoff_unit` can outlast the TTL; the lease then lapses and costs a lease recovery, not a failure. The global listen cap returns the same body and is retried too, harmlessly: the old slot frees a global one as well.
 const SWAP_CAPACITY_RETRIES: u32 = 5;
 /// The server's body for a listen past the listen cap (`src/server/mcp.ts` `reserve`), a plain-text 429 (`Error::Capacity`). Only this one is the reopen's slot race: request or exchange capacity is not.
 const LISTEN_CAPACITY: &str = "MCP listen capacity reached";

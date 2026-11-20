@@ -646,7 +646,7 @@ export class Controller<E extends Enrollment = Enrollment> {
                 bound.abort();
               }
               await this.guard(r, epoch, signal);
-              // The server frees the old slot when it notices the dropped request, so at the per-user listen cap the
+              // The server frees the old slot when it notices the dropped request, so at the listen cap (per-user or global) the
               // new listen can race it and be refused (#1394): that refusal alone is retried here, on a short
               // backoff under the same lease, and spends no failure. Past SWAP_CAPACITY_RETRIES it is an ordinary
               // reopen (one failure), as a listen the cap refuses outside a swap is.
