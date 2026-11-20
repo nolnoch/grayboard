@@ -92,11 +92,14 @@ describePg("pg.ts", () => {
     expect(JSON.parse(out.trim())).toEqual({ name: mine.name, built: false });
   });
 
-  test("the sweep drops another migration set's template unused for TEMPLATE_AGE_MS or unstamped, never a recent one or the caller's", async () => {
+  test("the sweep drops another migration set's template stamped over TEMPLATE_AGE_MS ago; it stamps an unstamped one and leaves a recent one, the caller's, and names it couldn't have made", async () => {
     const tag = crypto.randomUUID().replaceAll("-", "").slice(0, 10);
-    const names = { old: `gb_tpl_${tag}_old`, unstamped: `gb_tpl_${tag}_none`, recent: `gb_tpl_${tag}_new`, current: `gb_tpl_${tag}_cur` };
+    // `odd`: a name quoted() refuses (another tool's, say); the sweep must skip it, not throw.
+    const names = { old: `gb_tpl_${tag}_old`, unstamped: `gb_tpl_${tag}_none`, recent: `gb_tpl_${tag}_new`, current: `gb_tpl_${tag}_cur`, odd: `gb_tpl_${tag}_Odd` };
+    const oddLeak = `gbt_1_${tag}_Odd`;
     const admin = new Bun.SQL(PG_URL!);
-    const present = async () => (await admin`SELECT datname FROM pg_database WHERE datname LIKE ${`gb_tpl_${tag}%`} ORDER BY datname`).map((r: { datname: string }) => r.datname);
+    const present = async () => (await admin`SELECT datname FROM pg_database WHERE datname LIKE ${`%${tag}%`} ORDER BY datname`).map((r: { datname: string }) => r.datname);
+    const stampOf = async (name: string) => Number((await admin`SELECT shobj_description(oid, 'pg_database') AS s FROM pg_database WHERE datname = ${name}`)[0].s);
     try {
       const old = Date.now() - TEMPLATE_AGE_MS - 60_000;
       for (const [kind, name] of Object.entries(names)) {
@@ -104,8 +107,14 @@ describePg("pg.ts", () => {
         await admin.unsafe(`ALTER DATABASE "${name}" WITH IS_TEMPLATE true ALLOW_CONNECTIONS false`);
         if (kind !== "unstamped") await admin.unsafe(`COMMENT ON DATABASE "${name}" IS '${kind === "recent" ? Date.now() : old}'`);
       }
+      await admin.unsafe(`CREATE DATABASE "${oddLeak}" TEMPLATE template0`);
+      const before = Date.now();
       await sweepLeaks(admin, names.current);
-      expect(await present()).toEqual([names.current, names.recent].sort());
+      expect(await present()).toEqual([names.current, names.odd, names.recent, names.unstamped, oddLeak].sort());
+      // Stamped on first sight: it ages out TEMPLATE_AGE_MS from now, not at once.
+      expect(await stampOf(names.unstamped)).toBeGreaterThanOrEqual(before);
+      await sweepLeaks(admin, names.current);
+      expect(await present()).toContain(names.unstamped);
     } finally {
       for (const name of await present()) {
         await admin.unsafe(`ALTER DATABASE "${name}" WITH IS_TEMPLATE false`);

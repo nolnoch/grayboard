@@ -11,6 +11,7 @@ import { join } from "node:path";
 import { DELEGATE_LIMIT, DELEGATE_OPEN_CAP } from "../../src/core/delegation.ts";
 import { refusal, type AppSession } from "../support/app_session.ts";
 import { call, closeSessions, localSession, refusal as localRefusal, refusalCoded } from "../support/mcp.ts";
+import { drained, rows as sqlRows } from "../support/repo_sql.ts";
 import { TestServer } from "../support/server.ts";
 
 type Delegated = { to: string; message_id: number; replayed?: unknown };
@@ -25,8 +26,11 @@ afterEach(async () => {
 });
 
 const launcher = (srv: TestServer, token: string, identity: string): Promise<AppSession> => srv.connected(token, identity, { launcher: true });
-const rows = (srv: TestServer, action: string) =>
-  (srv.app.db.query(`SELECT actor, target, detail FROM access_log WHERE action = ? ORDER BY id`).all(action) as { actor: string; target: string; detail: string }[]);
+// The access_log rows of `action`, detail as stored (text), once the writes queued before the read have landed.
+const rows = async (srv: TestServer, action: string) => {
+  await drained(srv);
+  return sqlRows<{ actor: string; target: string; detail: string }>(srv, `SELECT actor, target, detail FROM access_log WHERE action = ? ORDER BY id`, action);
+};
 
 test("server: the user's bucket refuses past the burst, audits one streak, and charges neither a replay nor a refusal", async () => {
   let clock = Date.now();
@@ -53,17 +57,17 @@ test("server: the user's bucket refuses past the burst, audits one streak, and c
     expect((await refusal(sim.delegate({ persona: "p", task: "t2", resend: true }))).code).toBe("rate_limited");
 
     // One throttled row for the streak, naming the user and the requester that tripped it; the throttled calls aren't delegation.refused rows.
-    const throttled = rows(srv, "delegation.throttled");
+    const throttled = await rows(srv, "delegation.throttled");
     expect(throttled.length).toBe(1);
     expect(throttled[0]!.target).toBe("you@example.com");
     expect(throttled[0]!.actor).toBe("you@example.com");
     expect(JSON.parse(throttled[0]!.detail)).toMatchObject({ requester: "you@example.com/sim", session_id: expect.any(String) });
-    expect(rows(srv, "delegation.refused").map((x) => JSON.parse(x.detail).reason)).toEqual([expect.stringContaining("nobody")]);
+    expect((await rows(srv, "delegation.refused")).map((x) => JSON.parse(x.detail).reason)).toEqual([expect.stringContaining("nobody")]);
 
     // A minute refills one token.
     clock += 61_000;
     expect((await sim.delegate({ persona: "p", task: "t3" })).to).toBe("you@example.com/be");
-    expect(rows(srv, "delegation.requested").length).toBe(3);
+    expect((await rows(srv, "delegation.requested")).length).toBe(3);
   } finally {
     await srv.stop();
   }
@@ -94,7 +98,7 @@ test("server: a user's sessions share one bucket, so a fresh session can't reset
     expect((await refusal(theirs.delegate({ persona: "p", task: "t3" }))).code).toBe("rate_limited");
 
     // One streak row per user, the first naming the session that tripped it.
-    const throttled = rows(srv, "delegation.throttled");
+    const throttled = await rows(srv, "delegation.throttled");
     expect(throttled.map((x) => x.target)).toEqual(["you@example.com", "other@example.com"]);
     expect(JSON.parse(throttled[0]!.detail).requester).toBe("you@example.com/sim2");
   } finally {
@@ -111,8 +115,8 @@ test("server, hosted: the throttled row survives the tool call's rolled-back tra
     await sim.call("delegate", { persona: "p", task: "t1" });
     await expect(sim.call("delegate", { persona: "p", task: "t2" })).rejects.toThrow(/too many delegation requests/);
     await expect(sim.call("delegate", { persona: "p", task: "t3" })).rejects.toThrow(/too many delegation requests/);
-    expect(rows(srv, "delegation.throttled").length).toBe(1);
-    expect(rows(srv, "delegation.refused").length).toBe(0);
+    expect((await rows(srv, "delegation.throttled")).length).toBe(1);
+    expect((await rows(srv, "delegation.refused")).length).toBe(0);
   } finally {
     await srv.stop();
   }

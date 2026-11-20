@@ -474,3 +474,7 @@ describe("nothing else is touched", () => {
     expect(Bun.inspect(client)).not.toContain(run.token);
   }, 30_000);
 });
+
+test("a static run token reports no token changes: its root's listen is never replaced for one (#1379)", () => {
+  expect(signIn({ refused: "off" }, "https://grayboard.example.com/mcp").credential().rotated).toBeUndefined();
+});

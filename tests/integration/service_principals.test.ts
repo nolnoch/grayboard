@@ -14,6 +14,7 @@ import { HostedToolError } from "../support/hosted_session.ts";
 import { ROOT as REPO_ROOT } from "../support/paths.ts";
 import { seed } from "../support/seed.ts";
 import { ServerProcess, TestServer } from "../support/server.ts";
+import { execOn, row, rows as sqlRows } from "../support/repo_sql.ts";
 
 const A = "alice@example.com", B = "bob@example.com", ROOT = "root@example.com", SVC = "ingest";
 
@@ -23,8 +24,8 @@ afterEach(() => srv.stop());
 
 const api = (token: string, method: string, path: string, body?: unknown) => srv.api(token, method, path, body);
 const create = (token: string, name: string, owners: unknown) => api(token, "POST", "/api/admin/services", { name, owners });
-const serviceRows = () => srv.app.db.query("SELECT p.name, p.kind, u.email FROM principals p LEFT JOIN users u ON u.id = p.user_id WHERE p.kind = 'service' ORDER BY p.id").all();
-const ownerRows = () => srv.app.db.query("SELECT h.name AS holder, s.name AS service FROM role_bindings b JOIN principals h ON h.id = b.principal_id JOIN principals s ON s.id = b.scope_id WHERE b.role = 'service_owner' ORDER BY b.id").all();
+const serviceRows = async () => await sqlRows(srv, "SELECT p.name, p.kind, u.email FROM principals p LEFT JOIN users u ON u.id = p.user_id WHERE p.kind = 'service' ORDER BY p.id");
+const ownerRows = async () => await sqlRows(srv, "SELECT h.name AS holder, s.name AS service FROM role_bindings b JOIN principals h ON h.id = b.principal_id JOIN principals s ON s.id = b.scope_id WHERE b.role = 'service_owner' ORDER BY b.id");
 const refusedText = async (p: Promise<unknown>) => {
   try { await p; } catch (e) { if (e instanceof HostedToolError) return e.message; throw e; }
   throw new Error("the call wasn't refused");
@@ -45,10 +46,10 @@ describe("create, list, disable, enable: audited (acceptance 1)", () => {
     await srv.login(A); await srv.login(B);
     const r = await create(root, "Ingest", [B, A, A]);
     expect(r).toMatchObject({ status: 201, body: { name: SVC, owners: [A, B] } });
-    expect(serviceRows()).toEqual([{ name: SVC, kind: "service", email: SVC }]);
-    expect(ownerRows()).toEqual([{ holder: B, service: SVC }, { holder: A, service: SVC }]);
-    expect(accessAudits(srv.app.db, "service.created")).toEqual([expect.objectContaining({ actor: ROOT, target: SVC, detail: { owners: [B, A] } })]);
-    expect(accessAudits(srv.app.db, "role.granted").map(r => [r.actor, r.target, r.detail.role])).toEqual([[ROOT, B, "service_owner"], [ROOT, A, "service_owner"]]);
+    expect(await serviceRows()).toEqual([{ name: SVC, kind: "service", email: SVC }]);
+    expect(await ownerRows()).toEqual([{ holder: B, service: SVC }, { holder: A, service: SVC }]);
+    expect(await accessAudits(srv, "service.created")).toEqual([expect.objectContaining({ actor: ROOT, target: SVC, detail: { owners: [B, A] } })]);
+    expect((await accessAudits(srv, "role.granted")).map(r => [r.actor, r.target, r.detail.role])).toEqual([[ROOT, B, "service_owner"], [ROOT, A, "service_owner"]]);
     const l = await api(root, "GET", "/api/admin/services");
     expect(l).toMatchObject({ status: 200, body: { services: [{ name: SVC, disabled_at: null, owners: [A, B] }], next: null } });
   });
@@ -65,13 +66,13 @@ describe("create, list, disable, enable: audited (acceptance 1)", () => {
     expect(await create(root, "ingest@example.com", [A])).toMatchObject({ status: 400 });
     expect(await create(root, SVC, ["never@example.com"])).toMatchObject({ status: 404 });
     // The refused owner grant rolled the service's rows back with it.
-    expect(serviceRows()).toEqual([]);
+    expect(await serviceRows()).toEqual([]);
     expect((await create(root, SVC, [A])).status).toBe(201);
     expect(await create(root, SVC, [A])).toMatchObject({ status: 409 });
     // Another service's name can't be an owner: service_owner's holders are users.
     expect(await create(root, "other", [SVC])).toMatchObject({ status: 400 });
-    expect(serviceRows()).toEqual([{ name: SVC, kind: "service", email: SVC }]);
-    expect(accessAudits(srv.app.db, "service.created")).toHaveLength(1);
+    expect(await serviceRows()).toEqual([{ name: SVC, kind: "service", email: SVC }]);
+    expect(await accessAudits(srv, "service.created")).toHaveLength(1);
   });
 
   test("the routes are org_admin's: an owner or another user is refused, with a deny row", async () => {
@@ -80,7 +81,7 @@ describe("create, list, disable, enable: audited (acceptance 1)", () => {
     expect((await create(alice, "other", [A])).status).toBe(403);
     expect((await api(alice, "GET", "/api/admin/services")).status).toBe(403);
     expect((await api(alice, "POST", "/api/admin/services/disable", { name: SVC })).status).toBe(403);
-    expect(accessAudits(srv.app.db, "authz.decision").filter(r => r.actor === A).map(r => [r.detail.allow, r.detail.route])).toEqual([
+    expect((await accessAudits(srv, "authz.decision")).filter(r => r.actor === A).map(r => [r.detail.allow, r.detail.route])).toEqual([
       [false, "/api/admin/services"], [false, "/api/admin/services"], [false, "/api/admin/services/disable"],
     ]);
   });
@@ -92,9 +93,9 @@ describe("create, list, disable, enable: audited (acceptance 1)", () => {
       () => create(alice, SVC, [A]),
       async () => { expect((await api(root, "POST", "/api/admin/roles/revoke", { role: "org_admin", principal: A })).status).toBe(200); });
     expect(res).toMatchObject({ status: 403, body: { message: expect.stringContaining("no longer holds") } });
-    expect(serviceRows()).toEqual([]);
-    expect(ownerRows()).toEqual([]);
-    expect(accessAudits(srv.app.db, "service.created")).toEqual([]);
+    expect(await serviceRows()).toEqual([]);
+    expect(await ownerRows()).toEqual([]);
+    expect(await accessAudits(srv, "service.created")).toEqual([]);
   });
 
   test("list pages by id", async () => {
@@ -110,16 +111,16 @@ describe("create, list, disable, enable: audited (acceptance 1)", () => {
   test("disable ends the service's sessions in its transaction and is audited; enable revives none of them", async () => {
     const root = await service();
     const s = await srv.hosted(SVC, "w-1");
-    expect(hostedRowCount(srv.app.db)).toBe(1);
+    expect(await hostedRowCount(srv)).toBe(1);
     expect(await api(root, "POST", "/api/admin/services/disable", { name: SVC })).toMatchObject({ status: 200 });
-    expect(hostedRowCount(srv.app.db)).toBe(0);
+    expect(await hostedRowCount(srv)).toBe(0);
     await expect(s.call("whoami")).rejects.toThrow();
     // Its grant is gone: the client has nothing left to release.
     await s.drop();
     expect(await api(root, "POST", "/api/admin/services/enable", { name: SVC })).toMatchObject({ status: 200 });
-    expect(hostedRowCount(srv.app.db)).toBe(0);
-    expect(accessAudits(srv.app.db, "auth.user_disabled")).toEqual([expect.objectContaining({ actor: ROOT, target: SVC, detail: { service: true } })]);
-    expect(accessAudits(srv.app.db, "auth.user_enabled")).toEqual([expect.objectContaining({ actor: ROOT, target: SVC, detail: { service: true } })]);
+    expect(await hostedRowCount(srv)).toBe(0);
+    expect(await accessAudits(srv, "auth.user_disabled")).toEqual([expect.objectContaining({ actor: ROOT, target: SVC, detail: { service: true } })]);
+    expect(await accessAudits(srv, "auth.user_enabled")).toEqual([expect.objectContaining({ actor: ROOT, target: SVC, detail: { service: true } })]);
     const l = await api(root, "GET", "/api/admin/services");
     expect(l.body.services[0].disabled_at).toBeNull();
     // A user's email or a team's name is no service to these routes.
@@ -148,7 +149,7 @@ describe("create, list, disable, enable: audited (acceptance 1)", () => {
     expect(await del("w-2")).toMatchObject({ status: 404 });
     expect(await del("human")).toMatchObject({ status: 400 });
     expect(await api(root, "POST", "/api/admin/services/delete-alias", { service: A, name: "x" })).toMatchObject({ status: 404 });
-    expect(accessAudits(srv.app.db, "alias.deleted")).toEqual([expect.objectContaining({ actor: ROOT, target: `${SVC}/w-2`, detail: { service: SVC } })]);
+    expect(await accessAudits(srv, "alias.deleted")).toEqual([expect.objectContaining({ actor: ROOT, target: `${SVC}/w-2`, detail: { service: SVC } })]);
   });
 });
 
@@ -158,7 +159,7 @@ describe("owners", () => {
     const revoke = (p: string) => api(root, "POST", "/api/admin/roles/revoke", { role: "service_owner", principal: p, scope: SVC });
     expect((await revoke(A)).status).toBe(200);
     expect(await revoke(B)).toMatchObject({ status: 409, body: { message: expect.stringContaining(`service "${SVC}" must keep an owner`) } });
-    expect(ownerRows()).toEqual([{ holder: B, service: SVC }]);
+    expect(await ownerRows()).toEqual([{ holder: B, service: SVC }]);
     expect(await api(root, "POST", "/api/admin/roles/grant", { role: "service_owner", principal: A, scope: SVC })).toMatchObject({ status: 201 });
     expect((await revoke(B)).status).toBe(200);
   });
@@ -174,7 +175,7 @@ describe("owners", () => {
     expect((await grant("team_owner", SVC, "eng")).status).toBe(400);
     // service_invoke is held on a service, not a team (#270 D6).
     expect((await grant("service_invoke", A, "eng")).status).toBe(404);
-    expect(ownerRows()).toEqual([{ holder: A, service: SVC }]);
+    expect(await ownerRows()).toEqual([{ holder: A, service: SVC }]);
   });
 
   test("disable-user names the services it leaves with no enabled owner", async () => {
@@ -182,11 +183,11 @@ describe("owners", () => {
     expect((await create(root, "solo", [A])).status).toBe(201);
     const d = await api(root, "POST", "/api/admin/disable-user", { email: A });
     expect(d).toMatchObject({ status: 200, body: { ok: true, orphaned_services: ["solo"] } });
-    expect(accessAudits(srv.app.db, "auth.user_disabled").at(-1)).toMatchObject({ target: A, detail: { orphaned_services: ["solo"] } });
+    expect((await accessAudits(srv, "auth.user_disabled")).at(-1)).toMatchObject({ target: A, detail: { orphaned_services: ["solo"] } });
     const e = await api(root, "POST", "/api/admin/disable-user", { email: B });
     expect(e.body.orphaned_services).toEqual([SVC]);
     // The bindings stay: the owner record outlives the disable.
-    expect(ownerRows()).toHaveLength(3);
+    expect(await ownerRows()).toHaveLength(3);
   });
 });
 
@@ -197,11 +198,11 @@ describe("a service is not a user", () => {
     for (const route of ["revoke-session", "disable-user", "enable-user", "unlink-idp"]) {
       expect(await api(root, "POST", `/api/admin/${route}`, { email: SVC }), route).toMatchObject({ status: 400, body: { message: expect.stringContaining("is a service") } });
     }
-    expect(accessAudits(srv.app.db, "auth.user_disabled")).toEqual([]);
-    expect(accessAudits(srv.app.db, "auth.session_revoked")).toEqual([]);
+    expect(await accessAudits(srv, "auth.user_disabled")).toEqual([]);
+    expect(await accessAudits(srv, "auth.session_revoked")).toEqual([]);
     expect((await api(alice, "POST", "/api/teams", { name: "eng" })).status).toBe(201);
     expect(await api(alice, "POST", "/api/teams/eng/add", { email: SVC })).toMatchObject({ status: 400, body: { message: expect.stringContaining("services don't join teams") } });
-    expect(srv.app.db.query("SELECT count(*) AS n FROM team_members").get()).toEqual({ n: 1 });
+    expect(await row(srv, "SELECT count(*) AS n FROM team_members")).toEqual({ n: 1 });
   });
 
   test("no sign-in reaches a service row: upsertByEmail and the IdP sign-in refuse it", async () => {
@@ -210,7 +211,7 @@ describe("a service is not a user", () => {
     await expect(seed(repo, tx => repo.users.upsertByEmail(tx, SVC, null))).rejects.toThrow();
     const r = await seed(repo, tx => repo.users.signIn(tx, "https://accounts.google.com", "sub-1", SVC, null));
     expect(r.status).toBe("service");
-    expect(srv.app.db.query("SELECT idp_issuer, idp_subject FROM users WHERE email = ?").get(SVC)).toEqual({ idp_issuer: null, idp_subject: null });
+    expect(await row(srv, "SELECT idp_issuer, idp_subject FROM users WHERE email = ?", SVC)).toEqual({ idp_issuer: null, idp_subject: null });
     // The dev sign-in takes an email only, and a service's name is none.
     expect((await fetch(`${srv.base}/api/auth/dev-login`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email: SVC }) })).status).toBe(400);
   });
@@ -225,7 +226,7 @@ describe("a service session (D4)", () => {
     const s = await srv.hosted(SVC, null);
     expect(await s.bind("w-1")).toMatchObject({ name: "w-1" });
     expect(await s.call("whoami")).toMatchObject({ principal: SVC, primary: `${SVC}/w-1` });
-    expect(srv.app.db.query("SELECT scope_kind, scope_ref, name FROM aliases WHERE scope_ref = ?").all(SVC)).toEqual([{ scope_kind: "service", scope_ref: SVC, name: "w-1" }]);
+    expect(await sqlRows(srv, "SELECT scope_kind, scope_ref, name FROM aliases WHERE scope_ref = ?", SVC)).toEqual([{ scope_kind: "service", scope_ref: SVC, name: "w-1" }]);
     expect(await refusedText(s.call("bind", { name: `${A}/x`, create: true }))).toContain(`${SVC} is a service; it acts only in its own scope; bind a bare name`);
     // A team's or another service's scope reads as one that doesn't exist (#1240): the refusal names no existing scope.
     for (const scope of ["eng", "other"]) {
@@ -238,7 +239,7 @@ describe("a service session (D4)", () => {
     // It posts as the name.
     await s.call("board_create", { name: "svc-out", purpose: "a service's board" });
     await s.call("board_post", { board: "svc-out", body: "from the service" });
-    expect(srv.app.db.query("SELECT author FROM posts WHERE body = 'from the service'").get()).toEqual({ author: `${SVC}/w-1` });
+    expect(await row(srv, "SELECT author FROM posts WHERE body = 'from the service'")).toEqual({ author: `${SVC}/w-1` });
   });
 
   test("a user, its owner included, can't bind in a service's scope: it reads as a missing service", async () => {
@@ -247,7 +248,7 @@ describe("a service session (D4)", () => {
     const there = await refusedText(owner.call("bind", { name: `${SVC}/x`, create: true }));
     const missing = await refusedText(owner.call("bind", { name: "nosvc/x", create: true }));
     expect(there).toBe(missing.replaceAll("nosvc", SVC));
-    expect(srv.app.db.query("SELECT count(*) AS n FROM aliases WHERE scope_kind = 'service'").get()).toEqual({ n: 0 });
+    expect(await row(srv, "SELECT count(*) AS n FROM aliases WHERE scope_kind = 'service'")).toEqual({ n: 0 });
   });
 
   test("a service's hello carries no human handle; its unbound candidates are its own scope's names", async () => {
@@ -288,11 +289,11 @@ describe("audit fixes (#270 step 2)", () => {
       const d = await refusedText(u.call("delegate", { persona: "p", task: "t", to: `${SVC}/w-1` }));
       expect(d).toBe(await refusedText(u.call("delegate", { persona: "p", task: "t", to: `${SVC}/nope` })).then(t => t.replaceAll("nope", "w-1")));
     }
-    expect(srv.app.db.query("SELECT count(*) AS n FROM messages WHERE recipient LIKE 'ingest/%'").get()).toEqual({ n: 0 });
+    expect(await row(srv, "SELECT count(*) AS n FROM messages WHERE recipient LIKE 'ingest/%'")).toEqual({ n: 0 });
     // The service writes first: the user may answer in that thread (the replyingTo exception).
     const sent = await s.call<{ message_id: number }>("dm_send", { to: `${B}/be`, body: "a question" });
     await sessions[B]!.call("dm_send", { to: `${SVC}/w-1`, body: "an answer", parent_id: sent.message_id });
-    expect(srv.app.db.query("SELECT recipient FROM messages WHERE body = 'an answer'").get()).toEqual({ recipient: `${SVC}/w-1` });
+    expect(await row(srv, "SELECT recipient FROM messages WHERE body = 'an answer'")).toEqual({ recipient: `${SVC}/w-1` });
   });
 
   test("a claim call as a service's name reads like one in a scope nobody owns", async () => {
@@ -317,8 +318,8 @@ describe("audit fixes (#270 step 2)", () => {
     await srv.login(A); await srv.login(B);
     expect((await api(root, "POST", "/api/admin/disable-user", { email: B })).status).toBe(200);
     expect(await create(root, SVC, [A, B])).toMatchObject({ status: 409, body: { message: expect.stringContaining(`${B} is disabled`) } });
-    expect(serviceRows()).toEqual([]);
-    expect(ownerRows()).toEqual([]);
+    expect(await serviceRows()).toEqual([]);
+    expect(await ownerRows()).toEqual([]);
   });
 
   test("service-appropriate texts (#1241): the wake note both ways, delegation to a user, and create refuses the name human", async () => {
@@ -334,7 +335,7 @@ describe("audit fixes (#270 step 2)", () => {
     const d = await refusedText(s.call("delegate", { persona: "p", task: "t", to: `${B}/be` }));
     expect(d).toBe(`"${B}/be" belongs to another principal, and a service and a user can't delegate to each other: no team policy reaches a service, which is never a team member`);
     expect(await create(root, "human", [A])).toMatchObject({ status: 400, body: { message: expect.stringContaining("reserved") } });
-    expect(serviceRows()).toEqual([{ name: SVC, kind: "service", email: SVC }]);
+    expect(await serviceRows()).toEqual([{ name: SVC, kind: "service", email: SVC }]);
   });
 
   test("peer_list judges a service's ID rows by its service scope (#1241): the service sees its own sessions' facts, a user none", async () => {
@@ -344,11 +345,11 @@ describe("audit fixes (#270 step 2)", () => {
     const u = await srv.hosted(SVC, null);
     await u.call("peer_list");
     const a = await srv.hosted(A, "fe");
-    const ids = srv.app.db.query(`SELECT id FROM ids WHERE principal = ? ORDER BY started_at`).all(SVC) as { id: string }[];
+    const ids = await sqlRows(srv, `SELECT id FROM ids WHERE principal = ? ORDER BY started_at`, SVC) as { id: string }[];
     const unboundId = ids.find(r => r.id === u.sessionId)?.id ?? ids.at(-1)!.id;
-    await seed(srv.app.repo, () => {
-      srv.app.db.prepare(`INSERT INTO subscriptions (board, handle, mode, cursor, notified_id) VALUES ('svc-out', ?, 'push', 0, 0)`).run(unboundId);
-      srv.app.db.prepare(`UPDATE ids SET place = 'host:/src/pipeline (main)', harness = 'svc_x', model = 'model-s', effort = 'high', status = 'on a run', status_at = ? WHERE id = ?`).run(Date.now(), unboundId);
+    await seed(srv.app.repo, async tx => {
+      await execOn(tx, `INSERT INTO subscriptions (board, handle, mode, cursor, notified_id) VALUES ('svc-out', ?, 'push', 0, 0)`, unboundId);
+      await execOn(tx, `UPDATE ids SET place = 'host:/src/pipeline (main)', harness = 'svc_x', model = 'model-s', effort = 'high', status = 'on a run', status_at = ? WHERE id = ?`, Date.now(), unboundId);
     });
     const FACTS = ["where", "status", "harness", "model", "effort"];
     const shown = (r: { peers: Record<string, unknown>[] }) => {

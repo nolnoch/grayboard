@@ -214,8 +214,17 @@ export class Login implements SignIn {
   // throws AccessExpired when only a new sign-in helps.
   async token(): Promise<string> {
     const s = await this.live();
-    if (s.accessExpiresAt - Date.now() > REFRESH_MARGIN_MS) return s.access;
-    return this.refresh();
+    return this.serve(s.accessExpiresAt - Date.now() > REFRESH_MARGIN_MS ? s.access : await this.refresh());
+  }
+  // The access token token() last served, and who hears when it changes (#1379): a refresh in this process or
+  // another, or a 401's forced one. The first token served is no change.
+  private served?: string;
+  private readonly rotations = new Set<() => void>();
+  private serve(access: string): string {
+    const was = this.served;
+    this.served = access;
+    if (was !== undefined && was !== access) for (const changed of [...this.rotations]) changed();
+    return access;
   }
   // A 401 for `token`: one forced refresh unless another call already rotated
   // it. Returns when the next token() may succeed, else throws.
@@ -620,6 +629,11 @@ export class Login implements SignIn {
       },
       token: async e => { await check(e); return this.token(); },
       unauthorized: async (e, token) => { await check(e); await this.unauthorized(token); },
+      rotated: (_e, changed) => {
+        const listener = () => changed();
+        this.rotations.add(listener);
+        return { dispose: () => { this.rotations.delete(listener); } };
+      },
     };
   }
 }

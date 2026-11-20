@@ -15,6 +15,7 @@ import { GRAYBOARD_SESSION_META, GRAYBOARD_WRITES_AS_META } from "../../src/shar
 import { issueOAuth } from "../helpers/oauth.ts";
 import { withMeta } from "../helpers/hosted.ts";
 import { seed } from "../support/seed.ts";
+import { exec, rows as sqlRows } from "../support/repo_sql.ts";
 import { hostedPause } from "../support/hosted-pause.ts";
 
 const A = "alice@example.com";
@@ -52,8 +53,8 @@ async function toolsOnly(email: string, sessionId: string, writesAs: () => strin
   return async (tool, args = {}) => (await client.callTool({ name: tool, arguments: args })) as CallToolResult;
 }
 
-const rows = () =>
-  accessAudits(srv.app.db, "authz.decision").map((r) => ({
+const rows = async () =>
+  (await accessAudits(srv, "authz.decision")).map((r) => ({
     actor: r.actor, target: r.target, verb: r.detail.verb, allow: r.detail.allow, rule: r.detail.rule,
     ...(r.detail.route ? { route: r.detail.route } : {}),
   }));
@@ -67,7 +68,7 @@ describe("team management", () => {
     expect((await srv.api(c, "POST", "/api/teams/eng/add", { email: C })).status).toBe(404);
     expect((await srv.api(c, "GET", "/api/teams/eng/members")).status).toBe(404);
     expect((await srv.api(b, "GET", "/api/teams/eng/members")).status).toBe(200);
-    expect(rows()).toEqual([
+    expect(await rows()).toEqual([
       { actor: A, target: "team:eng", verb: "team.manage", allow: true, rule: "role.team_owner" },
       { actor: B, target: "team:eng", verb: "team.manage", allow: false, rule: "role.team_owner" },
       { actor: C, target: "team:eng", verb: "team.manage", allow: false, rule: "team.member" },
@@ -85,14 +86,14 @@ describe("team management", () => {
       () => srv.api(b, "GET", "/api/teams/eng/members"),
       async () => { expect((await srv.api(a, "POST", "/api/teams/eng/remove", { email: B })).status).toBe(200); });
     expect(res.status).toBe(404);
-    expect(rows().filter((r) => r.actor === B)).toEqual([{ actor: B, target: "team:eng", verb: "team.read", allow: false, rule: "team.member" }]);
+    expect((await rows()).filter((r) => r.actor === B)).toEqual([{ actor: B, target: "team:eng", verb: "team.read", allow: false, rule: "team.member" }]);
   });
 
   test("a non-admin's admin route denies; an admin's allows; both name the route", async () => {
     const [a, root] = await Promise.all([srv.login(A), srv.login(ROOT)]);
     expect((await srv.api(a, "POST", "/api/admin/enable-user", { email: A })).status).toBe(403);
     expect((await srv.api(root, "POST", "/api/admin/enable-user", { email: A })).status).toBe(200);
-    expect(rows()).toEqual([
+    expect(await rows()).toEqual([
       { actor: A, target: null, verb: "admin", allow: false, rule: "role.org_admin", route: "/api/admin/enable-user" },
       { actor: ROOT, target: null, verb: "admin", allow: true, rule: "admin.env", route: "/api/admin/enable-user" },
     ]);
@@ -104,7 +105,7 @@ describe("deny rows", () => {
     const [a, root] = await Promise.all([srv.login(A), srv.login(ROOT)]);
     for (let i = 0; i < DENY_ROW_LIMIT.burst + 10; i++) expect((await srv.api(a, "POST", "/api/admin/enable-user", { email: A })).status).toBe(403);
     for (let i = 0; i < DENY_ROW_LIMIT.burst + 10; i++) expect((await srv.api(root, "POST", "/api/admin/enable-user", { email: A })).status).toBe(200);
-    const got = rows();
+    const got = await rows();
     expect(got.filter((r) => r.actor === A).length).toBe(DENY_ROW_LIMIT.burst);
     expect(got.filter((r) => r.actor === ROOT).length).toBe(DENY_ROW_LIMIT.burst + 10);
   });
@@ -114,7 +115,7 @@ describe("deny rows", () => {
     const long = "x".repeat(4000);
     expect((await srv.api(a, "POST", `/api/admin/${long}`, {})).status).toBe(403);
     expect((await srv.api(a, "GET", `/api/teams/${long}/members`)).status).toBe(404);
-    const got = accessAudits(srv.app.db, "authz.decision");
+    const got = await accessAudits(srv, "authz.decision");
     expect(got.length).toBe(2);
     expect(String(got[0].detail.route).length).toBeLessThanOrEqual(129);
     expect(String(got[1].detail.team_requested).length).toBeLessThanOrEqual(129);
@@ -129,7 +130,7 @@ describe("session acts", () => {
     const err = (await fe.call("dm_send", { to: `${A}/human`, body: "hi" }).catch((e: unknown) => e)) as Error;
     expect(err).toBeInstanceOf(HostedToolError);
     expect(String(err.message)).toMatch(/reachable only by their teammates/);
-    const got = accessAudits(srv.app.db, "authz.decision");
+    const got = await accessAudits(srv, "authz.decision");
     expect(got.length).toBe(1);
     expect(got[0].actor).toBe(B);
     expect(got[0].target).toBe(`${A}/human`);
@@ -145,7 +146,7 @@ describe("session acts", () => {
     expect(err).toBeInstanceOf(HostedToolError);
     const call = await srv.api(b, "POST", "/api/claims/call", { as: "eng/build", tool: "claim_take", args: { key: "k" } });
     expect(call.status).toBe(403);
-    const got = accessAudits(srv.app.db, "authz.decision");
+    const got = await accessAudits(srv, "authz.decision");
     expect(got.map((r) => [r.actor, r.target, r.detail.verb, r.detail.allow, r.detail.rule])).toEqual([
       [B, "team:eng", "alias.bind", false, "scope.team_member"],
       [B, "team:eng", "act_as", false, "scope.team_member"],
@@ -160,7 +161,7 @@ describe("session acts", () => {
     expect((await srv.api(a, "POST", "/api/teams", { name: "eng" })).status).toBe(201);
     const tools = srv.appSession(b, "eng/build", { push: false });
     await expect(tools.connect()).rejects.toThrow(/"eng\/build": no team or service is named "eng"/);
-    const got = accessAudits(srv.app.db, "authz.decision");
+    const got = await accessAudits(srv, "authz.decision");
     expect(got.map((r) => [r.actor, r.target, r.detail.verb, r.detail.allow, r.detail.rule])).toEqual([[B, "team:eng", "alias.bind", false, "scope.team_member"]]);
     expect(got[0].detail).toMatchObject({ address: "eng/build", session: expect.stringMatching(/^id:/) });
   });
@@ -170,7 +171,7 @@ describe("session acts", () => {
     expect((await srv.api(a, "POST", "/api/teams", { name: "eng" })).status).toBe(201);
     // The connect's first request is refused (the hosted session is never created).
     await expect(toolsOnly(B, "tools-new", () => "eng/build")).rejects.toThrow();
-    const got = accessAudits(srv.app.db, "authz.decision");
+    const got = await accessAudits(srv, "authz.decision");
     expect(got.map((x) => [x.actor, x.target, x.detail.verb, x.detail.allow, x.detail.rule])).toEqual([[B, "team:eng", "alias.bind", false, "scope.team_member"]]);
     expect(got[0].detail).toMatchObject({ address: "eng/build", session: expect.stringMatching(/^id:/) });
   });
@@ -183,7 +184,7 @@ describe("session acts", () => {
     expect((await call("whoami")).isError).not.toBe(true);
     writesAs = "eng/build";
     await expect(call("whoami")).rejects.toThrow();
-    const got = accessAudits(srv.app.db, "authz.decision");
+    const got = await accessAudits(srv, "authz.decision");
     expect(got.map((x) => [x.actor, x.detail.verb, x.detail.allow, x.detail.address])).toEqual([[B, "alias.bind", false, "eng/build"]]);
   });
 });
@@ -192,18 +193,14 @@ describe("session acts", () => {
 // each with its response unchanged and one row.
 describe("pre-seam refusals", () => {
   const claimAs = (token: string, as: string) => srv.api(token, "POST", "/api/claims/call", { as, tool: "claim_take", args: { key: "k" } });
-  const idOf = (email: string) => srv.app.db.query<{ id: string }, [string]>("SELECT id FROM ids WHERE principal = ? ORDER BY rowid DESC").get(email)!.id;
 
   test("an HTTP `as` naming another user's, an unknown, a viewer's or an ended session ID is refused alike and leaves one row each", async () => {
     const [a, b] = await Promise.all([srv.login(A), srv.login(B)]);
-    await srv.connected(a, "fe");
-    const theirs = idOf(A);
-    await srv.connected(b, "be");
-    const mine = idOf(B);
-    await seed(srv.app.repo, () => srv.app.db.run("UPDATE ids SET ended_at = 1000 WHERE id = ?", [mine]));
-    await srv.connected(b, "viewer");
-    const viewer = idOf(B);
-    await seed(srv.app.repo, () => srv.app.db.run("UPDATE ids SET viewer = 1 WHERE id = ?", [viewer]));
+    const theirs = (await srv.connected(a, "fe")).id;
+    const mine = (await srv.connected(b, "be")).id;
+    await exec(srv, "UPDATE ids SET ended_at = 1000 WHERE id = ?", mine);
+    const viewer = (await srv.connected(b, "viewer")).id;
+    await exec(srv, "UPDATE ids SET viewer = TRUE WHERE id = ?", viewer);
     const unknown = "id:0000000000000";
     const texts: string[] = [];
     for (const id of [theirs, unknown, viewer, mine]) {
@@ -212,7 +209,7 @@ describe("pre-seam refusals", () => {
       texts.push(r.body.message);
     }
     expect(texts).toEqual([`${theirs} isn't a session of yours`, `${unknown} isn't a session of yours`, `${viewer} isn't a session of yours`, `${mine} ended at ${new Date(1000).toISOString()}`]);
-    const got = accessAudits(srv.app.db, "authz.decision");
+    const got = await accessAudits(srv, "authz.decision");
     expect(got.map((r) => [r.actor, r.target, r.detail.verb, r.detail.allow, r.detail.rule, r.detail.code])).toEqual([
       [B, theirs, "session.act", false, "session.other_user", "forbidden"],
       [B, unknown, "session.act", false, "session.unknown", "forbidden"],
@@ -231,7 +228,7 @@ describe("pre-seam refusals", () => {
     const ownerless = await claimAs(b, "nosuch/build");
     expect(ownerless.status).toBe(403);
     expect(ownerless.body.message).toBe(`you can't act as "nosuch/build": no principal owns its scope`);
-    const got = accessAudits(srv.app.db, "authz.decision");
+    const got = await accessAudits(srv, "authz.decision");
     expect(got.map((r) => [r.actor, r.target, r.detail.verb, r.detail.allow, r.detail.rule, r.detail.address])).toEqual([
       [B, `person:${B}`, "act_as", false, "alias.human_reserved", `${B}/human`],
       [B, "nosuch/build", "act_as", false, "scope.ownerless", "nosuch/build"],
@@ -242,7 +239,7 @@ describe("pre-seam refusals", () => {
     await srv.login(B);
     const s = await srv.hosted(B, null);
     await expect(s.call("bind", { name: "human", create: true })).rejects.toMatchObject({ code: "forbidden", message: HUMAN_RESERVED });
-    const got = accessAudits(srv.app.db, "authz.decision");
+    const got = await accessAudits(srv, "authz.decision");
     expect(got.map((r) => [r.actor, r.target, r.detail.verb, r.detail.allow, r.detail.rule, r.detail.name])).toEqual([[B, `person:${B}`, "alias.bind", false, "alias.human_reserved", "human"]]);
     expect(typeof got[0].detail.session).toBe("string");
   });
@@ -252,8 +249,8 @@ describe("pre-seam refusals", () => {
     expect((await srv.api(a, "POST", "/api/teams", { name: "eng" })).status).toBe(201);
     expect((await srv.api(c, "POST", "/api/teams/eng/leave")).status).toBe(404);
     expect((await srv.api(root, "POST", "/api/teams/eng/leave")).status).toBe(404);
-    expect((await srv.app.repo.teams.isMember(srv.app.repo.read, (await srv.app.repo.teams.findByName(srv.app.repo.read, "eng"))!.id, (await srv.app.repo.users.findByEmail(srv.app.repo.read, A))!.id))).toBe(true);
-    expect(rows().filter((r) => r.verb === "team.leave")).toEqual([
+    expect(await srv.app.repo.teams.isMember(srv.app.repo.read, (await srv.app.repo.teams.findByName(srv.app.repo.read, "eng"))!.id, (await srv.app.repo.users.findByEmail(srv.app.repo.read, A))!.id)).toBe(true);
+    expect((await rows()).filter((r) => r.verb === "team.leave")).toEqual([
       { actor: C, target: "team:eng", verb: "team.leave", allow: false, rule: "team.member" },
       { actor: ROOT, target: "team:eng", verb: "team.leave", allow: false, rule: "team.member" },
     ]);
@@ -263,11 +260,12 @@ describe("pre-seam refusals", () => {
   const hostedId = async (email: string, raw: string) => hostedSessionId((await srv.app.repo.users.findByEmail(srv.app.repo.read, email))!.id, HOSTED_CLIENT, raw);
   // A copy of row `from` under ID `id`, with `set`'s columns changed: the state only a hash collision (or another
   // client's session) could give.
-  const forgeRow = (id: string, from: string, set: Record<string, string | number>) => {
-    const cols = srv.app.db.query<{ name: string }, []>("SELECT name FROM pragma_table_info('hosted_sessions')").all().map((c) => c.name);
+  const forgeRow = async (id: string, from: string, set: Record<string, string | number>) => {
+    // The columns, from the row copied (no pragma or information_schema both backends have).
+    const cols = Object.keys((await sqlRows(srv, "SELECT * FROM hosted_sessions WHERE session_id = ?", from))[0]!);
     const picked = cols.map((c) => (c === "session_id" || c in set ? "?" : c)).join(", ");
     const values = cols.filter((c) => c === "session_id" || c in set).map((c) => (c === "session_id" ? id : set[c]!));
-    return seed(srv.app.repo, () => srv.app.db.run(`INSERT INTO hosted_sessions (${cols.join(", ")}) SELECT ${picked} FROM hosted_sessions WHERE session_id = ?`, [...values, from]));
+    return exec(srv, `INSERT INTO hosted_sessions (${cols.join(", ")}) SELECT ${picked} FROM hosted_sessions WHERE session_id = ?`, ...values, from);
   };
 
   test("session_end naming another user's or another client's hosted session reads as not found and leaves one row each, after the hosted rollback", async () => {
@@ -281,7 +279,7 @@ describe("pre-seam refusals", () => {
       await expect(b.subscriber.call("session_end", { session: id })).rejects.toMatchObject({ code: "not_found" });
       expect((await srv.app.repo.hosted.get(srv.app.repo.read, id))?.session_id ?? null).toBe(id === unknown ? null : id);
     }
-    const got = accessAudits(srv.app.db, "authz.decision");
+    const got = await accessAudits(srv, "authz.decision");
     // A missing ID isn't a policy question: no row.
     expect(got.map((r) => [r.actor, r.target, r.detail.verb, r.detail.allow, r.detail.rule, r.detail.code, r.detail.session, r.detail.client])).toEqual([
       [B, theirs, "hosted.session", false, "hosted.other_user", "not_found", mine, HOSTED_CLIENT],
@@ -302,8 +300,8 @@ describe("pre-seam refusals", () => {
     // One row per refused request: the session's native wire and its subscriber each sent one.
     const row = { actor: B, target: forged, verb: "hosted.session", allow: false, rule: "hosted.other_user" };
     // connect() rejects on the first refusal; the second request's row may land after.
-    await until(() => rows().filter((r) => r.verb === "hosted.session").length === 2);
-    expect(rows().filter((r) => r.verb === "hosted.session")).toEqual([row, row]);
+    await until(async () => (await rows()).filter((r) => r.verb === "hosted.session").length === 2);
+    expect((await rows()).filter((r) => r.verb === "hosted.session")).toEqual([row, row]);
   });
 
   test("registering a child whose hosted row is another user's reads as not found and leaves one row, after the hosted rollback", async () => {
@@ -312,7 +310,7 @@ describe("pre-seam refusals", () => {
     const mine = await hostedId(B, b.sessionId), forged = await hostedId(B, "child");
     await forgeRow(forged, mine, { user_id: (await srv.app.repo.users.findByEmail(srv.app.repo.read, A))!.id });
     await expect(b.subscriber.call("session_register", { child: "child" })).rejects.toMatchObject({ code: "not_found" });
-    const got = accessAudits(srv.app.db, "authz.decision").filter((r) => r.detail.verb === "hosted.session");
+    const got = (await accessAudits(srv, "authz.decision")).filter((r) => r.detail.verb === "hosted.session");
     expect(got.map((r) => [r.actor, r.target, r.detail.rule, r.detail.session])).toEqual([[B, forged, "hosted.other_user", mine]]);
   });
 
@@ -332,8 +330,8 @@ describe("pre-seam refusals", () => {
       expect(r.status).toBe(404);
       expect(await r.json()).toEqual({ code: "not_found", message: `no attachment ${id} on a message or post you can read` });
     }
-    expect(accessAudits(srv.app.db, "attachment.download_refused").map((r) => [r.actor, r.target])).toEqual([unsent, onDm, onPost, unknown].map((id) => [C, `attachment:${id}`]));
-    const got = accessAudits(srv.app.db, "authz.decision").filter((r) => r.detail.verb === "attachment.read");
+    expect((await accessAudits(srv, "attachment.download_refused")).map((r) => [r.actor, r.target])).toEqual([unsent, onDm, onPost, unknown].map((id) => [C, `attachment:${id}`]));
+    const got = (await accessAudits(srv, "authz.decision")).filter((r) => r.detail.verb === "attachment.read");
     expect(got.map((r) => [r.actor, r.target, r.detail.allow, r.detail.rule, r.detail.code, r.detail.identity, r.detail.address])).toEqual([
       [C, `attachment:${unsent}`, false, "attachment.uploader", "not_found", `${C}/sim`, `${C}/sim`],
       [C, `attachment:${onDm}`, false, "attachment.dm_party", "not_found", `${C}/sim`, `${C}/sim`],
