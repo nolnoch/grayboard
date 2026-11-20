@@ -31,7 +31,7 @@ async function open() {
   hosted = createHostedSessions(application, { now: () => now, isAuthorized }); await hosted.ready;
   delivery = createDelivery(hosted, { isAuthorized });
 }
-async function close() { delivery.close(); await hosted.close(); application.stopExpiry(); database.db.close(); }
+async function close() { delivery.close(); await hosted.close(); await application.stopExpiry(); database.db.close(); }
 async function issue(email = "you@example.com") {
   const issued = await issueOAuth(database.repo, resource, email, ["grayboard:tools", "grayboard:delivery"], now, OPENCODE_CLIENT);
   const principal: OAuthPrincipal = { authed: issued.authed, clientId: OPENCODE_CLIENT, sourceKey: OPENCODE_SESSION_META, grantId: issued.grantId, accessHash: hashToken(issued.token), accessExpiry: issued.tokens.accessExpiresAt, scopes: ["tools", "delivery"] };
@@ -42,7 +42,7 @@ afterEach(async () => { await close(); rmSync(dir, { recursive: true, force: tru
 const releases = () => database.db.query<{ detail: string }, []>("SELECT detail FROM binding_events WHERE event='released'").all();
 
 async function overlap(first: Record<string, unknown>, second: Record<string, unknown>, pause: string) {
-  delivery.close(); await hosted.close(); application.stopExpiry();
+  delivery.close(); await hosted.close(); await application.stopExpiry();
   const release = join(dir, "release-transaction");
   const start = (operation: Record<string, unknown>, point: string) => transactionProcess("tests/support/hosted-operation.ts", [join(dir, "bus.db"), join(dir, "blobs"), JSON.stringify({ now, ...operation })], point, release);
   const workers = [start(first, pause), start(second, "")];

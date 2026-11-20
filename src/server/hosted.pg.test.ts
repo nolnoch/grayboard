@@ -34,7 +34,7 @@ async function instance(url: string, side: string) {
   return {
     repo, application, hosted, delivery,
     async [Symbol.asyncDispose]() {
-      try { delivery.close(); await hosted.close(); application.stopExpiry(); await repo.close(); }
+      try { delivery.close(); await hosted.close(); await application.stopExpiry(); await repo.close(); }
       finally { rmSync(blobDir, { recursive: true, force: true }); }
     },
   };

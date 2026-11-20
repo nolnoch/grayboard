@@ -70,7 +70,7 @@ afterEach(async () => {
   expect(hosted.dormantLegacySessions).toBe(0);
   expect(hosted.activePosts).toBe(0);
   oauth.close();
-  application.stopExpiry();
+  await application.stopExpiry();
   await Bun.sleep(0);
   await store.close();
   rmSync(blobDir, { recursive: true, force: true });

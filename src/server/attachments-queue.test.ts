@@ -172,3 +172,17 @@ test("#807 P3 B3: a blob an upload names after the sweep's first read is kept", 
   expect(deleted).toEqual([orphan]);
   expect(catalog(db)).toEqual([named.sha256]);
 });
+
+// #1489: a server's stop skips the blobs a retention sweep hasn't reached; each is resumable, and the next sweep redoes it.
+test("#1489: a stopped blob sweep leaves the blobs it hasn't started", async () => {
+  const { db, repo } = setup();
+  const shas = ["one", "two"].map(t => sha256Hex(new TextEncoder().encode(t)));
+  await seed(repo, () => { for (const sha of shas) db.prepare(`INSERT INTO attachment_blobs (sha256, size, created_at) VALUES (?, 3, 0)`).run(sha); });
+  let stop = false;
+  const del = repo.blobs.delete.bind(repo.blobs);
+  repo.blobs.delete = async (sha: string) => { stop = true; await del(sha); };
+  expect(await sweepStoredBlobs(repo, () => stop)).toBe(1);
+  expect(catalog(db)).toHaveLength(1);
+  expect(await sweepStoredBlobs(repo)).toBe(1);
+  expect(catalog(db)).toEqual([]);
+});

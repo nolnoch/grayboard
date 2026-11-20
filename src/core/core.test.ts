@@ -44,6 +44,7 @@ import { claim, claimExpiryTimer, expiryTimer, listClaims, release, sweepExpired
 import { initCoreSchema } from "./schema.ts";
 import { dropHold, holdAlias, logBinding } from "./bindings.ts";
 import { boardNotification } from "../shared/notifications.ts";
+import { until } from "../../tests/support/until.ts";
 
 let db: Database;
 
@@ -798,6 +799,36 @@ test("#807 P3 B2: an asynchronous expiry read arms when it resolves, and a stop 
     await Bun.sleep(50);
     expect(sweeps).toBe(1);
   } finally { timer.stop(); }
+});
+
+// #1489: a server closes its store once stop() settles, so stop() waits out a sweep or a read already running.
+test("#1489: the expiry timer's stop resolves only once its running sweep and read have settled", async () => {
+  let finishSweep!: () => void, finishRead!: (next: number | null) => void;
+  let sweeping = false;
+  const timer = expiryTimer({
+    next: () => new Promise<number | null>(resolve => { finishRead = resolve; }),
+    sweep: () => { sweeping = true; return new Promise(resolve => { finishSweep = () => resolve({ wake: [], boards: [] }); }); },
+  }, () => {});
+  // The first arm's read is running: stop waits for it.
+  let stopped = false;
+  void timer.stop().then(() => { stopped = true; });
+  await Bun.sleep(20);
+  expect(stopped).toBe(false);
+  finishRead(null);
+  await until(() => stopped, 1000, "stop settles once the read has");
+
+  // A sweep already running when stop lands: stop waits for it too.
+  const second = expiryTimer({
+    next: () => Date.now(),
+    sweep: () => { sweeping = true; return new Promise(resolve => { finishSweep = () => resolve({ wake: [], boards: [] }); }); },
+  }, () => {});
+  await until(() => sweeping, 1000, "the sweep starts");
+  let secondStopped = false;
+  void second.stop().then(() => { secondStopped = true; });
+  await Bun.sleep(20);
+  expect(secondStopped).toBe(false);
+  finishSweep();
+  await until(() => secondStopped, 1000, "stop settles once the sweep has");
 });
 
 // #1390: the timer measures its delay on the source's clock, the one its sweep reads: a server on a test clock behind

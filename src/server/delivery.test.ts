@@ -49,7 +49,7 @@ beforeEach(async () => {
   await sender.connect();
   await hosted.bind(bob, context(bob), { name: "fe", create: true });
 });
-afterEach(async () => { delivery.close(); await hosted.close(); application.stopExpiry(); store.db.close(); rmSync(dir, { recursive: true, force: true }); });
+afterEach(async () => { delivery.close(); await hosted.close(); await application.stopExpiry(); store.db.close(); rmSync(dir, { recursive: true, force: true }); });
 const send = async (body = "hello", pending = false) => (await sender.send("bob@example.com/fe", body, { pending })).message_id;
 
 test("stale receipt audit survives rollback exactly once without committing any cursor", async () => {
