@@ -51,11 +51,21 @@ export async function blockedOrSettled(p: PgPair, settled: () => boolean, what =
 
 // `first` runs on store A and holds its transaction open after its body; `second` runs on store B. `waited`: B was
 // seen blocked on a lock while A held, and `waitEvent` the lock's kind. `whileHeld`: run once B is blocked or settled,
-// before A is released (a third connection's look at what B holds while it waits); its result is `seen`.
-export async function race<TA, TB, TS = undefined>(p: PgPair, first: (tx: Tx) => Promise<TA>, second: (tx: Tx) => Promise<TB>, whileHeld?: () => Promise<TS>):
-  Promise<{ a: Settled<TA>; b: Settled<TB>; waited: boolean; waitEvent: string | null; seen?: TS }> {
+// before A is released (a third connection's look at what B holds while it waits); its result is `seen`. `then`: A's
+// body goes on after its release, on the same transaction, with `first`'s value, and A's value is its result: for a
+// write whose two halves straddle B (a gate read and its insert, a lock and the statement that deadlocks on B).
+export type RaceOptions<TA, TS, TT> = { whileHeld?: () => Promise<TS>; then?: (tx: Tx, held: TA) => Promise<TT> };
+export async function race<TA, TB, TS = undefined, TT = TA>(p: PgPair, first: (tx: Tx) => Promise<TA>, second: (tx: Tx) => Promise<TB>,
+  opts?: (() => Promise<TS>) | RaceOptions<TA, TS, TT>):
+  Promise<{ a: Settled<TT>; b: Settled<TB>; waited: boolean; waitEvent: string | null; seen?: TS }> {
+  const { whileHeld, then } = typeof opts === "function" ? { whileHeld: opts, then: undefined } : (opts ?? {});
   const held = gate(), release = gate();
-  const a = settle(p.a.write(async tx => { const v = await first(tx); held.open(); await release.wait; return v; }));
+  const a = settle(p.a.write(async tx => {
+    const v = await first(tx);
+    held.open();
+    await release.wait;
+    return then ? then(tx, v) : (v as unknown as TT);
+  }));
   let b: Promise<Settled<TB>>, waitEvent: string | null, seen: TS | undefined;
   try {
     // A body that fails before holding settles A instead.

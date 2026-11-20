@@ -9,7 +9,7 @@ import { runRetention } from "./retention.ts";
 import type { Config } from "./config.ts";
 import { claim, claimExpiryTimer } from "../core/claims.ts";
 import { queueFor } from "./store/queue.ts";
-import { createBoard } from "../core/boards.ts";
+import { createBoard, openAccess, setAccess } from "../core/boards.ts";
 import { until } from "../../tests/support/until.ts";
 import { seed } from "../../tests/support/seed.ts";
 
@@ -19,6 +19,7 @@ afterEach(async () => { for (const c of cleanups.splice(0).reverse()) await c();
 function setup() {
   const dir = mkdtempSync(join(tmpdir(), "gb-retq-"));
   const opened = openDatabase(join(dir, "db.sqlite"), { blobDir: join(dir, "blobs") });
+  setAccess(opened.db, openAccess(opened.db)); // core seeds on a server database opt in to local mode's open Access
   cleanups.push(() => rmSync(dir, { recursive: true, force: true }), () => opened.db.close());
   return opened;
 }

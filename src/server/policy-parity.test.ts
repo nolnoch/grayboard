@@ -1,6 +1,7 @@
-// The synchronous and async policy drivers give one answer (#807 P3 A7e3): `authorizeNow` over `repo.policyNow`,
-// `authorize` on the store's read handle and `authorize` on a write body's Tx agree on every rule branch, make the
-// same reads in the same order, and see a body's own uncommitted writes. Every rule literal in policy.ts has a row,
+// The policy drivers give one answer (#807 P3 A7e3): the parity tests' synchronous oracle (tests/support/sync_access.ts
+// `authorizeNow`, which replaced the server's `authorizeNow` over `repo.policyNow` in #807 P3 C10d2-a), `authorize` on
+// the store's read handle and `authorize` on a write body's Tx agree on every rule branch and see a body's own
+// uncommitted writes. Every rule literal in policy.ts has a row,
 // so a new branch fails here until it's covered. The H1 race: a membership change committed between two of a
 // decision's reads must not combine into an allow neither state gives.
 import { describe, test, expect, beforeEach } from "bun:test";
@@ -10,11 +11,12 @@ import { join } from "node:path";
 import { idAddress } from "../core/bindings.ts";
 import { registerId, type CoreDb } from "../core/boards.ts";
 import type { Principal } from "../core/resolver.ts";
-import { authorize, authorizeNow, type AuthzRequest, type PolicyContext } from "./policy.ts";
+import { authorize, type AuthzRequest, type PolicyContext } from "./policy.ts";
 import { openDatabase, type Repo, type Team, type User } from "./db.ts";
 import { scratchDbPath } from "../../tests/support/scratch_db.ts";
 import { seed, seedSync } from "../../tests/support/seed.ts";
 import { grantOwner } from "../../tests/support/roles.ts";
+import { authorizeNow as oracle } from "../../tests/support/sync_access.ts";
 
 type Fixture = { repo: Repo; db: CoreDb; a: User; b: User; c: User; d: User; svc: User; eng: Team; ops: Team; x: Team; id: string };
 
@@ -195,7 +197,7 @@ const READS: Record<string, Record<string, string>> = {
   users: { findByEmail: "userByEmail" },
 };
 
-// A copy of the Repo whose policy reads, async and synchronous, log their read name and arguments (less the handle) to
+// A copy of the Repo whose policy reads log their read name and arguments (less the handle) to
 // `log` once they return; `after` runs then, before the rule sees the value.
 function traced(repo: Repo, log: unknown[][], after?: (read: string) => void): Repo {
   const out: Record<string, unknown> = { ...repo };
@@ -212,12 +214,6 @@ function traced(repo: Repo, log: unknown[][], after?: (read: string) => void): R
     }
     out[group] = copy;
   }
-  out.policyNow = Object.fromEntries(Object.entries(repo.policyNow).map(([k, fn]) => [k, (...args: unknown[]) => {
-    const v = (fn as (...a: unknown[]) => unknown)(...args);
-    log.push([k, ...args]);
-    after?.(k);
-    return v;
-  }]));
   return out as unknown as Repo;
 }
 
@@ -247,42 +243,31 @@ describe("policy drivers agree", () => {
     expect(literals.filter(l => !covered.has(l))).toEqual([]);
   });
 
-  test("authorizeNow, authorize on the read handle and authorize in a body give each row's decision", async () => {
+  test("the oracle, authorize on the read handle and authorize in a body give each row's decision", async () => {
     for (const row of rows(f)) {
       const ctx = row.ctx ?? { humanReach: "team" };
-      const now = authorizeNow(f.repo, ctx, row.req);
+      const now = oracle(f.repo, f.db, ctx, row.req);
       expect({ name: row.name, ...now }).toMatchObject({ name: row.name, allow: row.allow, rule: row.rule });
       expect({ name: row.name, ...(await authorize(f.repo, f.repo.read, ctx, row.req)) }).toEqual({ name: row.name, ...now });
       expect({ name: row.name, ...(await f.repo.write(tx => authorize(f.repo, tx, ctx, row.req))) }).toEqual({ name: row.name, ...now });
     }
   });
 
-  test("both drivers make the same reads in the same order", async () => {
-    for (const row of rows(f)) {
-      const ctx = row.ctx ?? { humanReach: "team" };
-      const sync: unknown[][] = [], async: unknown[][] = [];
-      authorizeNow(traced(f.repo, sync), ctx, row.req);
-      const t = traced(f.repo, async);
-      await authorize(t, t.read, ctx, row.req);
-      expect({ name: row.name, reads: async }).toEqual({ name: row.name, reads: sync });
-    }
-  });
-
-  test("both drivers see a body's own uncommitted write, and neither its rollback", async () => {
+  test("the oracle and authorize see a body's own uncommitted write, and neither its rollback", async () => {
     const req: AuthzRequest = { verb: "delegate.to", from_user: "b@example.com", to_user: "c@example.com" };
     const inside = await f.repo.write(async tx => {
       await f.repo.teams.addMember(tx, f.ops.id, f.b.id);
-      return [authorizeNow(f.repo, {}, req), await authorize(f.repo, tx, {}, req)];
+      return [oracle(f.repo, f.db, {}, req), await authorize(f.repo, tx, {}, req)];
     });
     expect(inside.map(d => d.allow)).toEqual([true, true]);
 
     const rolledBack = f.repo.write(async tx => {
       await f.repo.teams.removeMember(tx, f.ops.id, f.b.id);
-      expect([authorizeNow(f.repo, {}, req).allow, (await authorize(f.repo, tx, {}, req)).allow]).toEqual([false, false]);
+      expect([oracle(f.repo, f.db, {}, req).allow, (await authorize(f.repo, tx, {}, req)).allow]).toEqual([false, false]);
       throw new Error("roll back");
     });
     await expect(rolledBack).rejects.toThrow("roll back");
-    expect([authorizeNow(f.repo, {}, req).allow, (await authorize(f.repo, f.repo.read, {}, req)).allow]).toEqual([true, true]);
+    expect([oracle(f.repo, f.db, {}, req).allow, (await authorize(f.repo, f.repo.read, {}, req)).allow]).toEqual([true, true]);
   });
 });
 

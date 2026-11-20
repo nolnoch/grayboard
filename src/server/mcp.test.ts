@@ -20,6 +20,7 @@ import { OPENCODE_CLIENT } from "./oauth-config.ts";
 import { DEFAULT_MCP_LIMITS, type McpLimits } from "./config.ts";
 import { stubAuthRead } from "../../tests/support/auth_stub.ts";
 import type { Read } from "./store/tx.ts";
+import { sessionEndPort } from "./session_end.ts";
 import { scratchDbPath } from "../../tests/support/scratch_db.ts";
 import { seed, seedSync } from "../../tests/support/seed.ts";
 const meta = { "ai.opencode/sessionID": "test-root" };
@@ -35,7 +36,7 @@ let blobDir: string;
 const clients: Client[] = [];
 beforeEach(async () => {
   blobDir = mkdtempSync(join(tmpdir(), "gb-mcp-"));
-  store = openDatabase(scratchDbPath(), { blobDir });
+  store = openDatabase(scratchDbPath(), { blobDir , sessionEnd: sessionEndPort("team") });
   application = createApplication(store.repo, { helloLimit: { burst: 10000, perSec: 10000 }, hostedRequestLimit: { burst: 10000, perSec: 10000 }, hostedSubscriberLimit: { burst: 10000, perSec: 10000 } });
   oauth = createOAuthServer(store.repo, { dbPath: scratchDbPath(), blobDir, httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl: "https://grayboard.example.com:443", messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES });
   hosted = createHostedMcp(application, oauth, { trustedOrigin: "https://grayboard.example.com:443" });
@@ -570,17 +571,15 @@ test("actual access revocation between factory and dispatch prevents mutation", 
   const client = await connect();
   const original = oauth.isAuthorized;
   let checks = 0;
-  // The revoke answers with a promise (#807 P3 A6c), so seedSync's post would queue it; seed runs it now on the idle
-  // queue, and it commits a few microtasks later, before the dispatch's check. Awaited below, so a failure shows.
-  let revoking: Promise<void> | undefined;
-  const revokeOnFirst = (principal: OAuthPrincipal) => {
-    if (++checks === 1) revoking = seed(store.repo, tx => store.repo.oauth.revokeToken(tx, principal.accessHash, principal.clientId, Date.now()));
+  // The first check passes, then the revoke commits before it returns (#807 P3 C10d2-a: the revoke's body awaits its
+  // hosted ends, so it no longer commits within the few microtasks the check took to come back).
+  const revokeOnFirst = async (principal: OAuthPrincipal) => {
+    if (++checks === 1) await seed(store.repo, tx => store.repo.oauth.revokeToken(tx, principal.accessHash, principal.clientId, Date.now()));
   };
   // Selection and dispatch both check through the async form (#807 P3 A7d2b): either may be first.
-  oauth.isAuthorized = async principal => { const valid = await original(principal); revokeOnFirst(principal); return valid; };
+  oauth.isAuthorized = async principal => { const valid = await original(principal); await revokeOnFirst(principal); return valid; };
   try {
     await expect(client.callTool({ name: "board_create", arguments: { name: "blocked", purpose: "must not mutate" } })).rejects.toThrow("invalid_token");
-    await revoking;
     expect(checks).toBeGreaterThanOrEqual(2);
     expect(store.db.query("SELECT name FROM boards WHERE name = 'blocked'").get()).toBeNull();
   } finally { oauth.isAuthorized = original; }
@@ -1592,7 +1591,7 @@ test("#899: another connection's commit reaches a stamped listen within a tick",
   // Reopen the fixture on a file, so a second connection can commit to it.
   await hosted.close(); oauth.close(); application.stopExpiry(); store.db.close();
   const path = join(blobDir, "gb.db");
-  store = openDatabase(path, { blobDir });
+  store = openDatabase(path, { blobDir , sessionEnd: sessionEndPort("team") });
   application = createApplication(store.repo, { helloLimit: { burst: 10000, perSec: 10000 }, hostedRequestLimit: { burst: 10000, perSec: 10000 }, hostedSubscriberLimit: { burst: 10000, perSec: 10000 } });
   oauth = createOAuthServer(store.repo, { dbPath: path, blobDir, httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl: "https://grayboard.example.com:443", messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES });
   hosted = createHostedMcp(application, oauth, { trustedOrigin: "https://grayboard.example.com:443" });

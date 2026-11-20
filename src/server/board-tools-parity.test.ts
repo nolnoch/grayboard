@@ -7,12 +7,13 @@ import { boardActor, holdAlias, idAddress } from "../core/bindings.ts";
 import { archiveBoard, createBoard, markHuman, post, registerId, setStatus, setSubscription, subscribe, touchAlias, type CoreDb, type UnboundPeer } from "../core/boards.ts";
 import type { Principal } from "../core/resolver.ts";
 import { callBoardTool as coreCallBoardTool, type ToolContext } from "../core/tools.ts";
-import { boardAccess, principalCanSee } from "./access.ts";
+import { boardAccess } from "./access.ts";
 import { callBoardTool, serverBoardActor } from "./boards.ts";
 import type { Repo } from "./db.ts";
 import type { Read, Tx } from "./store/tx.ts";
 import { B, D, E, ENDED_ID, openBoardParity, W, WADE_ID } from "../../tests/support/board_parity.ts";
 import { seed } from "../../tests/support/seed.ts";
+import { principalCanSee } from "../../tests/support/sync_access.ts";
 
 const BOB_ID = idAddress("c".repeat(64)), EVE_ID = idAddress("d".repeat(64)), TAIL_ID = idAddress("e".repeat(64));
 // An unbound hosted session of dan's (an addressless reader), and a tools-only writer of dan's acting as bob's be.
@@ -112,7 +113,7 @@ const coreCtx = (c: Caller): ToolContext => ({
   addresses: c.addresses,
   unbound: UNBOUND,
   ...(c.session ? { session: c.session } : {}),
-  ...(c.principal ? { reader: b => principalCanSee(repo, c.principal!, b) } : {}),
+  ...(c.principal ? { reader: b => principalCanSee(repo, db, c.principal!, b) } : {}),
   ...(c.human ? { human: true } : {}),
   ...(c.via ? { via: c.via } : {}),
 });

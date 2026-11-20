@@ -135,6 +135,11 @@ export function makePgAttachments(): AttachmentsStore {
     async remove(tx, id) {
       await pgOf(tx)`DELETE FROM attachments WHERE id = ${id}`;
     },
+    // A session end's (#807 P3 C10d2-a). A bind racing it re-checks the row: the DELETE waits for the bind's row
+    // lock, then skips a row the bind gave a message or post.
+    async dropUnboundOf(tx, uploader) {
+      await pgOf(tx)`DELETE FROM attachments WHERE uploader = ${uploader} AND message_id IS NULL AND post_id IS NULL`;
+    },
     async unnamedBlobs(r) {
       const rows: Row[] = await pgOf(r)`SELECT sha256 FROM attachment_blobs b
         WHERE NOT EXISTS (SELECT 1 FROM attachments a WHERE a.sha256 = b.sha256) ORDER BY sha256`;

@@ -68,6 +68,7 @@ export function messagesContract(backend: MessagesBackend): void {
   inserts(it);
   reads(it);
   acksAndRetract(it);
+  sessionEnd(it);
 }
 
 type It = (name: string, fn: (h: MessagesHarness) => Promise<void>) => void;
@@ -490,5 +491,50 @@ function acksAndRetract(it: It): void {
     // Nothing old left: a second prune is a no-op.
     await h.write(tx => h.messages.prune(tx, T0 + 50));
     expect(await h.messageRows()).toHaveLength(3);
+  });
+}
+
+// A session end's reads and writes (#807 P3 C10d2-a, server/session_end.ts).
+function sessionEnd(it: It): void {
+  // M21.
+  it("unreadFor is the ID's direct mail past its read point, acked or not, from others, by id", async h => {
+    const read = await send(h, A, ID, "read");
+    const acked = await send(h, A, ID, "acked");
+    const unread = await send(h, B, ID, "unread");
+    await send(h, ID, ID, "to itself");
+    await h.write(tx => h.messages.insert(tx, A, "team", ID, "a team stream of the same name", null));
+    await send(h, A, C, "to someone else");
+    await h.cursor(ID, read.id);
+    await h.write(tx => h.messages.ack(tx, ID, acked.id));
+    expect(await h.write(tx => h.messages.unreadFor(tx, ID))).toEqual([{ id: acked.id, sender: A }, { id: unread.id, sender: B }]);
+    // No read point: everything to it from others.
+    expect(await h.write(tx => h.messages.unreadFor(tx, C))).toEqual([{ id: expect.any(Number), sender: A }]);
+    expect(await h.write(tx => h.messages.unreadFor(tx, "id:none"))).toEqual([]);
+  });
+
+  // M22.
+  it("bounce writes a kind 'bounce' reply from the ended ID, not pending, never the human mark; the parent stays", async h => {
+    const parent = await h.write(tx => h.messages.insert(tx, A, "user", ID, "hi", null, false, undefined, undefined, undefined, undefined, true));
+    h.setNow(T0 + 5);
+    const b = await h.write(tx => h.messages.bounce(tx, ID, A, parent.id, "returned", T0 + 9));
+    expect(b).toEqual({ id: expect.any(Number), sender: ID, recipient_type: "user", recipient: A, body: "returned", parent_id: parent.id, created_at: T0 + 9, delivered_at: null, pending: 0, kind: "bounce", via: null });
+    expect(await h.humanRows()).toEqual([{ id: parent.id, human: true }, { id: b!.id, human: false }]);
+    expect((await h.messages.getById(h.read, parent.id))?.kind).toBeNull();
+    // It rolls back with its body.
+    await expect(h.write(async tx => { await h.messages.bounce(tx, ID, A, parent.id, "again", T0 + 10); throw new Error("rolled back"); })).rejects.toThrow("rolled back");
+    expect(await h.messageRows()).toEqual([{ id: parent.id, parent_id: null }, { id: b!.id, parent_id: parent.id }]);
+  });
+
+  // M23.
+  it("dropReader drops the ID's read points and acks, no one else's", async h => {
+    const m = await send(h, A, ID, "m");
+    const n = await send(h, ID, B, "n");
+    await h.cursor(ID, m.id);
+    await h.cursor(B, n.id);
+    await h.write(async tx => { await h.messages.ack(tx, ID, m.id); await h.messages.ack(tx, B, n.id); });
+    await h.write(tx => h.messages.dropReader(tx, ID));
+    expect(await h.ackRows()).toEqual([{ reader: B, message_id: n.id }]);
+    expect(await h.write(tx => h.messages.unreadFor(tx, ID))).toEqual([{ id: m.id, sender: A }]);
+    expect(await h.write(tx => h.messages.unreadFor(tx, B))).toEqual([]);
   });
 }

@@ -533,6 +533,19 @@ export function isQueueKey(key: string): boolean {
   return key.startsWith("queue:");
 }
 
+/**
+ * `items` with its queue claims (keyed `queue:<board>:<post id>`) in post id order, each in a slot a queue claim held,
+ * and every other item where it was. A requeue locks its post (a claim of it, a reply under it), and a posts prune
+ * locks its batch by id: on Postgres, two requeues in another order deadlock against it (#1387). Every sweep and
+ * session end, local or server, runs them in this order.
+ */
+export function queuePostOrder<T>(items: T[], key: (item: T) => string): T[] {
+  const postId = (k: string) => Number(k.slice(k.lastIndexOf(":") + 1));
+  const queued = items.filter((i) => isQueueKey(key(i))).sort((a, b) => postId(key(a)) - postId(key(b)));
+  let next = 0;
+  return items.map((i) => (isQueueKey(key(i)) ? queued[next++]! : i));
+}
+
 /** Whether `c` is a queue post's claim on a board the caller (`sees`) can't see: it answers as no claim at all. */
 export function hiddenQueue(c: { key: string; board: string | null }, sees: (board: string) => boolean): boolean {
   return isQueueKey(c.key) && !(c.board && sees(c.board));
@@ -552,7 +565,7 @@ export function claimView(c: Claim, boardSeen: boolean, holderSeen: boolean): Cl
 export function sweepChanges(db: Database, now: number): ClaimChanges {
   const wake = new Set<string>();
   const boards = new Set<string>();
-  for (const c of expireClaims(db, now)) {
+  for (const c of queuePostOrder(expireClaims(db, now), (c) => c.key)) {
     logEvent(db, "expire", c.holder, c, now);
     if (c.key.startsWith("queue:")) {
       // A queue post's claim lapsed: re-offer the original post to the next

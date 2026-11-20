@@ -681,6 +681,24 @@ function cutover(it: It): void {
       .toEqual([{ key: "builtin_clients", value: start + 1 }, { key: "builtin_clients_cli", value: start + 3 }]);
   });
 
+  // A database with no grant to revoke (a fresh server) still claims the key on its first run: the built-in clients'
+  // grants issued after that boot are theirs, and the next boot must leave them alone.
+  it("revokePreBuiltinGrants with no grant to revoke still claims its key; a grant issued afterwards survives the next run", async h => {
+    const pi = { ...binding, clientId: "grayboard-pi" };
+    const pending = await world(h, "-pending", pi);
+    await pending.issueCode();
+    expect(await h.write(tx => h.oauth.revokePreBuiltinGrants(tx, ["grayboard-pi"], start + 1))).toBe(0);
+    expect(await h.rows("server_state")).toEqual([{ key: "builtin_clients", value: start + 1 }]);
+    // The claiming run drops the listed clients' unredeemed codes, as a run that revokes does.
+    expect(await h.rows("oauth_codes")).toEqual([]);
+    const later = await world(h, "-later", pi);
+    const laterInput = await later.issue();
+    expect(await h.write(tx => h.oauth.revokePreBuiltinGrants(tx, ["grayboard-pi"], start + 2))).toBe(0);
+    expect(await h.oauth.isGrantActive(h.read, laterInput.grantId, start + 2)).toBe(true);
+    expect(await h.audits("oauth.builtin_client_grant_revoked")).toEqual([]);
+    expect(await h.rows("server_state")).toEqual([{ key: "builtin_clients", value: start + 1 }]);
+  });
+
   it("revokePreBuiltinGrants and cleanup refuse an invalid time and write nothing", async h => {
     await expect(h.write(tx => h.oauth.revokePreBuiltinGrants(tx, ["grayboard-pi"], -1))).rejects.toThrow(RangeError);
     await expect(h.write(tx => h.oauth.cleanup(tx, 1.5))).rejects.toThrow(RangeError);

@@ -198,5 +198,32 @@ export function makePgMessages({ clock, attachmentLimits }: { clock: () => numbe
       await dropAttachments(sql, "message", old());
       await sql`DELETE FROM messages WHERE created_at < ${olderThanMs}`;
     },
+    // A session end's (#807 P3 C10d2-a); its row lock (sessionEnd.end, C10d2-b) is what orders it against a send. The
+    // rows FOR KEY SHARE, locked in id order (the lock sits above the sort), as messages.prune locks its batch: the
+    // end's bounces then lock their parents in sender order holding them all already, so they can't deadlock against
+    // a prune (session_end.ts's lock order). A retract holding one makes this wait, and its row is then gone.
+    async unreadFor(tx, id) {
+      const list = await pgOf(tx)`SELECT m.id, m.sender FROM messages m
+        WHERE m.recipient_type = 'user' AND m.recipient = ${id} AND m.sender <> ${id}
+          AND m.id > COALESCE((SELECT last_seen_id FROM mailbox_cursors
+                                WHERE address = ${id} AND stream_type = 'direct' AND stream_ref = ${id}), 0)
+        ORDER BY m.id FOR KEY SHARE OF m`;
+      return list.map((r: Row) => ({ id: int8(r.id), sender: r.sender as string }));
+    },
+    // The parent FOR KEY SHARE first, as insert's reply does: a retract that committed first leaves no parent, and the
+    // bounce writes nothing (null) rather than fail 23503 and abort the end's transaction.
+    async bounce(tx, from, to, parentId, body, now) {
+      const sql = pgOf(tx);
+      if ((await sql`SELECT id FROM messages WHERE id = ${parentId} FOR KEY SHARE`).length === 0) return null;
+      const [row] = await rows(sql`INSERT INTO messages (sender, sender_id, recipient_type, recipient, body, parent_id, created_at, pending, kind, human)
+        VALUES (${from}, ${from}, 'user', ${to}, ${body}, ${parentId}, ${now}, false, 'bounce', false)
+        RETURNING ${cols(sql)}`);
+      return row!;
+    },
+    async dropReader(tx, id) {
+      const sql = pgOf(tx);
+      await sql`DELETE FROM mailbox_cursors WHERE address = ${id}`;
+      await sql`DELETE FROM dm_acks WHERE reader = ${id}`;
+    },
   };
 }

@@ -8,11 +8,13 @@
 import { beforeEach, expect, spyOn, test } from "bun:test";
 import { claimQueuePost, createBoard, post, subscribe } from "../core/boards.ts";
 import { boardActor } from "../core/bindings.ts";
-import { logEvent, sweepChanges } from "../core/claims.ts";
+import { checkTake, logEvent, sweepChanges, type TakeOpts } from "../core/claims.ts";
 import { CoreError } from "../core/errors.ts";
 import { callBoardTool as coreCallBoardTool, type ToolContext } from "../core/tools.ts";
 import { boardAccess } from "./access.ts";
-import { callClaimTool, sweepClaims } from "./claims.ts";
+import { writeAudit } from "./audit.ts";
+import { callClaimTool, endedClaimText, sweepClaims } from "./claims.ts";
+import { endSessionServer } from "./session_end.ts";
 import type { Repo } from "./db.ts";
 import type { Tx } from "./store/tx.ts";
 import { B, BOB_ID, CHILD_ID, D, DAN_WRITER, diverging, E, ENDED_ID, ENG_ID, EVE_ID, inBody as inBodyOn, ONLINE, openPostParity, outcome, outcomeAsync, TAIL_ID, team, W, WADE_ID } from "../../tests/support/board_parity.ts";
@@ -245,17 +247,28 @@ const ctxOf = (c: Caller): ToolContext => ({
 });
 const session = (c: Caller) => ({ addresses: c.addresses, asAddresses: c.addresses, ownScope: c.user });
 
+const endedTake = (actor: string, args: Record<string, unknown>) => {
+  if (actor !== ENDED_ID || typeof args.key !== "string" || (args.board !== undefined && typeof args.board !== "string")) return false;
+  try { checkTake(args.key, args as TakeOpts); return true; } catch { return false; }
+};
+
 test("claim_take, claim_release and claim_watch give core's answers and leave its rows, for every caller and call", async () => {
   const access = boardAccess(repo);
   const out: [string, unknown, unknown][] = [];
   for (const c of CALLERS) for (const [tool, args] of CALLS()) {
     let actor: string;
     try { actor = boardActor(repo.coreOn(repo.read), tool, args, session(c)); } catch { continue; }
-    const want = await inBody(async tx => outcome(() => coreCallBoardTool(repo.coreOn(tx), actor, tool, args, ctxOf(c))));
+    // An ended ID's take that passes the argument checks is refused id_ended on the server, before any write (#807 P3
+    // C10d2-b, E4), where core takes it: the one deliberate difference.
+    const want = tool === "claim_take" && endedTake(actor, args)
+      ? await inBody(async () => ({ error: `CoreError: ${endedClaimText(actor)}` }))
+      : await inBody(async tx => outcome(() => coreCallBoardTool(repo.coreOn(tx), actor, tool, args, ctxOf(c))));
     const got = await inBody(tx => outcomeAsync(() => callClaimTool(repo, access, tx, actor, tool, args, ctxOf(c))));
     out.push([`${c.label} ${tool} ${JSON.stringify(args)}`, want, got]);
   }
   expect(diverging(out)).toEqual([]);
+  // The ended ID's takes that reach the server's refusal.
+  expect(out.filter(([l, , g]) => l.startsWith("bob's ended claim_take") && JSON.stringify(g).includes("has ended; it can't take")).length).toBe(15);
 
   // The fixture reaches each branch the port decides.
   type R = { out: { value?: { result: unknown; wake: string[] }; error?: string }; rows: Record<string, unknown[]> };
@@ -358,7 +371,7 @@ test("a session end's requeue of a confined holder's queue post replies as the p
     const { id, ...rest } = p;
     return { ...rest, told: r.rows.outbox.filter(o => o.post_id === id).map(o => o.handle) };
   };
-  const ended = await inBody(tx => repo.sessionEnd.end(tx, ENG_ID, { why: "test", now: Date.now() })) as R;
+  const ended = await inBody(tx => endSessionServer(repo, access, tx, ENG_ID, { why: "test", now: Date.now(), audit: async (a, actor, target, detail) => writeAudit(repo, tx, a, actor, target, detail) })) as R;
   const engBound: ToolContext = { user: W, addresses: ["eng/build", ENG_ID], session: ENG_ID };
   const declined = await inBody(tx => callClaimTool(repo, access, tx, "eng/build", "claim_release", { key: `queue:opsq:${OPSQ_LIVE}` }, engBound)) as R;
   expect(ended.rows.claims.map(c => c.key)).not.toContain(`queue:opsq:${OPSQ_LIVE}`);
@@ -416,6 +429,36 @@ test("a decline whose redelivery fails leaves the claim held and no release even
   } finally { spy.mockRestore(); }
   expect(claimRows()).toEqual(before);
   expect(JSON.stringify(before.claims)).toContain(`"key":"queue:q:${QLIVE}","holder":"${B}/be"`);
+});
+
+// #807 P3 C10e2 (C10e-a audit finding 3): a redelivery whose claim another lane took first (a second pod's sweep, on
+// Postgres) wrote no push for its lane, so the requeue wakes nobody; one that takes it wakes its lane.
+test("a decline's redelivery wakes its lane only when it took the claim", async () => {
+  const access = boardAccess(repo);
+  const real = repo.boards.claimQueuePost.bind(repo.boards);
+  const decline = async (took: boolean | null) => {
+    const lanes: string[] = [];
+    const spy = spyOn(repo.boards, "claimQueuePost").mockImplementation((async (tx: Tx, board: string, postId: number, lane: string, now: number, o: { note: string; push: boolean }) => {
+      lanes.push(lane);
+      const won = await real(tx, board, postId, lane, now, o);
+      return took ?? won;
+    }) as never);
+    const rollback = new Error("rolled back");
+    let wake: string[] = [];
+    try {
+      await expect(repo.write(async tx => {
+        wake = (await callClaimTool(repo, access, tx, `${B}/be`, "claim_release", { key: `queue:q:${QLIVE}` }, bob)).wake ?? [];
+        throw rollback;
+      })).rejects.toBe(rollback);
+    } finally { spy.mockRestore(); }
+    expect(lanes).toHaveLength(1);
+    return { lane: lanes[0]!, wake };
+  };
+  const won = await decline(null);
+  expect(won.wake).toContain(won.lane);
+  const lost = await decline(false);
+  expect(lost.lane).toBe(won.lane);
+  expect(lost.wake).not.toContain(lost.lane);
 });
 
 test("a refusal after a write, caught in a body that commits, leaves nothing of the call (the tool's savepoint)", async () => {

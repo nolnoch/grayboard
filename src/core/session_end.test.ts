@@ -261,3 +261,15 @@ test("expiry and session-end release posts carry the claimant's user; claim rows
   sweepExpired(db);
   expect(writer("[expired] ticket:ENG-9")).toBe("dave@example.com");
 });
+
+// #1387: an end releases its queue claims in post id order (queuePostOrder), whatever order the claims table gives.
+// Mutation: endSession without queuePostOrder (key order: queue:q:10 first).
+test("an end releases its queue claims in post id order", () => {
+  const db = bus();
+  createBoard(db, "be", "q", "p", null, { kind: "queue" });
+  for (let i = 0; i < 10; i++) post(db, "be", "q", `item ${i}`);
+  for (const n of [10, 9]) db.prepare(`INSERT INTO claims (key, holder, note, board, acquired_at, expires_at) VALUES (?, ?, 'queue post', 'q', 1, ?)`).run(`queue:q:${n}`, ID, 1e15);
+  end(db, ID, Date.now());
+  const released = db.prepare(`SELECT key FROM claim_events WHERE event = 'release' ORDER BY rowid`).all() as { key: string }[];
+  expect(released.map((e) => e.key)).toEqual(["queue:q:9", "queue:q:10"]);
+});

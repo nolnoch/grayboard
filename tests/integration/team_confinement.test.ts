@@ -7,6 +7,7 @@ import { boardAccess } from "../../src/server/access.ts";
 import { board } from "../support/events.ts";
 import { HostedSession, HostedToolError } from "../support/hosted_session.ts";
 import { TestServer } from "../support/server.ts";
+import { endId } from "../support/end_id.ts";
 
 const B = "bob@example.com", F = "frank@example.com", D = "dan@example.com";
 let srv: TestServer;
@@ -202,9 +203,9 @@ describe("a confined holder's claim end is announced for its user (#1286)", () =
     expect(await dan.call("claim_watch", { key: "ticket:QA-E" })).toBeDefined();
     expect((await srv.api(bob, "POST", "/api/teams/qa/remove", { email: D })).status).toBe(200);
     // A hosted root's own session_end leaves its ID unended (the hosted store's); the server's ID end (a startup
-    // leftover's, a revoked tools-only session's, a released child's) is core's endSession, run here as they run it.
+    // leftover's, a revoked tools-only session's, a released child's) is server/session_end.ts's, run here as they run it.
     // Its release has no signed-in caller (no ctx.user).
-    await srv.app.repo.write(tx => srv.app.repo.sessionEnd.end(tx, id, { why: "test", now: Date.now() }));
+    await srv.app.repo.write(tx => endId(srv.app.repo, tx, id, "test"));
     expect(srv.app.db.query("SELECT count(*) AS n FROM claims WHERE key = 'ticket:QA-E'").get()).toEqual({ n: 0 });
     const got = await ops.next(mentioned("ticket:QA-E", "[release]"));
     if (got.event.kind !== "board" || got.event.item.kind !== "push") throw new Error("not a push");
@@ -315,8 +316,8 @@ describe("a confined holder's queue claim ends in an [unclaimed] reply for its u
     const { w, id, postId, key } = await confinedQueue(B, c);
     const quiet = await confinedQueue(F, c);
     expect((await srv.api(bob, "POST", "/api/teams/qa/remove", { email: F })).status).toBe(200);
-    // As the #1286 session-end case runs it: the server's ID end is core's endSession, with no signed-in caller.
-    for (const ended of [id, quiet.id]) await srv.app.repo.write(tx => srv.app.repo.sessionEnd.end(tx, ended, { why: "test", now: Date.now() }));
+    // As the #1286 session-end case runs it: the server's ID end, with no signed-in caller.
+    for (const ended of [id, quiet.id]) await srv.app.repo.write(tx => endId(srv.app.repo, tx, ended, "test"));
     expect(srv.app.db.query("SELECT count(*) AS n FROM claims WHERE key IN (?, ?)").get(key, quiet.key)).toEqual({ n: 0 });
     const got = await w.next(board((i) => i.kind === "push" && i.reason === "mention" && i.post.body.startsWith(`[unclaimed] ${key}:`)));
     if (got.event.kind !== "board" || got.event.item.kind !== "push") throw new Error("not a push");

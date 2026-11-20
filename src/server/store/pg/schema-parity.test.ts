@@ -16,7 +16,7 @@ import { PrincipalTaken } from "../errors.ts";
 const NOT_CARRIED = new Set([
   "identities", "cursors", // pre-#284 identity and read-point tables, replaced by aliases/ids and mailbox_cursors
   "handles", // the 1.x roster, read only by each mode's one-time alias seed
-  "audit_log", // local mode's audit trail; the server audits to access_log (serverAuditSink)
+  "audit_log", // local mode's audit trail; the server audits to access_log (writeAudit)
   "sqlite_sequence", // SQLite's AUTOINCREMENT bookkeeping; identity columns keep their own sequences
 ]);
 // Tables Postgres has that the SQLite server schema doesn't.

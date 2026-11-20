@@ -14,7 +14,7 @@ import { coreAuditSink, type AuditSink } from "./audit.ts";
 import { addressParts } from "./addresses.ts";
 import { forgetHandle } from "./boards.ts";
 import { holdsOf, logBinding, primaryOf } from "./bindings.ts";
-import { logEvent, release, sweepIn, type Claim } from "./claims.ts";
+import { logEvent, queuePostOrder, release, sweepIn, type Claim } from "./claims.ts";
 import { CoreError } from "./errors.ts";
 import { heldText, Undeliverable, undeliverableFrom } from "./undeliverable.ts";
 import type { ErrorCode } from "../shared/protocol.ts";
@@ -97,7 +97,7 @@ export function endSession(
   // those) still frees the claim, unannounced, and the failure goes in the
   // id.ended audit: an end must not leave a claim on an ID that can't act.
   const releaseFailed: { key: string; error: string }[] = [];
-  for (const c of claims) {
+  for (const c of queuePostOrder(claims, (c) => c.key)) {
     try {
       for (const h of release(db, id, c.key, "session ended", { session: id }).wake) wake.add(h);
     } catch (e) {

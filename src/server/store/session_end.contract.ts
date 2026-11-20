@@ -1,6 +1,6 @@
 // The session end store's contract (#807 P3 C10d1, docs/future/postgres-server.md D9): SessionEndStore's refusal and
-// pruneEnded, written once over a harness so both stores run the same rows. `end` stays SQLite's until C10d2 (its rows
-// are db.test.ts's and core's session_end.test.ts). Not a *.test.ts file, so Bun doesn't discover it: a backend's test
+// pruneEnded, and end's row step (#807 P3 C10d2-b), written once over a harness so both stores run the same rows (the
+// composed end's are server/session_end.test.ts's and session_end.pg.test.ts's). Not a *.test.ts file, so Bun doesn't discover it: a backend's test
 // file registers it under a describe() (session_end.contract.sqlite.ts through db.test.ts for SQLite,
 // pg/session_end.contract.pg.test.ts for Postgres). The harness also serves the delegation contract
 // (delegation.contract.ts): both groups read the same ids, aliases and holds.
@@ -69,6 +69,7 @@ export function sessionEndContract(backend: IdsBackend): void {
   const it = idsRow(backend);
   refusal(it);
   prune(it);
+  end(it);
 }
 
 type It = ReturnType<typeof idsRow>;
@@ -137,12 +138,14 @@ function refusal(it: It): void {
     expect((await refusalOf(h, "id:0000000000011"))!.code).toBe("not_found");
   });
 
-  it("refusal and pruneEnded refuse a settled Tx and another backend's handle", async h => {
+  it("refusal, pruneEnded and end refuse a settled Tx and another backend's handle", async h => {
     await h.session(ids.s1);
     const kept = await h.write(async tx => tx);
     await expect(h.sessionEnd.refusal(kept, ids.s1)).rejects.toThrow(SETTLED);
     await expect(h.sessionEnd.pruneEnded(kept, 1, 1)).rejects.toThrow(SETTLED);
+    await expect(h.sessionEnd.end(kept, ids.s1, 1)).rejects.toThrow(SETTLED);
     await expect(h.sessionEnd.refusal({} as Tx, ids.s1)).rejects.toThrow(FOREIGN);
+    await expect(h.sessionEnd.end({} as Tx, ids.s1, 1)).rejects.toThrow(FOREIGN);
     await expect(h.sessionEnd.pruneEnded({} as Tx, 1, 1)).rejects.toThrow(FOREIGN);
   });
 }
@@ -191,5 +194,43 @@ function prune(it: It): void {
     expect(await h.idRows()).toEqual([ids.s1]);
     expect(await h.prunedRows()).toEqual([]);
     expect((await refusalOf(h, ids.s1))!.code).toBe("id_ended");
+  });
+}
+
+function end(it: It): void {
+  it("end: marks the ID ended with what it held (oldest hold first, as refusal reads it back), and returns its principal, holds and unended children by id", async h => {
+    const { s1, s2, s3, s4, s5 } = ids;
+    await h.session(s1, { principal: "you@example.com" });
+    await h.hold("you@example.com/fe", s1, 20);
+    await h.hold("you@example.com/be", s1, 10);
+    // s3 and s2 live children (returned by id), s4 an ended one, s5 another root's.
+    await h.session(s3, { rootId: s1 });
+    await h.session(s2, { rootId: s1 });
+    await h.session(s4, { rootId: s1, endedAt: T0 - 1 });
+    await h.session(s5, { rootId: s2 });
+    expect(await h.write(tx => h.sessionEnd.end(tx, s1, T0))).toEqual({ principal: "you@example.com", held: ["you@example.com/be", "you@example.com/fe"], children: [s2, s3] });
+    const why = await refusalOf(h, s1);
+    expect([why!.code, why!.detail]).toEqual(["id_ended", `${s1} ended at ${iso(T0)}; it held \`you@example.com/be\`, \`you@example.com/fe\``]);
+    // The holds stay: releasing them is the composed end's (bindings.release).
+    expect((await refusalOf(h, s2))!.code).toBe("child_session");
+  });
+
+  it("end: a second end returns null and changes nothing; an ID with no row returns principal null, nothing held", async h => {
+    const { s1, s2 } = ids;
+    await h.session(s1);
+    expect(await h.write(tx => h.sessionEnd.end(tx, s1, T0))).toEqual({ principal: null, held: [], children: [] });
+    expect(await h.write(tx => h.sessionEnd.end(tx, s1, T0 + 5))).toBeNull();
+    expect((await refusalOf(h, s1))!.detail).toBe(`${s1} ended at ${iso(T0)}; it held no alias`);
+    expect(await h.write(tx => h.sessionEnd.end(tx, s2, T0))).toEqual({ principal: null, held: [], children: [] });
+    expect(await h.idRows()).toEqual([s1]);
+  });
+
+  it("end rolls back with its body", async h => {
+    await h.session(ids.s1);
+    await expect(h.write(async tx => {
+      expect(await h.sessionEnd.end(tx, ids.s1, T0)).not.toBeNull();
+      throw new Error("rolled back");
+    })).rejects.toThrow("rolled back");
+    expect(await refusalOf(h, ids.s1)).toBeNull();
   });
 }

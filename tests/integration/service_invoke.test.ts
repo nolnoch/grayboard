@@ -6,12 +6,13 @@
 // queue board, claimed by a lane, never a dispatch (principle 7). Each security invariant the step names has a test
 // here that fails when it breaks.
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { boardAccess, serverAccess } from "../../src/server/access.ts";
+import { boardAccess } from "../../src/server/access.ts";
 import type { DeliveryEvent } from "../../src/server/application.ts";
 import { AppSession } from "../support/app_session.ts";
 import { accessAudits } from "../support/audit.ts";
 import { HostedSession, HostedToolError, type InboxItem } from "../support/hosted_session.ts";
 import { TestServer } from "../support/server.ts";
+import { serverAccess } from "../support/sync_access.ts";
 
 const A = "alice@example.com", B = "bob@example.com", C = "carol@example.com", D = "dave@example.com", E = "erin@example.com", ROOT = "root@example.com";
 const SVC = "ingest";

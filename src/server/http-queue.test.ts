@@ -175,9 +175,10 @@ test("#807 P1c-15c-1: claim, identity and team routes reach the store on their b
     // call is current when it lands: it is left out of the per-route reads and must read on the pool, outside any body.
     expect(checks.filter(c => c.op === "nextExpiry" && (c.handle !== "pool" || c.inTxn))).toEqual([]);
     const reads = (r: string) => checks.filter(c => c.route === r && c.op !== "nextExpiry").map(c => `${c.op}:${c.handle}`);
-    // Then the take itself: the sweep, the key's row, the upsert and its event, all on the body's Tx.
+    // Then the take itself: the sweep, the key's row, the upsert and its event, all on the body's Tx; an ID's take
+    // first locks its ids row (E4, #807 P3 C10d2-b).
     const take = ["expire:tx", "get:tx", "take:tx", "logEvent:tx"];
-    expect(reads("claim call as id")).toEqual(["idRow:tx", "addressSet:tx", ...take]);
+    expect(reads("claim call as id")).toEqual(["idRow:tx", "addressSet:tx", "lockLive:tx", ...take]);
     expect(reads("claim call")).toEqual(["userOf:tx", "addressSet:tx", ...take]);
     expect(reads("identity delete")).toEqual(["userOf:tx", "forget:tx"]);
     expect(reads("team delete-alias")).toEqual(["userOf:tx", "forget:tx"]);

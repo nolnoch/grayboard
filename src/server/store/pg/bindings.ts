@@ -4,7 +4,7 @@
 // - take locks before it checks. The alias row first, through the aliases store's lock "use" (FOR NO KEY UPDATE): two
 //   takes, or a take and a tools-only root's writes_as (application.ts hostedWritesAs takes the same lock), serialize,
 //   so the second's userOf sees the first's committed hold or writes_as; a gone alias is no take (a delete won). Then
-//   the taking ID's ids row FOR KEY SHARE, unended (E4): an end locks that row FOR UPDATE first, so a take waits for it
+//   the taking ID's ids row FOR KEY SHARE, unended (E4, lockLive, which the server's claim take shares): an end locks that row FOR UPDATE first, so a take waits for it
 //   and then reads it ended (null), or the end waits for the take and releases its hold. KEY SHARE, not SHARE: it
 //   doesn't conflict with a presence touch's UPDATE (FOR NO KEY UPDATE). Then core's upsert, its 2-argument MAX as
 //   GREATEST; its conflict WHERE (only the same ID re-takes) is what refuses a take by another ID of the same
@@ -66,6 +66,11 @@ export function makePgBindings({ clock, aliases }: { clock: () => number; aliase
       ORDER BY (i.id IN (SELECT id FROM alias_holds WHERE address = ${address})) DESC, i.started_at, i.seq
       LIMIT 1`;
     return (row?.id as string | undefined) ?? null;
+  };
+  // The ID's row FOR KEY SHARE (E4): read after the lock is granted, so an end that held it reads as ended.
+  const lockLive: BindingsStore["lockLive"] = async (tx, id) => {
+    const [row] = await pgOf(tx)`SELECT ended_at FROM ids WHERE id = ${id} FOR KEY SHARE`;
+    return row ? row.ended_at === null : null;
   };
   // core touchAlias.
   const touchAlias: BindingsStore["touchAlias"] = async (tx, address, now = clock()) => {
@@ -129,8 +134,7 @@ export function makePgBindings({ clock, aliases }: { clock: () => number; aliase
     async take(tx, address, id, principal, now) {
       const sql = pgOf(tx);
       if (!(await aliases.lock(tx, address, "use"))) return null;
-      const [live] = await sql`SELECT 1 FROM ids WHERE id = ${id} AND ended_at IS NULL FOR KEY SHARE`;
-      if (!live) return null;
+      if ((await lockLive(tx, id)) !== true) return null;
       if (await userOf(tx, address, principal)) return null;
       const [row] = await sql`INSERT INTO alias_holds (address, id, bound_at)
           VALUES (${address}, ${id}, GREATEST(${now}::int8, COALESCE((SELECT MAX(bound_at) + 1 FROM alias_holds WHERE id = ${id} AND address <> ${address}), ${now}::int8)))
@@ -138,6 +142,7 @@ export function makePgBindings({ clock, aliases }: { clock: () => number; aliase
         RETURNING bound_at`;
       return row ? { bound_at: int8(row.bound_at) } : null;
     },
+    lockLive,
     async release(tx, address, id) {
       await pgOf(tx)`DELETE FROM alias_holds WHERE address = ${address} AND id = ${id}`;
     },
