@@ -1203,13 +1203,13 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     // being refused child_session; null when the ID starts as a root, which makes it an address again.
     async hostedRoot(tx: Tx, id: string, root: string | null) { await repo.hosted.setRoot(tx, id, root); },
     // `harness` comes from the principal's source mapping (#414): peer_list shows it and match:{harness} filters on it.
-    // `collided`: where a caller inside a transaction that the refusal rolls back takes the audit row
-    // (`hostedCollided`, written after the rollback); without it the row is written here.
-    async hostedRegister(tx: Tx, authed: AuthedUser, id: string, harness: string, writesAs: string | null = null, collided?: (why: string) => void, facts?: { model?: string; effort?: string }) {
+    // `collided` takes the id.collision audit row: the refusal rolls back `tx`, so a row written on it would be lost
+    // (#1077). Every caller defers it (`hostedCollided`, written after the rollback).
+    async hostedRegister(tx: Tx, authed: AuthedUser, id: string, harness: string, writesAs: string | null, collided: (why: string) => void, facts?: { model?: string; effort?: string }) {
       const prior = await repo.bindings.idRow(tx, id);
       if (prior && prior.principal !== authed.user_email) {
         const why = "is another principal's session";
-        if (collided) collided(why); else writeAudit(repo, tx, "id.collision", authed.user_email, id, { why });
+        collided(why);
         fail("id_collision", idCollisionText(id, why));
       }
       // A tools-only root's writes_as is registered here (A4): aliasUser, aliasUses and
