@@ -53,7 +53,7 @@ import {
 import { localDbPath } from "./open.ts";
 import { deliverEnded, listenForWakeup, poke } from "./wakeup.ts";
 import { sockDir } from "../shared/sockdir.ts";
-import { ChildSessions, acquireName, displaceableHolder, attachSession, candidateNames, childFallback, conversationSnapshot, detachSession, endLocalSession, keyedHarness, liveSessions, nothingEnded, registerChild, registerSession, releaseName, runnerRoot, runnerRootLive, setHeldMeta, SIBLING_WAIT_MS, siblingGone, thisSession, type Ended, type Leave, type SessionKind } from "./binding.ts";
+import { ChildSessions, acquireName, displaceableHolder, attachSession, candidateNames, childFallback, conversationSnapshot, detachSession, endLocalSession, keyedHarness, liveSessions, nothingEnded, recordYields, registerChild, registerSession, releaseName, runnerRoot, runnerRootLive, setHeldMeta, SIBLING_WAIT_MS, siblingGone, thisSession, type Ended, type Leave, type SessionKind } from "./binding.ts";
 import { GRAYBOARD_AGENT_META, validSourceId } from "../shared/session_meta.ts";
 import { MISSING_TEXT, TOOL_USE_META, readCurrent, takeRecord, type MissingCause } from "../shared/claude_agents.ts";
 import { listenIdentity, type IdentityRequest } from "../shared/claude_identity.ts";
@@ -370,7 +370,10 @@ const markIfMine = (readers: string[], mark: (reader: string) => void): boolean 
   db.transaction(() => {
     let all = true;
     for (const r of readers) {
-      if (stillMine(r)) mark(r);
+      const mine = stillMine(r);
+      // Inside the write lock: a displacement waits for the mark (#1404).
+      testPause("drain:in-mark");
+      if (mine) mark(r);
       else all = false;
     }
     return all;
@@ -401,10 +404,16 @@ let restoredFrom: string | null = null;
 const RECORD_DIR = sockDir();
 const RECORDS = PUSH && !HUMAN && !KEYED && PARENT_SESSION === undefined;
 // A failed write costs only the restore after a restart; the bind itself stands.
+// A sibling an adapter's child shares the harness pid with leaves the record
+// to that child while it lives (#1404, recordYields): a displaced sibling's
+// stale start-time write or later bind would otherwise overwrite the child's.
 const writeNames = () => {
   if (!RECORDS) return;
   try {
-    writeRecord(RECORD_DIR, { names: held, session_id: SESSION_ID, harness_pid: process.ppid, bus: localDbPath() });
+    db.transaction(() => {
+      if (recordYields(db, SESSION_ID, process.ppid)) return;
+      writeRecord(RECORD_DIR, { names: held, session_id: SESSION_ID, harness_pid: process.ppid, bus: localDbPath() });
+    }).immediate();
   } catch (e) {
     console.error(`[grayboard] name record for harness pid ${process.ppid} not written:`, e);
   }
@@ -504,6 +513,8 @@ if (WRITES_AS) {
     const wrapper = wrapperName(process.ppid);
     if (wrapper) startNotes.push(wrapperNote(wrapper));
   }
+  // An adapter's child displacing this one here leaves `held` stale (#1404).
+  testPause("mcp:before-record");
   writeNames();
 }
 // A machine signed in to a server (#491): a bare `grayboard mcp` entry is
@@ -1255,6 +1266,8 @@ async function drainLoop(): Promise<void> {
     if (boardItems.size > 0) any = true;
     for (const { item, readers: pendingTo } of boardItems.values()) {
       if (shuttingDown) return;
+      // Between the read above and the check below, forced by a test (#1404).
+      await testPauseAsync("drain:before-board-push");
       // Only while every address is still this session's (#1381): a name
       // taken mid-drain is the taker's to push; the fresh drain re-reads.
       if (!pendingTo.every(stillMine)) return lostMidDrain();
