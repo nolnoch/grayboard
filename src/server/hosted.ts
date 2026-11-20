@@ -1090,7 +1090,8 @@ export function createHostedSessions(application: Application, options: { now?: 
             return { message: "already registered" };
           }
           if (existing) await store.end(tx, existing.session_id, "closed", now());
-          await application.hostedRegister(tx, p.authed, childId, harnessFor(p.clientId, p.source ?? null, context.client));
+          // The refusal rolls this body back: its id.collision row is written after, as rowFor's (#1077).
+          await application.hostedRegister(tx, p.authed, childId, harnessFor(p.clientId, p.source ?? null, context.client), null, why => later.defer(w => application.hostedCollided(w, p.authed, childId, why)));
           await application.hostedRoot(tx, childId, root.session_id);
           await store.insert(tx, { session_id: childId, ownership_id: attached.ownership_id, user_id: p.authed.user_id, client_id: p.clientId, grant_id: p.grantId,
             source_session_id: child, writes_as: null, bind_gen: 0, root_session_id: root.session_id, place: null, lease_deadline: null, created_at: now(), last_seen_at: now(), suggested: null, parked_at: null });
