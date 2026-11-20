@@ -316,6 +316,17 @@ test("#807 P1c-15b: core helpers inside hosted bodies run on that body's Tx, out
     expect(pulled.some(c => c.op === "boards.get" && c.handle === "tx" && c.inTxn)).toBe(true);
     expect(pulled.some(c => c.op === "boards.pendingPushes" && c.handle === "pool" && !c.inTxn)).toBe(true);
     expect(pulled.some(c => c.op === "boards.acknowledge" && c.handle === "tx" && c.inTxn)).toBe(true);
+    // #1214 item 4: the catalog and a snapshot (resources list/read) read boards through repo.boards alone, on the
+    // handle they're given (here a body's Tx), and reach coreOn zero times.
+    const resources = checks.length;
+    await hosted.run(principal, b, "resources_read", async (session, tx) => {
+      expect((await application.boardCatalog(tx, session)).boards.map(x => x.name)).toContain("p15");
+      expect((await application.boardSnapshot(tx, session, "p15")).posts.map(p => p.body)).toEqual(["x"]);
+    });
+    const read = checks.slice(resources);
+    expect(read.filter(c => c.op === "coreOn")).toEqual([]);
+    expect(read.some(c => c.op === "boards.catalogPage" && c.handle === "tx" && c.inTxn)).toBe(true);
+    expect(read.some(c => c.op === "boards.snapshotPage" && c.handle === "tx" && c.inTxn)).toBe(true);
     await hosted.whoami(principal, a);
     expect(checks.filter(c => c.inTxn !== (c.handle === "tx"))).toEqual([]);
   } finally { spy.mockRestore(); for (const s of boardSpies) s.mockRestore(); }

@@ -17,7 +17,9 @@
 //   dies with its body, and pgOf's handle has no begin, reserve or savepoint. There is no shared writer connection to
 //   guard per statement; SQL text that changes a pooled session's settings is caught only in review.
 // - An error a body catches without a savepoint aborts the transaction; the failure surfaces later as 25P02 or a
-//   rolled-back COMMIT, and the write rejects with TxAborted, which names the cause.
+//   rolled-back COMMIT, and the write rejects with TxAborted, which names the cause. A statement a store function sends
+//   without awaiting (pg/audit.ts write) notes its failure on the transaction (eagerFailure), and TxAborted names that
+//   first failure, since the later one only says the transaction was already aborted (#1302).
 //
 // Runtime imports stay off bun:sqlite (pg/isolation.test.ts): tx_base.ts, queue.ts and request_context.ts import
 // nothing that reaches it.
@@ -36,26 +38,53 @@ type Store = { readonly sql: SQL; readonly queue: WriteQueue; open: PgTx | undef
 
 // One transaction's savepoint bookkeeping: its connection, the open frames innermost last, and a counter for names.
 // A frame missing from `stack` is dead: its transaction ended, or an enclosing ROLLBACK TO or RELEASE ended it.
-type Txn = { readonly conn: SQL; readonly stack: object[]; n: number; ended: boolean };
+// `failed`: the first eager statement's failure that aborted it (eagerFailure), with the frames open when that statement
+// was sent; a ROLLBACK TO of one of those frames undid the failure and clears it.
+type Txn = { readonly conn: SQL; readonly stack: object[]; n: number; ended: boolean; failed?: { error: unknown; frames: object[] } };
 
 const READ_REFUSAL = "repo.read inside the caller's own transaction: pass the body's Tx (#807 D2)";
 
 // 25P02 or a rolled-back COMMIT: a statement failed inside the transaction (or a savepoint) and the body caught it
 // without a savepoint, so the transaction was already aborted. The statement that failed is gone by then; this names
-// the bug. `code` and `errno` are copied as own data properties for the diagnostics (diagnostics.ts reads no cause).
+// the bug. When that statement was an eager one (eagerFailure), its error is `first`, the message names its class,
+// code and SQLSTATE (never its text, which can quote row values), and `code` and `errno` are its: the cause, 25P02 or
+// the rolled-back COMMIT, says only that the transaction was already aborted (#1302). `code` and `errno` are copied as
+// own data properties for the diagnostics (diagnostics.ts reads no cause).
 export class TxAborted extends Error {
   override readonly name = "TxAbortedError";
   readonly code: string;
   readonly errno: string | undefined;
-  constructor(cause: InstanceType<typeof SQL.PostgresError>) {
-    super("transaction aborted: a statement error was caught without a savepoint; wrap the statement that may fail in tx.savepoint (#807 D6)", { cause });
-    this.code = cause.code;
-    this.errno = cause.errno;
+  readonly first: unknown;
+  constructor(cause: InstanceType<typeof SQL.PostgresError>, first?: unknown) {
+    const d = first === undefined ? undefined : errorDiagnostic(first);
+    const named = d ? [d.class, d.code, d.sqlstate].filter(Boolean).join(" ") : "";
+    super(named
+      ? `transaction aborted by an earlier statement's failure (${named}) that no savepoint caught; wrap the statement that may fail in tx.savepoint (#807 D6)`
+      : "transaction aborted: a statement error was caught without a savepoint; wrap the statement that may fail in tx.savepoint (#807 D6)", { cause });
+    const own = first instanceof SQL.SQLError ? first as { code?: unknown; errno?: unknown } : undefined;
+    this.code = typeof own?.code === "string" ? own.code : cause.code;
+    this.errno = own ? (typeof own.errno === "string" ? own.errno : undefined) : cause.errno;
+    this.first = first;
   }
-  // The error to reject with: a TxAborted for an aborted transaction, anything else unchanged.
-  static wrap(e: unknown): unknown {
-    return pgFailure(e)?.kind === "aborted" ? new TxAborted(e as InstanceType<typeof SQL.PostgresError>) : e;
+  // The error to reject with: a TxAborted for an aborted transaction, naming `txn`'s first eager failure when it has
+  // one; anything else unchanged.
+  static wrap(e: unknown, txn?: Txn): unknown {
+    return pgFailure(e)?.kind === "aborted" ? new TxAborted(e as InstanceType<typeof SQL.PostgresError>, txn?.failed?.error) : e;
   }
+}
+
+// For a statement a store function sends on `tx` without awaiting it (pg/audit.ts write): call at send time, and pass
+// the returned setter the statement's rejection. It notes the transaction's first such failure, with the savepoints open
+// when the statement was sent, so the TxAborted the transaction later rejects with names it.
+export function eagerFailure(tx: Tx): (error: unknown) => void {
+  if (!(tx instanceof PgTx)) return () => {};
+  const txn = tx.txn, frames = txn.stack.slice();
+  return error => { txn.failed ??= { error, frames }; };
+}
+
+// A ROLLBACK TO `marker`'s savepoint succeeded: a noted failure sent inside it was undone with it.
+function undone(txn: Txn, marker: object): void {
+  if (txn.failed?.frames.includes(marker)) txn.failed = undefined;
 }
 
 class PgRead extends BaseRead {
@@ -96,9 +125,16 @@ class PgTx extends BaseTx {
           await Promise.all([opened, released]);
         } catch (error) {
           // 25P02 when fn swallowed a statement error: the savepoint is still there, aborted; undo it so the
-          // transaction can go on (unless it already ended), and reject with what the caller must fix.
-          if (!txn.ended) await conn.unsafe(`ROLLBACK TO ${name}`).then(() => conn.unsafe(`RELEASE ${name}`)).catch(() => {});
-          throw TxAborted.wrap(error);
+          // transaction can go on (unless it already ended), and reject with what the caller must fix. Built before the
+          // undo, which clears a failure it undid.
+          const aborted = TxAborted.wrap(error, txn);
+          if (!txn.ended) {
+            await conn.unsafe(`ROLLBACK TO ${name}`).then(() => {
+              undone(txn, marker);
+              return conn.unsafe(`RELEASE ${name}`);
+            }).catch(() => {});
+          }
+          throw aborted;
         }
         // Its body returned without awaiting it (D4) and the transaction ended while RELEASE was in flight: dropped
         // with its effects and hooks, as one that settles after the end is.
@@ -112,9 +148,10 @@ class PgTx extends BaseTx {
         const released = conn.unsafe(`RELEASE ${name}`).execute();
         // A SAVEPOINT that failed (25P02: the transaction was already aborted) fails the two after it: the cause is
         // the aborted transaction, named as TxAborted, as the write's own rejection would be.
-        const [o, ...rest] = await Promise.allSettled([opened, back, released]);
-        if (o.status === "rejected") throw TxAborted.wrap(o.reason);
-        for (const r of rest) if (r.status === "rejected") throw r.reason;
+        const [o, b, ...rest] = await Promise.allSettled([opened, back, released]);
+        if (o.status === "rejected") throw TxAborted.wrap(o.reason, txn);
+        if (b.status === "fulfilled") undone(txn, marker);
+        for (const r of [b, ...rest]) if (r.status === "rejected") throw r.reason;
       },
     };
     return { frame, tx: new PgTx(this.store, this.txn, root) };
@@ -154,8 +191,7 @@ const isTemplate = (v: unknown): v is TemplateStringsArray => Array.isArray(v) &
 
 // Bun nests a fragment by its Query class; its own `then` stops it being sent alone (Bun would run it as a statement).
 function fragment(q: SQL.Query<unknown>): PgFragment {
-  Object.defineProperty(q, "then", { value() { throw new Error("a PgSql fragment awaited: it goes inside a statement (pgOf)"); } });
-  return q as unknown as PgFragment;
+  return Object.defineProperty(q, "then", { value() { throw new Error("a PgSql fragment awaited: it goes inside a statement (pgOf)"); } }) as unknown as PgFragment;
 }
 
 function statements(conn: SQL, check: () => void): PgSql {
@@ -264,7 +300,7 @@ export function makePgTransactions(url: string, { ownAuthCommit, ...opts }: Omit
         }
         // The mark was read, so only COMMIT failed: one whose outcome is unknown may have landed, and a bump is harmless.
         if (touched) ownAuthCommit!();
-        throw TxAborted.wrap(error);
+        throw TxAborted.wrap(error, root?.txn);
       }
       if (touched) ownAuthCommit!();
       store.open = undefined;

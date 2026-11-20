@@ -17,7 +17,7 @@ import { callClaimTool, endedClaimText, sweepClaims } from "./claims.ts";
 import { endSessionServer } from "./session_end.ts";
 import type { Repo } from "./db.ts";
 import type { Tx } from "./store/tx.ts";
-import { B, BOB_ID, CHILD_ID, D, DAN_WRITER, diverging, E, ENDED_ID, ENG_ID, EVE_ID, inBody as inBodyOn, ONLINE, openPostParity, outcome, outcomeAsync, TAIL_ID, team, W, WADE_ID } from "../../tests/support/board_parity.ts";
+import { B, BOB_ID, CHILD_ID, D, DAN_WRITER, diverging, E, ENDED_ID, ENG_ID, EVE_ID, inBody as inBodyOn, ONLINE, openPostParity, outcome, outcomeAsync, parityRows, TAIL_ID, team, W, WADE_ID } from "../../tests/support/board_parity.ts";
 import { seed } from "../../tests/support/seed.ts";
 
 let repo: Repo;
@@ -226,7 +226,9 @@ const CALLS = (): Call[] => [
   ["claim_take", { key: "ticket:live", note: "new plan" }], ["claim_take", { key: "ticket:live", ttl_minutes: 1 }], ["claim_take", { key: "ticket:live", board: "attic" }],
   ["claim_take", { key: "ticket:attic", note: "still" }], ["claim_take", { key: "ticket:onq", note: "moving" }], ["claim_take", { key: "ticket:watched" }],
   ["claim_take", { key: "queue:x" }], ["claim_take", { key: "k", ttl_minutes: -1 }], ["claim_take", { key: "k", until: "never" }],
-  ["claim_take", { key: "k", ttl_minutes: 5, until: "2030-01-01T00:00:00Z" }], ["claim_take", { key: "" }], ["claim_take", { key: 7 }], ["claim_take", { key: "k", board: 3 }],
+  ["claim_take", { key: "k", ttl_minutes: 5, until: "2030-01-01T00:00:00Z" }],
+  // #1230: a valid until, on a renewal and on a free key, settles to exactly later+90m.
+  ["claim_take", { key: "ticket:live", until: new Date(T1 + 90 * 60_000).toISOString() }], ["claim_take", { key: "ticket:new", until: new Date(T1 + 90 * 60_000).toISOString() }], ["claim_take", { key: "" }], ["claim_take", { key: 7 }], ["claim_take", { key: "k", board: 3 }],
   ["claim_release", { key: "ticket:live" }], ["claim_release", { key: "ticket:live", note: "done" }], ["claim_release", { key: "ticket:eng" }],
   ["claim_release", { key: "ticket:attic" }], ["claim_release", { key: "ticket:onq" }], ["claim_release", { key: "ticket:nob" }],
   ["claim_release", { key: "ticket:gone" }], ["claim_release", { key: "ticket:watched" }], ["claim_release", { key: "ticket:absent" }],
@@ -268,7 +270,7 @@ test("claim_take, claim_release and claim_watch give core's answers and leave it
   }
   expect(diverging(out)).toEqual([]);
   // The ended ID's takes that reach the server's refusal.
-  expect(out.filter(([l, , g]) => l.startsWith("bob's ended claim_take") && JSON.stringify(g).includes("has ended; it can't take")).length).toBe(15);
+  expect(out.filter(([l, , g]) => l.startsWith("bob's ended claim_take") && JSON.stringify(g).includes("has ended; it can't take")).length).toBe(17);
 
   // The fixture reaches each branch the port decides.
   type R = { out: { value?: { result: unknown; wake: string[] }; error?: string }; rows: Record<string, unknown[]> };
@@ -471,6 +473,25 @@ test("a refusal after a write, caught in a body that commits, leaves nothing of 
   });
   expect(answer).toContain("attic");
   expect(claimRows()).toEqual(before);
+});
+
+// #1230: a release refused after its delete, its event and its watchers' delete (the [release] post's cc runs past
+// MAX_BODY_BYTES), caught in a body that commits, leaves nothing of the call: serverRelease's own savepoint.
+test("a release whose [release] post is refused after the delete leaves nothing of the call (the tool's savepoint)", async () => {
+  const access = boardAccess(repo);
+  const out = await inBody(async tx => {
+    const c = repo.coreOn(tx);
+    c.prepare(`INSERT INTO claims (key, holder, note, board, acquired_at, expires_at) VALUES ('ticket:crowd', ?, 'n', 'general', 1, ?)`).run(`${W}/be`, Date.now() + 3_600_000);
+    const watch = c.prepare(`INSERT INTO claim_watches (key, handle) VALUES ('ticket:crowd', ?)`);
+    for (let i = 0; i < 400; i++) watch.run(`watcher-${String(i).padStart(4, "0")}/${"x".repeat(180)}`);
+    const before = parityRows(repo, tx);
+    let answer: string;
+    try { await callClaimTool(repo, access, tx, `${W}/be`, "claim_release", { key: "ticket:crowd" }, wade); answer = "released"; }
+    catch (e) { if (e instanceof CoreError) answer = e.message; else throw e; }
+    return { answer, before };
+  }) as { out: { answer: string; before: unknown }; rows: unknown };
+  expect(out.out.answer).toContain("body exceeds");
+  expect(out.rows).toEqual(out.out.before);
 });
 
 // #807 P3 C5a F1: a lapsed claim whose key holds a NUL (written before keys refused it) doesn't lock out every take on

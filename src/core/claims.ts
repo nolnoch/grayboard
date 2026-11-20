@@ -4,7 +4,7 @@ import { REDELIVERED_NOTE, canSeeBoard, getBoard, isHuman, normalizeBoard, post,
 import { holderUserRule } from "./claim_holder.ts";
 import { idRow } from "./bindings.ts";
 import { CoreError } from "./errors.ts";
-import { immediateTx, type WriteTx } from "./write_tx.ts";
+import { immediateTx } from "./write_tx.ts";
 
 export type Claim = {
   key: string;
@@ -612,12 +612,10 @@ export function claimExpiryTimer(
   db: Database,
   onWake: (handles: string[]) => void,
   onBoardsChanged?: (boards: string[]) => void | Promise<void>,
-  tx: WriteTx = immediateTx(db),
 ): { arm(): void; stop(): void } {
   return expiryTimer({
     next: () => (db.prepare(`SELECT MIN(expires_at) AS next FROM claims WHERE board IS NOT NULL`).get() as { next: number | null }).next,
-    // A queued `tx` may make the sweep wait (#807 D4): the clock is read inside it.
-    sweep: () => tx((w) => sweepChanges(w, Date.now())),
+    sweep: () => immediateTx(db)((w) => sweepChanges(w, Date.now())),
   }, onWake, onBoardsChanged);
 }
 
