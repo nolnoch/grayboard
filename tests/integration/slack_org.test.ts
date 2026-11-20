@@ -13,10 +13,11 @@ import { direct } from "../support/events.ts";
 import { accessAudits, auditOrigins } from "../support/audit.ts";
 import type { HostedSession } from "../support/hosted_session.ts";
 import { closeSessions } from "../support/mcp.ts";
-import { TestServer } from "../support/server.ts";
+import { TEST_BACKEND, TestServer } from "../support/server.ts";
 import { seed } from "../support/seed.ts";
 import { until } from "../support/until.ts";
-import { queueFor } from "../../src/server/store/queue.ts";
+import { drained, exec, queuedBodies, row, rows, txSpy } from "../support/repo_sql.ts";
+import { holdWrites } from "../support/write_hold.ts";
 import type { Relay, RelayStore } from "../../src/bridge/relay.ts";
 const DM = "D0ALICE";
 const ALICE_SLACK = "U0ALICE";
@@ -35,13 +36,30 @@ beforeEach(async () => {
   await srv.app.slackReady;
 });
 
+// Holds a test took and didn't release (a failed assert before its release): freed first, so teardown doesn't wait
+// behind them and the server's database is dropped.
+const holds: (() => void)[] = [];
 afterEach(async () => {
-  await closeSessions();
-  await srv.stop();
-  slack.stop();
+  for (const release of holds.splice(0)) release();
+  try { await closeSessions(); } finally {
+    await srv.stop();
+    slack.stop();
+  }
 });
 
 const login = (email: string) => srv.login(email);
+
+// Makes the next INSERT into `table` (with `action`, for access_log) fail inside its transaction, on either backend:
+// a trigger that raises `message`, so the write's whole transaction rolls back.
+async function failInsert(table: "access_log" | "slack_progress", name: string, message: string, action?: string): Promise<void> {
+  if (TEST_BACKEND === "pg") {
+    const when = action ? `IF NEW.action = '${action}' THEN RAISE EXCEPTION '${message}'; END IF;` : `RAISE EXCEPTION '${message}';`;
+    await exec(srv, `CREATE FUNCTION ${name}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN ${when} RETURN NEW; END $$`);
+    await exec(srv, `CREATE TRIGGER ${name} BEFORE INSERT ON ${table} FOR EACH ROW EXECUTE FUNCTION ${name}()`);
+  } else {
+    await exec(srv, `CREATE TRIGGER ${name} BEFORE INSERT ON ${table}${action ? ` WHEN NEW.action = '${action}'` : ""} BEGIN SELECT RAISE(ABORT, '${message}'); END`);
+  }
+}
 const api = (token: string, method: string, path: string, body?: unknown) => srv.api(token, method, path, body);
 
 // An agent: a hosted MCP session of `email`'s, bound to `identity`.
@@ -112,12 +130,13 @@ test("a DM Slack posts is stamped delivered_at; one Slack refuses is given up un
   const be = await hosted("alice@example.com", "be");
   const ok = await be.call<SendResult>("dm_send", { to: "human", body: "posted" });
   await until(() => slack.posts().find((p) => p.markdown_text === "**be** posted"));
-  const stamp = (id: number) => srv.app.db.prepare(`SELECT delivered_at FROM messages WHERE id = ?`).get(id) as { delivered_at: number | null };
-  await until(() => stamp(ok.message_id).delivered_at !== null);
+  const stamp = async (id: number) => (await row<{ delivered_at: number | null }>(srv, `SELECT delivered_at FROM messages WHERE id = ?`, id))!;
+  await until(async () => (await stamp(ok.message_id)).delivered_at !== null);
   slack.refusePosts = "msg_too_long";
   const refused = await be.call<SendResult>("dm_send", { to: "human", body: "too long" });
   await until(async () => (await srv.app.repo.cursors.directFor(srv.app.repo.read, "alice@example.com/human")) >= refused.message_id);
-  expect(stamp(refused.message_id).delivered_at).toBeNull();
+  await drained(srv);
+  expect((await stamp(refused.message_id)).delivered_at).toBeNull();
 }, 30_000);
 
 test("attachments cross the org bridge both ways for a hosted session, and the audit log says where they went", async () => {
@@ -135,7 +154,7 @@ test("attachments cross the org bridge both ways for a hosted session, and the a
   expect(slack.uploaded.get(s.files[0].id)).toEqual(png);
 
   // The relay maps the thread once files.info shows the share's ts, which lags the upload.
-  await until(() => srv.app.db.prepare(`SELECT 1 FROM slack_threads WHERE thread_ts = ?`).get(s.ts));
+  await until(() => row(srv, `SELECT 1 FROM slack_threads WHERE thread_ts = ?`, s.ts));
   slack.say("here", { thread_ts: s.ts, extra: { subtype: "file_share", files: [slack.host("reply.md", "ok\n")] } });
   const got = (await be.next(direct((m) => m.body === "here"), 5000)).event.message;
   expect(got).toMatchObject({ sender: "alice@example.com/human", parent_id: q.message_id });
@@ -143,21 +162,21 @@ test("attachments cross the org bridge both ways for a hosted session, and the a
   const id = got.attachments![0]!.id;
   expect(new TextDecoder().decode(await be.download(id))).toBe("ok\n");
 
-  const audit = (action: string) => accessAudits(srv.app.db, action);
-  const sent = await until(() => audit("attachment.sent_to_slack")[0]);
+  const audit = (action: string) => accessAudits(srv, action);
+  const sent = await until(async () => (await audit("attachment.sent_to_slack"))[0]);
   expect(sent.actor).toBe("alice@example.com");
   // The relay's drain started inside be's /mcp request, but carries every
   // queued item: its rows carry no request's address (security audit F-19).
-  expect(auditOrigins(srv.app.db, "attachment.sent_to_slack")).toEqual([{ ip: null, ua: null, client_id: null }]);
+  expect(await auditOrigins(srv, "attachment.sent_to_slack")).toEqual([{ ip: null, ua: null, client_id: null }]);
   const sha256 = createHash("sha256").update(png).digest("hex");
   expect(sent.detail).toEqual({ identity: "alice@example.com/human", channel: DM, thread_ts: s.ts, slack_file: s.files[0].id, sha256 });
   // Binding says which message carried each file, to whom: be's to the human, the human's reply to be.
-  const bound = audit("attachment.bound").map((r): Record<string, unknown> => ({ target: r.target, ...r.detail }));
+  const bound = (await audit("attachment.bound")).map((r): Record<string, unknown> => ({ target: r.target, ...r.detail }));
   expect(bound).toEqual([
     { target: `attachment:${q.attachments![0]!.id}`, identity: "alice@example.com/be", message_id: q.message_id, recipient: "alice@example.com/human" },
     { target: `attachment:${id}`, identity: "alice@example.com/human", message_id: got.id, recipient: "alice@example.com/be" },
   ]);
-  const fromSlack = audit("attachment.uploaded").find((r) => r.target === `attachment:${id}`)!;
+  const fromSlack = (await audit("attachment.uploaded")).find((r) => r.target === `attachment:${id}`)!;
   expect(fromSlack.detail).toMatchObject({ identity: "alice@example.com/human", filename: "reply.md", size: 3, slack_file: expect.stringMatching(/^FH/) });
 }, 30_000);
 
@@ -173,11 +192,11 @@ test("a file Slack refuses goes back to its sender, and the text carries the war
   const back = (await be.next(direct((m) => m.sender === "alice@example.com/human"), 5000)).event.message;
   expect(back.parent_id).toBe(q.message_id);
   expect(back.body).toStartWith(`[Slack bridge] Files on your message ${q.message_id} didn't reach Slack`);
-  const refused = await until(() => srv.app.db.prepare(`SELECT actor, target, detail FROM access_log WHERE action = 'attachment.slack_refused'`).get() as { actor: string; target: string; detail: string } | null);
+  const refused = await until(() => row<{ actor: string; target: string; detail: string }>(srv, `SELECT actor, target, detail FROM access_log WHERE action = 'attachment.slack_refused'`));
   expect(refused.actor).toBe("alice@example.com");
   expect(JSON.parse(refused.detail)).toMatchObject({ identity: "alice@example.com/human", channel: DM, filename: "shot.png", reason: "file_type_not_allowed", sha256: expect.stringMatching(/^[0-9a-f]{64}$/) });
   // Done items leave no progress behind.
-  await until(() => (srv.app.db.prepare(`SELECT COUNT(*) AS n FROM slack_progress`).get() as { n: number }).n === 0);
+  await until(async () => (await row<{ n: number }>(srv, `SELECT COUNT(*) AS n FROM slack_progress`))!.n === 0);
 }, 30_000);
 
 test("files on a Slack message the bus refuses are released, not left holding the quota", async () => {
@@ -186,10 +205,11 @@ test("files on a Slack message the bus refuses are released, not left holding th
   const { ts } = slack.say("@nobody look", { extra: { subtype: "file_share", files: [slack.host("n.md", "x")] } });
   const reply = await until(() => slack.posts().find((p) => p.thread_ts === ts));
   expect(reply.markdown_text).toStartWith("⚠️ not sent:");
-  const actions = srv.app.db.prepare(`SELECT action, detail FROM access_log WHERE action LIKE 'attachment.%' ORDER BY id`).all() as { action: string; detail: string }[];
+  await drained(srv);
+  const actions = await rows<{ action: string; detail: string }>(srv, `SELECT action, detail FROM access_log WHERE action LIKE 'attachment.%' ORDER BY id`);
   expect(actions.map((a) => a.action)).toEqual(["attachment.uploaded", "attachment.released"]);
   expect(JSON.parse(actions[1]!.detail)).toMatchObject({ identity: "alice@example.com/human", filename: "n.md", via: "slack" });
-  expect(srv.app.db.prepare(`SELECT COUNT(*) AS n FROM attachments`).get()).toEqual({ n: 0 });
+  expect(await row(srv, `SELECT COUNT(*) AS n FROM attachments`)).toEqual({ n: 0 });
 }, 30_000);
 
 test("a post Slack refuses is retried and lands once", async () => {
@@ -352,12 +372,11 @@ test("a thread reply reaches a human only as a DM could", async () => {
 // #807 D4: an unlink is one transaction through the server's write queue, and the human goes offline only after it commits.
 // `started`: once it holds the queue (a busy queue starts it later); a release before then frees it as it starts.
 function holdQueue(): { release: () => void; started: Promise<void>; done: Promise<void> } {
-  let released = false;
-  let free: (() => void) | undefined;
   let begin!: () => void;
   const started = new Promise<void>((r) => { begin = r; });
-  const done = queueFor(srv.app.db).run(() => new Promise<void>((r) => { begin(); if (released) r(); else free = r; }));
-  return { release: () => { released = true; free?.(); }, started, done };
+  const hold = holdWrites(srv, () => begin());
+  holds.push(hold.release);
+  return { release: hold.release, started, done: hold.done };
 }
 const ticks = async (n = 5) => { for (let i = 0; i < n; i++) await new Promise((r) => setImmediate(r)); };
 
@@ -366,8 +385,13 @@ test("#807: an HTTP unlink while another body holds the write queue waits, then 
   await link(alice);
   const userId = (await srv.app.repo.users.findByEmail(srv.app.repo.read, "alice@example.com"))!.id;
   const holder = holdQueue();
+  // The hold is a repo.write itself: taken before the spy, so the spy sees only the unlink's.
+  const write = spyOn(srv.app.repo, "write");
   const unlinked = srv.app.slack!.unlink(userId);
-  await ticks();
+  await until(() => write.mock.calls.length > 0, 5000, "the unlink reached the write queue");
+  write.mockRestore();
+  // Long enough for the unlink to commit on either backend if nothing held the queue.
+  await Bun.sleep(100);
   expect((await srv.app.repo.slack.linkFor(srv.app.repo.read, userId))).toBeDefined();
   holder.release();
   await holder.done;
@@ -384,14 +408,14 @@ test("#807: a Slack user's dm_send and board_post run inside a write-queue trans
   const app = srv.app.application;
   const { call, send } = app;
   const seen: Record<string, boolean> = {};
-  const queued = () => srv.app.db.inTransaction && queueFor(srv.app.db).mine;
-  app.call = (tx, s, n, a, p) => { seen[n] = queued(); return call.call(app, tx, s, n, a, p); };
-  app.send = (tx, s, to, body, o) => { seen.dm_send = queued(); return send.call(app, tx, s, to, body, o); };
+  const bodies = queuedBodies(srv);
+  app.call = (tx, s, n, a, p) => { seen[n] = bodies.inside; return call.call(app, tx, s, n, a, p); };
+  app.send = (tx, s, to, body, o) => { seen.dm_send = bodies.inside; return send.call(app, tx, s, to, body, o); };
   try {
     slack.say("#e2e queued post");
     slack.say("@be queued dm");
     await until(() => "board_post" in seen && "dm_send" in seen, 5000, "both calls reached the application");
-  } finally { app.call = call; app.send = send; }
+  } finally { app.call = call; app.send = send; bodies.restore(); }
   expect(seen).toEqual({ board_post: true, dm_send: true });
 });
 
@@ -408,9 +432,9 @@ test("#807: a Slack user's refused call keeps its refusal row", async () => {
   const top = slack.say("@bob@example.com/human hello");
   const reply = await until(() => slack.posts().find((p) => p.thread_ts === top.ts), 5000, "the refusal reached Slack");
   expect(reply.markdown_text).toContain("reachable only by their teammates");
-  const rows = accessAudits(srv.app.db, "authz.decision");
-  expect(rows).toHaveLength(1);
-  expect(rows[0]).toMatchObject({ actor: "alice@example.com", detail: { verb: "msg.send", allow: false, rule: "human.teammates", address: "alice@example.com/human" } });
+  const decisions = await accessAudits(srv, "authz.decision");
+  expect(decisions).toHaveLength(1);
+  expect(decisions[0]).toMatchObject({ actor: "alice@example.com", detail: { verb: "msg.send", allow: false, rule: "human.teammates", address: "alice@example.com/human" } });
 });
 
 // #981: the relay's dm_thread (dmRoot, for a reply that reaches the human) runs inside a write-queue transaction, as
@@ -422,13 +446,14 @@ test("#807: a Slack user's dm_thread runs inside a write-queue transaction", asy
   const app = srv.app.application;
   const { thread } = app;
   const seen: boolean[] = [];
-  app.thread = (tx, s, id) => { seen.push(srv.app.db.inTransaction && queueFor(srv.app.db).mine); return thread.call(app, tx, s, id); };
+  const bodies = queuedBodies(srv);
+  app.thread = (tx, s, id) => { seen.push(bodies.inside); return thread.call(app, tx, s, id); };
   try {
     const root = await be.call<SendResult>("dm_send", { to: "human", body: "thread root" });
     await until(() => posted("thread root"), 5000, "the root reached Slack");
     await be.call("dm_send", { to: "human", body: "thread reply", parent_id: root.message_id });
     await until(() => posted("thread reply"), 5000, "the reply reached Slack");
-  } finally { app.thread = thread; }
+  } finally { app.thread = thread; bodies.restore(); }
   expect(seen.length).toBeGreaterThan(0);
   expect(seen.every(Boolean)).toBe(true);
 });
@@ -473,10 +498,10 @@ test("#807: a Slack digest the human's replay drains is marked sent", async () =
   await seed(repo, tx => repo.boards.setSubscription(tx, human, "noise", "digest"));
   // A digest-board post wakes nobody: the digest waits for the human's next drain.
   const chatter = await fe.call<BoardPostResult>("board_post", { board: "noise", body: "chatter" });
-  const notified = () => (srv.app.db.prepare(`SELECT notified_id FROM subscriptions WHERE handle = ? AND board = 'noise'`).get(human) as { notified_id: number }).notified_id;
-  expect(notified()).toBeLessThan(chatter.post_id);
+  const notified = async () => (await row<{ notified_id: number }>(srv, `SELECT notified_id FROM subscriptions WHERE handle = ? AND board = 'noise'`, human))!.notified_id;
+  expect(await notified()).toBeLessThan(chatter.post_id);
   await reattach(root, () => {});
-  await until(() => notified() === chatter.post_id, 5000, "the receipt marked the digest sent");
+  await until(async () => (await notified()) === chatter.post_id, 5000, "the receipt marked the digest sent");
   expect(posted("chatter")).toBe(false);
 }, 30_000);
 
@@ -492,12 +517,12 @@ test("#807: a Slack digest drained by a mention's wake, from the queue's holder,
   const human = "alice@example.com/human";
   await seed(repo, tx => repo.boards.setSubscription(tx, human, "noise", "digest"));
   const chatter = await be.call<BoardPostResult>("board_post", { board: "noise", body: "chatter" });
-  const notified = () => (srv.app.db.prepare(`SELECT notified_id FROM subscriptions WHERE handle = ? AND board = 'noise'`).get(human) as { notified_id: number }).notified_id;
-  expect(notified()).toBeLessThan(chatter.post_id);
+  const notified = async () => (await row<{ notified_id: number }>(srv, `SELECT notified_id FROM subscriptions WHERE handle = ? AND board = 'noise'`, human))!.notified_id;
+  expect(await notified()).toBeLessThan(chatter.post_id);
   // A mention on another board wakes the human inside its commit: that drain carries the noise digest too.
   await be.call("board_post", { board: "desk", body: "@human a question" });
   await until(() => posted("a question"), 5000, "the mention reached Slack");
-  await until(() => notified() === chatter.post_id, 5000, "the receipt marked the digest sent");
+  await until(async () => (await notified()) === chatter.post_id, 5000, "the receipt marked the digest sent");
   expect(posted("chatter")).toBe(false);
 }, 30_000);
 
@@ -512,9 +537,8 @@ test("#807: a push the Slack human can no longer see is acked through the write 
   const hidden = await fe.call<BoardPostResult>("board_post", { board: "ops-room", body: "not for alice" });
   // A push alice's human can't see (she isn't in ops), as an undelivered mention left from before she lost the board would be.
   const human = "alice@example.com/human";
-  const db = srv.app.db;
-  await seed(db, () => db.prepare(`INSERT INTO outbox (handle, post_id, reason) VALUES (?, ?, 'mention')`).run(human, hidden.post_id));
-  const deliveredAt = () => (db.prepare(`SELECT delivered_at FROM outbox WHERE handle = ? AND post_id = ?`).get(human, hidden.post_id) as { delivered_at: number | null }).delivered_at;
+  await exec(srv, `INSERT INTO outbox (handle, post_id, reason) VALUES (?, ?, 'mention')`, human, hidden.post_id);
+  const deliveredAt = async () => (await row<{ delivered_at: number | null }>(srv, `SELECT delivered_at FROM outbox WHERE handle = ? AND post_id = ?`, human, hidden.post_id))!.delivered_at;
   let hold: ReturnType<typeof holdAtPushRead> | undefined;
   try {
     await reattach(root, () => { hold = holdAtPushRead(human, hidden.post_id); });
@@ -523,10 +547,10 @@ test("#807: a push the Slack human can no longer see is acked through the write 
     // The drain queued the ack (B5a1: repo.write, never inline in its read): it waits behind the held queue.
     await ticks();
     expect(hold!.acks).toEqual([]);
-    expect(deliveredAt()).toBeNull();
+    expect(await deliveredAt()).toBeNull();
     hold!.holder()!.release();
     await hold!.holder()!.done;
-    await until(() => deliveredAt() !== null, 5000, "the ack stamped the push delivered");
+    await until(async () => (await deliveredAt()) !== null, 5000, "the ack stamped the push delivered");
     expect(hold!.acks).toEqual([human]);
   } finally { hold?.restore(); }
   expect(posted("not for alice")).toBe(false);
@@ -553,11 +577,11 @@ test("#807: a Slack delivery receipt waits for the write queue, then stamps the 
     const sent = await be.call<SendResult>("dm_send", { to: "human", body: "receipt fixture" });
     await until(() => receipts.length > 0, 5000, "the relay posted the receipt");
     expect(receipts).toEqual([false]);
-    const deliveredAt = () => (srv.app.db.prepare(`SELECT delivered_at FROM messages WHERE id = ?`).get(sent.message_id) as { delivered_at: number | null }).delivered_at;
-    expect(deliveredAt()).toBeNull();
+    const deliveredAt = async () => (await row<{ delivered_at: number | null }>(srv, `SELECT delivered_at FROM messages WHERE id = ?`, sent.message_id))!.delivered_at;
+    expect(await deliveredAt()).toBeNull();
     holder!.release();
     await holder!.done;
-    await until(() => deliveredAt() !== null, 5000, "the receipt stamped the message delivered");
+    await until(async () => (await deliveredAt()) !== null, 5000, "the receipt stamped the message delivered");
   } finally { repo.post = post; slack.onPost = null; holder?.release(); }
 });
 
@@ -610,7 +634,7 @@ test("#807: a rolled-back unlink leaves the link and its human online", async ()
   await link(alice);
   const userId = (await srv.app.repo.users.findByEmail(srv.app.repo.read, "alice@example.com"))!.id;
   const be = await hosted("alice@example.com", "be");
-  srv.app.db.run(`CREATE TRIGGER fail_unlink BEFORE INSERT ON access_log WHEN NEW.action = 'slack.unlinked' BEGIN SELECT RAISE(ABORT, 'audit refused'); END`);
+  await failInsert("access_log", "fail_unlink", "audit refused", "slack.unlinked");
   const spy = spyOn(console, "error").mockImplementation(() => {});
   try {
     expect((await api(alice, "POST", "/api/slack/unlink")).status).not.toBe(200);
@@ -625,12 +649,16 @@ test("#807: a rolled-back unlink leaves the link and its human online", async ()
 test("#807: a rolled-back link leaves no link, no human identity and nothing attached", async () => {
   const alice = await login("alice@example.com");
   const userId = (await srv.app.repo.users.findByEmail(srv.app.repo.read, "alice@example.com"))!.id;
-  srv.app.db.run(`CREATE TRIGGER fail_link BEFORE INSERT ON access_log WHEN NEW.action = 'slack.linked' BEGIN SELECT RAISE(ABORT, 'audit refused'); END`);
+  await failInsert("access_log", "fail_link", "audit refused", "slack.linked");
   const spy = spyOn(console, "error").mockImplementation(() => {});
   try {
     const r = await api(alice, "POST", "/api/slack/link");
     slack.say(`link ${r.body.code}`);
-    await until(() => spy.mock.calls.some((c) => c.map(String).join(" ").includes("audit refused")), 5000, "the link's failure was logged");
+    // SQLite's error carries the trigger's text; Postgres's audit store logs a failed insert by its SQLSTATE only (a
+    // Postgres error's text can quote row values, pg/audit.ts): P0001 is the trigger's RAISE EXCEPTION.
+    const failed = (c: unknown[]) => c.map(String).join(" ").includes("audit refused")
+      || (String(c[0]).includes("audit row insert failed") && (c[1] as { sqlstate?: string } | undefined)?.sqlstate === "P0001");
+    await until(() => spy.mock.calls.some(failed), 5000, "the link's failure was logged");
   } finally { spy.mockRestore(); }
   expect((await srv.app.repo.slack.linkFor(srv.app.repo.read, userId))).toBeUndefined();
   expect(await srv.app.repo.aliases.find(srv.app.repo.read, "alice@example.com/human")).toBeUndefined();
@@ -644,10 +672,11 @@ test("#807: a rolled-back link leaves no link, no human identity and nothing att
 test("#807 P1c-13: link and unlink read and write the human alias on their body's Tx", async () => {
   const repo = srv.app.repo;
   const checks: { op: string; inTxn: boolean; handle: "pool" | "tx" }[] = [];
+  const txn = txSpy(srv);
   const spy = <G extends object>(group: G, name: keyof G & string) => {
     const original = (group[name] as (...a: unknown[]) => unknown).bind(group);
     return spyOn(group, name as never).mockImplementation(((r: unknown, ...rest: unknown[]) => {
-      if (new Error().stack?.includes("/slack.ts:")) checks.push({ op: name === "lock" ? `lock.${String(rest[1])}` : name, inTxn: srv.app.db.inTransaction, handle: r === repo.read ? "pool" : "tx" });
+      if (new Error().stack?.includes("/slack.ts:")) checks.push({ op: name === "lock" ? `lock.${String(rest[1])}` : name, inTxn: txn.open, handle: r === repo.read ? "pool" : "tx" });
       return original(r, ...rest);
     }) as never);
   };
@@ -656,7 +685,7 @@ test("#807 P1c-13: link and unlink read and write the human alias on their body'
     const alice = await login("alice@example.com");
     await link(alice);
     expect((await api(alice, "POST", "/api/slack/unlink")).status).toBe(200);
-  } finally { for (const s of spies) s.mockRestore(); }
+  } finally { for (const s of spies) s.mockRestore(); txn.restore(); }
   expect(checks.map(c => `${c.op}:${c.handle}:${c.inTxn}`)).toEqual(["create:tx:true", "forget:tx:true", "markHuman:tx:true", "lock.delete:tx:true", "remove:tx:true", "forget:tx:true"]);
 });
 
@@ -724,7 +753,7 @@ test("#807 P3 C7: the owed bridge notice and the bridge stop take the notice loc
       await srv.appSession(alice, name).connect();
       expect(calls.slice(start)).toEqual(["last bridge.stopped", "lock bridge.notified", "last bridge.stopped", "last bridge.notified"]);
     }
-    expect(accessAudits(srv.app.db, "bridge.notified")).toHaveLength(1);
+    expect(await accessAudits(srv, "bridge.notified")).toHaveLength(1);
     // A second stop inside the dedup window is suppressed: a bind reads it and locks nothing.
     const { SlackBridge } = await import("../../src/server/slack.ts");
     const second = new SlackBridge({ repo, application: srv.app.application, appToken: "xapp-1-t", botToken: "xoxb-t", apiUrl: slack.api });
@@ -769,10 +798,11 @@ test("#807 P3 C7: the owed bridge notice reports the stop written before its loc
 test("#807 P1c-14b: link and the Slack receipt read messages on their body's Tx", async () => {
   const repo = srv.app.repo;
   const checks: { op: string; inTxn: boolean; handle: "pool" | "tx" }[] = [];
+  const txn = txSpy(srv);
   const spies = (["history", "getById"] as const).map((name) => {
     const original = repo.messages[name].bind(repo.messages) as (...a: unknown[]) => unknown;
     return spyOn(repo.messages, name).mockImplementation(((r: unknown, ...rest: unknown[]) => {
-      if (new Error().stack?.includes("/slack.ts:")) checks.push({ op: name, inTxn: srv.app.db.inTransaction, handle: r === repo.read ? "pool" : "tx" });
+      if (new Error().stack?.includes("/slack.ts:")) checks.push({ op: name, inTxn: txn.open, handle: r === repo.read ? "pool" : "tx" });
       return original(r, ...rest);
     }) as never);
   });
@@ -782,7 +812,7 @@ test("#807 P1c-14b: link and the Slack receipt read messages on their body's Tx"
     const be = await hosted("alice@example.com", "be");
     await be.call<SendResult>("dm_send", { to: "human", body: "receipt check" });
     await until(() => checks.some((c) => c.op === "getById"));
-  } finally { for (const spy of spies) spy.mockRestore(); }
+  } finally { for (const spy of spies) spy.mockRestore(); txn.restore(); }
   expect(checks).toEqual([{ op: "history", inTxn: true, handle: "tx" }, { op: "getById", inTxn: true, handle: "tx" }]);
 });
 
@@ -816,9 +846,9 @@ test("relinking from another Slack account with the same email starts new thread
   await until(() => slack.posts().find((p) => p.channel === "D0OTHER" && p.markdown_text?.startsWith("Linked to")));
   // #805 F-05: a link never moves silently.
   expect(slack.posts().find((p) => p.channel === DM && p.markdown_text?.includes("now linked to another Slack account"))).toBeDefined();
-  expect(accessAudits(srv.app.db, "slack.relinked").map((row) => [row.actor, row.target, row.detail])).toEqual([["alice@example.com", "U0OTHER", { from: ALICE_SLACK }]]);
+  expect((await accessAudits(srv, "slack.relinked")).map((row) => [row.actor, row.target, row.detail])).toEqual([["alice@example.com", "U0OTHER", { from: ALICE_SLACK }]]);
   // The human outlived the move: the relink's create finds it (#807 P3 C5 decision 3) and makes nothing new.
-  expect(accessAudits(srv.app.db, "alias.created").filter((row) => row.target === "alice@example.com/human")).toHaveLength(1);
+  expect((await accessAudits(srv, "alias.created")).filter((row) => row.target === "alice@example.com/human")).toHaveLength(1);
   await be.call("dm_send", { to: "human", body: "second", parent_id: q.message_id });
   const post = await until(() => slack.posts().find((p) => p.markdown_text === "**be** second"));
   expect(post.channel).toBe("D0OTHER");
@@ -859,8 +889,9 @@ test("a relink skips mail queued for the earlier link's human without stamping i
   expect((await fe.call<SendResult>("dm_send", { to: "alice@example.com/human", body: "after relink" })).delivered_now).toBe(true);
   await until(() => posted("after relink"));
   expect(posted("while disabled")).toBe(false);
-  const row = srv.app.db.prepare(`SELECT delivered_at FROM messages WHERE id = ?`).get(queued.message_id) as { delivered_at: number | null };
-  expect(row.delivered_at).toBeNull();
+  await drained(srv);
+  const stamped = (await row<{ delivered_at: number | null }>(srv, `SELECT delivered_at FROM messages WHERE id = ?`, queued.message_id))!;
+  expect(stamped.delivered_at).toBeNull();
 }, 30_000);
 
 // The notice the owner used to get on their next WSS hello is gone with it
@@ -913,8 +944,8 @@ test("a fatal stop with no linked users writes nothing user-facing", async () =>
     // to tell and no user-facing row to write: the notify loop never runs.
     // Its posted write commits after stop() returns (#807 P3 A6b): a write queued behind it runs once it has.
     await down.app.repo.write(() => {});
-    const rows = down.app.db.prepare("SELECT COUNT(*) AS n FROM access_log WHERE action = 'bridge.stopped'").get() as { n: number };
-    expect(rows.n).toBe(0);
+    const stopped = (await row<{ n: number }>(down, "SELECT COUNT(*) AS n FROM access_log WHERE action = 'bridge.stopped'"))!;
+    expect(stopped.n).toBe(0);
   } finally {
     await down.stop();
   }
@@ -961,8 +992,12 @@ test("a hosted bind carries the owed bridge notice in its answer, once", async (
 test("the bridge notice comes before the claims notice, so a cut takes the claims", async () => {
   const alice = await login("alice@example.com");
   await link(alice);
-  const { claim } = await import("../../src/core/claims.ts");
-  await seed(srv.app.repo, () => claim(srv.app.db, "alice@example.com/sim", "ticket:ENG-142"));
+  // alice's sim holds a claim (no board), as core's claim takes one: the row and its take event.
+  const repo = srv.app.repo, now = Date.now();
+  await seed(repo, async tx => {
+    const taken = await repo.claims.take(tx, { key: "ticket:ENG-142", as: "alice@example.com/sim", note: null, board: null, now, expires: now + 30 * 60_000, user: null });
+    await repo.claims.logEvent(tx, "take", "alice@example.com/sim", taken!, now);
+  });
   srv.app.slack!.stop({ fatal: true, detail: "first fatal" });
   const notices = (await srv.appSession(alice, "be").connect()).bind?.notices ?? [];
   const bridge = notices.findIndex((n) => n.includes("your Slack bridge stopped"));
@@ -993,7 +1028,8 @@ test("a second fatal within the dedup window records the death but doesn't re-no
   const hello = await srv.appSession(alice, "fe").connect();
   const againNotices = (hello.bind?.notices ?? []).filter((n) => n.includes("your Slack bridge stopped"));
   expect(againNotices).toHaveLength(0);
-  const count = srv.app.db.prepare("SELECT COUNT(*) AS n FROM access_log WHERE action = 'bridge.stopped' AND target = 'alice@example.com/human'").get() as { n: number };
+  await drained(srv);
+  const count = (await row<{ n: number }>(srv, "SELECT COUNT(*) AS n FROM access_log WHERE action = 'bridge.stopped' AND target = 'alice@example.com/human'"))!;
   expect(count.n).toBe(2);
 });
 
@@ -1056,7 +1092,7 @@ test("a link code redeemed from a Slack account with another email is refused an
   slack.say(`link ${r.body.code}`, { user: "U0MALLORY", channel: "D0MALLORY" });
   await until(() => slack.posts().slice(seen).find((p) => p.channel === "D0MALLORY" && p.markdown_text?.includes("email isn't `alice@example.com`")));
   expect((await srv.app.repo.slack.linkFor(srv.app.repo.read, (await srv.app.repo.users.findByEmail(srv.app.repo.read, "alice@example.com"))!.id))).toMatchObject({ slack_user: ALICE_SLACK, dm_channel: DM });
-  expect(accessAudits(srv.app.db, "slack.link_refused").map((row) => [row.actor, row.target, row.detail])).toEqual([["alice@example.com", "U0MALLORY", { reason: "email_mismatch" }]]);
+  expect((await accessAudits(srv, "slack.link_refused")).map((row) => [row.actor, row.target, row.detail])).toEqual([["alice@example.com", "U0MALLORY", { reason: "email_mismatch" }]]);
 
   // Used up: the right account can't redeem it after the refusal.
   slack.emails.set("U0MALLORY", "alice@example.com");
@@ -1072,7 +1108,7 @@ test("without the email scope, a link is refused with what the admin must add", 
   slack.say(`link ${r.body.code}`);
   await until(() => slack.posts().find((p) => p.markdown_text?.includes("users:read.email")));
   expect((await srv.app.repo.slack.linkFor(srv.app.repo.read, (await srv.app.repo.users.findByEmail(srv.app.repo.read, "alice@example.com"))!.id))).toBeUndefined();
-  expect(accessAudits(srv.app.db, "slack.link_refused").map((row) => row.detail)).toEqual([{ reason: "no_email" }]);
+  expect((await accessAudits(srv, "slack.link_refused")).map((row) => row.detail)).toEqual([{ reason: "no_email" }]);
 }, 30_000);
 
 // An unreachable Slack isn't a missing scope: the user is told to retry, not
@@ -1085,7 +1121,7 @@ test("when Slack can't be reached to check the email, the link is refused with a
   const reply = await until(() => slack.posts().find((p) => p.markdown_text?.includes("couldn't reach Slack")));
   expect(reply.markdown_text).not.toContain("users:read.email");
   expect((await srv.app.repo.slack.linkFor(srv.app.repo.read, (await srv.app.repo.users.findByEmail(srv.app.repo.read, "alice@example.com"))!.id))).toBeUndefined();
-  expect(accessAudits(srv.app.db, "slack.link_refused").map((row) => row.detail)).toEqual([{ reason: "slack_unavailable" }]);
+  expect((await accessAudits(srv, "slack.link_refused")).map((row) => row.detail)).toEqual([{ reason: "slack_unavailable" }]);
 }, 30_000);
 
 // #856: a Slack DM to another user's agent that no grant lets this person wake (#806) says so in its thread; one
@@ -1245,7 +1281,7 @@ test("#1062: a redelivery while the item's progress waits in the write queue doe
 // A progress write that failed leaves its overlay entry (the relay did what it records); the receipt's commit drops it.
 test("#1062: the receipt drops the overlay of a progress write that failed", async () => {
   const { userId, store } = await linkedAlice();
-  srv.app.db.run(`CREATE TRIGGER fail_progress BEFORE INSERT ON slack_progress BEGIN SELECT RAISE(ABORT, 'progress refused'); END`);
+  await failInsert("slack_progress", "fail_progress", "progress refused");
   const meta = { board: "e2e", post_id: "990002", from: "alice@example.com/be" };
   const errors = spyOn(console, "error");
   const holder = holdQueue();
@@ -1310,6 +1346,6 @@ test("#807: Slack events reach the relay in arrival order, however slow the stor
     await be.next(direct((m) => m.body === "one"), 5000);
     await be.next(direct((m) => m.body === "two"), 5000);
   } finally { slow.mockRestore(); }
-  const rows = srv.app.db.query("SELECT body FROM messages WHERE body IN ('one', 'two') ORDER BY id").all() as { body: string }[];
-  expect(rows.map((r) => r.body)).toEqual(["one", "two"]);
+  const bodies = await rows<{ body: string }>(srv, "SELECT body FROM messages WHERE body IN ('one', 'two') ORDER BY id");
+  expect(bodies.map((r) => r.body)).toEqual(["one", "two"]);
 });

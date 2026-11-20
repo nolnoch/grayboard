@@ -22,6 +22,7 @@ import { deliveryPath } from "../../adapters/hosted-core/src/storage.ts";
 import { hostedSessionId } from "../../src/server/hosted.ts";
 import { hostedServer, seedGrant, storeLogin as sharedStore, type HostedServer } from "../support/hosted_oauth.ts";
 import { until } from "../support/until.ts";
+import { row as sqlRow, rows as sqlRows } from "../support/repo_sql.ts";
 
 const CLIENT = "grayboard-pi";
 const EMAIL = "alice@example.com";
@@ -84,10 +85,12 @@ async function live(id: string, name: string) {
 
 type Row = { name: string | null; lease_deadline: number | null };
 // A hosted root's holds are alias_holds rows (#451); `name` is its primary (oldest) hold.
-const row = (raw: string): Row | null => {
+const row = async (raw: string): Promise<Row | null> => {
   const id = hostedSessionId(user, CLIENT, raw);
-  const r = srv.app.db.query<{ lease_deadline: number | null }, [string]>("SELECT lease_deadline FROM hosted_sessions WHERE session_id = ?").get(id);
-  const hold = srv.app.db.query<{ address: string }, [string]>("SELECT address FROM alias_holds WHERE id = ? ORDER BY bound_at, address").get(id);
+  const r = await sqlRow<{ lease_deadline: number | null }>(srv, "SELECT lease_deadline FROM hosted_sessions WHERE session_id = ?", id);
+  // Oldest first, ties by address in byte order (SQLite's BINARY collation; sorted here so Postgres's text collation doesn't decide).
+  const holds = await sqlRows<{ address: string; bound_at: number }>(srv, "SELECT address, bound_at FROM alias_holds WHERE id = ?", id);
+  const hold = holds.sort((x, y) => Number(x.bound_at) - Number(y.bound_at) || (x.address < y.address ? -1 : x.address > y.address ? 1 : 0))[0];
   return r && { lease_deadline: r.lease_deadline, name: hold ? hold.address.slice(hold.address.lastIndexOf("/") + 1) : null };
 };
 
@@ -132,7 +135,7 @@ test("a root whose delivery another holder has runs tools-only, refuses bind, an
   expect(b.root.status().held).toBeUndefined();
   const result = await b.root.call("whoami", {});
   expect(texts(result).filter(t => t.startsWith("grayboard: "))).toEqual([]);
-  expect(row("wait-1")).toMatchObject({ name: "holder" });
+  expect(await row("wait-1")).toMatchObject({ name: "holder" });
 }, 30_000);
 
 test("a root in lock error whose resume finds delivery held elsewhere is held, not in error: the error's unseen notice is dropped for the held one", async () => {
@@ -162,7 +165,7 @@ test("a bind whose `before` retries a lock error and finds delivery held elsewhe
   // The plugin's before(): unpause retries the lock error.
   const result = await b.root.call("bind", { name: "intruder", create: true }, async () => { await b.root.resume(); return undefined; });
   expect(texts(result)).toEqual([`error: ${HELD}; bind and unbind work from the process that holds delivery`]);
-  expect(row("bindrace-1")).toMatchObject({ name: "holder" });
+  expect(await row("bindrace-1")).toMatchObject({ name: "holder" });
 }, 30_000);
 
 test("a held root shut down while its tools-only connect is in flight doesn't say it couldn't reach the server, and a sign-in racing a shutdown never reopens the closed connection", async () => {
@@ -175,7 +178,7 @@ test("a held root shut down while its tools-only connect is in flight doesn't sa
   await a.root.shutdown("release");
   await changing;
   expect([...a.logs, ...b.logs].filter(l => l.message.startsWith("couldn't reach the server"))).toEqual([]);
-  expect(row("earlyquit-1")).toBeNull();
+  expect(await row("earlyquit-1")).toBeNull();
 }, 30_000);
 
 test("a carried name a start takes is said nowhere; one the server refuses is said once and in the next tool result only", async () => {
@@ -187,7 +190,7 @@ test("a carried name a start takes is said nowhere; one the server refuses is sa
   await active(taker, "carrier");
   expect(taker.logs).toEqual([]);
   expect(texts(await taker.root.call("whoami", {})).filter(t => t.startsWith("grayboard: "))).toEqual([]);
-  expect(row("carry-2")).toMatchObject({ name: "carrier" });
+  expect(await row("carry-2")).toMatchObject({ name: "carrier" });
 
   await live("taken-1", "taken");
   const refused = rig("taken-2", { carried: [`${EMAIL}/taken`] });
@@ -206,7 +209,7 @@ test("a configured name binds at a fresh root's first start, created and said no
   await active(fresh, "conf-new");
   expect(fresh.logs).toEqual([]);
   expect(texts(await fresh.root.call("whoami", {})).filter(t => t.startsWith("grayboard: "))).toEqual([]);
-  expect(row("conf-1")).toMatchObject({ name: "conf-new" });
+  expect(await row("conf-1")).toMatchObject({ name: "conf-new" });
 
   // A resumed session takes back what it held, not the configured name.
   const before = await live("conf-2", "remembered");
@@ -214,7 +217,7 @@ test("a configured name binds at a fresh root's first start, created and said no
   const resumed = rig("conf-2", { configured: "conf-other" });
   await resumed.root.start();
   await active(resumed, "remembered");
-  expect(row("conf-2")).toMatchObject({ name: "remembered" });
+  expect(await row("conf-2")).toMatchObject({ name: "remembered" });
 
   // A /new's carried name, likewise.
   const carrier = await live("conf-3", "carried-name");
@@ -222,7 +225,7 @@ test("a configured name binds at a fresh root's first start, created and said no
   const successor = rig("conf-4", { carried, configured: "conf-other" });
   await successor.root.start();
   await active(successor, "carried-name");
-  expect(srv.app.db.query("SELECT 1 FROM alias_holds WHERE address = ?").get(`${EMAIL}/conf-other`)).toBeNull();
+  expect(await sqlRow(srv, "SELECT 1 FROM alias_holds WHERE address = ?", `${EMAIL}/conf-other`)).toBeNull();
 });
 
 test("a resumed session whose remembered names can't be read skips the configured bind: the resume takes them back (#544 item 1)", async () => {
@@ -235,15 +238,15 @@ test("a resumed session whose remembered names can't be read skips the configure
     await resumed.root.start();
     await active(resumed, "kept");
   } finally { remembered.mockRestore(); }
-  expect(row("conf-unread-1")).toMatchObject({ name: "kept" });
-  expect(srv.app.db.query("SELECT 1 FROM alias_holds WHERE address = ?").get(`${EMAIL}/conf-unread-other`)).toBeNull();
+  expect(await row("conf-unread-1")).toMatchObject({ name: "kept" });
+  expect(await sqlRow(srv, "SELECT 1 FROM alias_holds WHERE address = ?", `${EMAIL}/conf-unread-other`)).toBeNull();
 });
 
 test("a configured bind that lands but whose prepare fails says the session is bound, not that it couldn't bind (#544 item 2)", async () => {
   const prepare = spyOn(Controller.prototype as unknown as { prepare: () => Promise<void> }, "prepare").mockRejectedValueOnce(new Error("whoami unreachable"));
   const r = rig("conf-prep-1", { configured: "conf-prep" });
   try { await r.root.start(); } finally { prepare.mockRestore(); }
-  expect(row("conf-prep-1")).toMatchObject({ name: "conf-prep" });
+  expect(await row("conf-prep-1")).toMatchObject({ name: "conf-prep" });
   expect(r.logs).toEqual([{ level: "warning", message: expect.stringMatching(/^this session is bound as conf-prep, but delivery couldn't start \(Root enrolled; .+\)$/) }]);
   expect(r.logs[0]!.message).not.toContain("couldn't bind");
   // Bound for good: a later start takes it back instead of binding it again.
@@ -261,13 +264,13 @@ test("a configured name another session holds is said once and in the next tool 
   expect(texts(await r.root.call("whoami", {}))[0]).toMatch(new RegExp(`^grayboard: ${said.source.slice(1)}`));
   await r.root.resume();
   expect(r.logs).toHaveLength(1);
-  expect(row("conf-held-2")).toMatchObject({ name: null });
+  expect(await row("conf-held-2")).toMatchObject({ name: null });
 });
 
 test("a tools-only root (push off) binds its configured name through its own connection; one another session holds is said once", async () => {
   const r = rig("conf-tools", { configured: "conf-tools", push: false });
   await r.root.start();
-  await until(() => row("conf-tools")?.name === "conf-tools", 10_000, "tools-only bound");
+  await until(async () => (await row("conf-tools"))?.name === "conf-tools", 10_000, "tools-only bound");
   expect(r.logs).toEqual([]);
 
   await live("conf-tools-held-1", "conf-tools-held");
@@ -288,11 +291,11 @@ test("a tools-only configured bind the server couldn't be reached for is said on
   await r.root.start();
   await until(() => r.logs.length > 0, 10_000, "the unreachable try said");
   expect(r.logs).toEqual([{ level: "warning", message: `BUS_IDENTITY asked for "conf-retry", but this session couldn't bind it (couldn't reach the grayboard server); it is unbound until a later try binds it` }]);
-  expect(row("conf-tools-retry")?.name ?? null).toBeNull();
+  expect((await row("conf-tools-retry"))?.name ?? null).toBeNull();
 
   down = false;
   await r.root.call("bind", { name: "conf-own", create: true });
-  const held = srv.app.db.query<{ address: string }, [string]>("SELECT address FROM alias_holds WHERE id = ? ORDER BY bound_at").all(hostedSessionId(user, CLIENT, "conf-tools-retry"));
+  const held = await sqlRows<{ address: string }>(srv, "SELECT address FROM alias_holds WHERE id = ? ORDER BY bound_at", hostedSessionId(user, CLIENT, "conf-tools-retry"));
   expect(held.map(h => h.address)).toEqual([`${EMAIL}/conf-retry`, `${EMAIL}/conf-own`]);
   expect(r.logs).toHaveLength(1);
 });
@@ -300,13 +303,13 @@ test("a tools-only configured bind the server couldn't be reached for is said on
 test("detach keeps the lease and name for the next runtime; release ends the session", async () => {
   const a = await live("detach-1", "keeper");
   await a.root.shutdown("detach");
-  expect(row("detach-1")).toMatchObject({ name: "keeper" });
-  expect(row("detach-1")!.lease_deadline).not.toBeNull();
+  expect(await row("detach-1")).toMatchObject({ name: "keeper" });
+  expect((await row("detach-1"))!.lease_deadline).not.toBeNull();
   const b = rig("detach-1");
   await b.root.start();
   await active(b, "keeper");
   await b.root.shutdown("release");
-  expect(row("detach-1")).toBeNull();
+  expect(await row("detach-1")).toBeNull();
   expect([...a.logs, ...b.logs]).toEqual([]);
 });
 
@@ -333,7 +336,7 @@ test("a release while a start's prepare is still connecting ends it at once and 
     const began = performance.now();
     await b.root.shutdown("release");
     expect(performance.now() - began).toBeLessThan(5000);
-    expect(row("hung-1")).toBeNull();
+    expect(await row("hung-1")).toBeNull();
     await started;
   } finally { fetchSpy.mockRestore(); }
 }, 30_000);
@@ -428,7 +431,7 @@ test("a sign-in store the root can't read for its epoch is said once, however ma
 
 test("a shutdown while a start's push connection is still connecting releases the lease first, then closes the connection that start built", async () => {
   await (await live("first-1", "first")).root.shutdown("detach");
-  expect(row("first-1")!.lease_deadline).not.toBeNull();
+  expect((await row("first-1"))!.lease_deadline).not.toBeNull();
 
   const real = globalThis.fetch;
   let armed = true;
@@ -459,7 +462,7 @@ test("a shutdown while a start's push connection is still connecting releases th
     const started = b.root.start();
     await holding;
     down = b.root.shutdown("release");
-    await until(() => row("first-1") === null, 10_000, "the session ended while the connect is held");
+    await until(async () => (await row("first-1")) === null, 10_000, "the session ended while the connect is held");
     expect(made).toHaveLength(1);
     expect(closed).not.toContain(made[0]);
     open();
@@ -488,7 +491,7 @@ test("#542: unbinding the last name answers name null and says unbound; the Cont
   await a.root.resume();
   await until(() => record(a)!.time > before && record(a)?.state === "unbound", 10_000, "resumed unbound");
   expect(record(a)?.held ?? []).toEqual([]);
-  expect(row("unbind-last")).toMatchObject({ name: null });
+  expect(await row("unbind-last")).toMatchObject({ name: null });
 }, 30_000);
 
 // #1349: the server's session_register refusal reaches the root's diagnostic under its own code, not
