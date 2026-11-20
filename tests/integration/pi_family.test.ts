@@ -20,7 +20,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { CallToolResult } from "@modelcontextprotocol/client";
 import type { SessionFacts } from "../../adapters/hosted-core/src/port.ts";
-import { createGrayboard, factReader, INSTRUCTIONS_BACKOFF_MS, INSTRUCTIONS_WAIT_MS, LOGIN_ACTION, type DeliveryEntry, type Grayboard, type Marker, type SessionInfo } from "../../adapters/pi-family/extension.ts";
+import { createGrayboard, factReader, INSTRUCTIONS_BACKOFF_MS, INSTRUCTIONS_WAIT_MS, LOGIN_ACTION, SHUTDOWN_CALLS_WAIT_MS, type DeliveryEntry, type Grayboard, type Marker, type SessionInfo } from "../../adapters/pi-family/extension.ts";
 import { rootOf, type Agent } from "../../adapters/pi-family/omp-ancestry.ts";
 import { piMarker } from "../../adapters/pi-family/entry-pi.ts";
 import type { Level } from "../../adapters/hosted-core/src/client.ts";
@@ -855,6 +855,70 @@ test("a child's instructions fetch held on its register doesn't go out once the 
   expect(await fetched).toBeUndefined();
   expect(await row("midreg-fetch-child")).toBeNull();
 });
+
+// Holds the first request after this whose body names `marker` until `release` (or rejects it with `fail`), and
+// notes whether a session_end goes out meanwhile.
+function holdCall(marker: string) {
+  const real = globalThis.fetch;
+  let settle: ((ok: boolean) => void) | undefined, hit!: () => void, endedAt = 0;
+  const holding = new Promise<void>(resolve => { hit = resolve; });
+  const spy = spyOn(globalThis, "fetch").mockImplementation((async (input: RequestInfo | URL, init?: RequestInit) => {
+    const body = input instanceof Request ? await input.clone().text() : typeof init?.body === "string" ? init.body : "";
+    if (!settle && body.includes(marker)) {
+      const ok = await new Promise<boolean>(resolve => { settle = resolve; hit(); });
+      if (!ok) throw new Error("held call failed");
+    } else if (body.includes('"session_end"') && !endedAt) endedAt = Date.now();
+    return real(input, init);
+  }) as typeof fetch);
+  return { holding, endedAt: () => endedAt, release: () => settle?.(true), fail: () => settle?.(false), restore: () => spy.mockRestore() };
+}
+
+// #1477: a pi/omp child's or loose session's shutdown waits for calls already sent before its end (#1160), and
+// only up to SHUTDOWN_CALLS_WAIT_MS, inside omp's 2 s handler cap.
+for (const kind of ["child", "loose"] as const) {
+  const start = async (tag: string) => {
+    if (kind === "child") await root(`wait-${tag}-root`, `w${tag}`);
+    const s = instance(kind === "child" ? { child: true, root: `wait-${tag}-root` } : { child: true });
+    await s.ext.start({ id: `wait-${tag}-${kind}`, reason: "startup" });
+    expect((await s.call("whoami")).isError).toBeUndefined();
+    return s;
+  };
+
+  test(`a ${kind} session's shutdown waits for a call already sent, which lands before the end`, async () => {
+    const s = await start(`land${kind[0]}`);
+    const hold = holdCall("peer_list");
+    try {
+      const running = s.call("peer_list");
+      await hold.holding;
+      const down = s.ext.shutdown("quit");
+      await until(() => hold.endedAt() > 0, 500, "an early end").catch(() => {});
+      expect(hold.endedAt(), "the end went out while the call was held").toBe(0);
+      hold.release();
+      const listed = await running;
+      expect(listed.isError, texts(listed).join("\n")).toBeUndefined();
+      await down;
+      expect(hold.endedAt()).toBeGreaterThan(0);
+    } finally { hold.restore(); }
+    expect(await row(`wait-land${kind[0]}-${kind}`)).toBeNull();
+  });
+
+  test(`a ${kind} session's shutdown waits at most SHUTDOWN_CALLS_WAIT_MS for a stalled call`, async () => {
+    const s = await start(`stall${kind[0]}`);
+    const hold = holdCall("peer_list");
+    try {
+      const running = s.call("peer_list");
+      await hold.holding;
+      const t0 = Date.now();
+      await s.ext.shutdown("quit");
+      const ended = hold.endedAt() - t0;
+      expect(ended).toBeGreaterThanOrEqual(SHUTDOWN_CALLS_WAIT_MS - 50);
+      expect(Date.now() - t0).toBeLessThan(2_000);
+      expect(await row(`wait-stall${kind[0]}-${kind}`)).toBeNull();
+      hold.fail();
+      expect((await running).isError).toBe(true);
+    } finally { hold.restore(); }
+  });
+}
 
 test("an item sent while a root's /new reads the carried name stays for the new session: the run loop stopped before the read, so the outgoing one neither delivers nor receipts it", async () => {
   const sender = await root("closing-sender", "sender");
