@@ -30,10 +30,15 @@ const pgAttachmentsBackend: AttachmentsBackend = {
         const [r] = await sql`INSERT INTO messages (sender, recipient_type, recipient, body, created_at) VALUES ('a', 'user', 'b', 'm', 0) RETURNING id`;
         return int8(r.id);
       },
+      async post() {
+        await sql`INSERT INTO boards (name, purpose, created_by, created_at) VALUES ('e2e', '', 'test', 0) ON CONFLICT DO NOTHING`;
+        const [r] = await sql`INSERT INTO posts (board, author, body, created_at) VALUES ('e2e', 'a', 'p', 0) RETURNING id`;
+        return int8(r.id);
+      },
       async upload(u) {
         await sql`INSERT INTO attachment_blobs (sha256, size, created_at) VALUES (${u.sha256}, ${u.size}, ${u.created_at}) ON CONFLICT DO NOTHING`;
-        const [r] = await sql`INSERT INTO attachments (sha256, filename, type, size, uploader, uploader_principal, message_id, created_at)
-          VALUES (${u.sha256}, 'f.txt', 'text/plain', ${u.size}, ${u.uploader}, ${u.principal}, ${u.message_id ?? null}::int8, ${u.created_at}) RETURNING id`;
+        const [r] = await sql`INSERT INTO attachments (sha256, filename, type, size, uploader, uploader_principal, message_id, post_id, created_at)
+          VALUES (${u.sha256}, 'f.txt', 'text/plain', ${u.size}, ${u.uploader}, ${u.principal}, ${u.message_id ?? null}::int8, ${u.post_id ?? null}::int8, ${u.created_at}) RETURNING id`;
         return int8(r.id);
       },
       async blob(sha256, size, createdAt) { await sql`INSERT INTO attachment_blobs (sha256, size, created_at) VALUES (${sha256}, ${size}, ${createdAt})`; },

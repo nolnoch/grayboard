@@ -6,12 +6,12 @@
 // each body whole. Without GRAYBOARD_TEST_PG_URL they skip.
 import { expect, test } from "bun:test";
 import { describePg } from "../../../../tests/support/pg.ts";
-import { committed, outcome, pgPair, race, type PgPair } from "../../../../tests/support/pg_race.ts";
+import { blockedOrSettled, committed, gate, outcome, pgPair, race, settle, type PgPair, type Settled } from "../../../../tests/support/pg_race.ts";
 import { DEFAULT_ATTACHMENT_LIMITS, UNBOUND_TTL_MS } from "../../../shared/attachments.ts";
 import type { NewUpload, Uploader } from "../attachments.ts";
 import type { Tx } from "../tx_base.ts";
 import { bindLocked, lockUnsent } from "./attachment_rows.ts";
-import { makePgAttachments } from "./attachments.ts";
+import { insertAttachment, insertCatalogEntry, makePgAttachments } from "./attachments.ts";
 import { int8 } from "./sql.ts";
 import { pgOf } from "./tx.ts";
 
@@ -60,9 +60,9 @@ describePg("attachments store races (Postgres)", () => {
     expect(r.waited).toBe(false);
   });
 
-  // Q2, a sweep's catalog drop racing an upload of the same blob. Upload first: the drop's NOT EXISTS reads the
-  // snapshot from before the upload commits, so its delete goes ahead once the upload's foreign-key lock is released and
-  // fails the foreign key (23503 attachments_sha256_fkey).
+  // Q2, a sweep's catalog drop racing an upload of the same blob. Upload first: the drop waits on the entry the upload
+  // locked, and its NOT EXISTS reads the snapshot from before the upload commits, so its delete goes ahead once the
+  // upload commits and fails the foreign key (23503 attachments_sha256_fkey).
   // Mutation: the 23503 not caught in dropBlobEntry (the sweep's transaction fails); the savepoint dropped (the catch
   // answers 0 but the body's next statement fails 25P02).
   test("Q2a: a catalog drop racing an uncommitted upload of its blob answers 0, its body commits, and the entry survives", async () => {
@@ -90,6 +90,69 @@ describePg("attachments store races (Postgres)", () => {
     expect(int8(entry.created_at)).toBe(T0);
     expect(await rows(p)).toEqual([{ sha256: SHA("a"), uploader: FE, message_id: null }]);
     expect(r.waited).toBe(true);
+  });
+
+  // Q2d: the upload between its two inserts, on an existing entry (a known blob). The catalog insert locks the entry,
+  // so a drop there waits, then fails the foreign key once the upload's row commits, and answers 0.
+  // Mutation: the catalog insert as ON CONFLICT DO NOTHING (it locks nothing: the drop deletes the entry and commits
+  // without waiting, and the upload's row insert fails 23503).
+  test("Q2d: a catalog drop between an upload's catalog insert and its row's waits for the upload; the entry survives", async () => {
+    await using p = await pgPair();
+    await p.db.sql`INSERT INTO attachment_blobs (sha256, size, created_at) VALUES (${SHA("a")}, 60, 1)`;
+    const u = upload({});
+    const held = gate(), release = gate();
+    // insertUpload's two inserts, the race held between them.
+    const a = settle(p.a.write(async tx => {
+      await insertCatalogEntry(pgOf(tx), u);
+      held.open();
+      await release.wait;
+      return insertAttachment(pgOf(tx), u);
+    }));
+    let waitEvent: string | null = null, b!: Promise<Settled<number>>;
+    try {
+      await Promise.race([held.wait, a]);
+      let done = false;
+      b = settle(p.b.write(tx => att.dropBlobEntry(tx, SHA("a")))).finally(() => { done = true; });
+      waitEvent = await blockedOrSettled(p, () => done);
+    } finally {
+      release.open();
+    }
+    expect(committed(await a).sha256).toBe(SHA("a"));
+    expect(outcome(await b)).toBe(0);
+    expect(await blobs(p)).toEqual([SHA("a")]);
+    expect(await rows(p)).toEqual([{ sha256: SHA("a"), uploader: FE, message_id: null }]);
+    expect(waitEvent).not.toBeNull();
+  });
+
+  // dropBlobEntry answers 0 for its own constraint's 23503 only (#807 P3 C10c audit 5). Another table's foreign key on
+  // the catalog (none exists in the schema; this test adds one) fails the drop, and so does a non-constraint error.
+  // Mutation: the catch keyed on any 23503, or catching everything.
+  test("Q2e: a catalog drop that fails on another constraint, or on a lock timeout, rejects; it doesn't answer 0", async () => {
+    await using p = await pgPair();
+    await p.db.sql`INSERT INTO attachment_blobs (sha256, size, created_at) VALUES (${SHA("a")}, 60, 1), (${SHA("b")}, 60, 1)`;
+    await p.db.sql`CREATE TABLE blob_refs (sha256 text COLLATE "C" CONSTRAINT blob_refs_sha256_fkey REFERENCES attachment_blobs (sha256))`;
+    await p.db.sql`INSERT INTO blob_refs VALUES (${SHA("a")})`;
+    const other = await settle(p.a.write(tx => att.dropBlobEntry(tx, SHA("a"))));
+    expect(other.ok ? other.value : (other.error as { errno?: string; constraint?: string })).toMatchObject({ errno: "23503", constraint: "blob_refs_sha256_fkey" });
+    // The entry locked by another transaction until the drop has settled; the drop's 50 ms lock timeout (its deadline)
+    // fails it 55P03, which propagates.
+    const held = gate(), release = gate();
+    const a = settle(p.a.write(async tx => {
+      const n = (await pgOf(tx)`SELECT 1 FROM attachment_blobs WHERE sha256 = ${SHA("b")} FOR UPDATE`).length;
+      held.open();
+      await release.wait;
+      return n;
+    }));
+    let timedOut: Settled<number>;
+    try {
+      await Promise.race([held.wait, a]);
+      timedOut = await settle(p.b.write(async tx => { await pgOf(tx)`SET LOCAL lock_timeout = '50ms'`; return att.dropBlobEntry(tx, SHA("b")); }));
+    } finally {
+      release.open();
+    }
+    expect(committed(await a)).toBe(1);
+    expect(timedOut.ok ? timedOut.value : (timedOut.error as { errno?: string }).errno).toBe("55P03");
+    expect(await blobs(p)).toEqual([SHA("a"), SHA("b")]);
   });
 
   // A committed upload, held by a send binding it: the drop's NOT EXISTS sees the row and deletes nothing, without

@@ -14,7 +14,7 @@ export interface AttachmentsStore {
   get(r: Read, id: number): Promise<AttachmentRow | undefined>;
   // The blob digests of `from`'s unsent uploads `ids`, in call order; rejects with CoreError on an id that isn't one.
   unsentDigests(r: Read, ids: number[], from: Uploader): Promise<string[]>;
-  // Deletes `from`'s unsent uploads among `ids`, returning them by id. One that a send has just bound stays.
+  // Deletes `from`'s unsent uploads among `ids`, returning them in no set order. One that a send has just bound stays.
   dropUnsent(tx: Tx, ids: number[], from: Uploader): Promise<AttachmentRow[]>;
   // Deletes the uploads left unbound since before `olderThanMs`; returns how many. Postgres skips a row a send holds
   // locked to bind it (SKIP LOCKED), so a prune never waits on a send: that row is bound, or left for the next prune.
@@ -25,8 +25,9 @@ export interface AttachmentsStore {
   remove(tx: Tx, id: number): Promise<void>;
   // The catalog's blobs no attachment names; whether one is named; its entry dropped while unnamed (0 or 1). A drop
   // that meets an upload naming the blob, committed or committing, answers 0 and leaves the entry, never failing the
-  // caller's transaction. Bytes are the caller's: one process runs a blob's put and sweep one at a time (core withBlob);
-  // across processes that is #808's.
+  // caller's transaction; on Postgres an upload locks an existing entry first (insertUpload), so a drop between the
+  // upload's catalog insert and its row's waits for the upload, never deleting the entry from under it. Bytes are the
+  // caller's: one process runs a blob's put and sweep one at a time (core withBlob); across processes that is #808's.
   unnamedBlobs(r: Read): Promise<string[]>;
   named(r: Read, sha256: string): Promise<boolean>;
   dropBlobEntry(tx: Tx, sha256: string): Promise<number>;
