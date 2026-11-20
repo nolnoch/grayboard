@@ -84,7 +84,7 @@ export const INSTRUCTIONS_WAIT_MS = 2_000;
 export const INSTRUCTIONS_BACKOFF_MS = 30_000;
 // How long a shutdown waits for a non-root session's running calls before its
 // end (#1160): under omp's 2 s cap on shutdown handlers, so the end still goes.
-const SHUTDOWN_CALLS_WAIT_MS = 1_000;
+export const SHUTDOWN_CALLS_WAIT_MS = 1_000;
 const LATE = Symbol("late");
 
 // A tool's arguments and MCP result as both entries' tools take and return
