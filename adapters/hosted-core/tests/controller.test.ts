@@ -47,6 +47,8 @@ function runtime(mode: Mode, options: { rotates?: boolean } = {}) {
   let onRefused: (() => void) | undefined;
   let prepareHold: Promise<void> | undefined, admitHold: ((signal: AbortSignal) => Promise<void>) | undefined, beforeOpen: (() => void) | undefined;
   let whoamiFault: (() => Error) | undefined;
+  // The next inbox read by `id`'s run loop throws `fault()` (#1400).
+  let readFault: { id: string; fault: () => Error } | undefined;
   // The host's receipt hook (#441), when a test sets one.
   let receiptHook: ((sessionID: string, ids: readonly string[]) => void) | undefined;
   const loops: FakeWire[] = [];
@@ -125,7 +127,10 @@ function runtime(mode: Mode, options: { rotates?: boolean } = {}) {
       }
       return { ok: true };
     }
-    async read() { return { items: batches.get(this.sessionID) ?? [] }; }
+    async read() {
+      if (this.beforeRetry && readFault?.id === this.sessionID) { const { fault } = readFault; readFault = undefined; throw fault(); }
+      return { items: batches.get(this.sessionID) ?? [] };
+    }
     async takes(tool: string, arg: string) { calls.push({ sessionID: this.sessionID, name: "tools/list", args: {} }); return takesContext && tool === "delivery_open" && arg === "context"; }
     // The server closes the stream on its own: a revoked grant closes it at once.
     async listen() {
@@ -192,6 +197,8 @@ function runtime(mode: Mode, options: { rotates?: boolean } = {}) {
     beforeOpen: (hook: () => void) => { beforeOpen = hook; },
     // The next temporary wire's whoami (a start's prepare) throws `fault()` (the server refusing the access token).
     failWhoami: (fault: () => Error) => { whoamiFault = fault; },
+    // The next inbox read by `id`'s run loop throws `fault()`.
+    failRead: (id: string, fault: () => Error) => { readFault = { id, fault }; },
     holdAdmit: (hold: (signal: AbortSignal) => Promise<void>) => { admitHold = hold; },
     onReceipted: (hook: (sessionID: string, ids: readonly string[]) => void) => { receiptHook = hook; },
     drift: () => { grant++; for (const w of [...watchers]) w(); },
@@ -680,6 +687,40 @@ test.each(modes)("a credential change the run loop's check sees before any watch
     for (const id of ["R", "B"]) expect(r.root(c, id)).toMatchObject({ state: "paused", message: "Grayboard credential changed; run /grayboard resume" });
     expect(r.storage.get("paused:B")).toBe(true);
   } finally { await c.close(); await r.controller.close(); }
+});
+
+// #1400: the same race when a request, not the guard, meets the changed credential first: the port's token()
+// checks the binding too, and its refusal reaches whichever catch the request was under. Each start path's catch
+// takes it as the watch's drift, never one root's generic failure (operation_failed). `changed` moves the grant
+// as the refusal lands, so no guard's check could have seen it first.
+const DRIFT = { state: "paused", message: "Grayboard credential changed; run /grayboard resume" };
+const changed = (r: ReturnType<typeof runtime>) => () => { r.revoke("none"); return new Refusal("binding", "Grant changed"); };
+test.each(modes)("a binding refusal the run loop's request meets pauses every root as the watch's drift does (#1400, %s)", async mode => {
+  const r = runtime(mode);
+  const c = r.make({ wait: async () => {} });
+  try {
+    await c.enroll("B", ["fe"], true);
+    await until(() => r.root(c, "B")?.state === "active");
+    r.failRead("R", changed(r));
+    await c.enroll("R", ["be"], true);
+    await until(() => r.root(c)?.state === "paused");
+    for (const id of ["R", "B"]) expect(r.root(c, id)).toMatchObject(DRIFT);
+    expect(r.root(c)?.code).toBeUndefined();
+    expect(r.storage.get("paused:B")).toBe(true);
+  } finally { await c.close(); await r.controller.close(); }
+});
+test.each(modes.flatMap(mode => (["enroll", "resume"] as const).map(how => [mode, how] as const)))("a binding refusal a start's prepare meets pauses every root as the watch's drift does (#1400, %s, %s)", async (mode, how) => {
+  const r = runtime(mode);
+  try {
+    await r.controller.enroll("B", ["fe"], true);
+    await r.controller.enroll("R", ["be"], true);
+    await until(() => r.root(r.controller, "B")?.state === "active" && r.root(r.controller)?.state === "active");
+    r.failWhoami(changed(r));
+    if (how === "enroll") await r.controller.enroll("R");
+    else await r.controller.resume("R");
+    for (const id of ["R", "B"]) expect(r.root(r.controller, id)).toMatchObject(DRIFT);
+    expect(r.root(r.controller)?.code).toBeUndefined();
+  } finally { await r.controller.close(); }
 });
 
 test.each(modes)("an ended root releases ownership; an ended child ends only its own registration (%s)", async mode => {
@@ -1320,8 +1361,36 @@ for (const [what, act, code] of [
     expect(o.r.root(o.c)?.state).toBe("paused");
     expect(o.r.root(o.c)?.code).not.toBe("native_access_expired");
     if (code === "login_required") expect(o.r.root(o.c)?.code).toBe(code);
+    // The recovery's check meets the changed grant before any watch: the watch's drift (#1400).
+    else expect(o.r.root(o.c)).toMatchObject(DRIFT);
     expect(o.r.named("delivery_open")).toHaveLength(o.opened);
   } finally { await o.c.close(); await o.r.controller.close(); }
+});
+test.each(modes)("a binding refusal the recovery's prepare meets pauses the root as the watch's drift does (#1400, %s)", async mode => {
+  const o = await expiredPause(mode, (n, r) => { if (n === 1) { r.expireAccess(); r.failWhoami(changed(r)); } });
+  try {
+    await until(() => o.r.root(o.c)?.message.startsWith("Grayboard credential changed") === true || o.r.root(o.c)?.operation === "recover" && o.r.root(o.c)?.state !== "retrying");
+    expect(o.r.root(o.c)).toMatchObject(DRIFT);
+    expect(o.r.named("delivery_open")).toHaveLength(o.opened);
+  } finally { await o.c.close(); await o.r.controller.close(); }
+});
+for (const how of ["restore", "restore's outage retry"] as const) test(`a binding refusal a ${how} prepare meets pauses the root as the watch's drift does (#1400)`, async () => {
+  const r = runtime("approval");
+  try {
+    await r.controller.enroll("R", ["be"], true);
+    await until(() => r.root(r.controller)?.state === "active");
+    await r.controller.close();
+    let retries = 0;
+    const restarted = r.make({ wait: async () => { if (++retries === 1 && how !== "restore") r.failWhoami(changed(r)); } });
+    try {
+      r.failWhoami(how === "restore" ? changed(r) : () => new ServerUnreachable(new Error("down")));
+      await restarted.restore();
+      await until(() => r.root(restarted)?.state !== "retrying" && r.root(restarted)?.state !== "active");
+      expect(r.root(restarted)).toMatchObject(DRIFT);
+      expect(r.root(restarted)?.code).toBeUndefined();
+      expect(retries).toBe(how === "restore" ? 0 : 1);
+    } finally { await restarted.close(); }
+  } finally { await r.controller.close(); }
 });
 test.each(modes)("two roots awaiting one refresh both resume (%s)", async mode => {
   let landed = false;

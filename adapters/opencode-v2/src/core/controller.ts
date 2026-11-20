@@ -210,6 +210,15 @@ export class Controller<E extends Enrollment = Enrollment> {
   }
   // The watch's and a guard's drift alike; hosts key on DRIFTED (pi's describe, a root's sink).
   private credentialChanged() { this.drift(`${DRIFTED}; ${this.hint}`); }
+  // The port's refusal of a changed credential (Refusal "binding"), however a request surfaced it, while `live`
+  // (the root that met it is still the current one): the watch's drift, seen before the watch's next tick, so
+  // every root pauses with its message, not one with a generic failure (#1400). A replaced root's drifts nothing,
+  // like a disposed watch. Says whether it drifted.
+  private signInChanged(error: unknown, live: boolean) {
+    if (!live || causeOf(error, Refusal)?.code !== "binding") return false;
+    this.credentialChanged();
+    return true;
+  }
   private async path(sessionID: string) { return this.route(await this.port.ancestry(sessionID)); }
   private route(path: SessionPath) {
     this.routes.remember({ sessionID: path.root, root: path.root, via: [] });
@@ -341,10 +350,7 @@ export class Controller<E extends Enrollment = Enrollment> {
     // run loop's stream at once. That is the watch's drift, so every root
     // pauses with its message, not this one alone with a generic failure; a
     // guard whose root was replaced meanwhile drifts nothing, like a disposed watch.
-    await this.port.credential.check(e).catch(error => {
-      if (error instanceof Refusal && error.code === "binding" && current()) this.credentialChanged();
-      throw error;
-    });
+    await this.port.credential.check(e).catch(error => { this.signInChanged(error, current()); throw error; });
     await this.activeRoot(e.sessionID);
     if (this.port.approval && !await this.port.approval.approved(e, r.approval)) { r.paused = true; throw new Refusal("root", `Root approval changed; ${this.hint}`); }
     check();
@@ -420,6 +426,7 @@ export class Controller<E extends Enrollment = Enrollment> {
       // A drift during it (a guard saw the change) already said why every root paused.
       const what = this.port.approval ? (r.paused ? "Root approval unavailable" : "Root approval saved") : (r.paused ? "Root paused" : "Root enrolled");
       const stopped = this.stoppedBy(sessionID, error);
+      if (!stopped) this.signInChanged(error, this.roots.get(sessionID) === r);
       // Its message keeps what the enrollment did; the sign-out is its cause.
       if (!stopped && this.signedOut(error)) r.paused = true;
       if (!this.drifted) this.set(r, r.paused ? "paused" : "approved", `${what}; ${stopped ? "stopped before delivery opened" : failureMessage(this.expired(error), this.hint)}`, bound ? "prepare" : "enroll", stopped ? undefined : failureCode(this.expired(error)));
@@ -450,6 +457,8 @@ export class Controller<E extends Enrollment = Enrollment> {
       if ((error instanceof ServerUnreachable || error instanceof RefreshInProgress) && this.restorable(r, r.epoch)) {
         this.retrying(r, error);
         this.retryRestore(r);
+      } else if (!this.stoppedBy(sessionID, error) && this.signInChanged(error, this.roots.get(sessionID) === r)) {
+        // The drift said why every root paused.
       } else if (!this.drifted) {
         const stopped = this.stoppedBy(sessionID, error);
         if (!stopped && this.signedOut(error)) r.paused = true;
@@ -556,6 +565,7 @@ export class Controller<E extends Enrollment = Enrollment> {
     r.task = this.run(r, e, epoch, abort.signal, ready).catch(caught => {
       const error = this.expired(caught);
       if (abort.signal.aborted) return;
+      if (this.signInChanged(error, this.roots.get(r.e.sessionID) === r && r.epoch === epoch)) return;
       r.paused = true;
       if (error instanceof AccessExpired && error.reason === "expired") this.awaitRefresh(r, "subscriber");
       else this.set(r, "paused", failureMessage(error, this.hint), "subscriber", failureCode(error));
@@ -871,6 +881,9 @@ export class Controller<E extends Enrollment = Enrollment> {
         await this.rotated(grace, () => this.prepare(r, true, true));
       } catch (caught) {
         const r = this.roots.get(id), error = this.expired(caught);
+        // A changed credential the prepare met: the watch's drift, which says why every root paused (#1400). Before
+        // the watch, the check's refusal is the saved approval's own staleness, which only this root's record reports.
+        if (r && this.watches.has(id) && (this.drifted || this.signInChanged(error, this.restorable(r, r.epoch)))) continue;
         // An outage, or another process holding the token refresh: retry on the outage backoff (#424 6, #895, #1334).
         if (r && (error instanceof ServerUnreachable || error instanceof RefreshInProgress) && this.restorable(r, r.epoch)) {
           this.retrying(r, error);
@@ -920,7 +933,7 @@ export class Controller<E extends Enrollment = Enrollment> {
             return true;
           } catch (caught) {
             const error = this.expired(caught);
-            if (!this.restorable(r, epoch)) return true;
+            if (!this.restorable(r, epoch) || this.signInChanged(error, true)) return true;
             if (error instanceof ServerUnreachable || error instanceof RefreshInProgress) { this.retrying(r, error); return false; }
             // As in the run loop's outage: a token that expired while the server
             // (its issuer) was down couldn't be refreshed; ask the host before the next try.
@@ -986,6 +999,7 @@ export class Controller<E extends Enrollment = Enrollment> {
             if (!live()) return true;
             // Still expired, or another process holding the token refresh: the next check reads its outcome (#1334).
             if ((error instanceof AccessExpired && error.reason === "expired") || error instanceof RefreshInProgress) return false;
+            if (this.signInChanged(error, true)) return true;
             r.awaiting = undefined;
             this.set(r, "paused", failureMessage(error, this.hint), "recover", failureCode(error));
             return true;
@@ -998,7 +1012,7 @@ export class Controller<E extends Enrollment = Enrollment> {
             await this.prepare(r, true);
           } catch (caught) {
             const error = this.expired(caught);
-            if (this.drifted || this.stopped || this.ending.has(id) || this.roots.get(id) !== r) return true;
+            if (this.drifted || this.stopped || this.ending.has(id) || this.roots.get(id) !== r || this.signInChanged(error, true)) return true;
             if (error instanceof AccessExpired && error.reason === "expired") { r.paused = true; r.awaiting = mark; awaiting(); return false; }
             // An outage now, or another process holding the token refresh: restore's retry, on the outage
             // backoff, as resume's and restore's own prepares do (#424 6, #895, #1334).

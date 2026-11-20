@@ -36839,6 +36839,12 @@ class Controller {
   credentialChanged() {
     this.drift(`${DRIFTED}; ${this.hint}`);
   }
+  signInChanged(error, live) {
+    if (!live || causeOf(error, Refusal)?.code !== "binding")
+      return false;
+    this.credentialChanged();
+    return true;
+  }
   async path(sessionID) {
     return this.route(await this.port.ancestry(sessionID));
   }
@@ -36971,8 +36977,7 @@ class Controller {
     };
     check();
     await this.port.credential.check(e).catch((error) => {
-      if (error instanceof Refusal && error.code === "binding" && current())
-        this.credentialChanged();
+      this.signInChanged(error, current());
       throw error;
     });
     await this.activeRoot(e.sessionID);
@@ -37062,6 +37067,8 @@ class Controller {
       } catch (error) {
         const what = this.port.approval ? r.paused ? "Root approval unavailable" : "Root approval saved" : r.paused ? "Root paused" : "Root enrolled";
         const stopped = this.stoppedBy(sessionID, error);
+        if (!stopped)
+          this.signInChanged(error, this.roots.get(sessionID) === r);
         if (!stopped && this.signedOut(error))
           r.paused = true;
         if (!this.drifted)
@@ -37094,7 +37101,7 @@ class Controller {
         if ((error instanceof ServerUnreachable || error instanceof RefreshInProgress) && this.restorable(r, r.epoch)) {
           this.retrying(r, error);
           this.retryRestore(r);
-        } else if (!this.drifted) {
+        } else if (!this.stoppedBy(sessionID, error) && this.signInChanged(error, this.roots.get(sessionID) === r)) {} else if (!this.drifted) {
           const stopped = this.stoppedBy(sessionID, error);
           if (!stopped && this.signedOut(error))
             r.paused = true;
@@ -37212,6 +37219,8 @@ class Controller {
     r.task = this.run(r, e, epoch, abort.signal, ready).catch((caught) => {
       const error = this.expired(caught);
       if (abort.signal.aborted)
+        return;
+      if (this.signInChanged(error, this.roots.get(r.e.sessionID) === r && r.epoch === epoch))
         return;
       r.paused = true;
       if (error instanceof AccessExpired && error.reason === "expired")
@@ -37579,6 +37588,8 @@ class Controller {
         await this.rotated(grace, () => this.prepare(r, true, true));
       } catch (caught) {
         const r = this.roots.get(id), error = this.expired(caught);
+        if (r && this.watches.has(id) && (this.drifted || this.signInChanged(error, this.restorable(r, r.epoch))))
+          continue;
         if (r && (error instanceof ServerUnreachable || error instanceof RefreshInProgress) && this.restorable(r, r.epoch)) {
           this.retrying(r, error);
           this.retryRestore(r);
@@ -37620,7 +37631,7 @@ class Controller {
             return true;
           } catch (caught) {
             const error = this.expired(caught);
-            if (!this.restorable(r, epoch))
+            if (!this.restorable(r, epoch) || this.signInChanged(error, true))
               return true;
             if (error instanceof ServerUnreachable || error instanceof RefreshInProgress) {
               this.retrying(r, error);
@@ -37684,6 +37695,8 @@ class Controller {
               return true;
             if (error instanceof AccessExpired && error.reason === "expired" || error instanceof RefreshInProgress)
               return false;
+            if (this.signInChanged(error, true))
+              return true;
             r.awaiting = undefined;
             this.set(r, "paused", failureMessage(error, this.hint), "recover", failureCode(error));
             return true;
@@ -37699,7 +37712,7 @@ class Controller {
             await this.prepare(r, true);
           } catch (caught) {
             const error = this.expired(caught);
-            if (this.drifted || this.stopped || this.ending.has(id) || this.roots.get(id) !== r)
+            if (this.drifted || this.stopped || this.ending.has(id) || this.roots.get(id) !== r || this.signInChanged(error, true))
               return true;
             if (error instanceof AccessExpired && error.reason === "expired") {
               r.paused = true;
