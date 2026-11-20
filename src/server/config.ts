@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { isLoopback, parseOAuthClients, type OAuthClient } from "./oauth-config.ts";
 import { parseCimdClients } from "./oauth-cimd.ts";
@@ -41,6 +42,9 @@ export type Config = {
   store: Store;
   // Where attachment bytes are kept (src/server/blobs.ts); default blobs/ beside a SQLite database, required with a URL.
   blobDir: string;
+  // GRAYBOARD_DATABASE_CONNECT_SECONDS (#1418): how long a Postgres store's first connection retries; absent, the
+  // default (store/pg/connect.ts).
+  databaseConnectSeconds?: number;
   httpPort: number;
   googleClientId: string;
   googleClientSecret: string;
@@ -98,7 +102,36 @@ export type Config = {
   slack?: { appToken: string; botToken: string; apiUrl?: string };
 };
 
+// The secrets a deploy may mount as files (#1418): NAME_FILE names a file whose contents become NAME, the
+// Docker and Kubernetes convention, so a secret needn't sit in the process environment's source.
+export const FILE_SECRETS = [
+  "GRAYBOARD_DATABASE_URL", "GOOGLE_OAUTH_CLIENT_SECRET", "GRAYBOARD_MCP_GOOGLE_CLIENT_SECRET",
+  "GRAYBOARD_OKTA_CLIENT_SECRET", "SLACK_APP_TOKEN", "SLACK_BOT_TOKEN",
+] as const;
+
+// Resolves each NAME_FILE into env.NAME before anything reads it. Both set (to different values) is refused: which
+// one wins would be a guess. Trailing line breaks are dropped (an editor or `echo` adds one); an empty or unreadable file is refused,
+// naming the variable and path, never the contents.
+export function resolveFileSecrets(env: Record<string, string | undefined>): void {
+  for (const name of FILE_SECRETS) {
+    const path = env[`${name}_FILE`];
+    if (!path) continue;
+    let value: string;
+    try {
+      value = readFileSync(path, "utf8");
+    } catch (e) {
+      throw new Error(`${name}_FILE: cannot read ${path}: ${(e as NodeJS.ErrnoException).code ?? (e as Error).message}`);
+    }
+    value = value.replace(/[\r\n]+$/, "");
+    if (!value) throw new Error(`${name}_FILE: ${path} is empty`);
+    // NAME equal to the file is this resolution run before (a second loadConfig), not a second source.
+    if (env[name] && env[name] !== value) throw new Error(`Set one of ${name}, ${name}_FILE, not both`);
+    env[name] = value;
+  }
+}
+
 export function loadConfig(): Config {
+  resolveFileSecrets(process.env);
   const devAuth = process.env.GRAYBOARD_DEV_AUTH === "1";
 
   if (devAuth && (process.env.GOOGLE_OAUTH_CLIENT_SECRET || process.env.GRAYBOARD_MCP_GOOGLE_CLIENT_SECRET || process.env.GRAYBOARD_OKTA_CLIENT_SECRET)) {
@@ -134,6 +167,7 @@ export function loadConfig(): Config {
   return {
     store,
     blobDir,
+    ...connectSeconds(process.env.GRAYBOARD_DATABASE_CONNECT_SECONDS),
     httpPort: parsePort(process.env.GRAYBOARD_HTTP_PORT),
     googleClientId,
     googleClientSecret,
@@ -427,6 +461,14 @@ export function parseMetricsAddr(raw: string | undefined): { hostname: string; p
 // CLI token idle days: unset or empty is the default, 0 is never, else a
 // whole number of days up to ten years. Plain digits, as elsewhere here.
 export const DEFAULT_CLI_TOKEN_IDLE_DAYS = 30;
+function connectSeconds(raw: string | undefined): { databaseConnectSeconds?: number } {
+  if (raw === undefined || raw === "") return {};
+  if (!/^(0|[1-9][0-9]*)$/.test(raw) || Number(raw) > 3600) {
+    throw new Error(`GRAYBOARD_DATABASE_CONNECT_SECONDS must be a whole number of seconds from 0 (one try) to 3600, not "${raw}"`);
+  }
+  return { databaseConnectSeconds: Number(raw) };
+}
+
 function idleDays(raw: string | undefined): number {
   if (raw === undefined || raw === "") return DEFAULT_CLI_TOKEN_IDLE_DAYS;
   if (!/^(0|[1-9][0-9]*)$/.test(raw) || Number(raw) > 3650) {
