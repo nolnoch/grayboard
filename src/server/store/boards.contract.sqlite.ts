@@ -52,6 +52,7 @@ export const sqliteBoardsBackend: BoardsBackend = {
         "SELECT handle, post_id, reason, wake, delivered_at IS NOT NULL AS delivered FROM outbox ORDER BY post_id, handle")
         .map(r => ({ ...r, wake: r.wake === 1, delivered: r.delivered === 1 })),
       outboxSessions: async () => all("SELECT handle, post_id, session_id FROM outbox ORDER BY post_id, handle"),
+      takeSessions: async () => all("SELECT key, handle, session_id FROM claim_events WHERE event = 'take' ORDER BY id"),
       muteRows: async () => all("SELECT handle, root_id FROM thread_mutes ORDER BY handle, root_id"),
       postRow: async id => all<{ parent_id: number | null; human: number | null }>("SELECT parent_id, human FROM posts WHERE id = ?", [id])
         .map(r => ({ parent_id: r.parent_id, human: bool(r.human) }))[0],

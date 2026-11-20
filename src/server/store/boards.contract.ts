@@ -49,6 +49,8 @@ export type BoardsHarness = {
   outboxRows(): Promise<{ handle: string; post_id: number; reason: string; wake: boolean; delivered: boolean }[]>;
   // Every outbox row's receiving session (#1370), by post id then handle.
   outboxSessions(): Promise<{ handle: string; post_id: number; session_id: string | null }[]>;
+  // Every take's recorded session (#1461), by event id.
+  takeSessions(): Promise<{ key: string; handle: string; session_id: string | null }[]>;
   muteRows(): Promise<{ handle: string; root_id: number }[]>;
   postRow(id: number): Promise<{ parent_id: number | null; human: boolean | null } | undefined>;
   claimRows(): Promise<{ key: string; holder: string; note: string | null; board: string | null; acquired_at: number; expires_at: number; holder_user: string | null }[]>;
@@ -940,6 +942,7 @@ function queue(it: It): void {
     await h.hold(OPS, S2, T0 + 1);
     await ack();
     expect(await h.outboxSessions()).toEqual([{ handle: OPS, post_id: p, session_id: null }]);
+    expect(await h.takeSessions()).toEqual([{ key: `queue:jobs:${p}`, handle: OPS, session_id: null }]);
     expect(await h.boards.laneRows(h.read, "jobs", [])).toEqual(before);
   });
 

@@ -72,6 +72,8 @@ async function openPg(): Promise<{ h: BoardsHarness; sql: PgDatabase["sql"] }> {
       r => ({ handle: r.handle as string, post_id: int8(r.post_id), reason: r.reason as string, wake: r.wake === true, delivered: r.delivered === true })),
     outboxSessions: () => rows(sql`SELECT handle, post_id, session_id FROM outbox ORDER BY post_id, handle COLLATE "C"`,
       r => ({ handle: r.handle as string, post_id: int8(r.post_id), session_id: r.session_id as string | null })),
+    takeSessions: () => rows(sql`SELECT key, handle, session_id FROM claim_events WHERE event = 'take' ORDER BY id`,
+      r => ({ key: r.key as string, handle: r.handle as string, session_id: r.session_id as string | null })),
     muteRows: () => rows(sql`SELECT handle, root_id FROM thread_mutes ORDER BY handle COLLATE "C", root_id`,
       r => ({ handle: r.handle as string, root_id: int8(r.root_id) })),
     postRow: async id => (await rows(sql`SELECT parent_id, human FROM posts WHERE id = ${id}`,
