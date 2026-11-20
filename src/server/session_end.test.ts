@@ -15,7 +15,7 @@ import { writeAudit } from "./audit.ts";
 import type { Repo } from "./db.ts";
 import { endSessionServer } from "./session_end.ts";
 import type { Tx } from "./store/tx.ts";
-import { B, BOB_ID, CHILD_ID, E, ENDED_ID, EVE_ID, openPostParity, W, WADE_ID } from "../../tests/support/board_parity.ts";
+import { B, BOB_ID, CHILD_ID, E, ENDED_ID, EVE_ID, openPostParity, settleTime, W, WADE_ID } from "../../tests/support/board_parity.ts";
 import { seed } from "../../tests/support/seed.ts";
 
 let repo: Repo;
@@ -91,7 +91,8 @@ const mail = (db: CoreDb): MailPort => ({
   },
 });
 
-// Every table an end touches; a time past T1 reads "now" (an expiry "later"), ids of rows the end wrote compare by order.
+// Every table an end touches; a time past T1 settles by board_parity's rule ("now", an expiry "later+<minutes>m"), ids of
+// rows the end wrote compare by order.
 function rows(db: CoreDb): Record<string, unknown> {
   const q = (sql: string) => db.query(sql).all();
   const out = {
@@ -110,7 +111,7 @@ function rows(db: CoreDb): Record<string, unknown> {
     attachments: q(`SELECT id, uploader, post_id, message_id FROM attachments ORDER BY id`),
     access_log: q(`SELECT actor, action, target, detail, at FROM access_log ORDER BY id`),
   };
-  return JSON.parse(JSON.stringify(out, (k, x) => typeof x === "number" && x > T1 ? (k === "expires_at" ? "later" : "now") : x));
+  return JSON.parse(JSON.stringify(out, (k, x) => typeof x === "number" && x > T1 ? settleTime(T1, k, x) : x));
 }
 
 class Rollback { constructor(readonly value: unknown) {} }
