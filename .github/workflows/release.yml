@@ -294,10 +294,11 @@ jobs:
       suite: hosted-network
       public_revision: ${{ github.sha }}
 
-  # The server image (#1418), from the published release's own server binaries: each is checked against the signed
-  # SHA256SUMS the release job just published, so the image runs the bytes `install.sh` installs. One tag per
-  # release, no `latest`: a deploy pins a version. A new GHCR package starts private; its visibility is a one-time
-  # setting in the package's page.
+  # The server image (#1418), from the published release's own server binaries: the release's SHA256SUMS is checked
+  # against its signature and the committed key, and each binary against SHA256SUMS, so the image runs the bytes
+  # `install.sh` installs. The image is pushed by digest and attested before the version tag names it, so no tag is
+  # ever pullable unattested. One tag per release, no `latest`: a deploy pins a version. A new GHCR package starts
+  # private; its visibility is a one-time setting in the package's page.
   image:
     name: Publish server image
     needs: release
@@ -328,8 +329,16 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
         run: |
-          gh release download "$TAG" -R "$GITHUB_REPOSITORY" -p SHA256SUMS -D dist
-          (cd dist && grep -E ' grayboard-server-linux-(x64|arm64)$' SHA256SUMS | sha256sum -c -)
+          gh release download "$TAG" -R "$GITHUB_REPOSITORY" -p SHA256SUMS -p SHA256SUMS.sig -D dist
+          read -r id b64 < dist/SHA256SUMS.sig
+          pub="assets/release-keys/${id}.pem"
+          [ -f "$pub" ] || { echo "::error::key $id isn't in assets/release-keys"; exit 1; }
+          [ "$(openssl pkey -pubin -in "$pub" -outform DER | sha256sum | cut -c1-16)" = "$id" ] || { echo "::error::$pub isn't key $id"; exit 1; }
+          printf '%s' "$b64" | openssl base64 -d -A > "$RUNNER_TEMP/sums.der"
+          openssl dgst -sha256 -verify "$pub" -signature "$RUNNER_TEMP/sums.der" dist/SHA256SUMS
+          grep -E ' grayboard-server-linux-(x64|arm64)$' dist/SHA256SUMS > "$RUNNER_TEMP/server.sums"
+          [ "$(wc -l < "$RUNNER_TEMP/server.sums")" -eq 2 ] || { echo "::error::SHA256SUMS lacks a Linux server line"; exit 1; }
+          (cd dist && sha256sum -c "$RUNNER_TEMP/server.sums")
           mkdir -p image/amd64 image/arm64
           install -m 0755 dist/grayboard-server-linux-x64 image/amd64/grayboard-server
           install -m 0755 dist/grayboard-server-linux-arm64 image/arm64/grayboard-server
@@ -361,6 +370,7 @@ jobs:
           [ "$got" = "${TAG#v}" ] || { echo "::error::the image reports ${got}, not ${TAG#v}"; exit 1; }
           echo "image runs: ${got}"
 
+      # By digest, untagged: the tag comes after the attestation.
       - name: Build and push
         id: push
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
@@ -368,8 +378,7 @@ jobs:
           context: image
           file: deploy/Dockerfile
           platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ env.IMAGE }}:${{ github.ref_name }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
@@ -381,6 +390,16 @@ jobs:
           subject-name: ${{ env.IMAGE }}
           subject-digest: ${{ steps.push.outputs.digest }}
           push-to-registry: true
+
+      # The tag names the attested digest, and must resolve to it.
+      - name: Tag the release
+        env:
+          TAG: ${{ github.ref_name }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          docker buildx imagetools create -t "$IMAGE:$TAG" "$IMAGE@$DIGEST"
+          got="$(docker buildx imagetools inspect "$IMAGE:$TAG" --format '{{json .Manifest}}' | jq -r .digest)"
+          [ "$got" = "$DIGEST" ] || { echo "::error::$IMAGE:$TAG resolves to $got, not the attested $DIGEST"; exit 1; }
 
   # Pins the Claude Code plugin's marketplace entry to this release (#281),
   # only once the release is immutable: its tag can then never move (a failed

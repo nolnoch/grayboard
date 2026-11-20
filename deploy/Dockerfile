@@ -12,5 +12,6 @@ COPY ${TARGETARCH}/grayboard-server /usr/local/bin/grayboard-server
 
 # GRAYBOARD_HTTP_PORT's default. Configuration is env only (docs/guide/server.md §3); secrets can be files (`<NAME>_FILE`).
 EXPOSE 8080
-USER nonroot
+# Numeric, as the base sets it: a pod with runAsNonRoot and no runAsUser refuses a named user it can't check.
+USER 65532:65532
 ENTRYPOINT ["/usr/local/bin/grayboard-server"]
