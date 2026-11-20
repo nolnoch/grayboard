@@ -14,9 +14,16 @@ import { AsyncLocalStorage } from "node:async_hooks";
 // the body starts can therefore open a transaction while the body is suspended: the guard doesn't catch that. The
 // store is a token per body, not the queue: an async afterCommit effect a body started carries the context on
 // past the body's release, and must not pass for a later holder.
+//
+// A body that waits runs in the context of the task that queued it, as an idle queue's body does (#1408): the queue
+// takes a snapshot of every AsyncLocalStorage at run() and starts the waiter inside it, with its own holder token set
+// on top. Without that, a waiter started from release() inherits the releasing holder's context (another request's
+// hosted exchange, its auth pin, its request origin) and judges its work as that request's.
 const holder = new AsyncLocalStorage<object>();
 
-type Waiter = { fn: () => unknown; resolve: (value: unknown) => void; reject: (error: unknown) => void };
+// `enter`: the queuing task's context, for a body that waits (AsyncLocalStorage.snapshot); an idle queue's body
+// already runs in it.
+type Waiter = { fn: () => unknown; resolve: (value: unknown) => void; reject: (error: unknown) => void; enter?: <R>(fn: () => R) => R };
 
 export class WriteQueue {
   private busy = false;
@@ -26,7 +33,7 @@ export class WriteQueue {
   run<T>(fn: () => T | PromiseLike<T>): Promise<T> {
     return new Promise<T>((resolve, reject) => {
       const w = { fn, resolve, reject } as Waiter;
-      if (this.busy) { this.waiters.push(w); return; }
+      if (this.busy) { w.enter = AsyncLocalStorage.snapshot(); this.waiters.push(w); return; }
       this.busy = true;
       if (!this.start(w)) this.release();
     });
@@ -55,12 +62,13 @@ export class WriteQueue {
   private start(w: Waiter): boolean {
     const token = this.current = {};
     let held: Promise<unknown> | undefined, out: unknown;
+    const body = () => holder.run(token, () => {
+      out = w.fn();
+      const then = out !== null && (typeof out === "object" || typeof out === "function") ? (out as { then?: unknown }).then : undefined;
+      if (typeof then === "function") held = new Promise((resolve, reject) => then.call(out, resolve, reject));
+    });
     try {
-      holder.run(token, () => {
-        out = w.fn();
-        const then = out !== null && (typeof out === "object" || typeof out === "function") ? (out as { then?: unknown }).then : undefined;
-        if (typeof then === "function") held = new Promise((resolve, reject) => then.call(out, resolve, reject));
-      });
+      if (w.enter) w.enter(body); else body();
     } catch (error) { w.reject(error); return false; }
     if (!held) { w.resolve(out); return false; }
     held.finally(() => this.release()).then(w.resolve, w.reject);
