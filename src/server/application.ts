@@ -134,6 +134,10 @@ export class ApplicationSession {
   // Set while a replay's direct-message drain is in flight (drainDirect): live DMs held for it, the ids its drains
   // sent, how many are running, and the chain that runs them one at a time.
   draining: { held: MessageRow[]; sent: Set<number>; runs: number; chain: Promise<void> } | null = null;
+  // Gates raised by a push session's registering commit (a bind or the Slack bridge's attach whose caller said it
+  // replays, #1090): each counts as a run in `draining` until a replay's direct drain is done. A replay settles one
+  // whichever commit raised it; a replay no commit owed would settle another's early, so callers pair them.
+  owedDrains = 0;
   // Set while a board drain runs (drainBoards, #807 P3 B5a1): a wake meanwhile asks for one more run (`all` when any
   // asks for it), and a receipt committed meanwhile names what the running drain read before it and mustn't resend.
   boardDrain: { rerun: boolean; all: boolean; acked: Set<string>; done: Promise<void> } | null = null;
@@ -349,16 +353,38 @@ async function drainDirect(hub: Hub, session: ApplicationSession, addresses: str
   try {
     await run;
   } finally {
-    if (--d.runs === 0) {
-      session.draining = null;
-      // Each on its own, as drainBoards delivers: one that throws leaves the rest delivered (it stays unacked).
-      for (const m of d.held.sort((a, b) => a.id - b.id)) {
-        if (d.sent.has(m.id)) continue;
-        try { deliverDirect(session, m); }
-        catch (error) { console.error("held direct delivery failed", error); }
-      }
-    }
+    endDrainRun(session, d);
   }
+}
+
+// One run of the session's gate is done; the last delivers what waited, in id order, less what a drain already sent.
+function endDrainRun(session: ApplicationSession, d: NonNullable<ApplicationSession["draining"]>): void {
+  if (--d.runs !== 0) return;
+  session.draining = null;
+  // Each on its own, as drainBoards delivers: one that throws leaves the rest delivered (it stays unacked).
+  for (const m of d.held.sort((a, b) => a.id - b.id)) {
+    if (d.sent.has(m.id)) continue;
+    try { deliverDirect(session, m); }
+    catch (error) { console.error("held direct delivery failed", error); }
+  }
+}
+
+// A push session became deliverable at a commit whose caller replays next (#1090): the gate goes up now, in the
+// commit's effects. On SQLite those run before the queue's next body, so no send commits in between; otherwise one
+// committed before the replay is pushed live and then read again by its drain (the cursor hasn't moved): m3, m1, m2,
+// m3. On Postgres a bind registers the session in its body, so a concurrent commit can still land before the gate:
+// #1090 part 2.
+function owe(session: ApplicationSession): void {
+  if (!session.push) return;
+  session.owedDrains++;
+  (session.draining ??= { held: [], sent: new Set(), runs: 0, chain: Promise.resolve() }).runs++;
+}
+
+// The replay's part of the gate: released once its drain is done, or at once when it drains nothing.
+function settleOwed(session: ApplicationSession): void {
+  if (session.owedDrains === 0 || !session.draining) return;
+  session.owedDrains--;
+  endDrainRun(session, session.draining);
 }
 
 // A human's session has no wakes to save: it gets deferred pushes and
@@ -969,7 +995,9 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
   // Its alias, audit and binding row commit in one transaction through the write queue (#807 D4); the registry
   // changes after the commit, so a rolled-back attach leaves an earlier connection in place. `current` runs inside
   // that transaction: the bridge's checks went stale while the write waited (an unlink or stop queued ahead of it).
-  async function attachHuman(authed: AuthedUser, sink: DeliverySink, current?: (tx: Tx) => string | null | Promise<string | null>): Promise<{ session: ApplicationSession; ok: HelloResult }> {
+  // `replays`: the caller replays the session next (the bridge does), so the commit raises its drain gate (#1090); a
+  // caller that never replays leaves it down, or live direct messages would wait for a drain that never runs.
+  async function attachHuman(authed: AuthedUser, sink: DeliverySink, current?: (tx: Tx) => string | null | Promise<string | null>, replays = false): Promise<{ session: ApplicationSession; ok: HelloResult }> {
     const addr = `${authed.user_email}/${HUMAN_NAME}`;
     return repo.write(async tx => {
       if ((await repo.users.findById(tx, authed.user_id))?.disabled_at != null) fail("unauthenticated", "session is closed");
@@ -997,6 +1025,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
       if (prev && prev !== session) terminate(prev, new ApplicationError("superseded", "a newer Slack bridge connection took over this human"));
       hub.sessions.add(session);
       hub.registry.set(addr, session);
+      if (replays) owe(session);
       return { session, ok: { id: HUMAN_NAME, ...helloFields(hub, authed, hello) } };
     });
   }
@@ -1007,7 +1036,9 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
   // A refusal's binding row goes to the session's `afterRollback` when it has one: a hosted bind runs inside a
   // transaction the refusal's throw rolls back, and the row is written after it.
   // `tx`: the body the bind runs in; its alias reads and lazy create run on it.
-  async function bindNow(tx: Tx, session: ApplicationSession, m: Omit<BindRequest, "type" | "req_id">): Promise<BindResult> {
+  // `replays`: the caller replays the alias next, so a push session's commit raises its drain gate (#1090), as
+  // attachHuman's does; a caller that never replays leaves it down, or live direct messages would wait forever.
+  async function bindNow(tx: Tx, session: ApplicationSession, m: Omit<BindRequest, "type" | "req_id">, replays = false): Promise<BindResult> {
     await valid(session, true, tx);
     const { authed } = session;
     if (session.human) fail("bad_request", `the Slack bridge's connection is its user's "${HUMAN_NAME}"; it binds nothing`);
@@ -1045,6 +1076,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     if (session.holds.includes(address)) {
       // No binding event, and bound_at stays: the session already holds it.
       if (meta) await setAliasLabels(repo, tx, address, meta, id, authed.user_email);
+      if (replays) tx.afterCommit(() => owe(session));
       return { alias: address, held: [...session.holds] };
     }
     if (session.holds.length >= MAX_HOLDS) {
@@ -1112,6 +1144,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     // The first bind of a user's session after the bridge died carries the death notice, once.
     const owed = await owedBridgeNotice(repo, tx, authed.user_email);
     const notices = await noticesFor(hub, tx, session.addresses, owed ? [owed] : []);
+    if (replays) tx.afterCommit(() => owe(session));
     return { alias: address, held: [...session.holds], ...(notices.length ? { notices } : {}) };
   }
 
@@ -1321,17 +1354,25 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     // messages and board items for `addresses` (every address by default; a
     // bind's alias after its answer).
     async replay(session: ApplicationSession, addresses?: string[]) {
-      await valid(session, true);
-      if (session.readOnly || !session.push) return;
-      // Called after the hello's or bind's commit, outside any body, so the drain runs now; awaited, so the replay
-      // answers once it's delivered (#807 P3 A6a). A failure is logged, as a commit effect's is.
+      // The gate its bind or attach raised (#1090) comes down once the direct drain is done, or on any way out
+      // before it; settled twice, the second is a no-op.
+      let settled = false;
+      const settle = () => { if (!settled) { settled = true; settleOwed(session); } };
       try {
-        await drainDirect(hub, session, addresses ?? session.addresses);
-        // Closed while the drain awaited (an unlink, a revoke): nothing more is owed.
-        if (!session.active) return;
+        await testPauseAsync("server:replay:start");
         await valid(session, true);
-        await drainBoards(session, hub, true);
-      } catch (error) { console.error("postcommit effect failed", error); }
+        if (session.readOnly || !session.push) return;
+        // Called after the hello's or bind's commit, outside any body, so the drain runs now; awaited, so the replay
+        // answers once it's delivered (#807 P3 A6a). A failure is logged, as a commit effect's is.
+        try {
+          await drainDirect(hub, session, addresses ?? session.addresses);
+          settle();
+          // Closed while the drain awaited (an unlink, a revoke): nothing more is owed.
+          if (!session.active) return;
+          await valid(session, true);
+          await drainBoards(session, hub, true);
+        } catch (error) { console.error("postcommit effect failed", error); }
+      } finally { settle(); }
     },
     async send(
       tx: Tx,

@@ -75,29 +75,46 @@ test("a message committed before the drain's read arrives after the drained ones
   }
 });
 
-test("a message committed after the drain's read arrives through the gate's flush, after the drained ones", async () => {
-  const { alice, m1, m2, reconnect } = await offline();
+// Holds the server at testPause `point` while `during` runs, then releases it and awaits what `start` started.
+async function pausedAt<T>(point: string, start: () => Promise<T>, during: () => Promise<void>): Promise<T> {
   const dir = mkdtempSync(join(tmpdir(), "gb-drain-"));
   const go = join(dir, "go");
   const log = console.error;
   let hit = false;
   console.error = (...args: unknown[]) => {
-    if (String(args[0]).includes("test pause hit: server:drain:after-read")) hit = true;
+    if (String(args[0]).includes(`test pause hit: ${point}`)) hit = true;
     else if (!String(args[0]).includes("test pause released")) log(...args);
   };
-  process.env.BUS_TEST_PAUSE = "server:drain:after-read";
+  process.env.BUS_TEST_PAUSE = point;
   process.env.BUS_TEST_PAUSE_FILE = go;
   try {
-    const connecting = reconnect();
+    const started = start();
     await until(() => hit);
-    // The drain has read m1 and m2 only; m3 commits now, so only the gate's flush can deliver it.
-    const m3 = (await alice.send(BOB, "three")).message_id;
+    await during();
     writeFileSync(go, "");
-    await receivedInOrder(await connecting, [m1, m2, m3]);
+    return await started;
   } finally {
     delete process.env.BUS_TEST_PAUSE;
     delete process.env.BUS_TEST_PAUSE_FILE;
     console.error = log;
     rmSync(dir, { recursive: true, force: true });
   }
+}
+
+test("a message committed after the drain's read arrives through the gate's flush, after the drained ones", async () => {
+  const { alice, m1, m2, reconnect } = await offline();
+  let m3 = 0;
+  // The drain has read m1 and m2 only; m3 commits now, so only the gate's flush can deliver it.
+  const connecting = await pausedAt("server:drain:after-read", reconnect, async () => { m3 = (await alice.send(BOB, "three")).message_id; });
+  await receivedInOrder(connecting, [m1, m2, m3]);
+});
+
+// #1090: the bind's commit made bob deliverable; its caller's replay hasn't started. A send committed in that gap
+// waits in the gate the bind raised, not pushed live and then read again by the drain (m3, m1, m2, m3).
+test("a message committed between the bind's commit and its replay arrives once, after the drained ones", async () => {
+  const { alice, m1, m2, reconnect } = await offline();
+  let m3 = 0;
+  const connecting = await pausedAt("server:replay:start", reconnect, async () => { m3 = (await alice.send(BOB, "three")).message_id; });
+  expect(m3).toBeGreaterThan(m2);
+  await receivedInOrder(connecting, [m1, m2, m3]);
 });
