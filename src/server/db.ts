@@ -10,7 +10,7 @@ import { dirname } from "node:path";
 
 import { acknowledge, redeliveryFacts, type RedeliveryFacts, aliasScopeRows, authorAddresses, claimQueuePost, humansAmong, insertOutbox, insertPost, queueLaneRows, subscriberRows, threadFacts, type NewPost, type PostTarget, type ThreadFacts, insertBoard, isHuman, readRows, setArchived, setMute, threadRoot, type AliasScopeRow, type ReadResult, ALIAS_SESSION_SQL, boardViewRows, openSummaryRows, setQueueParticipation, whoRows, writeStatus, type BoardSummary, type BoardView, type UnboundFacts, type WhoRow, ensureBoard, forgetHandle, isSubscribed, markHuman, prunePosts, setSubscription, unsubscribeScope, type SubMode, catalogPage, getBoard, getPost, HOLD_ORDER, lastSeen, pendingDigests, pendingPushes, snapshotPage, type Board, type BoardSnapshot, type DigestRow, type PendingRef, type PushRow, type SnapshotOptions, pruneEndedIds, registerId, setAccess, setAliasMeta, setIdFacts, setPlace, touchAlias, touchId, type AliasMetaSet, type CoreDb, type IdFacts, type IdSessionFacts, type ReusedId } from "../core/boards.ts";
 import type { Post } from "../shared/notifications.ts";
-import { ackQueueClaim, addClaimWatch, claimRow, claimWatchers, expireClaims, holderUser, listClaims, liveClaim, logEvent, recentClaimEvents, releaseClaim, removeClaimWatch, takeClaim, takeClaimWatchers, type Claim, type ClaimEvent, type ClaimEventRow, type ClaimRow, type TakeRow } from "../core/claims.ts";
+import { ackQueueClaim, addClaimWatch, claimRow, claimWatchers, expireClaims, holderUser, listClaims, liveClaim, logEvent, recentClaimEvents, releaseClaim, removeClaimWatch, takeClaim, takeClaimWatchers } from "../core/claims.ts";
 import { addressSet, aliasUser, aliasUses, dropHold, holderOf, holdsOf, idRow, idStatuses, logBinding, unendedIds, type AliasUse, type BindingEvent, type IdRow } from "../core/bindings.ts";
 import type { AuditAction } from "./audit.ts";
 import { bindAttachments, blobNamed, dropAttachments, dropBlobEntry, dropUnsentUploads, getAttachment, insertUpload, pruneUnbound, removeUpload, unnamedBlobs, uploadDigests, withAttachments, type BlobStore, type Uploader } from "../core/attachments.ts";
@@ -39,6 +39,7 @@ import { AuthorityLost, LastOwner, MissingParent, PrincipalTaken } from "./store
 import type { Alias, AliasesStore } from "./store/aliases.ts";
 import type { MessageRow, MessagesStore, RetractResult } from "./store/messages.ts";
 import type { AttachmentsStore } from "./store/attachments.ts";
+import type { ClaimsStore } from "./store/claims.ts";
 import type { CursorsStore } from "./store/cursors.ts";
 import type { WriteReceipt, WriteReceiptsStore } from "./store/write_receipts.ts";
 import { AUDIT_WRITE_ON_READ, type AccessLogRow, type AuditStore } from "./store/audit.ts";
@@ -53,6 +54,7 @@ export type { User, IdpSignIn, Session, PrincipalRow, Team, TeamPolicy, TeamRole
 export type { Alias, AliasTarget, AliasesStore, AliasScopeRow } from "./store/aliases.ts";
 export type { MessageRow, MessageFiles, ServicePost, RetractResult, MessagesStore } from "./store/messages.ts";
 export type { AttachmentsStore } from "./store/attachments.ts";
+export type { ClaimsStore } from "./store/claims.ts";
 // The cursors, write receipts, audit and Slack groups' in store/cursors.ts, write_receipts.ts, audit.ts and slack.ts (#807 P3 C67a).
 export type { CursorStream, CursorsStore } from "./store/cursors.ts";
 export type { WriteReceipt, WriteReceiptKey, WriteReceiptsStore } from "./store/write_receipts.ts";
@@ -297,43 +299,8 @@ export interface Repo {
   };
   // Uploads and the blob catalog (store/attachments.ts).
   attachments: AttachmentsStore;
-  // Claims' reads and writes (#807 P3 B2, B5b3), on the caller's handle. The sweep and the claim tools are the
-  // server's (src/server/claims.ts); every rule they apply is core's.
-  claims: {
-    // Live claims, by key; with prefix, only keys that start with it.
-    list(r: Read, prefix?: string): Promise<Claim[]>;
-    // The earliest expiry of a claim with a board (the expiry timer's next fire), or null.
-    nextExpiry(r: Read): Promise<number | null>;
-    // The key's row, live or lapsed (core claimRow); the caller judges whether it's live.
-    get(r: Read, key: string): Promise<ClaimRow | undefined>;
-    // Take or renew (core takeClaim): overwrites only a lapsed row or `t.as`'s own (D3); null when another's live
-    // claim was there, which the caller answers as held.
-    take(tx: Tx, t: TakeRow): Promise<Claim | null>;
-    // Ends `holder`'s live claim on `key` (core releaseClaim): the deleted row, or null when a racing write ended it.
-    release(tx: Tx, key: string, holder: string, now: number): Promise<ClaimRow | null>;
-    // The key's latest two events, newest first (core recentClaimEvents), for releasedByRule.
-    recentEvents(r: Read, key: string): Promise<ClaimEventRow[]>;
-    // The claim's watchers, by handle (core claimWatchers): an [update]'s cc.
-    watchers(r: Read, key: string): Promise<string[]>;
-    // The key's live claim, for a watch (core liveClaim). Postgres reads it FOR SHARE (W1), so a release racing the
-    // watch waits for it rather than leaving an orphan watch; hence a Tx.
-    liveForWatch(tx: Tx, key: string, now: number): Promise<Claim | undefined>;
-    // Watch a claim, idempotently (core addClaimWatch); stop watching it (core removeClaimWatch).
-    addWatch(tx: Tx, key: string, handle: string): Promise<void>;
-    unwatch(tx: Tx, key: string, handle: string): Promise<void>;
-    // Deletes the claims lapsed at `now` and returns them in lapse order, by key within a tie (core expireClaims). It
-    // logs nothing: the sweep logs each row's expire event before that row's requeue, in core's order.
-    expire(tx: Tx, now: number): Promise<ClaimRow[]>;
-    // Appends a claim event (core logEvent).
-    logEvent(tx: Tx, event: ClaimEvent, handle: string, c: Partial<Claim> & { key: string }, at: number, heldBy?: string): Promise<void>;
-    // The watchers of a claim that ended, by handle, their watches deleted (core takeClaimWatchers).
-    takeWatchers(tx: Tx, key: string): Promise<string[]>;
-    // The user the system's announcement for `c` is written as (core holderUser).
-    holderUser(r: Read, c: ClaimRow): Promise<string | undefined>;
-    // A queue-board reply's ack (#807 P3 B5b2): releases `key` when one of `addresses` holds it, lapsed or not, with
-    // its watches and an "ack" or "ack (late)" release event (core ackQueueClaim); whether it did.
-    ackQueue(tx: Tx, addresses: string[], key: string, now: number): Promise<boolean>;
-  };
+  // Claims, their watches and events (store/claims.ts).
+  claims: ClaimsStore;
   // Board reads and the delivery acknowledgement (#807 P3 B5a1), on the caller's handle. Visibility is the caller's
   // (BoardAccess, src/server/access.ts): nothing here filters by it. Board writes stay with callBoardTool (B5b).
   boards: {

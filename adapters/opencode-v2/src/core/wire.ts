@@ -36,7 +36,9 @@ export function capServerText(error: unknown): void {
 export class LeaseUnavailable extends SubscriberError {
   constructor(code: "not_found" | "unbound" = "not_found") { super(code); }
 }
-const domainCodes = new Set(["identity_unknown", "alias_held", "not_found", "unbound", "refused", "internal_error", "bad_request", "unauthenticated", "forbidden", "rate_limited", "receipt_capacity"]);
+// The server's refusal codes hosted-core keeps; any other code reads invalid_response. session_register's own
+// refusals are here so a degraded root's diagnostic names the real one (#1349).
+const domainCodes = new Set(["identity_unknown", "alias_held", "not_found", "unbound", "refused", "internal_error", "bad_request", "unauthenticated", "forbidden", "rate_limited", "receipt_capacity", "child_bound", "child_registered_elsewhere", "has_children", "root_is_child", "invalid_registration"]);
 export function subscriberError(value: unknown, leaseOperation: boolean): SubscriberError {
   const code = (value as { code?: unknown } | undefined)?.code;
   const domain = typeof code === "string" && domainCodes.has(code) ? code : "invalid_response";

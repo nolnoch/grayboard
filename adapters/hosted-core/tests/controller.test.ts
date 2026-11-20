@@ -774,8 +774,7 @@ async function joinedFailure(r: ReturnType<typeof runtime>, c: Controller, error
   return Promise.allSettled([fetching, calling]);
 }
 const deterministic: [string, () => unknown][] = [
-  // The server's session_register refusals reach hosted-core as the wire makes them: codes outside its domain set
-  // read invalid_response.
+  // The server's session_register refusals, as the wire makes them: each keeps its own code (#1349).
   ...["child_bound", "child_registered_elsewhere", "has_children", "root_is_child", "invalid_registration"].map(code => [code, () => subscriberError({ code }, false)] as [string, () => unknown]),
   ["forbidden", () => subscriberError({ code: "forbidden" }, false)],
   ["AccessExpired", () => new AccessExpired("pi", "run /grayboard login", "login_required")],

@@ -36,6 +36,8 @@ import { authCacheContract } from "./store/auth_cache.contract.ts";
 import { sqliteAuthCacheBackend } from "./store/auth_cache.contract.sqlite.ts";
 import { attachmentsContract } from "./store/attachments.contract.ts";
 import { sqliteAttachmentsBackend } from "./store/attachments.contract.sqlite.ts";
+import { claimsContract } from "./store/claims.contract.ts";
+import { sqliteClaimsBackend } from "./store/claims.contract.sqlite.ts";
 
 const person = (email: string, name: string) => ({ scope_kind: "person" as const, scope_ref: email, name });
 
@@ -252,6 +254,7 @@ describe("slack contract (SQLite)", () => slackContract(sqliteSlackBackend));
 describe("hosted contract (SQLite)", () => hostedContract(sqliteHostedBackend));
 describe("auth cache contract (SQLite)", () => authCacheContract(sqliteAuthCacheBackend));
 describe("attachments contract (SQLite)", () => attachmentsContract(sqliteAttachmentsBackend));
+describe("claims contract (SQLite)", () => claimsContract(sqliteClaimsBackend));
 
 // Sign-in fixtures for the rows below (security audit F-13, #928 D4).
 const G = GOOGLE_ISSUER, OKTA = "https://example.okta.com";
