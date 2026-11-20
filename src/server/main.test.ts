@@ -7,6 +7,7 @@ import { tmpdir } from "node:os";
 const main = new URL("./main.ts", import.meta.url).pathname;
 const app = new URL("./app.ts", import.meta.url).pathname;
 const config = new URL("./config.ts", import.meta.url).pathname;
+const openRepo = new URL("./open_repo.ts", import.meta.url).pathname;
 async function shutdownCase(signal: "SIGINT" | "SIGTERM", failure?: "reject" | "throw") {
   const dir = mkdtempSync(join(tmpdir(), "gb-server-shutdown-"));
   const preload = join(dir, "preload.ts");
@@ -14,7 +15,8 @@ async function shutdownCase(signal: "SIGINT" | "SIGTERM", failure?: "reject" | "
 import { mock } from "bun:test";
 const keepAlive = setInterval(() => {}, 1000);
 mock.module(${JSON.stringify(config)}, () => ({ loadConfig: () => ({ store: { kind: "sqlite" as const, path: ":memory:" } }), describeStore: () => "sqlite :memory:" }));
-mock.module(${JSON.stringify(app)}, () => ({ openRepo: async () => ({}), startServer: () => ({
+mock.module(${JSON.stringify(openRepo)}, () => ({ openRepo: async () => ({}) }));
+mock.module(${JSON.stringify(app)}, () => ({ startServer: () => ({
   server: { port: 0 },
   stop: ${failure === "throw" ? "" : "async"} () => {
     console.log("stop started");
