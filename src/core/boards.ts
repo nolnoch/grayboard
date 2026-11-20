@@ -1230,7 +1230,7 @@ export type PostBranch = "queue" | "announcement" | "thread" | "broadcast";
 
 /**
  * A queue-kind board delivers each top-level post to exactly ONE subscriber: the claim IS the delivery. A system post
- * (a claim's [claim], [release] or [expired]) is a notice, not work (#1185), and an archived queue board takes no new
+ * (a claim's [claim], [update], [release] or [expired]) is a notice, not work (#1185), and an archived queue board takes no new
  * work (#635): either is a broadcast, never a delivery. Replies follow thread semantics.
  */
 export function postBranch(b: Board, parentId: number | null, announcement: boolean, system: boolean): PostBranch {
