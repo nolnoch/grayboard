@@ -36686,6 +36686,15 @@ function causeOf(error, type) {
       return e;
   return;
 }
+function transient(error) {
+  if (unreachable(error) || causeOf(error, RefreshInProgress))
+    return true;
+  for (let e = error, depth = 0;e && depth < 8; e = e.cause, depth++) {
+    if (e.name === "TimeoutError" || e instanceof SubscriberError && e.code === "unbound")
+      return true;
+  }
+  return false;
+}
 function fingerprint(e) {
   const c = e.configuration;
   return createHash6("sha256").update(JSON.stringify([e.version, e.sessionID, c.type, c.url, c.issuer, c.clientID, c.scope, c.configHash, e.held ?? []])).digest("hex");
@@ -36841,7 +36850,7 @@ class Controller {
       }, (error) => ({ error }));
       if (!error)
         break;
-      if (joined && unmoved()) {
+      if (joined && transient(error.error) && unmoved()) {
         joined = false;
         done = shared();
         continue;
