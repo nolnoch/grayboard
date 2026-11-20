@@ -87,8 +87,10 @@ export function makePgOAuth({ hosted }: { hosted: PgHostedEnds }): OAuthStore {
     const [row] = await sql`SELECT data FROM ${sql(table)} WHERE hash = ${h} AND expires_at > ${now}`;
     return row ? row.data as T : undefined;
   };
-  const grant = async (sql: PgSql, id: string): Promise<OAuthGrant | undefined> => {
-    const [row] = await sql`SELECT data, revoked_at FROM oauth_grants WHERE id = ${id}`;
+  const grant = async (sql: PgSql, id: string, lock = false): Promise<OAuthGrant | undefined> => {
+    const [row] = lock
+      ? await sql`SELECT data, revoked_at FROM oauth_grants WHERE id = ${id} FOR NO KEY UPDATE`
+      : await sql`SELECT data, revoked_at FROM oauth_grants WHERE id = ${id}`;
     return row ? grantOf(row) : undefined;
   };
   // Mints nothing for the user: a rotation's pair goes under an existing grant, which a disable's revoke sees.
@@ -293,7 +295,11 @@ export function makePgOAuth({ hosted }: { hosted: PgHostedEnds }): OAuthStore {
       const sql = pgOf(tx);
       const t = await token(sql, input.refreshHash);
       if (!t || t.kind !== "refresh") return missing;
-      const g = await grant(sql, t.grant_id);
+      // Locked FOR NO KEY UPDATE (#1066): a grant revoke's UPDATE waits for this rotation to commit, and a rotation behind
+      // a revoke reads the revoked row once it commits, so a rotation never answers ok under a grant revoked before it.
+      // Not FOR SHARE: a replay revokes the grant under this lock, and two replays each holding SHARE would deadlock on
+      // the upgrade. Rotations of one grant run one at a time.
+      const g = await grant(sql, t.grant_id, true);
       if (!g || !rotationBinding(g, input)) return invalid;
       if (!await live(sql, g, now)) return invalid;
       // A recognized ancestor revokes even after its sliding expiry; tombstones outlive it.

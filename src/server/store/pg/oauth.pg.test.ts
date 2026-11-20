@@ -8,7 +8,8 @@ import { expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { describePg } from "../../../../tests/support/pg.ts";
 import { hostedRecorder, type HostedRecorder } from "../../../../tests/support/pg_hosted.ts";
-import { blockedOrSettled, gate, pgPair, race, settle, type PgPair, type Settled } from "../../../../tests/support/pg_race.ts";
+import { BLOCK_WAIT_MS, blockedOrSettled, gate, pgPair, race, settle, type PgPair, type Settled } from "../../../../tests/support/pg_race.ts";
+import { until } from "../../../../tests/support/until.ts";
 import { OAUTH_SCOPES } from "../../oauth-config.ts";
 import { BROWSER_SESSIONS, REQUESTS_PER_BROWSER, REQUESTS_TOTAL } from "../../oauth-rules.ts";
 import { OAUTH_TTL, type OAuthAuthorization, type OAuthCode, type OAuthRequest, type OAuthStore, type OAuthTokenPair, type ServiceTokenLimits } from "../../oauth-types.ts";
@@ -16,7 +17,7 @@ import type { Tx } from "../tx_base.ts";
 import type { PgHostedEnds } from "./hosted_port.ts";
 import { makePgIdentity, type PgIdentity } from "./identity.ts";
 import { makePgOAuth } from "./oauth.ts";
-import { pgOf } from "./tx.ts";
+import { makePgTransactions, pgOf } from "./tx.ts";
 
 const start = 1_800_000_000_000;
 const sha = (s: string) => createHash("sha256").update(s).digest("hex");
@@ -137,6 +138,55 @@ describePg("OAuth races (Postgres)", () => {
     expect(await p.o.isGrantActive(p.a.read, red.grantId, start + 1)).toBe(false);
     expect(await count(p, "oauth_tokens", p.db.sql`hash IN (${sha("access-two")}, ${sha("refresh-two")})`)).toBe(0);
     expect(r.waited).toBe(true);
+  });
+
+  // Mutation: rotateRefresh reading its grant without FOR SHARE: B's read doesn't wait on A's uncommitted revoke, sees
+  // the grant live, spends the token (the revoke leaves it unrevoked) and answers ok with a pair that never authorizes.
+  test("T-C4-3b a rotation behind an in-flight grant revoke waits for it, then refuses and mints no pair (#1066)", async () => {
+    await using p = await pair();
+    const w = await world(p);
+    await w.until("code");
+    const red = w.redemption();
+    expect((await p.a.write(tx => p.o.redeemCode(tx, red, start))).status).toBe("ok");
+    const r = await race(p,
+      tx => p.o.revokeToken(tx, red.tokens.refreshHash, grantAuth.clientId, start + 1),
+      tx => p.o.rotateRefresh(tx, { ...grantAuth, refreshHash: red.tokens.refreshHash, tokens: pairOf("next", grantAuth, start + 1) }, start + 1));
+    expect(r.a.ok).toBe(true);
+    expect(st(r.b)).toBe("invalid");
+    expect(await count(p, "oauth_tokens", p.db.sql`hash IN (${sha("access-next")}, ${sha("refresh-next")})`)).toBe(0);
+    expect(await p.o.isGrantActive(p.a.read, red.grantId, start + 1)).toBe(false);
+    expect(r.waited).toBe(true);
+  });
+
+  // Three rotations of one token: A wins and holds its transaction open; two more on store B queue behind it. Mutation:
+  // the grant read FOR SHARE: both losers hold SHARE on the grant while they wait on A's token row, then both replay
+  // and revoke the grant, and the two lock upgrades deadlock (40P01). Locked FOR NO KEY UPDATE they queue on the grant
+  // instead: the first replays and revokes, the second reads the revoked grant.
+  test("T-C4-3c two rotations queued behind a winning one replay one at a time: no deadlock, the grant ends revoked (#1066)", async () => {
+    await using p = await pair();
+    const w = await world(p);
+    await w.until("code");
+    const red = w.redemption();
+    expect((await p.a.write(tx => p.o.redeemCode(tx, red, start))).status).toBe("ok");
+    const rotate = (tag: string) => (tx: Tx) => p.o.rotateRefresh(tx, { ...grantAuth, refreshHash: red.tokens.refreshHash, tokens: pairOf(tag, grantAuth, start + 1) }, start + 1);
+    const c = makePgTransactions(p.db.url, { max: 2, applicationName: "gb-test-c" });
+    p.onDispose(() => c.close());
+    const held = gate(), release = gate();
+    const a = settle(p.a.write(async tx => { const v = await rotate("one")(tx); held.open(); await release.wait; return v; }));
+    let losers: Settled<unknown>[];
+    try {
+      await Promise.race([held.wait, a]);
+      // A third store: one store's writes run one at a time (D4), so the two losers need two.
+      const pending = [settle(p.b.write(rotate("two"))), settle(c.write(rotate("three")))];
+      await until(async () => Number((await p.db.sql`SELECT count(*) AS n FROM pg_stat_activity
+        WHERE datname = ${p.db.name} AND application_name IN ('gb-test-b', 'gb-test-c') AND wait_event_type = 'Lock'`)[0].n) === 2,
+        BLOCK_WAIT_MS, "both queued rotations blocked on a lock behind A");
+      release.open();
+      losers = await Promise.all(pending);
+    } finally { release.open(); }
+    expect(st(await a)).toBe("ok");
+    expect(losers.map(st).sort()).toEqual(["invalid", "replay"]);
+    expect(await p.o.isGrantActive(p.a.read, red.grantId, start + 1)).toBe(false);
   });
 
   test("T-C4-4 a code deleted under its redeemer: the redeemer answers not_found and mints nothing", async () => {
