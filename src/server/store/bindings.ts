@@ -1,6 +1,7 @@
 // The bindings store's group interface (#807 P3 C10a-a, docs/future/postgres-server.md D2): holds (alias_holds), the
 // sessions' ids rows, binding events and presence, which Repo (db.ts) composes and the Postgres store (pg/, C10a-b)
-// implements. Type-only imports, so a module under pg/ may import it (pg/isolation.test.ts); db.ts re-exports every name.
+// implements. Type-only imports, so a module under pg/ may import it (pg/isolation.test.ts); db.ts re-exports
+// AliasMetaDiff and BindingsStore.
 // The SQLite store delegates to core (core/bindings.ts, core/boards.ts); bindings.contract.ts pins each method's serial
 // answer on both stores.
 import type { AliasUse, BindingEvent, IdRow } from "../../core/bindings.ts";
@@ -43,7 +44,9 @@ export interface BindingsStore {
   // Holds address for id (D3): null, writing nothing, when another session holds it or another principal's
   // session acts as it (userOf with exceptPrincipal = principal). A same-ID re-take moves its bound_at. bound_at
   // stays after the ID's other holds, so two takes in one millisecond keep their order (HOLD_ORDER). The check and
-  // the upsert are one method, so a store whose transactions interleave locks the alias row first (C10a-b).
+  // the upsert are one method, so a store whose transactions interleave locks the alias row first (C10a-b). A re-take
+  // at or before its own bound_at stamps now (only the ID's other holds bound it), even moving the stamp back. A take
+  // by an ended ID is not pinned: SQLite writes the hold; Postgres (C10a-b, E4) returns null.
   take(tx: Tx, address: string, id: string, principal: string, now: number): Promise<{ bound_at: number } | null>;
   // Drops id's hold on address; a hold another session took since stays.
   release(tx: Tx, address: string, id: string): Promise<void>;
@@ -57,8 +60,10 @@ export interface BindingsStore {
   touchId(tx: Tx, id: string, now?: number): Promise<void>;
   // A new session's ids row from facts (core registerId: harness, model and effort cleaned, place cleaned; delivery
   // 'none' for a writer or a child, else 'push'; started_at and last_seen stamped now). Rejects with IdCollision,
-  // carrying the existing row's ended_at, when the ID has a row, writing nothing. A pruned keyed ID's tombstone is
-  // consumed and returned (ReusedId), for the caller to audit as id.reused; null otherwise.
+  // carrying the existing row's ended_at, when the ID has a row, writing nothing. An ID's tombstone (only keyed IDs
+  // leave one, at prune) is consumed and returned (ReusedId) whether or not this registration is keyed, for the
+  // caller to audit as id.reused; null otherwise. A child (rootId) of an ended root is not pinned: SQLite registers
+  // it; Postgres (C10a-b, E3) refuses it.
   registerId(tx: Tx, facts: IdFacts): Promise<ReusedId | null>;
   // Sets the named facts (undefined leaves one alone), cleaned; the before and after of both when either changed,
   // null when nothing did (no write) or there's no such ID.

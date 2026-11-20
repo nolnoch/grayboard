@@ -37,7 +37,7 @@ export type BindingsHarness = {
   holdRows(): Promise<{ address: string; id: string; bound_at: number }[]>;
   events(): Promise<{ session_id: string; name: string; event: string; at: number; detail: string | null; count: number | null; last_at: number | null }[]>;
   aliasRow(address: string): Promise<{ last_seen: number | null; queue_off: boolean; task: string | null; owner: string | null; source_board: string | null; spec_hash: string | null; description: string | null } | undefined>;
-  idColumns(id: string): Promise<{ harness: string | null; cwd: string | null; delivery: string; keyed: boolean; local_resume: boolean; root_id: string | null; harness_session: string | null } | undefined>;
+  idColumns(id: string): Promise<{ harness: string | null; cwd: string | null; delivery: string; keyed: boolean; local_resume: boolean; root_id: string | null; harness_session: string | null; started_at: number; last_seen: number } | undefined>;
   tombstones(): Promise<{ id: string; ended_at: number; pruned_at: number }[]>;
   audits(action: string): Promise<unknown[]>;
   close(): void | Promise<void>;
@@ -83,7 +83,11 @@ function reads(it: It): void {
     const [s1, s2, idle, viewer, ended, cw] = ["id:0000000000001", "id:0000000000002", "id:0000000000003", "id:0000000000004", "id:0000000000005", "id:0000000000006"];
     const [fe, be, ops, zz] = [await h.alias(B, "fe"), await h.alias(B, "be"), await h.alias(B, "ops"), await h.alias(B, "zz")];
     const qa = await h.alias(C, "qa");
-    for (const id of [s1, s2, idle, ended]) await register(h, { id, principal: B, launcher: false });
+    const [old, gone] = [await h.alias(B, "old"), await h.alias(B, "gone")];
+    for (const id of [s1, s2, idle]) await register(h, { id, principal: B, launcher: false });
+    // An ended session that held old and wrote as gone before it ended: neither is a use (aliasUses, userOf).
+    await register(h, { id: ended, principal: B, launcher: false, writesAs: gone });
+    await h.hold(old, ended, 5);
     await register(h, { id: viewer, principal: B, launcher: false, viewer: true });
     await register(h, { id: cw, principal: C, launcher: false, writesAs: qa });
     await h.end(ended, 10);
@@ -118,6 +122,8 @@ function reads(it: It): void {
     expect(await b.userOf(r, fe, B)).toBeNull();
     expect(await b.userOf(r, qa)).toBe(cw);
     expect(await b.userOf(r, qa, B)).toBe(cw);
+    expect(await b.userOf(r, old)).toBeNull();
+    expect(await b.userOf(r, gone)).toBeNull();
     expect(await b.addressSet(r, be, B)).toEqual([be, fe, s1]);
     expect(await b.addressSet(r, s1, B)).toEqual([s1, fe, be]);
     expect(await b.addressSet(r, be, C)).toEqual([be]);
@@ -178,8 +184,12 @@ function takes(it: It): void {
     expect(await take(h, qa, s1, B, 300)).toEqual({ bound_at: 301 });
     // The same ID's re-take restamps its own hold.
     expect(await take(h, be, s1, B, 400)).toEqual({ bound_at: 400 });
+    // A re-take at or before its own bound_at stamps now: only the ID's other holds (qa at 301) bound it, so the
+    // stamp stays at an equal now and moves back to an earlier one.
+    expect(await take(h, be, s1, B, 400)).toEqual({ bound_at: 400 });
+    expect(await take(h, be, s1, B, 350)).toEqual({ bound_at: 350 });
     expect(await h.holdRows()).toEqual([
-      { address: be, id: s1, bound_at: 400 }, { address: dev, id: s2, bound_at: 300 },
+      { address: be, id: s1, bound_at: 350 }, { address: dev, id: s2, bound_at: 300 },
       { address: ops, id: s2, bound_at: 100 }, { address: qa, id: s1, bound_at: 301 },
     ]);
     // A released hold frees the alias for another ID; a release by an ID that doesn't hold it changes nothing.
@@ -219,6 +229,12 @@ function takes(it: It): void {
     await h.end(cA, 3000);
     expect(await h.bindings.userOf(h.read, x)).toBe(cZ);
     expect(await h.bindings.userOf(h.read, `${B}/none`)).toBeNull();
+    // A session with no principal counts as another principal's for every exceptPrincipal.
+    const [y, nW] = [await h.alias(B, "y"), "id:000000000000N"];
+    await register(h, { id: nW, principal: null, launcher: false, writesAs: y });
+    expect(await h.bindings.userOf(h.read, y, B)).toBe(nW);
+    expect(await h.bindings.userOf(h.read, y, C)).toBe(nW);
+    expect(await h.bindings.userOf(h.read, y)).toBe(nW);
   });
 }
 
@@ -232,7 +248,10 @@ function registers(it: It): void {
     })).toBeNull();
     expect(await h.bindings.idRow(h.read, s1)).toEqual({ principal: B, ended_at: null, place: "host /repo", writes_as: null, viewer: false });
     expect(await h.bindings.idFacts(h.read, [s1])).toEqual(new Map([[s1, { principal: B, harness: "claude code", model: "m", effort: "high", launcher: 1 }]]));
-    expect(await h.idColumns(s1)).toEqual({ harness: "claude code", cwd: "/w", delivery: "push", keyed: true, local_resume: true, root_id: null, harness_session: "hs-1" });
+    // started_at and last_seen are one stamp (the store's clock, so only their equality is pinned).
+    const cols = (await h.idColumns(s1))!;
+    expect(cols.started_at).toBeGreaterThan(0);
+    expect(cols).toEqual({ harness: "claude code", cwd: "/w", delivery: "push", keyed: true, local_resume: true, root_id: null, harness_session: "hs-1", started_at: cols.started_at, last_seen: cols.started_at });
     // A tools-only writer and a child receive nothing; a viewer is never unended.
     await register(h, { id: w, principal: B, launcher: false, writesAs: fe });
     await register(h, { id: child, principal: B, launcher: false, rootId: s1 });
@@ -270,16 +289,21 @@ function registers(it: It): void {
     expect(await h.bindings.idRow(h.read, "id:0000000000009")).toBeUndefined();
   });
 
-  it("registerId of a pruned keyed ID consumes its tombstone and returns it (ReusedId)", async h => {
-    const [k, other] = ["id:000000000000K", "id:000000000000L"];
+  it("registerId of a pruned ID consumes its tombstone and returns it (ReusedId), keyed or not", async h => {
+    const [k, nk, other] = ["id:000000000000K", "id:000000000000J", "id:000000000000L"];
     await h.tombstone(k, 5, 6);
+    await h.tombstone(nk, 3, 4);
     await h.tombstone(other, 7, 8);
     expect(await register(h, { id: k, principal: B, launcher: false, keyed: true })).toEqual({ ended_at: 5, pruned_at: 6 });
-    expect(await h.tombstones()).toEqual([{ id: other, ended_at: 7, pruned_at: 8 }]);
+    expect(await h.tombstones()).toEqual([{ id: nk, ended_at: 3, pruned_at: 4 }, { id: other, ended_at: 7, pruned_at: 8 }]);
     expect(await h.bindings.idRow(h.read, k)).toMatchObject({ principal: B, ended_at: null });
-    // A register that collides leaves another ID's tombstone alone.
-    expect(await caught(() => register(h, { id: k, principal: B, launcher: false }))).toBeInstanceOf(IdCollision);
+    // Only keyed IDs leave a tombstone, but a registration consumes one whether or not it is keyed.
+    expect(await register(h, { id: nk, principal: B, launcher: false })).toEqual({ ended_at: 3, pruned_at: 4 });
     expect(await h.tombstones()).toEqual([{ id: other, ended_at: 7, pruned_at: 8 }]);
+    // A register that collides writes nothing: a tombstone under its own ID stays.
+    await h.tombstone(k, 9, 10);
+    expect(await caught(() => register(h, { id: k, principal: B, launcher: false }))).toBeInstanceOf(IdCollision);
+    expect(await h.tombstones()).toEqual([{ id: k, ended_at: 9, pruned_at: 10 }, { id: other, ended_at: 7, pruned_at: 8 }]);
   });
 }
 
@@ -322,9 +346,12 @@ function labels(it: It): void {
 
 function writes(it: It): void {
   it("log writes a binding event, and a repeated refusal within the window is one row with a count", async h => {
-    const s1 = "id:0000000000001", fe = `${B}/fe`;
+    const s1 = "id:0000000000001", s2 = "id:0000000000002", fe = `${B}/fe`, be = `${B}/be`;
     const log = (event: "bound" | "refused" | "released", detail: string | null, at: number) => h.write(tx => h.bindings.log(tx, s1, fe, event, detail, at));
     await log("refused", "held", 1000);
+    // The same refusal by another session for the name, or by the session for another name, is its own row.
+    await h.write(tx => h.bindings.log(tx, s2, fe, "refused", "held", 1001));
+    await h.write(tx => h.bindings.log(tx, s1, be, "refused", "held", 1002));
     await log("refused", "held", 1000 + REFUSED_COALESCE_MS);
     // The window runs from the row's last stamp.
     await log("refused", "held", 1000 + 2 * REFUSED_COALESCE_MS);
@@ -334,6 +361,8 @@ function writes(it: It): void {
     await log("refused", "other", 9_000_001);
     expect(await h.events()).toEqual([
       { session_id: s1, name: fe, event: "refused", at: 1000, detail: "held", count: 3, last_at: 1000 + 2 * REFUSED_COALESCE_MS },
+      { session_id: s2, name: fe, event: "refused", at: 1001, detail: "held", count: null, last_at: null },
+      { session_id: s1, name: be, event: "refused", at: 1002, detail: "held", count: null, last_at: null },
       { session_id: s1, name: fe, event: "refused", at: 1000 + 2 * REFUSED_COALESCE_MS, detail: "other", count: null, last_at: null },
       { session_id: s1, name: fe, event: "refused", at: 1000 + 3 * REFUSED_COALESCE_MS + 1, detail: "other", count: null, last_at: null },
       { session_id: s1, name: fe, event: "bound", at: 9_000_000, detail: null, count: null, last_at: null },
@@ -341,7 +370,7 @@ function writes(it: It): void {
     ]);
     const kept = await h.write(async tx => tx);
     expect(await failure(() => h.bindings.log(kept, s1, fe, "bound", null, 1))).toContain(SETTLED);
-    expect(await h.events()).toHaveLength(5);
+    expect(await h.events()).toHaveLength(7);
   });
 
   it("presence, facts, place, status and queue participation write on the body's Tx", async h => {
