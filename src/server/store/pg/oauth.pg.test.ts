@@ -139,6 +139,24 @@ describePg("OAuth races (Postgres)", () => {
     expect(r.waited).toBe(true);
   });
 
+  // Mutation: rotateRefresh reading its grant without FOR SHARE: B's read doesn't wait on A's uncommitted revoke, sees
+  // the grant live, spends the token (the revoke leaves it unrevoked) and answers ok with a pair that never authorizes.
+  test("T-C4-3b a rotation behind an in-flight grant revoke waits for it, then refuses and mints no pair (#1066)", async () => {
+    await using p = await pair();
+    const w = await world(p);
+    await w.until("code");
+    const red = w.redemption();
+    expect((await p.a.write(tx => p.o.redeemCode(tx, red, start))).status).toBe("ok");
+    const r = await race(p,
+      tx => p.o.revokeToken(tx, red.tokens.refreshHash, grantAuth.clientId, start + 1),
+      tx => p.o.rotateRefresh(tx, { ...grantAuth, refreshHash: red.tokens.refreshHash, tokens: pairOf("next", grantAuth, start + 1) }, start + 1));
+    expect(r.a.ok).toBe(true);
+    expect(st(r.b)).toBe("invalid");
+    expect(await count(p, "oauth_tokens", p.db.sql`hash IN (${sha("access-next")}, ${sha("refresh-next")})`)).toBe(0);
+    expect(await p.o.isGrantActive(p.a.read, red.grantId, start + 1)).toBe(false);
+    expect(r.waited).toBe(true);
+  });
+
   test("T-C4-4 a code deleted under its redeemer: the redeemer answers not_found and mints nothing", async () => {
     await using p = await pair();
     const w = await world(p);
