@@ -1003,6 +1003,23 @@ test("pending holds the reader gate while rebind waits; stale receipt cannot mov
   await expect(delivery.release(principal, context("root"), lease.capability)).rejects.toHaveProperty("code", "not_found");
 });
 
+// #1473: a lease that pulled an item before its root unbound the item's name can neither pull again nor receipt it, so
+// a stale lease never credits or repushes a name it lost; the item stays undelivered for whoever holds the name next.
+test("after an unbind, the old lease's pull and its receipt of the pulled item are both refused; the cursor stays (#1473)", async () => {
+  await hosted.bind(principal, context("root"), { name: "fe", create: true });
+  await hosted.bind(principal, context("root"), { name: "be", create: true });
+  const lease = await delivery.open(principal, context("root"));
+  const sender = new AppSession(application, database.repo, principal.authed, "sender", { push: false });
+  await sender.connect();
+  await sender.send("you@example.com/fe", "to fe");
+  const issued = await delivery.pending(principal, context("root"), lease.capability);
+  expect(issued).toHaveLength(1);
+  await hosted.unbind(principal, context("root"), { name: "fe" });
+  await expect(delivery.pending(principal, context("root"), lease.capability)).rejects.toHaveProperty("code", "not_found");
+  await expect(delivery.receipt(principal, context("root"), lease.capability, issued.map(item => item.id))).rejects.toHaveProperty("code", "not_found");
+  expect(await database.repo.cursors.directFor(database.repo.read, "you@example.com/fe")).toBe(0);
+});
+
 test("tool reader gate excludes rebind and revoke during its pause prevents the write", async () => {
   await hosted.bind(principal, context("root"), { name: "fe", create: true });
   let wrote = false;
