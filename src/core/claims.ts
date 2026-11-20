@@ -1,7 +1,7 @@
 import type { Database } from "bun:sqlite";
 
 import { REDELIVERED_NOTE, canSeeBoard, getBoard, isHuman, normalizeBoard, post, redeliverQueuePost, seenHandles, systemBody, userViewer, type BoardPredicate, type PostOpts, type PostResult, type Viewer } from "./boards.ts";
-import { addressParts } from "./addresses.ts";
+import { holderUserRule } from "./claim_holder.ts";
 import { idRow } from "./bindings.ts";
 import { CoreError } from "./errors.ts";
 import { immediateTx, type WriteTx } from "./write_tx.ts";
@@ -21,17 +21,8 @@ const CLAIM_COLS = "key, holder, note, board, acquired_at, expires_at";
 // on a claim taken before the column.
 export type ClaimRow = Claim & { holder_user: string | null };
 
-// The user an announcement the system writes for a claim (its expiry, a session end's release) is recorded
-// as written by (#855): the claimant's, or for a claim from before holder_user (or a queue delivery to an alias
-// no session held then) an ID holder's principal, else the user of the session holding the alias now, else a
-// person alias's person. A team alias nobody holds names no user. The rule is pure; both modes read its facts.
-export function holderUserRule(c: ClaimRow, idPrincipal: string | null | undefined, heldPrincipal: string | null | undefined): string | undefined {
-  if (c.holder_user) return c.holder_user;
-  if (idPrincipal) return idPrincipal;
-  if (heldPrincipal) return heldPrincipal;
-  const p = addressParts(c.holder);
-  return p?.kind === "alias" && p.scopeKind === "person" ? p.scope : undefined;
-}
+// holderUserRule lives in claim_holder.ts, which reaches no SQLite module, so the Postgres store runs the same rule.
+export { holderUserRule };
 
 /** holderUserRule's facts: the principal of the ID `holder` names, and of the session holding `holder` as an alias. */
 export function holderPrincipals(db: Database, holder: string): { idPrincipal: string | null; heldPrincipal: string | null } {
