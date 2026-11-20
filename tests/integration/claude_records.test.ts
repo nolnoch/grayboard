@@ -154,11 +154,12 @@ test("settings without the hooks run every call as the root, audited once and sa
 // CLAUDECODE on to its grayboard. That grayboard isn't Claude Code's: it
 // neither warns that hooks are missing nor reads hook records, even one
 // written under its harness's pid. Under the claude stand-in, both hold. A
-// call carrying Claude's tool_use_id (omp sends none; Claude Code under an
-// unrecognized launcher does) is the root's, audited as such.
-for (const harness of ["omp", "claude"]) test(`under ${harness} with CLAUDECODE=1, Claude hook records and the attribution-off note ${harness === "claude" ? "apply" : "don't apply"}`, async () => {
+// call carrying Claude's tool_use_id (omp sends none; Claude Code starting
+// grayboard through an unrecognized launcher does) is the root's, audited as such.
+for (const harness of ["omp", "claude"]) test(`under ${harness} with CLAUDECODE=1, Claude hook records and the hooks-missing note ${harness === "claude" ? "apply" : "don't apply"}`, async () => {
   const claude = harness === "claude";
   const off = await claudeBus(false, undefined, harness);
+  if (!claude) expect((await off.s.call("whoami")).note).toBeUndefined();
   expect((await dm(off, "no-hooks", toolUse())).isError).toBeFalsy();
   expect(off.s.c.getInstructions()!.includes("subagent attribution is off")).toBe(claude);
   expect((await off.s.call("whoami")).note).toContain(claude ? "hooks aren't in Claude Code's user settings" : "can't find Claude Code");
@@ -176,11 +177,11 @@ for (const harness of ["omp", "claude"]) test(`under ${harness} with CLAUDECODE=
   expect(audits(on, "claude.agent_record_missing").length).toBe(claude ? 1 : 0);
 });
 
-// #1412: Claude Code under a launcher claudeAmong doesn't know (`node
+// #1412: Claude Code starting grayboard through a launcher claudeAmong doesn't know (`node
 // wrapper.js`) can't be found among this process's parents, so no hook record
 // can be read. Its subagents' calls act as the root: not refused, but audited
 // once and said in whoami once a call shows Claude's tool_use_id.
-test("Claude Code under an unrecognized launcher runs subagents' calls as the root, audited once and said in whoami", async () => {
+test("Claude Code starting grayboard through an unrecognized launcher runs subagents' calls as the root, audited once and said in whoami", async () => {
   const b = await claudeBus(true, undefined, "node");
   expect((await b.s.call("whoami")).note).toBeUndefined();
   for (const body of ["wrapped-1", "wrapped-2"]) expect((await dm(b, body, toolUse())).isError).toBeFalsy();

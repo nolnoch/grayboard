@@ -298,13 +298,13 @@ const CLAUDE_HARNESS = UNDER_CLAUDE && recordHookInstalled()
 const CLAUDE_CURRENT = CLAUDE_HARNESS !== null && ORDINARY && ADAPTER_OWNER === undefined && process.env.BUS_HARNESS_SESSION === undefined;
 const ATTRIBUTION_OFF = UNDER_CLAUDE && CLAUDE_HARNESS === null;
 const ATTRIBUTION_OFF_NOTE = "Claude Code subagent attribution is off: grayboard's hooks aren't in Claude Code's user settings, so subagents' calls act as this session. Run `grayboard update` (or `grayboard setup`) and restart Claude Code.";
-// Claude Code under a launcher claudeIsHarness doesn't know (`node
-// wrapper.js`, `bun run`): its harness pid can't be found, so no hook record
+// Claude Code starting grayboard through a launcher claudeIsHarness doesn't
+// know (`node wrapper.js`, `bun run`): its harness pid can't be found, so no hook record
 // can be read. A call carrying Claude's tool_use_id then acts as the root,
 // audited once and said in whoami from then on (#1412). Not in the
 // instructions: at start, a harness Claude launched (omp) looks the same.
 const CLAUDE_UNRECOGNIZED = process.env.CLAUDECODE === "1" && !UNDER_CLAUDE;
-const CLAUDE_UNRECOGNIZED_NOTE = "Claude Code subagent attribution is off: grayboard can't find Claude Code among this session's parent processes (an unrecognized launcher runs it), so subagents' calls act as this session.";
+const CLAUDE_UNRECOGNIZED_NOTE = "Claude Code subagent attribution is off: grayboard can't find Claude Code among this session's parent processes (an unrecognized launcher sits between them), so subagents' calls act as this session. Start `grayboard mcp` from Claude Code directly or through a launcher grayboard recognizes (docs/child-sessions.md §Local runner children).";
 let attributionOffAudited = false;
 if (CLAUDE_CURRENT) {
   const current = readCurrent(sockDir(), CLAUDE_HARNESS.pid, CLAUDE_HARNESS.start);
