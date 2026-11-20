@@ -831,7 +831,11 @@ test("a child shut down while its registration is in flight still ends it, so it
     down = child.ext.shutdown("quit");
   } finally { pause.release(); }
   await down;
-  await call;
+  // The call that waited on the register never goes out (#1160): sent beside the shutdown's end, the server could see
+  // it after the end and start the ID again as an unregistered root (the row this test once found left behind).
+  const result = await call;
+  expect(result.isError).toBe(true);
+  expect(texts(result).join("\n")).toContain("the pi session closed");
   expect(await row("midreg-child")).toBeNull();
 });
 

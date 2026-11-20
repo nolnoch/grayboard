@@ -82,6 +82,9 @@ const SOURCE = "grayboard";
 // the connect timeout (#438-25).
 export const INSTRUCTIONS_WAIT_MS = 2_000;
 export const INSTRUCTIONS_BACKOFF_MS = 30_000;
+// How long a shutdown waits for a non-root session's running calls before its
+// end (#1160): under omp's 2 s cap on shutdown handlers, so the end still goes.
+export const SHUTDOWN_CALLS_WAIT_MS = 1_000;
 const LATE = Symbol("late");
 
 // A tool's arguments and MCP result as both entries' tools take and return
@@ -362,8 +365,15 @@ export function createGrayboard(h: Harness): Grayboard {
       error => { if (registration === pending) registration = undefined; throw error; });
     return registration = pending;
   };
+  // A call that waited on the register goes out only if the session is still
+  // open: once shutdown began, its end (sent when the register settles) and
+  // this call would race, and a call the server saw after the end would start
+  // the ID again as an unregistered root (#1160).
   const childHooks = (fixed: { root: string; via: string[] }, child: string): CallHooks => ({
-    beforeCall: () => enlist(fixed, child),
+    beforeCall: async () => {
+      await enlist(fixed, child);
+      if (closed) throw new Error(`the ${h.name} session closed`);
+    },
     afterCall: async () => {},
   });
   const endFailed = (id: string) => (error: unknown) =>
@@ -465,6 +475,12 @@ export function createGrayboard(h: Harness): Grayboard {
       // An idle end still landing finishes first: omp caps shutdown handlers
       // at 2 s (omp 18.14.0 extensibility/extensions/runner.ts:151-160).
       await releasing;
+      // Calls already sent land before the end, as an idle end's do: one the
+      // server saw after it would start the ID again as a root (#1160). Bounded,
+      // so a stalled call can't hold the end past omp's handler cap.
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const late = new Promise<void>(resolve => { timer = setTimeout(resolve, SHUTDOWN_CALLS_WAIT_MS); });
+      await Promise.race([Promise.allSettled([...inflight]), late]).finally(() => clearTimeout(timer));
       if (id && reason !== "reload") {
         // A register still in flight, or one that failed after the server
         // committed it (a timeout), may have registered this child: it ends
