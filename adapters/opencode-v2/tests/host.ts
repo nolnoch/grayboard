@@ -106,7 +106,8 @@ globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
     console.log("SUBCALL", b.params.name, session);
     if (b.params.name === "delivery_receipt") { receiptAttempts++; if (dropReceipt) throw new Error("Receipt transport deliberately lost before commit"); }
   }
-  methods.push({ method: typeof b?.method === "string" ? b.method : req.method, subscriber: req.headers.get("X-Grayboard-Client") === "subscriber" });
+  const named = b?.params?._meta?.["ai.opencode/sessionID"];
+  methods.push({ method: typeof b?.method === "string" ? b.method : req.method, subscriber: req.headers.get("X-Grayboard-Client") === "subscriber", session: typeof named === "string" ? named : null });
   const read: SeenRead | undefined = b?.method === "resources/read" ? { uri: String(b.params?.uri), lease: req.headers.get("X-Grayboard-Lease") } : undefined;
   if (read) reads.push(read);
   const forward = () => fetch0(new Request(`http://127.0.0.1:${realServer?.port ?? app.server.port}` + url.pathname + url.search, req));
