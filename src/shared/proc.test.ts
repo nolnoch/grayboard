@@ -1,7 +1,7 @@
 // Liveness (#182 audit 9): a row is dead only on evidence, the pid gone or a
 // start time that differs; an unknown start time counts as alive.
 import { afterEach, expect, spyOn, test } from "bun:test";
-import { aliveRows, isAlive, isClaudeCode, procStart } from "./proc.ts";
+import { aliveRows, claudeAmong, isAlive, isClaudeCode, procStart, type AncestorFacts } from "./proc.ts";
 import { until } from "../../tests/support/until.ts";
 
 const PATH = process.env.PATH;
@@ -87,4 +87,27 @@ test("isClaudeCode: Claude Code's process titles, binaries and older npm install
   expect(isClaudeCode("bun", "bun", "bun /home/u/claude-tools/run.ts")).toBe(false);
   expect(isClaudeCode("claudette", "claudette", "claudette")).toBe(false);
   expect(isClaudeCode(null, "", "")).toBe(false);
+});
+
+// #1403: the walk up to the harness sees through launchers (not WRAPPERS),
+// which only moves it up to the real harness.
+test("claudeAmong: launchers between Claude Code and grayboard are seen through; one under another harness doesn't make it Claude Code", () => {
+  const p = (argv: string, wrapper = false, comm: string | null = argv.split(" ")[0]!.split("/").pop()!): AncestorFacts => ({ comm, argv: argv.split(" "), wrapper });
+  const claude = p("claude --resume");
+  const omp = p("omp --mode acp");
+  expect(claudeAmong([p("timeout 600 grayboard mcp"), claude])).toBe(true);
+  expect(claudeAmong([p("timeout 600 grayboard mcp"), omp, claude])).toBe(false);
+  for (const launcher of ["nice -n 5", "ionice -c3", "nohup", "stdbuf -oL", "direnv exec .", "mise x --", "mise exec --", "/usr/bin/uv run", "uvx"]) {
+    expect(claudeAmong([p(`${launcher} grayboard mcp`), claude])).toBe(true);
+    expect(claudeAmong([p(`${launcher} grayboard mcp`), omp, claude])).toBe(false);
+  }
+  // A wrapper (wrapperName) and a launcher stack.
+  expect(claudeAmong([p("sh -c x", true), p("uv run grayboard"), claude])).toBe(true);
+  // Not a launcher verb: uv itself, or mise's other subcommands, are the harness.
+  expect(claudeAmong([p("uv tool list"), claude])).toBe(false);
+  expect(claudeAmong([p("mise run task"), claude])).toBe(false);
+  // Nothing past the launchers, or an unreadable harness: unknown.
+  expect(claudeAmong([p("timeout 5 x")])).toBeNull();
+  expect(claudeAmong([{ comm: null, argv: [], wrapper: false }, claude])).toBeNull();
+  expect(claudeAmong([])).toBeNull();
 });

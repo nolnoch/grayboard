@@ -205,24 +205,57 @@ export function harnessAncestor(pid = process.pid): number | null {
 }
 
 /**
- * Whether this process's harness (harnessAncestor) is Claude Code
- * (isClaudeCode). Null when that can't be read (no ancestors readable, as
- * where neither /proc nor ps exists, or every ancestor a wrapper): an unknown,
- * never evidence that it isn't. CLAUDECODE and CLAUDE_CODE_SESSION_ID are
- * inherited by anything Claude Code launches, harnesses included (#1403), so
- * only this tells a child of Claude Code from a grandchild.
+ * Whether this process's harness is Claude Code (claudeAmong over its
+ * ancestors, read lazily, nearest first). Null when that can't be read (no
+ * ancestors readable, as where neither /proc nor ps exists, or every
+ * ancestor a wrapper or launcher): an unknown, never evidence that it isn't.
+ * CLAUDECODE and CLAUDE_CODE_SESSION_ID are inherited by anything Claude Code
+ * launches, harnesses included (#1403), so only this tells a child of Claude
+ * Code from a grandchild.
  */
 export function claudeIsHarness(pid = process.pid): boolean | null {
-  const h = harnessAncestor(pid);
-  if (h === null) return null;
-  const comm = commandName(h);
-  const args = argv(h);
-  if (comm === null && !args.length) return null;
-  // macOS: argv is ps's joined line, so its argv[0] is cut at the first space
-  // (an install under "Application Support" loses it); comm there is the
-  // executable's full path, whose basename (commandName) carries the match.
-  const argv0 = process.platform === "linux" ? (args[0] ?? "") : (args[0]?.split(/\s+/)[0] ?? "");
-  return isClaudeCode(comm, argv0, args.join(" "));
+  return claudeAmong((function* () {
+    for (const p of ancestors(pid)) {
+      // macOS: argv is ps's joined line, split on spaces, so an argv[0]
+      // holding a space (an install under "Application Support") is cut;
+      // comm there is the executable's full path, whose basename
+      // (commandName) still carries the match.
+      const raw = argv(p);
+      const words = process.platform === "linux" ? raw : (raw[0]?.split(/\s+/) ?? []);
+      yield { comm: commandName(p), argv: words, wrapper: wrapperName(p) !== null };
+    }
+  })());
+}
+
+/** One ancestor as claudeAmong reads it: its command name, argv, and whether wrapperName calls it a wrapper. */
+export type AncestorFacts = { comm: string | null; argv: string[]; wrapper: boolean };
+
+// Launchers that run a command in place and say nothing about the harness:
+// claudeAmong sees through them, so Claude Code -> timeout -> grayboard is
+// still Claude Code's child. Not in WRAPPERS, which keyedHarness and omp's
+// detection (#1140) share: there a launcher may be the harness pid to keep.
+// Skipping one only moves the walk up to the real harness, so it can't make
+// omp or pi Claude Code.
+const LAUNCHERS = new Set(["timeout", "nice", "ionice", "nohup", "stdbuf", "uvx"]);
+const LAUNCHER_VERBS: Record<string, Set<string>> = { direnv: new Set(["exec"]), mise: new Set(["x", "exec"]), uv: new Set(["run"]) };
+
+function isLauncher(p: AncestorFacts): boolean {
+  const name = p.argv[0]?.split(/[\\/]/).pop() || p.comm || "";
+  return LAUNCHERS.has(name) || (LAUNCHER_VERBS[name]?.has(p.argv[1] ?? "") ?? false);
+}
+
+/**
+ * Whether the first of `chain` (ancestors, nearest first) that is neither a
+ * wrapper nor a launcher is Claude Code (isClaudeCode); null when none is, or
+ * that one's comm and argv are both unreadable.
+ */
+export function claudeAmong(chain: Iterable<AncestorFacts>): boolean | null {
+  for (const p of chain) {
+    if (p.wrapper || isLauncher(p)) continue;
+    if (p.comm === null && !p.argv.length) return null;
+    return isClaudeCode(p.comm, p.argv[0] ?? "", p.argv.join(" "));
+  }
+  return null;
 }
 
 /**
