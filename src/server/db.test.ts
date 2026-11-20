@@ -1181,6 +1181,10 @@ test("#807 P3 B5b2b: board_post's repo reads and writes run on the handle they'r
     return p.id;
   });
   expect(db.query<{ handle: string }, [number]>("SELECT handle FROM outbox WHERE post_id = ?").all(landed)).toEqual([{ handle: fe }]);
+  // The row's human mark is what the write said (#1355), not whether the author is human now.
+  expect(db.query<{ human: number | null }, [number]>("SELECT human FROM posts WHERE id = ?").get(landed)).toEqual({ human: 0 });
+  const marked = await seed(repo, async tx => (await b.insertPost(tx, { ...np("hall", "mine"), human: true })).id);
+  expect(db.query<{ human: number | null }, [number]>("SELECT human FROM posts WHERE id = ?").get(marked)).toEqual({ human: 1 });
   expect(await b.subscribers(repo.read, "hall")).toEqual([{ handle: be, mode: "push" }, { handle: fe, mode: "push" }]);
 });
 
