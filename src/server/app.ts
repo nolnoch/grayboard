@@ -70,7 +70,26 @@ export function startServer(config: Config, opts: StartOptions = {}) {
     const revoked = await repo.sessions.revokeDev(tx);
     if (revoked > 0) writeAudit(repo, tx, "auth.dev_sessions_revoked", null, null, { count: revoked });
   });
-  const application = createApplication(repo, { humanReach, slackRunning: () => slack?.running ?? false, ...startLimits(config, opts) });
+  // The background passes running when stop() began (a revalidate tick, the retention pass, a claim expiry sweep), by
+  // name: stop() waits for them too, or one resumes from an await onto a closed database (#1489). None starts once
+  // `stopping` is set. Declared before the application, whose startup ends may start background work.
+  const passes = new Map<Promise<void>, string>();
+  let stopping = false;
+  const pass = (what: string, running: Promise<unknown>) => {
+    const settled = running.then(() => {}, () => {});
+    passes.set(settled, what);
+    void settled.then(() => passes.delete(settled));
+  };
+  // The work a commit or a pass starts and nobody awaits (a wake's drains, a board change's fan-out, a blob sweep),
+  // tracked as a pass (#1493). Once stopping it doesn't start: a fan-out then has nobody to reach, and the next start's
+  // sweep finishes a skipped blob sweep. `run` logs its own failure; one that escapes is logged here.
+  const background = (what: string, run: (stopped: () => boolean) => Promise<unknown>) => {
+    if (stopping) return;
+    let running: Promise<unknown>;
+    try { running = run(() => stopping); } catch (e) { running = Promise.reject(e); }
+    pass(what, running.catch(e => console.error(`[grayboard] ${what} failed:`, e)));
+  };
+  const application = createApplication(repo, { humanReach, slackRunning: () => slack?.running ?? false, ...startLimits(config, opts), runBackground: background });
   const { revalidate, disconnectUser, accessChanged, stopExpiry, wake } = application;
 
   const authGate = new AuthGate(repo, {
@@ -117,16 +136,6 @@ export function startServer(config: Config, opts: StartOptions = {}) {
     inFlight.set(response, what);
     void response.then(() => inFlight.delete(response), () => inFlight.delete(response));
     return response;
-  };
-  // The background passes running when stop() began (a revalidate tick, the retention pass, a claim expiry sweep), by
-  // name: stop() waits for them too, or one resumes from an await onto a closed database (#1489). None starts once
-  // `stopping` is set.
-  const passes = new Map<Promise<void>, string>();
-  let stopping = false;
-  const pass = (what: string, running: Promise<unknown>) => {
-    const settled = running.then(() => {}, () => {});
-    passes.set(settled, what);
-    void settled.then(() => passes.delete(settled));
   };
   // The revalidate tick, and the one tests call by hand; its promise is revalidate's own.
   const runRevalidate = (): Promise<void> => {

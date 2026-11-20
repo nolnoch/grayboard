@@ -14,6 +14,12 @@ import { dirname } from "node:path";
 const parent = process.ppid;
 const abandoned = (file: string) => !existsSync(dirname(file)) || process.ppid !== parent;
 
+// Whether `point` is armed: a caller on a hot path awaits testPauseAsync only then, so an inert point costs no
+// microtask and the code's timing is unchanged outside tests (#1493).
+export function testPaused(point: string, env = process.env): boolean {
+  return env.BUS_TEST_PAUSE === point && !!env.BUS_TEST_PAUSE_FILE;
+}
+
 export async function testPauseAsync(point: string, env = process.env): Promise<void> {
   const file = env.BUS_TEST_PAUSE_FILE;
   if (env.BUS_TEST_PAUSE !== point || !file) return;

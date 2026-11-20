@@ -23,11 +23,18 @@ beforeEach(() => {
   logs = [];
   log = spyOn(console, "error").mockImplementation((...args: unknown[]) => { logs.push(args.map(String).join(" ")); });
 });
-afterEach(() => {
+// A test that failed while it held a pause releases it here, and waits for the held work to leave the pause before its
+// dir goes: abandoned, that work would fail into the next test's logs and fail it too.
+afterEach(async () => {
   writeFileSync(release, "release");
-  delete process.env.BUS_TEST_PAUSE; delete process.env.BUS_TEST_PAUSE_FILE;
-  log.mockRestore();
-  rmSync(dir, { recursive: true, force: true });
+  const count = (what: string) => logs.filter(l => l.startsWith(`[grayboard] test pause ${what}:`)).length;
+  try {
+    await until(() => count("released") >= count("hit"), 5000, "the held work left its pause");
+  } finally {
+    delete process.env.BUS_TEST_PAUSE; delete process.env.BUS_TEST_PAUSE_FILE;
+    log.mockRestore();
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 // Opens a server with a team, then starts a roster read held at POINT. Returns the server, the read, and a flag that
@@ -175,3 +182,83 @@ test("stop() waits for writes queued and not awaited before it closes the store"
   expect(logs.filter(l => /closed|failed/i.test(l) && !l.includes("stopping"))).toEqual([]);
   await srv.stop();
 });
+
+// #1493: the work a commit or a pass starts and nobody awaits is background work stop() waits for as it does a pass:
+// a claim expiry sweep's board change and wake, the same fan-out an HTTP route or the retention pass starts, and the
+// wake and blob sweep after a session's end. Each is held at a testPause point inside it; without the wait the store
+// closes under it and its reads resume onto it. Once stop has begun, none starts.
+const pauseHits = (point: string) => logs.filter(l => l === `[grayboard] test pause hit: ${point}`).length;
+
+// stop() while `point` holds background work named `name`: it waits, names it, and closes the store only after.
+async function stopAround(srv: TestServer, closed: { at: number }, point: string, name: string, meanwhile?: () => void) {
+  await until(() => pauseHits(point) > 0, 5000, `the ${name} reached its pause`);
+  const stopping = srv.app.stop();
+  void stopping.catch(() => {});
+  await until(() => closed.at || logs.some(l => l.startsWith("[grayboard] stopping: waiting for")), 5000, "stop waits or closes the store");
+  expect(closed.at).toBe(0);
+  expect(logs.find(l => l.startsWith("[grayboard] stopping: waiting for"))).toContain(name);
+  meanwhile?.();
+  writeFileSync(release, "release");
+  await stopping;
+  expect(closed.at).toBeGreaterThan(0);
+  expect(logs.filter(l => /closed|failed/i.test(l) && !l.includes("stopping"))).toEqual([]);
+}
+
+for (const { point, name } of [
+  { point: "board-change:observers-read", name: "claim expiry board change" },
+  // Held inside the subscriber's drain, before its read: the wake's tracked promise is its drains'.
+  { point: "server:drain-boards:before-read", name: "claim expiry wake" },
+]) {
+  const boards = name.endsWith("board change");
+  test(`stop() waits for a claim expiry sweep's ${name.slice("claim expiry ".length)}${boards ? ", and starts no other once stopping" : ""}`, async () => {
+    const srv = await TestServer.open();
+    const token = await srv.login(A);
+    const be = await srv.connected(token, "be");
+    await be.call("board_create", { name: "lobby", purpose: "general" });
+    await be.call("claim_take", { key: "soon", board: "lobby", ttl_minutes: 60 });
+    // A push subscriber, so the lapse's post wakes someone.
+    const qa = await srv.connected(token, "qa");
+    await qa.call("board_subscribe", { board: "lobby", mode: "push" });
+    await be.call("claim_list");
+    const closed = await closeSpy(srv);
+    hold(point);
+    await exec(srv, "UPDATE claims SET expires_at = ? WHERE key = 'soon'", Date.now() + 200);
+    // A call re-arms the timer at the new expiry; it changes no board and wakes nobody.
+    await be.call("claim_list");
+    // A board change asked for once stop has begun is skipped, so it never reaches the same pause.
+    await stopAround(srv, closed, point, name, boards ? () => srv.app.application.boardsChanged(["lobby"]) : undefined);
+    // The drain reads once per address of the subscriber's (its alias and its ID), each read held at the pause.
+    if (boards) expect(pauseHits(point)).toBe(1);
+    await srv.stop();
+  });
+}
+
+for (const { point, name, start } of [
+  { point: "board-change:observers-read", name: "board change", start: (srv: TestServer) => srv.app.application.boardsChanged(["lobby"]) },
+  { point: "background:wake", name: "wake", start: (srv: TestServer) => srv.app.application.wake([]) },
+]) {
+  test(`stop() waits for a ${name} fan-out a route or the retention pass started`, async () => {
+    const srv = await TestServer.open();
+    const closed = await closeSpy(srv);
+    hold(point);
+    start(srv);
+    await stopAround(srv, closed, point, name);
+    await srv.stop();
+  });
+}
+
+for (const { point, name } of [
+  { point: "blobs:listed", name: "blob sweep" },
+  { point: "background:session end wake", name: "session end wake" },
+]) {
+  test(`stop() waits for the ${name} after a restart ends a leftover session`, async () => {
+    let srv = await TestServer.open();
+    await srv.connected(await srv.login(A), "be");
+    hold(point);
+    // The restart ends the session the first run left: its wake and blob sweep follow the end's commit.
+    srv = await srv.restart();
+    const closed = await closeSpy(srv);
+    await stopAround(srv, closed, point, name);
+    await srv.stop();
+  });
+}
