@@ -557,10 +557,33 @@ test("#385: the DM tools take local's definitions, so a bad message ID or an unk
   ] as const) {
     const result = await b.callRaw(tool, args);
     const text = result.content?.[0]?.type === "text" ? result.content[0].text : "";
-    expect([tool, args, result.isError, text.startsWith(`Input validation error: Invalid arguments for tool ${tool}:`)]).toEqual([tool, args, true, true]);
+    expect([tool, args, result.isError, text.startsWith(`Input validation error: Invalid arguments for tool ${tool}:`), result.structuredContent]).toEqual([tool, args, true, true, { code: "bad_request" }]);
   }
   // Nothing was sent by the refused calls.
   expect((await b.call<HistoryMessage[]>("dm_history", {})).map((m) => m.body)).toEqual(["hi"]);
+});
+
+test("#1220: every class of input-schema refusal carries code bad_request, local's code, with the SDK's text", async () => {
+  const a = await srv.hosted(A, "be");
+  for (const [tool, args] of [
+    ["peer_status", { text: "busy", queue: "maybe" }], // enum
+    ["board_subscribe", { board: "e2e", mode: "loud" }], // enum
+    ["board_create", { name: "e2e", kind: "fifo" }], // enum
+    ["claim_take", { key: "ticket:ENG-142", ttl_minutes: "30" }], // a string for a number
+    ["peer_list", { include_offline: 1 }], // a number for a boolean
+    ["board_post", { board: "e2e" }], // a required argument missing
+    ["claim_list", { prefix: "ticket:", extra: true }], // an unknown argument
+    ["dm_inbox", { days: -1 }], // a zod schema's bound
+    ["whoami", { x: 1 }], // a zod strict object
+    ["bind", { name: 7 }], // the hosted bind input
+  ] as const) {
+    const result = await a.callRaw(tool, args);
+    const text = result.content?.[0]?.type === "text" ? result.content[0].text : "";
+    expect([tool, result.isError, result.structuredContent, text.startsWith(`Input validation error: Invalid arguments for tool ${tool}:`)]).toEqual([tool, true, { code: "bad_request" }, true]);
+    await expect(a.call(tool, args)).rejects.toMatchObject({ code: "bad_request" });
+  }
+  // The refused peer_status set nothing.
+  expect((await a.call<{ peers: { handle: string; status?: string }[] }>("peer_list", {})).peers.find((p) => p.handle === "be")?.status ?? null).toBeNull();
 });
 
 test("attachments on a DM: uploaded as your identity, bound by the send, pushed and read, fetched by its two parties", async () => {
