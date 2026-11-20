@@ -244,13 +244,30 @@ type Hub = {
   delegateOpenCap: number;
   aliasScopeCap: number;
   now: () => number;
-  // `on`: when its effect runs (`onCommit(handle)`: after that handle's commit, or now for `repo.read`).
+  // `on`: when its effect runs (`trackedCommit(hub, handle, what)`: after that handle's commit, or now for `repo.read`).
   boardChanged: (on: Commit, board: string) => void;
+  // ApplicationOptions.runBackground, or a stand-in that runs the work at once, untracked.
+  background: Background;
 };
 
+type Background = (what: string, run: (stopped: () => boolean) => Promise<unknown>) => void;
 // Schedules an effect after the commit of the transaction a handle names, or now for a `Read` (#807 P1c-15a).
 type Commit = (effect: () => void | Promise<void>) => void;
-const onCommit = (h: Read): Commit => (effect) => afterCommitOf(h, effect);
+// An effect run now as background work `what` (#1493): its synchronous part runs in this turn, as flushEffect's
+// does, and the promise `background` tracks settles once its asynchronous part has. Each failure is logged; a test
+// holds it once the effect is done at "background:<what>".
+function runEffect(background: Background, what: string, effect: () => void | Promise<void>): void {
+  background(what, () => {
+    let done: Promise<unknown>;
+    try { done = Promise.resolve(effect()).catch((error) => console.error("postcommit effect failed", error)); }
+    catch (error) { console.error("postcommit effect failed", error); done = Promise.resolve(); }
+    return done.then(() => testPauseAsync(`background:${what}`)).catch((error) => console.error(`[grayboard] ${what} failed:`, error));
+  });
+}
+// A Commit whose effect runs after `h`'s commit (now, for a `Read`) as background work `what`: a server's stop()
+// waits for it, and once stopping skips it (#1496), as it does a pass's. Not stopping, it starts at the commit as an
+// untracked effect would, and the request doesn't await it.
+const trackedCommit = (hub: Hub, h: Read, what: string): Commit => (effect) => afterCommitOf(h, () => runEffect(hub.background, what, effect));
 
 // A push its reader can no longer see, acknowledged as pendingOf finds it, on `h`: inside a body (a delivery
 // receipt's `pending`) on its `Tx`, awaited; outside one (a drain, a lease's pull) queued on the write queue and not
@@ -608,15 +625,9 @@ function sessionActor(session: ApplicationSession, address?: string): Actor {
 
 export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
   const now = opts.now ?? Date.now;
-  const background = opts.runBackground ?? ((_what: string, run: (stopped: () => boolean) => Promise<unknown>) => { void run(() => false); });
-  // A Commit outside any body that runs its effect now, as onCommit(repo.read) does, as background work `what`; a
-  // test holds it once the effect is done at "background:<what>".
-  const backgroundCommit = (what: string): Commit => effect => background(what, () => {
-    let done: Promise<unknown>;
-    try { done = Promise.resolve(effect()).catch((error) => console.error("postcommit effect failed", error)); }
-    catch (error) { console.error("postcommit effect failed", error); done = Promise.resolve(); }
-    return done.then(() => testPauseAsync(`background:${what}`)).catch((error) => console.error(`[grayboard] ${what} failed:`, error));
-  });
+  const background: Background = opts.runBackground ?? ((_what, run) => { void run(() => false); });
+  // A Commit outside any body that runs its effect now, as background work `what` (#1493).
+  const backgroundCommit = (what: string): Commit => effect => runEffect(background, what, effect);
   // A bind spends the hello bucket inside its caller's transaction (hosted's `owning`, #467): while it does, this
   // holds the bind's `Tx` and the session's `afterRollback`; a streak's audit row is written on that `Tx`, where a
   // commit keeps it, and handed to `afterRollback` as well, to be written again if the transaction rolls back. A
@@ -645,6 +656,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     access: boardAccess(repo, opts.humanReach ?? "team"),
     slackRunning: opts.slackRunning ?? (() => false),
     now,
+    background,
     // Logged and audited once per run of refusals, so a loop floods neither.
     // Keyed by email, which is unique per user. A bind spends from the same
     // bucket (S2).
@@ -1911,7 +1923,8 @@ async function writeOnce<W extends Written>(
       });
     }
   }, recheck);
-  if ("replay" in out && uploads.length > 0) tx.afterCommit(async () => { await sweepStoredBlobs(repo); });
+  // Tracked as background work a server's stop waits for, and skipped once stopping (#1496).
+  if ("replay" in out && uploads.length > 0) tx.afterCommit(() => hub.background("blob sweep", stopped => sweepStoredBlobs(repo, stopped)));
   return out;
 }
 
@@ -2116,7 +2129,7 @@ async function handleRetract(hub: Hub, tx: Tx, session: ApplicationSession, id: 
   }
   if (done === "read") return fail("bad_request", retractRefusal.reached(id, m.recipient));
   if (done === "replied") return fail("bad_request", retractRefusal.replied(id));
-  tx.afterCommit(async () => { await sweepStoredBlobs(repo); });
+  tx.afterCommit(() => hub.background("blob sweep", stopped => sweepStoredBlobs(repo, stopped)));
   return {};
 }
 
@@ -2172,10 +2185,11 @@ async function handleCall(hub: Hub, tx: Tx, session: ApplicationSession, tool: s
   }
   // A hosted session with no name answers peer_list as its ID, but is nobody (#402).
   if (session.readOnly && tool === "peer_list" && outcome.result && typeof outcome.result === "object") delete (outcome.result as { you?: string }).you;
-  for (const board of new Set(outcome.boards ?? [])) hub.boardChanged(onCommit(tx), board);
+  // The fan-out and the wakes are background work a server's stop waits for (#1496).
+  for (const board of new Set(outcome.boards ?? [])) hub.boardChanged(trackedCommit(hub, tx, "call board change"), board);
   // The transitional adapter publishes its answer before the resulting deliveries.
   if (publish) tx.afterCommit(() => publish(outcome.result));
-  wake(hub, onCommit(tx), outcome.wake);
+  wake(hub, trackedCommit(hub, tx, "call wake"), outcome.wake);
   return outcome.result;
 }
 
@@ -2227,9 +2241,9 @@ async function handleBoardPost(hub: Hub, tx: Tx, session: ApplicationSession, me
   }
   const r = out.fresh.payload;
   tx.afterCommit(() => testPause("write:after-commit"));
-  hub.boardChanged(onCommit(tx), r.board);
+  hub.boardChanged(trackedCommit(hub, tx, "post board change"), r.board);
   if (publish) tx.afterCommit(() => publish(r));
-  wake(hub, onCommit(tx), out.fresh.wake);
+  wake(hub, trackedCommit(hub, tx, "post wake"), out.fresh.wake);
   return r;
 }
 
