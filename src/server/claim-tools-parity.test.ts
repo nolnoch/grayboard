@@ -8,12 +8,12 @@
 import { beforeEach, expect, spyOn, test } from "bun:test";
 import { claimQueuePost, createBoard, post, subscribe } from "../core/boards.ts";
 import { boardActor } from "../core/bindings.ts";
-import { logEvent, sweepChanges } from "../core/claims.ts";
+import { checkTake, logEvent, sweepChanges, type TakeOpts } from "../core/claims.ts";
 import { CoreError } from "../core/errors.ts";
 import { callBoardTool as coreCallBoardTool, type ToolContext } from "../core/tools.ts";
 import { boardAccess } from "./access.ts";
 import { writeAudit } from "./audit.ts";
-import { callClaimTool, sweepClaims } from "./claims.ts";
+import { callClaimTool, endedClaimText, sweepClaims } from "./claims.ts";
 import { endSessionServer } from "./session_end.ts";
 import type { Repo } from "./db.ts";
 import type { Tx } from "./store/tx.ts";
@@ -247,17 +247,28 @@ const ctxOf = (c: Caller): ToolContext => ({
 });
 const session = (c: Caller) => ({ addresses: c.addresses, asAddresses: c.addresses, ownScope: c.user });
 
+const endedTake = (actor: string, args: Record<string, unknown>) => {
+  if (actor !== ENDED_ID || typeof args.key !== "string" || (args.board !== undefined && typeof args.board !== "string")) return false;
+  try { checkTake(args.key, args as TakeOpts); return true; } catch { return false; }
+};
+
 test("claim_take, claim_release and claim_watch give core's answers and leave its rows, for every caller and call", async () => {
   const access = boardAccess(repo);
   const out: [string, unknown, unknown][] = [];
   for (const c of CALLERS) for (const [tool, args] of CALLS()) {
     let actor: string;
     try { actor = boardActor(repo.coreOn(repo.read), tool, args, session(c)); } catch { continue; }
-    const want = await inBody(async tx => outcome(() => coreCallBoardTool(repo.coreOn(tx), actor, tool, args, ctxOf(c))));
+    // An ended ID's take that passes the argument checks is refused id_ended on the server, before any write (#807 P3
+    // C10d2-b, E4), where core takes it: the one deliberate difference.
+    const want = tool === "claim_take" && endedTake(actor, args)
+      ? await inBody(async () => ({ error: `CoreError: ${endedClaimText(actor)}` }))
+      : await inBody(async tx => outcome(() => coreCallBoardTool(repo.coreOn(tx), actor, tool, args, ctxOf(c))));
     const got = await inBody(tx => outcomeAsync(() => callClaimTool(repo, access, tx, actor, tool, args, ctxOf(c))));
     out.push([`${c.label} ${tool} ${JSON.stringify(args)}`, want, got]);
   }
   expect(diverging(out)).toEqual([]);
+  // The ended ID's takes that reach the server's refusal.
+  expect(out.filter(([l, , g]) => l.startsWith("bob's ended claim_take") && JSON.stringify(g).includes("has ended; it can't take")).length).toBe(15);
 
   // The fixture reaches each branch the port decides.
   type R = { out: { value?: { result: unknown; wake: string[] }; error?: string }; rows: Record<string, unknown[]> };

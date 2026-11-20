@@ -5,7 +5,8 @@
 // binding detail, the id.ended row), so the two ends write the same rows (tests: server/session_end.test.ts).
 //
 // Lock order on Postgres (#807 P3 C10d2-b; docs/future/postgres-server.md D3). SQLite's single writer takes none. The
-// end takes, in this order:
+// end takes, in this order (a hosted child's end through the port, store/pg/hosted.ts, has already locked its grant
+// and the root's and child's hosted_sessions rows FOR UPDATE, all before step 1):
 //   1. ids: the ID's row FOR UPDATE, then its unended children's, by id (the row step, pg/session_end.ts). Every write
 //      that waits for an end takes its ids row lock FOR KEY SHARE before any lock below: a send (refusal, first in
 //      writeSend), a take (bindings.lockLive, after only its aliases row, which the end never locks), a claim take
@@ -20,7 +21,9 @@
 //      order: posts, then outbox, then subscriptions); mailbox_cursors, dm_acks; the unbound attachments; the holds
 //      (alias_holds), binding_events.
 //   5. each child, in id order, steps 2-4 (its ids row is already locked); then access_log.
-// So the order holds per ID, not across a tree: a child's messages and claims are locked after its root's step 4.
+// The tree is flat: a child's root_id names its session's top root (hosted setRoot), so a child has no children of
+// its own; were one to, step 5 would recurse, and the order holds per ID, not across the tree (a child's messages and
+// claims are locked after its root's step 4).
 // Known windows, each detected by Postgres (40P01, one side rolled back): two steps' requeues of posts older than
 // retention are each sorted but not merged, against a posts prune; and two ends whose releases cc each other's IDs
 // lock those ids rows KEY SHARE after their own FOR UPDATE.
