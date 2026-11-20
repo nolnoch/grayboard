@@ -121,14 +121,16 @@ export function startServer(config: Config, opts: StartOptions = {}) {
   async function drain(ms: number): Promise<void> {
     if (inFlight.size === 0) return;
     const plural = (n: number) => `${n} request${n === 1 ? "" : "s"}`;
-    console.error(`[grayboard] stopping: waiting for ${plural(inFlight.size)} in flight: ${[...inFlight.values()].join(", ")}`);
+    // Bounded: unauthenticated requests are tracked too, so the list and each path are capped.
+    const named = () => { const all = [...inFlight.values()].map(w => w.length > 120 ? `${w.slice(0, 120)}…` : w); return all.length > 10 ? `${all.slice(0, 10).join(", ")} +${all.length - 10} more` : all.join(", "); };
+    console.error(`[grayboard] stopping: waiting for ${plural(inFlight.size)} in flight: ${named()}`);
     let timer: ReturnType<typeof setTimeout> | undefined;
     const expired = new Promise<"expired">(resolve => { timer = setTimeout(() => resolve("expired"), ms); });
     try {
       while (inFlight.size) {
         if (await Promise.race([Promise.allSettled([...inFlight.keys()]), expired]) === "expired") {
           // Said here as well: main.ts redacts a failed stop's error, and a method and path carry no secret.
-          const message = `stop: ${plural(inFlight.size)} never finished within ${ms} ms: ${[...inFlight.values()].join(", ")}`;
+          const message = `stop: ${plural(inFlight.size)} never finished within ${ms} ms: ${named()}`;
           console.error(`[grayboard] ${message}`);
           throw new Error(message);
         }
