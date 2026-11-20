@@ -55,6 +55,7 @@
 // is restated, and so are normalizeBoard and the catalog page size (pinned to core's by the contract runner).
 import { CoreError } from "../../../core/errors.ts";
 import type { Post } from "../../../shared/notifications.ts";
+import { testPauseAsync } from "../../../shared/testpause.ts";
 import type { Board, BoardSummary, BoardsStore, DigestRow, PushRow, SubMode, ThreadFacts, WhoRow } from "../boards.ts";
 import { MissingPost } from "../errors.ts";
 import type { Read } from "../tx_base.ts";
@@ -291,6 +292,8 @@ export function makePgBoards({ clock }: { clock: () => number }): BoardsStore {
       const first: Row[] = await sql`UPDATE outbox SET delivered_at = ${now}, session_id = ${credited(sql, handle, receiver)}
         WHERE handle = ${handle} AND post_id = ${ref.post_id} AND delivered_at IS NULL AND ${held} RETURNING post_id`;
       if (first.length === 0) {
+        // A test forces a hold moving back here (#1472): the repeat's `delivered_at IS NOT NULL` then keeps it unmarked.
+        await testPauseAsync("boards:acknowledge:repeat");
         const again: Row[] = await sql`UPDATE outbox SET delivered_at = ${now}
           WHERE handle = ${handle} AND post_id = ${ref.post_id} AND delivered_at IS NOT NULL AND ${held} RETURNING post_id`;
         if (again.length === 0 && receiver !== undefined) return;
