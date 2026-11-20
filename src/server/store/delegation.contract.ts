@@ -59,12 +59,12 @@ export function delegationContract(backend: IdsBackend): void {
     await h.session(s9, { principal: B, launcher: true, endedAt: T0 });
     await h.session(more(10), { principal: B, launcher: true, delivery: "none" });
     await h.session(more(11), { principal: B, launcher: false });
-    const f = await h.delegation.facts(h.read, { since: 0 });
+    const f = await h.delegation.facts(h.read, { since: 0, principal: B });
     expect(f.launchers()).toEqual([`${B}/zz`, `${C}/offline`, s6]);
     expect(f.launchers().map(l => f.userOf(l))).toEqual([B, C, B]);
     expect(f.launchers().map(l => f.open(l))).toEqual([0, 0, 0]);
     // A named target: isLauncher by the same rules, and only its own facts.
-    const named = async (to: string) => { const n = await h.delegation.facts(h.read, { to, since: 0 }); return n.isLauncher(to); };
+    const named = async (to: string) => { const n = await h.delegation.facts(h.read, { to, since: 0, principal: B }); return n.isLauncher(to); };
     expect(await Promise.all([`${B}/zz`, `${B}/second`, `${C}/offline`, s6].map(named))).toEqual([true, true, true, true]);
     expect(await Promise.all([`${B}/human`, `${B}/plain`, `${B}/unset`, s7, s8, s9, more(10), more(11), s1].map(named)))
       .toEqual([false, false, false, false, false, false, false, false, false]);
@@ -75,7 +75,7 @@ export function delegationContract(backend: IdsBackend): void {
     await h.session(s1, { principal: C, launcher: true });
     await h.alias(`${C}/sim`, { lastSeen: T0 }); await h.hold(`${C}/sim`, s1, 1);
     await h.alias(`${C}/never`);
-    const of = (to: string) => h.delegation.facts(h.read, { to, since: 0 });
+    const of = (to: string) => h.delegation.facts(h.read, { to, since: 0, principal: B });
     const sim = await of(`${C}/sim`);
     expect([sim.everConnected(`${C}/sim`), sim.isLauncher(`${C}/sim`), sim.userOf(`${C}/sim`), sim.open(`${C}/sim`)]).toEqual([true, true, C, 0]);
     expect((await of(s1)).everConnected(s1)).toBe(true);
@@ -89,7 +89,7 @@ export function delegationContract(backend: IdsBackend): void {
     expect(() => sim.isLauncher(s1)).toThrow(/whether "id:0000000000001" is a launcher was not read/);
     expect(() => sim.humanHandles()).toThrow(/the human handles was not read/);
     expect(() => sim.lastSeen(s1)).toThrow(/a last-seen was not read/);
-    const auto = await h.delegation.facts(h.read, { since: 0 });
+    const auto = await h.delegation.facts(h.read, { since: 0, principal: B });
     expect(() => auto.everConnected(`${C}/sim`)).toThrow(/was not read/);
     expect(() => auto.userOf(`${C}/never`)).toThrow(/the user of "c@example.com\/never" was not read/);
   });
@@ -119,24 +119,27 @@ export function delegationContract(backend: IdsBackend): void {
     await request(T0 + 7, OTHER, L);
     // Another launcher's request counts for it alone.
     await request(T0 + 8, OTHER);
-    const auto = await h.delegation.facts(h.read, { since: T0 });
+    const auto = await h.delegation.facts(h.read, { since: T0, principal: B });
     expect([auto.open(L), auto.open(OTHER)]).toEqual([3, 1]);
-    expect((await h.delegation.facts(h.read, { to: L, since: T0 })).open(L)).toBe(3);
-    expect((await h.delegation.facts(h.read, { to: L, since: T0 - 1 })).open(L)).toBe(4);
-    expect((await h.delegation.facts(h.read, { to: L, since: T0 + 3 })).open(L)).toBe(0);
+    expect((await h.delegation.facts(h.read, { to: L, since: T0, principal: B })).open(L)).toBe(3);
+    expect((await h.delegation.facts(h.read, { to: L, since: T0 - 1, principal: B })).open(L)).toBe(4);
+    expect((await h.delegation.facts(h.read, { to: L, since: T0 + 3, principal: B })).open(L)).toBe(0);
   });
 
   it("facts and addressUser run on the Tx they're given (a body's own writes) and refuse a settled Tx and another backend's handle", async h => {
     await h.session(ids.s1, { principal: B, launcher: true });
+    // Another user's launcher is listed on a Tx as on a Read, with its user and count (Postgres takes no lock on it).
+    await h.session(ids.s2, { principal: C, launcher: true });
     const d = h.delegation;
     const kept = await h.write(async tx => {
-      expect((await d.facts(tx, { since: 0 })).launchers()).toEqual([ids.s1]);
+      const f = await d.facts(tx, { since: 0, principal: B });
+      expect(f.launchers().map(l => [l, f.userOf(l), f.open(l)])).toEqual([[ids.s1, B, 0], [ids.s2, C, 0]]);
       expect(await d.addressUser(tx, ids.s1)).toBe(B);
       return tx;
     });
     await expect(d.addressUser(kept, ids.s1)).rejects.toThrow(SETTLED);
-    await expect(d.facts(kept, { since: 0 })).rejects.toThrow(SETTLED);
-    await expect(d.facts({} as Tx, { since: 0 })).rejects.toThrow(FOREIGN);
+    await expect(d.facts(kept, { since: 0, principal: B })).rejects.toThrow(SETTLED);
+    await expect(d.facts({} as Tx, { since: 0, principal: B })).rejects.toThrow(FOREIGN);
     await expect(d.addressUser({} as Tx, ids.s1)).rejects.toThrow(FOREIGN);
   });
 }

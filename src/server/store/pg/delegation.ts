@@ -2,16 +2,17 @@
 // DelegationStore, each method on its caller's handle through pgOf. The SQLite store (db.ts makeRepo's delegation, over
 // core/delegation.ts's launchers, isLauncher, everConnected, addressUser and countOpenDelegations, and core/boards.ts's
 // ALIAS_SESSION_SQL, primaryHoldSql and rosterHandles) is the reference; what differs, and why:
-// - The open cap (DELEGATE_OPEN_CAP, #252): on a Tx, facts takes a transaction-scoped advisory lock per candidate
-//   target (DELEGATE_CAP_LOCK keyed by hashtext(target)), in sorted order, before it counts. The caller (the delegate
-//   path, application.ts) reads the facts on the savepoint it then writes the request's message and its
+// - The open cap (DELEGATE_OPEN_CAP, #252): on a Tx, facts takes a transaction-scoped advisory lock per target core
+//   could pick (DELEGATE_CAP_LOCK keyed by hashtext(target), lockCapKeys) before it counts: a named target, or each
+//   launcher whose user is the requester's (core's own-user filter); another user's launchers take none. The caller
+//   (the delegate path, application.ts) reads the facts on the savepoint it then writes the request's message and its
 //   delegation.requested row on, so a second delegation to that launcher waits for the first to commit and counts it:
 //   two at cap-1 would otherwise both count cap-1 and both send. Advisory rather than the launcher's ids row: the count
 //   is keyed by access_log.target, which may be an alias, and that row is also an end's FOR UPDATE and every send's
 //   KEY SHARE (c10-scope §7 Q7). A savepoint rolled back frees it, which only a refused delegation does: it wrote
 //   nothing to count. On a Read (the pool) there is no transaction to hold it, and no lock is taken.
 // - The open count reads the request's message id as `a.detail->>'message_id'` (access_log.detail is jsonb), cast to
-//   int8 so the join probes messages' primary key; the counts for every candidate are one statement.
+//   int8 so the join probes messages' primary key; the counts for every candidate are one statement, as are the users.
 // - launcher, viewer and human are booleans: `launcher` (NULL is not one), `NOT viewer`, `human IS NOT TRUE`.
 //
 // Runtime imports stay off bun:sqlite, db.ts and core's SQLite modules (pg/isolation.test.ts): the SQL is restated.
@@ -24,6 +25,20 @@ import { pgOf, type PgSql } from "./tx.ts";
 // pg_advisory_xact_lock(class, key) for a launcher's open cap: the two-int4 form beside ALIAS_CAP_LOCK and the OAuth
 // caps' classes, keyed by hashtext(target). A collision only serializes two launchers' delegations.
 export const DELEGATE_CAP_LOCK = 0x6762646c; // "gbdl"
+
+// Takes DELEGATE_CAP_LOCK for each of `targets` in one statement, in ascending key order, each key once (a repeated
+// target or a hashtext collision is one lock), so two delegations over overlapping targets lock in one order and can't
+// deadlock (40P01). Returns the keys in the order taken. The order is the subquery's: DISTINCT with ORDER BY keeps it
+// from being flattened, and the outer target list, the lock call, runs per row as the scan emits them.
+export async function lockCapKeys(sql: PgSql, targets: string[]): Promise<number[]> {
+  const rows: Row[] = await sql`SELECT k, pg_advisory_xact_lock(${DELEGATE_CAP_LOCK}::int4, k)
+    FROM (SELECT DISTINCT hashtext(t) AS k FROM unnest(${targets}::text[]) t ORDER BY k) s`;
+  return rows.map(r => Number(r.k));
+}
+
+// core/delegation.ts userMatches, restated (pg modules can't reach core/delegation.ts at runtime): a candidate core's
+// auto-pick keeps for this requester, one with no session behind it or whose user is the requester's.
+const userMatches = (principal: string | null, user: string | null | undefined): boolean => user === undefined || user === principal;
 
 type Row = Record<string, unknown>;
 
@@ -72,6 +87,18 @@ async function addressUser(sql: PgSql, candidate: string): Promise<string | null
   return row ? (row.principal as string | null) : undefined;
 }
 
+// addressUser for every candidate: an ID's and an alias's each in one statement; one with no session behind it is
+// absent, which the map reads as undefined, as addressUser does.
+async function addressUsers(sql: PgSql, candidates: string[]): Promise<Map<string, string | null | undefined>> {
+  const idList = candidates.filter(h => addressParts(h)?.kind === "id"), names = candidates.filter(h => addressParts(h)?.kind !== "id");
+  const rows: Row[] = [
+    ...(idList.length ? await sql`SELECT id AS address, principal FROM ids WHERE id = ANY(${idList}::text[])` : []),
+    ...(names.length ? await sql`SELECT a.address, i.principal FROM aliases a JOIN ids i ON i.id = ${aliasSession(sql)} WHERE a.address = ANY(${names}::text[])` : []),
+  ];
+  const found = new Map(rows.map(r => [r.address as string, r.principal as string | null]));
+  return new Map(candidates.map(h => [h, found.has(h) ? found.get(h) : undefined]));
+}
+
 // core countOpenDelegations over access_log, for every target at once: requests audited to it since `since` whose
 // message still exists and that its side hasn't taken (no reply from anyone but the requester, no ack by anyone but
 // the requester). A target with none is absent.
@@ -92,22 +119,34 @@ export function makePgDelegation(): DelegationStore {
     addressUser: async (r, address) => addressUser(pgOf(r), address),
     async facts(r, q) {
       const sql = pgOf(r);
-      const candidates = q.to !== undefined ? [q.to] : await launchers(sql);
-      // The cap's lock, before any count: one per candidate, in one order (byte order, as COLLATE "C" sorts), so two
-      // auto-picks over overlapping launchers can't deadlock.
-      if (isTx(r)) {
-        for (const t of [...new Set(candidates)].sort((x, y) => Buffer.compare(Buffer.from(x), Buffer.from(y)))) {
-          await sql`SELECT pg_advisory_xact_lock(${DELEGATE_CAP_LOCK}::int4, hashtext(${t}))`;
-        }
-      }
-      const users = new Map<string, string | null | undefined>();
-      for (const h of candidates) users.set(h, await addressUser(sql, h));
-      const open = await openCounts(sql, candidates, q.since);
       if (q.to !== undefined) {
         const to = q.to;
-        return delegationFacts({ to: { address: to, everConnected: await everConnected(sql, to), isLauncher: await isLauncher(sql, to) }, users, open });
+        // The cap's lock, before any count.
+        if (isTx(r)) await lockCapKeys(sql, [to]);
+        return delegationFacts({
+          to: { address: to, everConnected: await everConnected(sql, to), isLauncher: await isLauncher(sql, to) },
+          users: await addressUsers(sql, [to]),
+          open: await openCounts(sql, [to], q.since),
+        });
       }
-      return delegationFacts({ launchers: candidates, users, open });
+      const all = await launchers(sql);
+      let candidates = all, users: Map<string, string | null | undefined>;
+      if (isTx(r)) {
+        // Only the launchers core could pick for this requester are locked: their users are read unlocked first, and
+        // read again once the locks are held, since an alias can change hands in between. A launcher locked that no
+        // longer matches, core filters out. One that matches now but didn't then wasn't locked, so it's left out of
+        // the list: that answer is the one a delegation reading just before it changed hands would have got, and
+        // core only ever sends to a listed launcher, so nothing reaches a target whose count it didn't lock.
+        const before = await addressUsers(sql, all);
+        const locked = new Set(all.filter(h => userMatches(q.principal, before.get(h))));
+        await lockCapKeys(sql, [...locked]);
+        users = await addressUsers(sql, all);
+        const after = users;
+        candidates = all.filter(h => locked.has(h) || !userMatches(q.principal, after.get(h)));
+      } else users = await addressUsers(sql, all);
+      // Counted for every listed launcher, so the facts match SQLite's; another user's counts are unlocked, but core's
+      // user filter runs before it asks for a count.
+      return delegationFacts({ launchers: candidates, users, open: await openCounts(sql, candidates, q.since) });
     },
   };
 }

@@ -10,7 +10,7 @@ import { sessionEndContract, type IdsBackend, type IdsHarness } from "../session
 import { makePgDelegation } from "./delegation.ts";
 import { makePgSessionEnd, TOMBSTONE_HORIZON_MS } from "./session_end.ts";
 import { int8 } from "./sql.ts";
-import { makePgTransactions } from "./tx.ts";
+import { makePgTransactions, pgOf } from "./tx.ts";
 
 type Row = Record<string, unknown>;
 
@@ -65,4 +65,19 @@ describePg("delegation contract (Postgres)", () => delegationContract(pgIdsBacke
 
 test("the Postgres tombstone horizon is core's", () => {
   expect(TOMBSTONE_HORIZON_MS).toBe(CORE_HORIZON);
+});
+
+// Postgres only: held_aliases_json is jsonb, and a value that isn't an array (which no write produces) reads as no
+// alias held in refusal, as in a child's root primary, rather than throwing. Mutation: refusal's held() unguarded.
+describePg("session end refusal (Postgres)", () => {
+  test("an ended ID whose held_aliases_json isn't a jsonb array is refused as holding no alias", async () => {
+    const h = await pgIdsBackend.open();
+    try {
+      const S = "id:0000000000001";
+      await h.session(S, { endedAt: 1 });
+      await h.write(async tx => { await pgOf(tx)`UPDATE ids SET held_aliases_json = '"b@example.com/be"'::jsonb WHERE id = ${S}`; });
+      const why = await h.write(tx => h.sessionEnd.refusal(tx, S));
+      expect(why && `${why.code}: ${why.detail}`).toBe(`id_ended: ${S} ended at ${new Date(1).toISOString()}; it held no alias`);
+    } finally { await h.close(); }
+  });
 });

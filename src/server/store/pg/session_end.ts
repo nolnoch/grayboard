@@ -18,8 +18,8 @@ import type { SessionEndStore } from "../session_end.ts";
 import { int8, int8OrNull } from "./sql.ts";
 import { pgOf, type PgSql } from "./tx.ts";
 
-// core/boards.ts TOMBSTONE_HORIZON_MS (#333): how long a pruned keyed ID's tombstone is kept. The contract pins the two
-// equal (session_end.contract.ts).
+// core/boards.ts TOMBSTONE_HORIZON_MS (#333): how long a pruned keyed ID's tombstone is kept. The Postgres contract test
+// pins the two equal (pg/session_end.contract.pg.test.ts).
 export const TOMBSTONE_HORIZON_MS = 365 * 24 * 60 * 60 * 1000;
 
 type Row = Record<string, unknown>;
@@ -31,9 +31,12 @@ async function rootPrimary(sql: PgSql, root: string): Promise<string> {
   if (hold) return hold.address as string;
   const [r]: Row[] = await sql`SELECT ended_at, held_aliases_json, writes_as FROM ids WHERE id = ${root}`;
   if (r?.writes_as) return r.writes_as as string;
-  const held = r && r.ended_at !== null && Array.isArray(r.held_aliases_json) ? (r.held_aliases_json as string[]) : [];
+  const held = r && r.ended_at !== null ? heldAliases(r.held_aliases_json) : [];
   return held[0] ?? root;
 }
+
+// held_aliases_json as the aliases an ended ID held: a jsonb array, else none (NULL, or any other jsonb value).
+const heldAliases = (v: unknown): string[] => Array.isArray(v) ? v as string[] : [];
 
 export function makePgSessionEnd(): SessionEndStore {
   return {
@@ -46,7 +49,7 @@ export function makePgSessionEnd(): SessionEndStore {
       const primary = r && !r.viewer && r.root_id !== null ? await rootPrimary(sql, r.root_id as string) : undefined;
       return undeliverableFrom(id, r ? {
         ended_at: int8OrNull(r.ended_at),
-        held: () => (r.held_aliases_json as string[] | null) ?? [],
+        held: () => heldAliases(r.held_aliases_json),
         delivery: r.delivery as string,
         writes_as: r.writes_as as string | null,
         viewer: r.viewer as boolean,

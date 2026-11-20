@@ -16,10 +16,12 @@ export interface DelegationStore {
   // undefined with no session behind it.
   addressUser(r: Read, address: string): Promise<string | null | undefined>;
   // Everything the decision can ask for this call: with `to`, that target's; without, every launcher's user and
-  // open count (requests since `since` it hasn't taken, #252). A fact not read throws when asked. On a Tx, the open
-  // cap holds for the rest of the body: on Postgres an advisory lock per candidate (DELEGATE_CAP_LOCK) is taken
-  // before the counts, so two delegations to one launcher at cap-1 count in turn; SQLite's single writer is the lock.
-  facts(r: Read, q: { to?: string; since: number }): Promise<ReadDelegationFacts>;
+  // open count (requests since `since` it hasn't taken, #252). A fact not read throws when asked. `principal` is the
+  // requester's user, core's own-user filter. On a Tx, the open cap holds for the rest of the body: on Postgres an
+  // advisory lock (DELEGATE_CAP_LOCK) is taken before the counts on the named target, or on each launcher whose user
+  // is `principal`'s, so two delegations to one launcher at cap-1 count in turn; SQLite's single writer is the lock,
+  // and it ignores `principal`.
+  facts(r: Read, q: { to?: string; since: number; principal: string | null }): Promise<ReadDelegationFacts>;
 }
 
 // Maps over what was read; a question about anything else throws, so a decision that asks for a fact the read left
