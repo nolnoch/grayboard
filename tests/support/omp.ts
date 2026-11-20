@@ -1182,7 +1182,8 @@ export function ompLocalAcpScenario(dir: string): Promise<void> {
 // tools, aren't reported, nor is a grayboard a harness under omp starts.
 // `push`: the client's exact grayboard as a real ACP client declares it, a
 // plain `grayboard mcp` (push on), rather than a copy of the adapter's
-// tools-only entry. It then takes omp-local before the adapter's child (#1381).
+// tools-only entry. It then takes omp-local before the adapter's child, which
+// takes it back from that sibling when it starts (#1381).
 export function ompLocalAcpClientGrayboardScenario(dir: string, { push = false }: { push?: boolean } = {}): Promise<void> {
   return named(OMP_HARNESS, async () => {
     const procs: ChildProcess[] = [];
@@ -1224,7 +1225,7 @@ process.stdin.setEncoding("utf8").on("data", (c) => {
       // grayboard is tools-only: it takes no name and keeps no PID record.
       // With push on it takes omp-local first (by omp's BUS_IDENTITY, which it
       // inherits, or by the record under the same omp), and the adapter's
-      // child runs unbound (#1381).
+      // child, starting after, takes it from that sibling (#1381).
       const rows = (sql: string, name?: string) => {
         try {
           return existsSync(join(dir, "bus.db")) ? localRows(dir, sql, ...(name === undefined ? [] : [name])).length : 0;
@@ -1249,6 +1250,11 @@ process.stdin.setEncoding("utf8").on("data", (c) => {
         : rows("SELECT 1 FROM ids WHERE harness_session IS NULL AND ended_at IS NULL") === 1, 30_000, "the client's grayboard registers");
       writeFileSync(go, "");
       await until(() => holds("omp-local"), 30_000, "the adapter's grayboard holds omp-local");
+      if (push) {
+        // Taken from the client's, which holds nothing now, audited as such.
+        expect(rows("SELECT 1 FROM alias_holds h JOIN ids i ON i.id = h.id WHERE i.harness_session IS NULL")).toBe(0);
+        expect(rows("SELECT 1 FROM audit_log a JOIN ids i ON i.id = a.target WHERE a.action = 'alias.displaced' AND i.harness_session IS NULL AND i.ended_at IS NULL")).toBe(1);
+      }
       await until(() => grayboardDescendants(acp.proc.pid!).length === 3, 30_000, "the client's grayboard and the harness's run beside the adapter's");
       for (const text of ["hi", "again"]) await acp.call("session/prompt", { sessionId, prompt: [{ type: "text", text }] });
       // The adapter's own log lines; ACP also mirrors each notice at debug.

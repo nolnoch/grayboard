@@ -484,6 +484,14 @@ export function heldNote(name: string, holder: string): string {
 }
 
 /**
+ * A name this session held that its harness's adapter session took (#1381):
+ * the adapter's grayboard owns the harness session's delivery.
+ */
+export function displacedNote(name: string, taker: string | null): string {
+  return `"${name}" was taken by ${taker ?? "another session"}, the grayboard this harness's adapter runs, which delivers its mail; this session no longer holds it.`;
+}
+
+/**
  * A name record (decision 14) this restart couldn't take back. `holdsOthers`:
  * it took back another name from the record (#284 S10).
  */
