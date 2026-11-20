@@ -63,9 +63,9 @@ beforeEach(async () => {
   alice = await user("alice@example.com");
   bob = await user("bob@example.com");
 });
-afterEach(() => {
+afterEach(async () => {
   resources.close();
-  application.stopExpiry();
+  await application.stopExpiry();
   store.db.close();
   rmSync(dir, { recursive: true, force: true });
 });
@@ -423,7 +423,7 @@ test("revocation, disabled users, application disconnect and stop close watchers
   const c = await select(alice, "fe");
   const stopped = hooks();
   resources.watch(c, boardResourceUri("e2e"), stopped, true);
-  application.stopExpiry();
+  await application.stopExpiry();
   expect(stopped.counts.closed).toBe(1);
   resources.close();
   expect(() => resources.watch(c, boardResourceUri("e2e"), hooks(), true)).toThrow("unauthorized");
@@ -544,7 +544,7 @@ test("per-session watch capacity counts only that session's watches and frees on
 // cap was a hard-coded 1024 that would bind first.
 test("configured watch caps admit past the defaults and refuse at the configured size", async () => {
   resources.close();
-  application.stopExpiry();
+  await application.stopExpiry();
   application = createApplication(store.repo, { observerCap: 1100 });
   resources = createResources(application, { isCurrent: () => true, isAuthorized: () => true, caps: { global: 1100, perSession: 1100 } });
   const a = await select(alice);

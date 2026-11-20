@@ -48,7 +48,7 @@ beforeEach(async () => {
   hosted = createHostedSessions(application, { now: () => now, isAuthorized: () => authorized }); await hosted.ready;
   delivery = createDelivery(hosted, { isAuthorized: () => authorized });
 });
-afterEach(async () => { delivery.close(); await hosted.close(); application.stopExpiry(); database.db.close(); rmSync(blobDir, { recursive: true, force: true }); });
+afterEach(async () => { delivery.close(); await hosted.close(); await application.stopExpiry(); database.db.close(); rmSync(blobDir, { recursive: true, force: true }); });
 
 test("#807: behind a write backlog longer than a tick, the timer keeps one sweep queued, not one per tick", async () => {
   // The service's timer, driven by hand: each call is one tick, so the test needs no wall clock (#961).
@@ -1122,7 +1122,7 @@ test("a rate-limited hosted bind keeps its bind.rate_limited row after the trans
     await service.bind(principal, context("other"), { name: "ops", create: true });
     expect(rows("bind.rate_limit_ended")).toBe(1);
     expect(service.refusalRowsLost).toBe(0);
-  } finally { await service.close(); limited.stopExpiry(); }
+  } finally { await service.close(); await limited.stopExpiry(); }
 });
 
 test("a refusal row whose write after the rollback fails is counted, and the refusal is still what the caller sees (#467)", async () => {
@@ -1880,7 +1880,7 @@ test("a released child's ID ends with the release's reason, not at the next star
   expect(endedWhy(hostedId("kept"))).toEqual(["closed"]);
   expect(idEnd(hostedId("root"))).toBeNull();
   // Nothing is left for the startup sweep to label a WSS leftover.
-  await hosted.close(); application.stopExpiry();
+  await hosted.close(); await application.stopExpiry();
   application = createApplication(database.repo);
   hosted = createHostedSessions(application, { now: () => now, isAuthorized: () => authorized }); await hosted.ready;
   expect(childAudits("id.ended").filter(a => a.why === "wss_removed")).toEqual([]);
