@@ -593,7 +593,8 @@ async fn hints_mark_the_inbox_dirty_and_a_full_page_reads_again() {
     for n in 1..=101 {
         bus.direct(n);
     }
-    let w = World::start(bus).await;
+    // A request timeout well past a loaded renew, so only a real reopen adds a read.
+    let w = World::with(bus, |t| t.request = Duration::from_secs(5)).await;
     let mut stream = w.s().deliveries();
     let mut got = Vec::new();
     for _ in 0..101 {
