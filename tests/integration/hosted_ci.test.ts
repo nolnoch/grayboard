@@ -282,3 +282,13 @@ test("hosted entry point uses frozen package commands and retains no private sta
     expect(result.exitCode, result.stderr.toString()).toBe(0);
   }
 });
+
+// #1482: test-pg names its files explicitly, so a new pg-only test (`*.pg.test.ts`, which skips without a Postgres URL)
+// must be listed there too, or only the root job's incidental Postgres URL ever runs it.
+test("test-pg lists every *.pg.test.ts in the tree", () => {
+  const step = (Bun.YAML.parse(read(".github/workflows/test.yml")) as any).jobs["test-pg"].steps.find((s: any) => s.name === "Test on Postgres");
+  const listed = new Set((step.run as string).split("\n").map(line => line.trim()).filter(line => line.endsWith(".test.ts")));
+  const present = [...new Bun.Glob("{src,tests,adapters,plugins}/**/*.pg.test.ts").scanSync({ cwd: root })].filter(path => !path.includes("node_modules/")).sort();
+  expect(present.length).toBeGreaterThan(0);
+  expect(present.filter(path => !listed.has(path))).toEqual([]);
+});
