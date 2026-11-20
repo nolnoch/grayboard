@@ -600,6 +600,14 @@ function holdingSession(db: Database, name: string, sessionId: string | null = n
  * under the child's ID; a taken one registers the new session, ends the
  * child and audits `id.promoted` (leaveRoot) before the hold.
  *
+ * `displace`: an adapter's child (BUS_ADAPTER_OWNER with a harness session)
+ * takes the name from a live sibling under the same harness pid that has no
+ * harness session (a grayboard the harness's MCP config starts beside the
+ * adapter's, whose pushes the harness drops, #1381): the sibling's hold is
+ * released and audited (`alias.displaced`) in the transaction that takes it,
+ * and the sibling is woken, so it finds its hold gone (mcp.ts syncHolds). Any
+ * other live holder refuses as ever.
+ *
  * The socket probe for a pre-upgrade holder (no live hold, live socket) runs
  * before the lock and is re-checked against the rows inside it, so the write
  * lock is never held across a probe. A dead holder doesn't skip it: a settled
@@ -609,9 +617,11 @@ export async function acquireName(
   db: Database,
   sessionId: string,
   name: string,
-  opts: { create: boolean; allowHuman?: boolean; restartOf?: string; meta?: AliasMetaSet; promote?: Leave },
+  opts: { create: boolean; allowHuman?: boolean; restartOf?: string; meta?: AliasMetaSet; promote?: Leave; displace?: number },
 ): Promise<AcquireResult> {
   const before = holdingSession(db, name, sessionId);
+  // A holder that acquires and listens here makes the probe below answer: its own socket (#1381).
+  testPause("bind:before-poke");
   const sockLive = before && isAlive(before.pid, before.proc_start) ? false : await poke(name);
 
   testPause("bind:before-txn");
@@ -633,15 +643,23 @@ export async function acquireName(
       return refuse(unknownNameError(name, known), { known });
     }
     const holder = holdingSession(db, name, sessionId);
-    if (holder && isAlive(holder.pid, holder.proc_start)) {
+    const live = holder !== null && isAlive(holder.pid, holder.proc_start);
+    if (live && (opts.displace === undefined || !displaceableRow(db, holder, opts.displace))) {
       const who = describeHolder(holder);
       return refuse(aliasHeldText(name, who, "bind another name"), { holder: who });
     }
-    if (holder) ended = reap(db, [holder], now);
-    if (sockLive) {
+    // A live socket with a displaceable live holder is that holder's (it
+    // acquired and listened after the read above): no refusal, so a
+    // displacement never commits beside a refused acquire (#1381 audit).
+    if (sockLive && !live) {
+      if (holder) ended = reap(db, [holder], now);
       const who = noRowHolder(db, name, before !== null || holder !== null);
       return refuse(aliasHeldText(name, who, "bind another name"), { holder: who });
     }
+    if (live) {
+      displaceHold(db, holder, name, sessionId, now);
+      ended.wake.push(holder.session_id);
+    } else if (holder) ended = reap(db, [holder], now);
     if (opts.promote) {
       const promoted = leaveRoot(db, opts.promote, "id.promoted", `promoted to its own session ${sessionId}`, now);
       ended = { ended: [...ended.ended, ...promoted.ended], wake: [...new Set([...ended.wake, ...promoted.wake])] };
@@ -693,6 +711,32 @@ export function setHeldMeta(db: Database, sessionId: string, name: string, meta:
     setAliasMeta(db, name, meta, sessionId, coreAuditSink(db));
     return true;
   }).immediate();
+}
+
+// A live holder an adapter's child may take a name from (#1381): an unkeyed
+// root under the same harness pid with no harness session, which receives.
+// An adapter's own child always has a harness session, so a restart's
+// predecessor is never displaced: it is waited for (siblingGone).
+function displaceableRow(db: Database, r: SessionRow, harnessPid: number): boolean {
+  return r.harness_pid === harnessPid && r.harness_rule === null && db.prepare(
+    `SELECT 1 FROM ids WHERE id = ? AND harness_session IS NULL AND keyed = 0 AND viewer = 0 AND delivery = 'push' AND ended_at IS NULL`,
+  ).get(r.session_id) !== null;
+}
+
+/** Whether `name`'s live holder is one `displace` would take it from, for a restart deciding whether to wait. */
+export function displaceableHolder(db: Database, name: string, harnessPid: number): boolean {
+  const r = holdingSession(db, name);
+  return r !== null && isAlive(r.pid, r.proc_start) && displaceableRow(db, r, harnessPid);
+}
+
+// The displaced session's hold goes as an unbind's does (releaseName), logged
+// as released with who took it, and audited. Inside acquireName's transaction.
+function displaceHold(db: Database, r: SessionRow, name: string, by: string, now: number): void {
+  dropHold(db, name, r.session_id);
+  const rest = holdsOf(db, r.session_id);
+  db.prepare(`UPDATE bindings SET name = ? WHERE session_id = ? AND name = ?`).run(rest.length ? primaryOf(rest, r.session_id) : null, r.session_id, name);
+  logBinding(db, r.session_id, name, "released", `displaced by ${by}`, now);
+  writeCoreAudit(db, "alias.displaced", by, r.session_id, { name, harness_pid: r.harness_pid, pid: r.pid });
 }
 
 /** How long a restart waits, in all, for the process it replaces to exit. */

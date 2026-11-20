@@ -66,7 +66,4 @@ for (const kind of ["keyed", "human", "runner"] as const) {
 
 test("omp local, ACP: of two top-level sessions in one omp process, the first runs grayboard and the second is refused; while both live, no subagent of either gets grayboard tools, so none acts as the first session's names (#523, #470)", () => ompLocalAcpScenario(dir), 120_000);
 test("omp local, ACP: a tools-only (BUS_PUSH=off) grayboard among the client's declared mcpServers is reported once and not refused: by its tools under another name, by its process when named grayboard, whose tools omp drops; the adapter's own tools are never reported; started first, it leaves the adapter's child its name (#1140, #1228)", () => ompLocalAcpClientGrayboardScenario(dir), 120_000);
-// Fails today: a push-on grayboard the client declares, started first, takes
-// omp-local and the adapter's child runs unbound. When #1381 is fixed this
-// passes, so test.failing goes red: promote it to a plain test.
-test.failing("omp local, ACP: a push-on grayboard among the client's declared mcpServers, started first, leaves the adapter's child its name (#1381)", () => ompLocalAcpClientGrayboardScenario(dir, { push: true }), 120_000);
+test("omp local, ACP: a push-on grayboard among the client's declared mcpServers, started first, takes omp-local, and the adapter's child takes it back from that sibling when it starts (#1381)", () => ompLocalAcpClientGrayboardScenario(dir, { push: true }), 120_000);
