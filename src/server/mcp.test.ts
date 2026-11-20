@@ -21,12 +21,12 @@ import { sessionContext } from "./hosted.ts";
 import { OPENCODE_CLIENT } from "./oauth-config.ts";
 import { DEFAULT_MCP_LIMITS, type McpLimits } from "./config.ts";
 import { stubAuthRead } from "../../tests/support/auth_stub.ts";
-import type { Read } from "./store/tx.ts";
+import { isTx, type Read } from "./store/tx.ts";
 import { sessionEndPort } from "./session_end.ts";
 import { scratchDbPath } from "../../tests/support/scratch_db.ts";
 import { seed } from "../../tests/support/seed.ts";
 import { until } from "../../tests/support/until.ts";
-import { TEST_BACKEND, testSqlite } from "../../tests/support/server.ts";
+import { TEST_BACKEND } from "../../tests/support/server.ts";
 import { drained, execOn, pgText, row, rows } from "../../tests/support/repo_sql.ts";
 const meta = { "ai.opencode/sessionID": "test-root" };
 const issuedOAuth = (repo: Parameters<typeof issueOAuth>[0], resource: string, email = "alice@example.com", scopes = ["grayboard:tools"]) => issueOAuth(repo, resource, email, scopes, Date.now(), OPENCODE_CLIENT);
@@ -1446,11 +1446,35 @@ test("an unbind stops only its own session's listen, through the per-row notice 
   await kept.close();
 });
 
+// Every call to a Repo group's method (repo.hosted.get, repo.bindings.holdsOf, …) until restore(), with whether its
+// handle was a body's Tx (#1497): the backend-agnostic oracle for which rows a path reads, and on what. Callers reach
+// the groups through the Repo's own objects (hosted.ts's `store` is repo.hosted), so a replaced method sees each call.
+function repoCalls(repo: Repo): { readonly list: { method: string; tx: boolean }[]; restore(): void } {
+  const list: { method: string; tx: boolean }[] = [], restores: (() => void)[] = [];
+  for (const [group, value] of Object.entries(repo)) {
+    if (value === null || typeof value !== "object" || Array.isArray(value)) continue;
+    const g = value as Record<string, unknown>;
+    for (const [name, fn] of Object.entries(g)) {
+      if (typeof fn !== "function") continue;
+      g[name] = function (this: unknown, ...args: unknown[]) {
+        list.push({ method: `${group}.${name}`, tx: isTx(args[0] as Read) });
+        return (fn as (...a: unknown[]) => unknown).apply(this, args);
+      };
+      restores.push(() => { g[name] = fn; });
+    }
+  }
+  return { list, restore() { for (const r of restores.reverse()) r(); } };
+}
+// The Repo reads of a hosted_sessions row (any filter), and of alias_holds: what the SQL spies these replaced matched
+// by table name. hosted.idle reads both.
+const HOSTED_READS = new Set(["hosted.get", "hosted.lock", "hosted.owned", "hosted.all", "hosted.counts", "hosted.ofOwnership", "hosted.children", "hosted.roots", "hosted.expired", "hosted.idle", "hosted.disabled"]);
+const HOLDS_READS = new Set(["bindings.holdsOf", "bindings.holdsOfMany", "bindings.holderOf", "bindings.holdersOf", "bindings.userOf", "bindings.addressSet", "bindings.aliasUses", "hosted.holds", "hosted.idle"]);
+
 // #807 P3 B1b: a commit's notice judges a live synchronously, so whether its root holds a name comes from the stamp
 // its authorize read with the generation, never from a holds read outside a transaction.
-// SQLite only: the oracle is a spy on bun:sqlite's Database.prototype.query and its inTransaction.
-testSqlite("#807 P3 B1b: a notice that keeps a bound root's generation keeps its listen, judged with no holds read", async () => {
-  const { Database } = await import("bun:sqlite");
+// The oracle (#1497): the Repo's holds reads during the notice, each with its handle; one on a pool Read is outside
+// any transaction. The handle, not txSpy's open count: a judge in the commit's afterCommit runs while its body counts open.
+test("#807 P3 B1b: a notice that keeps a bound root's generation keeps its listen, judged with no holds read", async () => {
   const client = await connect();
   expect((await client.callTool({ name: "bind", arguments: { name: "fe", create: true } })).isError).not.toBe(true);
   expect((await client.callTool({ name: "board_create", arguments: { name: "held", purpose: "B1b" } })).isError).not.toBe(true);
@@ -1458,27 +1482,23 @@ testSqlite("#807 P3 B1b: a notice that keeps a bound root's generation keeps its
   expect(hosted.activeListens).toBe(1);
   const root = async (r: Read) => (await store.repo.hosted.all(r)).find(row => !row.root_session_id && row.user_id === user.user_id)!;
   // Holds reads outside any transaction: the pool's, as bindingLive's was before B1b.
-  const pooled: string[] = [];
-  const query = Database.prototype.query;
-  const spy = spyOn(Database.prototype, "query").mockImplementation(function (this: InstanceType<typeof Database>, sql: string) {
-    if (sql.includes("alias_holds") && !this.inTransaction) pooled.push(sql);
-    return query.call(this, sql);
-  } as typeof query);
+  const calls = repoCalls(store.repo);
   try {
     // A commit to the root's row that leaves its generation: its notice carries the row, and the judge keeps the live.
     await seed(store.repo, async tx => { const r = await root(tx); return store.repo.hosted.update(tx, r.session_id, { last_seen_at: r.last_seen_at + 1 }); });
     expect(hosted.activeListens).toBe(1);
-    expect(pooled).toEqual([]);
-  } finally { spy.mockRestore(); }
+    expect(calls.list.filter(c => HOLDS_READS.has(c.method) && !c.tx)).toEqual([]);
+    expect(calls.list.some(c => c.method === "hosted.update" && c.tx)).toBe(true); // the oracle sees the commit's calls
+  } finally { calls.restore(); }
   // The same path still stops it once the generation moves.
   await seed(store.repo, async tx => { const r = await root(tx); return store.repo.hosted.update(tx, r.session_id, { bind_gen: r.bind_gen + 1 }); });
   await untilHosted(() => hosted.activeListens === 0);
   await listen.close();
 });
 
-// SQLite only: the row-read count is a spy on bun:sqlite's Database.prototype.query.
-testSqlite("#902: a native tool call authorizes under one auth-generation read and leaves its row to the hosted gate", async () => {
-  const { Database } = await import("bun:sqlite");
+// The row reads are the Repo's by-ID reads of a hosted row, hosted.get and hosted.lock (#1497): on SQLite, the only
+// two that run `SELECT * FROM hosted_sessions WHERE session_id = ?`, the statement this counted before.
+test("#902: a native tool call authorizes under one auth-generation read and leaves its row to the hosted gate", async () => {
   const client = await connect();
   await client.callTool({ name: "board_list", arguments: {} });
   // The exchange's authorization check reads through the async form since #807 P3 A7d.
@@ -1486,11 +1506,11 @@ testSqlite("#902: a native tool call authorizes under one auth-generation read a
   let depth = 0, pinned = 0, unpinned = 0;
   store.repo.authRead = async fn => { depth++; try { return await authRead(fn); } finally { depth--; } };
   application.revalidateSession = (session, allowUnbound) => { if (depth) pinned++; else unpinned++; return validate(session, allowUnbound); };
-  const query = spyOn(Database.prototype, "query");
+  const calls = repoCalls(store.repo);
   try {
     const listed = await client.callTool({ name: "board_list", arguments: {} });
     expect(listed.isError).not.toBe(true);
-    const rowReads = query.mock.calls.filter(([s]) => String(s) === "SELECT * FROM hosted_sessions WHERE session_id = ?").length;
+    const rowReads = calls.list.filter(c => c.method === "hosted.get" || c.method === "hosted.lock").length;
     // Before #902: nine row reads (authorize's own, besides the exchange's and the tool's hosted gates), and the
     // user check outside the grant check's generation read. Before #907: eight; before #998: five. Now four: the
     // exchange's gate reads the row and settles it; the tool's gate checks the exchange's verdict still holds and
@@ -1498,7 +1518,7 @@ testSqlite("#902: a native tool call authorizes under one auth-generation read a
     // and the call ends inside the touch window, so its end touch reads nothing.
     expect(rowReads).toBe(4);
     expect({ pinned, unpinned }).toEqual({ pinned: 1, unpinned: 0 });
-  } finally { query.mockRestore(); store.repo.authRead = authRead; application.revalidateSession = validate; }
+  } finally { calls.restore(); store.repo.authRead = authRead; application.revalidateSession = validate; }
 });
 
 // #899: the stream timer re-reads a live's hosted rows only when they could have changed. A listen checked once
@@ -1987,23 +2007,21 @@ test("#807 P3 A7d: a legacy session a POST re-authorizes while the sweep's reads
   await raw.delete();
 });
 
-// SQLite only: the oracle is a spy on bun:sqlite's Database.prototype.query and prepare.
-testSqlite("#899: a quiet tick reads no hosted row or alias hold for a stamped listen or legacy GET", async () => {
-  const { Database } = await import("bun:sqlite");
+// The oracle (#1497): every Repo method the quiet ticks call; none may read a hosted row or an alias hold.
+test("#899: a quiet tick reads no hosted row or alias hold for a stamped listen or legacy GET", async () => {
   const f = await stampedListen();
   const legacy = await connect("2025-11-25");
   expect(await legacy.subscribeResource({ uri: "grayboard://boards/stamped" })).toEqual({});
   await untilHosted(() => hosted.activeGetStreams === 1);
   await f.tick();
-  const query = spyOn(Database.prototype, "query"), prepare = spyOn(Database.prototype, "prepare");
+  const calls = repoCalls(store.repo);
   try {
     for (let i = 0; i < 5; i++) { f.time.now += 1000; await f.tick(); }
-    const reads = [...query.mock.calls, ...prepare.mock.calls].map(([sql]) => String(sql)).filter(sql => /hosted_sessions|alias_holds/.test(sql));
     // Before #899: every tick read each live's row and root and, for its binding, the root's holds.
-    expect(reads).toEqual([]);
+    expect(calls.list.filter(c => HOSTED_READS.has(c.method) || HOLDS_READS.has(c.method))).toEqual([]);
     expect(hosted.activeListens).toBe(1);
     expect(hosted.activeGetStreams).toBe(1);
-  } finally { query.mockRestore(); prepare.mockRestore(); }
+  } finally { calls.restore(); }
   await f.listen.close();
   await legacy.close();
 });
