@@ -41,7 +41,7 @@ describe("a lost answer, then the same call from the same session", () => {
   const n = (sql: string, ...args: (string | number)[]) => (srv.app.db.prepare(sql).get(...args) as { n: number }).n;
 
   beforeAll(async () => {
-    srv = new TestServer();
+    srv = await TestServer.open();
     alice = await srv.login("alice@example.com");
     bob = await srv.login("bob@example.com");
   });
@@ -140,7 +140,7 @@ describe("a lost answer over hosted MCP, then the same call (server process)", (
 
   beforeAll(async () => {
     dir = mkdtempSync(join(tmpdir(), "gb-dedup-"));
-    srv = await ServerProcess.start([process.execPath, join(ROOT, "src/server/main.ts")], join(dir, "bus.db"), {
+    srv = await ServerProcess.start([process.execPath, join(ROOT, "src/server/main.ts")], { dbPath: join(dir, "bus.db") }, {
       BUS_TEST_PAUSE: PAUSE, BUS_TEST_PAUSE_FILE: go(),
       // Inbox polling spends hosted requests.
       GRAYBOARD_HOSTED_REQUEST_BURST: "10000", GRAYBOARD_HOSTED_REQUEST_PER_SEC: "10000",
@@ -241,7 +241,7 @@ describe("dedup and state answers (in process)", () => {
   let you: string;
   beforeEach(async () => {
     clock = Date.now();
-    srv = new TestServer({}, { now: () => clock });
+    srv = await TestServer.open({}, { now: () => clock });
     you = await srv.login("you@example.com");
   });
   afterEach(() => srv.stop());

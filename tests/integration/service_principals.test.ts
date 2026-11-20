@@ -18,7 +18,7 @@ import { ServerProcess, TestServer } from "../support/server.ts";
 const A = "alice@example.com", B = "bob@example.com", ROOT = "root@example.com", SVC = "ingest";
 
 let srv: TestServer;
-beforeEach(() => { srv = new TestServer({ admins: [ROOT], hostedRequestLimit: { burst: 10_000, perSec: 10_000 } }); });
+beforeEach(async () => { srv = await TestServer.open({ admins: [ROOT], hostedRequestLimit: { burst: 10_000, perSec: 10_000 } }); });
 afterEach(() => srv.stop());
 
 const api = (token: string, method: string, path: string, body?: unknown) => srv.api(token, method, path, body);
@@ -306,7 +306,7 @@ describe("audit fixes (#270 step 2)", () => {
 
   test("admin role list leaves out a GRAYBOARD_ADMINS entry that is no email", async () => {
     await srv.stop();
-    srv = new TestServer({ admins: [ROOT, SVC], hostedRequestLimit: { burst: 10_000, perSec: 10_000 } });
+    srv = await TestServer.open({ admins: [ROOT, SVC], hostedRequestLimit: { burst: 10_000, perSec: 10_000 } });
     const root = await service();
     const l = await api(root, "GET", "/api/admin/roles?role=org_admin");
     expect(l.body.bindings.map((b: { principal: string }) => b.principal)).toEqual([ROOT]);
@@ -362,7 +362,7 @@ describe("audit fixes (#270 step 2)", () => {
 
   test("at the alias cap a service is pointed at the admin route", async () => {
     await srv.stop();
-    srv = new TestServer({ admins: [ROOT], aliasScopeCap: 1, hostedRequestLimit: { burst: 10_000, perSec: 10_000 } });
+    srv = await TestServer.open({ admins: [ROOT], aliasScopeCap: 1, hostedRequestLimit: { burst: 10_000, perSec: 10_000 } });
     await service();
     const s = await srv.hosted(SVC, "w-1");
     expect(await refusedText(s.call("bind", { name: "w-2", create: true }))).toContain(`service "${SVC}" already has 1 names, the server's cap of 1; bind an existing name, or an admin frees one with grayboard admin service delete-alias ${SVC} <name>`);
@@ -371,7 +371,7 @@ describe("audit fixes (#270 step 2)", () => {
 
 test("the CLI creates, lists, disables and enables a service against a server process", async () => {
   const dir = mkdtempSync(join(tmpdir(), "gb-services-cli-"));
-  const server = await ServerProcess.start([process.execPath, join(REPO_ROOT, "src/server/main.ts")], join(dir, "bus.db"), { GRAYBOARD_ADMINS: ROOT });
+  const server = await ServerProcess.start([process.execPath, join(REPO_ROOT, "src/server/main.ts")], { dbPath: join(dir, "bus.db") }, { GRAYBOARD_ADMINS: ROOT });
   try {
     const root = await server.login(ROOT);
     await server.login(A);

@@ -8,7 +8,7 @@ import { afterEach, expect, test } from "bun:test";
 import { FakeSlack } from "./fake_slack.ts";
 import { refusal } from "../support/app_session.ts";
 import { closeSessions } from "../support/mcp.ts";
-import { TestServer } from "../support/server.ts";
+import { TestServer, type TestServerOverrides } from "../support/server.ts";
 import { until } from "../support/until.ts";
 
 const A = "alice@example.com";
@@ -19,8 +19,8 @@ afterEach(async () => {
   for (const f of cleanup.splice(0)) f();
 });
 
-function serve(o: ConstructorParameters<typeof TestServer>[0]): TestServer {
-  const srv = new TestServer(o);
+async function serve(o: TestServerOverrides): Promise<TestServer> {
+  const srv = await TestServer.open(o);
   cleanup.push(() => srv.stop());
   return srv;
 }
@@ -30,7 +30,7 @@ const count = (srv: TestServer, sql: string, ...args: string[]) => (srv.app.db.q
 
 test("a bind over the user's bucket is refused with a wait, writes nothing about the name, and passes after the wait", async () => {
   // Each bind takes a token (#284: binds create aliases).
-  const srv = serve({ helloLimit: { burst: 3, perSec: 4 } });
+  const srv = await serve({ helloLimit: { burst: 3, perSec: 4 } });
   const alice = await srv.login(A);
   const bob = await srv.login("bob@example.com");
   const a = srv.appSession(alice, null);
@@ -72,7 +72,7 @@ test("a bind over the user's bucket is refused with a wait, writes nothing about
 test("the heartbeat's sweep ends a run nobody binds after, and drops the refilled bucket (#247)", async () => {
   // The limiter on a clock the test moves; the sweep is what the 30s heartbeat runs.
   const clock = { t: Date.now() };
-  const srv = new TestServer({ helloLimit: { burst: 2, perSec: 0.1 } }, { now: () => clock.t });
+  const srv = await TestServer.open({ helloLimit: { burst: 2, perSec: 0.1 } }, { now: () => clock.t });
   cleanup.push(() => srv.stop());
   const a = srv.appSession(await srv.login(A), null);
   await a.connect();
@@ -98,7 +98,7 @@ test("the heartbeat's sweep ends a run nobody binds after, and drops the refille
 test("the Slack bridge's human connection is exempt", async () => {
   const slack = new FakeSlack({ channel: "D0ALICE", owner: "U0ALICE", channelType: "im" });
   cleanup.push(() => slack.stop());
-  const srv = serve({ helloLimit: { burst: 1, perSec: 0.01 }, slack: { appToken: "xapp-1-t", botToken: "xoxb-t", apiUrl: slack.api } });
+  const srv = await serve({ helloLimit: { burst: 1, perSec: 0.01 }, slack: { appToken: "xapp-1-t", botToken: "xoxb-t", apiUrl: slack.api } });
   await srv.app.slackReady;
   const alice = await srv.login(A);
   const a = srv.appSession(alice, null);
@@ -113,7 +113,7 @@ test("the Slack bridge's human connection is exempt", async () => {
 });
 
 test("a bind spends the user's bucket and the next is refused, writing no alias", async () => {
-  const srv = serve({ helloLimit: { burst: 2, perSec: 0.01 } });
+  const srv = await serve({ helloLimit: { burst: 2, perSec: 0.01 } });
   const alice = await srv.login(A);
   const a = srv.appSession(alice, null);
   await a.connect();

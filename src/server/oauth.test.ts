@@ -37,7 +37,7 @@ const googleKey = () => googleKeyPair ??= generateKeyPair("RS256").then(async ({
   ({ jwk: { ...await exportJWK(publicKey), kid: "google-fixture", alg: "RS256", use: "sig" }, privateKey }));
 const s256 = (s: string) => createHash("sha256").update(s).digest("base64url");
 let dir: string, storage: ReturnType<typeof openDatabase>, service: ReturnType<typeof createOAuthServer>, server: ReturnType<typeof Bun.serve>;
-let config: Config, base: string, clock: number, exchanges: number;
+let config: Config & { store: { kind: "sqlite" } }, base: string, clock: number, exchanges: number;
 let mcp: ReturnType<typeof createMcpHandler>;
 const liveClients: Client[] = [];
 const registrations: OAuthClient[] = [
@@ -70,7 +70,7 @@ beforeEach(() => {
     return mcp.fetch(req);
   } });
   base = `http://127.0.0.1:${server.port}`;
-  config = { dbPath: join(dir, "db.sqlite"), blobDir: join(dir, "blobs"), httpPort: 0, googleClientId: "fake-upstream", googleClientSecret: "", orgDomain: "example.com", publicUrl: base,
+  config = { store: { kind: "sqlite" as const, path: join(dir, "db.sqlite") }, blobDir: join(dir, "blobs"), httpPort: 0, googleClientId: "fake-upstream", googleClientSecret: "", orgDomain: "example.com", publicUrl: base,
     devAuth: true, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES, messageRetentionDays: 90, auditRetentionDays: 90, oauthClients: registrations,
     oauthCimdClients: [OPENCODE_CLIENT, "https://client.example/metadata.json", "https://client.example/client.json"] };
   service = makeService();
@@ -777,7 +777,7 @@ test("explicit consent and code survive service/database restart; distinct grant
   expect((await decide(browser, a.consent)).status).toBe(400);
   const oldCookies = [...browser.jar];
   service.close(); storage.db.close();
-  storage = openDatabase(config.dbPath, { blobDir: config.blobDir , sessionEnd: sessionEndPort("team") }); service = makeService();
+  storage = openDatabase(config.store.path, { blobDir: config.blobDir , sessionEnd: sessionEndPort("team") }); service = makeService();
   const tokens = await redeem(a); const p = await principal(tokens);
   expect(p.authed.session_id).toBe(0); expect(tokens.expires_in).toBe(3600); expect(tokens.token_type).toBe("Bearer");
   const b = await issue("subscriber", "grayboard:delivery", browser);
@@ -1386,8 +1386,8 @@ test("#853: a cached authorization ends with the write that ends it, from this c
     const ends: [string, (p: OAuthPrincipal) => unknown][] = [
       ["revokeAllForUser", p => seed(storage.repo, tx => storage.repo.sessions.revokeAllForUser(tx, p.authed.user_id))],
       ["disable", p => seed(storage.repo, tx => storage.repo.users.setDisabled(tx, p.authed.user_id, true))],
-      ["another connection's grant revoke", p => { const other = new Database(config.dbPath); try { other.run("UPDATE oauth_grants SET revoked_at = ? WHERE id = ?", [clock, p.grantId]); } finally { other.close(); } }],
-      ["another connection's token delete", p => { const other = new Database(config.dbPath); try { other.run("DELETE FROM oauth_tokens WHERE hash = ?", [p.accessHash]); } finally { other.close(); } }],
+      ["another connection's grant revoke", p => { const other = new Database(config.store.path); try { other.run("UPDATE oauth_grants SET revoked_at = ? WHERE id = ?", [clock, p.grantId]); } finally { other.close(); } }],
+      ["another connection's token delete", p => { const other = new Database(config.store.path); try { other.run("DELETE FROM oauth_tokens WHERE hash = ?", [p.accessHash]); } finally { other.close(); } }],
     ];
     for (const [i, [what, end]] of ends.entries()) {
       const q = await mint(`end${i}@example.com`);
@@ -1416,7 +1416,7 @@ test("#881: one authorization reads the auth generation once, and a write betwee
     if (sql === "PRAGMA data_version") { const get = statement.get.bind(statement); statement.get = (...args: never[]) => { reads++; return get(...args); }; }
     return statement;
   } as typeof query);
-  const counted = (() => { try { return openDatabase(config.dbPath, { blobDir: config.blobDir , sessionEnd: sessionEndPort("team") }); } finally { spy.mockRestore(); } })();
+  const counted = (() => { try { return openDatabase(config.store.path, { blobDir: config.blobDir , sessionEnd: sessionEndPort("team") }); } finally { spy.mockRestore(); } })();
   const saved = storage;
   storage = counted;
   const counting = makeService();

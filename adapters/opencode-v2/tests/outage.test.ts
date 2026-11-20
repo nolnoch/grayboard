@@ -14,7 +14,7 @@ import { DEFAULT_TRUSTED_PROXIES } from "../../../src/server/client_addr.ts";
 
 test("a server that stops under a live wire surfaces ServerUnreachable on the next call and read (#423)", async () => {
   const dir = mkdtempSync(join(tmpdir(), "wire-423-"));
-  const app = startServer({ dbPath: join(dir, "bus.db"), blobDir: join(dir, "blobs"), httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl: "http://127.0.0.1", messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES }, { hostname: "127.0.0.1", background: false });
+  const app = startServer({ store: { kind: "sqlite", path: join(dir, "bus.db") }, blobDir: join(dir, "blobs"), httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl: "http://127.0.0.1", messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES }, { hostname: "127.0.0.1", background: false });
   let stopped = false;
   try {
     const issued = await issueOAuth(app.repo, app.oauth.resource, "you@example.com", ["grayboard:tools", "grayboard:delivery"], Date.now(), OPENCODE_CLIENT);
@@ -39,7 +39,7 @@ test("a server that stops under a live wire surfaces ServerUnreachable on the ne
 // accessExpiry() (what the controller classifies with) finds it either way.
 test("a real connect whose token provider finds the native token expired surfaces that expiry, not an outage", async () => {
   const dir = mkdtempSync(join(tmpdir(), "wire-424-"));
-  const app = startServer({ dbPath: join(dir, "bus.db"), blobDir: join(dir, "blobs"), httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl: "http://127.0.0.1", messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES }, { hostname: "127.0.0.1", background: false });
+  const app = startServer({ store: { kind: "sqlite", path: join(dir, "bus.db") }, blobDir: join(dir, "blobs"), httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl: "http://127.0.0.1", messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES }, { hostname: "127.0.0.1", background: false });
   try {
     const expired = new AccessExpired("OpenCode", "reconnect or sign in using OpenCode", "expired");
     const url = `http://127.0.0.1:${app.server.port}/mcp`;

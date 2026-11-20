@@ -22,7 +22,7 @@ import { hostedPause } from "../support/hosted-pause.ts";
 import { hostedRowCount } from "../support/hosted_rows.ts";
 import { ROOT as REPO_ROOT } from "../support/paths.ts";
 import { seed } from "../support/seed.ts";
-import { ServerProcess, TestServer } from "../support/server.ts";
+import { ServerProcess, TestServer, testSqlite } from "../support/server.ts";
 import { until } from "../support/until.ts";
 
 const A = "alice@example.com", ROOT = "root@example.com", SVC = "ingest";
@@ -61,9 +61,9 @@ let sessions: HostedSession[] = [];
 const open = async (s: HostedSession) => { sessions.push(s); await s.connect(); return s; };
 const fresh = async (overrides: Partial<Config> = {}) => {
   await srv?.stop();
-  srv = new TestServer({ admins: [ROOT], hostedRequestLimit: LIMIT, ...overrides });
+  srv = await TestServer.open({ admins: [ROOT], hostedRequestLimit: LIMIT, ...overrides });
 };
-beforeEach(async () => { srv = new TestServer({ admins: [ROOT], hostedRequestLimit: LIMIT }); });
+beforeEach(async () => { srv = await TestServer.open({ admins: [ROOT], hostedRequestLimit: LIMIT }); });
 afterEach(async () => {
   await Promise.allSettled(sessions.splice(0).map(s => s.drop()));
   await srv.stop();
@@ -106,7 +106,7 @@ describe("add: the secret reaches the launcher only", () => {
     // A run token and a session later, still nowhere in the database.
     await session(await token(srv.base, c));
     const rotated = await credential(root, { rotate: c.client_id });
-    const rows = everyRow(srv.config.dbPath);
+    const rows = everyRow(srv.dbPath);
     for (const secret of [c.client_secret, rotated.client_secret]) expect(rows).not.toContain(secret);
     expect(rows).toContain(sha256(c.client_secret));
   });
@@ -242,7 +242,7 @@ describe("the token route", () => {
     clock = Date.now();
     const interval = spyOn(globalThis, "setInterval");
     try {
-      srv = new TestServer({ admins: [ROOT], hostedRequestLimit: LIMIT, serviceTokens }, { oauth: { now: () => clock } });
+      srv = await TestServer.open({ admins: [ROOT], hostedRequestLimit: LIMIT, serviceTokens }, { oauth: { now: () => clock } });
       // The OAuth server's timer is the first minute-long one startServer sets (oauth.ts, before the hosted MCP's).
       return interval.mock.calls.find(([, ms]) => ms === 60_000)![0] as () => void;
     } finally { interval.mockRestore(); }
@@ -383,7 +383,7 @@ describe("the token route", () => {
     expect(await answer(`svc_${"0".repeat(32)}`)).toEqual(expected);
   });
 
-  test("a startup client, confidential or public, can't use client_credentials", async () => {
+  testSqlite("a startup client, confidential or public, can't use client_credentials", async () => {
     const secret = "startup-secret";
     await fresh({ oauthClients: [
       { clientId: "launcher", name: "launcher", redirectUris: ["http://127.0.0.1/cb"], scopes: ["grayboard:tools"], tokenEndpointAuthMethod: "client_secret_basic", clientSecretHash: sha256(secret), allowRefresh: true },
@@ -398,7 +398,8 @@ describe("the token route", () => {
 
   // The secret is checked on a read before the mint's write: a revoke, a secret's revoke or a disable that lands
   // between them is the insert's to refuse, which re-checks the credential, its grant, the secret and the service.
-  for (const revoke of ["credential", "secret", "disable", "user row"] as const) test(`a ${revoke} revoke between the secret's check and the mint refuses the mint`, async () => {
+  // The "user row" case is an operator's write on a second connection to the SQLite file.
+  for (const revoke of ["credential", "secret", "disable", "user row"] as const) (revoke === "user row" ? testSqlite : test)(`a ${revoke} revoke between the secret's check and the mint refuses the mint`, async () => {
     await fresh({ oauthLimit: { burst: 1, perSec: 0.001 } });
     const root = await service();
     const c = await credential(root);
@@ -409,7 +410,7 @@ describe("the token route", () => {
         : revoke === "disable" ? await api(root, "POST", "/api/admin/services/disable", { name: SVC })
         // An operator's UPDATE on another connection: the service disabled, its grants not revoked.
         : (() => {
-          const other = new Database(srv.config.dbPath);
+          const other = new Database(srv.dbPath);
           try { other.exec("PRAGMA busy_timeout = 5000"); other.run("UPDATE users SET disabled_at = ? WHERE email = ?", [Date.now(), SVC]); } finally { other.close(); }
           return { status: 200 };
         })();
@@ -683,13 +684,13 @@ describe("sessions", () => {
     expect(await mint(srv.base, c.client_id, c.client_secret)).toMatchObject({ status: 200 });
   });
 
-  test("a token is re-read on every call: one revoked on another connection refuses the next call", async () => {
+  testSqlite("a token is re-read on every call: one revoked on another connection refuses the next call", async () => {
     const root = await service();
     const c = await credential(root);
     const t = await token(srv.base, c);
     const s = await session(t);
     expect(await s.call("whoami")).toMatchObject({ primary: `${SVC}/w-1` });
-    const other = new Database(srv.config.dbPath);
+    const other = new Database(srv.dbPath);
     try {
       other.exec("PRAGMA busy_timeout = 5000");
       other.run("UPDATE oauth_tokens SET revoked_at = ? WHERE hash = ?", [Date.now(), sha256(t)]);
@@ -697,14 +698,14 @@ describe("sessions", () => {
     await refused(s.call("whoami"));
   });
 
-  test("the credential's expiry is its grant's: an expired grant refuses the session's next call and every mint", async () => {
+  testSqlite("the credential's expiry is its grant's: an expired grant refuses the session's next call and every mint", async () => {
     const root = await service();
     const at = Date.now() + 3_600_000;
     const c = await credential(root, { expires_at: at });
     expect(srv.app.db.query("SELECT g.expires_at FROM oauth_grants g JOIN service_credentials c ON c.grant_id = g.id WHERE c.client_id = ?").get(c.client_id)).toEqual({ expires_at: at });
     expect(srv.app.db.query("SELECT * FROM pragma_table_info('service_credentials') WHERE name LIKE '%expire%'").all()).toEqual([]);
     const s = await session(await token(srv.base, c));
-    const other = new Database(srv.config.dbPath);
+    const other = new Database(srv.dbPath);
     try {
       other.exec("PRAGMA busy_timeout = 5000");
       other.run("UPDATE oauth_grants SET expires_at = ? WHERE id = (SELECT grant_id FROM service_credentials WHERE client_id = ?)", [Date.now() - 1, c.client_id]);
@@ -810,7 +811,7 @@ test("against the compiled server: the CLI's credential, client_credentials with
   const local: HostedSession[] = [];
   try {
     const bin = await buildCli(join(dir, "grayboard-server"), { entry: "server" });
-    server = await ServerProcess.start(bin, join(dir, "bus.db"), { GRAYBOARD_ADMINS: ROOT, GRAYBOARD_HOSTED_REQUEST_SERVICE_BURST: "10000", GRAYBOARD_HOSTED_SUBSCRIBER_SERVICE_BURST: "10000" });
+    server = await ServerProcess.start(bin, { dbPath: join(dir, "bus.db") }, { GRAYBOARD_ADMINS: ROOT, GRAYBOARD_HOSTED_REQUEST_SERVICE_BURST: "10000", GRAYBOARD_HOSTED_SUBSCRIBER_SERVICE_BURST: "10000" });
     const base = server.base;
     const root = await server.login(ROOT);
     await server.login(A);

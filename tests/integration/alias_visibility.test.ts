@@ -19,7 +19,7 @@ let bob: string;
 let carol: string;
 
 beforeEach(async () => {
-  srv = new TestServer({ admins: [ADMIN], hostedRequestLimit: { burst: 10_000, perSec: 10_000 } });
+  srv = await TestServer.open({ admins: [ADMIN], hostedRequestLimit: { burst: 10_000, perSec: 10_000 } });
   alice = await srv.login("alice@example.com");
   bob = await srv.login("bob@example.com");
   carol = await srv.login("carol@example.com");

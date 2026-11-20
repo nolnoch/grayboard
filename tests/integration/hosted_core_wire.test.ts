@@ -13,7 +13,7 @@ import { until } from "../support/until.ts";
 const CLIENT = "grayboard-pi";
 let srv: TestServer;
 const wires: { close(): Promise<void> }[] = [];
-beforeEach(() => { srv = new TestServer({ hostedRequestLimit: { burst: 10_000, perSec: 10_000 } }); });
+beforeEach(async () => { srv = await TestServer.open({ hostedRequestLimit: { burst: 10_000, perSec: 10_000 } }); });
 afterEach(async () => {
   await Promise.all(wires.splice(0).map(w => w.close().catch(() => {})));
   await srv.stop();
@@ -202,7 +202,7 @@ test.each(["whoami", "bind"] as const)("an aborted %s on a real wire is its stop
 // and SDK, is exactly what listenCapacity matches, and the first listen's slot is held until it closes.
 test("a listen past the per-user listen cap is the refusal listenCapacity matches", async () => {
   await srv.stop();
-  srv = new TestServer({ hostedRequestLimit: { burst: 10_000, perSec: 10_000 }, mcpLimits: { ...DEFAULT_MCP_LIMITS, listen: { global: 128, perUser: 1 } } });
+  srv = await TestServer.open({ hostedRequestLimit: { burst: 10_000, perSec: 10_000 }, mcpLimits: { ...DEFAULT_MCP_LIMITS, listen: { global: 128, perUser: 1 } } });
   const token = await issue();
   const open = async (sessionID: string, name: string) => {
     const wire = subscriber(token, options(), sessionID);

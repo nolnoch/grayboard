@@ -18,7 +18,7 @@ for (const mode of ["stop", "receipt-failure", "stop-during-receipt"]) test(`hos
     return response;
   }) as typeof fetch;
   // Hosted inbox polling and the lease spend hosted requests.
-  const srv = new TestServer({ hostedRequestLimit: { burst: 10_000, perSec: 10_000 }, slack: { appToken: "xapp-1-test", botToken: "xoxb-test", apiUrl: slack.api } });
+  const srv = await TestServer.open({ hostedRequestLimit: { burst: 10_000, perSec: 10_000 }, slack: { appToken: "xapp-1-test", botToken: "xoxb-test", apiUrl: slack.api } });
   let restarted: SlackBridge | undefined;
   try {
     await srv.app.slackReady;

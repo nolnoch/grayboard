@@ -11,7 +11,7 @@ import type { DeliveryEvent } from "../../src/server/application.ts";
 import { AppSession } from "../support/app_session.ts";
 import { accessAudits } from "../support/audit.ts";
 import { HostedSession, HostedToolError, type InboxItem } from "../support/hosted_session.ts";
-import { TestServer } from "../support/server.ts";
+import { TestServer, testSqlite } from "../support/server.ts";
 import { serverAccess } from "../support/sync_access.ts";
 
 const A = "alice@example.com", B = "bob@example.com", C = "carol@example.com", D = "dave@example.com", E = "erin@example.com", ROOT = "root@example.com";
@@ -23,7 +23,7 @@ let sessions: HostedSession[] = [];
 let root: string;
 let tokens: Record<string, string> = {};
 beforeEach(async () => {
-  srv = new TestServer({ admins: [ROOT, E], hostedRequestLimit: LIMIT });
+  srv = await TestServer.open({ admins: [ROOT, E], hostedRequestLimit: LIMIT });
   root = await srv.login(ROOT);
   tokens = {};
   for (const e of [A, B, C, D, E]) tokens[e] = await srv.login(e);
@@ -95,7 +95,7 @@ async function missingBoardRefusal(s: HostedSession, tool = "board_post"): Promi
 }
 
 describe("D5: a service's board is a queue board in the service's scope", () => {
-  test("a service's queue board is service-scoped; its broadcast board, and every user's board, stay org-open", async () => {
+  testSqlite("a service's queue board is service-scoped; its broadcast board, and every user's board, stay org-open", async () => {
     const { w1 } = await cast();
     expect(scopeOf("jobs")).toBe(`service:${SVC}`);
     await w1.call("board_create", { name: "news", purpose: "announcements" });
@@ -106,7 +106,8 @@ describe("D5: a service's board is a queue board in the service's scope", () => 
     expect(scopeOf("bobq")).toBeNull();
   });
 
-  test("no one but the service creates in its scope: a user, the owner, another service, a team name", async () => {
+  // The sync_access oracle reads the SQLite handle.
+  testSqlite("no one but the service creates in its scope: a user, the owner, another service, a team name", async () => {
     await cast();
     const read = srv.app.repo.read;
     const access = boardAccess(srv.app.repo), core = serverAccess(srv.app.repo, srv.app.db);

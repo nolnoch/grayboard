@@ -13,16 +13,16 @@ import { cleanEnv } from "../support/env.ts";
 import { hostedPause } from "../support/hosted-pause.ts";
 import { ROOT as REPO_ROOT } from "../support/paths.ts";
 import { seed } from "../support/seed.ts";
-import { ServerProcess, TestServer } from "../support/server.ts";
+import { ServerProcess, TestServer, testSqlite } from "../support/server.ts";
 
 const A = "alice@example.com", B = "bob@example.com", C = "carol@example.com", ROOT = "root@example.com";
 
 let srv: TestServer;
 const restart = async (overrides: Partial<Config> = {}) => {
   await srv.stop();
-  srv = new TestServer(overrides);
+  srv = await TestServer.open(overrides);
 };
-beforeEach(() => { srv = new TestServer({ admins: [ROOT] }); });
+beforeEach(async () => { srv = await TestServer.open({ admins: [ROOT] }); });
 afterEach(() => srv.stop());
 
 const api = (token: string, method: string, path: string, body?: unknown) => srv.api(token, method, path, body);
@@ -51,11 +51,11 @@ describe("acceptance 1: granted at runtime, revoked with no restart", () => {
 
   // An operator's psql: the row deleted on another connection is the next decision's answer. A cache, even one the
   // store's own revoke would invalidate, fails here.
-  test("a binding deleted on another connection refuses the next request", async () => {
+  testSqlite("a binding deleted on another connection refuses the next request", async () => {
     const [root, alice] = [await srv.login(ROOT), await srv.login(A)];
     expect((await grant(root, "org_admin", A)).status).toBe(201);
     expect((await api(alice, "POST", "/api/admin/enable-user", { email: A })).status).toBe(200);
-    const other = new Database(srv.config.dbPath);
+    const other = new Database(srv.dbPath);
     try {
       other.exec("PRAGMA busy_timeout = 5000");
       other.run("DELETE FROM role_bindings");
@@ -65,7 +65,7 @@ describe("acceptance 1: granted at runtime, revoked with no restart", () => {
 
   test("the CLI grants, lists and revokes against a server process", async () => {
     const dir = mkdtempSync(join(tmpdir(), "gb-roles-cli-"));
-    const server = await ServerProcess.start([process.execPath, join(REPO_ROOT, "src/server/main.ts")], join(dir, "bus.db"), { GRAYBOARD_ADMINS: ROOT });
+    const server = await ServerProcess.start([process.execPath, join(REPO_ROOT, "src/server/main.ts")], { dbPath: join(dir, "bus.db") }, { GRAYBOARD_ADMINS: ROOT });
     try {
       const [root, alice] = [await server.login(ROOT), await server.login(A)];
       // A credentials file per signed-in user (mode 0600), as `grayboard login` writes it.

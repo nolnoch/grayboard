@@ -269,7 +269,7 @@ test("real bearer CLI claim route hints committed posts without attention subscr
   resources.watch(a, boardResourceUri("private"), privateHint, true);
   resources.watch(b, boardResourceUri("private"), removedHint, true);
   const config: Config = {
-    dbPath: scratchDbPath(), blobDir: dir, httpPort: 0,
+    store: { kind: "sqlite" as const, path: scratchDbPath() }, blobDir: dir, httpPort: 0,
     devAuth: true, publicUrl: "http://localhost", googleClientId: "dev", googleClientSecret: "",
     messageRetentionDays: 90, auditRetentionDays: 90, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES, orgDomain: "example.com",
   };

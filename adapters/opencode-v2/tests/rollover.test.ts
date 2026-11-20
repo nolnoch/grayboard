@@ -24,7 +24,7 @@ const ORIGIN = "https://grayboard.example.com", ROOT = `ses_${"a".repeat(64)}`;
 // expiry poll, about 1.0 s after that close (the close's 500 ms backoff, then one 500 ms poll), as on prod.
 test("a real access-expiry stream close with OpenCode's refresh landing after it keeps the ownership and push delivery (#472)", async () => {
   const dir = mkdtempSync(join(tmpdir(), "rollover-472-"));
-  const app = startServer({ dbPath: join(dir, "bus.db"), blobDir: join(dir, "blobs"), httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl: ORIGIN, messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES }, { hostname: "127.0.0.1", background: false });
+  const app = startServer({ store: { kind: "sqlite", path: join(dir, "bus.db") }, blobDir: join(dir, "blobs"), httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl: ORIGIN, messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES }, { hostname: "127.0.0.1", background: false });
   setAccess(app.db, openAccess(app.db)); // core seeds on a server database opt in to local mode's open Access
   const fetch0 = globalThis.fetch;
   globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {

@@ -107,7 +107,7 @@ async function serverFromEnvFile(): Promise<{ server: ServerProcess; dbPath: str
     "",
   ].join("\n"));
   const { GRAYBOARD_DB_PATH: dbPath, ...env } = readEnvFile(envFile);
-  return { server: await ServerProcess.start(SERVER, dbPath!, env), dbPath: dbPath! };
+  return { server: await ServerProcess.start(SERVER, { dbPath: dbPath! }, env), dbPath: dbPath! };
 }
 
 test("server: the compiled server, started from an env file, relays a DM and its reply between hosted MCP sessions", async () => {

@@ -161,7 +161,7 @@ test("install.sh installs the latest release; setup --local registers it with ev
 
 test("setup --server keeps the sign-in at mode 600; logout truncates it; setup --local removes it", async () => {
   label = "setup-server-logout";
-  srv = new TestServer();
+  srv = await TestServer.open();
   releases = new ReleaseServer(REPO, TAG, { [TAG]: { [ASSET]: built } });
   await expectOk(install({ GRAYBOARD_VERSION: TAG }));
   await expectOk(grayboard("login", "--dev", "you@example.com", "--server", srv.base));

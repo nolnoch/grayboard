@@ -23,8 +23,8 @@ const C = "carol@example.com";
 const ROOT = "root@example.com";
 
 let srv: TestServer;
-beforeEach(() => {
-  srv = new TestServer({ admins: [ROOT], hostedRequestLimit: { burst: 10_000, perSec: 10_000 } });
+beforeEach(async () => {
+  srv = await TestServer.open({ admins: [ROOT], hostedRequestLimit: { burst: 10_000, perSec: 10_000 } });
 });
 const clients: Client[] = [];
 afterEach(async () => {

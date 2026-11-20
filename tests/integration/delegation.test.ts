@@ -16,7 +16,7 @@ import { direct } from "../support/events.ts";
 import { seed } from "../support/seed.ts";
 import { localEnv } from "../support/env.ts";
 import { call, closeSessions, localSession, stopSession } from "../support/mcp.ts";
-import { TestServer } from "../support/server.ts";
+import { TestServer, type TestServerOverrides } from "../support/server.ts";
 import { until } from "../support/until.ts";
 
 let dir: string;
@@ -25,7 +25,7 @@ type Peer = { handle: string; launcher?: true };
 type Delegated = { to: string; message_id: number; delivered_now: boolean; human_fallback?: true; note: string };
 type Inbox = { unanswered?: { id: number; from: string }[]; promised?: { to: string }[] };
 // A server whose hosted sessions can poll their inbox freely.
-const serve = (o: ConstructorParameters<typeof TestServer>[0] = {}) => new TestServer({ hostedRequestLimit: { burst: 10_000, perSec: 10_000 }, ...o });
+const serve = (o: TestServerOverrides = {}) => TestServer.open({ hostedRequestLimit: { burst: 10_000, perSec: 10_000 }, ...o });
 
 // A connected application session declared a launcher, as a hosted
 // request's launcher declaration does (#473).
@@ -166,7 +166,7 @@ test("local: no live launcher surfaces the request to the declared human", async
 }, 30_000);
 
 test("server: the launcher flag on a session's ID records the capability; delegate delivers", async () => {
-  const srv = serve();
+  const srv = await serve();
   try {
     const token = await srv.login("you@example.com");
     const be = await launcher(srv, token, "be");
@@ -210,7 +210,7 @@ test("server: the launcher flag on a session's ID records the capability; delega
 }, 30_000);
 
 test("server: a launcher naming itself is refused as self-delegation, and nothing is sent (#253)", async () => {
-  const srv = serve();
+  const srv = await serve();
   try {
     const token = await srv.login("you@example.com");
     const be = await launcher(srv, token, "be");
@@ -226,7 +226,7 @@ test("server: a launcher naming itself is refused as self-delegation, and nothin
 }, 30_000);
 
 test("server: delegation stays within the requester's user (review 1-2)", async () => {
-  const srv = serve();
+  const srv = await serve();
   try {
     // Two users, one launcher each. alice's launcher sorts before bob's.
     const alice = await srv.login("alice@example.com");
@@ -260,7 +260,7 @@ test("server: delegation stays within the requester's user (review 1-2)", async 
 // requester on `eng/sim` is judged by its signed-in user, not by the
 // `eng/` its handle shares with a teammate's launcher.
 test("server: a team alias doesn't carry delegation to a teammate's launcher", async () => {
-  const srv = serve();
+  const srv = await serve();
   try {
     const alice = await srv.login("alice@example.com");
     const bob = await srv.login("bob@b.com");
@@ -290,7 +290,7 @@ test("server: a team alias doesn't carry delegation to a teammate's launcher", a
 // #807 P1c-13: a delegate's peer resolution (a bare name in or outside the sender's scope) and its hidden-team-alias
 // check read aliases on the request's Tx, not the pool.
 test("server: a delegate reads aliases on its body's Tx (#807 P1c-13)", async () => {
-  const srv = serve();
+  const srv = await serve();
   const repo = srv.app.repo;
   const checks: { op: string; inTxn: boolean; handle: "pool" | "tx" }[] = [];
   const spies = (["find", "findAllByName"] as const).map((name) => {
@@ -319,7 +319,7 @@ test("server: a delegate reads aliases on its body's Tx (#807 P1c-13)", async ()
 // #807 P1c-14b, P3 B4b: a delegate's facts (the launchers, their users and open-request counts), the target's user, and
 // every messages read in its body run on the request's Tx, not the pool; core's decision reads nothing itself.
 test("server: a delegate reads its facts and messages on its body's Tx (#807 P1c-14b, P3 B4b)", async () => {
-  const srv = serve();
+  const srv = await serve();
   const repo = srv.app.repo;
   const checks: { op: string; inTxn: boolean; handle: "pool" | "tx" }[] = [];
   let route = "";
@@ -361,7 +361,7 @@ test("server: a delegate reads its facts and messages on its body's Tx (#807 P1c
 // launcher name that has since moved to a teammate's session is refused,
 // not answered with the first call's result.
 test("server: a delegate repeat after its launcher's name moved to another user is refused, not replayed", async () => {
-  const srv = serve();
+  const srv = await serve();
   try {
     const alice = await srv.login("alice@example.com");
     const bob = await srv.login("bob@b.com");
@@ -393,7 +393,7 @@ test("server: a delegate repeat after its launcher's name moved to another user 
 // says what the first call picked and how to pick afresh, and the audit row
 // names the pick.
 test("server: an auto-pick delegate repeat after its pick moved to another user names the pick and resend", async () => {
-  const srv = serve();
+  const srv = await serve();
   try {
     const alice = await srv.login("alice@example.com");
     const bob = await srv.login("bob@b.com");
@@ -457,7 +457,7 @@ test("local: a tools-only sidecar leaves the owner's launcher flag alone (review
 
 test("server: the human fallback checks Slack reachability (review 10)", async () => {
   // No launcher live, human not linked: refused with the undo.
-  const srv = serve();
+  const srv = await serve();
   try {
     const sim = await srv.hosted("you@example.com", "sim");
     await expect(sim.call("delegate", { persona: "p", task: "t" })).rejects.toThrow(/no live launcher session/);
@@ -513,7 +513,7 @@ test("local: a re-pick retracts the missed pick's message and returns the new on
 test("server: a reachable human fallback delivers end to end, and every refusal is audited (review 4/10)", async () => {
   const { FakeSlack } = await import("./fake_slack.ts");
   const slack = new FakeSlack({ channel: "D0ALICE", owner: "U0ALICE", channelType: "im" });
-  const srv = serve({ slack: { appToken: "xapp-1-t", botToken: "xoxb-t", apiUrl: slack.api } });
+  const srv = await serve({ slack: { appToken: "xapp-1-t", botToken: "xoxb-t", apiUrl: slack.api } });
   try {
     await srv.app.slackReady;
     const token = await srv.login("alice@example.com");
@@ -580,7 +580,7 @@ test("local and server: a delegate to a launcher session's second alias is accep
   expect(r).toMatchObject({ to: "be2", delivered_now: true });
   await until(() => be.pushes.some((p) => String(p.content).includes('"task": "local t"')), 10_000, "the local push");
 
-  const srv = serve();
+  const srv = await serve();
   try {
     const token = await srv.login("you@example.com");
     const sbe = await launcher(srv, token, "be");

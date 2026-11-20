@@ -22,12 +22,9 @@ let srv: TestServer;
 let alice: string;
 let bob: string;
 const A = "alice@example.com";
-// Restarts share a database at a path of its own; the last server opened
-// stands, and afterEach removes the temp dirs it made.
-const tempDirs: string[] = [];
 
 beforeEach(async () => {
-  srv = new TestServer({ hostedRequestLimit: { burst: 10_000, perSec: 10_000 } });
+  srv = await TestServer.open({ hostedRequestLimit: { burst: 10_000, perSec: 10_000 } });
   alice = await srv.login(A);
   bob = await srv.login("bob@example.com");
 });
@@ -35,7 +32,6 @@ beforeEach(async () => {
 afterEach(async () => {
   await closeSessions();
   await srv.stop();
-  for (const d of tempDirs.splice(0)) rmSync(d, { recursive: true, force: true });
 });
 
 function rows<T>(sql: string, ...args: (string | number)[]): T[] {
@@ -64,12 +60,10 @@ async function endIt(s: AppSession): Promise<void> {
   s.close();
   await seed(srv.app.repo, tx => endId(srv.app.repo, tx, s.id, "exit"));
 }
-// The server restarts on the same database, a new in-process TestServer.
+// A fresh server with default limits, which the test then restarts on its database (TestServer.restart).
 async function restarted(): Promise<void> {
-  const dbDir = mkdtempSync(join(tmpdir(), "gb-bind-"));
-  tempDirs.push(dbDir);
   await srv.stop();
-  srv = new TestServer({ dbPath: join(dbDir, "gb.db") });
+  srv = await TestServer.open();
   alice = await srv.login(A);
 }
 
@@ -344,8 +338,7 @@ test("a restart ends the application sessions it finds, and their names are free
   await restarted();
   const s = await connect("fe");
   const holder = events("fe")[0]!.session_id;
-  await srv.stop();
-  srv = new TestServer({ dbPath: join(tempDirs.at(-1)!, "gb.db") });
+  srv = await srv.restart();
   alice = await srv.login(A);
   expect(rows(`SELECT ended_at IS NOT NULL AS ended FROM ids WHERE id = ?`, holder)).toEqual([{ ended: 1 }]);
   expect(rows(`SELECT detail FROM access_log WHERE action = 'id.ended' AND target = ?`, holder).map((r: any) => JSON.parse(r.detail).why)).toEqual(["wss_removed"]);
@@ -408,7 +401,7 @@ test("16, 18: raw binds: create: false, lazy create; an unbound connection reads
 test("11 (server): a rebind refused by the bind limit binds after the wait", async () => {
   let clock = Date.now();
   await srv.stop();
-  srv = new TestServer({ helloLimit: { burst: 3, perSec: 1 } }, { now: () => clock });
+  srv = await TestServer.open({ helloLimit: { burst: 3, perSec: 1 } }, { now: () => clock });
   alice = await srv.login(A);
   const first = await connect("api");
   await endIt(first);
@@ -869,7 +862,7 @@ test("#284 S11: whoami over the server names the ID, the holds oldest first and 
 test("#284 S1 (server): with the server's clock frozen, the first alias bound stays the primary through a restore", async () => {
   await srv.stop();
   const frozen = Date.now();
-  srv = new TestServer({}, { now: () => frozen });
+  srv = await TestServer.open({}, { now: () => frozen });
   alice = await srv.login(A);
   const s = await connect("zed");
   await s.bind("alpha", { create: true });

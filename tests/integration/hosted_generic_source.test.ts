@@ -39,7 +39,7 @@ const clients: Client[] = [];
 // Every refusal and bind text the server returned, for the no-plugin/OpenCode wording check.
 const served: string[] = [];
 function start(oauthClients: OAuthClient[]) {
-  app = startServer({ dbPath: join(dir, "db.sqlite"), blobDir: join(dir, "blobs"), httpPort: 0, googleClientId: "test-upstream", googleClientSecret: "", orgDomain: "example.com", publicUrl: issuer,
+  app = startServer({ store: { kind: "sqlite" as const, path: join(dir, "db.sqlite") }, blobDir: join(dir, "blobs"), httpPort: 0, googleClientId: "test-upstream", googleClientSecret: "", orgDomain: "example.com", publicUrl: issuer,
     messageRetentionDays: 90, auditRetentionDays: 90, devAuth: false, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES,
     hostedRequestLimit: { burst: 10_000, perSec: 10_000 }, hostedSubscriberLimit: { burst: 10_000, perSec: 10_000 }, oauthClients, oauthCimdClients: [OPENCODE_CLIENT, CIMD_CLIENT],
   }, { hostname: "127.0.0.1", background: false, oauth: {

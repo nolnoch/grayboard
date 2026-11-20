@@ -60,7 +60,7 @@ const slots = globalThis as unknown as Record<symbol, { signins: SignInState } |
 const signins = () => slots[SLOT]?.signins ?? {};
 
 beforeEach(async () => {
-  srv = hostedServer();
+  srv = await hostedServer();
   stopped = false;
   delete slots[SLOT];
   agentDir = realpathSync(mkdtempSync(join(tmpdir(), "gb-pi-family-")));

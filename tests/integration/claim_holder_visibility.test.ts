@@ -15,7 +15,7 @@ let alice: string;
 let carol: string;
 
 beforeEach(async () => {
-  srv = new TestServer({ hostedRequestLimit: { burst: 10_000, perSec: 10_000 } });
+  srv = await TestServer.open({ hostedRequestLimit: { burst: 10_000, perSec: 10_000 } });
   alice = await srv.login(A);
   await srv.login(B);
   carol = await srv.login(C);

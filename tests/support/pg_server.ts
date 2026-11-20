@@ -1,6 +1,6 @@
-// In-process servers on Postgres (#807 P3 C11a): TestServers over pg_repo.ts makePgRepo on one fresh test database,
-// through startServer's injected Repo. The env selection (GRAYBOARD_TEST_BACKEND, TestServer.open) is C11b's; until
-// then a test that wants the server on Postgres opens it here.
+// In-process servers on Postgres (#807 P3 C11a): TestServers over pg_repo.ts makePgRepo on one shared fresh test
+// database, through startServer's injected Repo. One server on Postgres is TestServer.open under
+// GRAYBOARD_TEST_BACKEND=pg; a test that needs pods sharing a database, or Postgres whatever the backend, opens them here.
 //
 // Two servers on one database are two pods: each its own pool, write queue and auth LISTEN. Their pools are labelled
 // gb-test-a and gb-test-b, as pg_race.ts's pair is, so blockedOrSettled finds the B side's lock wait. One server can't
@@ -44,7 +44,7 @@ export async function pgServers(n = 1, { overrides = {}, start = {}, now, sides 
         attachmentLimits: o.attachmentLimits, attachmentUserQuota: o.attachmentUserQuota, ...(now ? { now } : {}) });
       let server: TestServer;
       try {
-        server = new TestServer({ ...o, blobDir }, { ...start, ...(now ? { now } : {}), repo });
+        server = await TestServer.open({ ...o, blobDir }, { ...start, ...(now ? { now } : {}), repo });
       } catch (error) {
         await repo.close();
         throw error;

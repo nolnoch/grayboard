@@ -426,7 +426,7 @@ test(`server: a database ${FROM} wrote opens and reads back`, async () => {
   const dbPath = join(dir, "old", "grayboard.db");
   mkdirSync(join(dir, "old"));
   // Hosted sessions spend hosted requests polling their inbox.
-  old = await ServerProcess.start(rel.server, dbPath, { GRAYBOARD_HOSTED_REQUEST_BURST: "10000", GRAYBOARD_HOSTED_REQUEST_PER_SEC: "10000" });
+  old = await ServerProcess.start(rel.server, { dbPath: dbPath }, { GRAYBOARD_HOSTED_REQUEST_BURST: "10000", GRAYBOARD_HOSTED_REQUEST_PER_SEC: "10000" });
   const alice = await old.login("alice@example.com");
   const bob = await old.login("bob@example.com");
   const signIns: Record<string, string> = { "alice@example.com": alice, "bob@example.com": bob };
@@ -481,7 +481,7 @@ test(`server: a database ${FROM} wrote opens and reads back`, async () => {
   }
   const before = schema(dbPath);
 
-  srv = new TestServer({ dbPath, blobDir: join(dir, "old", "blobs"), hostedRequestLimit: { burst: 10_000, perSec: 10_000 } });
+  srv = await TestServer.open({ dbPath, blobDir: join(dir, "old", "blobs"), hostedRequestLimit: { burst: 10_000, perSec: 10_000 } });
   // #928 D3: every user the release wrote (a v1.0.0 one with no idp_subject, or a post-F-13 one) is stamped with
   // Google's issuer, and the old index is gone.
   expect(identities(dbPath).map(u => u.idp_issuer)).toEqual(identities(dbPath).map(() => GOOGLE_ISSUER));
@@ -500,14 +500,14 @@ test(`server: a database ${FROM} wrote opens and reads back`, async () => {
   }
   if (roles) expect(owners(dbPath)).toEqual([["alice@example.com", "core"], ["bob@example.com", "core"]]);
 
-  const fresh = new TestServer({ dbPath: join(dir, "fresh.db") });
+  const fresh = await TestServer.open({ dbPath: join(dir, "fresh.db") });
   await fresh.stop();
   expectUpgraded(before, schema(dbPath), schema(join(dir, "fresh.db")));
 
   // The stamp runs once, with the column: a row unlink-idp cleared isn't re-stamped by a later open.
   await srv.app.repo.write(async tx => srv!.app.repo.users.clearSubject(tx, (await srv!.app.repo.users.findByEmail(tx, "bob@example.com"))!.id));
   await srv.stop();
-  srv = new TestServer({ dbPath, blobDir: join(dir, "old", "blobs") });
+  srv = await TestServer.open({ dbPath, blobDir: join(dir, "old", "blobs") });
   expect((await srv.app.repo.users.findByEmail(srv.app.repo.read, "bob@example.com"))).toMatchObject({ idp_issuer: null, idp_subject: null });
   expect((await srv.app.repo.users.findByEmail(srv.app.repo.read, "alice@example.com"))).toMatchObject({ idp_issuer: GOOGLE_ISSUER });
   // The ownership seed runs once, with the table: a binding revoked after it isn't seeded back by a later open, though
@@ -515,7 +515,7 @@ test(`server: a database ${FROM} wrote opens and reads back`, async () => {
   if (roles) {
     await srv.app.repo.write(tx => srv!.app.repo.roles.revoke(tx, { holder: "bob@example.com", role: "team_owner", scope: "core", byUser: null, authority: "none", actor: null }));
     await srv.stop();
-    srv = new TestServer({ dbPath, blobDir: join(dir, "old", "blobs") });
+    srv = await TestServer.open({ dbPath, blobDir: join(dir, "old", "blobs") });
     expect(owners(dbPath)).toEqual([["alice@example.com", "core"]]);
   }
 }, 60_000);
@@ -536,13 +536,13 @@ test(`server: a database this tree wrote, run under ${FROM} and reopened, keeps 
   label = "rollback";
   const dbPath = join(dir, "old", "grayboard.db");
   mkdirSync(join(dir, "old"));
-  srv = new TestServer({ dbPath, blobDir: join(dir, "old", "blobs") });
+  srv = await TestServer.open({ dbPath, blobDir: join(dir, "old", "blobs") });
   await srv.login("alice@example.com");
   expect(await srv.app.repo.write(async tx => (await srv!.app.repo.users.signIn(tx, GOOGLE_ISSUER, "g-alice", "alice@example.com", null)).status)).toBe("ok");
   await srv.stop();
   srv = undefined;
 
-  old = await ServerProcess.start(rel.server, dbPath);
+  old = await ServerProcess.start(rel.server, { dbPath: dbPath });
   await old.login("bob@example.com");
   await stopOld();
   const knowsSubjects = userIndexes(dbPath).includes("idx_users_idp_subject");
@@ -552,7 +552,7 @@ test(`server: a database this tree wrote, run under ${FROM} and reopened, keeps 
   }
   keep(`${label}-as-rolled-back`, join(dir, "old"));
 
-  srv = new TestServer({ dbPath, blobDir: join(dir, "old", "blobs") });
+  srv = await TestServer.open({ dbPath, blobDir: join(dir, "old", "blobs") });
   expect(userIndexes(dbPath)).toEqual(["idx_users_idp_identity"]);
   expect(identities(dbPath)).toEqual([
     { email: "alice@example.com", idp_issuer: GOOGLE_ISSUER, idp_subject: "g-alice" },
@@ -572,7 +572,7 @@ test(`server: a database this tree wrote, run under ${FROM} and reopened, keeps 
 // shim for it), so for it the contract is that it never exits 0 and no session is registered.
 test(`server: ${FROM}'s \`mcp --mode server\` gets no session from this tree's server`, async () => {
   label = "refusal";
-  srv = new TestServer({ dbPath: join(dir, "grayboard.db") });
+  srv = await TestServer.open({ dbPath: join(dir, "grayboard.db") });
   const token = await srv.login("alice@example.com");
   const upgrade = { Upgrade: "websocket", Connection: "Upgrade", "Sec-WebSocket-Key": "dGhlIHNhbXBsZSBub25jZQ==", "Sec-WebSocket-Version": "13" };
   for (const path of ["/ws", "/"]) {

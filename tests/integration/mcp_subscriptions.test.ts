@@ -14,9 +14,9 @@ import { stubAuthRead } from "../support/auth_stub.ts";
 
 let srv: TestServer, app: TestServer["app"], base: string, clock: number;
 const clients: Client[] = [];
-beforeEach(() => {
+beforeEach(async () => {
   clock = Date.now();
-  srv = new TestServer({ publicUrl: "https://grayboard.example.com" }, { hostname: "127.0.0.1", oauth: { now: () => clock } });
+  srv = await TestServer.open({ publicUrl: "https://grayboard.example.com" }, { hostname: "127.0.0.1", oauth: { now: () => clock } });
   app = srv.app;
   base = `http://127.0.0.1:${app.server.port}`;
 });

@@ -1,7 +1,8 @@
 import "./zod_config.ts";
 import pkg from "../../package.json" with { type: "json" };
-import { loadConfig } from "./config.ts";
+import { describeStore, loadConfig } from "./config.ts";
 import { startServer } from "./app.ts";
+import { openRepo } from "./open_repo.ts";
 import { BUILTIN_CLIENT_IDS } from "./oauth-config.ts";
 
 // Before loadConfig, which refuses to run without the server's env.
@@ -11,7 +12,15 @@ if (process.argv.includes("--version")) {
 }
 
 const config = loadConfig();
-const { server, stop, metrics, ready } = startServer(config);
+// The open migrates a Postgres store (#807 P3 C11b): a failure there is a failed startup, before anything listens.
+let repo;
+try {
+  repo = await openRepo(config);
+} catch (e) {
+  console.error(`grayboard server: startup failed: opening ${describeStore(config.store)}: ${(e as Error).stack ?? e}`);
+  process.exit(1);
+}
+const { server, stop, metrics, ready } = startServer(config, { repo });
 
 // Handlers go in before the listening line: a supervisor (or test) that
 // signals on seeing it must reach shutdown, not the default kill (#422).
@@ -39,6 +48,7 @@ try {
   process.exit(1);
 }
 console.log(`grayboard server ${pkg.version} listening on port ${server.port}`);
+console.log(`grayboard server: store ${describeStore(config.store)}`);
 // An unauthenticated listener: say where it bound, every start.
 console.log(`grayboard server: metrics ${metrics ? `on ${metrics.hostname}:${metrics.port}` : "off"}`);
 // Write-capable hosted clients are a trust decision (#414, #429); say which at every start.

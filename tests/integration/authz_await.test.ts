@@ -12,8 +12,8 @@ const A = "alice@example.com";
 const B = "bob@example.com";
 
 let srv: TestServer;
-beforeEach(() => {
-  srv = new TestServer({ hostedRequestLimit: { burst: 10_000, perSec: 10_000 }, delegateLimit: { burst: 100, perSec: 100 } });
+beforeEach(async () => {
+  srv = await TestServer.open({ hostedRequestLimit: { burst: 10_000, perSec: 10_000 }, delegateLimit: { burst: 100, perSec: 100 } });
 });
 afterEach(async () => { await srv.stop(); });
 
