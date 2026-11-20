@@ -27,7 +27,7 @@ import type { WriteTx } from "../core/write_tx.ts";
 import { isTx, type Read, type Tx, sqliteOf, sqliteRead, sqliteTx } from "./store/tx.ts";
 import { DEFAULT_ATTACHMENT_LIMITS, DEFAULT_ATTACHMENT_USER_QUOTA, type AttachmentLimits } from "../shared/attachments.ts";
 import { DiskBlobs } from "./blobs.ts";
-import { detached, inRequest, requestOrigin } from "./request_context.ts";
+import { requestOrigin } from "./request_context.ts";
 import { GOOGLE_ISSUER } from "./idp_google.ts";
 import { LOGIN_SCOPE, OAUTH_SCOPES } from "./oauth-config.ts";
 import type { CredentialSource, ServiceCredential, OAuthStore, OAuthAuthorization, OAuthRequest, OAuthBrowserSession, OAuthCode, OAuthGrant, OAuthTokenPair, OAuthAccess, OAuthFailure } from "./oauth-types.ts";
@@ -117,17 +117,15 @@ export type { AuthPeek };
 // read committed state on the reader and their writes wait in the queue (core/sqlite.ts ownWriter).
 // fn gets the transaction's Tx (#807 P1c), closed when fn settles: a timer or un-awaited promise fn started that uses it
 // later throws instead of writing into whichever transaction is open by then.
-// fn and committed run as the work of the request that called write(), or of none (#1042): a body that waited starts
-// from the releasing holder's context, whose request origin its audit rows would otherwise carry (F-19). Only the
-// origin is set: binding the whole context (AsyncResource.bind) would also restore the queue's holder token.
+// fn and committed run as the work of the request that called write(), or of none (#1042, #1408): the queue starts a
+// body that waited in its enqueuer's async context (queue.ts), so its audit rows carry that request's origin (F-19).
 // `thrown` sees a failure the body throws synchronously (BEGIN, fn, COMMIT, committed), before the promise rejects
 // with it: posted's idle queue throws it to its caller.
 function queued<T, R>(db: Database, fn: (tx: Tx) => T | PromiseLike<T>, committed?: (value: T) => R, thrown?: (error: unknown) => void): Promise<Awaited<R>> {
   const queue = queueFor(db);
   if (queue.mine && db.inTransaction) return Promise.reject(new Error("write() inside an open transaction: nested code calls its Tx's savepoint"));
-  const o = requestOrigin();
   const run = () => {
-    try { return o ? inRequest(o, body) : detached(body); } catch (error) { thrown?.(error); throw error; }
+    try { return body(); } catch (error) { thrown?.(error); throw error; }
   };
   return queue.run(run).then(box => box.out) as Promise<Awaited<R>>;
   function body(): { out: R } | Promise<{ out: R }> {
