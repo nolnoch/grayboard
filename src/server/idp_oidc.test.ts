@@ -83,6 +83,40 @@ test("the token request form-encodes the client ID and secret before base64, and
   expect(f.tokenRefusals.at(-1)).toMatch(/client credentials/);
 });
 
+test("a confidential client's secret travels only in the Authorization header, never the form", async () => {
+  const f = await fake();
+  await signIn(provider(f), f);
+  expect(f.tokenForms).toHaveLength(1);
+  expect(Object.keys(f.tokenForms[0]!).sort()).toEqual(["code", "code_verifier", "grant_type", "redirect_uri"]);
+  expect(JSON.stringify(f.tokenForms)).not.toContain(CLIENT_SECRET);
+});
+
+// A public client (#1418): no secret, so the token endpoint knows it by client_id and PKCE alone.
+
+test("a public client signs in with no Authorization header and its client_id in the form", async () => {
+  const f = await fake({ clientSecret: undefined });
+  const p = provider(f, { clientSecret: undefined });
+  expect(await signIn(p, f)).toEqual({ issuer: f.issuer, subject: USER.sub, email: "you@example.com", displayName: "You" });
+  expect(f.tokenAuthorizations).toEqual([null]);
+  expect(f.tokenForms.map(form => form.client_id)).toEqual([CLIENT_ID]);
+  expect(f.tokenRefusals).toEqual([]);
+});
+
+test("a public client's exchange with the wrong PKCE verifier is refused by the token endpoint", async () => {
+  const f = await fake({ clientSecret: undefined });
+  const p = provider(f, { clientSecret: undefined });
+  const nonce = random(), verifier = random();
+  const back = await f.authorize(await p.authorizeUrl({ redirectUri: REDIRECT, state: "s", nonce, challenge: createHash("sha256").update(verifier).digest("base64url") }));
+  await expect(p.exchange({ code: back.get("code")!, verifier: random(), redirectUri: REDIRECT, nonce })).rejects.toThrow(OidcEndpointError);
+  expect(f.tokenRefusals).toEqual(["PKCE verifier"]);
+});
+
+test("a provider holding a secret is refused by a public client's token endpoint, so neither mode falls back to the other", async () => {
+  const f = await fake({ clientSecret: undefined });
+  await expect(signIn(provider(f), f)).rejects.toThrow(OidcEndpointError);
+  expect(f.tokenRefusals).toEqual(["authentication from a public client"]);
+});
+
 // Refusals: each its own test.
 
 test("refuses an ID token signed by another key", async () => {

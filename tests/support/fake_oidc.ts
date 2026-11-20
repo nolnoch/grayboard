@@ -1,6 +1,7 @@
 // A loopback OpenID Connect issuer for the OIDC provider's tests (#928), in the pattern of
 // startFakeAnthropic(): discovery, JWKS, an authorize endpoint that redirects back with a code, a token endpoint that
-// checks client_secret_basic (each half form-decoded), each code's single use and the PKCE verifier, and userinfo.
+// checks client_secret_basic (each half form-decoded), or for a public client (no clientSecret) no Authorization and the
+// form's client_id, each code's single use and the PKCE verifier, and userinfo.
 // Bad tokens are minted, not stubbed: next() shapes the next ID token, signed with jose.
 import { createHash, randomBytes } from "node:crypto";
 import { exportJWK, generateKeyPair, SignJWT, type JWTPayload, type KeyLike } from "jose";
@@ -14,7 +15,8 @@ export type NextToken = { claims?: Record<string, unknown>; alg?: string; kid?: 
 
 export type FakeOidcOptions = {
   clientId: string;
-  clientSecret: string;
+  // Absent: a public client (#1418), as a Keycloak realm's public client is: any Authorization is refused.
+  clientSecret?: string;
   user: OidcUser;
   // Okta's code flow: the ID token carries no email claims, only userinfo does.
   claimsInUserinfoOnly?: boolean;
@@ -25,6 +27,8 @@ export type FakeOidc = {
   hits: { discovery: number; jwks: number; authorize: number; token: number; userinfo: number; other: number };
   // The Authorization header of each token request, as sent.
   tokenAuthorizations: (string | null)[];
+  // The form fields of each token request, as sent.
+  tokenForms: Record<string, string>[];
   // Refusals the token endpoint answered, by reason.
   tokenRefusals: string[];
   next(t: NextToken): void;
@@ -67,6 +71,7 @@ export async function startFakeOidc(o: FakeOidcOptions): Promise<FakeOidc> {
   const hits = { discovery: 0, jwks: 0, authorize: 0, token: 0, userinfo: 0, other: 0 };
   const answers: Partial<Record<"discovery" | "token" | "userinfo", (issuer: string) => Response>> = {};
   const tokenAuthorizations: (string | null)[] = [];
+  const tokenForms: Record<string, string>[] = [];
   const tokenRefusals: string[] = [];
 
   const server = Bun.serve({
@@ -112,14 +117,20 @@ export async function startFakeOidc(o: FakeOidcOptions): Promise<FakeOidc> {
         const authorization = req.headers.get("authorization");
         tokenAuthorizations.push(authorization);
         const refuse = (error: string, reason: string, status = 400) => { tokenRefusals.push(reason); return Response.json({ error }, { status }); };
-        const basic = /^Basic ([A-Za-z0-9+/=]+)$/.exec(authorization ?? "");
-        if (!basic) return refuse("invalid_client", "no basic authentication", 401);
-        const pair = Buffer.from(basic[1]!, "base64").toString("utf8");
-        const colon = pair.indexOf(":");
-        let id: string, secret: string;
-        try { id = formDecode(pair.slice(0, colon)); secret = formDecode(pair.slice(colon + 1)); } catch { return refuse("invalid_client", "undecodable client credentials", 401); }
-        if (colon < 0 || id !== o.clientId || secret !== o.clientSecret) return refuse("invalid_client", "wrong client credentials", 401);
         const form = new URLSearchParams(await req.text());
+        tokenForms.push(Object.fromEntries(form));
+        if (o.clientSecret === undefined) {
+          if (authorization !== null) return refuse("invalid_client", "authentication from a public client", 401);
+          if (form.get("client_id") !== o.clientId) return refuse("invalid_client", "wrong client_id", 401);
+        } else {
+          const basic = /^Basic ([A-Za-z0-9+/=]+)$/.exec(authorization ?? "");
+          if (!basic) return refuse("invalid_client", "no basic authentication", 401);
+          const pair = Buffer.from(basic[1]!, "base64").toString("utf8");
+          const colon = pair.indexOf(":");
+          let id: string, secret: string;
+          try { id = formDecode(pair.slice(0, colon)); secret = formDecode(pair.slice(colon + 1)); } catch { return refuse("invalid_client", "undecodable client credentials", 401); }
+          if (colon < 0 || id !== o.clientId || secret !== o.clientSecret) return refuse("invalid_client", "wrong client credentials", 401);
+        }
         if (form.get("grant_type") !== "authorization_code") return refuse("unsupported_grant_type", "grant type");
         const code = form.get("code") ?? "";
         const grant = codes.get(code);
@@ -171,7 +182,7 @@ export async function startFakeOidc(o: FakeOidcOptions): Promise<FakeOidc> {
     const alg = shape.alg ?? "RS256";
     const kid = shape.kid ?? key.kid;
     if (alg === "none") return `${b64url(JSON.stringify({ alg: "none", typ: "JWT" }))}.${b64url(JSON.stringify(payload))}.`;
-    if (alg.startsWith("HS")) return new SignJWT(payload as JWTPayload).setProtectedHeader({ alg, kid }).sign(new TextEncoder().encode(o.clientSecret));
+    if (alg.startsWith("HS")) return new SignJWT(payload as JWTPayload).setProtectedHeader({ alg, kid }).sign(new TextEncoder().encode(o.clientSecret ?? o.clientId));
     return new SignJWT(payload as JWTPayload).setProtectedHeader({ alg, kid }).sign((shape.foreignKey ? foreign : key).privateKey);
   }
 
@@ -179,6 +190,7 @@ export async function startFakeOidc(o: FakeOidcOptions): Promise<FakeOidc> {
     issuer,
     hits,
     tokenAuthorizations,
+    tokenForms,
     tokenRefusals,
     next(t) { nextToken = t; },
     discovery(patch) { discoveryPatch = patch; },

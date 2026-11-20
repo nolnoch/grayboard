@@ -9,6 +9,7 @@ const KEYS = [
   "GOOGLE_OAUTH_CLIENT_ID", "GOOGLE_OAUTH_CLIENT_SECRET", "GRAYBOARD_ADMINS",
   "GRAYBOARD_MCP_GOOGLE_CLIENT_ID", "GRAYBOARD_MCP_GOOGLE_CLIENT_SECRET",
   "GRAYBOARD_IDPS", "GRAYBOARD_OKTA_ISSUER", "GRAYBOARD_OKTA_CLIENT_ID", "GRAYBOARD_OKTA_CLIENT_SECRET", "GRAYBOARD_OKTA_ALLOWED_DOMAINS",
+  "GRAYBOARD_OIDC_ISSUER", "GRAYBOARD_OIDC_CLIENT_ID", "GRAYBOARD_OIDC_CLIENT_SECRET", "GRAYBOARD_OIDC_ALLOWED_DOMAINS", "GRAYBOARD_OIDC_LABEL",
   "GRAYBOARD_ATTACHMENT_MAX_BYTES", "GRAYBOARD_ATTACHMENT_MAX_TOTAL_BYTES", "GRAYBOARD_ATTACHMENT_USER_QUOTA_BYTES", "GRAYBOARD_BLOB_DIR",
   "GRAYBOARD_MESSAGE_RETENTION_DAYS", "GRAYBOARD_AUDIT_RETENTION_DAYS", "GRAYBOARD_HTTP_PORT",
   "GRAYBOARD_HELLO_BURST", "GRAYBOARD_HELLO_PER_SEC",
@@ -338,6 +339,101 @@ describe("loadConfig", () => {
       expect(text).toContain("must be nonempty credentials without whitespace");
       expect(text).not.toContain("private");
     }
+  });
+
+  // #1418: the generic provider, confidential or public.
+  function oidc() {
+    process.env.GRAYBOARD_OIDC_ISSUER = "https://sso.example.com/realms/eng";
+    process.env.GRAYBOARD_OIDC_CLIENT_ID = "grayboard";
+    process.env.GRAYBOARD_OIDC_ALLOWED_DOMAINS = "Example.com";
+  }
+
+  test("oidc without a secret is a public client, under the default label", () => {
+    process.env.GRAYBOARD_IDPS = "oidc";
+    oidc();
+    const c = loadConfig();
+    expect(c).toMatchObject({ idps: ["oidc"], googleClientId: "", orgDomain: "" });
+    expect(c.oidc).toEqual({ issuer: "https://sso.example.com/realms/eng", clientId: "grayboard", allowedDomains: ["example.com"], label: "Single sign-on" });
+  });
+
+  test("oidc with a secret and a label is a confidential client, beside Okta and Google in the listed order", () => {
+    process.env.GRAYBOARD_IDPS = "oidc, okta, google";
+    oidc();
+    okta();
+    primary();
+    process.env.GRAYBOARD_OIDC_CLIENT_SECRET = "oidc-private";
+    process.env.GRAYBOARD_OIDC_LABEL = "Example SSO";
+    expect(loadConfig()).toMatchObject({ idps: ["oidc", "okta", "google"], oidc: { clientSecret: "oidc-private", label: "Example SSO" }, okta: { clientId: "okta-client" } });
+  });
+
+  test("the oidc secret can come from a file, making a confidential client", () => {
+    const dir = mkdtempSync(join(tmpdir(), "gb-oidc-"));
+    try {
+      const path = join(dir, "oidc");
+      writeFileSync(path, "oidc-private\n");
+      process.env.GRAYBOARD_IDPS = "oidc";
+      oidc();
+      process.env.GRAYBOARD_OIDC_CLIENT_SECRET_FILE = path;
+      expect(loadConfig().oidc).toMatchObject({ clientSecret: "oidc-private" });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("an empty oidc secret refuses to start rather than become a public client", () => {
+    process.env.GRAYBOARD_IDPS = "oidc";
+    oidc();
+    process.env.GRAYBOARD_OIDC_CLIENT_SECRET = "";
+    expect(message()).toBe("GRAYBOARD_OIDC_CLIENT_ID and GRAYBOARD_OIDC_CLIENT_SECRET must be nonempty credentials without whitespace");
+  });
+
+  test("oidc listed needs its three variables, and any of its five set while it isn't refuses to start", () => {
+    process.env.GRAYBOARD_IDPS = "oidc";
+    for (const name of ["GRAYBOARD_OIDC_ISSUER", "GRAYBOARD_OIDC_CLIENT_ID", "GRAYBOARD_OIDC_ALLOWED_DOMAINS"]) {
+      oidc();
+      delete process.env[name];
+      expect(message()).toBe(`GRAYBOARD_IDPS lists oidc, so ${name} is required`);
+    }
+    delete process.env.GRAYBOARD_IDPS;
+    primary();
+    for (const name of ["GRAYBOARD_OIDC_ISSUER", "GRAYBOARD_OIDC_CLIENT_ID", "GRAYBOARD_OIDC_CLIENT_SECRET", "GRAYBOARD_OIDC_ALLOWED_DOMAINS", "GRAYBOARD_OIDC_LABEL"]) {
+      for (const k of ["GRAYBOARD_OIDC_ISSUER", "GRAYBOARD_OIDC_CLIENT_ID", "GRAYBOARD_OIDC_CLIENT_SECRET", "GRAYBOARD_OIDC_ALLOWED_DOMAINS", "GRAYBOARD_OIDC_LABEL"]) delete process.env[k];
+      process.env[name] = "x";
+      expect(message()).toBe(`${name} set but GRAYBOARD_IDPS doesn't list oidc: list it, or unset them`);
+    }
+  });
+
+  test("the oidc issuer, domains and label are checked as Okta's are, and its issuer can't be Okta's", () => {
+    process.env.GRAYBOARD_IDPS = "oidc";
+    for (const issuer of ["http://sso.example.com", "https://sso.example.com/", "https://sso.example.com?x=1", "https://accounts.google.com"]) {
+      oidc();
+      process.env.GRAYBOARD_OIDC_ISSUER = issuer;
+      expect(message()).toMatch(/^GRAYBOARD_OIDC_ISSUER (must be an https URL|can't be Google's issuer)/);
+    }
+    oidc();
+    process.env.GRAYBOARD_OIDC_ALLOWED_DOMAINS = "example";
+    expect(message()).toContain("GRAYBOARD_OIDC_ALLOWED_DOMAINS must be email domains");
+    for (const label of ["", " ", "x".repeat(65), "a\nb"]) {
+      oidc();
+      process.env.GRAYBOARD_OIDC_LABEL = label;
+      expect(message()).toBe("GRAYBOARD_OIDC_LABEL must be 1 to 64 characters on one line");
+    }
+    delete process.env.GRAYBOARD_OIDC_LABEL;
+    oidc();
+    okta();
+    process.env.GRAYBOARD_IDPS = "oidc,okta";
+    process.env.GRAYBOARD_OIDC_ISSUER = process.env.GRAYBOARD_OKTA_ISSUER;
+    expect(message()).toBe("GRAYBOARD_OIDC_ISSUER can't be GRAYBOARD_OKTA_ISSUER");
+  });
+
+  test("dev auth refuses to start alongside an oidc issuer, though a public client has no secret", () => {
+    process.env.GRAYBOARD_DEV_AUTH = "1";
+    process.env.GRAYBOARD_IDPS = "oidc";
+    oidc();
+    expect(message()).toBe("GRAYBOARD_DEV_AUTH=1 must not be set alongside GRAYBOARD_OIDC_ISSUER (prevents prod misconfig)");
+    const config = { idps: ["oidc" as const], devAuth: true, googleClientSecret: "", oidc: { issuer: "https://sso.example.com", clientId: "grayboard", allowedDomains: ["example.com"], label: "SSO" } };
+    expect(() => checkIdpConfig(config)).toThrow("dev auth must not coexist");
+    expect(() => checkIdpConfig({ ...config, devAuth: false })).not.toThrow();
   });
 
   test("dev auth refuses to start alongside the Okta client secret", () => {

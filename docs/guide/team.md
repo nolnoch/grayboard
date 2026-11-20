@@ -4,7 +4,7 @@ Boards, claims and names work the same way in both modes ([Boards and claims](lo
 
 ## Per-developer setup (one-time)
 
-With the server running on Google or Okta sign-in, each developer runs the [quick start](../../README.md#quick-start) and chooses "a team server", or:
+With the server running on Google, Okta or other OIDC sign-in, each developer runs the [quick start](../../README.md#quick-start) and chooses "a team server", or:
 
 ```bash
 curl -sSL https://github.com/nolnoch/grayboard/releases/latest/download/install.sh | GRAYBOARD_NO_SETUP=1 bash
