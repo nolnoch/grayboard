@@ -73,6 +73,8 @@ test("#807: the application's claim expiry sweep waits behind a body holding the
   await ticks();
   // listClaims hides an expired claim: the row itself is what the sweep deletes.
   expect(rows(db)).toEqual(["soon"]);
+  // The one write since the spy is the sweep's: another would let the queue free before the timer fired.
+  expect(writes.mock.calls.length).toBe(1);
   const fired = Date.now();
   while (Date.now() <= fired) { /* the next millisecond */ }
   const released = Date.now();
