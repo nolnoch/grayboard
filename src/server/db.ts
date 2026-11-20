@@ -1320,7 +1320,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       snapshotPage: async (r, board, opts) => snapshotPage(sqliteOf(r), board, opts),
       pendingPushes: async (r, handle) => pendingPushes(sqliteOf(r), handle),
       pendingDigests: async (r, handle) => pendingDigests(sqliteOf(r), handle),
-      acknowledge: async (tx, handle, ref) => acknowledge(sqliteOf(tx), handle, ref),
+      acknowledge: async (tx, handle, ref, receiver) => acknowledge(sqliteOf(tx), handle, ref, receiver),
       ensure: async (tx, name, purpose, scope, createdBy) => ensureBoard(sqliteOf(tx), name, purpose, scope, createdBy),
       isSubscribed: async (r, handle, board) => isSubscribed(sqliteOf(r), handle, board),
       setSubscription: async (tx, handle, board, mode) => setSubscription(sqliteOf(tx), handle, board, mode),
@@ -1332,7 +1332,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       roster: async (r, board) => whoRows(sqliteOf(r), board),
       create: async (tx, b) => insertBoard(sqliteOf(tx), b),
       setArchived: async (tx, name, by, now) => setArchived(sqliteOf(tx), name, by, now),
-      read: async (tx, board, handle, opts) => readRows(sqliteOf(tx), board, handle, opts),
+      read: async (tx, board, handle, opts, receiver) => readRows(sqliteOf(tx), board, handle, opts, receiver),
       threadRoot: async (r, postId) => threadRoot(sqliteOf(r), postId),
       mute: async (tx, handle, root, muted) => setMute(sqliteOf(tx), handle, root, muted),
       insertPost: async (tx, p) => {

@@ -23,7 +23,8 @@ import type { Read, Tx } from "./store/tx.ts";
 
 // core's ToolContext (its `reader` unset on the server), plus `principal`: an addressless
 // caller's user (an unbound hosted session, #410), whose sight judges board_list, peer_list and the boards it reads.
-export type ServerToolContext = ToolContext & { principal?: Principal; announced?: Announced };
+// receiver: the session a board_read's delivery credits, and must still hold the handle it marks (#1466).
+export type ServerToolContext = ToolContext & { principal?: Principal; announced?: Announced; receiver?: string };
 
 /**
  * core's boardActor over the store: `as`, else the first of `addresses` a board use acts as (#284 S3, S14), else the
@@ -118,7 +119,7 @@ export async function callBoardTool(
       const viewer = ctx.principal ?? actor;
       const b = await readableBoard(repo, access, tx, viewer, input);
       // A principal has no cursor, and a child's read (via) peeks: its root's read state stays as it was (#523).
-      const r = await repo.boards.read(tx, b.name, ctx.principal || ctx.via !== undefined ? null : actor, opts);
+      const r = await repo.boards.read(tx, b.name, ctx.principal || ctx.via !== undefined ? null : actor, opts, ctx.receiver);
       // Claims announced here stay in front of anyone reading the board.
       const held = (await claimViews(repo, access, tx, undefined, viewer, ctx.session ?? actor)).filter((c) => c.board === r.board);
       return { result: held.length ? { ...r, active_claims: held } : r, wake: [] };
