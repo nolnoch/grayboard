@@ -369,3 +369,43 @@ test("a session doesn't yield its name record to an adapter's child whose record
   await client.call("bind", { name: "task-r", create: true });
   expect(record(client.harnessPid)).toMatchObject({ names: ["task-r"], session_id: (await who(client)).id });
 }, 30_000);
+
+// #1457: an adapter's child that exits bound leaves its names in the record
+// it shares with a sibling under the same harness pid. The sibling, restarted
+// before it binds again, doesn't restore them as its own restart, nor inherit
+// the child's status; its own record still restores.
+const status = (id: string) => rows<{ status: string | null }>(`SELECT status FROM ids WHERE id = ?`, id)[0]!.status;
+
+test("a sibling restarting after the adapter's child exited bound doesn't restore the child's names from their shared record", async () => {
+  const client = await localSession(dir, undefined, { extra: { [SIBLINGS]: sock } });
+  const adapter = await siblingSession(sock, adapterEnv("conv-1"));
+  await ready(adapter);
+  const adapterId = (await who(adapter)).id;
+  await adapter.call("peer_status", { text: "adapter's task" });
+  expect(record(client.harnessPid)).toMatchObject({ names: ["omp-local"], session_id: adapterId });
+  await adapter.c.close();
+  await until(() => ended(adapterId), 10_000, "the adapter's child ends");
+  const restarted = await client.restart("reconnect");
+  const me = await who(restarted);
+  expect(me.aliases).toEqual([]);
+  expect(holder("omp-local")).toBeNull();
+  expect(status(me.id)).toBeNull();
+  expect(rows(`SELECT 1 FROM binding_events WHERE session_id = ?`, me.id)).toEqual([]);
+}, 30_000);
+
+test("a sibling whose own record it is still restores its names, verified, with its status, after an adapter's child came and went", async () => {
+  const client = await localSession(dir, undefined, { extra: { [SIBLINGS]: sock } });
+  const clientId = (await who(client)).id;
+  const adapter = await siblingSession(sock, adapterEnv("conv-1"));
+  await ready(adapter);
+  const adapterId = (await who(adapter)).id;
+  await adapter.c.close();
+  await until(() => ended(adapterId), 10_000, "the adapter's child ends");
+  await client.call("bind", { name: "task-s", create: true });
+  await client.call("peer_status", { text: "sibling's task" });
+  expect(record(client.harnessPid)).toMatchObject({ names: ["task-s"], session_id: clientId });
+  const restarted = await client.restart("reconnect");
+  const me = await who(restarted);
+  expect(me.aliases).toEqual(["task-s"]);
+  expect(status(me.id)).toBe("sibling's task");
+}, 30_000);

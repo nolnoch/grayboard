@@ -755,6 +755,21 @@ export function recordYields(db: Database, sessionId: string, harnessPid: number
   return rows.length > 0 && aliveRows(rows).alive.some((r) => parentOf(r.pid) === harnessPid);
 }
 
+/**
+ * Whether `writer`, the session that wrote the name record a restarting
+ * session found, can be its predecessor (#1457). The record is keyed by
+ * harness pid, so an adapter's child and a sibling grayboard under it share
+ * one (recordYields), and an adapter's child that exited bound leaves its
+ * names there: a session with no harness session never restarts one that has
+ * one, so it doesn't restore that record as its restart (nor inherit that
+ * session's status). A writer whose row retention pruned is taken at its word.
+ */
+export function recordPredecessor(db: Database, writer: string, harnessSession: string | undefined): boolean {
+  if (harnessSession !== undefined) return true;
+  const row = db.prepare(`SELECT harness_session FROM ids WHERE id = ?`).get(writer) as { harness_session: string | null } | null;
+  return row === null || row.harness_session === null;
+}
+
 // The displaced session's hold goes as an unbind's does (releaseName), logged
 // as released with who took it, and audited. Inside acquireName's transaction.
 function displaceHold(db: Database, r: SessionRow, name: string, by: string, now: number): void {
