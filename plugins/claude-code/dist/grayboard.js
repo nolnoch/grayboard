@@ -35150,11 +35150,18 @@ function data(value, allowed) {
   }
 }
 var clock = (value) => typeof value === "number" && Number.isSafeInteger(value) && value >= 0 && value <= Date.now() + 60000;
-function failureDTO(value) {
+var codeShaped = (value) => typeof value === "string" && /^[a-z0-9_]{1,64}$/.test(value);
+function codeOf2(value, restored) {
+  if (typeof value === "string" && codes.has(value))
+    return value;
+  return restored && codeShaped(value) ? "operation_failed" : undefined;
+}
+function failureDTO(value, restored) {
   const d = data(value, ["operation", "code", "time"]);
-  if (!d || typeof d.operation !== "string" || !operations.has(d.operation) || typeof d.code !== "string" || !codes.has(d.code) || !clock(d.time))
+  const code = d && codeOf2(d.code, restored);
+  if (!d || typeof d.operation !== "string" || !operations.has(d.operation) || !code || !clock(d.time))
     return;
-  return { operation: d.operation, code: d.code, time: d.time };
+  return { operation: d.operation, code, time: d.time };
 }
 function project(value, restored = false) {
   const d = data(value, fields);
@@ -35166,15 +35173,16 @@ function project(value, restored = false) {
     return;
   if (d.ownership !== undefined && (typeof d.ownership !== "number" || !Number.isSafeInteger(d.ownership) || d.ownership <= 0))
     return;
-  if (d.code !== undefined && (typeof d.code !== "string" || !codes.has(d.code)))
+  const code = d.code === undefined ? undefined : codeOf2(d.code, restored);
+  if (d.code !== undefined && !code)
     return;
-  const failure = d.failure === undefined ? undefined : failureDTO(d.failure);
+  const failure = d.failure === undefined ? undefined : failureDTO(d.failure, restored);
   if (d.failure !== undefined && !failure)
     return;
   if (typeof d.message !== "string" || d.message.length > 16384)
     return;
-  const message = restored ? `Saved ${d.state} status${d.held?.length ? ` for ${d.held.join(", ")}` : ""}${d.code ? ` (${d.code})` : ""}; approval is unchanged` : d.message;
-  return { state: d.state, message, operation: d.operation, time: d.time, ...typeof d.sessionID === "string" ? { sessionID: d.sessionID } : {}, ...d.held !== undefined ? { held: d.held } : {}, ...typeof d.ownership === "number" ? { ownership: d.ownership } : {}, ...typeof d.code === "string" ? { code: d.code } : {}, ...failure ? { failure } : {} };
+  const message = restored ? `Saved ${d.state} status${d.held?.length ? ` for ${d.held.join(", ")}` : ""}${code ? ` (${code})` : ""}; approval is unchanged` : d.message;
+  return { state: d.state, message, operation: d.operation, time: d.time, ...typeof d.sessionID === "string" ? { sessionID: d.sessionID } : {}, ...d.held !== undefined ? { held: d.held } : {}, ...typeof d.ownership === "number" ? { ownership: d.ownership } : {}, ...code ? { code } : {}, ...failure ? { failure } : {} };
 }
 class Diagnostics {
   storage;
@@ -35217,7 +35225,7 @@ class Diagnostics {
     const d = data(input, fields);
     const previous = this.records.get(typeof d?.sessionID === "string" ? d.sessionID : "background");
     const time = Date.now();
-    const failure = d?.code ? failureDTO({ operation: d.operation, code: d.code, time }) : failureDTO(previous?.failure);
+    const failure = d?.code ? failureDTO({ operation: d.operation, code: d.code, time }, false) : failureDTO(previous?.failure, false);
     const record = project({ ...d, ...failure ? { failure } : {}, time }) ?? { state: "degraded", message: "Diagnostic record unavailable; approval is unchanged", operation: "delivery", time };
     this.records.delete(record.sessionID ?? "background");
     this.records.set(record.sessionID ?? "background", record);
