@@ -526,6 +526,39 @@ test("while another process refreshes, a token that is still valid serves at onc
   expect(await l.read()).toEqual(store);
 }, 10_000);
 
+// #1379: the credential port reports each change of the access token token() serves, so the run loop can replace
+// its listen before the old token's expiry closes it: its own refresh, another process's, never the first token or
+// an unchanged one, and not after dispose.
+test("rotated hears this process's refresh and another process's, not the first or an unchanged token, and not once disposed", async () => {
+  const { store } = await seed({ expiresIn: 3_600_000 });
+  const l = login();
+  const port = l.credential();
+  const e = await port.capture("R");
+  let heard = 0;
+  const watching = port.rotated!(e, () => { heard++; });
+  expect(await port.token(e)).toBe(store.access!);
+  expect(await port.token(e)).toBe(store.access!);
+  expect(heard).toBe(0);
+  // Inside the refresh margin: this process refreshes.
+  await writeJsonAtomic(l.path, { ...(await l.read())!, accessExpiresAt: Date.now() + 30_000 });
+  const own = await port.token(e);
+  expect(own).not.toBe(store.access!);
+  expect(refreshes).toBe(1);
+  expect(heard).toBe(1);
+  expect(await port.token(e)).toBe(own);
+  expect(heard).toBe(1);
+  // Another process's refresh: the store already holds a new token.
+  const other = await issueOAuth(app.repo, resource, "alice@example.com", ["grayboard:tools", "grayboard:delivery"], Date.now(), CLIENT);
+  await writeJsonAtomic(l.path, { ...(await l.read())!, access: other.token, accessExpiresAt: Date.now() + 3_600_000 });
+  expect(await port.token(e)).toBe(other.token);
+  expect(refreshes).toBe(1);
+  expect(heard).toBe(2);
+  watching.dispose();
+  await writeJsonAtomic(l.path, { ...(await l.read())!, access: store.access!, accessExpiresAt: Date.now() + 3_600_000 });
+  expect(await port.token(e)).toBe(store.access!);
+  expect(heard).toBe(2);
+}, 30_000);
+
 test("a TLS failure once the refresh request may have gone out is an unknown outcome; a refused connection spends nothing", async () => {
   const { store } = await seed();
   const l = login();
@@ -594,6 +627,27 @@ test("a 401 runs one forced refresh, then the retried request succeeds", async (
   await wire.close();
   expect(refreshes).toBe(1);
   expect(current).toBe((await l.read())!.access!);
+});
+
+// #1379 audit L4: a 401's forced refresh is a token change too. The port's token() served the rejected token first, so
+// the retry's token() serves the new one and fires `rotated` once.
+test("a 401's forced refresh fires rotated once, when the retried request is served the new token", async () => {
+  await seed({ access: "unknown-access-token-0123456789abcdefghijklmnopqr", expiresIn: 3_600_000 });
+  const l = login();
+  const port = l.credential();
+  const e = await port.capture("raw-root");
+  let heard = 0, current = "";
+  const watching = port.rotated!(e, () => { heard++; });
+  const wire = new NativeWire({ url: resource, sessionKey: GRAYBOARD_SESSION_META, client: { name: CLIENT, version: "1.0.0" } },
+    { token: async () => (current = await port.token(e)), onUnauthorized: async () => port.unauthorized(e, current) }, new AbortController().signal, "raw-root");
+  try {
+    await wire.connect();
+    expect((await wire.callTool("whoami", {}, "raw-root")).isError).toBeFalsy();
+  } finally { await wire.close(); watching.dispose(); }
+  expect(refreshes).toBe(1);
+  expect(current).toBe((await l.read())!.access!);
+  expect(current).not.toBe("unknown-access-token-0123456789abcdefghijklmnopqr");
+  expect(heard).toBe(1);
 });
 
 // ---- the credential port and logout ----

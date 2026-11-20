@@ -52,6 +52,11 @@ export interface CredentialPort<E extends Enrollment> {
   // (run loop and restore) once the server answers with the expiry (#916); acting at most once per
   // expiry, and only when that can't disturb the host, is the port's. Resolves true when it acted.
   refresh?(e: E): Promise<boolean>;
+  // Optional, for a provider that refreshes its own token (pi, omp, Claude Code's Login; #1379): calls `changed`
+  // each time the access token it serves changes, its own refresh or another process's. The run loop then
+  // replaces its listen under the same lease, before the old token's expiry closes it. Omitted by a static run
+  // token, which never changes, and by a host that rotates its own token (OpenCode), which keeps the rotation grace.
+  rotated?(e: E, changed: () => void): { dispose(): void };
 }
 export interface ApprovalPort<E extends Enrollment> {
   key(e: E): string;                                   // OpenCode: enrollmentHash
