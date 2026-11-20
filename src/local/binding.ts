@@ -620,6 +620,8 @@ export async function acquireName(
   opts: { create: boolean; allowHuman?: boolean; restartOf?: string; meta?: AliasMetaSet; promote?: Leave; displace?: number },
 ): Promise<AcquireResult> {
   const before = holdingSession(db, name, sessionId);
+  // A holder that acquires and listens here makes the probe below answer: its own socket (#1381).
+  testPause("bind:before-poke");
   const sockLive = before && isAlive(before.pid, before.proc_start) ? false : await poke(name);
 
   testPause("bind:before-txn");
@@ -641,18 +643,23 @@ export async function acquireName(
       return refuse(unknownNameError(name, known), { known });
     }
     const holder = holdingSession(db, name, sessionId);
-    if (holder && isAlive(holder.pid, holder.proc_start)) {
-      if (opts.displace === undefined || !displaceableRow(db, holder, opts.displace)) {
-        const who = describeHolder(holder);
-        return refuse(aliasHeldText(name, who, "bind another name"), { holder: who });
-      }
-      displaceHold(db, holder, name, sessionId, now);
-      ended.wake.push(holder.session_id);
-    } else if (holder) ended = reap(db, [holder], now);
-    if (sockLive) {
+    const live = holder !== null && isAlive(holder.pid, holder.proc_start);
+    if (live && (opts.displace === undefined || !displaceableRow(db, holder, opts.displace))) {
+      const who = describeHolder(holder);
+      return refuse(aliasHeldText(name, who, "bind another name"), { holder: who });
+    }
+    // A live socket with a displaceable live holder is that holder's (it
+    // acquired and listened after the read above): no refusal, so a
+    // displacement never commits beside a refused acquire (#1381 audit).
+    if (sockLive && !live) {
+      if (holder) ended = reap(db, [holder], now);
       const who = noRowHolder(db, name, before !== null || holder !== null);
       return refuse(aliasHeldText(name, who, "bind another name"), { holder: who });
     }
+    if (live) {
+      displaceHold(db, holder, name, sessionId, now);
+      ended.wake.push(holder.session_id);
+    } else if (holder) ended = reap(db, [holder], now);
     if (opts.promote) {
       const promoted = leaveRoot(db, opts.promote, "id.promoted", `promoted to its own session ${sessionId}`, now);
       ended = { ended: [...ended.ended, ...promoted.ended], wake: [...new Set([...ended.wake, ...promoted.wake])] };

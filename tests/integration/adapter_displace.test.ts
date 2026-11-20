@@ -5,7 +5,7 @@
 // first, and the sibling stops consuming the name's mail. Holders that aren't
 // such a sibling keep the name.
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { z } from "zod";
@@ -13,6 +13,7 @@ import { busRows, pauseEnv, releasePause } from "../support/local_bus.ts";
 import { closeSessions, localSession, siblingSession, type Push, type Session } from "../support/mcp.ts";
 import { SIBLINGS } from "../support/harness.ts";
 import { until } from "../support/until.ts";
+import { SIBLING_WAIT_MS } from "../../src/local/binding.ts";
 
 let dir: string;
 let sock: string;
@@ -22,7 +23,7 @@ beforeEach(() => {
   sock = join(dir, "sib.sock");
 });
 afterEach(async () => {
-  for (const point of ["mcp:before-register", "drain:before-delivered"]) writeFileSync(join(dir, `go-${point}`), "");
+  for (const point of ["mcp:before-register", "drain:before-delivered", "drain:before-board-delivered", "bind:before-poke"]) writeFileSync(join(dir, `go-${point}`), "");
   await closeSessions();
   rmSync(dir, { recursive: true, force: true });
 });
@@ -91,6 +92,51 @@ test("a DM the sibling was pushing when the name was taken stays unread for the 
   await until(() => rows<{ delivered_at: number | null }>(`SELECT delivered_at FROM messages WHERE body = 'mid-drain'`)[0]!.delivered_at !== null, 10_000, "the adapter's child delivers it");
 }, 30_000);
 
+test("a board push the sibling was making when the name was taken stays pending for the adapter's child, which pushes it", async () => {
+  const client = await localSession(dir, "omp-local", { extra: { [SIBLINGS]: sock, ...pauseEnv(dir, "drain:before-board-delivered") } });
+  const clientId = (await who(client)).id;
+  const peer = await localSession(dir, "peer");
+  await peer.call("board_create", { name: "e2e", purpose: "test" });
+  await peer.call("board_post", { board: "e2e", body: "@omp-local board mid-drain" });
+  await until(() => client.pushes.some((p) => p.content.includes("board mid-drain")), 10_000, "the sibling pushes the post");
+  await until(() => client.stderr().includes("test pause hit: drain:before-board-delivered"), 10_000, "the sibling's drain pauses");
+  // Not ready yet: its delivery waits until the sibling has finished.
+  const adapter = await siblingSession(sock, { ...adapterEnv("conv-1"), BUS_TEST_PAUSE: null, BUS_TEST_PAUSE_FILE: null });
+  expect(holder("omp-local")).not.toBe(clientId);
+  releasePause(dir, "drain:before-board-delivered");
+  await until(() => client.stderr().includes(`session ${clientId} lost "omp-local"`), 10_000, "the sibling drops the name");
+  await ready(adapter);
+  await until(() => adapter.pushes.some((p) => p.content.includes("board mid-drain")), 10_000, "the adapter's child pushes the post");
+  await receipt(adapter, adapter.pushes.find((p) => p.content.includes("board mid-drain"))!);
+}, 30_000);
+
+test("a sibling that acquires and listens between the adapter's child's holder read and its socket probe is displaced, and the child holds the name: the live socket is the displaced holder's, never a refusal beside a committed displacement", async () => {
+  // The adapter's child reads no holder, then pauses before the probe.
+  const adapterP = localSession(dir, "omp-local", { extra: { [SIBLINGS]: sock, ...pauseEnv(dir, "bind:before-poke"), BUS_ADAPTER_OWNER: OWNER, BUS_HARNESS_SESSION: "conv-1" } });
+  // Its registration runs synchronously into the pause (no await between).
+  await until(() => {
+    try {
+      return rows<{ id: string }>(`SELECT id FROM ids WHERE harness_session = 'conv-1'`).length === 1;
+    } catch {
+      return false; // the file and its tables don't exist yet
+    }
+  }, 10_000, "the adapter's child registers");
+  const client = await siblingSession(sock, { BUS_ADAPTER_OWNER: null, BUS_HARNESS_SESSION: null, BUS_TEST_PAUSE: null, BUS_TEST_PAUSE_FILE: null });
+  const clientId = (await who(client)).id;
+  expect(holder("omp-local")).toBe(clientId);
+  await until(() => existsSync(join(dir, "sock.omp-local")), 10_000, "the sibling listens on the name");
+  releasePause(dir, "bind:before-poke");
+  const adapter = await adapterP;
+  expect(adapter.stderr()).toContain("test pause hit: bind:before-poke");
+  await ready(adapter);
+  const adapterId = (await who(adapter)).id;
+  expect(holder("omp-local")).toBe(adapterId);
+  expect((await who(adapter)).aliases).toEqual(["omp-local"]);
+  expect(holds(clientId)).toEqual([]);
+  expect(displaced()).toEqual([expect.objectContaining({ actor: adapterId, target: clientId, name: "omp-local" })]);
+  expect(rows(`SELECT 1 FROM binding_events WHERE session_id = ? AND event = 'refused'`, adapterId)).toEqual([]);
+}, 30_000);
+
 test("adapter first: its sibling's BUS_IDENTITY finds the name held and starts unbound; nothing is displaced", async () => {
   const adapter = await localSession(dir, "omp-local", { extra: { [SIBLINGS]: sock, BUS_ADAPTER_OWNER: OWNER, BUS_HARNESS_SESSION: "conv-1" } });
   await ready(adapter);
@@ -104,13 +150,16 @@ test("adapter first: its sibling's BUS_IDENTITY finds the name held and starts u
 test("the adapter's child restoring from the name record its sibling wrote takes the name at once, without the predecessor wait", async () => {
   const client = await localSession(dir, "omp-local", { extra: { [SIBLINGS]: sock } });
   const clientId = (await who(client)).id;
-  const t0 = Date.now();
   // No BUS_IDENTITY: the name comes from the record under the shared harness pid.
   const adapter = await siblingSession(sock, adapterEnv("conv-1", null));
-  expect(Date.now() - t0).toBeLessThan(4000);
   await ready(adapter);
   const adapterId = (await who(adapter)).id;
   expect(holder("omp-local")).toBe(adapterId);
+  // From its registration to its bind, measured in its own rows: the
+  // predecessor wait would put SIBLING_WAIT_MS between them.
+  const registered = rows<{ started_at: number }>(`SELECT started_at FROM bindings WHERE session_id = ?`, adapterId)[0]!.started_at;
+  const bound = rows<{ at: number }>(`SELECT at FROM binding_events WHERE session_id = ? AND name = 'omp-local' AND event = 'bound'`, adapterId)[0]!.at;
+  expect(bound - registered).toBeLessThan(SIBLING_WAIT_MS);
   expect(displaced()).toEqual([expect.objectContaining({ actor: adapterId, target: clientId, name: "omp-local" })]);
 }, 30_000);
 

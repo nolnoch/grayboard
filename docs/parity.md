@@ -56,6 +56,7 @@ Rows 1–8: `parity-delivery.md`. Rows 9–16: `parity-access.md`. Rows 17–22:
 ## Notes (known limits, not cells)
 
 - #559 items 3, 6: omp L robustness edges (a renamed entry running grayboard through its own script, or one an ACP client declares, is reported but not refused (#1140), except an exactly named `grayboard` over HTTP, through its own script or an unlisted wrapper, or on Windows; Windows). A child that wedges after it initializes (in a call, or omp's switch-time handshake) holds calls until abort; `tools/call` has no deadline, since a timed-out send may have landed (item 2). An omp advisor gets built-in tools only, so it never calls grayboard (item 5, omp 18.14).
+- #1381 (pi L, omp L, OC V1 (L)): an adapter's child takes a name a push-on grayboard its harness started directly beside it holds (sessions.md); one behind a wrapper isn't its sibling, so it keeps the name and its pushes go where the harness sends them.
 - #489: hosted presence and `whoami` items (an unbound native session lists itself twice in `unbound_sessions`; local `whoami` says `aliases` where hosted says `held`).
 - OC V1: N root sessions in one opencode process share one binding (adapters.md §opencode).
 - On a signed-in machine, `refresh-adapters` keeps the V1 opencode entry, which serves the local bus, and prints the `setup-opencode` command that reaches the server, with the URL's credentials stripped (#474); the entry's `grayboard mcp` already says on stderr that it serves the local bus (#491). Proof: `src/cli/opencode-setup.test.ts` ("(#474)").

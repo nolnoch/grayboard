@@ -349,6 +349,17 @@ function syncHolds(): void {
 }
 // Whether a drain may still mark mail to `reader` delivered: the ID, or a name the database says this session holds.
 const stillMine = (reader: string): boolean => reader === SESSION_ID || holdsOf(db, SESSION_ID).includes(reader);
+// Marks each of `readers` still this session's, in one BEGIN IMMEDIATE with
+// the check; false when one was taken (its mail is left to the taker).
+const markIfMine = (readers: string[], mark: (reader: string) => void): boolean =>
+  db.transaction(() => {
+    let all = true;
+    for (const r of readers) {
+      if (stillMine(r)) mark(r);
+      else all = false;
+    }
+    return all;
+  }).immediate();
 
 function bindHint(child: string | undefined): { bind_hint?: string } {
   if (child !== undefined || bindHinted || WRITES_AS || held.length) return {};
@@ -1205,9 +1216,9 @@ async function drainLoop(): Promise<void> {
         // A push in flight while another process's open merges a 1.x name in (#1192).
         await testPauseAsync("drain:before-delivered");
         if (sessionEnded) return;
-        // Taken mid-drain (#1381): the taker's drain delivers it.
-        if (!stillMine(reader)) return lostMidDrain();
-        deliveredTo(reader, msg.id);
+        // Taken mid-drain (#1381): the taker's drain delivers it. Checked and
+        // marked in one write transaction, so a displacement can't commit between.
+        if (!markIfMine([reader], (r) => deliveredTo(r, msg.id))) return lostMidDrain();
       }
     }
     // A post pending for several addresses (an ID and an alias subscription)
@@ -1226,12 +1237,16 @@ async function drainLoop(): Promise<void> {
     if (boardItems.size > 0) any = true;
     for (const { item, readers: pendingTo } of boardItems.values()) {
       if (shuttingDown) return;
+      // Only while every address is still this session's (#1381): a name
+      // taken mid-drain is the taker's to push; the fresh drain re-reads.
+      if (!pendingTo.every(stillMine)) return lostMidDrain();
       const params = boardNotification(item);
       // As the post's row recorded it when written (#1355), not whether its author is human now.
       if (item.kind === "push" && postHuman(db, item.post)) params.meta.human = "true";
       if (!await pushChannel(params)) return;
+      await testPauseAsync("drain:before-board-delivered");
       if (sessionEnded) return;
-      for (const reader of pendingTo) if (stillMine(reader)) markDelivered(db, reader, item);
+      if (!markIfMine(pendingTo, (r) => markDelivered(db, r, item))) return lostMidDrain();
     }
     if (!any) break;
   }
