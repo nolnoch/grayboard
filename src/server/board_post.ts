@@ -2,7 +2,7 @@
 // the caller's Tx, judged by the async BoardAccess on that same Tx. Every rule is core's (postGateRule, postPreChecks,
 // planPostTargets, orderLanes, boardPostResult), so local and the server answer alike and only the reads differ.
 import {
-  mentionTokens, needsRotation, orderLanes, planPostTargets, postBranch, postGateRule, postPreChecks, postWakes, seenScopeOf, systemBody,
+  mentionTokens, needsRotation, orderLanes, planPostTargets, postBranch, postGateRule, postMark, postPreChecks, postWakes, seenScopeOf, systemBody,
   type Board, type PostGate, type PostTargetFacts,
 } from "../core/boards.ts";
 import { CoreError } from "../core/errors.ts";
@@ -79,7 +79,7 @@ async function writePost(
   const now = Date.now();
   const p = await repo.boards.insertPost(tx, {
     board: b.name, author: actor, body, parentId, now, expiresAt: null,
-    authorId: w.session ?? null, via: w.via ?? null, authorUser: w.user ?? null,
+    authorId: w.session ?? null, via: w.via ?? null, authorUser: w.user ?? null, human: postMark(gate, strict),
   });
   const addresses = w.addresses ?? [actor];
   const send = w.files?.send;

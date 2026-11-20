@@ -1146,7 +1146,7 @@ test("#807 P3 B5b2b: board_post's repo reads and writes run on the handle they'r
   const settled = /used after its transaction settled/;
   const stranger = /not a SQLite store handle/;
   const [b, al, cl] = [repo.boards, repo.aliases, repo.claims];
-  const np = (board: string, body: string) => ({ board, author: be, body, parentId: null, now: 900, expiresAt: null, authorId: null, via: null, authorUser: null });
+  const np = (board: string, body: string) => ({ board, author: be, body, parentId: null, now: 900, expiresAt: null, authorId: null, via: null, authorUser: null, human: false });
   const limits = { file: 1 << 20, total: 1 << 20 };
   const target = [[fe, { reason: "subscription", wake: true }]] as [string, { reason: "subscription"; wake: boolean }][];
   for (const h of [kept, {} as Tx]) {
