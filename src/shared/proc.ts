@@ -239,10 +239,28 @@ export type AncestorFacts = { comm: string | null; argv: string[]; wrapper: bool
 const LAUNCHERS = new Set(["timeout", "nice", "ionice", "nohup", "stdbuf", "uvx"]);
 const LAUNCHER_VERBS: Record<string, Set<string>> = { direnv: new Set(["exec"]), mise: new Set(["x", "exec"]), uv: new Set(["run"]) };
 
+// Options before a launcher's verb that take a separate value (`mise -C dir x`,
+// `uv --directory d run`); any other leading `-…` is taken as a flag.
+const VALUE_OPTS = new Set(["-C", "--cd", "--directory", "--project", "-E", "--env", "-p", "--python"]);
+
 function isLauncher(p: AncestorFacts): boolean {
-  const name = p.argv[0]?.split(/[\\/]/).pop() || p.comm || "";
-  return LAUNCHERS.has(name) || (LAUNCHER_VERBS[name]?.has(p.argv[1] ?? "") ?? false);
+  const name = basename(p.argv[0] ?? "") || p.comm || "";
+  if (LAUNCHERS.has(name)) return true;
+  const verbs = LAUNCHER_VERBS[name];
+  return verbs !== undefined && verbs.has(firstOperand(p.argv, VALUE_OPTS) ?? "");
 }
+
+/** The first argument after argv[0] that isn't an option (or, for one in `valueOpts`, its value). */
+function firstOperand(argv: string[], valueOpts: Set<string> = new Set()): string | undefined {
+  for (let i = 1; i < argv.length; i++) {
+    const a = argv[i]!;
+    if (!a.startsWith("-")) return a;
+    if (valueOpts.has(a)) i++;
+  }
+  return undefined;
+}
+
+const basename = (path: string): string => path.split(/[\\/]/).pop() ?? "";
 
 /**
  * Whether the first of `chain` (ancestors, nearest first) that is neither a
@@ -253,22 +271,23 @@ export function claudeAmong(chain: Iterable<AncestorFacts>): boolean | null {
   for (const p of chain) {
     if (p.wrapper || isLauncher(p)) continue;
     if (p.comm === null && !p.argv.length) return null;
-    return isClaudeCode(p.comm, p.argv[0] ?? "", p.argv.join(" "));
+    return isClaudeCode(p.comm, p.argv);
   }
   return null;
 }
 
 /**
- * Whether a process with command name `comm`, argv[0] `argv0` and
- * space-joined command line `args` is Claude Code: its comm is `claude`
- * (Claude Code sets process.title, which also gives "claude daemon"), its
- * argv[0]'s basename is `claude` or `claude.exe` (the npm package's
- * `bin/claude.exe` native binary), or it is an older npm install's `cli.js`
- * under node (current releases ship no cli.js; kept for installs that predate
- * the native binary).
+ * Whether a process with command name `comm` and argv `argv` is Claude Code:
+ * its comm is `claude` (Claude Code sets process.title, which also gives
+ * "claude daemon"), its argv[0]'s basename is `claude` or `claude.exe` (the
+ * npm package's `bin/claude.exe` native binary), or it is node or bun running
+ * an older npm install's `cli.js` as its script (current releases ship no
+ * cli.js; kept for installs that predate the native binary). Only the script
+ * argument counts: another harness given that path as an argument isn't it.
  */
-export function isClaudeCode(comm: string | null, argv0: string, args: string): boolean {
+export function isClaudeCode(comm: string | null, argv: string[]): boolean {
   if (comm !== null && /^claude(\.exe)?( |$)/.test(comm)) return true;
-  if (/^claude(\.exe)?$/.test(argv0.split(/[\\/]/).pop() ?? "")) return true;
-  return /[\\/]@anthropic-ai[\\/]claude-code[\\/]cli\.js(?:\s|$)/.test(args);
+  const argv0 = basename(argv[0] ?? "");
+  if (/^claude(\.exe)?$/.test(argv0)) return true;
+  return /^(node|nodejs|bun)(\.exe)?$/.test(argv0) && /[\\/]@anthropic-ai[\\/]claude-code[\\/]cli\.js$/.test(firstOperand(argv) ?? "");
 }
