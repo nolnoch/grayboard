@@ -749,6 +749,35 @@ test("claims across a session's aliases: release under another primary, renew un
   expect(claimRow(key)).toEqual([]);
 }, 30_000);
 
+// #1174: a queue lane is its session, not the handle it took a post as. A take under the session's other alias (a
+// mention) counts for its lane in the rotation, and its decline of the post was its lane's one turn.
+test("#1174: a take under a lane's other alias keeps its place in the rotation, and is its turn at the post", async () => {
+  const poster = await connect("fe");
+  await poster.call("board_create", { name: "lanes", purpose: "rotation", kind: "queue" });
+  const s = await connect("lane-b");
+  const t = await connect("lane-c");
+  for (const l of [s, t]) await l.call("board_subscribe", { board: "lanes", mode: "push" });
+  expect(await s.bind("lane-a", { create: true })).toMatchObject({ held: [`${A}/lane-b`, `${A}/lane-a`] });
+  const holder = (key: string) => rows<{ holder: string }>(`SELECT holder FROM claims WHERE key = ?`, key);
+  const item = async (body: string) => (await poster.call<{ post_id: number }>("board_post", { board: "lanes", body })).post_id;
+
+  // Named, lane-a holds item 1: s's lane, lane-b, was woken by it.
+  const firstId = await item("@lane-a take this");
+  const first = `queue:lanes:${firstId}`;
+  expect(holder(first)).toEqual([{ holder: `${A}/lane-a` }]);
+  const second = `queue:lanes:${await item("item 2")}`;
+  expect(holder(second)).toEqual([{ holder: `${A}/lane-c` }]);
+
+  // s declines item 1: it isn't offered it again as lane-b; t, which hasn't held it, gets it.
+  await s.call("claim_release", { key: first, note: "pass" });
+  expect(holder(first)).toEqual([{ holder: `${A}/lane-c` }]);
+  await t.call("claim_release", { key: first, note: "pass" });
+  expect(holder(first)).toEqual([]);
+  expect(rows<{ body: string }>(`SELECT body FROM posts WHERE parent_id = ?`, firstId).map((r) => r.body)).toEqual([
+    `[unclaimed] ${first}: all 2 lanes passed on it, and no other lane is left; it stays here unclaimed`,
+  ]);
+}, 30_000);
+
 // #284 PR 4: an upload is the session's across its address set. One made as
 // a rides a send as b, and a reply that defaults to b.
 test("an upload made as one alias attaches to a send as another, and to a reply defaulting to it", async () => {

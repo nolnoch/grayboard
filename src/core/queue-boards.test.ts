@@ -17,7 +17,7 @@ import {
   touchAlias,
 } from "./boards.ts";
 import { holdAlias } from "./bindings.ts";
-import { claim, release, sweepExpired, listClaims, watch } from "./claims.ts";
+import { claim, logEvent, release, sweepExpired, listClaims, watch } from "./claims.ts";
 import { initCoreSchema } from "./schema.ts";
 
 let db: Database;
@@ -540,4 +540,89 @@ test("a redelivery of an old post moves its new holder to the back of the rotati
   expect(queueLanes(db, getBoard(db, "work")!, ["be"])).toEqual(["fe", "zed", "sim"]);
   expect(post(db, "be", "work", "item 4").wake).toEqual(["fe"]);
   expect(post(db, "be", "work", "item 5").wake).toEqual(["zed"]);
+});
+
+// #1174: a lane is its session, not the handle it held when it took a post. A session that subscribed unbound and
+// took a post as its ID, then bound a name, keeps that take in the rotation and has had its one turn at the post.
+describe("a lane's history follows its session across a bind (#1174)", () => {
+  const S = "id:0000000001174";
+  beforeEach(() => {
+    db.prepare(`DELETE FROM subscriptions WHERE handle = 'fe'`).run();
+    registerId(db, { id: S, principal: null, launcher: false });
+    ensureAlias(db, "qa", "test");
+    subscribe(db, S, "work", "push");
+  });
+
+  test("a lane that took a post unbound, then bound a name, keeps its place in the rotation", () => {
+    // Both never woken: the ID sorts before sim.
+    expect(post(db, "be", "work", "item 1").wake).toEqual([S]);
+    holdAlias(db, "qa", S);
+    // qa is the same session as the ID that took item 1: sim, never woken, is next.
+    expect(queueLanes(db, getBoard(db, "work")!, ["be"])).toEqual(["sim", "qa"]);
+    expect(post(db, "be", "work", "item 2").wake).toEqual(["sim"]);
+  });
+
+  test("a take under another alias the session holds counts for its lane", () => {
+    ensureAlias(db, "alpha", "test");
+    holdAlias(db, "qa", S, 100);
+    holdAlias(db, "alpha", S, 101);
+    const r = post(db, "be", "work", "@alpha take this", null, said);
+    expect(takes(claimKey(r.post.id))).toEqual(["alpha"]);
+    expect(post(db, "be", "work", "item 2").wake).toEqual(["sim"]);
+  });
+
+  test("a post it took unbound and declined after binding isn't offered it again, and counts it once", () => {
+    const r = post(db, "be", "work", "item 1");
+    const key = claimKey(r.post.id);
+    holdAlias(db, "qa", S);
+    release(db, "qa", key, "pass", { addresses: ["qa", S], session: S });
+    expect(listClaims(db).filter((c) => c.key === key).map((c) => c.holder)).toEqual(["sim"]);
+    release(db, "sim", key, "pass");
+    expect(takes(key)).toEqual([S, "sim"]);
+    const replies = db.prepare(`SELECT body FROM posts WHERE parent_id = ?`).all(r.post.id) as { body: string }[];
+    expect(replies.map((x) => x.body)).toEqual([`[unclaimed] ${key}: all 2 lanes passed on it, and no other lane is left; it stays here unclaimed`]);
+  });
+
+  test("a lane subscribed as a non-primary alias has had its turn when the session took the post as another", () => {
+    db.prepare(`DELETE FROM subscriptions WHERE handle = ?`).run(S);
+    ensureAlias(db, "qb", "test");
+    holdAlias(db, "qa", S, 100);
+    holdAlias(db, "qb", S, 101);
+    subscribe(db, "qb", "work", "push");
+    const r = post(db, "be", "work", "@qa take this", null, said);
+    const key = claimKey(r.post.id);
+    release(db, "qa", key, "pass", { addresses: ["qa", "qb", S], session: S });
+    // Not re-offered to the same session as qb: sim is the only other lane.
+    expect(listClaims(db).filter((c) => c.key === key).map((c) => c.holder)).toEqual(["sim"]);
+    release(db, "sim", key, "pass");
+    expect(takes(key)).toEqual(["qa", "sim"]);
+    const replies = db.prepare(`SELECT body FROM posts WHERE parent_id = ?`).all(r.post.id) as { body: string }[];
+    expect(replies.map((x) => x.body)).toEqual([`[unclaimed] ${key}: all 2 lanes passed on it, and no other lane is left; it stays here unclaimed`]);
+  });
+
+  test("a session that held a post under two addresses counts as one lane in its [unclaimed] reply", () => {
+    db.prepare(`DELETE FROM subscriptions WHERE handle IN ('sim', ?)`).run(S);
+    ensureAlias(db, "qb", "test");
+    holdAlias(db, "qa", S, 100);
+    holdAlias(db, "qb", S, 101);
+    subscribe(db, "qb", "work", "push");
+    const r = post(db, "be", "work", "@qa take this", null, said);
+    const key = claimKey(r.post.id);
+    // A take as qb the redelivery rule no longer makes (the history of an older build): one session, one lane.
+    logEvent(db, "take", "qb", { key, board: "work" }, Date.now());
+    release(db, "qa", key, "pass", { addresses: ["qa", "qb", S], session: S });
+    const replies = db.prepare(`SELECT body FROM posts WHERE parent_id = ?`).all(r.post.id) as { body: string }[];
+    expect(replies.map((x) => x.body)).toEqual([`[unclaimed] ${key}: its one lane passed on it, and no other lane is left; it stays here unclaimed`]);
+  });
+
+  test("its one turn as its only lane: declined after binding, the post ends unclaimed with one lane counted", () => {
+    db.prepare(`DELETE FROM subscriptions WHERE handle = 'sim'`).run();
+    const r = post(db, "be", "work", "item 1");
+    const key = claimKey(r.post.id);
+    holdAlias(db, "qa", S);
+    release(db, "qa", key, "pass", { addresses: ["qa", S], session: S });
+    expect(takes(key)).toEqual([S]);
+    const replies = db.prepare(`SELECT body FROM posts WHERE parent_id = ?`).all(r.post.id) as { body: string }[];
+    expect(replies.map((x) => x.body)).toEqual([`[unclaimed] ${key}: its one lane passed on it, and no other lane is left; it stays here unclaimed`]);
+  });
 });

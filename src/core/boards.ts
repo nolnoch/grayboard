@@ -860,13 +860,15 @@ export type PostOpts = {
 // (never-woken first, then by handle). A lane was last woken at its latest
 // queue take on the board (a delivery or redelivery, #221: an old post's
 // redelivery counts when it was handed over, not when it was written), or at
-// the newest board post in its outbox (a mention or a thread reply), whichever is later. A lane is a push subscriber who isn't
+// the newest board post in its outbox (a mention or a thread reply), whichever is later, under any address of its
+// session now (its ID or an alias it holds, #1174: a take as its ID before it bound counts). A lane is a push subscriber who isn't
 // one of the poster's addresses (its address set: a session's own lane never
 // takes its own post, whichever alias it posted as), hasn't opted out (peer_status queue:"off"), and isn't a
-// read-only viewer. A session's lane is its primary, the oldest alias it
-// holds, else its ID (#284 S8, S13; an ID can't opt out), whichever address
-// it subscribed under: a session that subscribed unbound stays in the
-// rotation after it binds, once however many aliases it holds. With
+// read-only viewer. A lane is named by the address subscribed, but a
+// subscription under an ID names the session's primary, the oldest alias it
+// holds, else the ID (#284 S8, S13; an ID can't opt out): a session that
+// subscribed unbound stays in the rotation after it binds, once however many
+// aliases it holds. With
 // `online`, live lanes come first; offline lanes are the fallback in the same
 // order, so an empty live set still delivers.
 export function queueLanes(
@@ -899,6 +901,24 @@ export function orderLanes(
   return [...lanes.filter((h) => online(h)), ...lanes.filter((h) => !online(h))];
 }
 
+/**
+ * SQL for the session an address belongs to now (#1174): an alias's holder, else the address itself (an ID, or an
+ * alias no session holds). A queue lane is its session, not the handle it held when it took a post: the rotation's
+ * history (laneAddressesSql) and a redelivery's one-turn rule (redeliveryFacts) both read a handle through this.
+ * `h` is an SQL expression.
+ */
+export function laneSessionSql(h: string): string {
+  return `COALESCE((SELECT id FROM alias_holds WHERE address = ${h}), ${h})`;
+}
+
+/** SQL for `lane`'s address set, a parenthesized one-column (`address`) subquery: its session's ID and every alias it
+ * holds (laneSessionSql), or the address alone when no session holds it. A take or a push under any of them woke this
+ * lane, and a take under any of them was its turn at a post. */
+function laneAddressesSql(lane: string): string {
+  const sid = laneSessionSql(lane);
+  return `(SELECT ${sid} AS address UNION ALL SELECT address FROM alias_holds WHERE id = ${sid})`;
+}
+
 /** queueLanes' rows before any judgment: the board's lanes less `poster`, least-recently-woken first. */
 export function queueLaneRows(db: Database, board: string, poster: string[]): string[] {
   return (
@@ -914,9 +934,9 @@ export function queueLaneRows(db: Database, board: string, poster: string[]): st
          GROUP BY l.lane
          ORDER BY NULLIF(MAX(
              COALESCE((SELECT MAX(e.at) FROM claim_events e
-                       WHERE e.board = ?1 AND e.handle = l.lane AND e.event = 'take' AND e.key GLOB 'queue:*'), 0),
+                       WHERE e.board = ?1 AND e.handle IN ${laneAddressesSql("l.lane")} AND e.event = 'take' AND e.key GLOB 'queue:*'), 0),
              COALESCE((SELECT MAX(p2.created_at) FROM outbox o2 JOIN posts p2 ON p2.id = o2.post_id
-                       WHERE o2.handle = l.lane AND p2.board = ?1), 0)), 0) ASC NULLS FIRST, l.lane ASC`,
+                       WHERE o2.handle IN ${laneAddressesSql("l.lane")} AND p2.board = ?1), 0)), 0) ASC NULLS FIRST, l.lane ASC`,
       )
       .all(board, JSON.stringify(poster)) as { handle: string }[]
   ).map((r) => r.handle);
@@ -985,7 +1005,8 @@ export function authorAddresses(db: Database, author: string, authorId: string |
 // offer the original post to the next eligible lane that hasn't held it. Each
 // lane gets one turn (#220): one that held it (declined it, or let its TTL
 // lapse) isn't offered it again, so two lanes can't pass it back and forth
-// forever. Presence-blind: the sweep has no online predicate, so an offline
+// forever. A lane is its session as of now (#219, #1174): a take as its ID or
+// any alias it holds was its turn, whatever its primary is now. Presence-blind: the sweep has no online predicate, so an offline
 // lane holds the re-offer in its outbox until it wakes, and its own TTL lapse
 // re-rotates. Caller is inside a transaction. Returns the lane woken; with no
 // lane left, the post and how many lanes held it, for the caller to say so in
@@ -1003,8 +1024,8 @@ export function redeliverQueuePost(db: Database, key: string, prevHolder: string
 export type RedeliveryFacts = { board: Board; postId: number; poster: string[]; takers: number; held: Set<string> };
 
 /** What a queue post's redelivery reads (#807 B5b3a): its board and post, the post's author addresses (no lane they
- * name gets it back), how many took it (the `[unclaimed]`
- * reply's count), and every address that held it with each one's lane. Null when `key` names no queue post. */
+ * name gets it back), how many sessions took it (the `[unclaimed]` reply's count), and every address that held it with
+ * every address of its session now (#1174). Null when `key` names no queue post. */
 export function redeliveryFacts(db: Database, key: string, prevHolder: string): RedeliveryFacts | null {
   const m = /^queue:([^:]+):(\d+)$/.exec(key);
   if (!m) return null;
@@ -1015,14 +1036,17 @@ export function redeliveryFacts(db: Database, key: string, prevHolder: string): 
     (db.prepare(`SELECT DISTINCT handle FROM claim_events WHERE key = ? AND event = 'take'`).all(key) as { handle: string }[]).map((r) => r.handle),
   );
   held.add(prevHolder);
-  // A holder named by a mention may be a session's other alias or its ID (#219): its session's lane, as
-  // queueLanes names it (the primary hold, else the address), has had its turn too.
-  const laneOf = db.prepare(
-    `SELECT COALESCE(${primaryHoldSql("COALESCE((SELECT id FROM alias_holds WHERE address = ?1), ?1)")}, ?1) AS lane`,
-  );
-  const takers = held.size; // the `[unclaimed]` reply counts who held it, not their lanes twice
-  for (const h of [...held]) held.add((laneOf.get(h) as { lane: string }).lane);
-  return { board: b, postId: p.id, poster: postAddresses(db, p.id), takers, held };
+  // A lane is its session as of now (#219, #1174): a take as its ID or any alias it holds was its turn, whichever of
+  // them queueLanes names it by (its primary, its ID, or the alias it subscribed as). The `[unclaimed]` reply counts
+  // sessions, where known: a handle no session holds counts as itself.
+  const sessionOf = db.prepare(`SELECT ${laneSessionSql("?1")} AS sid`);
+  const addressesOf = db.prepare(`SELECT address FROM ${laneAddressesSql("?1")}`);
+  const sessions = new Set<string>();
+  for (const h of [...held]) {
+    sessions.add((sessionOf.get(h) as { sid: string }).sid);
+    for (const r of addressesOf.all(h) as { address: string }[]) held.add(r.address);
+  }
+  return { board: b, postId: p.id, poster: postAddresses(db, p.id), takers: sessions.size, held };
 }
 
 /** The lane a declined or lapsed queue post goes to next: the first of `lanes` (queueLanes' order) that hasn't held it. */
