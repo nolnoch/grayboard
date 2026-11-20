@@ -256,6 +256,19 @@ function postRows(it: It): void {
     expect((await h.boards.snapshotPage(h.read, "hall", {})).posts.map(p => [p.body, p.parent_id])).toEqual([["root", null], ["next", root]]);
   });
 
+  // The mapping is narrow: a reply whose parent exists fails for its own reason (here a board that doesn't exist, as a
+  // board gone between the gate and the insert would), never as MissingPost.
+  it("insertPost of a reply to an existing parent on a board that doesn't exist rejects, not as MissingPost, writing nothing", async h => {
+    await board(h, "hall");
+    const root = await write(h, np("hall", BE, "root", T0));
+    const e = await caught(() => h.write(tx => h.boards.insertPost(tx, np("nope", FE, "reply", T0 + 1, { parentId: root }))));
+    expect(e).toBeInstanceOf(Error);
+    expect(e).not.toBeInstanceOf(MissingPost);
+    expect((e as Error).message).not.toContain("is not a post on");
+    expect((await h.boards.snapshotPage(h.read, "hall", {})).posts.map(p => p.id)).toEqual([root]);
+    expect(await h.boards.snapshotPage(h.read, "nope", {})).toEqual({ posts: [], next_before_id: null });
+  });
+
   it("snapshotPage: options checked first; pages oldest first within a page, next_before_id while older posts remain; attachments ride along", async h => {
     await board(h, "hall");
     await board(h, "other");
@@ -359,6 +372,8 @@ function subscriptions(it: It): void {
     await h.hold(FE, S1, T0);
     await h.hold(BE, S1, T0 + 1);
     const p = await write(h, np("hall", FE, "mine", T0));
+    // A post nothing references (no push, mute or reply) stays too.
+    const lone = await write(h, np("hall", FE, "unreferenced", T0 + 1));
     await sub(h, FE, "hall", "push");
     await sub(h, BE, "hall", "push");
     await h.write(async tx => {
@@ -376,6 +391,7 @@ function subscriptions(it: It): void {
     expect(await h.watchRows()).toEqual([{ key: "ticket:1", handle: BE }]);
     expect(await h.holdRows()).toEqual([{ address: BE, id: S1 }]);
     expect((await h.boards.post(h.read, p))?.author).toBe(FE);
+    expect(await h.boards.post(h.read, lone)).toMatchObject({ author: FE, body: "unreferenced" });
     expect((await h.claimRows()).map(c => c.holder)).toEqual([FE]);
   });
 }

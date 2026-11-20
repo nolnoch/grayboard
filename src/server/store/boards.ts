@@ -92,7 +92,7 @@ export interface BoardsStore {
   // or archived_by (core setArchived). The conditional write is the check: two archives give one board.
   setArchived(tx: Tx, name: string, by: string | null, now: number): Promise<Board | null>;
   // A read of a board already judged visible (core readRows), with attachments. thread: every post of the thread the
-  // post is in, on this board, by id. before_id: up to `limit` (1..200, default 20) posts before it, oldest first.
+  // post is in, on this board, by id. before_id: up to `limit` (clamped to 1..200, default 20) posts before it, oldest first.
   // Else the handle's unread (as views counts it) oldest first, up to limit, or when there is none the latest limit
   // (10 when limit is absent), oldest first. With a handle, its cursor moves up to the newest post returned (never
   // back) and its undelivered pushes of the returned posts are stamped delivered; unread_remaining is what's still
