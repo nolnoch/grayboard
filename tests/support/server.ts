@@ -256,6 +256,11 @@ export class TestServer {
 // once it prints the port it listens on. Its stdout and stderr are drained
 // into one log as they arrive, so it never blocks on a full pipe and log()
 // mid-run has both.
+// How long a spawned server gets to print its port. A compiled server listens in well under a second, but a CI
+// runner can stall for tens of seconds: on #1426 three consecutive conformance cases ran 3.2 s, 12.8 s and 6.2 s
+// against ~0.4 s on a passing run, and the server printed nothing in 10 s. A hung server still fails, with its output.
+const LISTEN_DEADLINE_MS = 30_000;
+
 export class ServerProcess {
   private constructor(
     readonly proc: Subprocess<"ignore", "pipe", "pipe">,
@@ -293,10 +298,11 @@ export class ServerProcess {
     };
     const drained = Promise.all([drain(proc.stdout), drain(proc.stderr)]);
     let timedOut = false;
+    const started = Date.now();
     const deadline = setTimeout(() => {
       timedOut = true;
       proc.kill("SIGKILL");
-    }, 10_000);
+    }, LISTEN_DEADLINE_MS);
     const exited = proc.exited.then((code) => ({ code }));
     try {
       for (;;) {
@@ -305,7 +311,7 @@ export class ServerProcess {
         const done = await Promise.race([exited, Bun.sleep(20)]);
         if (done) {
           await drained;
-          throw new Error(timedOut ? `${bin} didn't listen within 10 s; killed\n${out.text}` : `${bin} exited before listening (code ${done.code})\n${out.text}`);
+          throw new Error(timedOut ? `${bin} didn't listen within ${LISTEN_DEADLINE_MS / 1000} s (${Date.now() - started} ms since spawn); killed\n${out.text}` : `${bin} exited before listening (code ${done.code})\n${out.text}`);
         }
       }
     } finally {
