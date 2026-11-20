@@ -97,7 +97,7 @@ describePg("the Postgres Repo behind a server", () => {
       await repo.write(tx => repo.oauth.revokeToken(tx, "no-such-token", "no-such-client", repo.now()));
       await until(() => heard.find(h => h.changed === null), 2000, "the revoke's null notice");
       // The rollback told nothing, and its write left nothing: the revoke's notice is the only one since.
-      expect(heard.filter(h => h.place === "never")).toEqual([]);
+      expect(heard.filter(h => h.changed === id)).toEqual([]);
       expect(heard.filter(h => h.changed === null)).toEqual([{ changed: null }]);
     } finally { off(); }
   });

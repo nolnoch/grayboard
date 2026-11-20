@@ -48,7 +48,8 @@ export function startServer(config: Config, opts: StartOptions = {}) {
   const humanReach = config.humanReach ?? "team";
   const { db: testDb, repo } = opts.repo
     // No SQLite handle behind an injected Repo: `db` (tests only) is undefined there, typed as SQLite's until C11b-d
-    // move the tests that read it onto the Repo.
+    // move the tests that read it onto the Repo. The injected Repo's own attachment limits and session-end reach apply,
+    // not config's: its maker sets them (C11b opens it from config).
     ? { db: undefined as unknown as ReturnType<typeof openDatabase>["db"], repo: opts.repo }
     : openDatabase(config.dbPath, { blobDir: config.blobDir, sessionEnd: sessionEndPort(humanReach), attachmentLimits: config.attachmentLimits, attachmentUserQuota: config.attachmentUserQuota, ...(opts.now ? { now: opts.now } : {}) });
   let slack: SlackBridge | undefined;
@@ -222,10 +223,10 @@ export function startServer(config: Config, opts: StartOptions = {}) {
         const failure = outcomes.find(outcome => outcome.status === "rejected");
         if (failure?.status === "rejected") throw failure.reason;
       }).finally(async () => {
-        oauth.close();
         // Awaited (#807 P3 C11a): a Postgres Repo's pool and LISTEN connection close over the network, and a caller
-        // that exits once stop() settles would otherwise cut them off and leave its database in use.
-        await repo.close();
+        // that exits once stop() settles would otherwise cut them off and leave its database in use. The Repo closes
+        // even if oauth's close throws.
+        try { oauth.close(); } finally { await repo.close(); }
       });
       return stopPromise;
     },

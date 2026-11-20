@@ -273,3 +273,13 @@ test("an end releases its queue claims in post id order", () => {
   const released = db.prepare(`SELECT key FROM claim_events WHERE event = 'release' ORDER BY rowid`).all() as { key: string }[];
   expect(released.map((e) => e.key)).toEqual(["queue:q:9", "queue:q:10"]);
 });
+
+// An end reads its live claims ORDER BY key (bytewise), as the server's heldBy does, so both release in one order.
+// Mutation: endSession's claims query without ORDER BY key (insertion order: ticket:b first).
+test("an end releases its other claims in key order, not the order they were taken", () => {
+  const db = bus();
+  for (const k of ["ticket:b", "ticket:a"]) db.prepare(`INSERT INTO claims (key, holder, note, acquired_at, expires_at) VALUES (?, ?, 'n', 1, ?)`).run(k, ID, 1e15);
+  end(db, ID, Date.now());
+  const released = db.prepare(`SELECT key FROM claim_events WHERE event = 'release' ORDER BY rowid`).all() as { key: string }[];
+  expect(released.map((e) => e.key)).toEqual(["ticket:a", "ticket:b"]);
+});
