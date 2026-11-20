@@ -62,6 +62,16 @@ export class ConnectRefused extends SubscriberError {
 export class ServerUnreachable extends Error {
   constructor(cause: unknown) { super("Server unreachable", { cause }); }
 }
+// A tool call's request left, then the transport failed (a reset, a gateway
+// 502-504, a stream cut short, a timeout): the server may have run it, so the
+// agent checks before calling again (#1345, the Rust SDK's OutcomeUnknown). A
+// ServerUnreachable still, so every outage check (retry, drop) holds.
+export class OutcomeUnknown extends ServerUnreachable {
+  constructor(cause: unknown) {
+    super(cause);
+    this.message = "Server unreachable mid-call; it may have taken effect, so check (dm_history, board_read, claim_list) before calling it again";
+  }
+}
 // The server closed the inbox stream: an outage, or a refusal (expired
 // access, rebind, revocation) the reconnect will classify. Never itself
 // proof of an outage (#423).
@@ -83,6 +93,8 @@ function scopeRefusal(error: unknown): boolean {
   return false;
 }
 const networkCodes = new Set(["ECONNREFUSED", "ConnectionRefused", "ECONNRESET", "ETIMEDOUT", "EHOSTUNREACH", "ENETUNREACH", "ENOTFOUND", "EAI_AGAIN", "FailedToOpenSocket"]);
+// A failure to open the socket: no request left, so even a write is safe to call again.
+const connectCodes = new Set(["ECONNREFUSED", "ConnectionRefused", "EHOSTUNREACH", "ENETUNREACH", "ENOTFOUND", "EAI_AGAIN", "FailedToOpenSocket"]);
 const gatewayStatuses = new Set([502, 503, 504]);
 // Walks the cause chain: the SDK rethrows fetch failures from requests, but
 // wraps them during connect (SdkError EraNegotiationFailed {cause}).
@@ -95,6 +107,20 @@ export function unreachable(error: unknown): boolean {
     if (typeof code === "string" && networkCodes.has(code)) return true;
   }
   return false;
+}
+
+// A tool call's raw failure, before reachable() classifies it: an outage
+// after its request may have left (anything but a socket that never opened)
+// is OutcomeUnknown. A ServerUnreachable already is the credential's (a
+// refresh before the request, or after a 401 or 429 the server refused it
+// with), so nothing ran and it stays as it is.
+function outcome(error: unknown): unknown {
+  for (let e = error, depth = 0; e && depth < 8; e = (e as { cause?: unknown }).cause, depth++) {
+    if (e instanceof ServerUnreachable) return error;
+    const code = (e as { code?: unknown }).code;
+    if (typeof code === "string" && connectCodes.has(code)) return error;
+  }
+  return unreachable(error) ? new OutcomeUnknown(error) : error;
 }
 
 // Whether `error` is `signal`'s abort, by cause rather than timing (#1309): the reason itself, however deep a
@@ -272,7 +298,10 @@ export class NativeWire extends Connection {
     return tools;
   }
   // The server's result untouched: content, structuredContent, isError, _meta.
+  // Called on a connected wire, so an outage here may have come after the
+  // request left: OutcomeUnknown unless the socket never opened.
   async callTool(name: string, args: Record<string, unknown>, sessionID: string, signal?: AbortSignal): Promise<CallToolResult> {
-    return this.reachable(this.client.callTool({ name, arguments: args, _meta: { [this.wireOptions.sessionKey]: sessionID, ...this.declaration(), ...this.facts(sessionID) } }, this.options(signal)));
+    const call = this.client.callTool({ name, arguments: args, _meta: { [this.wireOptions.sessionKey]: sessionID, ...this.declaration(), ...this.facts(sessionID) } }, this.options(signal));
+    return this.reachable(call.catch(error => { throw this.signal.aborted ? error : outcome(error); }));
   }
 }

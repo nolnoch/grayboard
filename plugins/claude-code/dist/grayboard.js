@@ -31621,6 +31621,13 @@ class ServerUnreachable extends Error {
   }
 }
 
+class OutcomeUnknown extends ServerUnreachable {
+  constructor(cause) {
+    super(cause);
+    this.message = "Server unreachable mid-call; it may have taken effect, so check (dm_history, board_read, claim_list) before calling it again";
+  }
+}
+
 class SubscriptionClosed extends Error {
   constructor() {
     super("Subscription closed");
@@ -31640,6 +31647,7 @@ function scopeRefusal(error) {
   return false;
 }
 var networkCodes = new Set(["ECONNREFUSED", "ConnectionRefused", "ECONNRESET", "ETIMEDOUT", "EHOSTUNREACH", "ENETUNREACH", "ENOTFOUND", "EAI_AGAIN", "FailedToOpenSocket"]);
+var connectCodes = new Set(["ECONNREFUSED", "ConnectionRefused", "EHOSTUNREACH", "ENETUNREACH", "ENOTFOUND", "EAI_AGAIN", "FailedToOpenSocket"]);
 var gatewayStatuses = new Set([502, 503, 504]);
 function unreachable(error) {
   for (let e = error, depth = 0;e && depth < 8; e = e.cause, depth++) {
@@ -31654,6 +31662,16 @@ function unreachable(error) {
       return true;
   }
   return false;
+}
+function outcome(error) {
+  for (let e = error, depth = 0;e && depth < 8; e = e.cause, depth++) {
+    if (e instanceof ServerUnreachable)
+      return error;
+    const code = e.code;
+    if (typeof code === "string" && connectCodes.has(code))
+      return error;
+  }
+  return unreachable(error) ? new OutcomeUnknown(error) : error;
 }
 function abortOf(error, signal) {
   if (!signal.aborted)
@@ -31865,7 +31883,10 @@ class NativeWire extends Connection {
     return tools;
   }
   async callTool(name, args, sessionID, signal) {
-    return this.reachable(this.client.callTool({ name, arguments: args, _meta: { [this.wireOptions.sessionKey]: sessionID, ...this.declaration(), ...this.facts(sessionID) } }, this.options(signal)));
+    const call = this.client.callTool({ name, arguments: args, _meta: { [this.wireOptions.sessionKey]: sessionID, ...this.declaration(), ...this.facts(sessionID) } }, this.options(signal));
+    return this.reachable(call.catch((error) => {
+      throw this.signal.aborted ? error : outcome(error);
+    }));
   }
 }
 
@@ -32216,7 +32237,7 @@ var TokenResponse = object({
   refresh_token: Credential
 });
 var OAuthRefusal = strictObject({ error: string2() });
-var connectCodes = new Set(["ECONNREFUSED", "ConnectionRefused", "ENOTFOUND", "EAI_AGAIN", "EHOSTUNREACH", "ENETUNREACH", "FailedToOpenSocket", "UND_ERR_CONNECT_TIMEOUT"]);
+var connectCodes2 = new Set(["ECONNREFUSED", "ConnectionRefused", "ENOTFOUND", "EAI_AGAIN", "EHOSTUNREACH", "ENETUNREACH", "FailedToOpenSocket", "UND_ERR_CONNECT_TIMEOUT"]);
 function codeOf(e) {
   const code = e && typeof e === "object" && "code" in e ? e.code : undefined;
   return typeof code === "string" && /^[A-Za-z0-9_]{1,64}$/.test(code) ? code : undefined;
@@ -32224,7 +32245,7 @@ function codeOf(e) {
 function connectFailure(error) {
   for (let e = error, depth = 0;e && depth < 8; e = e instanceof Error ? e.cause : undefined, depth++) {
     const code = codeOf(e);
-    if (code && connectCodes.has(code))
+    if (code && connectCodes2.has(code))
       return true;
   }
   return false;
@@ -35093,6 +35114,8 @@ function failureCode(error) {
 function failureMessage(error, resumeHint) {
   if (error instanceof DeliveryStopped)
     return `Retry limit reached${error.item ? ` for ${error.item}; item remains unreceipted` : " before inbox progress"}; ${resumeHint}`;
+  if (error instanceof OutcomeUnknown)
+    return error.message;
   if (error instanceof ServerUnreachable)
     return `Server unreachable; ${resumeHint}`;
   if (error instanceof AccessExpired || error instanceof ServerOutdated || error instanceof DeliveryHeldElsewhere)
