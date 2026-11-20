@@ -36842,7 +36842,8 @@ class Controller {
   signInChanged(error, live) {
     if (!live || causeOf(error, Refusal)?.code !== "binding")
       return false;
-    this.credentialChanged();
+    if (!this.drifted)
+      this.credentialChanged();
     return true;
   }
   async path(sessionID) {
@@ -37588,7 +37589,7 @@ class Controller {
         await this.rotated(grace, () => this.prepare(r, true, true));
       } catch (caught) {
         const r = this.roots.get(id), error = this.expired(caught);
-        if (r && this.watches.has(id) && (this.drifted || this.signInChanged(error, this.restorable(r, r.epoch))))
+        if (r && this.watches.has(id) && (this.drifted && r.paused || this.signInChanged(error, this.restorable(r, r.epoch))))
           continue;
         if (r && (error instanceof ServerUnreachable || error instanceof RefreshInProgress) && this.restorable(r, r.epoch)) {
           this.retrying(r, error);

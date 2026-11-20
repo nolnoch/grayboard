@@ -213,10 +213,11 @@ export class Controller<E extends Enrollment = Enrollment> {
   // The port's refusal of a changed credential (Refusal "binding"), however a request surfaced it, while `live`
   // (the root that met it is still the current one): the watch's drift, seen before the watch's next tick, so
   // every root pauses with its message, not one with a generic failure (#1400). A replaced root's drifts nothing,
-  // like a disposed watch. Says whether it drifted.
+  // like a disposed watch. Says whether it drifted. A drift already made (a guard's, or a port's own with its own
+  // message) is the one every root shows: it isn't made again.
   private signInChanged(error: unknown, live: boolean) {
     if (!live || causeOf(error, Refusal)?.code !== "binding") return false;
-    this.credentialChanged();
+    if (!this.drifted) this.credentialChanged();
     return true;
   }
   private async path(sessionID: string) { return this.route(await this.port.ancestry(sessionID)); }
@@ -883,7 +884,7 @@ export class Controller<E extends Enrollment = Enrollment> {
         const r = this.roots.get(id), error = this.expired(caught);
         // A changed credential the prepare met: the watch's drift, which says why every root paused (#1400). Before
         // the watch, the check's refusal is the saved approval's own staleness, which only this root's record reports.
-        if (r && this.watches.has(id) && (this.drifted || this.signInChanged(error, this.restorable(r, r.epoch)))) continue;
+        if (r && this.watches.has(id) && ((this.drifted && r.paused) || this.signInChanged(error, this.restorable(r, r.epoch)))) continue;
         // An outage, or another process holding the token refresh: retry on the outage backoff (#424 6, #895, #1334).
         if (r && (error instanceof ServerUnreachable || error instanceof RefreshInProgress) && this.restorable(r, r.epoch)) {
           this.retrying(r, error);
