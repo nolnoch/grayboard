@@ -52,7 +52,8 @@ export type TestServerOverrides = Partial<Config> & { dbPath?: string };
 export type TestServerStart = StartOptions & { reuse?: TestServer; backend?: "sqlite" | "pg" };
 
 // The database a TestServer owns: dropped (pg) with its dir on the final stop, kept by stop({ keep: true }).
-type Owned = { store: Config["store"]; drop(): Promise<void> };
+// `injected`: the Repo came in through `start.repo`; `store` is then only a placeholder, so nothing may reuse it.
+type Owned = { store: Config["store"]; drop(): Promise<void>; injected?: boolean };
 
 function serverConfig(dir: string, overrides: Partial<Config>): Config {
   return {
@@ -104,9 +105,10 @@ export class TestServer {
     const { reuse, backend = TEST_BACKEND, ...start } = opts;
     const { dbPath, ...rest } = overrides;
     if (reuse && (!reuse.kept || reuse.handedOver)) throw new Error("TestServer.open: reuse takes a server stopped with stop({ keep: true })");
+    if (reuse?.owned.injected) throw new Error("TestServer.open: a server opened with an injected repo can't be reused; inject the repo again");
     if (reuse) reuse.handedOver = true;
     const dir = reuse?.dir ?? mkdtempSync(join(tmpdir(), "gb-server-"));
-    let owned: Owned = reuse?.owned ?? { store: { kind: "sqlite", path: dbPath ?? join(dir, "bus.db") }, drop: async () => {} };
+    let owned: Owned = reuse?.owned ?? { store: { kind: "sqlite", path: dbPath ?? join(dir, "bus.db") }, drop: async () => {}, ...(start.repo ? { injected: true } : {}) };
     let repo = start.repo;
     try {
       if (!reuse && !start.repo && !rest.store && !dbPath && backend === "pg") {
