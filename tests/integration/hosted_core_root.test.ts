@@ -490,3 +490,16 @@ test("#542: unbinding the last name answers name null and says unbound; the Cont
   expect(record(a)?.held ?? []).toEqual([]);
   expect(row("unbind-last")).toMatchObject({ name: null });
 }, 30_000);
+
+// #1349: the server's session_register refusal reaches the root's diagnostic under its own code, not
+// invalid_response. A session already bound as its own root can't become another root's child (child_bound).
+test("a child already bound as its own root is refused registration, and the root's diagnostic names child_bound (#1349)", async () => {
+  const a = await live("register-root", "be");
+  await live("register-bound", "fe");
+  const result = await a.root.call("whoami", {}, undefined, { child: "register-bound" });
+  expect(result.isError).toBe(true);
+  expect(texts(result).join("\n")).toContain("child_bound");
+  const code = () => { const r = record(a); return r?.operation === "child_register" ? r.code : r?.failure?.operation === "child_register" ? r.failure.code : undefined; };
+  await until(() => code() !== undefined, 10_000, "the root's child_register diagnostic");
+  expect(code()).toBe("child_bound");
+}, 30_000);
