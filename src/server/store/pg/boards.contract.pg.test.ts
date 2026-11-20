@@ -3,16 +3,13 @@
 // GRAYBOARD_TEST_PG_URL it skips (tests/support/pg.ts).
 //
 // C10e1 ports the reads, the pure writes and serial forms of five designed writes; forget, prunePosts and
-// claimQueuePost are C10e2's (pg/boards.ts refuses them), so their rows are pending by name. One C10e1 row (the
-// rollback) sets up through claimQueuePost, so until C10e2 the harness's store has CLAIM_QUEUE_POST_SHIM in its place:
-// core's serial SQL restated (claim first, push only to the key's holder), without C10e2's locks. C10e2 deletes the
-// shim and the pending list, so every row runs on its store.
+// claimQueuePost are C10e2's (pg/boards.ts throws "C10e2"), so the rows whose subject or setup is one of them are
+// pending by name, the rollback row among them (it sets up through claimQueuePost). C10e2 deletes the pending list.
 // Also here: the restated normalizeBoard is core's, and laneRows' take subquery keeps idx_claim_events_take.
 import { expect, test } from "bun:test";
 import { describePg, pgDatabase } from "../../../../tests/support/pg.ts";
 import { normalizeBoard as coreNormalizeBoard } from "../../../core/boards.ts";
 import { boardsContract, type BoardsBackend, type BoardsHarness } from "../boards.contract.ts";
-import type { BoardsStore } from "../boards.ts";
 import { laneRowsStatement, makePgBoards, normalizeBoard } from "./boards.ts";
 import { int8, int8OrNull } from "./sql.ts";
 import { makePgTransactions, pgOf } from "./tx.ts";
@@ -20,37 +17,17 @@ import { makePgTransactions, pgOf } from "./tx.ts";
 type Row = Record<string, unknown>;
 // The store's clock: ensure's created_at, and read's and acknowledge's delivered_at stamps.
 const CLOCK = 1_800_000_000_000;
-const QUEUE_CLAIM_TTL_MS = 30 * 60_000;
 
-const C10E2 = "C10e2: its subject is forget, claimQueuePost or prunePosts, which pg/boards.ts doesn't implement yet";
+// C10e2: forget, claimQueuePost and prunePosts throw until C10e2 implements them.
+const C10E2 = "C10e2: it runs forget, claimQueuePost or prunePosts, which pg/boards.ts doesn't implement yet";
 const PENDING: Record<string, string> = Object.fromEntries([
+  "a body's reads see its writes, and a body that throws leaves none of them",
   "forget deletes a handle's pushes, subscriptions, mutes, watches and hold; its posts and claims and others' rows stay",
   "claimQueuePost on a free key: the claim with its holder's user, a take event and the lane's waking push; push false writes no push",
   "claimQueuePost on a key another lane holds: false, and no claim, event or outbox row for the lane",
   "claimQueuePost on a key the lane already holds: false, no new event, and its push reset to undelivered and waking",
   "prunePosts: old posts with their pushes, mutes and attachments go, a reply becomes a root; old claim events and binding events go but each name's latest bind",
 ].map(name => [name, C10E2]));
-
-// ── C10e2 shim: core claimQueuePost's SQL for the rollback row's setup (deleted by C10e2) ──
-const CLAIM_QUEUE_POST_SHIM: Pick<BoardsStore, "claimQueuePost"> = {
-  async claimQueuePost(tx, board, postId, lane, now, { note, push }) {
-    const sql = pgOf(tx);
-    const key = `queue:${board}:${postId}`;
-    const expires = now + QUEUE_CLAIM_TTL_MS;
-    const took: Row[] = await sql`INSERT INTO claims (key, holder, note, board, acquired_at, expires_at, holder_user)
-      VALUES (${key}, ${lane}, ${note}, ${board}, ${now}, ${expires}, COALESCE((SELECT principal FROM ids WHERE id = ${lane}),
-        (SELECT i.principal FROM alias_holds h JOIN ids i ON i.id = h.id WHERE h.address = ${lane})))
-      ON CONFLICT (key) DO NOTHING RETURNING key`;
-    if (push) {
-      await sql`INSERT INTO outbox (handle, post_id, reason, wake)
-        SELECT ${lane}, ${postId}::int8, 'subscription', true WHERE EXISTS (SELECT 1 FROM claims WHERE key = ${key} AND holder = ${lane})
-        ON CONFLICT (handle, post_id) DO UPDATE SET delivered_at = NULL, wake = true`;
-    }
-    if (took.length === 0) return false;
-    await sql`INSERT INTO claim_events (key, handle, event, note, board, expires_at, at) VALUES (${key}, ${lane}, 'take', ${note}, ${board}, ${expires}, ${now})`;
-    return true;
-  },
-};
 
 const pgBoardsBackend: BoardsBackend = {
   kind: "postgres",
@@ -63,7 +40,7 @@ const pgBoardsBackend: BoardsBackend = {
     let blob = 0;
     const rows = async <T>(q: Promise<Row[]>, f: (r: Row) => T) => (await q).map(f);
     return {
-      boards: { ...makePgBoards({ clock: () => CLOCK }), ...CLAIM_QUEUE_POST_SHIM },
+      boards: makePgBoards({ clock: () => CLOCK }),
       write: fn => s.write(fn),
       read: s.read,
       async alias(address, o = {}) {

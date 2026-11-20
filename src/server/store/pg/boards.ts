@@ -218,7 +218,7 @@ export function makePgBoards({ clock }: { clock: () => number }): BoardsStore {
         WHERE d.unread > 0`;
       return rows.map((x): DigestRow => ({ board: x.digest_board as string, unread: int8(x.unread), latest: toPost(x) }));
     },
-    // C10e2: core acknowledge, serial.
+    // C10e2: owes GREATEST under concurrency (two acknowledges racing on one subscription row). Core acknowledge, serial.
     async acknowledge(tx, handle, ref) {
       const sql = pgOf(tx);
       if (ref.kind === "digest") {
@@ -244,7 +244,7 @@ export function makePgBoards({ clock }: { clock: () => number }): BoardsStore {
     async isSubscribed(r, handle, board) {
       return (await pgOf(r)`SELECT 1 FROM subscriptions WHERE board = ${board} AND handle = ${handle}`).length > 0;
     },
-    // C10e2: core setSubscription, serial; the tip is read in the insert.
+    // C10e2: owes the tip read racing a post (the board's tip vs a concurrent insert). Core setSubscription, serial.
     async setSubscription(tx, handle, board, mode) {
       const sql = pgOf(tx);
       if (mode === "off") {
@@ -333,7 +333,7 @@ export function makePgBoards({ clock }: { clock: () => number }): BoardsStore {
         WHERE b.name = ${name} AND ${state} RETURNING ${boardCols(sql)}`;
       return row ? toBoard(row) : null;
     },
-    // C10e2: core readRows, serial.
+    // C10e2: owes GREATEST under concurrency (two reads moving one cursor) and a prune between its statements. Core readRows, serial.
     async read(tx, board, handle, opts) {
       const sql = pgOf(tx);
       const limit = Math.min(Math.max(opts.limit ?? 20, 1), 200);
@@ -381,8 +381,8 @@ export function makePgBoards({ clock }: { clock: () => number }): BoardsStore {
       else await sql`DELETE FROM thread_mutes WHERE handle = ${handle} AND root_id = ${root}`;
     },
 
-    // C10e2: core insertPost, serial (no parent lock: the reply-vs-prune race is C10e2's). human is bound on every
-    // insert (#1355), so the row reads marked only when given true.
+    // C10e2: owes the parent lock (reply vs prune, P1) and the archive gate. Core insertPost, serial; the 23503-to-
+    // MissingPost savepoint is here already. human is bound on every insert (#1355/#1366): marked only when given true.
     async insertPost(tx, p) {
       pgOf(tx);
       try {
@@ -398,7 +398,7 @@ export function makePgBoards({ clock }: { clock: () => number }): BoardsStore {
         throw e;
       }
     },
-    // C10e2: core bindAttachments, serial: the sender's unsent uploads locked in call order, then bound.
+    // C10e2: owes the race with a concurrent bind of the same uploads (P5). Core bindAttachments, serial: locked in call order, then bound.
     async bindAttachments(tx, ids, from, postId, limits) {
       const sql = pgOf(tx);
       const files = await lockUnsent(sql, ids, from, limits);
