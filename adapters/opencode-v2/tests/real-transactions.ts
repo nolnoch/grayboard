@@ -246,12 +246,13 @@ export async function transactionRace(f: TransactionRace) {
         } else {
           assert.deepEqual(attached, [], "Released first: nothing attaches");
           assert.deepEqual(revoked, [{ session_id: before.session_id, name: RACE, reason: "revoked" }], "One released(revoked) per held name");
-          await until(() => { const r = row(root); return !!r && r.ownership_id !== before.ownership_id && r.held.includes("final"); }, 30_000, "The plugin's bind lands under a new ownership");
+          await until(() => { const r = row(root); return !!r && r.ownership_id !== before.ownership_id && r.held.includes("final"); }, 30_000, "The plugin's bind lands under a new ownership (a bind held past the 5 s busy_timeout fails SQLITE_BUSY and is not retried)");
           assert.notEqual(row(root)!.grant_id, g1, "The new ownership is G2's");
           // The traced bind was still waiting when the revoke released (#1181): its BEGIN IMMEDIATE waits out the lock in
           // SQLite's busy handler for 5 s, and a release later than that fails it with SQLITE_BUSY, which nothing on the
           // server retries. So the bind that landed is that one only if the plugin sent no other: a retry after the
           // commit (by the plugin or its transport, both under the fetch shim that records calls) would land the same.
+          // No other bind is legitimate here: the root is paused after G2's sign-in, so the subscriber's bindAll can't run.
           assert.deepEqual(f.calls.slice(mark).filter(c => c.name === "bind").map(c => c.session), [root], "The bind that landed is the one traced at the gate: the plugin sent no other");
         }
         console.log("REAL_TXN_ATTACH_REVOKE_OK", JSON.stringify({ boundary: f.boundary, attached: attached.length, revoked: revoked.length }));
