@@ -1,7 +1,8 @@
 import "./zod_config.ts";
 import pkg from "../../package.json" with { type: "json" };
 import { describeStore, loadConfig } from "./config.ts";
-import { openRepo, startServer } from "./app.ts";
+import { startServer } from "./app.ts";
+import { openRepo } from "./open_repo.ts";
 import { BUILTIN_CLIENT_IDS } from "./oauth-config.ts";
 
 // Before loadConfig, which refuses to run without the server's env.

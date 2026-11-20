@@ -1,7 +1,6 @@
 import { MAX_BODY_BYTES } from "../core/boards.ts";
 import { openDatabase, type Repo } from "./db.ts";
 import { sessionEndPort } from "./session_end.ts";
-import { makePgRepo } from "./pg_repo.ts";
 import { createApplication, type ApplicationOptions } from "./application.ts";
 import { handleHttp, isJsonRequest, signInRoute } from "./http.ts";
 import { AuthGate, type Caller } from "./auth_gate.ts";
@@ -27,20 +26,10 @@ export type StartOptions = ApplicationOptions & {
   retentionFirstDelayMs?: number;
   // Trusted test dependency injection; never populated from configuration.
   oauth?: OAuthOptions;
-  // The opened store to serve (openRepo, or a test's own makePgRepo); stop() closes it. Without one, startServer opens
+  // The opened store to serve (openRepo in open_repo.ts, or a test's own makePgRepo); stop() closes it. Without one, startServer opens
   // config.store's SQLite file itself, which only tests rely on: they read the raw handle it exposes as `db`.
   repo?: Repo;
 };
-
-// The server's store, opened from config (#807 P3 C11b): SQLite at once; Postgres migrates and starts its auth LISTEN
-// first (pg_repo.ts), so a migration failure fails the open and so the startup. `pool` labels and sizes a Postgres
-// Repo's connections (tests run many servers on one cluster).
-export async function openRepo(config: Config, opts: { now?: () => number; pool?: { applicationName?: string; max?: number } } = {}): Promise<Repo> {
-  const humanReach = config.humanReach ?? "team";
-  const limits = { attachmentLimits: config.attachmentLimits, attachmentUserQuota: config.attachmentUserQuota, ...(opts.now ? { now: opts.now } : {}) };
-  if (config.store.kind === "sqlite") return openDatabase(config.store.path, { blobDir: config.blobDir, sessionEnd: sessionEndPort(humanReach), ...limits }).repo;
-  return makePgRepo(config.store.url, { blobDir: config.blobDir, humanReach, ...limits, ...opts.pool });
-}
 
 // A start option overrides the config's limit; an explicit undefined one doesn't wipe it (#385 item 14).
 export function startLimits(config: Pick<Config, "helloLimit" | "hostedRequestLimit" | "hostedSubscriberLimit" | "delegateLimit" | "delegateOpenCap" | "hostedCaps" | "aliasScopeCap" | "serviceLimits">, opts: StartOptions) {
