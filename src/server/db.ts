@@ -13,7 +13,7 @@ import type { Post } from "../shared/notifications.ts";
 import { ackQueueClaim, addClaimWatch, claimRow, claimWatchers, expireClaims, holderUser, listClaims, liveClaim, logEvent, recentClaimEvents, releaseClaim, removeClaimWatch, takeClaim, takeClaimWatchers, type Claim, type ClaimEvent, type ClaimEventRow, type ClaimRow, type TakeRow } from "../core/claims.ts";
 import { addressSet, aliasUser, aliasUses, dropHold, holderOf, holdsOf, idRow, idStatuses, logBinding, unendedIds, type AliasUse, type BindingEvent, type IdRow } from "../core/bindings.ts";
 import type { AuditAction } from "./audit.ts";
-import { bindAttachments, blobNamed, dropAttachments, dropBlobEntry, dropUnsentUploads, getAttachment, insertUpload, pruneUnbound, removeUpload, unnamedBlobs, uploadDigests, withAttachments, type AttachmentRow, type BlobStore, type NewUpload, type Uploader } from "../core/attachments.ts";
+import { bindAttachments, blobNamed, dropAttachments, dropBlobEntry, dropUnsentUploads, getAttachment, insertUpload, pruneUnbound, removeUpload, unnamedBlobs, uploadDigests, withAttachments, type BlobStore, type Uploader } from "../core/attachments.ts";
 import { addressParts } from "../core/addresses.ts";
 import { HUMAN_NAME } from "../shared/addressing.ts";
 import type { Principal } from "../core/resolver.ts";
@@ -38,6 +38,7 @@ import { accessFits, accessLookup, BROWSER_SESSIONS, browserData, browserSession
 import { AuthorityLost, LastOwner, MissingParent, PrincipalTaken } from "./store/errors.ts";
 import type { Alias, AliasesStore } from "./store/aliases.ts";
 import type { MessageRow, MessagesStore, RetractResult } from "./store/messages.ts";
+import type { AttachmentsStore } from "./store/attachments.ts";
 import type { CursorsStore } from "./store/cursors.ts";
 import type { WriteReceipt, WriteReceiptsStore } from "./store/write_receipts.ts";
 import { AUDIT_WRITE_ON_READ, type AccessLogRow, type AuditStore } from "./store/audit.ts";
@@ -51,6 +52,7 @@ export type { User, IdpSignIn, Session, PrincipalRow, Team, TeamPolicy, TeamRole
 // The aliases and messages groups' row types and interfaces live in store/aliases.ts and store/messages.ts (#807 P3 C5a).
 export type { Alias, AliasTarget, AliasesStore, AliasScopeRow } from "./store/aliases.ts";
 export type { MessageRow, MessageFiles, ServicePost, RetractResult, MessagesStore } from "./store/messages.ts";
+export type { AttachmentsStore } from "./store/attachments.ts";
 // The cursors, write receipts, audit and Slack groups' in store/cursors.ts, write_receipts.ts, audit.ts and slack.ts (#807 P3 C67a).
 export type { CursorStream, CursorsStore } from "./store/cursors.ts";
 export type { WriteReceipt, WriteReceiptKey, WriteReceiptsStore } from "./store/write_receipts.ts";
@@ -293,25 +295,8 @@ export interface Repo {
     // A name's queue-board opt-out, touching it (core setQueueParticipation).
     setQueueParticipation(tx: Tx, handle: string, on: boolean): Promise<void>;
   };
-  // Uploads and the blob catalog (#807 P3 B3), on the caller's handle. Messages' attachments stay inside the messages
-  // store; posts' go with the board writes (B5b). The flows over these (store, release, sweep) are in attachments.ts.
-  attachments: {
-    get(r: Read, id: number): Promise<AttachmentRow | undefined>;
-    // The blob digests of `from`'s unsent uploads `ids`, in call order; rejects with CoreError on an id that isn't one.
-    unsentDigests(r: Read, ids: number[], from: Uploader): Promise<string[]>;
-    // Deletes `from`'s unsent uploads among `ids`, returning them.
-    dropUnsent(tx: Tx, ids: number[], from: Uploader): Promise<AttachmentRow[]>;
-    // Deletes the uploads left unbound since before `olderThanMs`; returns how many.
-    pruneUnbound(tx: Tx, olderThanMs: number): Promise<number>;
-    // Prunes, checks the quota (rejects with TooLargeError), and inserts the catalog entry and the row (core
-    // insertUpload). On Postgres the quota check holds the principal's lock (D3).
-    insertUpload(tx: Tx, upload: NewUpload): Promise<{ row: AttachmentRow; pruned: boolean }>;
-    remove(tx: Tx, id: number): Promise<void>;
-    // The catalog's blobs no attachment names; whether one is named; its entry dropped while unnamed (0 or 1).
-    unnamedBlobs(r: Read): Promise<string[]>;
-    named(r: Read, sha256: string): Promise<boolean>;
-    dropBlobEntry(tx: Tx, sha256: string): Promise<number>;
-  };
+  // Uploads and the blob catalog (store/attachments.ts).
+  attachments: AttachmentsStore;
   // Claims' reads and writes (#807 P3 B2, B5b3), on the caller's handle. The sweep and the claim tools are the
   // server's (src/server/claims.ts); every rule they apply is core's.
   claims: {

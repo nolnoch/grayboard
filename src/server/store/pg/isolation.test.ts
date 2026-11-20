@@ -59,7 +59,7 @@ function pgModules(): string[] {
 test("no non-test module under src/server/store/pg/ reaches bun:sqlite or the SQLite store, even transitively", () => {
   const roots = pgModules();
   // The scan sees this directory's modules (a scan that read nothing would pass vacuously).
-  expect(roots.map(p => relative(import.meta.dir, p))).toEqual(expect.arrayContaining(["aliases.ts", "attachment_rows.ts", "audit.ts", "audit_row.ts", "cursors.ts", "errors.ts", "hosted.ts", "hosted_port.ts", "identity.ts", "messages.ts", "migrate.ts", "oauth.ts", "slack.ts", "sql.ts", "tx.ts", "write_receipts.ts"]));
+  expect(roots.map(p => relative(import.meta.dir, p))).toEqual(expect.arrayContaining(["aliases.ts", "attachment_rows.ts", "attachments.ts", "audit.ts", "audit_row.ts", "cursors.ts", "errors.ts", "hosted.ts", "hosted_port.ts", "identity.ts", "messages.ts", "migrate.ts", "oauth.ts", "slack.ts", "sql.ts", "tx.ts", "write_receipts.ts"]));
   expect(forbiddenReach(roots)).toEqual([]);
 });
 
@@ -98,6 +98,8 @@ test("the walk follows relative imports and skips type-only ones", () => {
   expect(forbiddenReach([join(SRC, "server/store/hosted.ts")])).toEqual([]);
   // The auth cache (#807 P3 C9a), which the Postgres Repo composes over its own generation source (C11).
   expect(forbiddenReach([join(SRC, "server/store/auth_cache.ts")])).toEqual([]);
+  // The attachments group's interface and its Postgres store (#807 P3 C10c), which restates core/attachments.ts's SQL.
+  for (const m of [join(SRC, "server/store/attachments.ts"), join(import.meta.dir, "attachments.ts")]) expect(forbiddenReach([m])).toEqual([]);
   for (const m of ["hosted.ts", "hosted_port.ts"]) expect(forbiddenReach([join(import.meta.dir, m)])).toEqual([]);
   expect(runtimeImports(`import type { X } from "../tx.ts";\nexport type { Y } from "../db.ts";`)).toEqual([]);
   expect(runtimeImports(`import {\n  a,\n  b,\n} from "../tx.ts";\nexport { c } from "./d.ts";\nimport "./e.ts";\nconst f = await import("../db.ts");`))

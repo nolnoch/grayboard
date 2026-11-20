@@ -1,7 +1,7 @@
 // Attachment rows on Postgres (#807 P3 C5 decision 8, docs/future/postgres-server.md D3, D6): the bind, read and drop
 // of uploads owned by a message or a post, which core/attachments.ts (bindAttachments, withAttachments,
-// dropAttachments) does for SQLite. pg/messages.ts uses the message side; C10c adds the post side and the per-user
-// quota here. What differs from core, and why:
+// dropAttachments) does for SQLite. pg/messages.ts uses the message side; C10e the post side. The upload side (the
+// quota, the prune, the blob catalog) is pg/attachments.ts's. What differs from core, and why:
 // - The bind locks first. lockUnsent reads the unsent rows FOR UPDATE, by id, and the caller refuses and tallies
 //   before it writes anything, then inserts its owner and binds. Two sends binding one upload: the second waits on the
 //   first's row lock, re-checks `message_id IS NULL` on the bound version, gets no row and refuses before its insert,
@@ -22,10 +22,10 @@ export type AttachmentOwner = "message" | "post";
 type Row = Record<string, unknown>;
 const info = (r: Row): AttachmentInfo => ({ id: int8(r.id), filename: r.filename as string, type: r.type as string, size: int8(r.size), sha256: r.sha256 as string });
 const column = (sql: PgSql, owner: AttachmentOwner) => sql(owner === "message" ? "message_id" : "post_id");
-const refused = (id: number) => new CoreError(`attachment ${id} isn't an unsent upload of yours`);
+export const refused = (id: number) => new CoreError(`attachment ${id} isn't an unsent upload of yours`);
 
-// core's UNSENT clause: `from`'s unsent uploads among ids.
-const unsent = (sql: PgSql, ids: number[], from: Uploader) => sql.fragment`id = ANY(${ids}::int8[]) AND uploader = ANY(${from.addresses}::text[])
+// core's UNSENT clause: `from`'s unsent uploads among ids (pg/attachments.ts's reads and drops too).
+export const unsent = (sql: PgSql, ids: number[], from: Uploader) => sql.fragment`id = ANY(${ids}::int8[]) AND uploader = ANY(${from.addresses}::text[])
   AND (${from.principal}::text IS NULL OR uploader_principal = ${from.principal}::text) AND message_id IS NULL AND post_id IS NULL`;
 
 // `from`'s unsent uploads `ids`, locked for the rest of the body, in call order; a missing id (someone else's, unknown,
