@@ -100,7 +100,7 @@ function causeOf<T>(error: unknown, type: abstract new (...args: never[]) => T):
   return undefined;
 }
 // A failure an older request's own fault may explain, so a newer request may not meet it (#1176): an outage or a
-// deadline, however the SDK or a wire's own timeout signal surfaced it (ServerUnreachable and OutcomeUnknown, an
+// deadline, however the SDK or a wire's own timeout signal surfaced it (a ServerUnreachable, an
 // SdkError RequestTimeout or ConnectionClosed, a gateway status, a network code, an abort's TimeoutError), a token
 // refresh another process held, or the server's `unbound` (the root's binding moved while it waited at the gate).
 // A refusal (child_bound, child_registered_elsewhere, has_children, root_is_child and invalid_registration all
