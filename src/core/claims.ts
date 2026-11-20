@@ -512,15 +512,16 @@ export function watch(db: Database, handle: string, keyInput: string, off = fals
 
 // Claims are visible to everyone on the bus. The announcing board's name is
 // hidden from handles that can't see that board; with `seer` (a session ID or
-// handle), a holder it may not see is withheld with its note (#871).
-export function listClaims(db: Database, prefix?: string): Claim[];
-export function listClaims(db: Database, prefix: string | undefined, viewer: Viewer, seer?: string): ClaimView[];
-export function listClaims(db: Database, prefix?: string, viewer?: Viewer, seer?: string): ClaimView[] {
+// handle), a holder it may not see is withheld with its note (#871). `now`: the clock live claims are judged at, the
+// server's store clock there (#1390).
+export function listClaims(db: Database, prefix?: string, viewer?: undefined, seer?: undefined, now?: number): Claim[];
+export function listClaims(db: Database, prefix: string | undefined, viewer: Viewer, seer?: string, now?: number): ClaimView[];
+export function listClaims(db: Database, prefix?: string, viewer?: Viewer, seer?: string, now = Date.now()): ClaimView[] {
   const rows = db
     .prepare(
       `SELECT ${CLAIM_COLS} FROM claims WHERE expires_at > ? AND key LIKE ? ESCAPE '\\' ORDER BY key`,
     )
-    .all(Date.now(), `${(prefix ?? "").replace(/[\\%_]/g, "\\$&")}%`) as Claim[];
+    .all(now, `${(prefix ?? "").replace(/[\\%_]/g, "\\$&")}%`) as Claim[];
   if (viewer === undefined) return rows;
   return rows
     .filter((c) => !isQueueKey(c.key) || (!!c.board && canSeeBoard(db, viewer, c.board)))

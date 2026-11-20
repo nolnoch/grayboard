@@ -2,7 +2,8 @@
 // startServer's `now`, never Date.now(): one time source per transaction. The clock here runs ten days behind wall
 // time, so a stamp read from the wall clock differs from every value the test expects. Runs on either backend
 // (GRAYBOARD_TEST_BACKEND).
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
+import { CoreError } from "../../src/core/errors.ts";
 import type { AppSession } from "../support/app_session.ts";
 import { TestServer } from "../support/server.ts";
 import { drained, rows as sqlRows } from "../support/repo_sql.ts";
@@ -80,9 +81,21 @@ test("claim_watch judges a claim live at the Repo clock", async () => {
 test("the claim expiry timer sweeps at the Repo clock", async () => {
   const be = await srv.connected(alice, "be");
   await workBoard(be);
-  // A board claim arms the timer for its expiry, 60 ms on the Repo clock; the clock then jumps past it.
+  // A board claim arms the timer for its expiry, 60 ms on the Repo clock; the clock then jumps past it. The timer's
+  // delay is measured on that clock too: on the wall clock, ten days ahead, it would be 0 and the timer would fire,
+  // sweep nothing and re-arm in a loop until the jump. Its timeouts are told apart by their callback's text.
+  const delays: number[] = [];
+  const real = globalThis.setTimeout;
+  const spied = spyOn(globalThis, "setTimeout").mockImplementation(((fn: () => void, ms?: number, ...rest: unknown[]) => {
+    if (String(fn).includes("claim expiry timer failed")) delays.push(ms ?? 0);
+    return real(fn, ms, ...rest);
+  }) as typeof setTimeout);
   const t1 = clock;
-  await be.call("claim_take", { key: "ticket:ENG-5", board: "work", ttl_minutes: 0.001 });
+  try {
+    await be.call("claim_take", { key: "ticket:ENG-5", board: "work", ttl_minutes: 0.001 });
+    await until(() => delays.length > 0, 10_000, "the expiry timer's arm");
+  } finally { spied.mockRestore(); }
+  expect(delays).toEqual([60]);
   const t2 = tick(300_000);
   await until(async () => (await events("ticket:ENG-5")).length === 2, 10_000, "the timer's expire event");
   expect(await events("ticket:ENG-5")).toEqual([
@@ -107,6 +120,16 @@ test("a session end releases its ID's claims at the Repo clock", async () => {
   ]);
 });
 
+// claim_list, and an unbind's `left`, judge claims live at the Repo clock: ten days behind wall time, these are live.
+test("claim_list and unbind's left list claims live at the Repo clock", async () => {
+  const be = await srv.connected(alice, "be");
+  await be.bind("fe", { create: true });
+  await be.call("claim_take", { key: "ticket:ENG-10", as: "fe", ttl_minutes: 60 });
+  const listed = await be.call<{ key: string }[] | { claims: { key: string }[] }>("claim_list", { prefix: "ticket:" });
+  expect((Array.isArray(listed) ? listed : listed.claims).map((c) => c.key)).toEqual(["ticket:ENG-10"]);
+  expect(await be.unbind("fe")).toMatchObject({ released: true, left: ["ticket:ENG-10"] });
+});
+
 // The end reads its clock once (application.ts endIdsIn) and stamps every row of the end with that reading, its claim
 // releases and its closing sweep among them, even when the Repo clock has moved on.
 test("a session end stamps its releases and its sweep with the end's own clock reading", async () => {
@@ -127,6 +150,25 @@ test("a session end stamps its releases and its sweep with the end's own clock r
     { key: "ticket:ENG-8", event: "take", at: t1 },
     { key: "ticket:ENG-8", event: "expire", at },
   ]);
+});
+
+// A release the end can't make the ordinary way (a CoreError, forced here on its event row) still frees the claim, and
+// the fallback's row carries the end's reading too.
+test("a session end's fallback release stamps the end's own clock reading", async () => {
+  const s = await srv.connected(alice, "be");
+  await s.call("claim_take", { key: "ticket:ENG-11", as: s.id, ttl_minutes: 60 });
+  s.close();
+  const repo = srv.app.repo;
+  const stub: typeof repo = { ...repo, claims: { ...repo.claims, logEvent: (tx, event, handle, c, at, heldBy) => {
+    if (event === "release" && c.note === "session ended") throw new CoreError("forced");
+    return repo.claims.logEvent(tx, event, handle, c, at, heldBy);
+  } } };
+  const at = clock + 120_000;
+  await seed(repo, tx => endId(stub, tx, s.id, "exit", "team", at));
+  expect(await rows(`SELECT event, note, at FROM claim_events WHERE key = ? AND event = 'release'`, "ticket:ENG-11")).toEqual([
+    { event: "release", note: "session ended; announce failed: forced", at },
+  ]);
+  expect(await rows(`SELECT key FROM claims WHERE key = ?`, "ticket:ENG-11")).toEqual([]);
 });
 
 // A stop time is judged against the Repo clock, before the take as in it.

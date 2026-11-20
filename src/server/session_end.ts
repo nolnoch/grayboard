@@ -91,8 +91,10 @@ export async function endSessionServer(
 
   // Lapsed claims first, so they end as lapses (announced, redelivered) rather than releases.
   for (const h of (await sweepClaims(repo, access, tx, now)).wake) wake.add(h);
-  // A release that fails for any reason but a lapse (the sweep below takes those) still frees the claim, unannounced,
-  // and the failure goes in the id.ended audit: an end must not leave a claim on an ID that can't act.
+  // A release that fails still frees the claim, unannounced, and the failure goes in the id.ended audit: an end must
+  // not leave a claim on an ID that can't act. Every release here reads the end's one clock reading, so none of these
+  // claims lapses mid-end: the sweep below finds nothing the one above didn't, and a claim that lapses on the Repo
+  // clock while the end runs is the expiry timer's (#1390).
   const releaseFailed: { key: string; error: string }[] = [];
   for (const key of queuePostOrder(await repo.claims.heldBy(tx, id, now), (k) => k)) {
     try {

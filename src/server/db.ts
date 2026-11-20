@@ -1280,7 +1280,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
     },
 
     claims: {
-      list: async (r, prefix) => listClaims(sqliteOf(r), prefix),
+      list: async (r, prefix) => listClaims(sqliteOf(r), prefix, undefined, undefined, clock()),
       nextExpiry: async (r) => sqliteOf(r).query<{ next: number | null }, []>(`SELECT MIN(expires_at) AS next FROM claims WHERE board IS NOT NULL`).get()!.next,
       get: async (r, key) => claimRow(sqliteOf(r), key),
       take: async (tx, t) => takeClaim(sqliteOf(tx), t),
