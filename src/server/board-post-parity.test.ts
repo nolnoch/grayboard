@@ -55,6 +55,7 @@ const CALLS = (): Record<string, unknown>[] => [
   { board: "q", body: "work item" }, { board: "q", body: "@qa take this" }, { board: "q", body: `@${E}/be take this` }, { board: "q", body: "@be @deploy both" }, { board: "q", body: `@${B}/be @${E}/be both` }, { board: "q", body: `@${B}/human take` },
   { board: "q", body: `@${TAIL_ID} you?` }, { board: "q", body: "done", parent_id: QPOST }, { board: "q", body: "late", parent_id: QLATE }, { board: "q", body: `@${UNKNOWN_ID} x` },
   { board: "general", body: "@eng/deploy hi" }, { board: "q", body: "@eng/deploy take" },
+  { board: "q", body: `@${E}/be mine` }, { board: "q", body: `@${E}/be @nobody mine` },
   { board: "engq", body: `@${D}/be you?` }, { board: "engq", body: "work" },
   { board: "general", body: "file", attachment_ids: [UP_W] }, { board: "general", body: "files", attachment_ids: [UP_W, UP_W2] }, { board: "general", body: "theirs", attachment_ids: [UP_B] },
   { board: "general", body: `file @${UNKNOWN_ID}`, attachment_ids: [UP_W] }, { board: "general", body: "bad", attachment_ids: "x" }, { board: "general", body: "path", attachments: ["/etc/passwd"] },
@@ -150,6 +151,14 @@ test("board_post gives core's answers and leaves its rows, for every caller and 
   expect(hidden.result.unresolved).toEqual(["eng/deploy"]);
   const hiddenQ = call("dan, sessionless", { board: "q", body: "@eng/deploy take" });
   expect(JSON.stringify(hiddenQ.rows.claims)).not.toContain(`"holder":"eng/deploy","note":"queue post (mentioned)"`);
+  // #1185: a queue post naming only the poster's own address (or it and a name nobody has) rotates to a lane.
+  for (const [label, body] of [["eve", `@${E}/be mine`], ["eve", `@${E}/be @nobody mine`], ["wade", "@eng/deploy take"]] as const) {
+    const self = call(label, { board: "q", body });
+    const id = self.out.value!.result.post_id;
+    const held = (self.rows.claims as { key: string; holder: string; note: string }[]).find(c => c.key === `queue:q:${id}`);
+    expect(held?.note).toBe("queue post");
+    expect(self.out.value!.wake).toEqual([held!.holder]);
+  }
   // A team board's non-member is unresolved, on a queue board too.
   expect(text("wade", { board: "eng", body: `@${D}/be you?` })).toContain("unresolved");
   expect(text("wade", { board: "engq", body: `@${D}/be you?` })).toContain("unresolved");

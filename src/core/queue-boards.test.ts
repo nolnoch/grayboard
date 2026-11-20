@@ -303,10 +303,11 @@ test("several mentions, a human's handle or the poster's own address take no cla
   expect(human.wake).toEqual(["wade"]);
   const tail = "id:00000000000aa";
   registerId(db, { id: tail, principal: null, launcher: false, viewer: true });
-  // An agent's post naming a viewer is refused whole (boards.md §3 Mentions); naming only itself reaches nobody.
+  // An agent's post naming a viewer is refused whole (boards.md §3 Mentions); naming only itself claims nothing by
+  // name: it rotates (#1185).
   expect(() => post(db, "be", "work", `@${tail} look`, null, said)).toThrow("no session");
   post(db, "be", "work", "@be note to self", null, said);
-  expect(db.prepare(`SELECT COUNT(*) AS n FROM claims WHERE key LIKE 'queue:%'`).get()).toEqual({ n: 0 });
+  expect(listClaims(db).filter((c) => c.key.startsWith("queue:")).map((c) => c.note)).toEqual(["queue post"]);
 });
 
 test("a thread reply naming one lane takes no claim", () => {
@@ -980,4 +981,35 @@ describe("#1175: humans aren't lanes; the [unclaimed] reply falls back to the po
     sweepExpired(db, later());
     expect(replies(r.post.id)).toEqual([expect.objectContaining({ author: "id:0000000000ln1", author_user: "u-lane" })]);
   });
+});
+
+// #1185: a regular claim's announcements on a queue board are notices, not work: no lane is handed them and no
+// queue claim names them, and a watcher cc'd there is still told.
+test("a claim's [claim] and [release] on a queue board broadcast: no lane gets them, no queue claim", () => {
+  claim(db, "sim", "ticket:ENG-142", { board: "work" });
+  watch(db, "be", "ticket:ENG-142");
+  release(db, "sim", "ticket:ENG-142", "done");
+  const notices = db.prepare(`SELECT id, body FROM posts WHERE board = 'work' ORDER BY id`).all() as { id: number; body: string }[];
+  expect(notices.map((p) => p.body.split(" ")[0])).toEqual(["[claim]", "[release]"]);
+  // Neither lane (fe, nor sim, the holder) gets a notice; the release's cc reaches its watcher.
+  for (const [p, want] of [[notices[0]!, []], [notices[1]!, ["be"]]] as const) {
+    expect(db.prepare(`SELECT key FROM claims WHERE key = ?`).get(claimKey(p.id))).toBeNull();
+    const to = (db.prepare(`SELECT handle FROM outbox WHERE post_id = ?`).all(p.id) as { handle: string }[]).map((r) => r.handle);
+    expect(to).toEqual([...want]);
+  }
+  expect(db.prepare(`SELECT COUNT(*) AS n FROM claim_events WHERE key LIKE 'queue:%'`).get()).toEqual({ n: 0 });
+});
+
+// #1185: the poster's own address names nobody else, so a post naming only it (or it and a name nobody has) rotates.
+test("a queue post mentioning only the poster's own address rotates to a lane", () => {
+  for (const body of ["@be mine", "@be @nobody mine"]) {
+    const r = post(db, "be", "work", body, null, { strictIds: true });
+    const held = db.prepare(`SELECT holder, note FROM claims WHERE key = ?`).get(claimKey(r.post.id)) as { holder: string; note: string } | null;
+    expect(held?.note).toBe("queue post");
+    expect(["fe", "sim"]).toContain(held!.holder);
+    expect(r.wake).toEqual([held!.holder]);
+  }
+  // Beside one other visible name, the poster's own doesn't count: that name holds the post.
+  const named = post(db, "be", "work", "@be @sim yours", null, { strictIds: true });
+  expect(db.prepare(`SELECT holder, note FROM claims WHERE key = ?`).get(claimKey(named.post.id))).toEqual({ holder: "sim", note: "queue post (mentioned)" });
 });

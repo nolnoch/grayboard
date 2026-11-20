@@ -329,7 +329,7 @@ export function expireClaims(db: Database, now: number): ClaimRow[] {
 // `seenBy` passes the gate for a claimant's user whose holder lost the board (endReach, #1286).
 function announce(db: Database, handle: string, board: string | null, text: string, ctx: ClaimCtx = {}, ending = true, seenBy?: BoardPredicate): ClaimChanges {
   if (!board) return { wake: [], boards: [] };
-  const result = post(db, handle, board, systemBody(text), null, { author_id: ctx.session, via: ctx.via, author_user: ctx.user, allowArchived: ending, seenBy });
+  const result = post(db, handle, board, systemBody(text), null, { author_id: ctx.session, via: ctx.via, author_user: ctx.user, allowArchived: ending, seenBy, system: true });
   return { wake: result.wake, boards: [result.post.board] };
 }
 
