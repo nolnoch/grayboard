@@ -12,7 +12,7 @@
 // through the instance's `onclose`, which fires for every connection of the instance, so on a shared pool an idle read
 // connection's close would read as a lost LISTEN. Bun reconnects and re-listens by itself (onclose, then onlisten).
 //
-// Two drops Bun doesn't handle (c9-scope §2.3-2.4):
+// Three drops Bun doesn't handle (c9-scope §2.3-2.4, #1354):
 // - A silently dead connection (a NAT or security-group idle drop, a hung backend) gives no event at all. Every
 //   `heartbeatMs` the source sends `hb:<nonce>:<seq>` through the store's pool; a listener receives notifications in
 //   commit order, so a ping that arrived proves every notification committed before it did. If the last ping hasn't

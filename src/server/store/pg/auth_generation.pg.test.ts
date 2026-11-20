@@ -513,6 +513,8 @@ describePg("Postgres auth generation", () => {
       timers.tick();
       expect(timers.pending).toBe(0); // one tick isn't a full interval
       expect(first!.closed).toBe(false);
+      // Bun's reconnect attempts can report onclose again: the wait keeps counting from the first drop.
+      first!.onclose(new Error("test: a failed reconnect attempt"));
       timers.tick();
     });
     expect(logged.map(l => l[0])).toEqual([
