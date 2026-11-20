@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
-import { SdkError, SdkErrorCode } from "@modelcontextprotocol/client";
+import { SdkError, SdkErrorCode, SdkHttpError } from "@modelcontextprotocol/client";
 import { AccessExpired, accessExpiry } from "../src/model.js";
-import { abortOf, ConnectRefused, subscriberError, unreachable, Wire } from "../src/wire.js";
+import { abortOf, ConnectRefused, LISTEN_CAPACITY, listenCapacity, subscriberError, unreachable, Wire } from "../src/wire.js";
 
 // #424 item 5: a host's token() that finds its access token expired (OpenCode's native grant) throws inside the
 // MCP SDK's connect. The SDK pinned now rethrows it as is (it wraps fetch failures, not this); the Controller's
@@ -47,4 +47,18 @@ test("subscriberError keeps session_register's refusal codes; an unknown code is
   expect(codes.map(code => new ConnectRefused(400, JSON.stringify({ code, message: "refused" })).code)).toEqual(codes);
   expect([{ code: "child_unknown" }, { code: 7 }, {}, undefined].map(value => subscriberError(value, false).code)).toEqual(Array(4).fill("invalid_response"));
   expect(new ConnectRefused(400, JSON.stringify({ code: "child_unknown" })).code).toBe("invalid_response");
+});
+
+// #1394: only the listen cap's own plain 429 is the swap's slot race; another 429, another status with the same body,
+// or a body-driven rate_limited 429 is not. A wrapper's cause is followed.
+test("listenCapacity matches only the listen cap's plain-text 429", () => {
+  const http = (status: number, text: string) => new SdkHttpError(SdkErrorCode.ClientHttpNotImplemented, `Error POSTing to endpoint: ${text}`, { status, text });
+  expect(listenCapacity(http(429, LISTEN_CAPACITY))).toBe(true);
+  expect(listenCapacity(new Error("wrapped", { cause: http(429, LISTEN_CAPACITY) }))).toBe(true);
+  expect(listenCapacity(http(429, "MCP request capacity reached"))).toBe(false);
+  expect(listenCapacity(http(429, "MCP exchange capacity reached"))).toBe(false);
+  expect(listenCapacity(http(429, JSON.stringify({ error: { data: { code: "rate_limited", retry_after_ms: 5 } } })))).toBe(false);
+  expect(listenCapacity(http(503, LISTEN_CAPACITY))).toBe(false);
+  expect(listenCapacity(new Error(LISTEN_CAPACITY))).toBe(false);
+  expect(listenCapacity(undefined)).toBe(false);
 });
