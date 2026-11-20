@@ -14,6 +14,7 @@ import { direct } from "../support/events.ts";
 import { closeSessions } from "../support/mcp.ts";
 import { TestServer } from "../support/server.ts";
 import { seed } from "../support/seed.ts";
+import { drained, exec, execOn, rows as sqlRows } from "../support/repo_sql.ts";
 
 const B = "bob@example.com";
 let srv: TestServer;
@@ -33,10 +34,11 @@ afterEach(async () => {
   await srv.stop();
 });
 
-const rows = (sql: string, ...args: string[]) => srv.app.db.query(sql).all(...args);
-const holder = (address: string) => rows(`SELECT id FROM alias_holds WHERE address = ?`, address).map((r: any) => r.id);
-const lastEvent = (address: string) => rows(`SELECT session_id, event, detail FROM binding_events WHERE name = ? ORDER BY id DESC LIMIT 1`, address)[0];
-const revoked = () => rows(`SELECT actor, target, detail FROM access_log WHERE action = 'alias.revoked' ORDER BY id`).map((r: any) => ({ ...r, detail: JSON.parse(r.detail) }));
+// Committed rows, once the writes queued before the read have landed (a post is always queued on Postgres).
+const rows = async (sql: string, ...args: unknown[]): Promise<any[]> => { await drained(srv); return sqlRows(srv, sql, ...args); };
+const holder = async (address: string) => (await rows(`SELECT id FROM alias_holds WHERE address = ?`, address)).map((r: any) => r.id);
+const lastEvent = async (address: string) => (await rows(`SELECT session_id, event, detail FROM binding_events WHERE name = ? ORDER BY id DESC LIMIT 1`, address))[0];
+const revoked = async () => (await rows(`SELECT actor, target, detail FROM access_log WHERE action = 'alias.revoked' ORDER BY id`)).map((r: any) => ({ ...r, detail: JSON.parse(r.detail) }));
 const REASON = `${B} isn't a member of team eng`;
 // One HTTP call made as `identity`: a claim taken under it, a fresh key each time.
 let claimKey = 0;
@@ -52,29 +54,29 @@ test("a removed member's sessions lose the team's aliases: a holder keeps its ID
   await deploy.connect();
   // A closed session no longer enters a grace and ends (#282): its hold stays until revoked.
   deploy.close();
-  expect(holder("eng/deploy")).toEqual([deploy.id]);
+  expect(await holder("eng/deploy")).toEqual([deploy.id]);
   // bob's own alias is untouched.
   const own = srv.appSession(bob, "be");
   await own.connect();
 
   expect((await srv.api(alice, "POST", "/api/teams/eng/remove", { email: B })).status).toBe(200);
 
-  expect(holder("eng/build")).toEqual([]);
-  expect(lastEvent("eng/build")).toEqual({ session_id: build.id, event: "released", detail: `access revoked: ${REASON}` });
-  expect(holder("eng/deploy")).toEqual([]);
-  expect(lastEvent("eng/deploy")).toEqual({ session_id: deploy.id, event: "released", detail: `access revoked: ${REASON}` });
-  expect(holder(`${B}/be`)).toEqual([own.id]);
+  expect(await holder("eng/build")).toEqual([]);
+  expect(await lastEvent("eng/build")).toEqual({ session_id: build.id, event: "released", detail: `access revoked: ${REASON}` });
+  expect(await holder("eng/deploy")).toEqual([]);
+  expect(await lastEvent("eng/deploy")).toEqual({ session_id: deploy.id, event: "released", detail: `access revoked: ${REASON}` });
+  expect(await holder(`${B}/be`)).toEqual([own.id]);
 
   // The holder keeps its ID (not ended) and can't take the alias back.
-  expect(rows(`SELECT ended_at FROM ids WHERE id = ?`, build.id)).toEqual([{ ended_at: null }]);
+  expect(await rows(`SELECT ended_at FROM ids WHERE id = ?`, build.id)).toEqual([{ ended_at: null }]);
   await expect(build.bind("eng/build")).rejects.toMatchObject({ code: "not_found" });
 
   // The tools-only writer had nothing else to be: its ID ends. No transport
   // closes it with a `forbidden` frame any more.
-  expect(rows(`SELECT ended_at IS NOT NULL AS ended FROM ids WHERE id = ?`, writer.id)).toEqual([{ ended: 1 }]);
+  expect(await rows(`SELECT ended_at IS NOT NULL AS ended FROM ids WHERE id = ?`, writer.id)).toEqual([{ ended: 1 }]);
   await expect(srv.appSession(bob, "eng/build", { push: false }).connect()).rejects.toMatchObject({ code: "not_found" });
 
-  const audited = revoked();
+  const audited = await revoked();
   expect(audited).toHaveLength(3);
   expect(audited).toEqual(expect.arrayContaining([
     // The actor is the admin who removed B; the principal is B.
@@ -112,9 +114,9 @@ test("a recheck inside a caller's body resyncs a live holder from the holds the 
     await repo.teams.removeMember(tx, team.id, (await repo.users.findByEmail(tx, B))!.id);
     await srv.app.application.accessChanged(tx, B, "alice@example.com");
     // After the recheck returned: the body drops the other hold too.
-    srv.app.db.run(`DELETE FROM alias_holds WHERE address = ?`, [`${B}/side`]);
+    await execOn(tx, `DELETE FROM alias_holds WHERE address = ?`, `${B}/side`);
   });
-  expect(holder("eng/build")).toEqual([]);
+  expect(await holder("eng/build")).toEqual([]);
   // Neither address is the live session's any more: mail to the dropped one isn't pushed to it.
   const peer = srv.appSession(alice, "fe");
   await peer.connect();
@@ -128,8 +130,8 @@ test("leaving a team releases its aliases from the leaver's sessions; revalidate
   await build.connect();
   const first = build.id;
   expect((await srv.api(bob, "POST", "/api/teams/eng/leave")).status).toBe(200);
-  expect(holder("eng/build")).toEqual([]);
-  expect(lastEvent("eng/build")).toMatchObject({ session_id: first, event: "released" });
+  expect(await holder("eng/build")).toEqual([]);
+  expect(await lastEvent("eng/build")).toMatchObject({ session_id: first, event: "released" });
 
   // Rejoin, rebind (a new session: the old one isn't told, so still thinks it
   // holds the alias), then lose the membership without the HTTP route.
@@ -138,15 +140,15 @@ test("leaving a team releases its aliases from the leaver's sessions; revalidate
   expect((await build.connect()).bind).toMatchObject({ alias: "eng/build" });
   const team = (await srv.app.repo.teams.findByName(srv.app.repo.read, "eng"))!;
   await seed(srv.app.repo, async (tx) => srv.app.repo.teams.removeMember(tx, team.id, (await srv.app.repo.users.findByEmail(tx, B))!.id));
-  expect(holder("eng/build")).toEqual([build.id]);
+  expect(await holder("eng/build")).toEqual([build.id]);
   await srv.app.revalidate();
-  expect(holder("eng/build")).toEqual([]);
-  expect(lastEvent("eng/build")).toEqual({ session_id: build.id, event: "released", detail: `access revoked: ${REASON}` });
+  expect(await holder("eng/build")).toEqual([]);
+  expect(await lastEvent("eng/build")).toEqual({ session_id: build.id, event: "released", detail: `access revoked: ${REASON}` });
   // A member's hold survives the backstop.
   const kept = srv.appSession(alice, "eng/build");
   await kept.connect();
   await srv.app.revalidate();
-  expect(holder("eng/build")).toEqual([kept.id]);
+  expect(await holder("eng/build")).toEqual([kept.id]);
 });
 
 // Acting as an address over HTTP (`/api/claims/call`'s identity, as the
@@ -170,12 +172,12 @@ test("a DM to a team alias reaches its holder alone; team:eng isn't a DM recipie
 
   await be.send("eng/deploy", "ship it");
   await deploy.next(direct((m) => m.body === "ship it"));
-  expect(rows(`SELECT sender, recipient FROM messages WHERE body = 'ship it'`)).toEqual([{ sender: "alice@example.com/be", recipient: "eng/deploy" }]);
+  expect(await rows(`SELECT sender, recipient FROM messages WHERE body = 'ship it'`)).toEqual([{ sender: "alice@example.com/be", recipient: "eng/deploy" }]);
   await bobFe.none(direct((m) => m.body === "ship it"));
   await aliceQa.none(direct((m) => m.body === "ship it"));
 
   await expect(be.send("team:eng", "everyone")).rejects.toMatchObject({ message: "team:eng isn't a person; to reach a team, board_post to its board #eng" });
-  expect(rows(`SELECT 1 FROM messages WHERE body = 'everyone'`)).toEqual([]);
+  expect(await rows(`SELECT 1 FROM messages WHERE body = 'everyone'`)).toEqual([]);
   await be.call("board_post", { board: "eng", body: "everyone" });
   for (const s of [deploy, bobFe, aliceQa]) expect((await s.call<{ posts: { body: string }[] }>("board_read", { board: "eng" })).posts.map((p) => p.body)).toEqual(["everyone"]);
 });
@@ -185,8 +187,8 @@ test("a DM to a team alias reaches its holder alone; team:eng isn't a DM recipie
 test("a lazily created team alias follows only its team's board", async () => {
   expect((await srv.api(bob, "POST", "/api/teams", { name: "ops" })).status).toBe(201);
   await srv.appSession(bob, "eng/build").connect();
-  expect(rows(`SELECT board FROM subscriptions WHERE handle = 'eng/build'`)).toEqual([{ board: "eng" }]);
-  expect(rows(`SELECT created_by FROM boards WHERE name = 'eng'`)).toEqual([{ created_by: "alice@example.com" }]);
+  expect(await rows(`SELECT board FROM subscriptions WHERE handle = 'eng/build'`)).toEqual([{ board: "eng" }]);
+  expect(await rows(`SELECT created_by FROM boards WHERE name = 'eng'`)).toEqual([{ created_by: "alice@example.com" }]);
 });
 
 // #349: an alias_held refusal names the holder's place (its machine and
@@ -194,7 +196,7 @@ test("a lazily created team alias follows only its team's board", async () => {
 test("an alias_held refusal shows the holder's place to its own principal, not to another member", async () => {
   const build = srv.appSession(bob, "eng/build");
   expect((await build.connect()).bind?.alias).toBe("eng/build");
-  await seed(srv.app.repo, () => srv.app.db.query(`UPDATE ids SET place = 'bob-box:~/src/secret-project' WHERE id = ?`).run(build.id));
+  await exec(srv, `UPDATE ids SET place = 'bob-box:~/src/secret-project' WHERE id = ?`, build.id);
 
   const other = srv.appSession(alice, "eng/build");
   const refusal = await other.connect().then(() => { throw new Error("alice's bind was not refused"); }, (e: { code: string; message: string }) => e);
@@ -225,15 +227,15 @@ test("a team alias in use by one member's session refuses another member's write
   const sidecar = srv.appSession(alice, "eng/deploy", { push: false });
   await sidecar.connect();
   await expect(srv.appSession(bob, "eng/deploy").connect()).rejects.toMatchObject({ code: "alias_held", message: expect.stringContaining(`another user's session ${sidecar.id}`) });
-  expect(holder("eng/deploy")).toEqual([]);
-  expect(lastEvent("eng/deploy")).toMatchObject({ event: "refused", detail: `another user's session ${sidecar.id}` });
+  expect(await holder("eng/deploy")).toEqual([]);
+  expect(await lastEvent("eng/deploy")).toMatchObject({ event: "refused", detail: `another user's session ${sidecar.id}` });
 
   // Once bob's sessions using it stop, the alias is free to alice. A close
   // leaves a hold alone (#282), so the holder unbinds; the tools-only writer's
   // ID ends, as the hosted store's end does it.
   await build.unbind("eng/build");
   expect((await actAs(alice, "eng/build")).status).toBe(409);
-  await seed(srv.app.repo, () => srv.app.db.query(`UPDATE ids SET ended_at = ? WHERE id = ?`).run(Date.now(), own.id));
+  await exec(srv, `UPDATE ids SET ended_at = ? WHERE id = ?`, Date.now(), own.id);
   expect((await actAs(alice, "eng/build")).status).toBe(200);
 });
 
@@ -252,21 +254,21 @@ test("losing one of two team aliases keeps the other's hold and its mail", async
   await peer.connect();
   const senderOf = async (c: AppSession) => {
     const sent = await c.send("alice@example.com/fe", "who");
-    return rows(`SELECT sender FROM messages WHERE id = ?`, String(sent.message_id))[0];
+    return (await rows(`SELECT sender FROM messages WHERE id = ?`, sent.message_id))[0];
   };
   expect(await senderOf(s)).toEqual({ sender: "eng/build" });
 
   expect((await srv.api(alice, "POST", "/api/teams/eng/remove", { email: B })).status).toBe(200);
-  expect(holder("eng/build")).toEqual([]);
-  expect(holder("ops/run")).toEqual([s.id]);
+  expect(await holder("eng/build")).toEqual([]);
+  expect(await holder("ops/run")).toEqual([s.id]);
   // Mail to the kept alias still reaches it.
   await peer.send("ops/run", "still yours");
   await s.next(direct((m) => m.body === "still yours"));
-  expect(revoked()).toEqual([{ actor: "alice@example.com", target: "eng/build", detail: { session: s.id, principal: B, reason: REASON } }]);
+  expect(await revoked()).toEqual([{ actor: "alice@example.com", target: "eng/build", detail: { session: s.id, principal: B, reason: REASON } }]);
 });
 
-const labels = (address: string) => rows(`SELECT task, source_board FROM aliases WHERE address = ?`, address)[0];
-const metaSets = (address: string) => rows(`SELECT actor, detail FROM access_log WHERE action = 'alias.meta_set' AND target = ? ORDER BY id`, address).map((r: any) => ({ ...r, detail: JSON.parse(r.detail) }));
+const labels = async (address: string) => (await rows(`SELECT task, source_board FROM aliases WHERE address = ?`, address))[0];
+const metaSets = async (address: string) => (await rows(`SELECT actor, detail FROM access_log WHERE action = 'alias.meta_set' AND target = ? ORDER BY id`, address)).map((r: any) => ({ ...r, detail: JSON.parse(r.detail) }));
 const peerRow = async (c: AppSession, match?: Record<string, string>) =>
   (await c.call<WhoResult>("peer_list", { include_offline: true, ...(match ? { match } : {}) })).peers.find((p) => p.handle === "eng/build");
 
@@ -276,27 +278,27 @@ const peerRow = async (c: AppSession, match?: Record<string, string>) =>
 test("bind's meta on a session: set, checked, cleared and audited; a held re-bind keeps bound_at; a non-member sees no row", async () => {
   const build = srv.appSession(bob, "eng/build", { bind: { create: true, meta: { task: "ENG-142", source_board: "#E2E" } }, harness: "opus" });
   expect((await build.connect()).bind).toMatchObject({ alias: "eng/build" });
-  expect(labels("eng/build")).toEqual({ task: "ENG-142", source_board: "e2e" });
+  expect(await labels("eng/build")).toEqual({ task: "ENG-142", source_board: "e2e" });
   // The actor is the signed-in user, as on every user-initiated server row (#373); the session is in the detail.
-  expect(metaSets("eng/build")).toEqual([{ actor: B, detail: { address: "eng/build", fields: { task: "ENG-142", source_board: "e2e" }, session: build.id } }]);
+  expect(await metaSets("eng/build")).toEqual([{ actor: B, detail: { address: "eng/build", fields: { task: "ENG-142", source_board: "e2e" }, session: build.id } }]);
   const boundAt = () => rows(`SELECT bound_at FROM alias_holds WHERE address = 'eng/build'`);
-  const at = boundAt();
-  const bound = () => rows(`SELECT event FROM binding_events WHERE name = 'eng/build'`).length;
-  const events = bound();
+  const at = await boundAt();
+  const bound = async () => (await rows(`SELECT event FROM binding_events WHERE name = 'eng/build'`)).length;
+  const events = await bound();
 
   // Held already: the same labels write nothing; a change is audited; neither is a bind.
   expect(await build.bind("eng/build", { meta: { task: "ENG-142" } })).toMatchObject({ alias: "eng/build", held: ["eng/build"] });
-  expect(metaSets("eng/build")).toHaveLength(1);
+  expect(await metaSets("eng/build")).toHaveLength(1);
   expect(await build.bind("eng/build", { meta: { task: "" } })).toMatchObject({ alias: "eng/build" });
-  expect(labels("eng/build")).toEqual({ task: null, source_board: "e2e" });
-  expect(metaSets("eng/build").at(-1)).toEqual({ actor: B, detail: { address: "eng/build", fields: { task: null }, session: build.id } });
-  expect(boundAt()).toEqual(at);
-  expect(bound()).toBe(events);
+  expect(await labels("eng/build")).toEqual({ task: null, source_board: "e2e" });
+  expect((await metaSets("eng/build")).at(-1)).toEqual({ actor: B, detail: { address: "eng/build", fields: { task: null }, session: build.id } });
+  expect(await boundAt()).toEqual(at);
+  expect(await bound()).toBe(events);
 
   // Refusals change nothing.
   await expect(build.bind("eng/build", { meta: { task: "x".repeat(201) } })).rejects.toMatchObject({ code: "bad_request", message: "meta.task must be at most 200 chars" });
   await expect(build.bind("eng/build", { meta: { source_board: "not a board" } })).rejects.toMatchObject({ code: "bad_request", message: expect.stringContaining(`invalid board name "not a board"`) });
-  expect(labels("eng/build")).toEqual({ task: null, source_board: "e2e" });
+  expect(await labels("eng/build")).toEqual({ task: null, source_board: "e2e" });
   expect(await build.bind("eng/build", { meta: { task: "ENG-142" } })).toMatchObject({ alias: "eng/build" });
 
   // A non-member can't bind it, so can't label it.
@@ -304,7 +306,7 @@ test("bind's meta on a session: set, checked, cleared and audited; a held re-bin
   const outsider = srv.appSession(carol, null);
   await outsider.connect();
   await expect(outsider.bind("eng/build", { meta: { task: "mine" } })).rejects.toMatchObject({ code: "not_found" });
-  expect(labels("eng/build")).toEqual({ task: "ENG-142", source_board: "e2e" });
+  expect(await labels("eng/build")).toEqual({ task: "ENG-142", source_board: "e2e" });
 
   // The labels and the session's facts reach a member (F-12); a non-member
   // isn't listed the team's alias at all (#348), so match can't probe them.
@@ -336,11 +338,11 @@ test("peer_list's match: harness, task, id and scope; an unknown key is refused"
 // #356: the bind-target checks a team's scope shares with a person's, end to end.
 test("a bind of human in a team's scope is refused as reserved, and creates nothing", async () => {
   await expect(srv.appSession(bob, "eng/human").connect()).rejects.toMatchObject({ code: "forbidden", message: expect.stringContaining(`"human" is reserved`) });
-  expect(rows(`SELECT address FROM aliases WHERE address = 'eng/human'`)).toEqual([]);
+  expect(await rows(`SELECT address FROM aliases WHERE address = 'eng/human'`)).toEqual([]);
 });
 
 test("a user's bind in a service principal's scope reads as a missing scope (#270), and creates nothing", async () => {
   await seed(srv.app.repo, tx => srv.app.repo.services.create(tx, "ingest"));
   await expect(srv.appSession(bob, "ingest/worker").connect()).rejects.toMatchObject({ code: "not_found", message: '"ingest/worker": no team or service is named "ingest"' });
-  expect(rows(`SELECT address FROM aliases WHERE address = 'ingest/worker'`)).toEqual([]);
+  expect(await rows(`SELECT address FROM aliases WHERE address = 'ingest/worker'`)).toEqual([]);
 });

@@ -1,11 +1,32 @@
+import { isSqliteDb } from "./hosted_rows.ts";
+import { drained, type RepoLike, rows } from "./repo_sql.ts";
+
+type SqliteDb = { query(sql: string): { all(...args: string[]): unknown[] } };
+
 // The server's access_log rows of `action`, oldest first (by id, not `at`: rows written in one
 // millisecond, or under a test clock that stands still, share an `at`), details parsed (#479, #277).
+// Given the server (or its Repo), on either backend (#807 P3 C11c), once the writes queued before the call have
+// committed (repo_sql.ts drained: an audit row is often a post); given a SQLite connection, read there synchronously
+// (callers not yet ported).
 export type AccessAudit = { at: number; actor: string | null; target: string | null; detail: Record<string, unknown> };
-export const accessAudits = (db: { query(sql: string): { all(...args: string[]): unknown[] } }, action: string): AccessAudit[] =>
-  (db.query("SELECT at, actor, target, detail FROM access_log WHERE action = ? ORDER BY id").all(action) as { at: number; actor: string | null; target: string | null; detail: string }[])
-    .map((r) => ({ at: r.at, actor: r.actor, target: r.target, detail: JSON.parse(r.detail) }));
+type AuditRow = { at: number; actor: string | null; target: string | null; detail: string };
+const AUDITS = "SELECT at, actor, target, detail FROM access_log WHERE action = ? ORDER BY id";
+const parsed = (rs: AuditRow[]): AccessAudit[] => rs.map((r) => ({ at: r.at, actor: r.actor, target: r.target, detail: JSON.parse(r.detail) }));
+
+export function accessAudits(on: SqliteDb, action: string): AccessAudit[];
+export function accessAudits(on: RepoLike, action: string): Promise<AccessAudit[]>;
+export function accessAudits(on: SqliteDb | RepoLike, action: string): AccessAudit[] | Promise<AccessAudit[]> {
+  if (isSqliteDb(on)) return parsed(on.query(AUDITS).all(action) as AuditRow[]);
+  return drained(on).then(() => rows<AuditRow>(on, AUDITS, action)).then(parsed);
+}
 
 // Where each of the server's access_log rows of `action` came from, oldest first (security audit F-19).
 export type AuditOrigin = { ip: string | null; ua: string | null; client_id: string | null };
-export const auditOrigins = (db: { query(sql: string): { all(...args: string[]): unknown[] } }, action: string): AuditOrigin[] =>
-  db.query("SELECT ip, ua, client_id FROM access_log WHERE action = ? ORDER BY id").all(action) as AuditOrigin[];
+const ORIGINS = "SELECT ip, ua, client_id FROM access_log WHERE action = ? ORDER BY id";
+
+export function auditOrigins(on: SqliteDb, action: string): AuditOrigin[];
+export function auditOrigins(on: RepoLike, action: string): Promise<AuditOrigin[]>;
+export function auditOrigins(on: SqliteDb | RepoLike, action: string): AuditOrigin[] | Promise<AuditOrigin[]> {
+  if (isSqliteDb(on)) return on.query(ORIGINS).all(action) as AuditOrigin[];
+  return drained(on).then(() => rows<AuditOrigin>(on, ORIGINS, action));
+}

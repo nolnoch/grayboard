@@ -8,7 +8,8 @@
 import { expect, test } from "bun:test";
 import { refusal, type AppSession } from "../support/app_session.ts";
 import { direct } from "../support/events.ts";
-import { seed } from "../support/seed.ts";
+import { accessAudits } from "../support/audit.ts";
+import { exec } from "../support/repo_sql.ts";
 import { TestServer, type TestServerOverrides } from "../support/server.ts";
 import { until } from "../support/until.ts";
 
@@ -26,10 +27,8 @@ async function team(srv: TestServer, policy: string) {
   return { alice, bob };
 }
 
-const decisions = (srv: TestServer, rule: string) =>
-  (srv.app.db.query(`SELECT detail FROM access_log WHERE action = 'authz.decision' ORDER BY rowid`).all() as { detail: string }[])
-    .map((r) => JSON.parse(r.detail) as Record<string, unknown>)
-    .filter((d) => d.rule === rule);
+const decisions = async (srv: TestServer, rule: string) =>
+  (await accessAudits(srv, "authz.decision")).map((r) => r.detail).filter((d) => d.rule === rule);
 
 test("server: a delegating team lets a member name another member's launcher; collaborative alone doesn't", async () => {
   const srv = await serve();
@@ -43,7 +42,7 @@ test("server: a delegating team lets a member name another member's launcher; co
     expect(no.message).toMatch(/"eng\/launcher" belongs to another user.*delegating/);
     await bobLauncher.none(direct());
     // The row survives the delegate's rolled-back write (#867).
-    expect(decisions(srv, "delegate.cross_user")).toEqual([expect.objectContaining({ verb: "delegate.to", allow: false, from_user: "alice@example.com", to_user: "bob@b.com", launcher: "eng/launcher" })]);
+    expect(await decisions(srv, "delegate.cross_user")).toEqual([expect.objectContaining({ verb: "delegate.to", allow: false, from_user: "alice@example.com", to_user: "bob@b.com", launcher: "eng/launcher" })]);
 
     expect((await srv.api(alice, "POST", "/api/teams/eng/policy", { policy: "delegating" })).status).toBe(200);
     const r = await aliceSim.delegate({ persona: "p", task: "t", to: "eng/launcher" });
@@ -68,11 +67,11 @@ test("server: a delegate replay after the team's policy went back to open is ref
     expect((await aliceSim.delegate(req)).replayed).toBeDefined();
 
     expect((await srv.api(alice, "POST", "/api/teams/eng/policy", { policy: "open" })).status).toBe(200);
-    const replays = () => (srv.app.db.query(`SELECT COUNT(*) AS n FROM access_log WHERE action = 'request.replayed'`).get() as { n: number }).n;
-    const before = replays();
+    const replays = async () => (await accessAudits(srv, "request.replayed")).length;
+    const before = await replays();
     expect((await refusal(aliceSim.delegate(req))).message).toMatch(/"eng\/launcher" belongs to another user/);
-    expect(replays()).toBe(before);
-    expect(decisions(srv, "delegate.cross_user").length).toBe(1);
+    expect(await replays()).toBe(before);
+    expect((await decisions(srv, "delegate.cross_user")).length).toBe(1);
   } finally {
     await srv.stop();
   }
@@ -90,10 +89,10 @@ test("server: a delegate replay whose launcher name is unheld is refused, not re
     await aliceSim.delegate(req);
     expect((await srv.api(alice, "POST", "/api/teams/eng/policy", { policy: "open" })).status).toBe(200);
     await bobLauncher.unbind("eng/launcher");
-    const replays = () => (srv.app.db.query(`SELECT COUNT(*) AS n FROM access_log WHERE action = 'request.replayed'`).get() as { n: number }).n;
-    const before = replays();
+    const replays = async () => (await accessAudits(srv, "request.replayed")).length;
+    const before = await replays();
     expect((await refusal(aliceSim.delegate(req))).message).toMatch(/no session holds "eng\/launcher" now/);
-    expect(replays()).toBe(before);
+    expect(await replays()).toBe(before);
   } finally {
     await srv.stop();
   }
@@ -244,13 +243,13 @@ test("server: delegate's msg.send deny leaves a decision row on a fresh call and
 
     // A replay with nothing revoked answers the first call (#1030): the human has no session, yet it is alice's.
     expect((await sim.delegate(replayed)).replayed).toBeDefined();
-    await seed(srv.app.repo, () => { srv.app.db.exec(`DELETE FROM team_members`); });
+    await exec(srv, `DELETE FROM team_members`);
     // A replay of the first call rechecks msg.send against the launcher it picked.
     expect((await refusal(sim.delegate(replayed))).message).toMatch(/auto-picked "alice@example\.com\/human"/);
-    expect(decisions(srv, "human.team_alias")).toEqual(denied);
+    expect(await decisions(srv, "human.team_alias")).toEqual(denied);
     // A fresh call's prepareSend decides it too.
     await refusal(sim.delegate({ persona: "p", task: "fresh" }));
-    expect(decisions(srv, "human.team_alias")).toEqual([...denied, ...denied]);
+    expect(await decisions(srv, "human.team_alias")).toEqual([...denied, ...denied]);
   } finally {
     await srv.stop();
   }
