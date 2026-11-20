@@ -42,6 +42,9 @@ export type Config = {
   store: Store;
   // Where attachment bytes are kept (src/server/blobs.ts); default blobs/ beside a SQLite database, required with a URL.
   blobDir: string;
+  // GRAYBOARD_DATABASE_CONNECT_SECONDS (#1418): how long a Postgres store's first connection retries; absent, the
+  // default (store/pg/connect.ts).
+  databaseConnectSeconds?: number;
   httpPort: number;
   googleClientId: string;
   googleClientSecret: string;
@@ -163,6 +166,7 @@ export function loadConfig(): Config {
   return {
     store,
     blobDir,
+    ...connectSeconds(process.env.GRAYBOARD_DATABASE_CONNECT_SECONDS),
     httpPort: parsePort(process.env.GRAYBOARD_HTTP_PORT),
     googleClientId,
     googleClientSecret,
@@ -456,6 +460,14 @@ export function parseMetricsAddr(raw: string | undefined): { hostname: string; p
 // CLI token idle days: unset or empty is the default, 0 is never, else a
 // whole number of days up to ten years. Plain digits, as elsewhere here.
 export const DEFAULT_CLI_TOKEN_IDLE_DAYS = 30;
+function connectSeconds(raw: string | undefined): { databaseConnectSeconds?: number } {
+  if (raw === undefined || raw === "") return {};
+  if (!/^(0|[1-9][0-9]*)$/.test(raw) || Number(raw) > 3600) {
+    throw new Error(`GRAYBOARD_DATABASE_CONNECT_SECONDS must be a whole number of seconds from 0 (one try) to 3600, not "${raw}"`);
+  }
+  return { databaseConnectSeconds: Number(raw) };
+}
+
 function idleDays(raw: string | undefined): number {
   if (raw === undefined || raw === "") return DEFAULT_CLI_TOKEN_IDLE_DAYS;
   if (!/^(0|[1-9][0-9]*)$/.test(raw) || Number(raw) > 3650) {

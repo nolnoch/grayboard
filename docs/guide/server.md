@@ -113,6 +113,8 @@ GOOGLE_OAUTH_CLIENT_SECRET=<client secret>
 
 **Secrets from files.** Each secret can come from a file instead: set `<NAME>_FILE` to its path, the convention for Docker and Kubernetes secrets mounted as files. That covers `GRAYBOARD_DATABASE_URL`, `GOOGLE_OAUTH_CLIENT_SECRET`, `GRAYBOARD_MCP_GOOGLE_CLIENT_SECRET`, `GRAYBOARD_OKTA_CLIENT_SECRET`, `SLACK_APP_TOKEN` and `SLACK_BOT_TOKEN`. The server reads the file once at start and drops trailing line breaks. It refuses to start when both `<NAME>` and `<NAME>_FILE` are set, or when the file is empty or unreadable; the error names the variable and path, never the contents.
 
+**Waiting for Postgres.** With `GRAYBOARD_DATABASE_URL`, the server waits for the database to answer before it migrates and listens, so a managed database that is resuming, failing over or still booting doesn't fail the start. It retries refused, timed-out and dropped connections, and a server that says it isn't taking connections yet, for `GRAYBOARD_DATABASE_CONNECT_SECONDS` (default 60, a whole number from 0 to 3600; 0 tries once), and logs each failed try. A wrong password or a missing database fails the start at once.
+
 ### Admins and roles
 
 Admins come from two places: the emails in `GRAYBOARD_ADMINS`, and people an admin grants the `org_admin` role at runtime. A grant or a revoke takes effect on the next request, with no restart:

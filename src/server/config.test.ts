@@ -23,7 +23,7 @@ const KEYS = [
   "GRAYBOARD_HOSTED_SESSIONS_PER_SERVICE", "GRAYBOARD_DELIVERY_LEASES_PER_SERVICE",
   ...["HOSTED_REQUEST_SERVICE", "HOSTED_SUBSCRIBER_SERVICE", "HELLO_SERVICE"].flatMap(p => [`GRAYBOARD_${p}_BURST`, `GRAYBOARD_${p}_PER_SEC`]),
   "GRAYBOARD_SERVICE_TOKEN_MAX_SECONDS", "GRAYBOARD_SERVICE_TOKEN_MINTS_PER_MINUTE", "GRAYBOARD_SERVICE_TOKENS_UNEXPIRED",
-  "SLACK_APP_TOKEN", "SLACK_BOT_TOKEN", ...FILE_SECRETS.map(name => `${name}_FILE`),
+  "GRAYBOARD_DATABASE_CONNECT_SECONDS", "SLACK_APP_TOKEN", "SLACK_BOT_TOKEN", ...FILE_SECRETS.map(name => `${name}_FILE`),
 ];
 
 describe("loadConfig", () => {
@@ -145,6 +145,20 @@ describe("loadConfig", () => {
     expect(describeStore({ kind: "postgres", url: "not a url s3cret" })).not.toContain("s3cret");
     delete process.env.GRAYBOARD_DATABASE_URL;
     expect(() => loadConfig()).toThrow("Required env var GRAYBOARD_DB_PATH (or GRAYBOARD_DATABASE_URL) is not set");
+  });
+
+  // #1418: the Postgres first-connection wait; unset leaves the store's default.
+  test("GRAYBOARD_DATABASE_CONNECT_SECONDS is 0 to 3600 whole seconds", () => {
+    process.env.GRAYBOARD_DEV_AUTH = "1";
+    expect(loadConfig().databaseConnectSeconds).toBeUndefined();
+    for (const ok of ["0", "15", "3600"]) {
+      process.env.GRAYBOARD_DATABASE_CONNECT_SECONDS = ok;
+      expect(loadConfig().databaseConnectSeconds).toBe(Number(ok));
+    }
+    for (const bad of ["3601", "-1", "1.5", "015", " 5", "5s"]) {
+      process.env.GRAYBOARD_DATABASE_CONNECT_SECONDS = bad;
+      expect(() => loadConfig()).toThrow(`GRAYBOARD_DATABASE_CONNECT_SECONDS must be a whole number of seconds from 0 (one try) to 3600, not "${bad}"`);
+    }
   });
 
   // #1418: a secret mounted as a file (Docker, Kubernetes) reads as its variable, before any check sees it.
