@@ -17,6 +17,8 @@ use tokio::sync::mpsc;
 
 const EMAIL: &str = "u@example.com";
 const INBOX: &str = "grayboard://inbox";
+/// How often the fake bus sends a keepalive on each open listen stream.
+const KEEPALIVE: Duration = Duration::from_millis(250);
 
 fn addr(name: &str) -> String {
     format!("{EMAIL}/{name}")
@@ -89,6 +91,12 @@ impl Bus {
 
     fn hint(&mut self) {
         self.streams.retain(|s| s.send(hint().into_bytes()).is_ok());
+    }
+
+    /// A comment on every open listen stream, as the server's keepalive: it resets the client's idle timeout and is not a hint.
+    fn keepalive(&mut self) {
+        self.streams
+            .retain(|s| s.send(b": keepalive\n\n".to_vec()).is_ok());
     }
 
     /// Ends every open listen stream, as a server restart or a dropped connection does.
@@ -300,6 +308,16 @@ impl World {
         let bus = Arc::new(Mutex::new(bus));
         let shared = Arc::clone(&bus);
         let fake = Fake::start(false, move |req, _| shared.lock().unwrap().handle(req)).await;
+        // The server's keepalive, well inside `fast()`'s 1.5 s listen idle (#1380): without it a listen stream outliving that idle, as a long test's does under load, dies and reopens, adding reads and opens no test expects.
+        let weak = Arc::downgrade(&bus);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(KEEPALIVE);
+            loop {
+                tick.tick().await;
+                let Some(bus) = weak.upgrade() else { return };
+                bus.lock().unwrap().keepalive();
+            }
+        });
         let mut t = fast();
         tune(&mut t);
         let session = Client::new(
@@ -585,7 +603,7 @@ async fn hints_mark_the_inbox_dirty_and_a_full_page_reads_again() {
     }
     assert_eq!(got.last().unwrap(), "direct:101");
     // One read for the first page, one because it was full; no hint, no renew.
-    assert_eq!(w.count("read"), 2);
+    assert_eq!(w.count("read"), 2, "ops: {:?}", w.ops());
     let reads: Vec<Value> = w
         ._fake
         .requests()
