@@ -89,6 +89,13 @@ export function exec(on: RepoLike, sql: string, ...params: unknown[]): Promise<v
   return repoOf(on).write(async (tx: Tx) => { await execOn(tx, sql, ...params); });
 }
 
+// Resolves once every write queued before it has committed: a no-op body through the server's FIFO write queue. A
+// post (an audit row, a deny row flushed after a rollback) runs at once on SQLite's idle queue but is always queued on
+// Postgres, so a test reading what a request wrote waits here first. Don't call it while the test holds the queue.
+export function drained(on: RepoLike): Promise<void> {
+  return repoOf(on).write(() => undefined);
+}
+
 function isRepoLike(on: RepoLike | Tx): on is RepoLike {
   return !isTx(on as Read);
 }
