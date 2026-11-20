@@ -487,6 +487,57 @@ describePg("Postgres auth generation", () => {
     await on(a, "the second replacement's LISTEN");
   });
 
+  // Bun reports the drop (onclose) but its re-LISTEN never completes: without the watchdog no heartbeat is sent while
+  // off, so nothing would ever replace the instance (#1354).
+  withPods("a drop whose re-LISTEN never completes: after a full heartbeat interval the instance is closed and the LISTEN retried on the backoff; a re-LISTEN acknowledged in time schedules nothing", 1, async (db, a) => {
+    const timers = a.timers!;
+    await a.settle();
+    const g0 = a.auth.authGeneration()!;
+    const [first] = a.listener.instances;
+    // A re-LISTEN acknowledged before the second tick: the cache is back on and the watchdog stands down.
+    await capturingErrors(async () => { first!.onclose(new Error("test: a drop Bun recovers from")); });
+    expect(a.gen.read()).toBeUndefined();
+    first!.onlisten!();
+    expect(a.gen.read()).toBeDefined();
+    timers.tick();
+    await pinged(a, db);
+    timers.tick();
+    await pinged(a, db);
+    expect(timers.pending).toBe(0);
+    expect(a.listener.instances).toHaveLength(1);
+    expect(first!.closed).toBe(false);
+    // A drop whose re-LISTEN never comes.
+    const { logged } = await capturingErrors(async () => {
+      first!.onclose(new Error("test: a drop Bun never re-listens after"));
+      expect(a.gen.read()).toBeUndefined();
+      timers.tick();
+      expect(timers.pending).toBe(0); // one tick isn't a full interval
+      expect(first!.closed).toBe(false);
+      // Bun's reconnect attempts can report onclose again: the wait keeps counting from the first drop.
+      first!.onclose(new Error("test: a failed reconnect attempt"));
+      timers.tick();
+    });
+    expect(logged.map(l => l[0])).toEqual([
+      "[grayboard] auth LISTEN connection closed; the auth cache is off until it listens again",
+      "[grayboard] auth LISTEN failed; the auth cache stays off and the LISTEN is retried:",
+    ]);
+    expect(first!.closed).toBe(true);
+    expect(timers.delays).toEqual([1000]);
+    expect(timers.pending).toBe(1);
+    timers.fire();
+    await on(a, "the retried LISTEN");
+    expect(a.listener.instances).toHaveLength(2);
+    expect(Number(a.auth.authGeneration())).toBeGreaterThan(Number(g0));
+    // The closed instance's late callbacks change nothing.
+    const g1 = a.auth.authGeneration();
+    first!.onclose(new Error("test: the old instance's late close"));
+    timers.tick();
+    await pinged(a, db);
+    timers.tick();
+    expect(a.auth.authGeneration()).toBe(g1);
+    expect(timers.pending).toBe(0);
+  });
+
   withPods("the heartbeat: a ping that arrives keeps the cache on and never bumps; another pod's ping and a stale one of its own neither bump nor clear the outstanding one; close() turns the cache off and closes the listener", 1, async (db, a) => {
     const timers = a.timers!;
     await a.settle();
