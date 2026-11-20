@@ -88,7 +88,7 @@ test("legacy identity headers cannot select or create names; explicit bind retai
   expect(hosted.activeContexts).toBe(0);
 });
 
-async function connect(version = "2026-07-28", intercept?: (response: Response, request: Request) => Promise<void>, headers?: Headers, observeRequest?: (request: Request) => void) {
+async function connect(version = "2026-07-28", intercept?: (response: Response, request: Request) => Promise<void>, headers?: Headers, observeRequest?: (request: Request) => void, routing: Record<string, unknown> = meta) {
   const client = new Client({ name: "unit", version: "1" }, {
     supportedProtocolVersions: [version], versionNegotiation: { mode: version === "2026-07-28" ? { pin: version } : "legacy" },
   });
@@ -99,7 +99,7 @@ async function connect(version = "2026-07-28", intercept?: (response: Response, 
       let request = new Request(input, init);
       if (request.method === "POST" && request.body) {
         const body = await request.json() as { params?: Record<string, unknown> };
-        body.params = { ...body.params, _meta: { ...((body.params?._meta ?? {}) as object), ...meta } };
+        body.params = { ...body.params, _meta: { ...((body.params?._meta ?? {}) as object), ...routing } };
         request = new Request(request, { body: JSON.stringify(body) });
       }
       headers?.forEach((value, key) => request.headers.set(key, value));
@@ -1814,6 +1814,39 @@ test("#1196: a child's legacy GET whose read moved keeps streaming through a roo
     abort.abort(); await get.body?.cancel().catch(() => {});
   } finally { roots.mockRestore(); }
   await raw.delete(); await root.delete();
+});
+
+// #1486: a re-read a root notice raced is merged per row: the child's own row, which no notice followed, takes the
+// re-read's half (ended), so the child's listen stops on its first re-read, though a root notice races every re-read.
+// The stream timer runs only by hand and never does here: the stop is the re-read's own.
+test("#1486: a child's listen whose row ended during its read stops on its re-read though root notices race each one", async () => {
+  const { time } = await clocked(undefined, undefined, true);
+  token = (await issueOAuth(store.repo, oauth.resource, "alice@example.com", ["grayboard:tools"], time.now, OPENCODE_CLIENT)).token;
+  const principal = await oauth.authenticate(new Request("http://localhost/mcp", { headers: { Authorization: `Bearer ${token}` } }));
+  if (principal instanceof Response) throw new Error("fixture authorization failed");
+  await hosted.sessions.register(principal, sessionContext(principal, meta), "test-child");
+  expect((await (await connect()).callTool({ name: "board_create", arguments: { name: "churn", purpose: "#1486" } })).isError).not.toBe(true);
+  const child = (await store.repo.hosted.all(store.repo.read)).find(r => r.root_session_id)!;
+  const client = await connect(undefined, undefined, undefined, undefined, { "ai.opencode/sessionID": "test-child" });
+  const readRow = hosted.sessions.readRow;
+  let armed = false, reads = 0;
+  // The child's reads once armed: the first (the listen's own) is followed by the row's end, each later one (a
+  // re-read) by a root notice, up to a bound a re-read loop that never merges reaches.
+  const rows = spyOn(hosted.sessions, "readRow").mockImplementation(async id => {
+    const read = await readRow(id);
+    if (!armed || id !== child.session_id) return read;
+    reads++;
+    if (reads === 1) await seed(store.repo, tx => store.repo.hosted.childEnd(tx, child.session_id, Date.now(), "closed"));
+    else if (reads < 20) await seed(store.repo, tx => store.repo.hosted.update(tx, child.root_session_id!, { last_seen_at: Date.now() }));
+    return read;
+  });
+  try {
+    const { value: listen } = await held("mcp:authorize:facts", () => client.listen({ resourceSubscriptions: ["grayboard://boards/churn"] }), async () => { armed = true; });
+    await untilHosted(() => hosted.activeListens === 0, 5_000);
+    expect(reads).toBeGreaterThanOrEqual(2);
+    expect(reads).toBeLessThan(5);
+    await listen.close();
+  } finally { rows.mockRestore(); }
 });
 
 // #1196: an idle GET a subscription attaches adopts its re-selection's rows only when no notice for them followed
