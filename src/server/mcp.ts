@@ -68,7 +68,8 @@ type Legacy = { ref: string; meta?: unknown; server: McpServer; transport: WebSt
 type Checked = { row: HostedSession | undefined; root?: HostedSession; seq: number; boards?: Map<string, boolean> };
 type Bound = { row: HostedSession | undefined; root?: HostedSession };
 // `bound`: the binding's row and root as the last read or commit notice left them, which a notice judges (#807 P3
-// A7h2). `rechecking`: the context a re-read of them is in flight for.
+// A7h2). `rechecking`: the context a re-read of them is in flight for. `noted`: per bound row, the seq of the last
+// notice that carried its facts into `bound`, so a raced re-read keeps those halves and takes its own for the rest (#1486).
 type Live = { context: Context; rows: Set<string>; bound: Bound; rechecking?: Context; noted?: Map<string, number>; uris: Map<string, string | null>; watches: string[]; stream?: OwnedStream; handler?: McpHttpHandler; legacy?: Legacy; stopped: boolean; hint(uri: string): void; stop(): void };
 
 export function createHostedMcp(application: Application, oauth: Pick<ReturnType<typeof createOAuthServer>, "authenticate" | "isAuthorized" | "peekAuthorized" | "isGrantActive" | "issuer" | "resource">, opts: { trustedOrigin: string; now?: () => number; limits?: McpLimits; caps?: HostedCaps; idleSeconds?: number; streamRecheckMs?: number }) {
