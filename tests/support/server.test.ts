@@ -1,9 +1,10 @@
 // #807 P3 C11b: TestServer's store. On pg each server gets a database of its own, kept across a restart and dropped by
 // the final stop; describeSqlite and testSqlite skip on pg and say so.
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import * as pgRepo from "../../src/server/pg_repo.ts";
 import { describePg, pgDatabase, PG_URL, pgUrl } from "./pg.ts";
 import { ServerProcess, TestServer } from "./server.ts";
 
@@ -12,6 +13,11 @@ const ROOT = join(import.meta.dir, "../..");
 async function exists(datname: string): Promise<boolean> {
   const admin = new Bun.SQL(PG_URL!);
   try { return (await admin`SELECT 1 FROM pg_database WHERE datname = ${datname}`).length > 0; } finally { await admin.close(); }
+}
+// This process's per-test databases (pg.ts names them gbt_<epoch>_<pid>_…): other workers' come and go meanwhile.
+async function mine(): Promise<string[]> {
+  const admin = new Bun.SQL(PG_URL!);
+  try { return (await admin`SELECT datname FROM pg_database WHERE datname LIKE ${`gbt\\_%\\_${process.pid}\\_%`}`).map((r: { datname: string }) => r.datname).sort(); } finally { await admin.close(); }
 }
 const dbName = (srv: TestServer) => new URL((srv.config.store as { url: string }).url).pathname.slice(1);
 
@@ -30,6 +36,17 @@ test("on sqlite a restart keeps the file and the dir; the final stop removes the
     await srv.stop();
   }
   expect(existsSync(srv.dir)).toBe(false);
+});
+
+test("a server opened with an injected repo can't be restarted onto its placeholder store", async () => {
+  const donor = await TestServer.open({}, { backend: "sqlite" });
+  const srv = await TestServer.open({}, { backend: "sqlite", repo: donor.app.repo });
+  try {
+    await srv.stop({ keep: true });
+    await expect(TestServer.open({}, { reuse: srv })).rejects.toThrow("a server opened with an injected repo can't be reused");
+  } finally {
+    await donor.stop();
+  }
 });
 
 describePg("TestServer on pg", () => {
@@ -58,15 +75,45 @@ describePg("TestServer on pg", () => {
     expect(await exists(dbName(other))).toBe(false);
   });
 
-  test("the Postgres Repo takes the config's attachment limits and quota", async () => {
-    const srv = await TestServer.open({ attachmentLimits: { file: 16, total: 32 }, attachmentUserQuota: 64 }, { backend: "pg" });
+  // humanReach only shapes the session-end port's board access, built lazily inside makePgRepo, so the test reads it
+  // at the seam: the options openRepo hands makePgRepo.
+  test("the Postgres Repo takes the config's attachment limits, quota, humanReach and the server's clock", async () => {
+    const make = spyOn(pgRepo, "makePgRepo");
+    const srv = await TestServer.open({ attachmentLimits: { file: 16, total: 32 }, attachmentUserQuota: 64, humanReach: "all" }, { backend: "pg", now: () => 1_234_567 });
     try {
       expect(srv.config.store.kind).toBe("postgres");
       expect(srv.app.repo.attachmentLimits).toEqual({ file: 16, total: 32 });
       expect(srv.app.repo.attachmentUserQuota).toBe(64);
+      expect(srv.app.repo.now()).toBe(1_234_567);
+      expect(make).toHaveBeenCalledTimes(1);
+      expect(make.mock.calls[0]![1]).toMatchObject({ humanReach: "all", blobDir: srv.config.blobDir });
     } finally {
+      make.mockRestore();
       await srv.stop();
     }
+  });
+
+  test("a failed open and a stop whose app.stop throws both drop the server's database", async () => {
+    const before = await mine();
+    const make = spyOn(pgRepo, "makePgRepo").mockRejectedValueOnce(new Error("migration failed"));
+    try {
+      await expect(TestServer.open({}, { backend: "pg" })).rejects.toThrow("migration failed");
+    } finally {
+      make.mockRestore();
+    }
+    expect(await mine()).toEqual(before);
+
+    const srv = await TestServer.open({}, { backend: "pg" });
+    expect(await mine()).toContain(dbName(srv));
+    const realStop = srv.app.stop.bind(srv.app);
+    const stop = spyOn(srv.app, "stop").mockRejectedValueOnce(new Error("stop failed"));
+    try {
+      await expect(srv.stop()).rejects.toThrow("stop failed");
+    } finally {
+      stop.mockRestore();
+      await realStop().catch(() => {});
+    }
+    expect(await mine()).toEqual(before);
   });
 
   test("under GRAYBOARD_TEST_BACKEND=pg, describeSqlite and testSqlite skip, named as SQLite only", async () => {
@@ -74,7 +121,7 @@ describePg("TestServer on pg", () => {
     try {
       const file = join(dir, "fixture.test.ts");
       writeFileSync(file, `
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import { describeSqlite, testSqlite, TEST_BACKEND } from ${JSON.stringify(join(import.meta.dir, "server.ts"))};
 test("runs", () => { console.log("BACKEND " + TEST_BACKEND); });
 describeSqlite("second connection", () => { test("inner", () => { console.log("RAN inner"); }); });

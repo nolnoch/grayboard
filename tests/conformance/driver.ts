@@ -7,9 +7,9 @@ import { join } from "node:path";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { freePort } from "../support/hosted_oauth.ts";
 import { closeSessions, localSession } from "../support/mcp.ts";
-import { PG_URL } from "../support/pg.ts";
+import { PG_URL, pgDatabase, type PgDatabase } from "../support/pg.ts";
 import { pgServers } from "../support/pg_server.ts";
-import { ServerProcess, TestServer } from "../support/server.ts";
+import { ServerProcess, TEST_BACKEND, TestServer } from "../support/server.ts";
 
 export type Mode = "local" | "hosted";
 
@@ -157,8 +157,17 @@ export function rustDriver(bin: string): Driver {
       const strip = (s: string) => s.split(prefix).join("");
       // scenario.ts opens a bus outside its try: a failed start stops what it started and removes the dir itself.
       let credential: { client_id: string; client_secret: string }, server: ServerProcess | undefined, proc: ReturnType<typeof spawnDriver>;
+      // Under GRAYBOARD_TEST_BACKEND=pg the server runs on a database of its own, dropped with the dir.
+      let pg: PgDatabase | undefined;
+      const cleanup = async () => {
+        try { await server?.stop(); } finally {
+          await pg?.[Symbol.asyncDispose]();
+          rmSync(dir, { recursive: true, force: true });
+        }
+      };
       try {
-        server = await ServerProcess.start(SERVER_BIN, { dbPath: dbPath }, {
+        if (TEST_BACKEND === "pg") pg = await pgDatabase({ max: 1 });
+        server = await ServerProcess.start(SERVER_BIN, pg ? { url: pg.url, blobDir: join(dir, "blobs") } : { dbPath }, {
           GRAYBOARD_PUBLIC_URL: issuer,
           GRAYBOARD_HTTP_PORT: String(port),
           GRAYBOARD_ADMINS: RUST_ADMIN,
@@ -177,11 +186,9 @@ export function rustDriver(bin: string): Driver {
         credential = await post("/api/admin/services/credentials", { service: RUST_SERVICE });
         proc = spawnDriver(bin);
       } catch (e) {
-        await server?.stop();
-        rmSync(dir, { recursive: true, force: true });
+        await cleanup();
         throw e;
       }
-      const running = server;
       let stderr = "";
       const drainErr = (async () => {
         const decoder = new TextDecoder();
@@ -191,7 +198,7 @@ export function rustDriver(bin: string): Driver {
       const pending = new Map<number, { resolve(v: any): void; reject(e: Error): void }>();
       let next = 0;
       const failAll = (why: string) => {
-        for (const p of pending.values()) p.reject(new Error(`${why}\n${stderr}\n${running.log()}`));
+        for (const p of pending.values()) p.reject(new Error(`${why}\n${stderr}\n${server!.log()}`));
         pending.clear();
       };
       const reader = (async () => {
@@ -238,8 +245,7 @@ export function rustDriver(bin: string): Driver {
             await Promise.all([reader, drainErr]);
             if (code !== 0) throw new Error(`conformance-driver exited ${code}\n${stderr}`);
           } finally {
-            await running.stop();
-            rmSync(dir, { recursive: true, force: true });
+            await cleanup();
           }
         },
       };
