@@ -22,7 +22,7 @@ let skew = 0;
 const clients: Client[] = [];
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "gb-hosted-end-"));
-  app = startServer({ dbPath: scratchDbPath(), blobDir: dir, httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl: "http://localhost", messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES }, { hostname: "127.0.0.1", background: false, now: () => Date.now() + skew });
+  app = startServer({ store: { kind: "sqlite" as const, path: scratchDbPath() }, blobDir: dir, httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl: "http://localhost", messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES }, { hostname: "127.0.0.1", background: false, now: () => Date.now() + skew });
   base = `http://127.0.0.1:${app.server.port}`;
 });
 afterEach(async () => {

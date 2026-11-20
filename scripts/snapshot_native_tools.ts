@@ -27,7 +27,7 @@ export type ToolLists = { native: NativeTool[]; subscriber: Tool[] };
 export type SchemaTool = { name: string; inputSchema: unknown };
 
 export async function liveToolLists(): Promise<ToolLists> {
-  const server = new TestServer();
+  const server = await TestServer.open();
   const signal = new AbortController();
   try {
     const { token } = await issueOAuth(server.app.repo, server.app.oauth.resource, "you@example.com", ["grayboard:tools", "grayboard:delivery"], Date.now(), "grayboard-pi");

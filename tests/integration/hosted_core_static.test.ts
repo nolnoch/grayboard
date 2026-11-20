@@ -29,8 +29,8 @@ const ENDED = `Signed out of grayboard in pi; ${NEW_RUN}`;
 
 let srv: HostedServer, dir: string;
 const roots: RootDelivery[] = [];
-beforeEach(() => {
-  srv = hostedServer({ admins: [ROOT] });
+beforeEach(async () => {
+  srv = await hostedServer({ admins: [ROOT] });
   dir = realpathSync(mkdtempSync(join(tmpdir(), "gb-static-")));
 });
 afterEach(async () => {

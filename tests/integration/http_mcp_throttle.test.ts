@@ -13,7 +13,7 @@ import { seed } from "../support/seed.ts";
 // application sessions'.
 test("hosted traffic at 5 requests/s cannot starve same-user binds; exhaustion is isolated", async () => {
   let now = 0;
-  const srv = new TestServer({}, { now: () => now });
+  const srv = await TestServer.open({}, { now: () => now });
   const client = new Client({ name: "load", version: "1" }, { supportedProtocolVersions: ["2026-07-28"], versionNegotiation: { mode: { pin: "2026-07-28" } } });
   try {
     const token = await srv.login("alice@example.com");
@@ -58,7 +58,7 @@ test("hosted traffic at 5 requests/s cannot starve same-user binds; exhaustion i
 }, 60_000);
 
 for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: hosted admission exposes throttling and recovers without dispatching refused tools`, async () => {
-  const srv = new TestServer({}, { hostedRequestLimit: { burst: 10, perSec: 1 } });
+  const srv = await TestServer.open({}, { hostedRequestLimit: { burst: 10, perSec: 1 } });
   const client = new Client({ name: "throttle-test", version: "1" }, {
     supportedProtocolVersions: [version],
     versionNegotiation: { mode: version === "2026-07-28" ? { pin: version } : "legacy" },
@@ -117,7 +117,7 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: hosted admission 
 
 for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: native hosted preflight spends once before candidate reads`, async () => {
   let now = 0;
-  const srv = new TestServer({}, { hostedRequestLimit: { burst: 2, perSec: 1 }, now: () => now });
+  const srv = await TestServer.open({}, { hostedRequestLimit: { burst: 2, perSec: 1 }, now: () => now });
   try {
     const { token } = await issueOAuth(srv.app.repo, srv.app.oauth.resource, "alice@example.com");
     await seed(srv.app.repo, tx => srv.app.repo.aliases.create(tx, { scope_kind: "person", scope_ref: "alice@example.com", name: "be" }, "alice@example.com"));
@@ -177,7 +177,7 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: native hosted pre
 
 test("the hosted attachment byte routes charge a refused bearer to the address gate, and a request with none costs nothing (#401)", async () => {
   let now = 0;
-  const srv = new TestServer({ authFailLimit: { burst: 2, perSec: 1 } }, { now: () => now });
+  const srv = await TestServer.open({ authFailLimit: { burst: 2, perSec: 1 } }, { now: () => now });
   try {
     const token = await srv.login("alice@example.com");
     now = 10_000;
@@ -203,7 +203,7 @@ test("the hosted attachment byte routes charge a refused bearer to the address g
 
 test("native HTTP charges only presented invalid tokens in the shared address gate", async () => {
   let now = 0;
-  const srv = new TestServer({ authFailLimit: { burst: 2, perSec: 1 } }, { now: () => now });
+  const srv = await TestServer.open({ authFailLimit: { burst: 2, perSec: 1 } }, { now: () => now });
   try {
     const token = await srv.login("alice@example.com");
     now = 10_000;
@@ -229,7 +229,7 @@ test("native HTTP charges only presented invalid tokens in the shared address ga
 // refuse their subscriber requests, nor the reverse, and each bucket's refusal run is audited apart.
 test("subscriber-role requests and tool calls draw on separate per-user buckets (#845)", async () => {
   let now = 0;
-  const srv = new TestServer({}, { hostedRequestLimit: { burst: 2, perSec: 1 }, hostedSubscriberLimit: { burst: 3, perSec: 1 }, now: () => now });
+  const srv = await TestServer.open({}, { hostedRequestLimit: { burst: 2, perSec: 1 }, hostedSubscriberLimit: { burst: 3, perSec: 1 }, now: () => now });
   try {
     const tools = (await issueOAuth(srv.app.repo, srv.app.oauth.resource, "alice@example.com", ["grayboard:tools"])).token;
     const delivery = (await issueOAuth(srv.app.repo, srv.app.oauth.resource, "alice@example.com", ["grayboard:delivery"])).token;

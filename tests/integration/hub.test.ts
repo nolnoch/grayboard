@@ -6,9 +6,6 @@
 // logout close and `end` went with it. Moved from ws.test.ts; tool, board and
 // DM semantics are in hosted_tools.test.ts, routes in http_routes.test.ts.
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import type { ReadResult, WhoResult } from "../../src/core/boards.ts";
 import type { SendResult } from "../../src/server/application.ts";
 import type { Config } from "../../src/server/config.ts";
@@ -26,30 +23,22 @@ const C = "carol@example.com";
 
 // Each test's server; inbox polling spends hosted requests.
 const start = (overrides: Partial<Config> = {}) =>
-  new TestServer({ hostedRequestLimit: { burst: 10_000, perSec: 10_000 }, ...overrides });
+  TestServer.open({ hostedRequestLimit: { burst: 10_000, perSec: 10_000 }, ...overrides });
 let srv: TestServer;
 
 // A test that needs other config replaces the server.
 const restart = async (overrides: Partial<Config> = {}) => {
   await srv.stop();
-  srv = start(overrides);
+  srv = await start(overrides);
 };
 
-// Databases a test restarts its server on, removed once the last server is down.
-const dbDirs: string[] = [];
-const fileDb = () => {
-  const dir = mkdtempSync(join(tmpdir(), "gb-hub-"));
-  dbDirs.push(dir);
-  return join(dir, "bus.db");
-};
 
-beforeEach(() => {
-  srv = start();
+beforeEach(async () => {
+  srv = await start();
 });
 
 afterEach(async () => {
   await srv.stop();
-  for (const dir of dbDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
 const login = (email: string) => srv.login(email);
@@ -263,15 +252,13 @@ test("a bind's notices carry active claims and DMs undelivered after a day", asy
 // session ends only by a restart now (a closed one keeps its hold), so the
 // holder releases with unbind and the tools-only session by the restart.
 test("an identity a session holds or writes as can't be deleted until those sessions end", async () => {
-  const dbPath = fileDb();
-  await restart({ dbPath: dbPath });
   let alice = await login(A);
   const a = await srv.connected(alice, "be");
   const sidecar = await srv.connected(alice, "be", { push: false });
   expect(await api(alice, "DELETE", "/api/identities/be")).toEqual({ status: 409, body: { code: "alias_held", message: expect.stringContaining("is in use by the session") } });
   await a.unbind("be");
   expect(await api(alice, "DELETE", "/api/identities/be")).toEqual({ status: 409, body: { code: "alias_held", message: expect.stringContaining(sidecar.id) } });
-  await restart({ dbPath: dbPath });
+  srv = await srv.restart();
   alice = await login(A);
   expect(await api(alice, "DELETE", "/api/identities/be")).toEqual({ status: 200, body: { ok: true } });
 });
@@ -305,8 +292,6 @@ test("a tools-only connection works beside the live owner without taking its pus
 // at all (#229), so the session is bound from the start.
 // hosted twin: #451 (a hosted session that reads as its ID)
 test("a bound session replies to a thread it received as its ID; once ended, nothing acts as it", async () => {
-  const dbPath = fileDb();
-  await restart({ dbPath: dbPath });
   let alice = await login(A);
   const a = await srv.connected(alice, "be");
   const b = await srv.hosted(B, "fe");
@@ -320,7 +305,7 @@ test("a bound session replies to a thread it received as its ID; once ended, not
   expect((await api(alice, "POST", "/api/claims/call", { as: a.id, ...take })).status).toBe(200);
 
   // The restart ends the session the WSS transport can no longer reattach.
-  await restart({ dbPath: dbPath });
+  srv = await srv.restart();
   alice = await login(A);
   const gone = await api(alice, "POST", "/api/claims/call", { as: a.id, ...take });
   expect(gone).toEqual({ status: 403, body: { code: "forbidden", message: expect.stringContaining(`${a.id} ended at`) } });

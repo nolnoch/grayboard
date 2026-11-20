@@ -38,7 +38,7 @@ beforeEach(async () => {
   blobDir = mkdtempSync(join(tmpdir(), "gb-mcp-"));
   store = openDatabase(scratchDbPath(), { blobDir , sessionEnd: sessionEndPort("team") });
   application = createApplication(store.repo, { helloLimit: { burst: 10000, perSec: 10000 }, hostedRequestLimit: { burst: 10000, perSec: 10000 }, hostedSubscriberLimit: { burst: 10000, perSec: 10000 } });
-  oauth = createOAuthServer(store.repo, { dbPath: scratchDbPath(), blobDir, httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl: "https://grayboard.example.com:443", messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES });
+  oauth = createOAuthServer(store.repo, { store: { kind: "sqlite" as const, path: scratchDbPath() }, blobDir, httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl: "https://grayboard.example.com:443", messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES });
   hosted = createHostedMcp(application, oauth, { trustedOrigin: "https://grayboard.example.com:443" });
   const issued = await issuedOAuth(store.repo, oauth.resource);
   token = issued.token;
@@ -790,7 +790,7 @@ test("global POST admission remains bounded across distinct authenticated users"
 async function clocked(limits?: McpLimits, streamRecheckMs?: number, manual = false) {
   await hosted.close(); oauth.close();
   const time = { now: Date.now() };
-  oauth = createOAuthServer(store.repo, { dbPath: scratchDbPath(), blobDir, httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl: "https://grayboard.example.com", messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES }, { now: () => time.now });
+  oauth = createOAuthServer(store.repo, { store: { kind: "sqlite" as const, path: scratchDbPath() }, blobDir, httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl: "https://grayboard.example.com", messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES }, { now: () => time.now });
   const intervals: (() => unknown)[] = [];
   const interval = globalThis.setInterval;
   const spy = spyOn(globalThis, "setInterval").mockImplementation(((fn: () => void, ms: number, ...args: unknown[]) => {
@@ -1593,7 +1593,7 @@ test("#899: another connection's commit reaches a stamped listen within a tick",
   const path = join(blobDir, "gb.db");
   store = openDatabase(path, { blobDir , sessionEnd: sessionEndPort("team") });
   application = createApplication(store.repo, { helloLimit: { burst: 10000, perSec: 10000 }, hostedRequestLimit: { burst: 10000, perSec: 10000 }, hostedSubscriberLimit: { burst: 10000, perSec: 10000 } });
-  oauth = createOAuthServer(store.repo, { dbPath: path, blobDir, httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl: "https://grayboard.example.com:443", messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES });
+  oauth = createOAuthServer(store.repo, { store: { kind: "sqlite" as const, path: path }, blobDir, httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl: "https://grayboard.example.com:443", messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES });
   hosted = createHostedMcp(application, oauth, { trustedOrigin: "https://grayboard.example.com:443" });
   const issued = await issuedOAuth(store.repo, oauth.resource);
   user = issued.authed;

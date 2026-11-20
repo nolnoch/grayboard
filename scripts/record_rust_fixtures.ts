@@ -39,7 +39,7 @@ function normalize(headers: Headers, body: any): RecordedRequest {
 }
 
 export async function recordWire(): Promise<Fixture> {
-  const server = new TestServer();
+  const server = await TestServer.open();
   const recorded: RecordedRequest[] = [];
   const real = globalThis.fetch;
   globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {

@@ -26,12 +26,12 @@ let slack: FakeSlack;
 
 // Inbox polling spends hosted requests.
 const serve = (apiUrl: string) =>
-  new TestServer({ admins: ["root@example.com"], slack: { appToken: "xapp-1-t", botToken: "xoxb-t", apiUrl }, hostedRequestLimit: { burst: 10_000, perSec: 10_000 } });
+  TestServer.open({ admins: ["root@example.com"], slack: { appToken: "xapp-1-t", botToken: "xoxb-t", apiUrl }, hostedRequestLimit: { burst: 10_000, perSec: 10_000 } });
 
 beforeEach(async () => {
   slack = new FakeSlack({ channel: DM, owner: ALICE_SLACK, channelType: "im" });
   slack.emails.set(ALICE_SLACK, "alice@example.com");
-  srv = serve(slack.api);
+  srv = await serve(slack.api);
   await srv.app.slackReady;
 });
 
@@ -894,7 +894,7 @@ test("a deliberate bridge teardown stays silent (no audit row)", async () => {
 });
 
 test("a bridge that failed to start issues no codes", async () => {
-  const down = serve("http://127.0.0.1:1/api/");
+  const down = await serve("http://127.0.0.1:1/api/");
   try {
     await down.app.slackReady;
     const r = await down.api(await down.login("alice@example.com"), "POST", "/api/slack/link");
@@ -906,7 +906,7 @@ test("a bridge that failed to start issues no codes", async () => {
 }, 30_000);
 
 test("a fatal stop with no linked users writes nothing user-facing", async () => {
-  const down = serve("http://127.0.0.1:1/api/");
+  const down = await serve("http://127.0.0.1:1/api/");
   try {
     await down.app.slackReady;
     // The start failure is fatal, but with zero linked users there is nobody

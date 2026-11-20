@@ -8,8 +8,8 @@ import { TestServer } from "../support/server.ts";
 let srv: TestServer;
 let sessions: HostedSession[] = [];
 
-beforeEach(() => {
-  srv = new TestServer({ hostedRequestLimit: { burst: 10_000, perSec: 10_000 } });
+beforeEach(async () => {
+  srv = await TestServer.open({ hostedRequestLimit: { burst: 10_000, perSec: 10_000 } });
 });
 afterEach(async () => {
   await Promise.allSettled(sessions.splice(0).map((s) => s.close()));

@@ -23,6 +23,9 @@ export const describePg = describe.skipIf(!PG_URL);
 const TEMPLATE_LOCK = "7454656d706c6174"; // "tTemplat"
 // A killed run's databases older than this are dropped by the next template check.
 const LEAK_AGE_SECONDS = 6 * 3600;
+// Another migration set's template unused this long is dropped too (its COMMENT stamp, refreshed by each process that
+// uses it; an unstamped one counts as old). A checkout coming back to it rebuilds it in about a second.
+export const TEMPLATE_AGE_MS = 7 * 24 * 3600 * 1000;
 const IDENT = /^[a-z0-9_]+$/;
 
 export function pgUrl(database: string): string {
@@ -74,9 +77,12 @@ async function buildTemplate(name: string, migrations: readonly Migration[]): Pr
   try {
     await conn.unsafe(`SELECT pg_advisory_lock(${BigInt("0x" + TEMPLATE_LOCK)})`);
     try {
-      await sweepLeaks(conn);
+      await sweepLeaks(conn, name);
       const [exists] = await conn`SELECT 1 FROM pg_database WHERE datname = ${name}`;
-      if (exists) return { name, built: false };
+      if (exists) {
+        await stamp(conn, name);
+        return { name, built: false };
+      }
       // A builder that died mid-build left this behind.
       const build = `${name}_build`;
       await conn.unsafe(`DROP DATABASE IF EXISTS ${quoted(build)} WITH (FORCE)`);
@@ -87,6 +93,7 @@ async function buildTemplate(name: string, migrations: readonly Migration[]): Pr
       // DATABASE … TEMPLATE with 55006 under parallel workers).
       await conn.unsafe(`ALTER DATABASE ${quoted(build)} RENAME TO ${quoted(name)}`);
       await conn.unsafe(`ALTER DATABASE ${quoted(name)} WITH IS_TEMPLATE true ALLOW_CONNECTIONS false`);
+      await stamp(conn, name);
       return { name, built: true };
     } finally {
       await conn.unsafe(`SELECT pg_advisory_unlock(${BigInt("0x" + TEMPLATE_LOCK)})`);
@@ -96,12 +103,28 @@ async function buildTemplate(name: string, migrations: readonly Migration[]): Pr
   }
 }
 
-async function sweepLeaks(conn: SQL): Promise<void> {
+// The template's last use, for the sweep: COMMENT ON DATABASE works on a template no one may connect to.
+async function stamp(conn: SQL, name: string): Promise<void> {
+  await conn.unsafe(`COMMENT ON DATABASE ${quoted(name)} IS '${Date.now()}'`);
+}
+
+// Under the template lock: a killed run's per-test databases, and other migration sets' templates (and dead builds)
+// whose stamp is older than TEMPLATE_AGE_MS. `current` is the caller's template, never dropped.
+export async function sweepLeaks(conn: SQL, current: string): Promise<void> {
   const rows: { datname: string }[] = await conn`SELECT datname FROM pg_database WHERE datname LIKE 'gbt\_%'`;
   const cutoff = Math.floor(Date.now() / 1000) - LEAK_AGE_SECONDS;
   for (const { datname } of rows) {
     const sec = Number(/^gbt_(\d+)_/.exec(datname)?.[1]);
     if (Number.isFinite(sec) && sec < cutoff) await conn.unsafe(`DROP DATABASE IF EXISTS ${quoted(datname)} WITH (FORCE)`);
+  }
+  const templates: { datname: string; stamp: string | null }[] =
+    await conn`SELECT datname, shobj_description(oid, 'pg_database') AS stamp FROM pg_database WHERE datname LIKE 'gb\_tpl\_%'`;
+  for (const { datname, stamp } of templates) {
+    if (datname === current) continue;
+    const at = stamp === null ? NaN : Number(stamp);
+    if (Number.isFinite(at) && Date.now() - at < TEMPLATE_AGE_MS) continue;
+    await conn.unsafe(`ALTER DATABASE ${quoted(datname)} WITH IS_TEMPLATE false`);
+    await conn.unsafe(`DROP DATABASE IF EXISTS ${quoted(datname)} WITH (FORCE)`);
   }
 }
 
@@ -109,7 +132,8 @@ export type PgDatabase = { name: string; url: string; sql: SQL; [Symbol.asyncDis
 
 let serial = 0;
 async function createDatabase(template: string, opts: { max?: number }): Promise<PgDatabase> {
-  const name = `gbt_${Math.floor(Date.now() / 1000)}_${process.pid}_${++serial}`;
+  // The random part: bun test reloads this module per file in a worker, so `serial` restarts with the pid unchanged.
+  const name = `gbt_${Math.floor(Date.now() / 1000)}_${process.pid}_${++serial}_${crypto.randomUUID().slice(0, 8)}`;
   await admin().unsafe(`CREATE DATABASE ${quoted(name)} TEMPLATE ${quoted(template)}`);
   const url = pgUrl(name);
   const sql = openPg(url, { max: opts.max ?? 4, applicationName: "gb-test" });

@@ -23,9 +23,9 @@ const B = "bob@example.com";
 const C = "carol@example.com";
 let srv: TestServer;
 
-beforeEach(() => {
+beforeEach(async () => {
   // Inbox polling spends hosted requests.
-  srv = new TestServer({ hostedRequestLimit: { burst: 10_000, perSec: 10_000 } });
+  srv = await TestServer.open({ hostedRequestLimit: { burst: 10_000, perSec: 10_000 } });
 });
 afterEach(() => srv.stop());
 

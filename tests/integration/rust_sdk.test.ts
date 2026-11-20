@@ -35,7 +35,7 @@ afterEach(async () => {
 
 async function roundtrip(auth: "credentials" | "static") {
   expect(existsSync(example!)).toBe(true);
-  srv = hostedServer({ admins: [ROOT] }, EMAIL);
+  srv = await hostedServer({ admins: [ROOT] }, EMAIL);
   const s = srv;
   const db = s.app.db;
   const rows = <T>(sql: string, ...args: (string | number)[]) => db.query(sql).all(...args) as T[];

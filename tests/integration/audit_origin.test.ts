@@ -9,7 +9,7 @@ import { TestServer } from "../support/server.ts";
 import { until } from "../support/until.ts";
 
 let srv: TestServer;
-beforeEach(() => { srv = new TestServer({ hostedRequestLimit: { burst: 10_000, perSec: 10_000 } }); });
+beforeEach(async () => { srv = await TestServer.open({ hostedRequestLimit: { burst: 10_000, perSec: 10_000 } }); });
 afterEach(async () => { await srv.stop(); });
 
 const LOOPBACK = /^(127\.0\.0\.1|::1|::ffff:127\.0\.0\.1)$/;

@@ -1,8 +1,8 @@
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
-import { checkIdpConfig, loadConfig } from "./config.ts";
+import { checkIdpConfig, describeStore, loadConfig } from "./config.ts";
 
 const KEYS = [
-  "GRAYBOARD_DEV_AUTH", "GRAYBOARD_DB_PATH", "GRAYBOARD_PUBLIC_URL", "GRAYBOARD_ORG_DOMAIN",
+  "GRAYBOARD_DEV_AUTH", "GRAYBOARD_DB_PATH", "GRAYBOARD_DATABASE_URL", "GRAYBOARD_UNRELEASED_POSTGRES", "GRAYBOARD_PUBLIC_URL", "GRAYBOARD_ORG_DOMAIN",
   "GOOGLE_OAUTH_CLIENT_ID", "GOOGLE_OAUTH_CLIENT_SECRET", "GRAYBOARD_ADMINS",
   "GRAYBOARD_MCP_GOOGLE_CLIENT_ID", "GRAYBOARD_MCP_GOOGLE_CLIENT_SECRET",
   "GRAYBOARD_IDPS", "GRAYBOARD_OKTA_ISSUER", "GRAYBOARD_OKTA_CLIENT_ID", "GRAYBOARD_OKTA_CLIENT_SECRET", "GRAYBOARD_OKTA_ALLOWED_DOMAINS",
@@ -119,6 +119,28 @@ describe("loadConfig", () => {
       }
       delete process.env[prefix + "_BURST"]; delete process.env[prefix + "_PER_SEC"];
     }
+  });
+
+  // #807 P3 C11b: one of the path and the URL; the URL only behind the unreleased gate and with a blob directory.
+  test("the store is a SQLite path or, behind the gate, a Postgres URL", () => {
+    process.env.GRAYBOARD_DEV_AUTH = "1";
+    expect(loadConfig().store).toEqual({ kind: "sqlite", path: ":memory:" });
+    const url = "postgres://gb:s3cret@db.example.com:5432/grayboard";
+    process.env.GRAYBOARD_DATABASE_URL = url;
+    expect(() => loadConfig()).toThrow("Set one of GRAYBOARD_DATABASE_URL, GRAYBOARD_DB_PATH, not both");
+    delete process.env.GRAYBOARD_DB_PATH;
+    expect(() => loadConfig()).toThrow("GRAYBOARD_DATABASE_URL needs GRAYBOARD_UNRELEASED_POSTGRES=1");
+    process.env.GRAYBOARD_UNRELEASED_POSTGRES = "1";
+    expect(() => loadConfig()).toThrow("GRAYBOARD_DATABASE_URL needs GRAYBOARD_BLOB_DIR");
+    process.env.GRAYBOARD_BLOB_DIR = "/var/lib/grayboard/blobs";
+    const config = loadConfig();
+    expect(config.store).toEqual({ kind: "postgres", url });
+    expect(config.blobDir).toBe("/var/lib/grayboard/blobs");
+    // The startup line's description carries no credentials.
+    expect(describeStore(config.store)).toBe("postgres db.example.com:5432/grayboard");
+    expect(describeStore({ kind: "postgres", url: "not a url s3cret" })).not.toContain("s3cret");
+    delete process.env.GRAYBOARD_DATABASE_URL;
+    expect(() => loadConfig()).toThrow("Required env var GRAYBOARD_DB_PATH (or GRAYBOARD_DATABASE_URL) is not set");
   });
 
   // #928 D6/D8: one pair. The primary is required only when the MCP pair is absent; with both set (a Desktop

@@ -13,8 +13,8 @@ async function shutdownCase(signal: "SIGINT" | "SIGTERM", failure?: "reject" | "
   writeFileSync(preload, `
 import { mock } from "bun:test";
 const keepAlive = setInterval(() => {}, 1000);
-mock.module(${JSON.stringify(config)}, () => ({ loadConfig: () => ({}) }));
-mock.module(${JSON.stringify(app)}, () => ({ startServer: () => ({
+mock.module(${JSON.stringify(config)}, () => ({ loadConfig: () => ({ store: { kind: "sqlite" as const, path: ":memory:" } }), describeStore: () => "sqlite :memory:" }));
+mock.module(${JSON.stringify(app)}, () => ({ openRepo: async () => ({}), startServer: () => ({
   server: { port: 0 },
   stop: ${failure === "throw" ? "" : "async"} () => {
     console.log("stop started");

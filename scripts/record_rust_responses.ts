@@ -67,7 +67,7 @@ function jsonText(text: string, walk: (v: unknown) => unknown): string {
 }
 
 export async function recordResponses(): Promise<Recorded> {
-  const srv = new TestServer({ hostedRequestLimit: { burst: 10_000, perSec: 10_000 } });
+  const srv = await TestServer.open({ hostedRequestLimit: { burst: 10_000, perSec: 10_000 } });
   const out: Recorded = {};
   try {
     const a = await srv.hosted(EMAIL, null, { sessionId: "rec-session-a" });

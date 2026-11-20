@@ -75,7 +75,7 @@ export async function named(h: { name: string; version: string }, run: () => Pro
 export function withHosted(h: HostedHarness, dir: string, rules: Rule[], run: (hosted: Hosted) => Promise<void>, server: Partial<Config> = {}): Promise<void> {
   return named(h, async () => {
     const procs: ChildProcess[] = [];
-    const srv = hostedServer(server);
+    const srv = await hostedServer(server);
     const model = startFakeModel([answerPeer(h.prefix), ...rules]);
     let peer: Peer | undefined;
     try {

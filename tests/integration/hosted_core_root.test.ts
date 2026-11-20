@@ -32,7 +32,7 @@ let srv: HostedServer, stateDir: string, user: number;
 const rigs: Rig[] = [];
 
 beforeEach(async () => {
-  srv = hostedServer();
+  srv = await hostedServer();
   stateDir = realpathSync(mkdtempSync(join(tmpdir(), "gb-hosted-root-")));
   mkdirSync(stateDir, { recursive: true });
   user = (await seedGrant(srv, stateDir, CLIENT, EMAIL)).authed.user_id;

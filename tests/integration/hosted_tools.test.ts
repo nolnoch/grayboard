@@ -30,17 +30,17 @@ const B = "bob@example.com";
 const C = "carol@example.com";
 
 // Inbox polling spends hosted requests.
-const start = (overrides: Partial<Config> = {}) => new TestServer({ hostedRequestLimit: { burst: 10_000, perSec: 10_000 }, ...overrides });
+const start = (overrides: Partial<Config> = {}) => TestServer.open({ hostedRequestLimit: { burst: 10_000, perSec: 10_000 }, ...overrides });
 let srv: TestServer;
 
 // A test that needs other config replaces the server.
 const restart = async (overrides: Partial<Config> = {}) => {
   await srv.stop();
-  srv = start(overrides);
+  srv = await start(overrides);
 };
 
-beforeEach(() => {
-  srv = start();
+beforeEach(async () => {
+  srv = await start();
 });
 
 afterEach(() => srv.stop());

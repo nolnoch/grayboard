@@ -12,7 +12,7 @@ import { runCli } from "../support/cli.ts";
 import { cleanEnv } from "../support/env.ts";
 import { closeSessions } from "../support/mcp.ts";
 import { issueOAuth } from "../helpers/oauth.ts";
-import { TestServer } from "../support/server.ts";
+import { TestServer, type TestServerOverrides } from "../support/server.ts";
 import { REFUSED_TOKEN_TTL_MS } from "../../src/server/auth_gate.ts";
 import { stubAuthRead } from "../support/auth_stub.ts";
 
@@ -25,9 +25,9 @@ afterEach(async () => {
 });
 
 // A server whose limiters run on a clock the test moves.
-function serve(o: ConstructorParameters<typeof TestServer>[0] = {}) {
+async function serve(o: TestServerOverrides = {}) {
   const clock = { t: 1_000_000 };
-  const srv = new TestServer({ authFailLimit: { burst: 3, perSec: 0.1 }, ...o }, { now: () => clock.t });
+  const srv = await TestServer.open({ authFailLimit: { burst: 3, perSec: 0.1 }, ...o }, { now: () => clock.t });
   cleanup.push(() => srv.stop());
   // Every token lookup, to show a refused request makes none.
   let lookups = 0;
@@ -60,7 +60,7 @@ const X = "198.51.100.1";
 const Y = "198.51.100.2";
 
 test("burst refused tokens on a route are refused 401; the next gets 429 with a wait, before any token lookup", async () => {
-  const { srv, lookups } = serve();
+  const { srv, lookups } = await serve();
   for (let i = 0; i < 3; i++) expect((await get(srv, "/api/whoami", `bad${i}`, X)).status).toBe(401);
   expect(lookups()).toBe(3);
   const r = await get(srv, "/api/whoami", "bad", X);
@@ -74,7 +74,7 @@ test("burst refused tokens on a route are refused 401; the next gets 429 with a 
 });
 
 test("a limited address is refused everything, a valid token, /healthz and the hosted MCP too; another address isn't", async () => {
-  const { srv } = serve();
+  const { srv } = await serve();
   const alice = await srv.login(A);
   const hosted = await hostedToken(srv);
   for (let i = 0; i < 3; i++) await get(srv, "/api/whoami", `bad${i}`, X);
@@ -86,7 +86,7 @@ test("a limited address is refused everything, a valid token, /healthz and the h
 });
 
 test("valid traffic, hosted MCP included, 403s, 404s and requests with no token never spend; a refused token on any path does", async () => {
-  const { srv } = serve({ authFailLimit: { burst: 1, perSec: 0.1 } });
+  const { srv } = await serve({ authFailLimit: { burst: 1, perSec: 0.1 } });
   const alice = await srv.login(A);
   const hosted = await hostedToken(srv);
   for (let i = 0; i < 5; i++) {
@@ -105,7 +105,7 @@ test("valid traffic, hosted MCP included, 403s, 404s and requests with no token 
 });
 
 test("sign-in calls are charged on entry, and refused uncharged unless JSON; dev-login with dev auth off is a 404 and isn't", async () => {
-  const { srv } = serve();
+  const { srv } = await serve();
   const devLogin = (from: string) => fetch(`${srv.base}/api/auth/dev-login`, { method: "POST", headers: { "X-Forwarded-For": from, "Content-Type": "application/json; charset=utf-8" }, body: JSON.stringify({ email: A }) });
   // A cross-origin form post: text/plain needs no preflight.
   for (let i = 0; i < 5; i++) {
@@ -125,20 +125,20 @@ test("sign-in calls are charged on entry, and refused uncharged unless JSON; dev
   expect((await devLogin("127.0.0.5")).status).toBe(200);
   expect(audit(srv, "auth.login").map((r) => r.detail.ip)).toEqual(["127.0.0.5"]);
 
-  const off = serve({ devAuth: false, googleClientSecret: "s", publicUrl: "https://grayboard.example.com" });
+  const off = await serve({ devAuth: false, googleClientSecret: "s", publicUrl: "https://grayboard.example.com" });
   const r = (from: string) => fetch(`${off.srv.base}/api/auth/dev-login`, { method: "POST", headers: { "X-Forwarded-For": from }, body: "{}" });
   for (let i = 0; i < 5; i++) expect((await r(X)).status).toBe(404);
   expect(off.srv.app.authGate.size).toBe(0);
 });
 
 test("behind the trusted loopback each X-Forwarded-For has its own bucket, trusted hops skipped; with none trusted it's ignored", async () => {
-  const { srv } = serve({ authFailLimit: { burst: 1, perSec: 0.1 } });
+  const { srv } = await serve({ authFailLimit: { burst: 1, perSec: 0.1 } });
   expect((await get(srv, "/api/whoami", "bad0", `6.6.6.6, ${X}, 127.0.0.1`)).status).toBe(401);
   expect((await get(srv, "/api/whoami", "bad1", X)).status).toBe(429);
   expect((await get(srv, "/api/whoami", "bad2", Y)).status).toBe(401);
   expect(audit(srv, "auth.rate_limited").map((r) => r.target)).toEqual([X]);
 
-  const none = serve({ authFailLimit: { burst: 1, perSec: 0.1 }, trustedProxies: [] });
+  const none = await serve({ authFailLimit: { burst: 1, perSec: 0.1 }, trustedProxies: [] });
   expect((await get(none.srv, "/api/whoami", "bad0", X)).status).toBe(401);
   expect((await get(none.srv, "/api/whoami", "bad1", Y)).status).toBe(429);
   // Both keyed by the peer, whichever loopback address it was.
@@ -152,7 +152,7 @@ test("behind the trusted loopback each X-Forwarded-For has its own bucket, trust
 test("IPv6 /64s rotating under one /48 drain it on the auth gate and the OAuth routes; another /48 is unaffected", async () => {
   const err = spyOn(console, "error").mockImplementation(() => {});
   try {
-    const { srv } = serve({ authFailLimit: { burst: 1, perSec: 0.001 }, oauthLimit: { burst: 1, perSec: 0.001 } });
+    const { srv } = await serve({ authFailLimit: { burst: 1, perSec: 0.001 }, oauthLimit: { burst: 1, perSec: 0.001 } });
     const v6 = (site: number, net: number) => `2001:db8:${site}:${net}::1`;
     // Auth gate: the /48 holds 4, so four /64s each fail once and the fifth is refused before any lookup.
     for (let net = 0; net < 4; net++) expect((await get(srv, "/api/whoami", `bad${net}`, v6(1, net))).status).toBe(401);
@@ -174,7 +174,7 @@ test("IPv6 /64s rotating under one /48 drain it on the auth gate and the OAuth r
 });
 
 test("a run of refusals writes one row and one log line at its start and one at its end", async () => {
-  const { srv, clock } = serve();
+  const { srv, clock } = await serve();
   // The limiter's own lines, out of everything else the server logs (#277).
   const err = spyOn(console, "error");
   cleanup.push(() => err.mockRestore());
@@ -210,7 +210,7 @@ test("a run of refusals writes one row and one log line at its start and one at 
 });
 
 test("a stale token looping from a shared address is answered from memory: one lookup, one charge, and its neighbours are never limited (#923)", async () => {
-  const { srv, clock, lookups } = serve();
+  const { srv, clock, lookups } = await serve();
   const alice = await srv.login(A);
   for (let i = 0; i < 100; i++) {
     const r = await get(srv, "/api/whoami", "stale", X);
@@ -242,7 +242,7 @@ test("a stale token looping from a shared address is answered from memory: one l
 });
 
 test("a stale token sent in parallel stays one entry; the same token in another shape or query is its own entry", async () => {
-  const { srv } = serve();
+  const { srv } = await serve();
   const alice = await srv.login(A);
   const all = await Promise.all(Array.from({ length: 6 }, () => get(srv, "/api/whoami", "stale", X)));
   expect(all.map((r) => r.status)).toEqual([401, 401, 401, 401, 401, 401]);
@@ -256,7 +256,7 @@ test("a stale token sent in parallel stays one entry; the same token in another 
 });
 
 test("a hosted MCP refusal is replayed with its WWW-Authenticate, so an OAuth client still re-authorizes", async () => {
-  const { srv, lookups } = serve({ authFailLimit: { burst: 1, perSec: 0.1 } });
+  const { srv, lookups } = await serve({ authFailLimit: { burst: 1, perSec: 0.1 } });
   const stale = "s".repeat(43);
   const first = await mcpList(srv, stale, X);
   expect(first.status).toBe(401);
@@ -278,7 +278,7 @@ test("a hosted MCP refusal is replayed with its WWW-Authenticate, so an OAuth cl
 });
 
 test("a CLI command on a limited address prints the server's wait", async () => {
-  const srv = new TestServer({ authFailLimit: { burst: 1, perSec: 0.1 } });
+  const srv = await TestServer.open({ authFailLimit: { burst: 1, perSec: 0.1 } });
   cleanup.push(() => srv.stop());
   const creds = join(mkdtempSync(join(srv.dir, "gb-creds-")), "credentials");
   writeFileSync(creds, JSON.stringify({ session_token: "stale", server: srv.base, user_email: A }));

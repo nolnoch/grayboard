@@ -55,17 +55,17 @@ test("every capacity refusal site counts its refusal", () => {
 
 test("a background server holds one lag sampler reference until it stops", async () => {
   const before = lagSamplerUsers();
-  const srv = new TestServer({}, { background: true, retentionFirstDelayMs: 3_600_000 });
+  const srv = await TestServer.open({}, { background: true, retentionFirstDelayMs: 3_600_000 });
   try { expect(lagSamplerUsers()).toBe(before + 1); } finally { await srv.stop(); }
   expect(lagSamplerUsers()).toBe(before);
-  const quiet = new TestServer();
+  const quiet = await TestServer.open();
   try { expect(lagSamplerUsers()).toBe(before); } finally { await quiet.stop(); }
 });
 
 test("a metrics port in use fails startup", async () => {
   const taken = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response("") });
   try {
-    expect(() => new TestServer({ metricsAddr: { hostname: "127.0.0.1", port: taken.port! } })).toThrow();
+    await expect(TestServer.open({ metricsAddr: { hostname: "127.0.0.1", port: taken.port! } })).rejects.toThrow();
   } finally { taken.stop(true); }
 });
 
@@ -104,7 +104,7 @@ test("the lag sampler records a blocked loop in its window, and stops by referen
 });
 
 test("the listener serves /metrics on its own address, refuses anything else, and stops with the app", async () => {
-  const srv = new TestServer({ metricsAddr: { hostname: "127.0.0.1", port: 0 }, mcpLimits: { ...DEFAULT_MCP_LIMITS, post: { global: 0, perUser: 0 } } });
+  const srv = await TestServer.open({ metricsAddr: { hostname: "127.0.0.1", port: 0 }, mcpLimits: { ...DEFAULT_MCP_LIMITS, post: { global: 0, perUser: 0 } } });
   try {
     const base = `http://127.0.0.1:${srv.app.metrics!.port}`;
     const before = sample(await (await fetch(`${base}/metrics`)).text(), 'grayboard_capacity_refusals_total{kind="mcp_post"}')!;
@@ -132,12 +132,12 @@ test("the listener serves /metrics on its own address, refuses anything else, an
 });
 
 test("no GRAYBOARD_METRICS_ADDR, no listener", async () => {
-  const srv = new TestServer();
+  const srv = await TestServer.open();
   try { expect(srv.app.metrics).toBeUndefined(); } finally { await srv.stop(); }
 });
 
 test("a hosted tool call lands in the latency histogram under its own name", async () => {
-  const srv = new TestServer({ metricsAddr: { hostname: "127.0.0.1", port: 0 }, hostedRequestLimit: { burst: 10_000, perSec: 10_000 } });
+  const srv = await TestServer.open({ metricsAddr: { hostname: "127.0.0.1", port: 0 }, hostedRequestLimit: { burst: 10_000, perSec: 10_000 } });
   try {
     const count = async () => sample(await (await fetch(`http://127.0.0.1:${srv.app.metrics!.port}/metrics`)).text(), 'grayboard_tool_call_duration_seconds_count{tool="board_list"}') ?? 0;
     const before = await count();

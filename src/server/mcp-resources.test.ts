@@ -31,7 +31,7 @@ beforeEach(async () => {
   store = openDatabase(scratchDbPath(), { blobDir: dir , sessionEnd: sessionEndPort("team") });
   setAccess(store.db, openAccess(store.db)); // core seeds on a server database opt in to local mode's open Access
   application = createApplication(store.repo);
-  oauth = createOAuthServer(store.repo, { dbPath: scratchDbPath(), blobDir: dir, httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl: "https://grayboard.example.com:443", messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES });
+  oauth = createOAuthServer(store.repo, { store: { kind: "sqlite" as const, path: scratchDbPath() }, blobDir: dir, httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl: "https://grayboard.example.com:443", messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES });
   hosted = createHostedMcp(application, oauth, { trustedOrigin: oauth.issuer });
   grant = await issueOAuth(store.repo, oauth.resource, "alice@example.com", ["grayboard:tools", "grayboard:delivery"], Date.now(), OPENCODE_CLIENT);
   const principal = await oauth.authenticate(new Request("http://localhost/mcp", { headers: { Authorization: `Bearer ${grant.token}` } }));

@@ -31,7 +31,7 @@ const { NEW_RUN } = await import(pathToFileURL(join(installed, "src/binding.ts")
 const issuer = "https://grayboard.example.com/hosted", resource = issuer + "/mcp", ADMIN = "admin@example.com", SERVICE = "ingest";
 const lim = { burst: 10000, perSec: 10000 };
 mkdirSync(join(root, "server"), { recursive: true });
-const config = { dbPath: join(root, "server/grayboard.sqlite"), blobDir: join(root, "server/blobs"), httpPort: 0, googleClientId: "", googleClientSecret: "", orgDomain: "example.com", publicUrl: issuer, messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [ADMIN], oauthClients: [], authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES, helloLimit: DEFAULT_HELLO_LIMIT, hostedRequestLimit: lim, hostedSubscriberLimit: lim };
+const config = { store: { kind: "sqlite" as const, path: join(root, "server/grayboard.sqlite") }, blobDir: join(root, "server/blobs"), httpPort: 0, googleClientId: "", googleClientSecret: "", orgDomain: "example.com", publicUrl: issuer, messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [ADMIN], oauthClients: [], authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES, helloLimit: DEFAULT_HELLO_LIMIT, hostedRequestLimit: lim, hostedSubscriberLimit: lim };
 const app = startServer(config, { hostname: "127.0.0.1", background: false });
 const local = `http://127.0.0.1:${app.server.port}`;
 const fetch0 = globalThis.fetch;

@@ -26,7 +26,7 @@ import { pinMarketplace } from "../../scripts/pin_claude_plugin.ts";
 import { CLAUDE_PLUGIN } from "../../src/shared/claude_channels.ts";
 import { CLAUDE_CODE_VERSION, type ClaudeHome, claudeCli, claudeCodeBin, claudeHome, claudeTty, descendants, transcript } from "../support/claude_code.ts";
 import { onChannelDm, onUserText, startFakeAnthropic, toolResults, userTexts } from "../support/fake_anthropic.ts";
-import { browse, hostedServer, seedGrant, tokenRequests } from "../support/hosted_oauth.ts";
+import { browse, hostedServer, seedGrant, tokenRequests, type HostedServer } from "../support/hosted_oauth.ts";
 import { serviceRun } from "../support/service_token.ts";
 import { NEW_RUN } from "../../adapters/hosted-core/src/static.ts";
 import { direct } from "../support/events.ts";
@@ -70,7 +70,7 @@ function marketplace(mp: string): string {
 }
 
 // The plugin under test installed in `h`, configured for `srv`; returns where it came from.
-function install(h: ClaudeHome, srv: ReturnType<typeof hostedServer>, mp: string): string {
+function install(h: ClaudeHome, srv: HostedServer, mp: string): string {
   const from = marketplace(mp);
   claudeCli(bin, h, ["plugin", "marketplace", "add", mp]);
   claudeCli(bin, h, ["plugin", "install", CLAUDE_PLUGIN, "--config", `server_url=${srv.resource}`]);
@@ -78,7 +78,7 @@ function install(h: ClaudeHome, srv: ReturnType<typeof hostedServer>, mp: string
 }
 
 test(`Claude Code ${CLAUDE_CODE_VERSION}: the plugin binds, a DM arrives as a channel message, the reply reaches the peer`, async () => {
-  const srv = hostedServer();
+  const srv = await hostedServer();
   const model = startFakeAnthropic([
     onUserText("BIND-NOW", SOURCE, TOOL("bind"),{ name: "alpha", create: true }),
     onChannelDm(SOURCE, "beta", (id) => ({ tool: TOOL("dm_send"), input: { to: "beta", body: "pong", parent_id: id } })),
@@ -133,7 +133,7 @@ test(`Claude Code ${CLAUDE_CODE_VERSION}: the plugin binds, a DM arrives as a ch
 }, 240_000);
 
 test(`Claude Code ${CLAUDE_CODE_VERSION}: the root reports its model and effort (#545), after /effort, a confirmed /model switch and /clear, and clears the effort on a model without one (#558)`, async () => {
-  const srv = hostedServer();
+  const srv = await hostedServer();
   const model = startFakeAnthropic([
     onUserText("FACTS-1", SOURCE, TOOL("bind"), { name: "facts", create: true }),
     onUserText("FACTS-2", SOURCE, TOOL("whoami"), {}),
@@ -208,7 +208,7 @@ test(`Claude Code ${CLAUDE_CODE_VERSION}: the root reports its model and effort 
 }, 240_000);
 
 test(`Claude Code ${CLAUDE_CODE_VERSION}: with no grant, the first tool call shows the sign-in link under the call, never in a request (also after --resume), and opening it signs the session in`, async () => {
-  const srv = hostedServer();
+  const srv = await hostedServer();
   const model = startFakeAnthropic([
     onUserText("WHOAMI-FIRST", SOURCE, TOOL("whoami"), {}),
   ]);
@@ -278,7 +278,7 @@ test(`Claude Code ${CLAUDE_CODE_VERSION}: with no grant, the first tool call sho
 }, 300_000);
 
 test(`Claude Code ${CLAUDE_CODE_VERSION}: a service run's token leases its BUS_IDENTITY name with no sign-in prompt or link, and a revoked credential ends the run with the new-run text`, async () => {
-  const srv = hostedServer({ admins: ["root@example.com"] });
+  const srv = await hostedServer({ admins: ["root@example.com"] });
   const model = startFakeAnthropic([
     onUserText("STATIC-WHO", SOURCE, TOOL("whoami"), {}),
     onUserText("STATIC-AFTER", SOURCE, TOOL("whoami"), {}),

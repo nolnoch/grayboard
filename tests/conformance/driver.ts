@@ -79,7 +79,7 @@ const HOSTED_LIMITS = { hostedRequestLimit: { burst: 100_000, perSec: 100_000 } 
 
 export function hostedDriver(): Driver {
   return hostedOn("hosted", async () => {
-    const server = new TestServer(HOSTED_LIMITS);
+    const server = await TestServer.open(HOSTED_LIMITS);
     return { server, close: () => server.stop() };
   });
 }
@@ -158,7 +158,7 @@ export function rustDriver(bin: string): Driver {
       // scenario.ts opens a bus outside its try: a failed start stops what it started and removes the dir itself.
       let credential: { client_id: string; client_secret: string }, server: ServerProcess | undefined, proc: ReturnType<typeof spawnDriver>;
       try {
-        server = await ServerProcess.start(SERVER_BIN, dbPath, {
+        server = await ServerProcess.start(SERVER_BIN, { dbPath: dbPath }, {
           GRAYBOARD_PUBLIC_URL: issuer,
           GRAYBOARD_HTTP_PORT: String(port),
           GRAYBOARD_ADMINS: RUST_ADMIN,

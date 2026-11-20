@@ -1,6 +1,7 @@
 import { MAX_BODY_BYTES } from "../core/boards.ts";
 import { openDatabase, type Repo } from "./db.ts";
 import { sessionEndPort } from "./session_end.ts";
+import { makePgRepo } from "./pg_repo.ts";
 import { createApplication, type ApplicationOptions } from "./application.ts";
 import { handleHttp, isJsonRequest, signInRoute } from "./http.ts";
 import { AuthGate, type Caller } from "./auth_gate.ts";
@@ -26,10 +27,20 @@ export type StartOptions = ApplicationOptions & {
   retentionFirstDelayMs?: number;
   // Trusted test dependency injection; never populated from configuration.
   oauth?: OAuthOptions;
-  // An opened store to serve instead of config.dbPath's SQLite file (#807 P3 C11a: a Postgres Repo from pg_repo.ts
-  // makePgRepo, for tests until C11b selects it by URL). stop() closes it.
+  // The opened store to serve (openRepo, or a test's own makePgRepo); stop() closes it. Without one, startServer opens
+  // config.store's SQLite file itself, which only tests rely on: they read the raw handle it exposes as `db`.
   repo?: Repo;
 };
+
+// The server's store, opened from config (#807 P3 C11b): SQLite at once; Postgres migrates and starts its auth LISTEN
+// first (pg_repo.ts), so a migration failure fails the open and so the startup. `pool` labels and sizes a Postgres
+// Repo's connections (tests run many servers on one cluster).
+export async function openRepo(config: Config, opts: { now?: () => number; pool?: { applicationName?: string; max?: number } } = {}): Promise<Repo> {
+  const humanReach = config.humanReach ?? "team";
+  const limits = { attachmentLimits: config.attachmentLimits, attachmentUserQuota: config.attachmentUserQuota, ...(opts.now ? { now: opts.now } : {}) };
+  if (config.store.kind === "sqlite") return openDatabase(config.store.path, { blobDir: config.blobDir, sessionEnd: sessionEndPort(humanReach), ...limits }).repo;
+  return makePgRepo(config.store.url, { blobDir: config.blobDir, humanReach, ...limits, ...opts.pool });
+}
 
 // A start option overrides the config's limit; an explicit undefined one doesn't wipe it (#385 item 14).
 export function startLimits(config: Pick<Config, "helloLimit" | "hostedRequestLimit" | "hostedSubscriberLimit" | "delegateLimit" | "delegateOpenCap" | "hostedCaps" | "aliasScopeCap" | "serviceLimits">, opts: StartOptions) {
@@ -44,14 +55,19 @@ export function startLimits(config: Pick<Config, "helloLimit" | "hostedRequestLi
   };
 }
 
+function sqlitePath(store: Config["store"]): string {
+  if (store.kind !== "sqlite") throw new Error("startServer: a Postgres store is opened with openRepo, then passed as `repo`");
+  return store.path;
+}
+
 export function startServer(config: Config, opts: StartOptions = {}) {
   const humanReach = config.humanReach ?? "team";
   const { db: testDb, repo } = opts.repo
-    // No SQLite handle behind an injected Repo: `db` (tests only) is undefined there, typed as SQLite's until C11b-d
+    // No SQLite handle behind an injected Repo: `db` (tests only) is undefined there, typed as SQLite's until C11c-d
     // move the tests that read it onto the Repo. The injected Repo's own attachment limits and session-end reach apply,
-    // not config's: its maker sets them (C11b opens it from config).
+    // not config's: openRepo sets them from the same config.
     ? { db: undefined as unknown as ReturnType<typeof openDatabase>["db"], repo: opts.repo }
-    : openDatabase(config.dbPath, { blobDir: config.blobDir, sessionEnd: sessionEndPort(humanReach), attachmentLimits: config.attachmentLimits, attachmentUserQuota: config.attachmentUserQuota, ...(opts.now ? { now: opts.now } : {}) });
+    : openDatabase(sqlitePath(config.store), { blobDir: config.blobDir, sessionEnd: sessionEndPort(humanReach), attachmentLimits: config.attachmentLimits, attachmentUserQuota: config.attachmentUserQuota, ...(opts.now ? { now: opts.now } : {}) });
   let slack: SlackBridge | undefined;
   // Dev sign-in mints tokens for any email; they must not outlive it (#805 F-04). A
   // server started without dev auth revokes them, so a re-enable doesn't revive them.

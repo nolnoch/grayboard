@@ -17,11 +17,11 @@ let srv: TestServer;
 // A test that needs other config replaces the server.
 const restart = async (overrides: Partial<Config> = {}) => {
   await srv.stop();
-  srv = new TestServer(overrides);
+  srv = await TestServer.open(overrides);
 };
 
-beforeEach(() => {
-  srv = new TestServer();
+beforeEach(async () => {
+  srv = await TestServer.open();
 });
 
 afterEach(() => srv.stop());

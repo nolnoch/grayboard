@@ -24,9 +24,9 @@ const clients: Client[] = [];
 const appSessions: AppSession[] = [];
 const publicUrl = "https://grayboard.example.com:443/hosted";
 const trustedOrigin = "https://grayboard.example.com";
-beforeEach(() => {
+beforeEach(async () => {
   clock = undefined;
-  srv = new TestServer({ publicUrl, admins: ["alice@example.com"] }, { hostname: "127.0.0.1", oauth: { now: () => clock ?? Date.now() } });
+  srv = await TestServer.open({ publicUrl, admins: ["alice@example.com"] }, { hostname: "127.0.0.1", oauth: { now: () => clock ?? Date.now() } });
   app = srv.app;
   base = `http://127.0.0.1:${app.server.port}`;
 });

@@ -47,8 +47,8 @@ const HELD = "another Claude Code process holds delivery for this session";
 
 let srv: HostedServer, dir: string, data: string, fake: string, host: string, stopped: boolean;
 
-beforeEach(() => {
-  srv = hostedServer();
+beforeEach(async () => {
+  srv = await hostedServer();
   stopped = false;
   dir = realpathSync(mkdtempSync(join(tmpdir(), "gb-claude-plugin-")));
   // HOME without .claude.json or managed settings: the channel policy passes.
@@ -912,7 +912,7 @@ test("a shutdown while an admit waits for `initialized` records no pause", async
 // A server with an admin replaces the default one, so the service and its credential can be made.
 async function staticServer() {
   await srv.stop();
-  srv = hostedServer({ admins: ["root@example.com"] });
+  srv = await hostedServer({ admins: ["root@example.com"] });
   return serviceRun(srv);
 }
 const svcRow = (raw: string) => srv.app.db.query<{ client_id: string; name: string | null; lease_deadline: number | null }, [string]>(
