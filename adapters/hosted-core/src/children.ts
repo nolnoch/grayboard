@@ -5,8 +5,9 @@
 import type { Wire } from "./wire.js";
 
 // Opens a subscriber wire whose `_meta[sessionKey]` is `sessionID`, runs
-// `call` on it, and closes it.
-export type Temporary = <T>(sessionID: string, call: (wire: Wire) => Promise<T>) => Promise<T>;
+// `call` on it, and closes it. `ending`: the wire only ends its session, so its
+// connect names none and admits nothing (#1099).
+export type Temporary = <T>(sessionID: string, call: (wire: Wire) => Promise<T>, ending?: boolean) => Promise<T>;
 
 // `root` and `child` are raw session ids; `via` lists the intermediate raw ids
 // from the root down, empty for a direct child (sent as no `via`).
@@ -17,5 +18,5 @@ export async function register(temporary: Temporary, path: { root: string; via: 
 // session_end with no argument over the child's own raw id: the tool's
 // `session` argument is a hosted session id, never a raw one.
 export async function end(temporary: Temporary, path: { child: string }) {
-  await temporary(path.child, wire => wire.call("session_end"));
+  await temporary(path.child, wire => wire.call("session_end"), true);
 }
