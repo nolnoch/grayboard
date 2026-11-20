@@ -628,6 +628,34 @@ test("#807 P3 C10a: bind audits setMeta's diff on its own Tx after the store set
   } finally { late.mockRestore(); }
 });
 
+// #807 P3 C10a Q4: a tools-only root's writes_as is judged under the alias's "use" lock on the create path, after the
+// lazy create and before the userOf check (on Postgres that lock serializes it against a bind's take, aliases.pg.test.ts
+// T-C5-6); the create=false re-check takes none. A lock that finds the alias gone (a delete committed first) refuses.
+test("#807 P3 C10a: hostedWritesAs locks the alias before its check on the create path only", async () => {
+  const steps: string[] = [];
+  const lock = store.repo.aliases.lock.bind(store.repo.aliases), userOf = store.repo.bindings.userOf.bind(store.repo.bindings);
+  const create = store.repo.aliases.create.bind(store.repo.aliases);
+  const locks = spyOn(store.repo.aliases, "lock").mockImplementation(async (...a: Parameters<typeof lock>) => { steps.push(`lock ${a[1]} ${a[2]}`); return lock(...a); });
+  const spies = [
+    locks,
+    spyOn(store.repo.bindings, "userOf").mockImplementation(async (...a: Parameters<typeof userOf>) => { steps.push(`userOf ${a[1]}`); return userOf(...a); }),
+    spyOn(store.repo.aliases, "create").mockImplementation(async (...a: Parameters<typeof create>) => { steps.push("create"); return create(...a); }),
+  ];
+  const fe = "alice@example.com/fe";
+  try {
+    expect(await seed(store.repo, tx => application.hostedWritesAs(tx, alice, "id:w1", "fe", true))).toBe(fe);
+    expect(steps).toEqual(["create", `lock ${fe} use`, `userOf ${fe}`]);
+    steps.length = 0;
+    expect(await seed(store.repo, tx => application.hostedWritesAs(tx, alice, "id:w1", "fe", false))).toBe(fe);
+    expect(steps).toEqual([`userOf ${fe}`]);
+    // Another user's session writing as the alias: refused on the create path, under the lock.
+    await seed(store.repo, tx => store.repo.bindings.registerId(tx, { id: "id:w2", principal: "bob@example.com", launcher: false, writesAs: fe }));
+    await expect(seed(store.repo, tx => application.hostedWritesAs(tx, alice, "id:w1", "fe", true))).rejects.toThrow("another user's session id:w2");
+    locks.mockImplementation(async () => undefined);
+    await expect(seed(store.repo, tx => application.hostedWritesAs(tx, alice, "id:w1", "be", true))).rejects.toThrow(`"alice@example.com/be" was deleted while this session declared it`);
+  } finally { for (const s of spies) s.mockRestore(); }
+});
+
 // #807 P3 B1c: close's rows. On a body's Tx they're written at its commit and roll back with it, as when written
 // inline; outside a body they're queued writes, so a close from the write queue's holder (a commit callback) lands
 // after it rather than throwing as an async post there would.

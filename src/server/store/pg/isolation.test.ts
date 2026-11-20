@@ -59,7 +59,7 @@ function pgModules(): string[] {
 test("no non-test module under src/server/store/pg/ reaches bun:sqlite or the SQLite store, even transitively", () => {
   const roots = pgModules();
   // The scan sees this directory's modules (a scan that read nothing would pass vacuously).
-  expect(roots.map(p => relative(import.meta.dir, p))).toEqual(expect.arrayContaining(["aliases.ts", "attachment_rows.ts", "audit.ts", "audit_row.ts", "claims.ts", "cursors.ts", "errors.ts", "hosted.ts", "hosted_port.ts", "identity.ts", "messages.ts", "migrate.ts", "oauth.ts", "slack.ts", "sql.ts", "tx.ts", "write_receipts.ts"]));
+  expect(roots.map(p => relative(import.meta.dir, p))).toEqual(expect.arrayContaining(["aliases.ts", "attachment_rows.ts", "audit.ts", "audit_row.ts", "bindings.ts", "claims.ts", "cursors.ts", "errors.ts", "hosted.ts", "hosted_port.ts", "identity.ts", "messages.ts", "migrate.ts", "oauth.ts", "slack.ts", "sql.ts", "tx.ts", "write_receipts.ts"]));
   expect(forbiddenReach(roots)).toEqual([]);
 });
 
@@ -108,6 +108,10 @@ test("the walk follows relative imports and skips type-only ones", () => {
   expect(forbiddenReach([join(SRC, "server/store/claims.ts")])).toEqual([]);
   expect(forbiddenReach([join(SRC, "core/claim_holder.ts")])).toEqual([]);
   expect(forbiddenReach([join(import.meta.dir, "claims.ts")])).toEqual([]);
+  // The Postgres bindings store (#807 P3 C10a-b), which restates core/bindings.ts's and core/boards.ts's SQL, and the
+  // text cleaners it shares with them, moved to core/text.ts so it can.
+  expect(forbiddenReach([join(SRC, "core/text.ts")])).toEqual([]);
+  expect(forbiddenReach([join(import.meta.dir, "bindings.ts")])).toEqual([]);
   expect(runtimeImports(`import type { X } from "../tx.ts";\nexport type { Y } from "../db.ts";`)).toEqual([]);
   expect(runtimeImports(`import {\n  a,\n  b,\n} from "../tx.ts";\nexport { c } from "./d.ts";\nimport "./e.ts";\nconst f = await import("../db.ts");`))
     .toEqual(["../tx.ts", "./d.ts", "./e.ts", "../db.ts"]);

@@ -207,10 +207,11 @@ function takes(it: It): void {
   it("userOf picks the holder, then the earliest started, then the first registered", async h => {
     const x = await h.alias(B, "x");
     const [cZ, cA, bH] = ["id:000000000000Z", "id:000000000000A", "id:000000000000M"];
-    // Registered Z then A, with one started_at: the first registered wins, whichever ID sorts first.
+    // Registered Z then A, with one started_at: the first registered wins, whichever ID sorts first. A's stamp is
+    // written first, so a store whose rows move on update (Postgres) doesn't keep Z first by physical order alone.
     await register(h, { id: cZ, principal: C, launcher: false, writesAs: x });
     await register(h, { id: cA, principal: C, launcher: false, writesAs: x });
-    for (const id of [cZ, cA]) await h.started(id, 1000);
+    for (const id of [cA, cZ]) await h.started(id, 1000);
     expect(await h.bindings.userOf(h.read, x)).toBe(cZ);
     expect(await h.bindings.userOf(h.read, x, B)).toBe(cZ);
     expect(await h.bindings.userOf(h.read, x, C)).toBeNull();

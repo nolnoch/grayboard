@@ -10,6 +10,7 @@ import { DEFAULT_HELLO_LIMIT, DEFAULT_HOSTED_REQUEST_LIMIT, DEFAULT_HOSTED_SUBSC
 import { dedupWrite, type DedupOutcome, type DedupTool, type Written } from "./write_dedup.ts";
 import { testPause, testPauseAsync } from "../shared/testpause.ts";
 import { ALIAS_SCOPE_CAP, aliasCapRefusal } from "./alias_cap.ts";
+import { lockedUserOf } from "./alias_use.ts";
 import { DELEGATE_LIMIT, DELEGATE_OPEN_CAP, crossUserRefusal, delegateOkFields, delegateThrottled, neverConnected, resolveDelegationWith, type DelegateReach } from "../core/delegation.ts";
 import {
   MAX_CANDIDATES, MAX_HOLDS, actingAs, aliasHeldText, childStateRefusal, closestNames,
@@ -1247,12 +1248,6 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
         }
         return fail(target.code, target.error);
       }
-      const other = await repo.bindings.userOf(tx, target.address, authed.user_email);
-      if (other) {
-        const why = `another user's session ${other}`;
-        await note(target.address, why);
-        return fail("alias_held", aliasHeldText(target.address, why, "write as another name"));
-      }
       if (create) {
         const capped = (await repo.aliases.find(tx, target.address)) ? null : await aliasCapRefusal(repo.aliases, tx, target.scope, hub.aliasScopeCap);
         if (capped) {
@@ -1260,6 +1255,16 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
           return fail("bad_request", capped);
         }
         await createLazily(hub, tx, authed, target, id);
+      }
+      // A registration judges the alias under its "use" lock, as a bind's take does (#807 P3 C10a Q4), so the two
+      // serialize on Postgres; the create=false call re-checks a row this ID already registered.
+      const other = create ? await lockedUserOf(repo, tx, target.address, authed.user_email) : await repo.bindings.userOf(tx, target.address, authed.user_email);
+      // A delete committed between the create and the lock (Postgres only: SQLite's single writer runs the body whole).
+      if (other === undefined) return fail("not_found", `"${target.address}" was deleted while this session declared it; retry`);
+      if (other) {
+        const why = `another user's session ${other}`;
+        await note(target.address, why);
+        return fail("alias_held", aliasHeldText(target.address, why, "write as another name"));
       }
       return target.address;
     },
