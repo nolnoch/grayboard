@@ -305,13 +305,14 @@ function subject(req: AuthzRequest): { target: string | null; detail: Record<str
 // and admins reach them. One limiter per Repo (per server). The streak's end fires
 // inside recordDecision's sweep or take, so its row goes on the handle that call was
 // given (`suppressedOn`): the caller's body `Tx`, or a post outside any body.
+// Buckets age on the store's clock (#1082), the one a test injects, like every row's stamp (#1390).
 export const DENY_ROW_LIMIT: RateLimit = { burst: 30, perSec: 0.5 };
 const denyLimiters = new WeakMap<Repo, RateLimiter>();
 let suppressedOn: Read | undefined;
 function denyLimiter(repo: Repo): RateLimiter {
   let l = denyLimiters.get(repo);
   if (!l) {
-    l = new RateLimiter(DENY_ROW_LIMIT, { start() {}, end: (user, refused) => writeAudit(repo, suppressedOn ?? repo.read, "authz.suppressed", user, null, { refused }) }, Date.now, 4096);
+    l = new RateLimiter(DENY_ROW_LIMIT, { start() {}, end: (user, refused) => writeAudit(repo, suppressedOn ?? repo.read, "authz.suppressed", user, null, { refused }) }, () => repo.now(), 4096);
     denyLimiters.set(repo, l);
   }
   return l;

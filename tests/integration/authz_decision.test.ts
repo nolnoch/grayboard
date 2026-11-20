@@ -1,7 +1,7 @@
 // The server's decisions land as `authz.decision` rows (#806, security audit
 // F-19): every deny, and the allows of team management and admin routes. A
 // hosted tool call's deny row survives the call's rollback.
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { TestServer } from "../support/server.ts";
 import { accessAudits } from "../support/audit.ts";
 import { until } from "../support/until.ts";
@@ -108,6 +108,28 @@ describe("deny rows", () => {
     const got = await rows();
     expect(got.filter((r) => r.actor === A).length).toBe(DENY_ROW_LIMIT.burst);
     expect(got.filter((r) => r.actor === ROOT).length).toBe(DENY_ROW_LIMIT.burst + 10);
+  });
+
+  // #1082: a streak that ends inside a write body (team leave's memberTeam deny runs in repo.write) writes its
+  // authz.suppressed row on that body's Tx, so it commits with the body and is never posted. The buckets age on the
+  // store's clock: here it runs ten days behind wall time and only it moves, so a limiter on Date.now never refills.
+  test("a deny streak ending inside a write body writes authz.suppressed on that body, on the store's clock", async () => {
+    await srv.stop();
+    let clock = Date.now() - 10 * 24 * 3_600_000;
+    srv = await TestServer.open({ admins: [ROOT], hostedRequestLimit: { burst: 10_000, perSec: 10_000 } }, { now: () => clock });
+    const a = await srv.login(A);
+    const leave = async () => expect((await srv.api(a, "POST", "/api/teams/nosuch/leave")).status).toBe(404);
+    for (let i = 0; i < DENY_ROW_LIMIT.burst + 5; i++) await leave();
+    expect(await accessAudits(srv, "authz.suppressed")).toEqual([]);
+    clock += Math.ceil(DENY_ROW_LIMIT.burst / DENY_ROW_LIMIT.perSec) * 1000;
+    const post = spyOn(srv.app.repo, "post");
+    try {
+      await leave();
+      expect(post.mock.calls.filter((c) => c[2] === "audit authz.suppressed")).toEqual([]);
+    } finally { post.mockRestore(); }
+    expect((await accessAudits(srv, "authz.suppressed")).map((r) => [r.actor, r.at, r.detail])).toEqual([[A, clock, { refused: 5 }]]);
+    // The refilled bucket records the deny that ended the streak.
+    expect((await accessAudits(srv, "authz.decision")).filter((r) => r.actor === A).length).toBe(DENY_ROW_LIMIT.burst + 1);
   });
 
   test("a caller-chosen route or team name is clipped in the row", async () => {
