@@ -1,5 +1,5 @@
 import { MAX_BODY_BYTES } from "../core/boards.ts";
-import { openDatabase } from "./db.ts";
+import { openDatabase, type Repo } from "./db.ts";
 import { sessionEndPort } from "./session_end.ts";
 import { createApplication, type ApplicationOptions } from "./application.ts";
 import { handleHttp, isJsonRequest, signInRoute } from "./http.ts";
@@ -26,6 +26,9 @@ export type StartOptions = ApplicationOptions & {
   retentionFirstDelayMs?: number;
   // Trusted test dependency injection; never populated from configuration.
   oauth?: OAuthOptions;
+  // An opened store to serve instead of config.dbPath's SQLite file (#807 P3 C11a: a Postgres Repo from pg_repo.ts
+  // makePgRepo, for tests until C11b selects it by URL). stop() closes it.
+  repo?: Repo;
 };
 
 // A start option overrides the config's limit; an explicit undefined one doesn't wipe it (#385 item 14).
@@ -43,7 +46,11 @@ export function startLimits(config: Pick<Config, "helloLimit" | "hostedRequestLi
 
 export function startServer(config: Config, opts: StartOptions = {}) {
   const humanReach = config.humanReach ?? "team";
-  const { db: testDb, repo } = openDatabase(config.dbPath, { blobDir: config.blobDir, sessionEnd: sessionEndPort(humanReach), attachmentLimits: config.attachmentLimits, attachmentUserQuota: config.attachmentUserQuota, ...(opts.now ? { now: opts.now } : {}) });
+  const { db: testDb, repo } = opts.repo
+    // No SQLite handle behind an injected Repo: `db` (tests only) is undefined there, typed as SQLite's until C11b-d
+    // move the tests that read it onto the Repo.
+    ? { db: undefined as unknown as ReturnType<typeof openDatabase>["db"], repo: opts.repo }
+    : openDatabase(config.dbPath, { blobDir: config.blobDir, sessionEnd: sessionEndPort(humanReach), attachmentLimits: config.attachmentLimits, attachmentUserQuota: config.attachmentUserQuota, ...(opts.now ? { now: opts.now } : {}) });
   let slack: SlackBridge | undefined;
   // Dev sign-in mints tokens for any email; they must not outlive it (#805 F-04). A
   // server started without dev auth revokes them, so a re-enable doesn't revive them.
@@ -214,7 +221,12 @@ export function startServer(config: Config, opts: StartOptions = {}) {
       stopPromise = ready.catch(() => {}).then(() => Promise.allSettled([mcp.close(), attachments.close()])).then(outcomes => {
         const failure = outcomes.find(outcome => outcome.status === "rejected");
         if (failure?.status === "rejected") throw failure.reason;
-      }).finally(() => { oauth.close(); repo.close(); });
+      }).finally(async () => {
+        oauth.close();
+        // Awaited (#807 P3 C11a): a Postgres Repo's pool and LISTEN connection close over the network, and a caller
+        // that exits once stop() settles would otherwise cut them off and leave its database in use.
+        await repo.close();
+      });
       return stopPromise;
     },
   };

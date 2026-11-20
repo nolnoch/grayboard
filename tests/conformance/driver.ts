@@ -7,6 +7,8 @@ import { join } from "node:path";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { freePort } from "../support/hosted_oauth.ts";
 import { closeSessions, localSession } from "../support/mcp.ts";
+import { PG_URL } from "../support/pg.ts";
+import { pgServers } from "../support/pg_server.ts";
 import { ServerProcess, TestServer } from "../support/server.ts";
 
 export type Mode = "local" | "hosted";
@@ -73,12 +75,30 @@ export function localDriver(): Driver {
 // Hosted: each bus is its own in-process server (claims and boards are server-wide, so a fresh user alone would
 // share them), and each peer a hosted MCP session of one user bound to its name. Handles come back qualified by
 // the user's email (`you@example.com/be`); the driver strips that prefix.
+const HOSTED_LIMITS = { hostedRequestLimit: { burst: 100_000, perSec: 100_000 } };
+
 export function hostedDriver(): Driver {
+  return hostedOn("hosted", async () => {
+    const server = new TestServer(HOSTED_LIMITS);
+    return { server, close: () => server.stop() };
+  });
+}
+
+// The hosted driver with the server on Postgres (#807 P3 C11a): pg_repo.ts makePgRepo behind startServer, on a fresh
+// test database per bus, dropped on close. Joins DRIVERS when GRAYBOARD_TEST_PG_URL names a cluster.
+export function pgHostedDriver(): Driver {
+  return hostedOn("hosted/pg", async () => {
+    const pg = await pgServers(1, { overrides: HOSTED_LIMITS });
+    return { server: pg.servers[0]!, close: () => pg[Symbol.asyncDispose]() };
+  });
+}
+
+function hostedOn(label: string, open: () => Promise<{ server: TestServer; close(): Promise<void> }>): Driver {
   return {
     mode: "hosted",
-    label: "hosted",
+    label,
     async bus() {
-      const server = new TestServer({ hostedRequestLimit: { burst: 100_000, perSec: 100_000 } });
+      const { server, close } = await open();
       const email = "you@example.com";
       const prefix = `${email}/`;
       const strip = (s: string) => s.split(prefix).join("");
@@ -99,7 +119,7 @@ export function hostedDriver(): Driver {
             },
           };
         },
-        close: () => server.stop(),
+        close,
       };
     },
     async stop() {},
@@ -230,4 +250,5 @@ export function rustDriver(bin: string): Driver {
 
 const rustBin = process.env.GRAYBOARD_RUST_DRIVER;
 if (!rustBin) console.log("conformance: hosted/rust skipped (set GRAYBOARD_RUST_DRIVER to the built conformance-driver, or run scripts/e2e.sh rust-sdk)");
-export const DRIVERS: (() => Driver)[] = [localDriver, hostedDriver, ...(rustBin ? [() => rustDriver(rustBin)] : [])];
+if (!PG_URL) console.log("conformance: hosted/pg skipped (set GRAYBOARD_TEST_PG_URL)");
+export const DRIVERS: (() => Driver)[] = [localDriver, hostedDriver, ...(PG_URL ? [pgHostedDriver] : []), ...(rustBin ? [() => rustDriver(rustBin)] : [])];

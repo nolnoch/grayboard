@@ -1,5 +1,5 @@
 // The Postgres auth generation for tests (#807 P3 C9b): a "pod" (a transaction store, its generation over a listener
-// the test controls, and store/auth_cache.ts over both) on a test database, as C11 will compose them.
+// the test controls, and store/auth_cache.ts over both) on a test database, composed as pg_repo.ts makePgRepo composes them.
 //
 // The listener is the real one (store/pg/auth_generation.ts openPgListener) behind a wrapper that can:
 // - swallow markers: a payload starting "test:" (its own markers, a probe listener's) never reaches the generation (it
@@ -22,12 +22,12 @@
 // A pod's heartbeat and retry run on manual timers by default (`manualTimers`), so no heartbeat fires unless a test
 // ticks it. A pod's `holdSends` holds the heartbeat's sends until `failHeldSends()` rejects them.
 import type { SQL } from "bun";
-import { makeAuthCache, type AuthCache } from "../../src/server/store/auth_cache.ts";
-import { AUTH_CHANNEL, HEARTBEAT_PREFIX, makePgAuthGeneration, openPgListener, realTimers, type AuthTimers, type OpenListener, type PgAuthGeneration } from "../../src/server/store/pg/auth_generation.ts";
+import type { AuthCache } from "../../src/server/store/auth_cache.ts";
+import { AUTH_CHANNEL, HEARTBEAT_PREFIX, makePgAuthCache, makePgAuthGeneration, openPgListener, realTimers, type AuthTimers, type OpenListener, type PgAuthGeneration } from "../../src/server/store/pg/auth_generation.ts";
 import { makePgCursors } from "../../src/server/store/pg/cursors.ts";
 import { makePgIdentity, type PgIdentity } from "../../src/server/store/pg/identity.ts";
 import { makePgOAuth } from "../../src/server/store/pg/oauth.ts";
-import { makePgTransactions, pgOf, type PgTransactions } from "../../src/server/store/pg/tx.ts";
+import { makePgTransactions, type PgTransactions } from "../../src/server/store/pg/tx.ts";
 import type { OAuthStore } from "../../src/server/oauth-types.ts";
 import type { PgDatabase } from "./pg.ts";
 import { hostedRecorder } from "./pg_hosted.ts";
@@ -259,15 +259,17 @@ export async function pgAuthPod(db: PgDatabase, name = "a", { txUrl = db.url, ti
     },
     async close() { await gen.close(); await tx.close(); },
   };
-  pod.auth = makeAuthCache(gen, {
+  // The production composition (pg/auth_generation.ts makePgAuthCache, as pg_repo.ts makePgRepo calls it), over counting
+  // wrappers of the same uncached reads.
+  pod.auth = makePgAuthCache(gen, {
     findActiveAccess: (...a) => { counts.accesses++; return oauth.findActiveAccess(...a); },
-    async userById(r, id) {
+  }, {
+    async findById(r, id) {
       counts.users++;
       const u = await identity.users.findById(r, id);
       await pod.afterUserRead?.();
       return u;
     },
-    check: r => { pgOf(r); },
   });
   await gen.start();
   if (!allowOff && gen.read() === undefined) {

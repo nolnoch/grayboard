@@ -1078,6 +1078,11 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     // The take is the authority (D3): the checks above fix the refusal order; one that lost since (on Postgres a
     // concurrent bind) refuses here, naming whoever has it now.
     if (!(await repo.bindings.take(tx, address, id, authed.user_email, now()))) {
+      // The session's own ID ended meanwhile (on Postgres, E4: the take waited on its ids row): that, not a holder.
+      if ((await repo.bindings.lockLive(tx, id)) === false) {
+        const why = `session ${id} has ended; it can't bind a name`;
+        return await refuse("id_ended", why, why);
+      }
       const now_ = await repo.bindings.holderOf(tx, address);
       // On Postgres an unbind or end may commit between the take and these reads, leaving neither: "another session".
       const user = now_ === null ? await repo.bindings.userOf(tx, address, authed.user_email) : null;

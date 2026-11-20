@@ -25,8 +25,10 @@
 import { SQL } from "bun";
 import { randomUUID } from "node:crypto";
 import { errorDiagnostic } from "../../diagnostics.ts";
-import type { AuthGenerationSource } from "../auth_cache.ts";
-import type { PgTransactions } from "./tx.ts";
+import { makeAuthCache, type AuthCache, type AuthGenerationSource } from "../auth_cache.ts";
+import type { OAuthStore } from "../../oauth-types.ts";
+import type { UsersStore } from "../identity.ts";
+import { pgOf, type PgTransactions } from "./tx.ts";
 
 export const AUTH_CHANNEL = "gb_auth";
 export const HEARTBEAT_PREFIX = "hb:";
@@ -177,4 +179,15 @@ export function makePgAuthGeneration({ url, transactions, heartbeatMs = 5000, st
       await i?.close({ timeout: 0 });
     },
   };
+}
+
+// The Postgres auth cache (#807 P3 C11a): store/auth_cache.ts over this generation and the stores' uncached reads, as
+// pg_repo.ts makePgRepo composes it (and tests/support/pg_auth.ts's pods, over counting wrappers of the same reads).
+// `pgOf` resolves the handle, so a kept Tx is refused on a cache hit too.
+export function makePgAuthCache(gen: AuthGenerationSource, oauth: Pick<OAuthStore, "findActiveAccess">, users: Pick<UsersStore, "findById">): AuthCache {
+  return makeAuthCache(gen, {
+    findActiveAccess: (...a) => oauth.findActiveAccess(...a),
+    userById: (r, id) => users.findById(r, id),
+    check: r => { pgOf(r); },
+  });
 }

@@ -670,7 +670,7 @@ test("#807 P1c-11: the hosted store refuses a foreign handle", async () => {
   await expect(h.lock(foreign, "root-1")).rejects.toThrow(refused);
   await expect(h.lockCapacity(foreign)).rejects.toThrow(refused);
   await expect(h.grantLive(foreign, "g", 1)).rejects.toThrow(refused);
-  repo.close();
+  await repo.close();
 });
 
 // #807 P1c-13: the aliases store runs on the handle it's given, as P1c-6's sessions do.
