@@ -95,7 +95,9 @@ test("the claim expiry timer sweeps at the Repo clock", async () => {
     await be.call("claim_take", { key: "ticket:ENG-5", board: "work", ttl_minutes: 0.001 });
     await until(() => delays.length > 0, 10_000, "the expiry timer's arm");
   } finally { spied.mockRestore(); }
-  expect(delays).toEqual([60]);
+  // A stalled runner may let the timer fire and re-arm (the clock hasn't moved) before the restore: every arm is 60 ms.
+  expect(delays.length).toBeGreaterThan(0);
+  expect(delays.every((d) => d === 60)).toBe(true);
   const t2 = tick(300_000);
   await until(async () => (await events("ticket:ENG-5")).length === 2, 10_000, "the timer's expire event");
   expect(await events("ticket:ENG-5")).toEqual([
