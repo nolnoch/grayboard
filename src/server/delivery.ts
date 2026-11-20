@@ -174,8 +174,11 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
       }, result => {
         // The body awaits after its reads (seeLost, the row's update, the audit): a close that ran meanwhile finished
         // every lease, and one tracked now would outlive it with nothing to finish it (#1122). Its row stays, as close
-        // leaves every lease's row.
-        if (stopped) stale(p, context, "capability" in result ? result.capability : "");
+        // leaves every lease's row, and a new lease's opened audit gets close's detach. A reused lease was close's own.
+        if (stopped) {
+          if (!("capability" in result)) hosted.auditAs(pool, result.row.session_id, "hosted.lease_detached", { reason: "shutdown" }, p);
+          stale(p, context, "capability" in result ? result.capability : "");
+        }
         if ("capability" in result) return opened(result, false, hooks);
         if (previous) finish(previous);
         const { row, expiresAt, holds, facts } = result;

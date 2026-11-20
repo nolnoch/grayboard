@@ -444,6 +444,9 @@ test("an open whose update awaits across a close is refused and tracks no lease 
     release();
     await expect(opening).rejects.toHaveProperty("code", "not_found");
     expect(delivery.activeLeaseCount).toBe(0);
+    // Its opened audit is matched by a detach, as close gives each lease it finished.
+    const actions = store.db.query<{ action: string }, []>("SELECT action FROM access_log WHERE action IN ('hosted.lease_opened', 'hosted.lease_detached') ORDER BY id").all();
+    expect(actions.map(a => a.action)).toEqual(["hosted.lease_opened", "hosted.lease_detached"]);
   } finally { release(); spy.mockRestore(); }
 });
 
