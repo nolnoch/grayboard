@@ -2,7 +2,7 @@ import type { Database } from "bun:sqlite";
 import { describeLocation } from "../shared/identity.ts";
 import type { Pending, Post } from "../shared/notifications.ts";
 import { bindAttachments, dropAttachments, withAttachments, type FileSend } from "./attachments.ts";
-import { CoreError } from "./errors.ts";
+import { CoreError, IdCollision } from "./errors.ts";
 import { ackQueueClaim, logEvent } from "./claims.ts";
 import { addressParts, aliasScope, type AliasScope, type ScopeKind } from "./addresses.ts";
 import { writeCoreAudit, type AuditSink } from "./audit.ts";
@@ -228,21 +228,8 @@ export type IdFacts = {
   localResume?: boolean;
 };
 
-/** The id_collision refusal's text, both modes: `id` and why it's taken. */
-export function idCollisionText(id: string, why: string): string {
-  return `id_collision: ${id} ${why}; start with a new session key`;
-}
-
-/** The refusal for a session ID that already has a row (#284 decision 2): a reused key, or a collision. */
-export class IdCollision extends CoreError {
-  // Why the ID can't be this session's: its id.collision audit's `why`.
-  readonly why: string;
-  constructor(readonly id: string, readonly endedAt: number | null) {
-    const why = endedAt === null ? "is a live session's" : `ended at ${new Date(endedAt).toISOString()}`;
-    super(idCollisionText(id, why));
-    this.why = why;
-  }
-}
+// The id_collision refusal (#284 decision 2) lives in errors.ts, so a Postgres store can throw it (#807 P3 C10a).
+export { IdCollision, idCollisionText } from "./errors.ts";
 
 /**
  * How long a pruned keyed ID's tombstone lasts (#333): a key re-presented
@@ -1476,23 +1463,37 @@ export function parseAliasMeta(v: unknown): AliasMetaSet {
   return out;
 }
 
+/** What an alias label write changed: each changed key's value before and after (null: unset). */
+export type AliasMetaDiff = { before: AliasMetaSet; after: AliasMetaSet };
+
 /**
- * Set an alias's labels from a parsed `meta`, as `session` binding it.
- * Only the fields whose value changes are written, and audited as one
- * alias.meta_set. Call inside the bind's write transaction. `actor` is who the row names: the
- * signed-in user on a server (#373), the session locally, where no user is.
+ * Write an alias's labels from a parsed `meta`: only the fields whose value
+ * changes are written. Returns what changed, or null when nothing did (no
+ * write). Throws when the alias has no row. The server audits the diff itself
+ * (#807 P3 C10a); local mode through setAliasMeta.
  */
-export function setAliasMeta(db: Database, address: string, meta: AliasMetaSet, session: string, audit: AuditSink, actor: string = session): void {
+export function writeAliasMeta(db: Database, address: string, meta: AliasMetaSet): AliasMetaDiff | null {
   const keys = Object.keys(meta) as (keyof AliasMetaSet)[];
-  if (!keys.length) return;
+  if (!keys.length) return null;
   const cur = db.prepare(`SELECT ${ALIAS_META_KEYS.join(", ")} FROM aliases WHERE address = ?`).get(address) as Record<string, string | null> | null;
   if (!cur) throw new Error(`grayboard: no alias "${address}" to label`);
-  const fields: AliasMetaSet = {};
-  for (const k of keys) if ((meta[k] ?? null) !== cur[k]) fields[k] = meta[k] ?? null;
-  const changed = Object.keys(fields) as (keyof AliasMetaSet)[];
-  if (!changed.length) return;
-  db.prepare(`UPDATE aliases SET ${changed.map((k) => `${k} = ?`).join(", ")} WHERE address = ?`).run(...changed.map((k) => fields[k] ?? null), address);
-  audit("alias.meta_set", actor, address, { address, fields, session });
+  const before: AliasMetaSet = {}, after: AliasMetaSet = {};
+  for (const k of keys) if ((meta[k] ?? null) !== cur[k]) { before[k] = cur[k] ?? null; after[k] = meta[k] ?? null; }
+  const changed = Object.keys(after) as (keyof AliasMetaSet)[];
+  if (!changed.length) return null;
+  db.prepare(`UPDATE aliases SET ${changed.map((k) => `${k} = ?`).join(", ")} WHERE address = ?`).run(...changed.map((k) => after[k] ?? null), address);
+  return { before, after };
+}
+
+/**
+ * Set an alias's labels from a parsed `meta`, as `session` binding it
+ * (writeAliasMeta), auditing what changed as one alias.meta_set. Call inside
+ * the bind's write transaction. `actor` is who the row names: the session
+ * locally, where no user is.
+ */
+export function setAliasMeta(db: Database, address: string, meta: AliasMetaSet, session: string, audit: AuditSink, actor: string = session): void {
+  const diff = writeAliasMeta(db, address, meta);
+  if (diff) audit("alias.meta_set", actor, address, { address, fields: diff.after, session });
 }
 
 // A session's self-reported facts (#284 S12), shown on its rows.

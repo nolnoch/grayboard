@@ -522,6 +522,13 @@ async function createLazily(hub: Hub, tx: Tx, authed: AuthedUser, { address, sco
   await onAliasCreated(repo, tx, authed.user_id, address);
 }
 
+// An alias's labels as `session` binding it (#284 S12): the store writes what changed and returns it, and the
+// alias.meta_set row goes on the same Tx once that write has settled (#807 P3 C10a Q3), naming the signed-in user (#373).
+async function setAliasLabels(repo: Repo, tx: Tx, address: string, meta: AliasMetaSet, session: string, actor: string): Promise<void> {
+  const diff = await repo.bindings.setMeta(tx, address, meta);
+  if (diff) writeAudit(repo, tx, "alias.meta_set", actor, address, { address, fields: diff.after, session });
+}
+
 // Who holds an alias, for an alias_held refusal: its ID and where it runs.
 // `place` describes the holder's machine, so only its own principal sees it
 // (#349): a team alias's asker can be another member. `r`: the bind's body.
@@ -1019,10 +1026,9 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
       if (e instanceof CoreError) return await refuse("bad_request", e.message, e.message);
       throw e;
     }
-    const audit = serverAuditSink(repo, tx);
     if (session.holds.includes(address)) {
       // No binding event, and bound_at stays: the session already holds it.
-      if (meta) await repo.bindings.setMeta(tx, address, meta, id, audit, authed.user_email);
+      if (meta) await setAliasLabels(repo, tx, address, meta, id, authed.user_email);
       return { alias: address, held: [...session.holds] };
     }
     if (session.holds.length >= MAX_HOLDS) {
@@ -1075,7 +1081,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
       return await refuse("alias_held", aliasHeldText(address, who, "bind another name"), who, now_ !== null ? { holder: who } : {});
     }
     await repo.bindings.log(tx, id, address, "bound", null);
-    if (meta) await repo.bindings.setMeta(tx, address, meta, id, audit, authed.user_email);
+    if (meta) await setAliasLabels(repo, tx, address, meta, id, authed.user_email);
     await repo.bindings.touchAlias(tx, address);
     const held = await repo.bindings.holdsOf(tx, id);
     // After the last write's await (R1; the notices below only read): a session closed meanwhile isn't registered

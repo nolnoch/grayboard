@@ -595,6 +595,39 @@ test("#807 P3 B1c: a hold or another user's writer landing after bind's checks r
   expect(a.session.holds).toEqual([]);
 });
 
+// #807 P3 C10a Q3: bindings.setMeta returns its diff and bind writes alias.meta_set itself, on the bind's Tx once the
+// store's write has settled: a setMeta that settles late (as a Postgres one does) still leaves its row, and a bind that
+// fails after it keeps neither the labels nor the row.
+test("#807 P3 C10a: bind audits setMeta's diff on its own Tx after the store settles", async () => {
+  const metaSets = () => store.db.query<{ actor: string; detail: string }, []>("SELECT actor, detail FROM access_log WHERE action = 'alias.meta_set' ORDER BY id").all()
+    .map(r => ({ actor: r.actor, detail: JSON.parse(r.detail) as unknown }));
+  const setMeta = store.repo.bindings.setMeta.bind(store.repo.bindings);
+  const late = spyOn(store.repo.bindings, "setMeta").mockImplementation(async (...args: Parameters<typeof setMeta>) => {
+    const diff = await setMeta(...args);
+    await new Promise<void>(resolve => setImmediate(resolve));
+    return diff;
+  });
+  try {
+    const a = await connect(alice, null);
+    // A new bind's labels, then a held re-bind's change, then one that changes nothing.
+    await a.bind("fe", { create: true, meta: { task: "ENG-142" } });
+    await a.bind("fe", { meta: { task: "ENG-143", owner: "o" } });
+    await a.bind("fe", { meta: { task: "ENG-143" } });
+    const fe = "alice@example.com/fe";
+    expect(metaSets()).toEqual([
+      { actor: "alice@example.com", detail: { address: fe, fields: { task: "ENG-142" }, session: a.id } },
+      { actor: "alice@example.com", detail: { address: fe, fields: { task: "ENG-143", owner: "o" }, session: a.id } },
+    ]);
+    // A bind that fails after its labels are written rolls both back.
+    const touch = spyOn(store.repo.bindings, "touchAlias").mockRejectedValue(new Error("touch failed"));
+    try {
+      await expect(a.bind("be", { create: true, meta: { task: "lost" } })).rejects.toThrow("touch failed");
+    } finally { touch.mockRestore(); }
+    expect(metaSets()).toHaveLength(2);
+    expect(await store.repo.aliases.find(store.repo.read, "alice@example.com/be")).toBeUndefined();
+  } finally { late.mockRestore(); }
+});
+
 // #807 P3 B1c: close's rows. On a body's Tx they're written at its commit and roll back with it, as when written
 // inline; outside a body they're queued writes, so a close from the write queue's holder (a commit callback) lands
 // after it rather than throwing as an async post there would.
