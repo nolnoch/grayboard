@@ -159,7 +159,7 @@ describePg("writes_as against bind through the server (Postgres, C10a Q4)", () =
     const T = "id:tools-only-root";
     const register = async (tx: Tx) => {
       const as = await w.srv.app.application.hostedWritesAs(tx, aw, T, LEAD, true);
-      await w.srv.app.application.hostedRegister(tx, aw, T, "test", as);
+      await w.srv.app.application.hostedRegister(tx, aw, T, "test", as, () => { throw new Error("unexpected id_collision"); });
       return as;
     };
     const r = await raceRequest(w.p, register, () => s.bind(LEAD));

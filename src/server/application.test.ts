@@ -384,7 +384,7 @@ test("unbound hosted reads never use the human address and still list and read b
   store.repo.principals.of = (r, address) => { asked.push(address); return principalOf(r, address); };
   // One with no ids row (a foreign or pre-context ID), and one registered as hosted does at create.
   const unregistered = (await application.hostedSession(store.repo.read, alice, "id:0000000000000", [], null, null, delivery())).session;
-  await seed(store.repo, tx => application.hostedRegister(tx, alice, "id:1111111111111", "opencode"));
+  await seed(store.repo, tx => application.hostedRegister(tx, alice, "id:1111111111111", "opencode", null, () => { throw new Error("unexpected id_collision"); }));
   const registered = (await application.hostedSession(store.repo.read, alice, "id:1111111111111", [], null, null, delivery())).session;
   for (const session of [unregistered, registered]) {
     expect((await application.boardCatalog(store.repo.read, session)).boards.map(b => b.name)).toContain("e2e");
