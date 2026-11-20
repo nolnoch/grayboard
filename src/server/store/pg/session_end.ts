@@ -10,8 +10,14 @@
 // - pruneEnded is three statements on the caller's Tx with no nested transaction: a keyed row's tombstone is an
 //   upsert (ON CONFLICT (id) DO UPDATE, SQLite's INSERT OR REPLACE), keyed and viewer are booleans, and the count is
 //   the DELETE's. Its DELETE of an ended row waits on a send's KEY SHARE, and that send has read the ID ended.
-// - end (the row-level step of the server's composed end, src/server/session_end.ts) is not here yet: it throws until
-//   C10d2-b (FOR UPDATE of the row, the held aliases as jsonb, the children).
+// - end (the row-level step of the server's composed end, src/server/session_end.ts, #807 P3 C10d2-b) locks the ID's
+//   row SELECT … FOR UPDATE first: a send's or take's FOR KEY SHARE (refusal, bindings.lockLive) conflicts with it, as
+//   a plain UPDATE of ended_at (FOR NO KEY UPDATE) would not (probe B5), so the end waits for an in-flight send, take,
+//   claim or child registration and then reads what it wrote, and one that comes after waits and reads the ID ended.
+//   Then, each a statement of its own so each reads after the lock was granted: the holds, the guarded UPDATE (its
+//   `ended_at IS NULL` is what makes a second end, waiting on the first's lock, return null), and the unended children
+//   locked FOR UPDATE by id, so every ids row the end will write is locked before any other row it touches (the lock
+//   order in session_end.ts's header). held_aliases_json is bound as text and cast, so it is a jsonb array.
 //
 // Runtime imports stay off bun:sqlite, db.ts and core's SQLite modules (pg/isolation.test.ts): the SQL is restated.
 import { undeliverableFrom } from "../../../core/undeliverable.ts";
@@ -41,8 +47,16 @@ const heldAliases = (v: unknown): string[] => Array.isArray(v) ? v as string[] :
 
 export function makePgSessionEnd(): SessionEndStore {
   return {
-    async end() {
-      throw new Error("sessionEnd.end is not implemented on Postgres until #807 P3 C10d2-b (the end's row step, c10-scope §4)");
+    async end(tx, id, now) {
+      const sql = pgOf(tx);
+      const [row]: Row[] = await sql`SELECT principal FROM ids WHERE id = ${id} FOR UPDATE`;
+      const held = [...new Set((await sql`SELECT address FROM alias_holds WHERE id = ${id} ORDER BY bound_at, address COLLATE "C"` as Row[])
+        .map(r => r.address as string))];
+      // No row: nothing to mark, and the rest of the end runs as core's does (principal null).
+      if (row && !(await sql`UPDATE ids SET ended_at = ${now}::int8, held_aliases_json = ${JSON.stringify(held)}::text::jsonb
+          WHERE id = ${id} AND ended_at IS NULL RETURNING 1`).length) return null;
+      const children = (await sql`SELECT id FROM ids WHERE root_id = ${id} AND ended_at IS NULL ORDER BY id FOR UPDATE` as Row[]).map(r => r.id as string);
+      return { principal: (row?.principal as string | null | undefined) ?? null, held, children };
     },
     async refusal(tx, id) {
       const sql = pgOf(tx);

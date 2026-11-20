@@ -1285,6 +1285,8 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
            RETURNING bound_at`,
         ).get(address, id, now);
       },
+      // The single writer is the lock: no end lands inside the caller's write, so no ruling (store/bindings.ts).
+      lockLive: async () => null,
       release: async (tx, address, id) => dropHold(sqliteOf(tx), address, id),
       // A stamp the caller doesn't give is core's default (Date.now), as when the server called core directly.
       log: async (tx, id, name, event, detail = null, at) => logBinding(sqliteOf(tx), id, name, event, detail, at),

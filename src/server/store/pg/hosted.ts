@@ -14,9 +14,10 @@
 //   `end` then takes the rest of its ownership's hosted_sessions rows, its alias_holds rows, and its own and its
 //   children's ids rows, and `childEnd` its child's ids row, each SKIP LOCKED against an unlocked count: a shortfall
 //   means another body holds one, and the call returns as refused, writing nothing (`dependentsFree`). `park` writes
-//   only its own row. Not bounded: every lock the session-end port takes past those ids rows (core endSession's
-//   claims, messages, aliases and attachments on C10d2's port), so a capped end or childEnd can still wait inside the
-//   port. The flag is per Tx handle: hosted.ts runs that sweep on the Tx it took the lock on.
+//   only its own row. Not skipped: every lock the session-end port takes past those ids rows (the composed end's
+//   messages, claims, posts and attachments; hosted_port.ts PgSessionEndPort), so a capped end or childEnd can still
+//   wait inside the port, up to the pool's lock_timeout. The flag is per Tx handle: hosted.ts runs that sweep on the
+//   Tx it took the lock on.
 // - A released child's ID ends through the injected session-end port (hosted_port.ts PgSessionEndPort, the server's
 //   composed end), on the caller's Tx, with an awaited audit sink that writes its id.ended row to access_log as db.ts
 //   hostedEnds does on SQLite;

@@ -50,6 +50,13 @@ export interface BindingsStore {
   // alias row or no ids row: SQLite writes the hold, Postgres returns null; neither is reachable today, since the one
   // caller (application.ts bind) creates the alias and checks the session live just before it takes.
   take(tx: Tx, address: string, id: string, principal: string, now: number): Promise<{ bound_at: number } | null>;
+  // Whether id's ids row is unended (true) or ended (false), read under the lock a session end waits for (#807 P3
+  // C10d2-b, E4); null when there is no row, or nothing to rule on. On Postgres the row FOR KEY SHARE until the caller's
+  // transaction ends, so an end's FOR UPDATE waits for the caller's write and then sees it, and a caller behind an end
+  // waits and reads it ended: take refuses unless true, the server's claim take (claims.ts serverClaim) when false.
+  // SQLite's single writer is the lock, and no end can land inside the caller's write: it answers null, so its takes
+  // and claims behave as before (an ID already ended is refused before them, where it matters, by session.act).
+  lockLive(tx: Tx, id: string): Promise<boolean | null>;
   // Drops id's hold on address; a hold another session took since stays.
   release(tx: Tx, address: string, id: string): Promise<void>;
   // A binding_events row at `at` (the wall clock when absent, core logBinding's default). A refusal repeating the

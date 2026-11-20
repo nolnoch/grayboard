@@ -38,24 +38,29 @@ export async function reclaimFreePages(repo: Repo, maxPages = RECLAIM_PAGES_PER_
 type BoardsChanged = (boards: string[]) => void | Promise<void>;
 export async function runRetention(repo: Repo, config: Config, now = Date.now(), onBoardsChanged?: BoardsChanged): Promise<void> {
   // Each prune is its own transaction through the write queue (#807 D4), short as the separate statements were,
-  // so requests interleave between them rather than wait out the whole run.
-  try {
-    // Board posts share the message retention window.
-    await repo.write(tx => pruneMessages(repo, tx, now - config.messageRetentionDays * 86_400_000));
-    await repo.write((tx: Tx) => repo.boards.prunePosts(tx, now - config.messageRetentionDays * 86_400_000), boards => {
-      if (boards.length) {
-        try { void Promise.resolve(onBoardsChanged?.(boards)).catch(() => {}); } catch {}
-      }
-    });
-    // Ended sessions' rows share it too (#328): a keyed one leaves a
-    // tombstone, so its key coming back is audited as reused.
-    await repo.write(tx => repo.sessionEnd.pruneEnded(tx, now - config.messageRetentionDays * 86_400_000, now));
-    await repo.write((tx) => pruneAudit(repo, tx, now - config.auditRetentionDays * 86_400_000));
-    await repo.write(tx => repo.attachments.pruneUnbound(tx, now - UNBOUND_TTL_MS));
-    await repo.write(tx => repo.writeReceipts.prune(tx, now - WRITE_DEDUP_WINDOW_MS));
-  } catch (e) {
-    console.error("[grayboard] retention failed:", e);
-  }
+  // so requests interleave between them rather than wait out the whole run. Each has its own try (#1387): one that
+  // fails (on Postgres, a deadlock victim) is logged and the rest still run.
+  const step = async (name: string, run: () => Promise<unknown>) => {
+    try {
+      await run();
+    } catch (e) {
+      console.error(`[grayboard] retention failed (${name}):`, e);
+    }
+  };
+  const cutoff = now - config.messageRetentionDays * 86_400_000;
+  // Board posts share the message retention window.
+  await step("messages", () => repo.write(tx => pruneMessages(repo, tx, cutoff)));
+  await step("posts", () => repo.write((tx: Tx) => repo.boards.prunePosts(tx, cutoff), boards => {
+    if (boards.length) {
+      try { void Promise.resolve(onBoardsChanged?.(boards)).catch(() => {}); } catch {}
+    }
+  }));
+  // Ended sessions' rows share it too (#328): a keyed one leaves a
+  // tombstone, so its key coming back is audited as reused.
+  await step("ended sessions", () => repo.write(tx => repo.sessionEnd.pruneEnded(tx, cutoff, now)));
+  await step("audit", () => repo.write((tx) => pruneAudit(repo, tx, now - config.auditRetentionDays * 86_400_000)));
+  await step("unbound uploads", () => repo.write(tx => repo.attachments.pruneUnbound(tx, now - UNBOUND_TTL_MS)));
+  await step("write receipts", () => repo.write(tx => repo.writeReceipts.prune(tx, now - WRITE_DEDUP_WINDOW_MS)));
   // Also finishes any sweep a crash or a failed delete left.
   const swept = await sweepStoredBlobs(repo);
   if (swept) console.error(`[grayboard] retention: deleted ${swept} attachment blobs`);

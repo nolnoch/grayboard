@@ -29,11 +29,19 @@ export const noHosted: PgHostedEnds = { endForGrant: async () => {}, endForUser:
 
 // The session end the Postgres hosted store ends a released child's ID through (#807 P3 C8 decision 7): the server's
 // end composed over the Repo's groups (src/server/session_end.ts sessionEndPort), injected so the store imports no
-// application code; the same port SQLite's hosted store takes (store/session_end.ts SessionEndPort). C11 wires it once
-// Postgres's sessionEnd.end lands (C10d2-b); tests pass a recorder (tests/support/pg_hosted.ts). Its `audit` is
+// application code; the same port SQLite's hosted store takes (store/session_end.ts SessionEndPort). Its `audit` is
 // awaited (#807 P3 C10 Q3): the store passes the sink that writes id.ended to access_log on the end's Tx (pg/audit.ts
-// pgCoreAuditSink).
+// pgCoreAuditSink). It may wait on row locks held by in-flight writes for the ended IDs, bounded by the pool's
+// `lock_timeout` (pg/tx.ts); it takes nothing SKIP LOCKED, which would leave a claim or hold on an ended ID (#807 P3
+// C10 Q9). The lock order is session_end.ts's.
 export type PgSessionEndPort = SessionEndPort;
+
+// The port for makePgHosted({ sessionEnd }) before its Repo exists (#807 P3 C10d2-b): the hosted store is one of the
+// Repo's groups and the end closes over the Repo, so the composition (C11's makePgRepo) passes
+// `deferredSessionEnd(() => port ??= sessionEndPort(humanReach)(repo))`, as db.ts openDatabase does on SQLite.
+export function deferredSessionEnd(get: () => SessionEndPort): PgSessionEndPort {
+  return { end: (tx, id, opts) => get().end(tx, id, opts) };
+}
 
 // The revokes' ends over the hosted store's `end`: every root on the grant, or of the user, locked in session_id order
 // (one order against another revoke), then each ended with its children. Roots only: a child's grant is its root's
