@@ -416,6 +416,39 @@ async fn plain_429_is_capacity_and_not_retried() {
     assert_eq!(fake.calls("tools/call").len(), 1);
 }
 
+/// The server's own response to a listen past the per-user listen cap, byte for byte (`sdk/rust/schema/wire/listen-capacity.json`, which `tests/integration/rust_listen_capacity.test.ts` checks against a real server under `bun test`): the transport raises it as `Error::Capacity` with the body unchanged, so the swap retry's match on `LISTEN_CAPACITY` holds against the real server (#1398, #1394).
+#[tokio::test]
+async fn the_servers_listen_cap_refusal_is_capacity_with_its_body_unchanged() {
+    let fixture: Value =
+        serde_json::from_str(include_str!("../../schema/wire/listen-capacity.json")).unwrap();
+    let status = u16::try_from(fixture["status"].as_u64().unwrap()).unwrap();
+    let content_type = fixture["headers"]["content-type"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let body = fixture["body"].as_str().unwrap().to_owned();
+    let served = body.clone();
+    let fake = Fake::start(false, move |_, _| Reply {
+        status,
+        headers: vec![("content-type", content_type.clone())],
+        chunks: vec![(Duration::ZERO, served.clone().into_bytes())],
+        hold: Duration::ZERO,
+        live: None,
+    })
+    .await;
+    let err = session(&fake)
+        .listen(&["grayboard://inbox"])
+        .await
+        .err()
+        .unwrap();
+    assert!(
+        matches!(err, Error::Capacity(ref t) if *t == body && t == crate::delivery::LISTEN_CAPACITY),
+        "{err:?}"
+    );
+    // Not retried: one listen.
+    assert_eq!(fake.calls("subscriptions/listen").len(), 1);
+}
+
 #[tokio::test]
 async fn static_bearer_401_is_terminal() {
     let fake = Fake::start(false, |_, _| Reply::status(401, "")).await;
