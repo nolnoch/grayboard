@@ -487,11 +487,13 @@ CREATE TABLE claim_events (
   board      text COLLATE "C",
   expires_at int8,
   held_by    text COLLATE "C",
-  at         int8 NOT NULL
+  at         int8 NOT NULL,
+  session_id text COLLATE "C"
 );
 CREATE INDEX idx_claim_events_at ON claim_events (at);
 CREATE INDEX idx_claim_events_key ON claim_events (key);
 CREATE INDEX idx_claim_events_take ON claim_events (board, handle, at) WHERE event = 'take';
+CREATE INDEX idx_claim_events_take_sid ON claim_events (board, session_id, at) WHERE event = 'take';
 
 CREATE TABLE binding_events (
   id         int8 GENERATED ALWAYS AS IDENTITY PRIMARY KEY,

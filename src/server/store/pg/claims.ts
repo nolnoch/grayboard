@@ -45,8 +45,10 @@ export function makePgClaims({ clock }: { clock: () => number }): ClaimsStore {
   async function logEvent(
     tx: Parameters<ClaimsStore["logEvent"]>[0], event: ClaimEvent, handle: string, c: Partial<Claim> & { key: string }, at: number, heldBy?: string,
   ): Promise<void> {
-    await pgOf(tx)`INSERT INTO claim_events (key, handle, event, note, board, expires_at, held_by, at)
-      VALUES (${c.key}, ${handle}, ${event}, ${c.note ?? null}, ${c.board ?? null}, ${c.expires_at ?? null}::int8, ${heldBy ?? null}, ${at})`;
+    // session_id: core logEvent's rule (#1351), the alias's holder, else the handle when it is a session ID, else null.
+    await pgOf(tx)`INSERT INTO claim_events (key, handle, event, note, board, expires_at, held_by, at, session_id)
+      VALUES (${c.key}, ${handle}, ${event}, ${c.note ?? null}, ${c.board ?? null}, ${c.expires_at ?? null}::int8, ${heldBy ?? null}, ${at},
+        COALESCE((SELECT id FROM alias_holds WHERE address = ${handle}), (SELECT id FROM ids WHERE id = ${handle})))`;
   }
   return {
     async list(r, prefix) {

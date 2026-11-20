@@ -116,10 +116,14 @@ function validNote(note: string | undefined): void {
 export type ClaimEvent = "take" | "renew" | "refused" | "release" | "expire";
 export type ClaimEventRow = { handle: string; event: ClaimEvent; note: string | null; at: number };
 
-// One claim_events row; callers are inside the claim's transaction.
+// One claim_events row; callers are inside the claim's transaction. session_id (#1351) is the session holding `handle`
+// now: the alias's holder, else `handle` itself when it is a session ID (live or ended), else null (an alias no
+// session holds). Every event kind records it, so there's one write path.
 export function logEvent(db: Database, event: ClaimEvent, handle: string, c: Partial<Claim> & { key: string }, at: number, heldBy?: string): void {
   db.prepare(
-    `INSERT INTO claim_events (key, handle, event, note, board, expires_at, held_by, at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO claim_events (key, handle, event, note, board, expires_at, held_by, at, session_id)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
+       COALESCE((SELECT id FROM alias_holds WHERE address = ?2), (SELECT id FROM ids WHERE id = ?2)))`,
   ).run(c.key, handle, event, c.note ?? null, c.board ?? null, c.expires_at ?? null, heldBy ?? null, at);
 }
 
