@@ -154,6 +154,27 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: a parked child's 
   expect(app.db.query("SELECT 1 FROM access_log WHERE action = 'hosted.child_unparked'").all()).toEqual([]);
 });
 
+// #1101: settle (inside end's gate) ends an idle root, and its child with it; end then reports ended: false and admits
+// neither ID again: no row, no new ownership. Once from the child's context, once from the root's.
+for (const from of ["child", "root"] as const) test(`session_end from the ${from} after settle ends the idle root reports ended: false and admits nothing`, async () => {
+  const grant = await issue();
+  await connect("2026-07-28", grant.token, "idle-root");
+  const principal = await app.oauth.authenticate(new Request(`${base}/mcp`, { headers: { Authorization: `Bearer ${grant.token}` } }));
+  if (principal instanceof Response) throw new Error("fixture authorization failed");
+  const rootContext = sessionContext(principal, { "ai.opencode/sessionID": "idle-root" });
+  await app.mcp.sessions.register(principal, rootContext, "idle-child");
+  expect(hostedRowCount(app.db)).toBe(2);
+  const started = () => app.db.query<{ n: number }, []>("SELECT count(*) AS n FROM access_log WHERE action = 'hosted.ownership_started'").get()!.n;
+  const before = started();
+  skew += 900_001;
+  const context = from === "root" ? rootContext : sessionContext(principal, { "ai.opencode/sessionID": "idle-child" });
+  expect(await app.mcp.sessions.end(principal, context)).toEqual({ ended: false });
+  expect(hostedRowCount(app.db)).toBe(0);
+  expect(started()).toBe(before);
+  // The child ended with its root, not parked then evicted.
+  expect(app.db.query("SELECT 1 FROM access_log WHERE action = 'hosted.child_parked'").all()).toEqual([]);
+});
+
 // #1097: an ending call (session_end, delivery_release) under an ID the server no longer holds ends nothing and starts
 // nothing: no row, no ownership, no audit but the stale lease's own refusal row. A connect that names an ID admits it as
 // any session start does, so this raw client's row ends after its connect (here the server releases it); hosted-core's
