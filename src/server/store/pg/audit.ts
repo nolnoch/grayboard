@@ -7,10 +7,11 @@
 //   savepoint, and `last` on the Tx (a later statement on that connection) sees it. A failing insert aborts the
 //   transaction, so the body's next statement or its COMMIT fails and the write rejects TxAborted (pg/tx.ts), whose
 //   cause is that later failure: 25P02 from the next statement, or ERR_POSTGRES_COMMIT_ROLLED_BACK when the refused
-//   insert was the body's last. The insert's own error (its SQLSTATE) would be lost, so its rejection is caught and
-//   logged here (class, code and SQLSTATE only: a Postgres error's text quotes row values). The catch also keeps the
-//   rejection handled, should Bun start reporting an executed query's unhandled one (Bun 1.4.4 doesn't). A Read
-//   refuses synchronously (AUDIT_WRITE_ON_READ): on the pool the insert would fail 25006 after write returned.
+//   insert was the body's last. The insert's rejection is caught here: noted on the transaction (eagerFailure), so the
+//   TxAborted names it as `first` with its SQLSTATE (#1302), and logged (class, code and SQLSTATE only: a Postgres
+//   error's text quotes row values). The catch also keeps the rejection handled, should Bun start reporting an executed
+//   query's unhandled one (Bun 1.4.4 doesn't). A Read refuses synchronously (AUDIT_WRITE_ON_READ): on the pool the
+//   insert would fail 25006 after write returned.
 // - access_log.detail is jsonb: write parses writeAudit's JSON text and binds the object (bound as text it would be a
 //   JSON string scalar), and last selects detail::text, so AccessLogRow.detail stays JSON text (spacing and key order
 //   are jsonb's). Strings are made safe first (jsonSafe, store/json_safe.ts): jsonb refuses NUL (22P05) and a lone
@@ -30,7 +31,7 @@ import { insertAudit } from "./audit_row.ts";
 import { isTx, type Tx } from "../tx_base.ts";
 import { jsonSafe, textSafeOrNull } from "../json_safe.ts";
 import { int8, type AuditDetail } from "./sql.ts";
-import { pgOf } from "./tx.ts";
+import { eagerFailure, pgOf } from "./tx.ts";
 
 // pg_advisory_xact_lock(class, key) for a dedup read and the write it decides, per (action, target): the two-int4 form
 // beside ALIAS_CAP_LOCK and the OAuth classes, keyed by hashtext(`${action}:${target}`). A collision only serializes
@@ -55,9 +56,10 @@ export function makePgAudit(): AuditStore {
       if (!isTx(tx)) throw new Error(AUDIT_WRITE_ON_READ);
       const o = requestOrigin();
       const detail = row.detail === null ? null : jsonSafe(JSON.parse(row.detail) as unknown);
+      const note = eagerFailure(tx);
       sql`INSERT INTO access_log (at, actor, action, target, detail, ip, ua, client_id)
         VALUES (${row.at}, ${textSafeOrNull(row.actor)}, ${row.action}, ${textSafeOrNull(row.target)}, ${detail},
-          ${o?.ip ?? null}, ${o?.ua ?? null}, ${o?.client_id ?? null})`.catch(logged);
+          ${o?.ip ?? null}, ${o?.ua ?? null}, ${o?.client_id ?? null})`.catch(e => { note(e); logged(e); });
     },
     async last(r, action, target) {
       const [row] = await pgOf(r).unsafe(PG_ACCESS_LOG_LAST_SQL, [action, target]);
