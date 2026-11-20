@@ -215,6 +215,9 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     await authCheck(context, signal);
     if (!withRow) return;
     const boards = await boardFacts(context, uris);
+    // Holds any row check past its board read (a subscribe's too), where a control may add a uri the read missed and
+    // `authorizeFor` must read again (#1216).
+    await testPauseAsync("mcp:authorize:facts");
     if (cancelled(context, signal)) throw new ApplicationError("unauthenticated", "request cancelled");
     const checked = await rowCheck(context);
     if (cancelled(context, signal)) throw new ApplicationError("unauthenticated", "request cancelled");
