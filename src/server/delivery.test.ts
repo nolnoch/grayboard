@@ -431,6 +431,22 @@ test("a lease finished while renew's update awaits stays finished: renew refuses
   } finally { release(); spy.mockRestore(); }
 });
 
+test("an open whose update awaits across a close is refused and tracks no lease (#1122)", async () => {
+  const update = store.repo.hosted.update.bind(store.repo.hosted);
+  let entered!: () => void, release!: () => void;
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  const held = new Promise<void>(resolve => { release = resolve; });
+  const spy = spyOn(store.repo.hosted, "update").mockImplementationOnce(async (tx, id, patch) => { entered(); await held; return update(tx, id, patch); });
+  try {
+    const opening = delivery.open(bob, context(bob));
+    await started;
+    delivery.close();
+    release();
+    await expect(opening).rejects.toHaveProperty("code", "not_found");
+    expect(delivery.activeLeaseCount).toBe(0);
+  } finally { release(); spy.mockRestore(); }
+});
+
 test("renew completes while a transfer holds the reader gate past the original deadline", async () => {
   const lease = await delivery.open(bob, context(bob));
   let entered!: () => void, release!: () => void;
