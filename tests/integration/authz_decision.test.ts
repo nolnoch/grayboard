@@ -8,7 +8,7 @@ import { until } from "../support/until.ts";
 import { HOSTED_CLIENT, HOSTED_SCOPES, HostedToolError } from "../support/hosted_session.ts";
 import { Client, StreamableHTTPClientTransport, type CallToolResult } from "@modelcontextprotocol/client";
 import { MCP_PROTOCOL_VERSIONS } from "../../src/server/mcp.ts";
-import { DENY_ROW_LIMIT } from "../../src/server/policy.ts";
+import { DENY_ROW_LIMIT, recordDecision } from "../../src/server/policy.ts";
 import { hostedSessionId } from "../../src/server/hosted.ts";
 import { HUMAN_RESERVED } from "../../src/shared/addressing.ts";
 import { GRAYBOARD_SESSION_META, GRAYBOARD_WRITES_AS_META } from "../../src/shared/session_meta.ts";
@@ -110,11 +110,11 @@ describe("deny rows", () => {
     expect(got.filter((r) => r.actor === ROOT).length).toBe(DENY_ROW_LIMIT.burst + 10);
   });
 
-  // #1082: a streak that ends inside a write body (team leave's memberTeam deny runs in repo.write) writes its
-  // authz.suppressed row on that body's Tx, so it commits with the body and is never posted: the caller's own streak
-  // and, since the sweep covers every bucket, another user's. (A streak ends once its bucket is full again; the sweep
-  // runs before the take, so take's own end is reached only after a failed sweep.) The buckets age on the store's
-  // clock: here it runs ten days behind wall time and only it moves, so a limiter on Date.now never refills.
+  // #1082, #1436: a streak that ends inside a write body (team leave's memberTeam deny runs in repo.write): the
+  // caller's own authz.suppressed row goes on that body's Tx, so it commits with the body and is never posted; another
+  // user's refilled bucket is swept after the body commits, its row posted. (A streak ends once its bucket is full
+  // again.) The buckets age on the store's clock: here it runs ten days behind wall time and only it moves, so a
+  // limiter on Date.now never refills.
   test("a deny streak ending inside a write body writes authz.suppressed on that body, on the store's clock", async () => {
     await srv.stop();
     let clock = Date.now() - 10 * 24 * 3_600_000;
@@ -126,14 +126,40 @@ describe("deny rows", () => {
     expect(await accessAudits(srv, "authz.suppressed")).toEqual([]);
     const post = spyOn(srv.app.repo, "post");
     try {
-      // A full refill: alice's next deny ends her streak and sweeps bob's onto her body.
+      // A full refill: alice's next deny ends her streak on her body; bob's is swept after her body commits, posted.
       clock += Math.ceil(DENY_ROW_LIMIT.burst / DENY_ROW_LIMIT.perSec) * 1000;
       await leave(a);
-      expect(post.mock.calls.filter((c) => c[2] === "audit authz.suppressed")).toEqual([]);
+      await until(async () => (await accessAudits(srv, "authz.suppressed")).length === 2, 3000, "both suppressed rows");
+      expect(post.mock.calls.filter((c) => c[2] === "audit authz.suppressed").length).toBe(1);
     } finally { post.mockRestore(); }
-    expect((await accessAudits(srv, "authz.suppressed")).map((r) => [r.actor, r.at, r.detail])).toEqual([[A, clock, { refused: 5 }], [B, clock, { refused: 2 }]]);
+    const suppressed = (await accessAudits(srv, "authz.suppressed")).map((r) => [r.actor, r.at, r.detail]);
+    expect(suppressed).toContainEqual([A, clock, { refused: 5 }]);
+    expect(suppressed).toContainEqual([B, clock, { refused: 2 }]);
     // The refilled bucket records the deny that ended the streak.
     expect((await accessAudits(srv, "authz.decision")).filter((r) => r.actor === A).length).toBe(DENY_ROW_LIMIT.burst + 1);
+  });
+
+  // #1436: a body that records a deny and then fails to commit sweeps no other user's bucket, so bob's streak isn't
+  // lost with alice's rolled-back rows: the next committed deny's sweep writes it. Mutation: the sweep back inside the
+  // body (before the take), and bob's row rolls back with it and his bucket is gone.
+  test("a body that fails to commit leaves another user's streak for the next sweep", async () => {
+    await srv.stop();
+    let clock = Date.now() - 10 * 24 * 3_600_000;
+    srv = await TestServer.open({ admins: [ROOT], hostedRequestLimit: { burst: 10_000, perSec: 10_000 } }, { now: () => clock });
+    const [a, b] = [await srv.login(A), await srv.login(B)];
+    const leave = async (t: string) => expect((await srv.api(t, "POST", "/api/teams/nosuch/leave")).status).toBe(404);
+    for (let i = 0; i < DENY_ROW_LIMIT.burst + 2; i++) await leave(b);
+    clock += Math.ceil(DENY_ROW_LIMIT.burst / DENY_ROW_LIMIT.perSec) * 1000;
+    const { repo } = srv.app;
+    const failed = await repo.write((tx) => {
+      recordDecision(repo, tx, { user: A }, { verb: "msg.send", from: A, to: B }, { allow: false, code: "forbidden", reason: "test", rule: "test" });
+      throw new Error("commit fails");
+    }).then(() => undefined, (e: Error) => e.message);
+    expect(failed).toBe("commit fails");
+    expect(await accessAudits(srv, "authz.suppressed")).toEqual([]);
+    await leave(a);
+    await until(async () => (await accessAudits(srv, "authz.suppressed")).length === 1, 3000, "bob's suppressed row");
+    expect((await accessAudits(srv, "authz.suppressed")).map((r) => [r.actor, r.at, r.detail])).toEqual([[B, clock, { refused: 2 }]]);
   });
 
   test("a caller-chosen route or team name is clipped in the row", async () => {
