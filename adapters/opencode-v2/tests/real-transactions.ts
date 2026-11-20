@@ -131,6 +131,8 @@ export async function transactionRace(f: TransactionRace) {
         // second waits at the gate (the bindgate:wait trace; every hosted request first snapshots its root as a
         // gate reader, so it waits there) and both land, in that order. The first is held at its async boundary
         // just inside the gate, so the server keeps serving and only the gate can make the second wait.
+        // Behind a held bind, what waits is the registration wire's connect (a reader); register's own writer wait
+        // behind a bind is src/server/hosted-persistence.test.ts's.
         // The child is created only once the first is armed (#1208): the plugin registers a new child as soon as it
         // sees it (the creation's instructions prefetch, which the child's call then shares, #567), so a child made
         // earlier could register before the race began, and that registration, already committed or queued at the
