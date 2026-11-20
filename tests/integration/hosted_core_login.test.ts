@@ -629,6 +629,27 @@ test("a 401 runs one forced refresh, then the retried request succeeds", async (
   expect(current).toBe((await l.read())!.access!);
 });
 
+// #1379 audit L4: a 401's forced refresh is a token change too. The port's token() served the rejected token first, so
+// the retry's token() serves the new one and fires `rotated` once.
+test("a 401's forced refresh fires rotated once, when the retried request is served the new token", async () => {
+  await seed({ access: "unknown-access-token-0123456789abcdefghijklmnopqr", expiresIn: 3_600_000 });
+  const l = login();
+  const port = l.credential();
+  const e = await port.capture("raw-root");
+  let heard = 0, current = "";
+  const watching = port.rotated!(e, () => { heard++; });
+  const wire = new NativeWire({ url: resource, sessionKey: GRAYBOARD_SESSION_META, client: { name: CLIENT, version: "1.0.0" } },
+    { token: async () => (current = await port.token(e)), onUnauthorized: async () => port.unauthorized(e, current) }, new AbortController().signal, "raw-root");
+  try {
+    await wire.connect();
+    expect((await wire.callTool("whoami", {}, "raw-root")).isError).toBeFalsy();
+  } finally { await wire.close(); watching.dispose(); }
+  expect(refreshes).toBe(1);
+  expect(current).toBe((await l.read())!.access!);
+  expect(current).not.toBe("unknown-access-token-0123456789abcdefghijklmnopqr");
+  expect(heard).toBe(1);
+});
+
 // ---- the credential port and logout ----
 
 test("credential port: capture, check, token; logout revokes the grant, drifts every watcher and signs out", async () => {

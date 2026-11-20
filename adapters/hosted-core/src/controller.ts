@@ -73,6 +73,9 @@ const LOOKUPS = 1024;
 const ROTATION_POLL_MS = 500, ROTATION_GRACE_MS = 10_000, LEASE_MARGIN_MS = 2_000;
 // Renews stay on the client's own clock: a cadence read from `expiresAt` would follow clock skew.
 const RENEW_MS = 10_000;
+// How long a listen swap (#1379) waits for the old stream's close: its local end is at once, but its
+// `notifications/cancelled` POST has no timeout of its own, and a server that never answers it must not stall the swap.
+const SWAP_CLOSE_MS = 1_000;
 // One rotation grace: `spent` charges each retry its poll plus the failed attempt's own time (a slow
 // reconnect counts); `lease` is the ownership it protects, if any.
 type Grace = { spent: number; lease?: () => Lease | undefined };
@@ -605,7 +608,7 @@ export class Controller<E extends Enrollment = Enrollment> {
         r.lease = lease; wire.capability = lease.capability; r.recovery = undefined;
         this.set(r, "active", `Subscribed as ${this.names(e)}${this.lostNote(current)}; receipts follow durable root admission`);
         ready();
-        let dirty = true, wake: (() => void) | undefined, closed = false, rotated = false;
+        let dirty = true, wake: (() => void) | undefined, closed = false, tokenChanged = false;
         wire.client.setNotificationHandler("notifications/resources/updated", () => { dirty = true; wake?.(); });
         let subscription: Awaited<ReturnType<Wire["listen"]>> | undefined;
         // Only the current listen's end counts: a replaced one's close is ours.
@@ -617,7 +620,7 @@ export class Controller<E extends Enrollment = Enrollment> {
         // An own-login provider's token changed (#1379): the server closes a listen at the expiry of the token it
         // was opened with, so it is replaced now, under this lease. Heard from before the first listen opens, so a
         // refresh during that open replaces it once it's open; repeated changes replace it once.
-        const rotation = this.port.credential.rotated?.(e, () => { rotated = true; wake?.(); });
+        const rotation = this.port.credential.rotated?.(e, () => { tokenChanged = true; wake?.(); });
         let renewal = Date.now() + RENEW_MS;
         try {
           await listen();
@@ -626,11 +629,18 @@ export class Controller<E extends Enrollment = Enrollment> {
             // at once. Hints don't consume and the server keeps the inbox position, so the re-read finds whatever
             // arrived in between. Not an outage: no whoami, no delivery_open, no backoff; a failed open is an
             // ordinary reopen. Ahead of `closed`: an old stream the expiry already closed is replaced the same way.
-            if (rotated) {
-              rotated = false;
+            // The old stream ends locally at once (its `closed` settles, which the `subscription === opened` guard
+            // ignores, and its request is aborted); its cancel POST gets SWAP_CLOSE_MS, then runs on unawaited.
+            if (tokenChanged) {
+              tokenChanged = false;
               const old = subscription;
               subscription = undefined; closed = false;
-              await old?.close().catch(error => this.failure("subscription_close", error, r));
+              if (old) {
+                const bound = new AbortController();
+                const closing = old.close().catch(error => this.failure("subscription_close", error, r));
+                await Promise.race([closing, this.wait(SWAP_CLOSE_MS, AbortSignal.any([signal, bound.signal]))]);
+                bound.abort();
+              }
               await this.guard(r, epoch, signal);
               await listen();
               dirty = true;
@@ -669,7 +679,7 @@ export class Controller<E extends Enrollment = Enrollment> {
               await this.guard(r, epoch, signal); renewed(lease, await wire.call("delivery_renew"));
               renewal = Date.now() + RENEW_MS; dirty = true; recoveries = 0; unreachable = 0;
             }
-            if (dirty || rotated) continue;
+            if (dirty || tokenChanged) continue;
             const timer = new AbortController();
             await Promise.race([sleep(1000, AbortSignal.any([signal, timer.signal])), new Promise<void>(resolve => { wake = resolve; })]);
             wake = undefined; timer.abort();
