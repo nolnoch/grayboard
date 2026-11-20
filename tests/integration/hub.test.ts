@@ -112,6 +112,39 @@ for (const via of ["receipt", "read"] as const) {
   });
 }
 
+// #1466: the same stale session, when the push's board is gone from the name's view: its drain (a replay) and its pull
+// (application.pending) find the push lost and acknowledge it as that session (lostAck's receiver), which no longer
+// holds the name, so nothing is marked or credited to s2; s2's own pull then acks it as s2. The ack is queued on the
+// write queue, so an empty write behind it is the barrier. Mutation: the drain's (or the pull's) lostAck passing no
+// receiver marks it under s2.
+for (const via of ["drain", "pending"] as const) {
+  test(`#1466: a ${via}'s lost-visibility ack after the session's name moved marks nothing; the new holder's credits it`, async () => {
+    const alice = await login(A);
+    const carol = await login(C);
+    await api(alice, "POST", "/api/teams", { name: "eng" });
+    await api(alice, "POST", "/api/teams/eng/add", { email: C });
+    const a = await srv.hosted(A, "be");
+    const s1 = await srv.connected(carol, "sim");
+    await s1.bind("dev", { create: true });
+    await a.call("board_post", { board: "eng", body: `@${C}/sim ping` });
+    const id = postOf((await s1.next(board())).item).id;
+    const outbox = () => row<{ delivered_at: number | null; session_id: string | null }>(srv, `SELECT delivered_at, session_id FROM outbox WHERE handle = ? AND post_id = ?`, `${C}/sim`, id);
+    const queued = async () => { const held = holdWrites(srv); held.release(); await held.done; };
+    const before = { addresses: [...s1.session.addresses], primary: s1.session.primary };
+    await s1.unbind("sim");
+    const s2 = await srv.connected(carol, "sim");
+    Object.assign(s1.session, before);
+    expect((await api(alice, "POST", "/api/teams/eng/remove", { email: C })).status).toBe(200);
+    if (via === "drain") await srv.app.application.replay(s1.session);
+    else await s1.pending(100);
+    await queued();
+    expect(await outbox()).toEqual({ delivered_at: null, session_id: s1.id });
+    await s2.pending(100);
+    await until(async () => (await outbox())!.delivered_at !== null, 5000, "s2's lost-visibility ack marked the push");
+    expect(await outbox()).toMatchObject({ session_id: s2.id });
+  });
+}
+
 // hosted twin: #451 (a reconnect on the session's key)
 test("unacked board pushes are resent after reconnect; acked ones aren't", async () => {
   const alice = await login(A);
