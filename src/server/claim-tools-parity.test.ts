@@ -3,7 +3,8 @@
 // lapsed claims reaching every branch of the sweep: an announced lapse with a watcher, each of holderUser's fallbacks
 // (an ID, a held alias, an unheld person alias, an unheld team alias, a recorded user), a holder who lost the board, an
 // archived board, a regular claim on a queue board, no board, and queue posts with a lane left, none left, and none
-// left whose `[unclaimed]` reply the holder can no longer write, or writes for its user (#1296).
+// left whose `[unclaimed]` reply the holder can no longer write, or writes for its user (#1296), or its author writes
+// for a holder that can't (#1175).
 import { beforeEach, expect, spyOn, test } from "bun:test";
 import { claimQueuePost, createBoard, post, subscribe } from "../core/boards.ts";
 import { boardActor } from "../core/bindings.ts";
@@ -19,7 +20,7 @@ import { seed } from "../../tests/support/seed.ts";
 
 let repo: Repo;
 let T1 = 0;
-let QPOST = 0, ENGQ = 0, LOST = 0, TAILQ = 0, ENGQ2 = 0, QLIVE = 0, OPSQ = 0, OPSQ_QUIET = 0, OPSQ_LIVE = 0;
+let QPOST = 0, ENGQ = 0, LOST = 0, IDLEQ = 0, HUMANQ = 0, HELDQ = 0, TAILQ = 0, ENGQ2 = 0, QLIVE = 0, OPSQ = 0, OPSQ_QUIET = 0, OPSQ_LIVE = 0;
 
 beforeEach(async () => {
   const f = await openPostParity();
@@ -56,7 +57,8 @@ beforeEach(async () => {
     ENGQ = post(core, `${W}/be`, "engq", "eng work").post.id;
     core.prepare(`UPDATE claims SET expires_at = 2 WHERE key = ?`).run(`queue:engq:${ENGQ}`);
     core.prepare(`INSERT INTO claim_watches (key, handle) VALUES (?, ?)`).run(`queue:engq:${ENGQ}`, `${W}/be`);
-    // A lane dan held on engq though he was never in eng, bob's turn already spent: no lane, and dan can't reply there.
+    // A lane dan held on engq though he was never in eng, bob's turn already spent: no lane, and dan can't reply there,
+    // so its author does (#1175).
     subscribe(core, `${B}/qa`, "engq", "push");
     LOST = post(core, `${W}/be`, "engq", "more eng work").post.id;
     for (const [key, h] of [[`queue:engq:${LOST}`, `${B}/be`], [`queue:engq:${LOST}`, `${B}/qa`]] as const) logEvent(core, "take", h, { key }, 1);
@@ -64,6 +66,25 @@ beforeEach(async () => {
     claimQueuePost(core, "engq", LOST, `${D}/be`, 1);
     core.prepare(`INSERT INTO claim_watches (key, handle) VALUES (?, ?)`).run(`queue:engq:${LOST}`, `${W}/be`);
     core.prepare(`UPDATE claims SET expires_at = 2 WHERE key = ?`).run(`queue:engq:${LOST}`);
+    // #1175: eng/idle, a team alias nobody holds, held an engq post at its lapse, bob's lanes' turns spent: it sees
+    // engq, so it writes the [unclaimed] reply itself, naming no user.
+    IDLEQ = post(core, `${W}/be`, "engq", "idle eng work").post.id;
+    for (const h of [`${B}/be`, `${B}/qa`]) logEvent(core, "take", h, { key: `queue:engq:${IDLEQ}` }, 1);
+    core.prepare(`DELETE FROM claims WHERE key = ?`).run(`queue:engq:${IDLEQ}`);
+    claimQueuePost(core, "engq", IDLEQ, "eng/idle", 1);
+    core.prepare(`UPDATE claims SET expires_at = 2 WHERE key = ?`).run(`queue:engq:${IDLEQ}`);
+    // #1175: system text never bears the human mark. bob's human's post that dan, who can't reply on engq, held last
+    // ends quietly; a claim bob's human held (from before humans left the lanes) is replied to by the post's author.
+    const spent = (author: string, body: string, holder: string) => {
+      const id = post(core, author, "engq", body).post.id;
+      for (const h of [`${B}/be`, `${B}/qa`]) logEvent(core, "take", h, { key: `queue:engq:${id}` }, 1);
+      core.prepare(`DELETE FROM claims WHERE key = ?`).run(`queue:engq:${id}`);
+      claimQueuePost(core, "engq", id, holder, 1);
+      core.prepare(`UPDATE claims SET expires_at = 2 WHERE key = ?`).run(`queue:engq:${id}`);
+      return id;
+    };
+    HUMANQ = spent(`${B}/human`, "human's eng work", `${D}/be`);
+    HELDQ = spent(`${W}/be`, "work a human held", `${B}/human`);
     // Every lane on q but wade's viewer tail has had its turn: a viewer is never a lane, so the post gets [unclaimed].
     TAILQ = post(core, `${E}/be`, "q", `@${D}/be tail work`, null, { strictIds: true }).post.id;
     for (const h of [`${B}/be`, `${B}/qa`, "eng/deploy"]) logEvent(core, "take", h, { key: `queue:q:${TAILQ}` }, 1);
@@ -82,13 +103,15 @@ beforeEach(async () => {
     core.prepare(`INSERT INTO claim_watches (key, handle) VALUES (?, ?)`).run("ticket:confined-live", `${E}/be`);
     // bob released ticket:gone a moment ago: a repeat release answers "already released".
     logEvent(core, "release", `${B}/be`, { key: "ticket:gone", board: "general" }, Date.now() - 1000);
-    // A live engq post bob holds and is its only lane: his decline leaves none, so it gets an [unclaimed] reply.
+    // A live engq post bob holds and is its only lane: his decline leaves none, so it gets an [unclaimed] reply. bob's
+    // qa watches it: a decline as bob leaves his whole address set out of the reply (#1175).
     ENGQ2 = post(core, `${W}/be`, "engq", "more eng").post.id;
+    core.prepare(`INSERT INTO claim_watches (key, handle) VALUES (?, ?)`).run(`queue:engq:${ENGQ2}`, `${B}/qa`);
     // A live q post bob holds by mention: his decline leaves lanes, so it goes on, redelivered.
     QLIVE = post(core, `${E}/be`, "q", `@${B}/be live work`, null, { strictIds: true }).post.id;
     // #1296: ops's queue board, eve's posts, no lane but the eng-bound session's ID, which can't see ops though wade
     // can. Its lapse's [unclaimed] reply is posted for wade, cc'ing eve, who sees ops, and dan, who doesn't. A lapse of
-    // eng/idle's, held by nobody, names no user: quiet. A live one the eng-bound session declines.
+    // eng/idle's, held by nobody, names no user: its author, eve, writes it (#1175). A live one the eng-bound session declines.
     createBoard(core, `${E}/be`, "opsq", "ops work", "team:ops", { kind: "queue" });
     const opsq = (body: string, holder: string) => {
       const id = post(core, `${E}/be`, "opsq", body).post.id;
@@ -139,7 +162,19 @@ test("sweepClaims gives core sweepChanges' wakes and boards and leaves its rows"
   expect(JSON.stringify(want.rows.claims)).toContain("ticket:live");
   expect(JSON.stringify(want.rows.claims)).toContain(`"note":"queue post (redelivered)"`);
   expect(body(`[unclaimed] queue:engq:${ENGQ}`)!.body).toContain(`@${W}/be`);
-  expect(posts).not.toContain(`[unclaimed] queue:engq:${LOST}`);
+  // #1175: dan, its last lane, can't reply on engq: the post's author, wade's be, writes it into its own thread as its
+  // post's writer, and is neither handed nor woken by it (it's also the cc'd watcher).
+  type Row = { id: number; body: string; author: string; author_user: string | null; author_id: string | null; parent_id: number | null };
+  type Out = { post_id: number; handle: string };
+  const reply = (start: string) => (want.rows.posts as Row[]).find(p => p.body.startsWith(start))!;
+  const handed = (id: number) => (want.rows.outbox as Out[]).filter(o => o.post_id === id).map(o => o.handle);
+  const lost = reply(`[unclaimed] queue:engq:${LOST}:`);
+  expect(lost).toMatchObject({ author: `${W}/be`, author_user: null, author_id: null, parent_id: LOST });
+  expect(lost.body).toEndWith(` cc @${W}/be`);
+  expect(handed(lost.id)).not.toContain(`${W}/be`);
+  expect(reply(`[unclaimed] queue:engq:${IDLEQ}:`)).toMatchObject({ author: "eng/idle", author_user: null, author_id: null, parent_id: IDLEQ });
+  expect(posts).not.toContain(`[unclaimed] queue:engq:${HUMANQ}`);
+  expect(reply(`[unclaimed] queue:engq:${HELDQ}:`)).toMatchObject({ author: `${W}/be`, parent_id: HELDQ });
   // A refused [unclaimed] reply still takes its watches, and the queue board's cc takes no claim.
   const watches = JSON.stringify(want.rows.claim_watches);
   for (const gone of [`queue:engq:${ENGQ}`, `queue:engq:${LOST}`, "ticket:q"]) expect(watches).not.toContain(`"${gone}"`);
@@ -147,12 +182,15 @@ test("sweepClaims gives core sweepChanges' wakes and boards and leaves its rows"
   expect(body("[expired] ticket:watched")!.body).toContain(ENDED_ID);
   expect(body(`[unclaimed] queue:q:${TAILQ}`)).toBeDefined();
   // #1296: the [unclaimed] reply of a holder who lost ops is posted for its user; only the watcher who sees ops is
-  // told. One whose holder names no user is quiet, its watches gone all the same.
+  // told. One whose holder names no user falls to its author, its watches gone all the same.
   const unclaimed = (want.rows.posts as { id: number; body: string; author: string; author_user: string | null; author_id: string | null; parent_id: number | null }[]).find(p => p.body.startsWith(`[unclaimed] queue:opsq:${OPSQ}:`))!;
   expect(unclaimed).toMatchObject({ author: ENG_ID, author_user: W, author_id: null, parent_id: OPSQ });
   expect(unclaimed.body).toEndWith(` cc @${D}/be @${E}/be`);
   expect((want.rows.outbox as { post_id: number; handle: string }[]).filter(o => o.post_id === unclaimed.id).map(o => o.handle)).toEqual([`${E}/be`]);
-  expect(posts).not.toContain(`[unclaimed] queue:opsq:${OPSQ_QUIET}`);
+  // #1175: eng/idle, held by nobody, names no user to post for: the post's author, eve, writes it, uncc'd.
+  const quiet = reply(`[unclaimed] queue:opsq:${OPSQ_QUIET}:`);
+  expect(quiet).toMatchObject({ author: `${E}/be`, author_user: null, author_id: null, parent_id: OPSQ_QUIET });
+  expect(handed(quiet.id)).not.toContain(`${E}/be`);
   expect(watches).not.toContain(`queue:opsq:${OPSQ}"`);
   expect(want.out.value.wake.length).toBeGreaterThan(0);
 });
@@ -251,6 +289,11 @@ test("claim_take, claim_release and claim_watch give core's answers and leave it
   expect(text("bob", "claim_release", { key: "ticket:gone" })).toContain("already released");
   expect(JSON.stringify(call("bob", "claim_release", { key: `queue:q:${QLIVE}` }).rows.claims)).toContain(`"note":"queue post (redelivered)"`);
   expect(JSON.stringify(call("bob", "claim_release", { key: `queue:engq:${ENGQ2}` }).rows.posts)).toContain(`[unclaimed] queue:engq:${ENGQ2}`);
+  // #1175: a sessionless decline's reply leaves out the caller's whole address set: bob's qa, which watches the post,
+  // is cc'd but handed nothing.
+  const http = call("bob over http", "claim_release", { key: `queue:engq:${ENGQ2}` }).rows;
+  const httpReply = (http.posts as { id: number; body: string }[]).find(p => p.body.startsWith(`[unclaimed] queue:engq:${ENGQ2}:`))!;
+  expect((http.outbox as { post_id: number; handle: string }[]).filter(o => o.post_id === httpReply.id).map(o => o.handle)).toEqual([`${W}/be`]);
   // #1286: the eng-bound session's release of its claim on ops is posted for wade, without its note or its session,
   // and answers as a quiet one.
   const confined = call("wade's eng-bound", "claim_release", { key: "ticket:confined-live", note: "secret" });

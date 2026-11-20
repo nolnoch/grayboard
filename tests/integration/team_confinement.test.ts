@@ -215,7 +215,8 @@ describe("a confined holder's claim end is announced for its user (#1286)", () =
 // #1296: a queue post on qa's queue board, claimed for a session's ID by mention (#219) while its primary was a
 // person name, the primary since moved to eng/h: with no lane left, its claim's end is an `[unclaimed]` reply posted
 // for the claimant's user, who still sees qa's board, cc'ing the watcher. The holder's decline note never reaches it,
-// and its own answer and deliveries are a quiet end's.
+// and its own answer and deliveries are a quiet end's. When the user lost qa too, the post's author writes the reply
+// (#1175): the watcher is told, and the author, whose own post it answers, is never woken by it.
 describe("a confined holder's queue claim ends in an [unclaimed] reply for its user (#1296)", () => {
   async function confinedQueue(email = B, cast_?: Awaited<ReturnType<typeof cast>>) {
     const { ops } = cast_ ?? (await cast());
@@ -244,6 +245,13 @@ describe("a confined holder's queue claim ends in an [unclaimed] reply for its u
   }
   const replies = (postId: number) => srv.app.db.query("SELECT body, author, author_user, author_id FROM posts WHERE parent_id = ?").all(postId);
   const unclaimed = (key: string) => board((i) => (i.kind === "push" ? i.post : i.latest).body.startsWith(`[unclaimed] ${key}:`));
+  // #1175: the reply the post's author, qa/ops, writes when neither the holder nor its user can; its watcher is told,
+  // its author isn't.
+  const authored = async (c: Awaited<ReturnType<typeof cast>>, q: Awaited<ReturnType<typeof confinedQueue>>) => {
+    await q.w.next(board((i) => i.kind === "push" && i.reason === "mention" && i.post.body.startsWith(`[unclaimed] ${q.key}:`)));
+    expect(replies(q.postId)).toEqual([{ body: expect.stringMatching(/ cc @qa\/w-f$/), author: "qa/ops", author_user: B, author_id: idHolding("qa/ops") }]);
+    await c.ops.none(unclaimed(q.key));
+  };
 
   test("a decline: the watcher is told without the holder's note; the holder's answer and inbox are a quiet decline's", async () => {
     const c = await cast();
@@ -254,18 +262,19 @@ describe("a confined holder's queue claim ends in an [unclaimed] reply for its u
     expect(got.event.item.post.body).toEndWith(" cc @qa/w-b");
     expect(replies(postId)).toEqual([{ body: expect.stringMatching(/^\[unclaimed\] /), author: id, author_user: B, author_id: null }]);
     expect(JSON.stringify(srv.app.db.query("SELECT body FROM posts").all())).not.toContain("eng secret");
-    // The control: frank's user lost qa too, so his decline is quiet. Both holders answer alike and are told nothing.
+    // frank's user lost qa too, so the post's author writes his decline's reply, without his note. Both holders answer
+    // alike and are told nothing.
     const quiet = await confinedQueue(F, c);
     expect((await srv.api(bob, "POST", "/api/teams/qa/remove", { email: F })).status).toBe(200);
     const quietAnswer = await quiet.h.call("claim_release", { key: quiet.key, note: "eng secret" });
-    expect(replies(quiet.postId)).toEqual([]);
+    await authored(c, quiet);
+    expect(JSON.stringify(srv.app.db.query("SELECT body FROM posts").all())).not.toContain("eng secret");
     expect([answer, quietAnswer]).toEqual([`released ${key}`, `released ${quiet.key}`]);
-    await quiet.w.none(unclaimed(quiet.key));
     await h.none(unclaimed(key));
     await quiet.h.none(unclaimed(quiet.key));
   });
 
-  test("a lapse is replied to for the user; one whose user lost the board too lapses quietly", async () => {
+  test("a lapse is replied to for the user; one whose user lost the board too is replied to by the post's author", async () => {
     const c = await cast();
     const { w, id, postId, key } = await confinedQueue(B, c);
     const quiet = await confinedQueue(F, c);
@@ -277,13 +286,12 @@ describe("a confined holder's queue claim ends in an [unclaimed] reply for its u
     if (got.event.kind !== "board" || got.event.item.kind !== "push") throw new Error("not a push");
     expect(replies(postId)).toEqual([{ body: expect.stringMatching(/ cc @qa\/w-b$/), author: id, author_user: B, author_id: null }]);
     expect(srv.app.db.query("SELECT count(*) AS n FROM claims WHERE key IN (?, ?)").get(key, quiet.key)).toEqual({ n: 0 });
-    expect(replies(quiet.postId)).toEqual([]);
-    await quiet.w.none(unclaimed(quiet.key));
+    await authored(c, quiet);
   });
 
   // #1306: session end releases through core release with the ended session's ctx (src/core/session_end.ts), which
   // reaches core requeue: the reply is still the user's, without the session or the end's note.
-  test("a session end's requeue is replied to for the user; one whose user lost the board too ends quietly", async () => {
+  test("a session end's requeue is replied to for the user; one whose user lost the board too is replied to by the post's author", async () => {
     const c = await cast();
     const { w, id, postId, key } = await confinedQueue(B, c);
     const quiet = await confinedQueue(F, c);
@@ -296,7 +304,7 @@ describe("a confined holder's queue claim ends in an [unclaimed] reply for its u
     expect(got.event.item.post.body).toEndWith(" cc @qa/w-b");
     expect(replies(postId)).toEqual([{ body: expect.stringMatching(/ cc @qa\/w-b$/), author: id, author_user: B, author_id: null }]);
     expect(JSON.stringify(replies(postId))).not.toContain("session ended");
-    expect(replies(quiet.postId)).toEqual([]);
-    await quiet.w.none(unclaimed(quiet.key));
+    await authored(c, quiet);
+    expect(JSON.stringify(replies(quiet.postId))).not.toContain("session ended");
   });
 });
