@@ -21,6 +21,7 @@ import { browse, seedGrant, type HostedServer } from "./hosted_oauth.ts";
 import { factsOf, hostedRow, leased, PEER, Pi, pingPong, requestTools, resultText, scripted, statusOf, stopAll, systemText, toolResultNamed } from "./pi.ts";
 import { localSession, stopSession, type Session } from "./mcp.ts";
 import { accessAudits } from "./audit.ts";
+import { row, rows } from "./repo_sql.ts";
 import { grayboardChildPids, grayboardDescendants, processDescendants, sigkill, STOP_READING } from "./procs.ts";
 import { CLI, REFUSING_MCP, ROOT } from "./paths.ts";
 import { until } from "./until.ts";
@@ -93,16 +94,16 @@ function startHostedOmp(dir: string, procs: ChildProcess[], { persist = false, s
 }
 
 // The server's session id for omp's session `raw`.
-const serverId = (srv: HostedServer, raw: string): string | undefined => srv.app.db.query<{ session_id: string }, [string, string]>(
-  "SELECT session_id FROM hosted_sessions WHERE client_id = ? AND source_session_id = ?").get(OMP_CLIENT, raw)?.session_id;
+const serverId = async (srv: HostedServer, raw: string): Promise<string | undefined> => (await row<{ session_id: string }>(srv,
+  "SELECT session_id FROM hosted_sessions WHERE client_id = ? AND source_session_id = ?", OMP_CLIENT, raw))?.session_id;
 // omp finished its run: settled (nothing streaming, queued or pending).
 const idle = (omp: Pi, ms = 30_000) => until(async () => (await omp.command({ type: "get_state" })).isSettled === true, ms, "omp settled");
 
 // The hosted audit rows of `action`, oldest first.
-const audits = (srv: HostedServer, action: string) => accessAudits(srv.app.db, action);
+const audits = (srv: HostedServer, action: string) => accessAudits(srv, action);
 // The server sessions registered as children of `root` right now.
-const liveChildren = (srv: HostedServer, root: string): string[] => srv.app.db.query<{ session_id: string }, [string]>(
-  "SELECT session_id FROM hosted_sessions WHERE root_session_id = ?").all(root).map((r) => r.session_id);
+const liveChildren = async (srv: HostedServer, root: string): Promise<string[]> => (await rows<{ session_id: string }>(srv,
+  "SELECT session_id FROM hosted_sessions WHERE root_session_id = ?", root)).map((r) => r.session_id);
 // A model request made by a task subagent (taskFanout's child prompt).
 const childOf = (req: ChatRequest): string | undefined => /\bfake-child-\d+\b/.exec(messageText(req.messages.find((m) => m.role === "user") ?? { role: "user", content: "" }))?.[0];
 const fromChild = (req: ChatRequest): boolean => childOf(req) !== undefined;
@@ -169,7 +170,7 @@ export function ompHostedLoadSmoke(dir: string): Promise<void> {
     expect(omp.events.filter((e) => e.type === "extension_error")).toEqual([]);
     expect(omp.notices()).not.toContain(LOGIN_NOTICE);
     expect(existsSync(deliveryPath(stateDirOf(dir), srv.resource, OMP_CLIENT, sessionId))).toBe(true);
-    expect(hostedRow(srv, OMP_CLIENT, sessionId)?.name).toBeNull();
+    expect((await hostedRow(srv, OMP_CLIENT, sessionId))?.name).toBeNull();
     expect(grayboardDescendants(omp.pid)).toEqual([]);
     await omp.quit();
     await until(() => srv.app.mcp.activeLeases === 0, 10_000, "nothing leased after quit");
@@ -216,14 +217,14 @@ export function ompHostedScenario(dir: string): Promise<void> {
     await until(() => leased(srv, OMP_CLIENT, sessionId, "omp-task"), 15_000, "omp-task holds the lease");
     // Its requests report omp's model and thinking level; `inherit` is none (#364).
     const { thinkingLevel } = await omp.command({ type: "get_state" }, 30_000);
-    expect(factsOf(srv, OMP_CLIENT, sessionId)).toEqual({ model: "fake/fake-1", effort: thinkingLevel && thinkingLevel !== "inherit" ? thinkingLevel : null });
+    expect(await factsOf(srv, OMP_CLIENT, sessionId)).toEqual({ model: "fake/fake-1", effort: thinkingLevel && thinkingLevel !== "inherit" ? thinkingLevel : null });
     await idle(omp);
     // A level, then `inherit`: the next call clears the server's effort (#563 item 1).
     for (const [level, effort] of [["high", "high"], ["inherit", null]] as const) {
       await omp.command({ type: "set_thinking_level", level });
       expect((await omp.command({ type: "get_state" })).thinkingLevel ?? null).toBe(effort);
       await omp.command({ type: "prompt", message: "whoami" });
-      await until(() => factsOf(srv, OMP_CLIENT, sessionId)?.effort === effort, 15_000, `the server's effort ${effort}`);
+      await until(async () => (await factsOf(srv, OMP_CLIENT, sessionId))?.effort === effort, 15_000, `the server's effort ${effort}`);
       await idle(omp);
     }
     const first = model.requests[0]!.body;
@@ -245,7 +246,7 @@ export function ompHostedScenario(dir: string): Promise<void> {
     expect(systemText(woken)).toContain('You are "alice@example.com/omp-task" on grayboard.');
     expect(systemText(woken)).not.toContain("no bus name yet");
     expect((await omp.messages()).filter((m) => JSON.stringify(m).includes(`message_id=\\"${ping}\\"`))).toHaveLength(1);
-    expect(srv.app.db.query<{ n: number }, [number]>("SELECT count(*) AS n FROM messages WHERE parent_id = ?").get(ping)!.n).toBe(1);
+    expect((await row<{ n: number }>(srv, "SELECT count(*) AS n FROM messages WHERE parent_id = ?", ping))!.n).toBe(1);
 
     // The next user prompt carries the server's instructions for omp-task.
     // dm_send with a local file uploads it with the message; the peer gets it intact.
@@ -254,8 +255,8 @@ export function ompHostedScenario(dir: string): Promise<void> {
     const next = systemText((await until(() => model.requests[prompted], 15_000, "the send report request")).body);
     expect(next).toContain('You are "alice@example.com/omp-task" on grayboard.');
     expect(next).not.toContain("no bus name yet");
-    const sent = await until(() => srv.app.db.query<{ id: number }, []>("SELECT id FROM messages WHERE body = 'report attached' AND sender = 'alice@example.com/omp-task'").get(), 30_000, "the report DM");
-    const files = srv.app.db.query<{ id: number; filename: string; sha256: string }, [number]>("SELECT id, filename, sha256 FROM attachments WHERE message_id = ?").all(sent.id);
+    const sent = await until(() => row<{ id: number }>(srv, "SELECT id FROM messages WHERE body = 'report attached' AND sender = 'alice@example.com/omp-task'"), 30_000, "the report DM");
+    const files = await rows<{ id: number; filename: string; sha256: string }>(srv, "SELECT id, filename, sha256 FROM attachments WHERE message_id = ?", sent.id);
     expect(files).toEqual([{ id: expect.any(Number), filename: "report.txt", sha256: sha256Hex(new TextEncoder().encode(report)) }]);
     expect(readFileSync((await peer.call("attachment_get", { id: files[0]!.id })).path, "utf8")).toBe(report);
     await idle(omp);
@@ -264,7 +265,7 @@ export function ompHostedScenario(dir: string): Promise<void> {
     // under GRAYBOARD_ATTACHMENTS_DIR, this bus's folder.
     writeFileSync(join(peer.dir, "notes.txt"), notes);
     const withFile = (await peer.call("dm_send", { to: "alice@example.com/omp-task", body: "notes attached", attachments: [join(peer.dir, "notes.txt")] })).message_id;
-    const fileId = srv.app.db.query<{ id: number }, [number]>("SELECT id FROM attachments WHERE message_id = ?").get(withFile)!.id;
+    const fileId = (await row<{ id: number }>(srv, "SELECT id FROM attachments WHERE message_id = ?", withFile))!.id;
     const saved = await toolResultNamed(omp, `${PREFIX}attachment_get`);
     expect(saved.isError).toBeFalsy();
     const got = JSON.parse(resultText(saved)) as { path: string };
@@ -275,7 +276,7 @@ export function ompHostedScenario(dir: string): Promise<void> {
 
     // Quitting releases the lease and ends the session.
     await omp.quit();
-    await until(() => srv.app.mcp.activeLeases === 0 && !hostedRow(srv, OMP_CLIENT, sessionId), 10_000, "released on quit");
+    await until(async () => srv.app.mcp.activeLeases === 0 && !(await hostedRow(srv, OMP_CLIENT, sessionId)), 10_000, "released on quit");
   });
 }
 
@@ -299,16 +300,16 @@ export function ompHostedTaskScenario(dir: string): Promise<void> {
     await omp.command({ type: "prompt", message: "bind" });
     await until(() => leased(srv, OMP_CLIENT, sessionId, "omp-task"), 30_000, "omp-task holds the lease");
     await idle(omp);
-    const root = serverId(srv, sessionId)!;
+    const root = (await serverId(srv, sessionId))!;
 
     // Both children send while held open; each send is the child's own write,
     // under main's root and name, from a child registered with no intermediates.
     await omp.command({ type: "prompt", message: "fan out" });
-    const writes = await until(() => {
-      const w = audits(srv, "hosted.write").filter((a) => a.detail.tool === "dm_send");
+    const writes = await until(async () => {
+      const w = (await audits(srv, "hosted.write")).filter((a) => a.detail.tool === "dm_send");
       return w.length === 2 ? w : undefined;
     }, 60_000, "both children's sends");
-    const registered = audits(srv, "hosted.child_registered");
+    const registered = await audits(srv, "hosted.child_registered");
     expect(registered.map((r) => r.target)).toEqual([root, root]);
     expect(registered.map((r) => r.detail.via)).toEqual([[], []]);
     const children = registered.map((r) => r.detail.child as string);
@@ -318,9 +319,9 @@ export function ompHostedTaskScenario(dir: string): Promise<void> {
     expect(registered.map((r) => r.detail.source_session_id)).not.toContain(sessionId);
     expect(writes.map((w) => w.target).sort()).toEqual([...children].sort());
     for (const w of writes) expect(w.detail).toMatchObject({ session: w.target, root, held: ["alice@example.com/omp-task"] });
-    expect(srv.app.db.query<{ body: string; sender: string }, []>("SELECT body, sender FROM messages WHERE body LIKE 'child %' ORDER BY body").all())
+    expect(await rows<{ body: string; sender: string }>(srv, "SELECT body, sender FROM messages WHERE body LIKE 'child %' ORDER BY body"))
       .toEqual([0, 1].map((i) => ({ body: `child ${i}`, sender: "alice@example.com/omp-task" })));
-    expect(liveChildren(srv, root).sort()).toEqual([...children].sort());
+    expect((await liveChildren(srv, root)).sort()).toEqual([...children].sort());
     // A subagent's requests carry no grayboard instructions.
     const childRequests = model.requests.filter((r) => fromChild(r.body));
     expect(childRequests.length).toBeGreaterThan(0);
@@ -338,9 +339,9 @@ export function ompHostedTaskScenario(dir: string): Promise<void> {
 
     // Released, both runs end: each child is ended, while omp still holds them live.
     writeFileSync(gate, "");
-    await until(() => audits(srv, "hosted.child_released").length === 2, 30_000, "both children released");
-    expect(audits(srv, "hosted.child_released").map((r) => [r.target, r.detail.child]).sort()).toEqual(children.map((c) => [root, c]).sort());
-    expect(liveChildren(srv, root)).toEqual([]);
+    await until(async () => (await audits(srv, "hosted.child_released")).length === 2, 30_000, "both children released");
+    expect((await audits(srv, "hosted.child_released")).map((r) => [r.target, r.detail.child]).sort()).toEqual(children.map((c) => [root, c]).sort());
+    expect(await liveChildren(srv, root)).toEqual([]);
     await idle(omp);
     // The children's requests after the ping (their runs' last steps) don't carry it either (#526).
     const late = model.requests.filter((r) => fromChild(r.body)).slice(childRequests.length);
@@ -348,7 +349,7 @@ export function ompHostedTaskScenario(dir: string): Promise<void> {
     expect(model.requests.filter((r) => fromChild(r.body) && r.body.messages.some((m) => messageText(m).includes(`message_id="${ping}"`)))).toEqual([]);
     expect(grayboardDescendants(omp.pid)).toEqual([]);
     await omp.quit();
-    await until(() => srv.app.mcp.activeLeases === 0 && !hostedRow(srv, OMP_CLIENT, sessionId), 10_000, "released on quit");
+    await until(async () => srv.app.mcp.activeLeases === 0 && !(await hostedRow(srv, OMP_CLIENT, sessionId)), 10_000, "released on quit");
   });
 }
 
@@ -376,28 +377,28 @@ export function ompHostedNestedScenario(dir: string): Promise<void> {
     await omp.command({ type: "prompt", message: "bind" });
     await until(() => leased(srv, OMP_CLIENT, sessionId, "omp-nest"), 30_000, "omp-nest holds the lease");
     await idle(omp);
-    const root = serverId(srv, sessionId)!;
+    const root = (await serverId(srv, sessionId))!;
 
     await omp.command({ type: "prompt", message: "nest" });
     const registered = () => audits(srv, "hosted.child_registered");
-    const sends = () => audits(srv, "hosted.write").filter((a) => a.detail.tool === "dm_send");
-    const [inner] = await until(() => registered().length === 1 && sends().length === 1 ? registered() : undefined, 60_000, "the grandchild's registration and send");
+    const sends = async () => (await audits(srv, "hosted.write")).filter((a) => a.detail.tool === "dm_send");
+    const [inner] = await until(async () => (await registered()).length === 1 && (await sends()).length === 1 ? registered() : undefined, 60_000, "the grandchild's registration and send");
     expect(inner!.target).toBe(root);
     expect(inner!.detail.via).toHaveLength(1);
     const parentSession = (inner!.detail.via as string[])[0];
     expect([sessionId, inner!.detail.source_session_id]).not.toContain(parentSession);
     const grandchild = inner!.detail.child as string;
-    expect(sends()[0]!.target).toBe(grandchild);
-    expect(liveChildren(srv, root)).toEqual([grandchild]);
+    expect((await sends())[0]!.target).toBe(grandchild);
+    expect(await liveChildren(srv, root)).toEqual([grandchild]);
 
     // Released, the grandchild's run ends it; fake-child-0 then sends as itself.
     writeFileSync(gate, "");
-    const [, middle] = await until(() => registered().length === 2 ? registered() : undefined, 30_000, "fake-child-0's registration");
+    const [, middle] = await until(async () => (await registered()).length === 2 ? registered() : undefined, 30_000, "fake-child-0's registration");
     expect(middle!.target).toBe(root);
     expect(middle!.detail).toMatchObject({ source_session_id: parentSession, via: [] });
     const child = middle!.detail.child as string;
     expect(child).not.toBe(grandchild);
-    const writes = await until(() => sends().length === 2 ? sends() : undefined, 30_000, "fake-child-0's send");
+    const writes = await until(async () => (await sends()).length === 2 ? sends() : undefined, 30_000, "fake-child-0's send");
     expect(writes.map((w) => w.target)).toEqual([grandchild, child]);
     for (const w of writes) expect(w.detail).toMatchObject({ session: w.target, root, held: ["alice@example.com/omp-nest"] });
     // The task call blocked: fake-child-0's next request carries the grandchild's
@@ -405,18 +406,18 @@ export function ompHostedNestedScenario(dir: string): Promise<void> {
     const results = model.requests.filter((r) => childOf(r.body) === "fake-child-0").flatMap((r) => r.body.messages.filter((m) => m.role === "tool").map(messageText));
     expect(results.some((t) => t.includes("fake-child-1 done"))).toBe(true);
     expect(model.requests.filter((r) => r.body.messages.some((m) => messageText(m).includes("Spawned agent")))).toEqual([]);
-    expect(srv.app.db.query<{ body: string; sender: string }, []>("SELECT body, sender FROM messages WHERE body IN ('inner', 'middle') ORDER BY id").all())
+    expect(await rows<{ body: string; sender: string }>(srv, "SELECT body, sender FROM messages WHERE body IN ('inner', 'middle') ORDER BY id"))
       .toEqual([{ body: "inner", sender: "alice@example.com/omp-nest" }, { body: "middle", sender: "alice@example.com/omp-nest" }]);
 
-    await until(() => audits(srv, "hosted.child_released").length === 2, 30_000, "both children released");
+    await until(async () => (await audits(srv, "hosted.child_released")).length === 2, 30_000, "both children released");
     // Each end is sent after its run's last step without being awaited, so the
     // two may land in either order.
-    expect(audits(srv, "hosted.child_released").map((r) => [r.target, r.detail.child]).sort()).toEqual([[root, grandchild], [root, child]].sort());
-    expect(liveChildren(srv, root)).toEqual([]);
+    expect((await audits(srv, "hosted.child_released")).map((r) => [r.target, r.detail.child]).sort()).toEqual([[root, grandchild], [root, child]].sort());
+    expect(await liveChildren(srv, root)).toEqual([]);
     await idle(omp);
     expect(grayboardDescendants(omp.pid)).toEqual([]);
     await omp.quit();
-    await until(() => srv.app.mcp.activeLeases === 0 && !hostedRow(srv, OMP_CLIENT, sessionId), 10_000, "released on quit");
+    await until(async () => srv.app.mcp.activeLeases === 0 && !(await hostedRow(srv, OMP_CLIENT, sessionId)), 10_000, "released on quit");
   });
 }
 
@@ -1182,7 +1183,8 @@ export function ompLocalAcpScenario(dir: string): Promise<void> {
 // tools, aren't reported, nor is a grayboard a harness under omp starts.
 // `push`: the client's exact grayboard as a real ACP client declares it, a
 // plain `grayboard mcp` (push on), rather than a copy of the adapter's
-// tools-only entry. It then takes omp-local before the adapter's child (#1381).
+// tools-only entry. It then takes omp-local before the adapter's child, which
+// takes it back from that sibling when it starts (#1381).
 export function ompLocalAcpClientGrayboardScenario(dir: string, { push = false }: { push?: boolean } = {}): Promise<void> {
   return named(OMP_HARNESS, async () => {
     const procs: ChildProcess[] = [];
@@ -1224,7 +1226,7 @@ process.stdin.setEncoding("utf8").on("data", (c) => {
       // grayboard is tools-only: it takes no name and keeps no PID record.
       // With push on it takes omp-local first (by omp's BUS_IDENTITY, which it
       // inherits, or by the record under the same omp), and the adapter's
-      // child runs unbound (#1381).
+      // child, starting after, takes it from that sibling (#1381).
       const rows = (sql: string, name?: string) => {
         try {
           return existsSync(join(dir, "bus.db")) ? localRows(dir, sql, ...(name === undefined ? [] : [name])).length : 0;
@@ -1249,6 +1251,11 @@ process.stdin.setEncoding("utf8").on("data", (c) => {
         : rows("SELECT 1 FROM ids WHERE harness_session IS NULL AND ended_at IS NULL") === 1, 30_000, "the client's grayboard registers");
       writeFileSync(go, "");
       await until(() => holds("omp-local"), 30_000, "the adapter's grayboard holds omp-local");
+      if (push) {
+        // Taken from the client's, which holds nothing now, audited as such.
+        expect(rows("SELECT 1 FROM alias_holds h JOIN ids i ON i.id = h.id WHERE i.harness_session IS NULL")).toBe(0);
+        expect(rows("SELECT 1 FROM audit_log a JOIN ids i ON i.id = a.target WHERE a.action = 'alias.displaced' AND i.harness_session IS NULL AND i.ended_at IS NULL")).toBe(1);
+      }
       await until(() => grayboardDescendants(acp.proc.pid!).length === 3, 30_000, "the client's grayboard and the harness's run beside the adapter's");
       for (const text of ["hi", "again"]) await acp.call("session/prompt", { sessionId, prompt: [{ type: "text", text }] });
       // The adapter's own log lines; ACP also mirrors each notice at debug.
@@ -1299,22 +1306,22 @@ export function ompHostedManyChildrenScenario(dir: string): Promise<void> {
     await omp.command({ type: "prompt", message: "bind" });
     await until(() => leased(srv, OMP_CLIENT, sessionId, "omp-many"), 30_000, "omp-many holds the lease");
     await idle(omp);
-    const root = serverId(srv, sessionId)!;
+    const root = (await serverId(srv, sessionId))!;
 
     let most = 0;
     await omp.command({ type: "prompt", message: "fan out" });
-    await until(() => {
-      most = Math.max(most, liveChildren(srv, root).length);
-      return audits(srv, "hosted.child_released").length === n;
+    await until(async () => {
+      most = Math.max(most, (await liveChildren(srv, root)).length);
+      return (await audits(srv, "hosted.child_released")).length === n;
     }, 600_000, `${n} children released`);
-    const writes = audits(srv, "hosted.write").filter((a) => a.detail.tool === "peer_status");
+    const writes = (await audits(srv, "hosted.write")).filter((a) => a.detail.tool === "peer_status");
     expect(writes).toHaveLength(n);
-    const registered = audits(srv, "hosted.child_registered");
+    const registered = await audits(srv, "hosted.child_registered");
     expect(registered).toHaveLength(n);
     expect(new Set(registered.map((r) => r.detail.child)).size).toBe(n);
     expect(registered.every((r) => r.target === root)).toBe(true);
     expect(most).toBeLessThanOrEqual(1);
-    expect(liveChildren(srv, root)).toEqual([]);
+    expect(await liveChildren(srv, root)).toEqual([]);
     await idle(omp, 60_000);
     await omp.quit();
   });

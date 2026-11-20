@@ -13,6 +13,7 @@ import { hostedServer, seedGrant, tokenRequests, type HostedServer } from "./hos
 import { answerPeer, expectDeliveryRecords, expectSignInOffer, hostedPeer, tokenPeer, hostedRow, leased, ownershipEnded, pingPong, scripted, statusOf, stopAll, toolResultNamed, type Peer, type Pi } from "./pi.ts";
 import { grayboardDescendants } from "./procs.ts";
 import { accessAudits } from "./audit.ts";
+import { row as sqlRow } from "./repo_sql.ts";
 import { serviceRun } from "./service_token.ts";
 import { until } from "./until.ts";
 
@@ -119,33 +120,33 @@ export function hostedCarryScenario(h: HostedHarness, dir: string): Promise<void
     await proc.command({ type: "prompt", message: "bind" });
     await until(() => leasedAs(srv, first.sessionId), 30_000, `first session leased as ${name}`);
     const p1 = await ping();
-    const firstOwnership = row(srv, first.sessionId)!.ownership_id;
+    const firstOwnership = (await row(srv, first.sessionId))!.ownership_id;
 
     // /fork: the outgoing session ends; the fork binds the name under its own ownership and lease.
     await h.fork(proc);
     const forked = await proc.command({ type: "get_state" });
     expect(forked.sessionId).not.toBe(first.sessionId);
     await until(() => leasedAs(srv, forked.sessionId), 15_000, `fork leased as ${name}`);
-    expect(row(srv, first.sessionId)).toBeUndefined();
-    expect(ownershipEnded(srv, firstOwnership)).toBe(true);
-    expect(row(srv, forked.sessionId)!.ownership_id).not.toBe(firstOwnership);
+    expect(await row(srv, first.sessionId)).toBeUndefined();
+    expect(await ownershipEnded(srv, firstOwnership)).toBe(true);
+    expect((await row(srv, forked.sessionId))!.ownership_id).not.toBe(firstOwnership);
     const p2 = await ping();
 
     // /new carries it on.
-    const forkOwnership = row(srv, forked.sessionId)!.ownership_id;
+    const forkOwnership = (await row(srv, forked.sessionId))!.ownership_id;
     await proc.command({ type: "new_session" });
     const fresh = await proc.command({ type: "get_state" });
     expect([first.sessionId, forked.sessionId]).not.toContain(fresh.sessionId);
     await until(() => leasedAs(srv, fresh.sessionId), 15_000, `new session leased as ${name}`);
-    expect(row(srv, forked.sessionId)).toBeUndefined();
-    expect(ownershipEnded(srv, forkOwnership)).toBe(true);
+    expect(await row(srv, forked.sessionId)).toBeUndefined();
+    expect(await ownershipEnded(srv, forkOwnership)).toBe(true);
     const p3 = await ping();
 
     // /resume of the first session: it rebinds the name it remembers.
     await proc.command({ type: "switch_session", sessionPath: first.sessionFile });
     expect((await proc.command({ type: "get_state" })).sessionId).toBe(first.sessionId);
     await until(() => leasedAs(srv, first.sessionId), 15_000, `resumed first session leased as ${name}`);
-    expect(row(srv, fresh.sessionId)).toBeUndefined();
+    expect(await row(srv, fresh.sessionId)).toBeUndefined();
     const p4 = await ping();
     expect(grayboardDescendants(proc.pid)).toEqual([]);
     expect(proc.events.filter((e) => e.type === "extension_error")).toEqual([]);
@@ -157,7 +158,7 @@ export function hostedCarryScenario(h: HostedHarness, dir: string): Promise<void
     await expectDeliveryRecords(forked.sessionFile, forked.sessionId, [p2], name, h.forkCopiesRecords ? { root: first.sessionId, pings: [p1] } : undefined);
     await expectDeliveryRecords(fresh.sessionFile, fresh.sessionId, [p3], name);
     await proc.quit();
-    await until(() => srv.app.mcp.activeLeases === 0 && !row(srv, first.sessionId), 10_000, "released on quit");
+    await until(async () => srv.app.mcp.activeLeases === 0 && !(await row(srv, first.sessionId)), 10_000, "released on quit");
   });
 }
 
@@ -173,9 +174,9 @@ export function hostedRefreshLogoutScenario(h: HostedHarness, dir: string): Prom
     scripted("check", [{ tool: `${h.prefix}whoami`, args: {} }]),
   ], async ({ srv, start }) => {
     const seeded = await seedGrant(srv, h.stateDir(dir), h.client, "alice@example.com", -60_000);
-    const refreshTokens = () => srv.app.db.query<{ n: number; spent: number }, [string]>(
-      "SELECT count(*) AS n, count(spent_at) AS spent FROM oauth_tokens WHERE grant_id = ? AND kind = 'refresh'").get(seeded.grantId)!;
-    expect(refreshTokens()).toEqual({ n: 1, spent: 0 });
+    const refreshTokens = async () => (await sqlRow<{ n: number; spent: number }>(srv,
+      "SELECT count(*) AS n, count(spent_at) AS spent FROM oauth_tokens WHERE grant_id = ? AND kind = 'refresh'", seeded.grantId))!;
+    expect(await refreshTokens()).toEqual({ n: 1, spent: 0 });
     const tokens = tokenRequests(srv);
 
     // The one rotation must serve both processes, even when b waits on a
@@ -186,14 +187,14 @@ export function hostedRefreshLogoutScenario(h: HostedHarness, dir: string): Prom
     const [sa, sb] = await Promise.all([a.command({ type: "get_state" }, h.stateTimeout), b.command({ type: "get_state" }, h.stateTimeout)]);
     expect(sa.sessionId).not.toBe(sb.sessionId);
     // Both reached the server on one refresh request, and so one rotation.
-    await until(() => row(srv, sa.sessionId) && row(srv, sb.sessionId), h.onServerTimeout, "both sessions on the server");
-    expect(refreshTokens()).toEqual({ n: 2, spent: 1 });
+    await until(async () => await row(srv, sa.sessionId) && await row(srv, sb.sessionId), h.onServerTimeout, "both sessions on the server");
+    expect(await refreshTokens()).toEqual({ n: 2, spent: 1 });
     expect(tokens()).toEqual(["refresh_token"]);
 
     await a.command({ type: "prompt", message: "bind a" });
     await b.command({ type: "prompt", message: "bind b" });
-    await until(() => row(srv, sa.sessionId)?.name === nameA && row(srv, sb.sessionId)?.name === nameB && srv.app.mcp.activeLeases === 2, 30_000, "both leased");
-    expect(refreshTokens()).toEqual({ n: 2, spent: 1 });
+    await until(async () => (await row(srv, sa.sessionId))?.name === nameA && (await row(srv, sb.sessionId))?.name === nameB && srv.app.mcp.activeLeases === 2, 30_000, "both leased");
+    expect(await refreshTokens()).toEqual({ n: 2, spent: 1 });
     expect(tokens()).toEqual(["refresh_token"]);
     await Promise.all([h.idle(a), h.idle(b)]);
 
@@ -205,7 +206,7 @@ export function hostedRefreshLogoutScenario(h: HostedHarness, dir: string): Prom
     if (h.logoutNoticeLags) await until(() => a.notices().slice(seenA).includes(loggedOut), 10_000, "the logout notice");
     else expect(a.notices().slice(seenA)).toContain(loggedOut);
     await until(() => srv.app.mcp.activeLeases === 0, 15_000, "both leases dropped");
-    expect(srv.app.db.query<{ revoked_at: number | null }, [string]>("SELECT revoked_at FROM oauth_grants WHERE id = ?").get(seeded.grantId)!.revoked_at).not.toBeNull();
+    expect((await sqlRow<{ revoked_at: number | null }>(srv, "SELECT revoked_at FROM oauth_grants WHERE id = ?", seeded.grantId))!.revoked_at).not.toBeNull();
     await until(() => b.notices().slice(seenB).includes(loginNotice(h.name)), 15_000, "the login notice in the other process");
     const paused = (status: string) => status.includes("\nsign-in: signed out (logged_out); run /grayboard login\n") && /: paused, /.test(status);
     // A root whose subscription closed first sits in `retrying` until its next reopen meets the sign-out (#606).
@@ -270,31 +271,31 @@ export function hostedStaticScenario(h: HostedHarness, dir: string): Promise<voi
     await until(() => leased(srv, run.clientId, state.sessionId, "w-1"), 30_000, `leased as ${NAME}`);
 
     const { message_id: id } = await sender.call("dm_send", { to: NAME, body: "ping w-1" });
-    const reply = await until(() => srv.app.db.query<{ sender: string }, [number]>("SELECT sender FROM messages WHERE parent_id = ? AND body = 'pong'").get(id), 30_000, `pong to DM ${id}`);
+    const reply = await until(() => sqlRow<{ sender: string }>(srv, "SELECT sender FROM messages WHERE parent_id = ? AND body = 'pong'", id), 30_000, `pong to DM ${id}`);
     expect(reply.sender).toBe(NAME);
     await h.idle(proc);
 
     // A subagent of the service run (#1303): it inherits the run token, registers as a child under the root's
     // svc_ session at its first call, writes as the root's name, and ends with its run.
     rootSession = state.sessionId;
-    const root = srv.app.db.query<{ session_id: string }, [string, string]>("SELECT session_id FROM hosted_sessions WHERE client_id = ? AND source_session_id = ?").get(run.clientId, state.sessionId)!.session_id;
+    const root = (await sqlRow<{ session_id: string }>(srv, "SELECT session_id FROM hosted_sessions WHERE client_id = ? AND source_session_id = ?", run.clientId, state.sessionId))!.session_id;
     await proc.command({ type: "prompt", message: "delegate" });
-    const sent = await until(() => srv.app.db.query<{ sender: string }, []>("SELECT sender FROM messages WHERE body = 'from the subagent'").get(), 60_000, "the subagent's DM");
+    const sent = await until(() => sqlRow<{ sender: string }>(srv, "SELECT sender FROM messages WHERE body = 'from the subagent'"), 60_000, "the subagent's DM");
     expect(sent.sender).toBe(NAME);
-    const registered = accessAudits(srv.app.db, "hosted.child_registered");
+    const registered = await accessAudits(srv, "hosted.child_registered");
     expect(registered.map((r) => [r.target, r.detail.via])).toEqual([[root, []]]);
     const child = registered[0]!.detail.child as string;
     expect(child).not.toBe(root);
     expect(registered[0]!.detail.source_session_id).not.toBe(state.sessionId);
-    const childRow = srv.app.db.query<{ client_id: string; user_id: number; root_session_id: string | null }, [string]>("SELECT client_id, user_id, root_session_id FROM hosted_sessions WHERE session_id = ?").get(child);
-    const rootRow = srv.app.db.query<{ user_id: number }, [string]>("SELECT user_id FROM hosted_sessions WHERE session_id = ?").get(root)!;
+    const childRow = await sqlRow<{ client_id: string; user_id: number; root_session_id: string | null }>(srv, "SELECT client_id, user_id, root_session_id FROM hosted_sessions WHERE session_id = ?", child);
+    const rootRow = (await sqlRow<{ user_id: number }>(srv, "SELECT user_id FROM hosted_sessions WHERE session_id = ?", root))!;
     expect(childRow).toEqual({ client_id: run.clientId, user_id: rootRow.user_id, root_session_id: root });
-    const writes = accessAudits(srv.app.db, "hosted.write").filter((w) => w.detail.tool === "dm_send" && w.target === child);
+    const writes = (await accessAudits(srv, "hosted.write")).filter((w) => w.detail.tool === "dm_send" && w.target === child);
     expect(writes.map((w) => w.detail)).toEqual([expect.objectContaining({ session: child, root, held: [NAME] })]);
     writeFileSync(gate, "");
-    await until(() => accessAudits(srv.app.db, "hosted.child_released").length === 1, 30_000, "the subagent's child ended with its run");
-    expect(accessAudits(srv.app.db, "hosted.child_released").map((r) => [r.target, r.detail.child])).toEqual([[root, child]]);
-    expect(srv.app.db.query("SELECT 1 FROM hosted_sessions WHERE session_id = ?").get(child)).toBeNull();
+    await until(async () => (await accessAudits(srv, "hosted.child_released")).length === 1, 30_000, "the subagent's child ended with its run");
+    expect((await accessAudits(srv, "hosted.child_released")).map((r) => [r.target, r.detail.child])).toEqual([[root, child]]);
+    expect(await sqlRow(srv, "SELECT 1 FROM hosted_sessions WHERE session_id = ?", child)).toBeNull();
     await h.idle(proc);
 
     const status = await statusOf(proc);

@@ -8,6 +8,7 @@ import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import type { DeliveryEvent } from "../../src/server/application.ts";
 import { authorize } from "../../src/server/policy.ts";
 import { accessAudits } from "../support/audit.ts";
+import { drained, exec, rows } from "../support/repo_sql.ts";
 import { board, direct } from "../support/events.ts";
 import { seed } from "../support/seed.ts";
 import { TestServer } from "../support/server.ts";
@@ -159,7 +160,7 @@ test("POST /api/teams/<t>/policy: owner sets it (audited once per change), membe
   const deleg = await policy(alice, "eng", "delegating");
   expect(deleg.body).toEqual({ ok: true, team: "eng", policy: "delegating", previous: "collaborative" });
   expect((await policy(alice, "eng", "open")).status).toBe(200);
-  expect(accessAudits(srv.app.db, "team.policy_set").map((r) => [r.actor, r.target, r.detail])).toEqual([
+  expect((await accessAudits(srv, "team.policy_set")).map((r) => [r.actor, r.target, r.detail])).toEqual([
     [A, "eng", { from: "open", to: "collaborative" }],
     [A, "eng", { from: "collaborative", to: "delegating" }],
     [A, "eng", { from: "delegating", to: "open" }],
@@ -213,7 +214,7 @@ test("an expired claim's post @mentioning another user's agent arrives ungranted
   const key = `deploy @${A}/be run it`;
   await bfe.call("claim_take", { key, board: "lobby", ttl_minutes: 60 });
   await bqa.call("claim_watch", { key });
-  await seed(srv.app.repo, () => srv.app.db.run("UPDATE claims SET expires_at = 1 WHERE key = ?", [key]));
+  await exec(srv, "UPDATE claims SET expires_at = 1 WHERE key = ?", key);
   // Any claim call sweeps the lapse.
   await bfe.call("claim_list", {});
   const expired = board((i) => i.kind === "push" && i.post.body.startsWith(`[expired] ${key}`));
@@ -257,7 +258,8 @@ test("an [unclaimed] reply by another user's team-alias lane reaches the poster 
   const key = `queue:jobs:${postId}`;
   await lane.next(pushed("a job"));
   await lane.call("claim_release", { key, note: "pass" });
-  const reply = srv.app.db.query("SELECT author, author_user FROM posts WHERE parent_id = ?").all(postId);
+  await drained(srv);
+  const reply = await rows(srv, "SELECT author, author_user FROM posts WHERE parent_id = ?", postId);
   expect(reply).toEqual([{ author: "eng/lane", author_user: A }]);
   const got = await bfe.next(board((i) => i.kind === "push" && i.post.body.startsWith(`[unclaimed] ${key}:`)));
   expect(got.actionable).toBe(false);

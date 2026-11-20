@@ -14,7 +14,7 @@ import { boardNotification, dmNotification, fenceChannel, type Pending } from ".
 import { DELEGATE_LIMIT, countOpenDelegations, delegateOkFields, delegateThrottled, launcherInstruction, launchers, resolveDelegation } from "../core/delegation.ts";
 import { RateLimiter } from "../core/rate_limit.ts";
 import { writeCoreAudit } from "../core/audit.ts";
-import { MAX_HOLDS, TOOLS_ONLY_BIND, TOUCH_EVERY_MS, actingAs, bindMissed, boardActor, childStateRefusal, holdsOf, logBinding, replyPeer, replyPeerError, replySender, replySenderError, runnerChildInstructions, unbindMissed, envSessionKey, bindOk, boundInstructions, heldNote, idAddress, lastWasRelease, notHolding, primaryOf, unbindOk, unboundInstruction, mintSessionKey, restoreNote, unboundPeer, unverifiedRestoreNote, wrapperNote } from "../core/bindings.ts";
+import { MAX_HOLDS, TOOLS_ONLY_BIND, displacedNote, holderOf, TOUCH_EVERY_MS, actingAs, bindMissed, boardActor, childStateRefusal, holdsOf, logBinding, replyPeer, replyPeerError, replySender, replySenderError, runnerChildInstructions, unbindMissed, envSessionKey, bindOk, boundInstructions, heldNote, idAddress, lastWasRelease, notHolding, primaryOf, unbindOk, unboundInstruction, mintSessionKey, restoreNote, unboundPeer, unverifiedRestoreNote, wrapperNote } from "../core/bindings.ts";
 import { CoreError } from "../core/errors.ts";
 import { claimExpiryTimer, listClaims } from "../core/claims.ts";
 import { isQueueBoard } from "../core/boards.ts";
@@ -53,7 +53,7 @@ import {
 import { localDbPath } from "./open.ts";
 import { deliverEnded, listenForWakeup, poke } from "./wakeup.ts";
 import { sockDir } from "../shared/sockdir.ts";
-import { ChildSessions, acquireName, attachSession, candidateNames, childFallback, conversationSnapshot, detachSession, endLocalSession, keyedHarness, liveSessions, nothingEnded, registerChild, registerSession, releaseName, runnerRoot, runnerRootLive, setHeldMeta, SIBLING_WAIT_MS, siblingGone, thisSession, type Ended, type Leave, type SessionKind } from "./binding.ts";
+import { ChildSessions, acquireName, displaceableHolder, attachSession, candidateNames, childFallback, conversationSnapshot, detachSession, endLocalSession, keyedHarness, liveSessions, nothingEnded, registerChild, registerSession, releaseName, runnerRoot, runnerRootLive, setHeldMeta, SIBLING_WAIT_MS, siblingGone, thisSession, type Ended, type Leave, type SessionKind } from "./binding.ts";
 import { GRAYBOARD_AGENT_META, validSourceId } from "../shared/session_meta.ts";
 import { MISSING_TEXT, TOOL_USE_META, readCurrent, takeRecord, type MissingCause } from "../shared/claude_agents.ts";
 import { listenIdentity, type IdentityRequest } from "../shared/claude_identity.ts";
@@ -239,6 +239,11 @@ let adapterEpoch = 0;
 // outgoing work; adapterEpoch advances only after that selection completes.
 let adapterSelectedEpoch = 0;
 let adapterPaused = ADAPTER_OWNER !== undefined;
+// An adapter's child (#1381) is its harness session's delivery owner: a name
+// it takes that a sibling grayboard under the same harness holds (one the
+// harness's MCP config starts beside it, whose pushes the harness drops) is
+// taken from that sibling (acquireName's `displace`), never left to it.
+const DISPLACE = ADAPTER_OWNER !== undefined && HARNESS_SESSION !== undefined ? process.ppid : undefined;
 
 // The live root this process is a runner child of (#523 step 5), while it
 // is one; null for a root. A runner child acts under its root's addresses,
@@ -324,6 +329,38 @@ function localRecipient(to: string): string {
   return parsed.address;
 }
 
+// A name this session held that the database says it no longer does: an
+// adapter's child under the same harness took it (#1381, acquireName's
+// `displace`). Dropped here before a drain reads its mail or a call acts as
+// it; its socket closes (the taker's has replaced it, so the close leaves
+// that alone), and the next result says so. The name record isn't rewritten:
+// the taker's is the record now.
+function syncHolds(): void {
+  if (liveParent !== null || WRITES_AS || !held.length) return;
+  const still = holdsOf(db, SESSION_ID);
+  const lost = held.filter((h) => !still.includes(h));
+  if (!lost.length) return;
+  for (const h of lost) stopListening(h);
+  held = held.filter((h) => still.includes(h));
+  for (const h of lost) requeued.push(displacedNote(h, holderOf(db, h)));
+  instructionsStale = true;
+  console.error(`[grayboard] session ${SESSION_ID} lost "${lost.join('", "')}" to another session; ${held.length ? `holds "${held.join('", "')}"` : "unbound"}`);
+  if (!held.length) void candidateNames(db, SUGGESTED).then((c) => { if (!held.length) unboundCandidates = c; });
+}
+// Whether a drain may still mark mail to `reader` delivered: the ID, or a name the database says this session holds.
+const stillMine = (reader: string): boolean => reader === SESSION_ID || holdsOf(db, SESSION_ID).includes(reader);
+// Marks each of `readers` still this session's, in one BEGIN IMMEDIATE with
+// the check; false when one was taken (its mail is left to the taker).
+const markIfMine = (readers: string[], mark: (reader: string) => void): boolean =>
+  db.transaction(() => {
+    let all = true;
+    for (const r of readers) {
+      if (stillMine(r)) mark(r);
+      else all = false;
+    }
+    return all;
+  }).immediate();
+
 function bindHint(child: string | undefined): { bind_hint?: string } {
   if (child !== undefined || bindHinted || WRITES_AS || held.length) return {};
   bindHinted = true;
@@ -363,9 +400,10 @@ async function restoreNames(rec: { names: string[]; session_id: string }, siblin
   const deadline = Date.now() + SIBLING_WAIT_MS;
   for (const name of rec.names.slice(0, MAX_HOLDS)) {
     const n = normalizeIdentityName(name);
-    if (sibling && n.ok) await siblingGone(db, n.name, process.ppid, Math.max(0, deadline - Date.now()));
+    // A displaceable sibling isn't a predecessor that will exit: no wait.
+    if (sibling && n.ok && !(DISPLACE !== undefined && displaceableHolder(db, n.name, DISPLACE))) await siblingGone(db, n.name, process.ppid, Math.max(0, deadline - Date.now()));
     const r = n.ok
-      ? await acquireName(db, SESSION_ID, n.name, { create: false, restartOf: rec.session_id })
+      ? await acquireName(db, SESSION_ID, n.name, { create: false, restartOf: rec.session_id, displace: DISPLACE })
       : { ok: false as const, error: n.error, ended: nothingEnded() };
     await deliverEnded(db, r.ended);
     if (!r.ok) { missed.push({ name, why: r.error }); continue; }
@@ -437,7 +475,7 @@ if (WRITES_AS) {
   if (snapshot !== null || rec?.names.length) {
     await restoreNames(rec!, snapshot === null);
   } else if (EXPLICIT && !attached) {
-    const r = await acquireName(db, SESSION_ID, SUGGESTED!, { create: true, allowHuman: HUMAN });
+    const r = await acquireName(db, SESSION_ID, SUGGESTED!, { create: true, allowHuman: HUMAN, displace: DISPLACE });
     await deliverEnded(db, r.ended);
     if (r.ok) held.push(r.name);
     else if (HUMAN) {
@@ -750,6 +788,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req, { signal, requestId }) 
     // A runner child whose root isn't live (its parent harness exited while
     // this runner lives on) is its own session from here (#523 step 5).
     if (liveParent !== null && !runnerRootLive(db, SESSION_ID, liveParent)) await rootGone();
+    syncHolds();
     touchSeen(WRITES_AS ? [WRITES_AS] : held);
     // A runner child's own call is its child session's.
     if (agent === undefined) return call(name, args, signal, liveParent === null ? undefined : SESSION_ID);
@@ -1157,6 +1196,7 @@ async function drainLoop(): Promise<void> {
     if (!await pushChannel({ content: `Current grayboard instructions supersede this conversation's earlier bus guidance. Current bus session: ${SESSION_ID}.\n${localInstructions(true, startNotes).join("\n")}`, meta: { kind: "guidance" } })) return;
     claudeGuidancePending = false;
   }
+  syncHolds();
   // Read once: a cursor written under one name must never get another's ids.
   const readers = addresses();
   while (!shuttingDown) {
@@ -1168,6 +1208,7 @@ async function drainLoop(): Promise<void> {
       if (batch.length > 0) any = true;
       for (const msg of batch) {
         if (shuttingDown) return;
+        if (!stillMine(reader)) return lostMidDrain();
         const params = dmNotification(msg, primary());
         // As the DM's row recorded it when sent (#1364), not whether its sender is human now.
         if (dmHuman(msg.id)) params.meta.human = "true";
@@ -1175,7 +1216,9 @@ async function drainLoop(): Promise<void> {
         // A push in flight while another process's open merges a 1.x name in (#1192).
         await testPauseAsync("drain:before-delivered");
         if (sessionEnded) return;
-        deliveredTo(reader, msg.id);
+        // Taken mid-drain (#1381): the taker's drain delivers it. Checked and
+        // marked in one write transaction, so a displacement can't commit between.
+        if (!markIfMine([reader], (r) => deliveredTo(r, msg.id))) return lostMidDrain();
       }
     }
     // A post pending for several addresses (an ID and an alias subscription)
@@ -1194,15 +1237,26 @@ async function drainLoop(): Promise<void> {
     if (boardItems.size > 0) any = true;
     for (const { item, readers: pendingTo } of boardItems.values()) {
       if (shuttingDown) return;
+      // Only while every address is still this session's (#1381): a name
+      // taken mid-drain is the taker's to push; the fresh drain re-reads.
+      if (!pendingTo.every(stillMine)) return lostMidDrain();
       const params = boardNotification(item);
       // As the post's row recorded it when written (#1355), not whether its author is human now.
       if (item.kind === "push" && postHuman(db, item.post)) params.meta.human = "true";
       if (!await pushChannel(params)) return;
+      await testPauseAsync("drain:before-board-delivered");
       if (sessionEnded) return;
-      for (const reader of pendingTo) markDelivered(db, reader, item);
+      if (!markIfMine(pendingTo, (r) => markDelivered(db, r, item))) return lostMidDrain();
     }
     if (!any) break;
   }
+}
+
+// A name taken mid-drain: its mail is left to the taker, and a fresh drain
+// (once this one has cleared `inflight`) runs under what this session still holds.
+function lostMidDrain(): void {
+  syncHolds();
+  setImmediate(onWake);
 }
 
 async function pushChannel(params: { content: string; meta: Record<string, string> }): Promise<boolean> {
@@ -1337,7 +1391,7 @@ async function bind(a: Record<string, unknown>, signal: AbortSignal) {
     // A runner child's bind promotes it to its own session in the
     // transaction that takes the name (#523 step 5).
     const promote = liveParent === null ? null : leaving();
-    const r = await acquireName(db, promote?.leave.self.session_id ?? SESSION_ID, n.name, { create: a.create === true, meta, ...(promote ? { promote: promote.leave } : {}) });
+    const r = await acquireName(db, promote?.leave.self.session_id ?? SESSION_ID, n.name, { create: a.create === true, meta, displace: DISPLACE, ...(promote ? { promote: promote.leave } : {}) });
     await deliverEnded(db, r.ended);
     // Hosted's codes and data for the same refusals (domainData): a name never used without create, with the
     // closest names; a name another session holds, with its holder.

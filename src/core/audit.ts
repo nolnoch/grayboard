@@ -19,7 +19,8 @@
 // as its own session for want of a live root, and binding a name;
 // alias.case_moved and alias.case_collision, a 1.x mixed-case handle moved
 // (or merged) into its lowercase name at open, or left where a merge would
-// change who the name is (#216).
+// change who the name is (#216); and alias.displaced, an adapter's child
+// taking its name from a sibling grayboard under the same harness (#1381).
 // Rows land in the shared audit_log table (core/schema.ts) and are pruned
 // with the bus's retention (src/local/retention.ts).
 import type { Database } from "bun:sqlite";
@@ -32,7 +33,7 @@ export type CoreAuditAction = "alias.created" | "alias.meta_set" | "delegation.r
  * whose settings predate the hook. The hosted plugin refuses a missing record
  * itself, so the server never sees either.
  */
-export type LocalAuditAction = CoreAuditAction | "alias.case_collision" | "alias.case_moved" | "claude.agent_record_missing" | "claude.attribution_off" | "id.conversation_selected";
+export type LocalAuditAction = CoreAuditAction | "alias.case_collision" | "alias.case_moved" | "alias.displaced" | "claude.agent_record_missing" | "claude.attribution_off" | "id.conversation_selected";
 
 /**
  * Where a core function shared by both modes writes its audit row: local

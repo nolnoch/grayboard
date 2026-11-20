@@ -12,6 +12,7 @@ import { OPENCODE_CLIENT, OPENCODE_SESSION_META } from "../../src/server/oauth-c
 import { GRAYBOARD_LAUNCHER_META } from "../../src/shared/session_meta.ts";
 import { bindFixture, withMeta } from "../helpers/hosted.ts";
 import { seed } from "../support/seed.ts";
+import { drained, row, rows } from "../support/repo_sql.ts";
 import { stubAuthRead } from "../support/auth_stub.ts";
 import { until } from "../support/until.ts";
 import { render as renderMetrics } from "../../src/server/metrics.ts";
@@ -310,7 +311,8 @@ test("connected clients cannot dispatch after their actual access deadline", asy
   const client = await connect(await login());
   clock = Date.now() + 3_600_001;
   await expect(client.callTool({ name: "board_create", arguments: { name: "expired", purpose: "blocked" } })).rejects.toThrow();
-  expect(app.db.query("SELECT name FROM boards WHERE name = 'expired'").get()).toBeNull();
+  await drained(srv);
+  expect(await row(srv, "SELECT name FROM boards WHERE name = 'expired'")).toBeNull();
   expect(app.mcp.activeContexts).toBe(app.mcp.activeGetStreams);
 });
 
@@ -369,7 +371,8 @@ for (const version of MCP_PROTOCOL_VERSIONS) for (const failure of ["expiry", "r
     }
     expect(checks).toBe(2);
     expect(await app.repo.aliases.find(app.repo.read, `${issued.authed.user_email}/unselected`)).toBeUndefined();
-    expect(app.db.query("SELECT name FROM boards WHERE name = 'blocked'").get()).toBeNull();
+    await drained(srv);
+    expect(await row(srv, "SELECT name FROM boards WHERE name = 'blocked'")).toBeNull();
     expect(app.mcp.activeContexts).toBe(app.mcp.activeGetStreams);
   } finally { app.oauth.authenticate = original; }
 });
@@ -409,7 +412,7 @@ test("HTTP: a launcher declared in _meta is stored for its session; initialize c
   await bindFixture(lead, "lead");
   await bindFixture(plain, "plain");
   // The declaration reached the server: the flag is stored for lead's session only.
-  const flags = (app.db.query(`SELECT i.launcher FROM aliases a JOIN alias_holds h ON h.address = a.address JOIN ids i ON i.id = h.id WHERE a.address IN ('alice@example.com/lead', 'alice@example.com/plain') ORDER BY a.address`).all() as { launcher: number }[]).map((r) => r.launcher);
+  const flags = (await rows<{ launcher: number }>(srv, `SELECT i.launcher FROM aliases a JOIN alias_holds h ON h.address = a.address JOIN ids i ON i.id = h.id WHERE a.address IN ('alice@example.com/lead', 'alice@example.com/plain') ORDER BY a.address`)).map((r) => r.launcher);
   expect(flags).toEqual([1, 0]);
   // A second initialize of each session, with no declaration on the wire and no delivery lease: neither carries
   // the sentence, since a launcher whose delivery isn't live is no delegation target (#521 4).

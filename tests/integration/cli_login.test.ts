@@ -9,6 +9,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { accessAudits } from "../support/audit.ts";
 import { runCli } from "../support/cli.ts";
+import { drained, exec, row } from "../support/repo_sql.ts";
 import { browse, hostedServer, type HostedServer } from "../support/hosted_oauth.ts";
 import { Browser } from "../support/oauth_browser.ts";
 import { until } from "../support/until.ts";
@@ -54,9 +55,9 @@ test("grayboard login signs in through the AS as grayboard-cli and stores a work
   expect(Object.keys(creds).sort()).toEqual(["server", "session_token", "user_email"]);
   expect(creds).toMatchObject({ server: srv.issuer, user_email: EMAIL });
   expect(creds.session_token).toStartWith("gbrd_v1_");
-  const issued = accessAudits(srv.app.db, "oauth.session_issued");
+  const issued = await accessAudits(srv, "oauth.session_issued");
   expect(issued).toEqual([expect.objectContaining({ actor: EMAIL, detail: expect.objectContaining({ client_id: "grayboard-cli" }) })]);
-  expect(srv.app.db.query("SELECT label FROM sessions WHERE id = ?").get(issued[0]!.detail.token_session as number)).toEqual({ label: expect.stringMatching(/\S/) });
+  expect(await row(srv, "SELECT label FROM sessions WHERE id = ?", issued[0]!.detail.token_session as number)).toEqual({ label: expect.stringMatching(/\S/) });
 
   const whoami = await runCli(["whoami"], { env });
   expect(whoami.code).toBe(0);
@@ -71,14 +72,15 @@ test("a denied consent fails the login and writes no credentials", async () => {
   expect(result.code).toBe(1);
   expect(result.err).toContain("sign-in was denied");
   expect(existsSync(env.GRAYBOARD_CREDENTIALS!)).toBe(false);
-  expect(srv.app.db.query("SELECT COUNT(*) AS n FROM sessions").get()).toEqual({ n: 0 });
+  await drained(srv);
+  expect(await row(srv, "SELECT COUNT(*) AS n FROM sessions")).toEqual({ n: 0 });
 });
 
 // A refusal after the upstream sign-in returns to the CLI's loopback (#928): the CLI exits at once, printing the
 // server's reason, rather than waiting out its five minutes; the browser tab only says the sign-in didn't complete.
 test("a refusal at the provider callback reaches the CLI, which exits promptly with the reason", async () => {
   await srv.app.repo.write(tx => srv.app.repo.users.upsertByEmail(tx, EMAIL, null));
-  await srv.app.repo.write(() => srv.app.db.run("UPDATE users SET disabled_at = ? WHERE email = ?", [Date.now(), EMAIL]));
+  await exec(srv, "UPDATE users SET disabled_at = ? WHERE email = ?", Date.now(), EMAIL);
   const started = Date.now();
   const login = runCli(["login", "--server", srv.issuer], { env, timeoutMs: 30_000 });
   await until(() => existsSync(opened), 20_000, "the CLI to open the authorize URL");
@@ -94,6 +96,6 @@ test("a refusal at the provider callback reaches the CLI, which exits promptly w
   expect(result.code).toBe(1);
   expect(result.err).toContain("sign-in was refused: this account is disabled on this server");
   expect(Date.now() - started).toBeLessThan(25_000);
-  expect(accessAudits(srv.app.db, "oauth.user_refused")).toEqual([expect.objectContaining({ actor: EMAIL, detail: { client_id: "grayboard-cli" } })]);
+  expect(await accessAudits(srv, "oauth.user_refused")).toEqual([expect.objectContaining({ actor: EMAIL, detail: { client_id: "grayboard-cli" } })]);
   expect(existsSync(env.GRAYBOARD_CREDENTIALS!)).toBe(false);
 });
