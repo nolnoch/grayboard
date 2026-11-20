@@ -45,11 +45,16 @@ async function claudeBus(hooks: boolean, client?: ClientShape, harness?: string)
   writeFileSync(host, `const cmd = process.argv.slice(process.argv.indexOf("::") + 1);
 Bun.spawn([process.execPath, ...cmd], { stdio: ["inherit", "inherit", "inherit"] }).exited.then((c) => process.exit(c ?? 0));`);
   const env = localEnv(dir, "cc", { CLAUDECODE: "1", CLAUDE_CODE_ENTRYPOINT: "cli", CLAUDE_CONFIG_DIR: cfg });
-  const s = await mcpSession({ env, cwd: dir, args: ["mcp", "--mode", "local"], client, via: [fake, host, "--dangerously-load-development-channels", "server:grayboard", "::"] });
+  const s = await mcpSession({ env, cwd: dir, args: ["mcp", "--mode", "local"], client, via: standIn(dir, harness) });
   await s.c.listTools();
-  const pid = processDescendants(s.harnessPid).find((p) => p.command.includes(host))!.pid;
-  return { dir, cfg, s, db: new Database(join(dir, "bus.db"), { readonly: true }), pid };
+  return { dir, cfg, s, db: new Database(join(dir, "bus.db"), { readonly: true }), pid: standInPid(dir, s) };
 }
+
+// The launcher prefix that runs grayboard under claudeBus's stand-in in `dir`,
+// and that stand-in's pid under a session's harness.
+const standIn = (dir: string, harness = "claude") =>
+  [join(dir, harness), join(dir, "host.ts"), "--dangerously-load-development-channels", "server:grayboard", "::"];
+const standInPid = (dir: string, s: Session) => processDescendants(s.harnessPid).find((p) => p.command.includes(join(dir, "host.ts")))!.pid;
 
 // The hook events Claude Code would run for this session's harness.
 const hook = (b: Bus, event: "session-start" | "pre-tool-use", input: Record<string, unknown>) =>
@@ -271,11 +276,18 @@ test("a genuinely new configured root has the same correct title before and afte
 test("an adapter's selected identity ignores inherited Claude environment and needs no Claude hook record", async () => {
   const b = await claudeBus(true);
   const owner = "adapter-not-claude";
-  const adapter = await localSession(b.dir, "adapter", { extra: {
-    BUS_HARNESS_SESSION: "pi-current", BUS_ADAPTER_OWNER: owner,
-    CLAUDECODE: "1", CLAUDE_CODE_SESSION_ID: "claude-stale", CLAUDE_CONFIG_DIR: b.cfg,
+  // Under the claude stand-in, with hooks installed, so only BUS_ADAPTER_OWNER
+  // keeps Claude's conversation record from steering it: no BUS_HARNESS_SESSION
+  // at start; the adapter selects its conversation as an adapter does.
+  const adapter = await localSession(b.dir, "adapter", { via: standIn(b.dir), extra: {
+    BUS_ADAPTER_OWNER: owner,
+    CLAUDECODE: "1", CLAUDE_CODE_ENTRYPOINT: "cli", CLAUDE_CODE_SESSION_ID: "claude-stale", CLAUDE_CONFIG_DIR: b.cfg,
   } });
-  await adapter.c.request({ method: "grayboard/session/ready", params: { owner, epoch: 0 } }, z.object({}).passthrough());
+  await adapter.c.listTools();
+  // Claude's hook says the conversation under this harness is claude-stale.
+  runHook("session-start", JSON.stringify({ session_id: "claude-stale" }), { base: b.dir, env: { CLAUDE_PID: String(standInPid(b.dir, adapter)) }, hosted: false });
+  await adapter.c.request({ method: "grayboard/session", params: { owner, epoch: 1, session: "pi-current" } }, z.object({}).passthrough());
+  await adapter.c.request({ method: "grayboard/session/ready", params: { owner, epoch: 1 } }, z.object({}).passthrough());
   const identity = await adapter.call("whoami");
   expect(identity.aliases).toEqual(["adapter"]);
   expect(b.db.query<{ harness_session: string }, [string]>("SELECT harness_session FROM ids WHERE id=?").get(identity.id)?.harness_session).toBe("pi-current");
