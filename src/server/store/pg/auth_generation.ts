@@ -22,6 +22,9 @@
 // - A first LISTEN that fails is never retried by Bun (it retries only after a connection it had). The source retries
 //   it at 1 s doubling to 30 s, with the cache off meanwhile; an attempt still unanswered after a full heartbeat
 //   interval counts as failed. `start()` waits at most `startTimeoutMs` for the first.
+// - A drop Bun reports (onclose) whose re-LISTEN never completes would leave the cache off for good: no heartbeat is
+//   sent while off. The ticks go on counting, and a re-LISTEN still unacknowledged after a full heartbeat interval
+//   counts as a failed attempt: the instance is closed and a new one opened on the same backoff (#1354).
 import { SQL } from "bun";
 import { randomUUID } from "node:crypto";
 import { errorDiagnostic } from "../../diagnostics.ts";
@@ -80,6 +83,9 @@ export function makePgAuthGeneration({ url, transactions, heartbeatMs = 5000, st
   let inst: PgListener | undefined;
   // The current instance's first LISTEN while unanswered, and the ticks it has waited.
   let attempt: { i: PgListener; ticks: number } | undefined;
+  // The current instance after Bun reported its connection closed, until its re-LISTEN is acknowledged, and the ticks
+  // it has waited.
+  let dropped: { i: PgListener; ticks: number } | undefined;
   // The outstanding heartbeat token: sent, not yet received.
   let hb: string | undefined;
   let seq = 0;
@@ -103,7 +109,11 @@ export function makePgAuthGeneration({ url, transactions, heartbeatMs = 5000, st
   function open(): Promise<void> {
     cancelRetry?.();
     cancelRetry = undefined;
-    const i: PgListener = openListener(error => { if (i === inst && !closed) off("connection closed", error); });
+    const i: PgListener = openListener(error => {
+      if (i !== inst || closed) return;
+      off("connection closed", error);
+      if (dropped?.i !== i) dropped = { i, ticks: 0 };
+    });
     inst = i;
     attempt = { i, ticks: 0 };
     return i.listen(AUTH_CHANNEL, p => {
@@ -112,6 +122,7 @@ export function makePgAuthGeneration({ url, transactions, heartbeatMs = 5000, st
       n++;
     }, () => {
       if (i !== inst || closed) return;
+      dropped = undefined;
       n++;
       on = true;
       offLogged = failLogged = false;
@@ -146,6 +157,8 @@ export function makePgAuthGeneration({ url, transactions, heartbeatMs = 5000, st
   function tick() {
     if (closed) return;
     if (attempt && ++attempt.ticks >= 2) failed(attempt.i, new Error(`LISTEN not acknowledged within ${heartbeatMs} ms`));
+    if (dropped && dropped.i !== inst) dropped = undefined;
+    if (dropped && ++dropped.ticks >= 2) failed(dropped.i, new Error(`re-LISTEN after a dropped connection not acknowledged within ${heartbeatMs} ms`));
     if (hb !== undefined) replace("heartbeat never arrived");
     if (!on) return;
     const token = hb = `${HEARTBEAT_PREFIX}${nonce}:${++seq}`;
