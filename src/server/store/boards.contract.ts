@@ -721,7 +721,9 @@ function queue(it: It): void {
     expect((await h.outboxRows())[0]?.delivered).toBe(true);
   });
 
-  // From db.test.ts B5b3b.
+  // From db.test.ts B5b3b. The claimEvent fixture writes no session_id, so these takes map by address as today;
+  // a take under a live session (an alias that moved between sessions) is pending #1351, which maps it to that
+  // session's addresses and counts takers by session: add its row with that change, not here.
   it("redeliveryFacts: the board, post, author addresses and writer, sessions that took it, every address that held it; null for a non-queue key", async h => {
     await board(h, "jobs", { kind: "queue" });
     await board(h, "hall");
