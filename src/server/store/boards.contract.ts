@@ -128,7 +128,7 @@ function handles(it: It): void {
       () => b.views(kept, [FE], null), () => b.openSummaries(kept), () => b.roster(kept, null),
       () => b.create(kept, { name: "x", purpose: "p", scope: null, kind: "broadcast", createdBy: BE, now: T0 }),
       () => b.setArchived(kept, "hall", BE, T0), () => b.read(kept, "hall", FE, {}), () => b.threadRoot(kept, root),
-      () => b.mute(kept, FE, root, true), () => b.insertPost(kept, np("hall", BE, "x", T0)),
+      () => b.mute(kept, FE, root, true), () => b.lockForPost(kept, "hall"), () => b.insertPost(kept, np("hall", BE, "x", T0)),
       () => b.bindAttachments(kept, [1], { addresses: [BE], principal: ME }, root, LIMITS), () => b.authorAddresses(kept, BE, null),
       () => b.subscribers(kept, "hall"), () => b.threadFacts(kept, root), () => b.laneRows(kept, "hall", [BE]),
       () => b.claimQueuePost(kept, "hall", root, FE, T0, { note: "n", push: true }), () => b.insertOutbox(kept, root, [[FE, target("subscription", true)]]),
@@ -220,6 +220,21 @@ function boardRows(it: It): void {
     expect(await h.write(tx => b.setArchived(tx, "hall", null, T0 + 40))).toBeNull();
     expect(Object.keys((await b.get(h.read, "hall"))!)).not.toContain("archived_by");
     expect(await h.write(tx => b.setArchived(tx, "none", BE, T0))).toBeNull();
+  });
+
+  // #807 P3 C10e2 P5's serial half: the gate's read is get's answer (the lock is Postgres's, pg/boards.pg.test.ts).
+  it("lockForPost reads the board as get does: open without archive keys, archived with them, a body's own archive, missing undefined", async h => {
+    const b = h.boards;
+    const made = await board(h, "hall");
+    expect(await h.write(tx => b.lockForPost(tx, "hall"))).toEqual(made!);
+    await h.write(tx => b.setArchived(tx, "hall", FE, T0 + 10));
+    expect(await h.write(tx => b.lockForPost(tx, "hall"))).toEqual({ ...made!, archived_at: T0 + 10, archived_by: FE });
+    await board(h, "ops");
+    expect(await h.write(async tx => {
+      await b.setArchived(tx, "ops", BE, T0 + 20);
+      return b.lockForPost(tx, "ops");
+    })).toMatchObject({ name: "ops", archived_at: T0 + 20, archived_by: BE });
+    expect(await h.write(tx => b.lockForPost(tx, "none"))).toBeUndefined();
   });
 }
 

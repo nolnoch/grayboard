@@ -1365,6 +1365,8 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
 
     boards: {
       get: async (r, name) => getBoard(sqliteOf(r), name),
+      // The single writer already orders a post's gate against an archive: a plain read.
+      lockForPost: async (tx, name) => getBoard(sqliteOf(tx), name),
       post: async (r, id) => getPost(sqliteOf(r), id),
       catalogPage: async (r, cursor) => catalogPage(sqliteOf(r), cursor),
       snapshotPage: async (r, board, opts) => snapshotPage(sqliteOf(r), board, opts),

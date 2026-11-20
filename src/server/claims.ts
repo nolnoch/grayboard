@@ -69,8 +69,9 @@ export async function requeue(repo: Repo, access: BoardAccess, tx: Tx, c: ClaimR
   const lanes = rows.length ? await access.lanesAmong(tx, rows, f.board) : new Set<string>();
   const lane = requeuePick(orderLanes(rows, (h) => viewers.has(h), (h) => sees.has(h), (h) => lanes.has(h)), f.held);
   if (lane) {
-    await repo.boards.claimQueuePost(tx, f.board.name, f.postId, lane, now, { note: REDELIVERED_NOTE, push: true });
-    return { wake: [lane], boards: [] };
+    // A redelivery that finds the key taken (another pod's sweep, on Postgres) wrote no push for the lane: wake nobody.
+    const took = await repo.boards.claimQueuePost(tx, f.board.name, f.postId, lane, now, { note: REDELIVERED_NOTE, push: true });
+    return { wake: took ? [lane] : [], boards: [] };
   }
   const text = unclaimedText(c.key, f.takers, cc);
   const refusedAsNull = async (o: Parameters<typeof systemPost>[7], as: string): Promise<ClaimChanges | null> => {
