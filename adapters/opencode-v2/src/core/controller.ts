@@ -607,13 +607,36 @@ export class Controller<E extends Enrollment = Enrollment> {
         r.lease = lease; wire.capability = lease.capability; r.recovery = undefined;
         this.set(r, "active", `Subscribed as ${this.names(e)}${this.lostNote(current)}; receipts follow durable root admission`);
         ready();
-        let dirty = true, wake: (() => void) | undefined, closed = false;
+        let dirty = true, wake: (() => void) | undefined, closed = false, rotated = false;
         wire.client.setNotificationHandler("notifications/resources/updated", () => { dirty = true; wake?.(); });
-        const subscription = await wire.listen();
-        void subscription.closed.then(() => { closed = true; wake?.(); }, () => { closed = true; wake?.(); });
+        let subscription: Awaited<ReturnType<Wire["listen"]>> | undefined;
+        // Only the current listen's end counts: a replaced one's close is ours.
+        const listen = async () => {
+          const opened = subscription = await wire!.listen();
+          const ended = () => { if (subscription === opened) { closed = true; wake?.(); } };
+          void opened.closed.then(ended, ended);
+        };
+        // An own-login provider's token changed (#1379): the server closes a listen at the expiry of the token it
+        // was opened with, so it is replaced now, under this lease. Heard from before the first listen opens, so a
+        // refresh during that open replaces it once it's open; repeated changes replace it once.
+        const rotation = this.port.credential.rotated?.(e, () => { rotated = true; wake?.(); });
         let renewal = Date.now() + RENEW_MS;
         try {
+          await listen();
           while (!signal.aborted) {
+            // Close, then open: listens count against a per-user cap, and every session on one credential renews
+            // at once. Hints don't consume and the server keeps the inbox position, so the re-read finds whatever
+            // arrived in between. Not an outage: no whoami, no delivery_open, no backoff; a failed open is an
+            // ordinary reopen. Ahead of `closed`: an old stream the expiry already closed is replaced the same way.
+            if (rotated) {
+              rotated = false;
+              const old = subscription;
+              subscription = undefined; closed = false;
+              await old?.close().catch(error => this.failure("subscription_close", error, r));
+              await this.guard(r, epoch, signal);
+              await listen();
+              dirty = true;
+            }
             if (dirty) {
               dirty = false;
               const items = itemsOf(await wire.read("grayboard://inbox"));
@@ -648,12 +671,15 @@ export class Controller<E extends Enrollment = Enrollment> {
               await this.guard(r, epoch, signal); renewed(lease, await wire.call("delivery_renew"));
               renewal = Date.now() + RENEW_MS; dirty = true; recoveries = 0; unreachable = 0;
             }
-            if (dirty) continue;
+            if (dirty || rotated) continue;
             const timer = new AbortController();
             await Promise.race([sleep(1000, AbortSignal.any([signal, timer.signal])), new Promise<void>(resolve => { wake = resolve; })]);
             wake = undefined; timer.abort();
           }
-        } finally { await subscription.close().catch(error => this.failure("subscription_close", error, r)); }
+        } finally {
+          rotation?.dispose();
+          await subscription?.close().catch(error => this.failure("subscription_close", error, r));
+        }
       } catch (caught) {
         if (signal.aborted) break;
         const error = this.expired(caught);

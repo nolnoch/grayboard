@@ -16,7 +16,7 @@ type Call = { sessionID: string; name: string; args: Record<string, unknown> };
 const SESSION_KEY = "io.github.nolnoch.grayboard/sessionID";
 const DELIVERY = { mode: "push" as const, source: "grayboard" };
 
-function runtime(mode: Mode) {
+function runtime(mode: Mode, options: { rotates?: boolean } = {}) {
   const rows = new Map<string, Row>(), storage = new Map<string, unknown>(), batches = new Map<string, Item[]>();
   const calls: Call[] = [], admits: { sessionID: string; id: string; item: string }[] = [], wires: WireOptions[] = [];
   const nodes = new Map<string, string | undefined>([["R", undefined], ["B", undefined], ["C", "R"], ["G", "C"]]);
@@ -50,6 +50,12 @@ function runtime(mode: Mode) {
   // The host's receipt hook (#441), when a test sets one.
   let receiptHook: ((sessionID: string, ids: readonly string[]) => void) | undefined;
   const loops: FakeWire[] = [];
+  // The credential's token-change listeners (#1379); every listen the run loop opened, in order, while `open`;
+  // the most listens one session had open at once; the next listen waits on `listenHold` (released by its gate,
+  // or refused by its wire's abort); the next `failListen` listens throw.
+  const rotations = new Set<() => void>();
+  const listens: { sessionID: string; open: boolean }[] = [];
+  let mostOpen = 0, listenHold: Promise<void> | undefined, failListen = 0;
   const address = (name: string) => name.includes("/") ? name : `you@example.com/${name}`;
   // A bind adds a hold; an unbind releases one and bumps the generation too (#451).
   const bind = (id: string, name: string) => { const old = rows.get(id), held = old?.held ?? []; rows.set(id, { held: held.includes(address(name)) ? held : [...held, address(name)], ownership: old?.ownership ?? ++ownership, generation: (old?.generation ?? 0) + 1 }); };
@@ -120,9 +126,17 @@ function runtime(mode: Mode) {
     async takes(tool: string, arg: string) { calls.push({ sessionID: this.sessionID, name: "tools/list", args: {} }); return takesContext && tool === "delivery_open" && arg === "context"; }
     // The server closes the stream on its own: a revoked grant closes it at once.
     async listen() {
+      if (listenHold) {
+        const hold = listenHold; listenHold = undefined;
+        await Promise.race([hold, new Promise<never>((_, reject) => this.signal.addEventListener("abort", () => reject(this.signal.reason), { once: true }))]);
+      }
+      if (failListen > 0) { failListen--; throw new ServerUnreachable(new Error("listen refused")); }
       const { promise: closed, resolve } = Promise.withResolvers<void>();
+      const entry = { sessionID: this.sessionID, open: true };
+      listens.push(entry);
+      mostOpen = Math.max(mostOpen, listens.filter(l => l.open && l.sessionID === this.sessionID).length);
       streams.set(this.sessionID, resolve);
-      return { closed, close: async () => {} };
+      return { closed, close: async () => { entry.open = false; resolve(); } };
     }
   }
   const configuration = () => ({ type: "remote" as const, url: "https://grayboard.example.com/mcp", issuer: "https://grayboard.example.com", clientID: "grayboard-pi", scope: "grayboard:delivery grayboard:tools", configHash: `grant-${grant}` });
@@ -137,6 +151,7 @@ function runtime(mode: Mode) {
     token: async () => { if (accessFault) throw new AccessExpired("pi", "run /grayboard login", accessFault); return "access"; },
     unauthorized: async () => { throw new Refusal("auth", "unauthorized"); },
     refresh: async () => { refreshes++; return true; },
+    ...(options.rotates === false ? {} : { rotated: (_e: Enrollment, changed: () => void) => { const fn = () => changed(); rotations.add(fn); return { dispose: () => { rotations.delete(fn); } }; } }),
   };
   const approval: ApprovalPort<Enrollment> | null = mode === "approval" ? {
     key: e => JSON.stringify([e.sessionID, e.configuration]),
@@ -211,6 +226,15 @@ function runtime(mode: Mode) {
     holdElsewhere: (name: string) => { heldElsewhere.add(address(name)); },
     olderServer: () => { takesContext = false; },
     root: (c: Controller, id = "R") => c.status().roots.find(r => r.sessionID === id),
+    // The credential's access token changed (#1379): every listener hears it.
+    rotate: () => { for (const fn of [...rotations]) fn(); },
+    get rotationListeners() { return rotations.size; },
+    listens,
+    get mostOpen() { return mostOpen; },
+    // The next listen waits until `gate` resolves (or its wire aborts).
+    holdListen: (gate: Promise<void>) => { listenHold = gate; },
+    // The next `n` listens are refused as an outage.
+    failListen: (n: number) => { failListen = n; },
   };
 }
 const modes: Mode[] = ["adapter", "approval"];
@@ -1815,5 +1839,97 @@ test.each(modes)("a primary lost between the run loop's whoami and delivery_open
     r.closeStream("R");
     await until(() => r.root(r.controller)?.state === "active" && r.root(r.controller)?.held?.length === 1);
     expect(r.root(r.controller)).toMatchObject({ held: ["eng/build"], message: `Subscribed as build (lost be: ${reason}); receipts follow durable root admission` });
+  } finally { await r.controller.close(); }
+});
+
+// #1379: an own-login provider's token refresh replaces the listen at once, under the same lease.
+test.each(modes)("a token change replaces the listen under the same lease: close before open, no whoami or delivery_open, and a message sent across the swap is admitted once (%s)", async mode => {
+  const r = runtime(mode);
+  try {
+    await r.controller.enroll("R", ["be"], true);
+    await until(() => r.root(r.controller)?.state === "active" && r.listens.length === 1);
+    const whoamis = r.named("whoami").length, opens = r.named("delivery_open").length;
+    let release!: () => void;
+    r.holdListen(new Promise<void>(resolve => { release = resolve; }));
+    r.rotate();
+    // The old listen is closed while the new one is still opening; a message lands in the gap.
+    await until(() => !r.listens[0]!.open);
+    r.batches.set("R", [r.item("direct:7")]);
+    release();
+    await until(() => r.named("delivery_receipt").length === 1);
+    expect(r.admits.filter(a => a.item === "direct:7")).toHaveLength(1);
+    expect(r.listens.map(l => l.open)).toEqual([false, true]);
+    expect(r.mostOpen).toBe(1);
+    expect(r.named("whoami").length).toBe(whoamis);
+    expect(r.named("delivery_open").length).toBe(opens);
+    // The replaced stream's end is ours, not the server's: nothing reopened for it.
+    expect(r.root(r.controller)?.state).toBe("active");
+  } finally { await r.controller.close(); }
+  expect(r.rotationListeners).toBe(0);
+});
+
+test.each(modes)("token changes while the first listen opens replace it once it's open; repeated changes replace it once (%s)", async mode => {
+  const r = runtime(mode);
+  let release!: () => void;
+  r.holdListen(new Promise<void>(resolve => { release = resolve; }));
+  try {
+    await r.controller.enroll("R", ["be"], true);
+    await until(() => r.rotationListeners === 1);
+    r.rotate(); r.rotate(); r.rotate();
+    release();
+    await until(() => r.listens.length === 2 && r.listens[1]!.open);
+    r.batches.set("R", [r.item("direct:1")]);
+    r.closeStream("R");
+    // The new stream's own end still reopens: the server closing it is no token change.
+    await until(() => r.named("delivery_open").length === 2 && r.named("delivery_receipt").length === 1);
+    expect(r.listens.map(l => l.open)).toEqual([false, false, true]);
+    expect(r.mostOpen).toBe(1);
+    expect(r.admits.filter(a => a.item === "direct:1")).toHaveLength(1);
+  } finally { await r.controller.close(); }
+});
+
+test.each(modes)("a replacement listen that fails is an ordinary reopen: whoami, delivery_open, then delivery again (%s)", async mode => {
+  const r = runtime(mode);
+  try {
+    await r.controller.enroll("R", ["be"], true);
+    await until(() => r.root(r.controller)?.state === "active" && r.listens.length === 1);
+    const whoamis = r.named("whoami").length;
+    r.failListen(1);
+    r.rotate();
+    await until(() => r.named("delivery_open").length === 2 && r.listens.length === 2 && r.root(r.controller)?.state === "active");
+    expect(r.named("whoami").length).toBe(whoamis + 1);
+    r.batches.set("R", [r.item("direct:3")]);
+    r.closeStream("R");
+    await until(() => r.named("delivery_receipt").length === 1);
+    expect(r.admits.filter(a => a.item === "direct:3")).toHaveLength(1);
+  } finally { await r.controller.close(); }
+});
+
+test.each([["close"], ["shutdown"]] as const)("a %s during the swap ends the replacement listen's open and the run loop", async how => {
+  const r = runtime("adapter");
+  await r.controller.enroll("R", ["be"], true);
+  await until(() => r.root(r.controller)?.state === "active" && r.listens.length === 1);
+  r.holdListen(new Promise<void>(() => {}));
+  r.rotate();
+  await until(() => !r.listens[0]!.open);
+  if (how === "close") await r.controller.close();
+  else { await r.controller.shutdown("R", "release"); await r.controller.close(); }
+  expect(r.listens).toHaveLength(1);
+  expect(r.named("delivery_open")).toHaveLength(1);
+  expect(r.rotationListeners).toBe(0);
+});
+
+test.each(modes)("a credential that reports no token changes (a static run token) never replaces its listen (%s)", async mode => {
+  const r = runtime(mode, { rotates: false });
+  try {
+    await r.controller.enroll("R", ["be"], true);
+    await until(() => r.root(r.controller)?.state === "active" && r.listens.length === 1);
+    r.rotate();
+    r.batches.set("R", [r.item("direct:1"), r.item("direct:2")]);
+    r.closeStream("R");
+    await until(() => r.named("delivery_receipt").length >= 1 && r.listens.length === 2);
+    // Only the server's close reopened it.
+    expect(r.rotationListeners).toBe(0);
+    expect(r.named("delivery_open")).toHaveLength(2);
   } finally { await r.controller.close(); }
 });
