@@ -663,6 +663,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
               }
             }
             const stream = legacy.stream, streamContext = stream?.context;
+            await testPauseAsync("mcp:legacy:control-stream");
             // The checks this registration is judged by, both in one last await (#807 P3 A7d, B5a2): this POST's
             // context again (an attach may have awaited since the first), and the stream's, whose answer decides
             // whether this uri joins it. Each is judged below with no await since.
@@ -683,8 +684,15 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
                 if (!expected(error)) throw error;
               }
             }
-            // A stream stopped or replaced while the check awaited is left alone: nothing to join or stop.
-            if (!stream || legacy.stream !== stream || stream.stopped) {}
+            const attached = legacy.stream;
+            if (attached !== stream) {
+              // A GET attached, or replaced the stream, while the checks awaited (#1408): it built its uris from the
+              // registrations before this one, so it lacks this uri, and wasn't judged for it here. It stops; the
+              // client reconnects it with every registration, this one included (set below, before any await).
+              if (attached && !attached.stopped && attached.uris.get(uri) !== cap) attached.stop();
+            }
+            // A stream stopped while the check awaited is left alone: nothing to join or stop.
+            else if (!stream || stream.stopped) {}
             else if (compatible) {
               // Publish registration only after observer installation succeeds.
               if (!stream.uris.has(uri)) { addWatch(stream, uri, streamChecked!); stream.uris.set(uri, cap); indexInbox(stream); }

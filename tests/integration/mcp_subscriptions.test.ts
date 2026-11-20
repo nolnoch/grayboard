@@ -362,6 +362,37 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: a resource read q
     rmSync(dir, { recursive: true, force: true });
   }
 });
+// #1408: a GET that attaches while a subscribe's checks await was built from the registrations before it. The subscribe
+// stops it, and the client's reconnect carries the new registration; left alone, it never joined a stream.
+for (const version of MCP_PROTOCOL_VERSIONS.slice(1)) test(`${version}: a GET attached while a subscribe is judged is reconnected with its registration`, async () => {
+  const c = await connect((await issue()).token, version);
+  await call(c, "board_create", { name: "e2e", purpose: "fixtures" });
+  await call(c, "board_create", { name: "other", purpose: "fixtures" });
+  const unwatch = await watch(c, "grayboard://boards/other");
+  await until(() => app.mcp.activeWatches === 1);
+  const resume = c.pauseGets();
+  await unwatch();
+  await until(() => app.mcp.activeGetStreams === 0);
+  const dir = mkdtempSync(join(tmpdir(), "gb-1408-")), go = join(dir, "go"), hits: string[] = [];
+  const said = spyOn(console, "error").mockImplementation((...args: unknown[]) => { hits.push(args.join(" ")); });
+  process.env.BUS_TEST_PAUSE = "mcp:legacy:control-stream";
+  process.env.BUS_TEST_PAUSE_FILE = go;
+  try {
+    const subscribed = c.client.subscribeResource({ uri: boardUri });
+    await until(() => hits.some(h => h.includes("test pause hit: mcp:legacy:control-stream")));
+    delete process.env.BUS_TEST_PAUSE;
+    resume();
+    await until(() => app.mcp.activeGetStreams === 1);
+    writeFileSync(go, "");
+    await subscribed;
+    await until(() => app.mcp.activeWatches === 1);
+  } finally {
+    resume(); writeFileSync(go, "");
+    said.mockRestore();
+    delete process.env.BUS_TEST_PAUSE; delete process.env.BUS_TEST_PAUSE_FILE;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: private membership loss and background storage fault close streams`, async () => {
   const grant = await issue();
