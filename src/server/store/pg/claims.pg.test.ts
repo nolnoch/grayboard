@@ -15,7 +15,9 @@ const T0 = 1_800_000_000_000;
 const ME = "you@example.com";
 const FE = `${ME}/fe`, BE = `${ME}/be`, SIM = `${ME}/sim`;
 const K = "queue:jobs:1";
-const cl = makePgClaims({ clock: () => T0 });
+// The store's clock, far from T0 (every call's `now`): a method reading clock() in place of its argument fails a race.
+const CLOCK = T0 + 1_000_000_000;
+const cl = makePgClaims({ clock: () => CLOCK });
 
 const take = (as: string, more: Partial<TakeRow> = {}): TakeRow => ({ key: K, as, note: null, board: null, now: T0, expires: T0 + 60_000, user: null, ...more });
 
@@ -164,5 +166,13 @@ describePg("claims store races (Postgres)", () => {
     expect(await watches(p)).toEqual([]);
     expect(r.waited).toBe(true);
   });
-});
 
+  // Not a race: list is the one method on the store's clock, which the contract can't pin portably (SQLite's core reads
+  // Date.now()). Mutation: `expires_at > clock` → `>=` (a claim lapsing this instant listed as live).
+  test("list: a claim expiring exactly at the store's clock has lapsed", async () => {
+    await using p = await pgPair();
+    await claim(p, "at", FE, CLOCK);
+    await claim(p, "after", FE, CLOCK + 1);
+    expect((await cl.list(p.a.read)).map(c => c.key)).toEqual(["after"]);
+  });
+});

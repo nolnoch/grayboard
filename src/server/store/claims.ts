@@ -12,7 +12,7 @@ export type { Claim, ClaimEvent, ClaimEventRow, ClaimRow, TakeRow };
 // takeWatchers) is one conditional DELETE … RETURNING: what it returns is what it deleted, so two racing enders
 // can't both act on one row (D3).
 export interface ClaimsStore {
-  // Live claims, by key in byte order; with prefix, only keys that start with it, ASCII letters matched in either case
+  // Live claims at the store's clock (SQLite: Date.now()), by key in byte order; with prefix, only keys that start with it, ASCII letters matched in either case
   // (SQLite's LIKE; Postgres ILIKE), `%`, `_` and `\` literally. Rows carry no holder_user.
   list(r: Read, prefix?: string): Promise<Claim[]>;
   // The earliest expiry of a claim with a board (the expiry timer's next fire), or null.

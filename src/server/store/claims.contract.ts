@@ -7,8 +7,9 @@
 // Portability rules the rows follow:
 // - Each row opens a fresh store and asserts no absolute id.
 // - Times are fixed epochs passed in. The one method that reads a clock is list (SQLite's core reads Date.now(), the
-//   Postgres store its clock, set to T0): its live claims expire at LIVE and its lapsed ones at LAPSED, far either side of
-//   both, so the answer is the same on each.
+//   Postgres store its clock, set to CLOCK): its live claims expire at LIVE and its lapsed ones at LAPSED, far either side
+//   of both, so the answer is the same on each. CLOCK is far from T0, every other method's `now`, so a method that read
+//   the store's clock in place of its argument fails its row.
 // - The rows are serial. An interleaving (two takes of one key, an ack racing a takeover, a watch racing a release) is
 //   Postgres's own test (pg/claims.pg.test.ts, races K1-K6): on SQLite the single writer runs no two of these at once.
 //   What these rows pin is each statement's serial answer, which the race rows then hold under concurrency.
@@ -43,6 +44,8 @@ export type ClaimsBackend = { kind: "sqlite" | "postgres"; open(): Promise<Claim
 const T0 = 1_800_000_000_000;
 // Far either side of T0 and of any wall clock this suite runs under: list's live and lapsed claims.
 const LIVE = T0 + 100_000_000_000, LAPSED = 1_000;
+// The store's clock: between LAPSED and LIVE, far from T0.
+const CLOCK = T0 + 1_000_000_000;
 const ME = "you@example.com";
 const FE = `${ME}/fe`, BE = `${ME}/be`;
 
@@ -55,7 +58,7 @@ const bytewise = (a: string, b: string) => Buffer.compare(Buffer.from(a), Buffer
 export function claimsContract(backend: ClaimsBackend): void {
   const it = (name: string, fn: (h: ClaimsHarness) => Promise<void>) => test(name, async () => {
     const h = await backend.open();
-    h.setNow(T0);
+    h.setNow(CLOCK);
     try { await fn(h); } finally { await h.close(); }
   });
   takeAndRelease(it);
