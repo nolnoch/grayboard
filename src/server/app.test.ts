@@ -329,6 +329,37 @@ test("a startup write that fails rejects ready, and the server stops and serves 
   }
 });
 
+// #1085: the startup leftover-session ends (#807 P3 A1) reject `ready` when their whole write fails, not only a
+// per-ID end, which rolls back alone in its savepoint and is audited id.end_failed. The triggers fail the leftover's
+// end and then that audit, which is written on the write's own Tx, so the write rolls back whole.
+test("a startup leftover-session ends write that fails rejects ready, and the server stops and serves nothing", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "gb-ready-ends-"));
+  const config = restartConfig(dir);
+  const leftover = randomUUID();
+  const log = spyOn(console, "error").mockImplementation(() => {});
+  let app: ReturnType<typeof startServer> | undefined;
+  try {
+    app = startServer(config, { hostname, background: false }); await app.ready;
+    await app.stop(); app = undefined;
+    const db = new Database(config.store.path);
+    db.run("INSERT INTO ids (id, started_at, last_seen) VALUES (?, ?, ?)", [leftover, Date.now(), Date.now()]);
+    db.run(`CREATE TRIGGER fail_leftover_end BEFORE UPDATE ON ids WHEN OLD.id = '${leftover}' BEGIN SELECT RAISE(ABORT, 'leftover end refused'); END`);
+    db.run("CREATE TRIGGER fail_end_audit BEFORE INSERT ON access_log WHEN NEW.action = 'id.end_failed' BEGIN SELECT RAISE(ABORT, 'ends write refused'); END");
+    db.close();
+
+    app = startServer(config, { hostname, background: false });
+    expect(await app.ready.then(() => "resolved", (e: Error) => e.message)).toContain("ends write refused");
+    expect((await fetch(`http://${hostname}:${app.server.port}/healthz`)).status).toBe(500);
+    await app.stop(); app = undefined;
+    const after = new Database(config.store.path, { readonly: true });
+    expect(after.query<{ ended_at: number | null }, [string]>("SELECT ended_at FROM ids WHERE id = ?").get(leftover)).toEqual({ ended_at: null });
+    after.close();
+  } finally {
+    log.mockRestore();
+    await app?.stop().catch(() => {}); rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 // F-04: a dev sign-in token must not outlive dev auth. A restart without it
 // revokes every dev token, and turning dev auth back on doesn't revive them;
 // a token from the real sign-in survives.
