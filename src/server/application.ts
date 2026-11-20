@@ -1204,7 +1204,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     async hostedRoot(tx: Tx, id: string, root: string | null) { await repo.hosted.setRoot(tx, id, root); },
     // `harness` comes from the principal's source mapping (#414): peer_list shows it and match:{harness} filters on it.
     // `collided` takes the id.collision audit row: the refusal rolls back `tx`, so a row written on it would be lost
-    // (#1077). Every caller defers it (`hostedCollided`, written after the rollback).
+    // (#1077). Production callers defer it (`hostedCollided`, written after the rollback).
     async hostedRegister(tx: Tx, authed: AuthedUser, id: string, harness: string, writesAs: string | null, collided: (why: string) => void, facts?: { model?: string; effort?: string }) {
       const prior = await repo.bindings.idRow(tx, id);
       if (prior && prior.principal !== authed.user_email) {
