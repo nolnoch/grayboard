@@ -5,7 +5,7 @@
 // per-session instructions, and local-path attachments with a verified
 // download. Tokens are issued for the built-in pi client, as the server's
 // own OAuth issuance would.
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type AddressInfo, type Server } from "node:net";
 import { tmpdir } from "node:os";
@@ -25,6 +25,7 @@ import { issueOAuth } from "../helpers/oauth.ts";
 import { seed } from "../support/seed.ts";
 import { TestServer } from "../support/server.ts";
 import { until } from "../support/until.ts";
+import { drained, row as sqlRow, rows as sqlRows } from "../support/repo_sql.ts";
 
 const CLIENT = "grayboard-pi";
 let srv: TestServer, dir: string;
@@ -66,8 +67,15 @@ const textOf = (result: CallToolResult) => {
   return only.text;
 };
 const tool = (tools: NativeTool[], name: string) => tools.find(t => t.name === name)!;
-const hostedRow = (raw: string, user: number) => srv.app.db.query<{ name: string | null; source_session_id: string; client_id: string }, [string]>(
-  "SELECT (SELECT substr(address, instr(address, '/') + 1) FROM alias_holds WHERE id = session_id ORDER BY bound_at, address LIMIT 1) AS name, source_session_id, client_id FROM hosted_sessions WHERE session_id = ?").get(hostedSessionId(user, CLIENT, raw));
+// The session's row with its primary (oldest) hold's name: ties by address in byte order (SQLite's BINARY collation).
+const hostedRow = async (raw: string, user: number) => {
+  const id = hostedSessionId(user, CLIENT, raw);
+  const r = await sqlRow<{ source_session_id: string; client_id: string }>(srv, "SELECT source_session_id, client_id FROM hosted_sessions WHERE session_id = ?", id);
+  if (!r) return null;
+  const holds = await sqlRows<{ address: string; bound_at: number }>(srv, "SELECT address, bound_at FROM alias_holds WHERE id = ?", id);
+  const hold = holds.sort((x, y) => Number(x.bound_at) - Number(y.bound_at) || (x.address < y.address ? -1 : x.address > y.address ? 1 : 0))[0];
+  return { name: hold ? hold.address.slice(hold.address.indexOf("/") + 1) : null, ...r };
+};
 
 test("before login: the snapshot's tools with local-path attachments, and every call returns one error naming the login action", async () => {
   const hooks = recorder();
@@ -122,11 +130,11 @@ test("a write tool round trip binds the calling session through _meta; results c
   expect(output.instructions.length).toBeGreaterThan(0);
   expect(textOf(bound)).toStartWith(`Bound to "proxy-run"`);
   // The server's own record: the session named in `_meta`, under the pi client.
-  expect(hostedRow("pi-root", authed.user_id)).toEqual({ name: "proxy-run", source_session_id: "pi-root", client_id: CLIENT });
+  expect(await hostedRow("pi-root", authed.user_id)).toEqual({ name: "proxy-run", source_session_id: "pi-root", client_id: CLIENT });
   expect(JSON.parse(textOf(await p.call("whoami", {}, "pi-root")))).toMatchObject({ primary: "alice@example.com/proxy-run" });
   // The shared connection routes per call: another session is still unbound.
   expect(JSON.parse(textOf(await p.call("whoami", {}, "pi-other")))).toMatchObject({ unbound: true });
-  expect(hostedRow("pi-other", authed.user_id)?.name ?? null).toBeNull();
+  expect((await hostedRow("pi-other", authed.user_id))?.name ?? null).toBeNull();
   // A refusal comes back as the server wrote it, and afterCall sees an error.
   const taken = await p.call("bind", { name: "proxy-run", create: true }, "pi-other");
   expect(taken.isError).toBe(true);
@@ -318,8 +326,9 @@ test("dm_send with a local file uploads and attaches it; attachment_get saves it
 
   const sent = await sender.call("dm_send", { to: "bob@example.com/proxy-b", body: "see attached", attachments: [join(dir, "report.txt")] }, "pi-a");
   expect(sent.isError).toBeUndefined();
-  const message = srv.app.db.query<{ id: number }, []>("SELECT id FROM messages WHERE body = 'see attached'").get()!;
-  const stored = srv.app.db.query<{ id: number; filename: string; sha256: string; message_id: number | null }, []>("SELECT id, filename, sha256, message_id FROM attachments").all();
+  await drained(srv);
+  const message = (await sqlRow<{ id: number }>(srv, "SELECT id FROM messages WHERE body = 'see attached'"))!;
+  const stored = await sqlRows<{ id: number; filename: string; sha256: string; message_id: number | null }>(srv, "SELECT id, filename, sha256, message_id FROM attachments");
   expect(stored).toEqual([{ id: expect.any(Number), filename: "report.txt", sha256: sha256Hex(new TextEncoder().encode(bytes)), message_id: message.id }]);
   const id = stored[0]!.id;
 
@@ -345,13 +354,19 @@ test("dm_send with a local file uploads and attaches it; attachment_get saves it
   } finally { globalThis.fetch = fetch0; }
 
   // A refused send releases its uploads: one was made, nothing is left unsent.
-  const uploads = () => srv.app.db.query<{ seq: number }, []>("SELECT seq FROM sqlite_sequence WHERE name = 'attachments'").get()!.seq;
+  // Uploads the server stored (each an attachments row; what SQLite's sqlite_sequence counted, on either backend).
+  let stores = 0;
+  const insertUpload = srv.app.repo.attachments.insertUpload.bind(srv.app.repo.attachments);
+  const storeSpy = spyOn(srv.app.repo.attachments, "insertUpload").mockImplementation(async (tx, upload) => { const out = await insertUpload(tx, upload); stores++; return out; });
+  const uploads = () => stores;
   const before = uploads();
   writeFileSync(join(dir, "second.txt"), "second\n");
   const refused = await sender.call("dm_send", { to: "nobody@example.com/missing", body: "lost", attachments: [join(dir, "second.txt")] }, "pi-a");
   expect(refused.isError).toBe(true);
+  storeSpy.mockRestore();
   expect(uploads()).toBe(before + 1);
-  expect(srv.app.db.query<{ n: number }, []>("SELECT count(*) AS n FROM attachments WHERE message_id IS NULL AND post_id IS NULL").get()!.n).toBe(0);
+  await drained(srv);
+  expect((await sqlRow<{ n: number }>(srv, "SELECT count(*) AS n FROM attachments WHERE message_id IS NULL AND post_id IS NULL"))!.n).toBe(0);
   // A path outside the roots never leaves the host.
   const outside = await sender.call("dm_send", { to: "bob@example.com/proxy-b", body: "x", attachments: [join(tmpdir(), "nope.txt")] }, "pi-a");
   expect(outside.isError).toBe(true);
@@ -436,8 +451,8 @@ test("an aborted dm_send with attachments still releases every upload", async ()
   await p.call("bind", { name: "abort-send", create: true }, "pi-send");
   writeFileSync(join(dir, "a.txt"), "first file");
   writeFileSync(join(dir, "b.txt"), "second file");
-  const unsent = () => srv.app.db.query<{ n: number }, []>("SELECT count(*) AS n FROM attachments WHERE message_id IS NULL").get()!.n;
-  const before = unsent();
+  const unsent = async () => { await drained(srv); return (await sqlRow<{ n: number }>(srv, "SELECT count(*) AS n FROM attachments WHERE message_id IS NULL"))!.n; };
+  const before = await unsent();
   const fetch0 = globalThis.fetch;
   const deletes: string[] = [];
   const { promise: reached, resolve: entered } = Promise.withResolvers<void>();
@@ -454,11 +469,11 @@ test("an aborted dm_send with attachments still releases every upload", async ()
     const ac = new AbortController();
     const sending = p.call("dm_send", { to: "abort-send", body: "files", attachments: [join(dir, "a.txt"), join(dir, "b.txt")] }, "pi-send", ac.signal);
     await reached;
-    expect(unsent()).toBe(before + 2);
+    expect(await unsent()).toBe(before + 2);
     ac.abort();
     await expect(sending).rejects.toBeInstanceOf(CallAborted);
     expect(deletes).toHaveLength(2);
-    expect(unsent()).toBe(before);
+    expect(await unsent()).toBe(before);
     expect(p.reports).toEqual([]);
   } finally { globalThis.fetch = fetch0; }
   await p.retire();
@@ -563,7 +578,8 @@ test("uploads are checked against the server's published caps; a server that pub
     globalThis.fetch = fetch0;
     HostedClient.getServerCapabilities = capabilities;
   }
-  expect(srv.app.db.query<{ n: number }, []>("SELECT count(*) AS n FROM attachments").get()!.n).toBe(0);
+  await drained(srv);
+  expect((await sqlRow<{ n: number }>(srv, "SELECT count(*) AS n FROM attachments"))!.n).toBe(0);
   expect(() => publishedLimits({ [ATTACHMENT_LIMITS_CAPABILITY]: { file: 0, total: 32 } })).toThrow(`Invalid ${ATTACHMENT_LIMITS_CAPABILITY} capability from the server`);
   expect(publishedLimits({})).toBeUndefined();
 });
@@ -579,7 +595,8 @@ test("an attachment request refused with 401 runs the credential's onUnauthorize
   const sent = await p.call("dm_send", { to: "alice@example.com/proxy-self", body: "to self", attachments: [join(dir, "note.txt")] }, "pi-root");
   expect(refreshed).toBe(1);
   expect(sent.isError).toBeUndefined();
-  expect(srv.app.db.query<{ n: number }, []>("SELECT count(*) AS n FROM attachments WHERE message_id IS NOT NULL").get()!.n).toBe(1);
+  await drained(srv);
+  expect((await sqlRow<{ n: number }>(srv, "SELECT count(*) AS n FROM attachments WHERE message_id IS NOT NULL"))!.n).toBe(1);
 });
 
 test("a token without the tools scope needs a new login, never a refresh", async () => {

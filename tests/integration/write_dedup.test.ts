@@ -26,7 +26,11 @@ import type { AppSession } from "../support/app_session.ts";
 import { board, direct } from "../support/events.ts";
 import { HOSTED_CLIENT, HOSTED_SCOPES, HostedSession } from "../support/hosted_session.ts";
 import { ROOT } from "../support/paths.ts";
-import { ServerProcess, TestServer } from "../support/server.ts";
+import { ServerProcess, TEST_BACKEND, TestServer } from "../support/server.ts";
+import { drained, rows as sqlRows, type RepoLike } from "../support/repo_sql.ts";
+import { pgDatabase, type PgDatabase } from "../support/pg.ts";
+import { makePgRepo } from "../../src/server/pg_repo.ts";
+import type { Repo } from "../../src/server/db.ts";
 import { seed } from "../support/seed.ts";
 import { until } from "../support/until.ts";
 
@@ -38,7 +42,8 @@ describe("a lost answer, then the same call from the same session", () => {
   let srv: TestServer;
   let alice: string;
   let bob: string;
-  const n = (sql: string, ...args: (string | number)[]) => (srv.app.db.prepare(sql).get(...args) as { n: number }).n;
+  // Reads after drained: an audit row is a post, queued on Postgres.
+  const n = async (sql: string, ...args: (string | number)[]) => { await drained(srv); return (await sqlRows<{ n: number }>(srv, sql, ...args))[0]!.n; };
 
   beforeAll(async () => {
     srv = await TestServer.open();
@@ -73,14 +78,15 @@ describe("a lost answer, then the same call from the same session", () => {
     const fe = srv.appSession(bob, "fe");
     await fe.connect();
     const { again, retry } = await lostThenRepeated("be", (s) => s.send("bob@example.com/fe", "lost answer dm"));
-    const rows = srv.app.db.prepare("SELECT id FROM messages WHERE body = 'lost answer dm'").all() as { id: number }[];
+    await drained(srv);
+    const rows = await sqlRows<{ id: number }>(srv, "SELECT id FROM messages WHERE body = 'lost answer dm'");
     expect(rows.length).toBe(1);
     const id = rows[0]!.id;
     const r = retry as SendResult & Replayed;
     expect(r.replayed!.first_at).toMatch(ISO);
     expect(r).toMatchObject({ message_id: id, delivered_now: true, replayed: { ref: { kind: "message", id } } });
     expect(r.note).toBe(`already sent to bob@example.com/fe at ${r.replayed!.first_at} as message ${id}; this repeat was not sent. To send it again on purpose, call with resend: true.`);
-    const replays = srv.app.db.prepare("SELECT actor, target, detail FROM access_log WHERE action = 'request.replayed'").all() as { actor: string; target: string; detail: string }[];
+    const replays = await sqlRows<{ actor: string; target: string; detail: string }>(srv, "SELECT actor, target, detail FROM access_log WHERE action = 'request.replayed'");
     expect(replays.length).toBe(1);
     expect(replays[0]).toMatchObject({ actor: "alice@example.com", target: "alice@example.com/be" });
     expect(JSON.parse(replays[0]!.detail)).toMatchObject({ tool: "dm_send", ref_kind: "message", ref_id: id, transport: "hosted", first_at: r.replayed!.first_at });
@@ -93,13 +99,14 @@ describe("a lost answer, then the same call from the same session", () => {
     await lane.connect();
     await lane.call("board_create", { name: "work", purpose: "a queue", kind: "queue" });
     const { again, retry } = await lostThenRepeated("poster", (s) => s.call<{ post_id: number; board: string; note: string } & Replayed>("board_post", { board: "#Work", body: "process next batch" }));
-    const posts = srv.app.db.prepare("SELECT id FROM posts WHERE body = 'process next batch'").all() as { id: number }[];
+    await drained(srv);
+    const posts = await sqlRows<{ id: number }>(srv, "SELECT id FROM posts WHERE body = 'process next batch'");
     expect(posts.length).toBe(1);
     const id = posts[0]!.id;
     expect(retry).toMatchObject({ post_id: id, board: "work", replayed: { ref: { kind: "post", id } } });
     expect(retry.note).toStartWith(`already posted to #work at ${retry.replayed!.first_at} as post ${id}; this repeat was not posted.`);
-    expect(srv.app.db.prepare("SELECT holder FROM claims WHERE key LIKE 'queue:work:%'").all()).toEqual([{ holder: "bob@example.com/lane" }]);
-    expect(srv.app.db.prepare("SELECT event FROM claim_events WHERE key = ?").all(`queue:work:${id}`)).toEqual([{ event: "take" }]);
+    expect(await sqlRows(srv, "SELECT holder FROM claims WHERE key LIKE 'queue:work:%'")).toEqual([{ holder: "bob@example.com/lane" }]);
+    expect(await sqlRows(srv, "SELECT event FROM claim_events WHERE key = ?", `queue:work:${id}`)).toEqual([{ event: "take" }]);
     const events = await pushedBefore(lane, () => again.send("bob@example.com/lane", "sentinel 2"), "sentinel 2");
     expect(events.filter(board((i) => i.kind === "push" && i.post.id === id)).length).toBe(1);
   });
@@ -108,14 +115,15 @@ describe("a lost answer, then the same call from the same session", () => {
     const lx = srv.appSession(alice, "lx", { launcher: true });
     await lx.connect();
     const { again, retry } = await lostThenRepeated("asker", (s) => s.delegate({ persona: "a researcher", task: "survey the options", to: "lx" }));
-    const rows = srv.app.db.prepare("SELECT id, pending FROM messages WHERE recipient = 'alice@example.com/lx' AND sender = 'alice@example.com/asker'").all() as { id: number; pending: number }[];
+    await drained(srv);
+    const rows = await sqlRows<{ id: number; pending: number }>(srv, "SELECT id, pending FROM messages WHERE recipient = 'alice@example.com/lx' AND sender = 'alice@example.com/asker'");
     expect(rows).toEqual([{ id: expect.any(Number), pending: 1 }]);
     const id = rows[0]!.id;
     const r = retry as typeof retry & Replayed;
     expect(r).toMatchObject({ message_id: id, to: "alice@example.com/lx", pending: true, replayed: { ref: { kind: "message", id } } });
     expect(r.note).toStartWith(`already delegated to alice@example.com/lx at ${r.replayed!.first_at} as message ${id}; this repeat was not sent.`);
-    expect(n("SELECT COUNT(*) AS n FROM access_log WHERE action = 'delegation.requested' AND target = 'alice@example.com/lx'")).toBe(1);
-    expect(n("SELECT COUNT(*) AS n FROM access_log WHERE action = 'request.replayed'")).toBe(3);
+    expect(await n("SELECT COUNT(*) AS n FROM access_log WHERE action = 'delegation.requested' AND target = 'alice@example.com/lx'")).toBe(1);
+    expect(await n("SELECT COUNT(*) AS n FROM access_log WHERE action = 'request.replayed'")).toBe(3);
     const events = await pushedBefore(lx, () => again.send("lx", "sentinel 3"), "sentinel 3");
     expect(events.filter(direct((m) => m.id === id)).length).toBe(1);
   });
@@ -127,8 +135,12 @@ describe("a lost answer over hosted MCP, then the same call (server process)", (
   let srv: ServerProcess;
   let alice: string;
   let bob: string;
+  // A second handle on the server's database, beside the running process: a SQLite connection to its file (WAL), or a
+  // Postgres pool on its database. Grants are written and rows read through it.
+  let store: { repo: Repo; close(): Promise<void> | void };
+  let pg: PgDatabase | undefined;
   const go = () => join(dir, "go");
-  const db = () => new Database(join(dir, "bus.db"), { readonly: true });
+  const db = (): RepoLike => store.repo;
   const hits = (what: "hit" | "released") => srv.log().split(`test pause ${what}: ${PAUSE}`).length - 1;
   const sessions: HostedSession[] = [];
   const session = async (token: string, identity: string, opts: { sessionId?: string; delivery?: boolean } = {}) => {
@@ -140,7 +152,8 @@ describe("a lost answer over hosted MCP, then the same call (server process)", (
 
   beforeAll(async () => {
     dir = mkdtempSync(join(tmpdir(), "gb-dedup-"));
-    srv = await ServerProcess.start([process.execPath, join(ROOT, "src/server/main.ts")], { dbPath: join(dir, "bus.db") }, {
+    if (TEST_BACKEND === "pg") pg = await pgDatabase({ max: 1 });
+    srv = await ServerProcess.start([process.execPath, join(ROOT, "src/server/main.ts")], pg ? { url: pg.url, blobDir: join(dir, "blobs") } : { dbPath: join(dir, "bus.db") }, {
       BUS_TEST_PAUSE: PAUSE, BUS_TEST_PAUSE_FILE: go(),
       // Inbox polling spends hosted requests.
       GRAYBOARD_HOSTED_REQUEST_BURST: "10000", GRAYBOARD_HOSTED_REQUEST_PER_SEC: "10000",
@@ -149,19 +162,23 @@ describe("a lost answer over hosted MCP, then the same call (server process)", (
     // Grants written through the server's database beside the running
     // process (WAL), as a finished hosted login leaves them. ServerProcess's
     // public URL is http://localhost, so its OAuth resource is http://localhost/mcp.
-    const store = openDatabase(join(dir, "bus.db"), { blobDir: join(dir, "blobs") });
-    try {
-      const token = async (email: string) => (await issueOAuth(store.repo, "http://localhost/mcp", email, HOSTED_SCOPES, Date.now(), HOSTED_CLIENT)).token;
-      alice = await token("alice@example.com");
-      bob = await token("bob@example.com");
-    } finally {
-      store.db.close();
+    if (pg) {
+      const repo = await makePgRepo(pg.url, { blobDir: join(dir, "blobs"), applicationName: "gb-test-dedup", max: 2 });
+      store = { repo, close: () => repo.close() };
+    } else {
+      const opened = openDatabase(join(dir, "bus.db"), { blobDir: join(dir, "blobs") });
+      store = { repo: opened.repo, close: () => opened.db.close() };
     }
+    const token = async (email: string) => (await issueOAuth(store.repo, "http://localhost/mcp", email, HOSTED_SCOPES, Date.now(), HOSTED_CLIENT)).token;
+    alice = await token("alice@example.com");
+    bob = await token("bob@example.com");
   });
   afterAll(async () => {
     writeFileSync(go(), "");
     await Promise.allSettled(sessions.splice(0).map((s) => s.close()));
     await srv.stop();
+    await store?.close();
+    await pg?.[Symbol.asyncDispose]();
     rmSync(dir, { recursive: true, force: true });
   });
 
@@ -195,21 +212,21 @@ describe("a lost answer over hosted MCP, then the same call (server process)", (
     const { retry } = await lostThenRepeated<SendResult & Replayed>("be", "dm_send", { to: "bob@example.com/fe", body: "lost answer dm" }, watch.hints);
     await watch.close();
     const d = db();
-    try {
-      const rows = d.prepare("SELECT id FROM messages WHERE body = 'lost answer dm'").all() as { id: number }[];
+    {
+      const rows = await sqlRows<{ id: number }>(d, "SELECT id FROM messages WHERE body = 'lost answer dm'");
       expect(rows.length).toBe(1);
       const id = rows[0]!.id;
       expect(retry.replayed!.first_at).toMatch(ISO);
       expect(retry).toMatchObject({ message_id: id, delivered_now: true, replayed: { ref: { kind: "message", id } } });
       expect(retry.note).toBe(`already sent to bob@example.com/fe at ${retry.replayed!.first_at} as message ${id}; this repeat was not sent. To send it again on purpose, call with resend: true.`);
-      const replays = d.prepare("SELECT actor, target, detail FROM access_log WHERE action = 'request.replayed'").all() as { actor: string; target: string; detail: string }[];
+      // The replay's audit row is the server process's post: wait for it to land.
+      await until(async () => (await sqlRows(d, "SELECT id FROM access_log WHERE action = 'request.replayed'")).length > 0, 5000, "the request.replayed audit row");
+      const replays = await sqlRows<{ actor: string; target: string; detail: string }>(d, "SELECT actor, target, detail FROM access_log WHERE action = 'request.replayed'");
       expect(replays.length).toBe(1);
       expect(replays[0]).toMatchObject({ actor: "alice@example.com", target: "alice@example.com/be" });
       expect(JSON.parse(replays[0]!.detail)).toMatchObject({ tool: "dm_send", ref_kind: "message", ref_id: id, transport: "hosted", first_at: retry.replayed!.first_at });
       // The inbox is the message rows, so one row is one delivery.
       expect((await fe.next(direct((m) => m.id === id), 5000)).event.message.sender).toBe("alice@example.com/be");
-    } finally {
-      d.close();
     }
   }, 30_000);
 
@@ -220,17 +237,15 @@ describe("a lost answer over hosted MCP, then the same call (server process)", (
     const { retry } = await lostThenRepeated<{ post_id: number; board: string; note: string } & Replayed>("poster", "board_post", { board: "#Work", body: "process next batch" }, watch.hints);
     await watch.close();
     const d = db();
-    try {
-      const posts = d.prepare("SELECT id FROM posts WHERE body = 'process next batch'").all() as { id: number }[];
+    {
+      const posts = await sqlRows<{ id: number }>(d, "SELECT id FROM posts WHERE body = 'process next batch'");
       expect(posts.length).toBe(1);
       const id = posts[0]!.id;
       expect(retry).toMatchObject({ post_id: id, board: "work", replayed: { ref: { kind: "post", id } } });
       expect(retry.note).toStartWith(`already posted to #work at ${retry.replayed!.first_at} as post ${id}; this repeat was not posted.`);
-      expect(d.prepare("SELECT holder FROM claims WHERE key LIKE 'queue:work:%'").all()).toEqual([{ holder: "bob@example.com/lane" }]);
-      expect(d.prepare("SELECT event FROM claim_events WHERE key = ?").all(`queue:work:${id}`)).toEqual([{ event: "take" }]);
+      expect(await sqlRows(d, "SELECT holder FROM claims WHERE key LIKE 'queue:work:%'")).toEqual([{ holder: "bob@example.com/lane" }]);
+      expect(await sqlRows(d, "SELECT event FROM claim_events WHERE key = ?", `queue:work:${id}`)).toEqual([{ event: "take" }]);
       await lane.next(board((i) => i.kind === "push" && i.post.id === id), 5000);
-    } finally {
-      d.close();
     }
   }, 30_000);
 });
@@ -246,8 +261,9 @@ describe("dedup and state answers (in process)", () => {
   });
   afterEach(() => srv.stop());
 
-  const q = (sql: string, ...args: (string | number)[]) => srv.app.db.prepare(sql).all(...args);
-  const n = (sql: string, ...args: (string | number)[]) => (srv.app.db.prepare(sql).get(...args) as { n: number }).n;
+  // Reads after drained: an audit row is a post, queued on Postgres.
+  const q = async (sql: string, ...args: (string | number)[]) => { await drained(srv); return sqlRows(srv, sql, ...args); };
+  const n = async (sql: string, ...args: (string | number)[]) => ((await q(sql, ...args))[0] as { n: number }).n;
   // A session of `identity`'s: one key, so a reconnect with it is the same session.
   const session = async (identity: string, opts: { push?: boolean; key?: string } = {}) => {
     const s = srv.appSession(you, identity, { key: opts.key ?? mintSessionKey(), ...(opts.push === false ? { push: false } : {}) });
@@ -266,8 +282,8 @@ describe("dedup and state answers (in process)", () => {
     const forced = await dm(be, "ok", { resend: true });
     expect(forced.replayed).toBeUndefined();
     expect(forced.message_id).not.toBe(first.message_id);
-    expect(n("SELECT COUNT(*) AS n FROM messages WHERE body = 'ok'")).toBe(2);
-    const resent = q("SELECT detail FROM access_log WHERE action = 'request.resent'") as { detail: string }[];
+    expect(await n("SELECT COUNT(*) AS n FROM messages WHERE body = 'ok'")).toBe(2);
+    const resent = (await q("SELECT detail FROM access_log WHERE action = 'request.resent'")) as { detail: string }[];
     expect(resent.map((r) => JSON.parse(r.detail))).toEqual([{ tool: "dm_send", fp: expect.stringMatching(/^[0-9a-f]{64}$/), ref_kind: "message", ref_id: forced.message_id, session: expect.any(String) }]);
     // A later plain repeat replays the forced one.
     expect((await dm(be, "ok")).replayed!.ref.id).toBe(forced.message_id);
@@ -283,8 +299,8 @@ describe("dedup and state answers (in process)", () => {
     const forced = await send({ resend: true });
     expect(forced.replayed).toBeUndefined();
     expect(forced.message_id).not.toBe(first.message_id);
-    expect(n("SELECT COUNT(*) AS n FROM messages WHERE body = 'hosted ok'")).toBe(2);
-    const resent = q("SELECT detail FROM access_log WHERE action = 'request.resent'") as { detail: string }[];
+    expect(await n("SELECT COUNT(*) AS n FROM messages WHERE body = 'hosted ok'")).toBe(2);
+    const resent = (await q("SELECT detail FROM access_log WHERE action = 'request.resent'")) as { detail: string }[];
     expect(resent.map((r) => JSON.parse(r.detail))).toEqual([expect.objectContaining({ tool: "dm_send", ref_kind: "message", ref_id: forced.message_id })]);
   });
 
@@ -293,7 +309,7 @@ describe("dedup and state answers (in process)", () => {
     const be = await session("be");
     const first = await dm(be, "oops");
     expect(await be.retract(first.message_id)).toEqual({});
-    const row = q("SELECT at, actor, target, detail FROM access_log WHERE action = 'message.retracted'") as { at: number; actor: string; target: string; detail: string }[];
+    const row = (await q("SELECT at, actor, target, detail FROM access_log WHERE action = 'message.retracted'")) as { at: number; actor: string; target: string; detail: string }[];
     expect(row.length).toBe(1);
     expect(row[0]).toMatchObject({ actor: "you@example.com", target: `message:${first.message_id}` });
     expect(JSON.parse(row[0]!.detail)).toEqual({ message_id: first.message_id, sender: "you@example.com/be", recipient: "you@example.com/fe", session: be.id });
@@ -304,7 +320,7 @@ describe("dedup and state answers (in process)", () => {
     const again = await dm(be, "oops");
     expect(again.replayed).toBeUndefined();
     expect(again.message_id).not.toBe(first.message_id);
-    const stale = q("SELECT detail FROM access_log WHERE action = 'request.receipt_stale'") as { detail: string }[];
+    const stale = (await q("SELECT detail FROM access_log WHERE action = 'request.receipt_stale'")) as { detail: string }[];
     expect(stale.map((r) => JSON.parse(r.detail))).toEqual([expect.objectContaining({ tool: "dm_send", ref_kind: "message", ref_id: first.message_id, session: be.id })]);
   });
 
@@ -328,9 +344,11 @@ describe("dedup and state answers (in process)", () => {
     expect(reup.replayed!.ref.id).toBe(withFile.message_id);
     expect(reup.attachments).toEqual(withFile.attachments);
     // The replay released the retry's upload, audited; the first copy keeps the blob.
-    expect(n(`SELECT COUNT(*) AS n FROM attachments WHERE id = ${retryUpload}`)).toBe(0);
-    expect(n(`SELECT COUNT(*) AS n FROM access_log WHERE action = 'attachment.released' AND target = 'attachment:${retryUpload}' AND detail LIKE '%"reason":"replayed"%'`)).toBe(1);
-    expect(n(`SELECT COUNT(*) AS n FROM attachment_blobs WHERE sha256 = '${withFile.attachments![0]!.sha256}'`)).toBe(1);
+    expect(await n(`SELECT COUNT(*) AS n FROM attachments WHERE id = ${retryUpload}`)).toBe(0);
+    // detail is jsonb on Postgres: match its reason in JS rather than LIKE on the text.
+    const released = (await q(`SELECT detail FROM access_log WHERE action = 'attachment.released' AND target = 'attachment:${retryUpload}'`)) as { detail: string }[];
+    expect(released.filter((r) => JSON.parse(r.detail).reason === "replayed").length).toBe(1);
+    expect(await n(`SELECT COUNT(*) AS n FROM attachment_blobs WHERE sha256 = '${withFile.attachments![0]!.sha256}'`)).toBe(1);
     const other = await dm(be, "files", { attachment_ids: [await up("v2")] });
     expect(other.replayed).toBeUndefined();
     // Files are refused as bindAttachments would refuse them.
@@ -343,7 +361,7 @@ describe("dedup and state answers (in process)", () => {
     be.close();
     const reconnect = await session("be", { key });
     expect(((await reconnect.send("fe", "hello")) as Sent).replayed!.ref.id).toBe(first.message_id);
-    expect(n("SELECT COUNT(*) AS n FROM messages WHERE body = 'hello'")).toBe(2);
+    expect(await n("SELECT COUNT(*) AS n FROM messages WHERE body = 'hello'")).toBe(2);
   });
 
   test("board_post: a replay releases the retry's upload; a non-string body is a bad request", async () => {
@@ -355,8 +373,8 @@ describe("dedup and state answers (in process)", () => {
     const retryUpload = await up();
     const retry = await be.call<Post>("board_post", { board: "e2e", body: "see file", attachment_ids: [retryUpload] });
     expect(retry.replayed!.ref.id).toBe(first.post_id);
-    expect(n(`SELECT COUNT(*) AS n FROM attachments WHERE id = ${retryUpload}`)).toBe(0);
-    expect(n("SELECT COUNT(*) AS n FROM access_log WHERE action = 'attachment.released'")).toBe(1);
+    expect(await n(`SELECT COUNT(*) AS n FROM attachments WHERE id = ${retryUpload}`)).toBe(0);
+    expect(await n("SELECT COUNT(*) AS n FROM access_log WHERE action = 'attachment.released'")).toBe(1);
     await expect(be.call("board_post", { board: "e2e", body: [[1]] })).rejects.toMatchObject({ code: "bad_request", message: "body must be a string" });
     await expect(be.call("board_post", { board: "e2e", body: "reply", parent_id: "1" })).rejects.toMatchObject({ code: "bad_request", message: "parent_id must be a number" });
   });
@@ -372,13 +390,13 @@ describe("dedup and state answers (in process)", () => {
     try {
       await expect(be.call("board_post", { board: "jobs", body: "build it" })).rejects.toMatchObject({ code: "internal" });
     } finally { failing.mockRestore(); }
-    expect(n("SELECT COUNT(*) AS n FROM posts WHERE body = 'build it'")).toBe(0);
-    expect(n("SELECT COUNT(*) AS n FROM claims WHERE key LIKE 'queue:jobs:%'")).toBe(0);
-    expect(n("SELECT COUNT(*) AS n FROM claim_events WHERE key LIKE 'queue:jobs:%'")).toBe(0);
-    expect(n("SELECT COUNT(*) AS n FROM write_receipts WHERE tool = 'board_post'")).toBe(0);
+    expect(await n("SELECT COUNT(*) AS n FROM posts WHERE body = 'build it'")).toBe(0);
+    expect(await n("SELECT COUNT(*) AS n FROM claims WHERE key LIKE 'queue:jobs:%'")).toBe(0);
+    expect(await n("SELECT COUNT(*) AS n FROM claim_events WHERE key LIKE 'queue:jobs:%'")).toBe(0);
+    expect(await n("SELECT COUNT(*) AS n FROM write_receipts WHERE tool = 'board_post'")).toBe(0);
     const retry = await be.call<{ post_id: number } & Replayed>("board_post", { board: "jobs", body: "build it" });
     expect(retry.replayed).toBeUndefined();
-    expect(q("SELECT key, holder FROM claims WHERE key LIKE 'queue:jobs:%'")).toEqual([{ key: `queue:jobs:${retry.post_id}`, holder: "you@example.com/fe" }]);
+    expect(await q("SELECT key, holder FROM claims WHERE key LIKE 'queue:jobs:%'")).toEqual([{ key: `queue:jobs:${retry.post_id}`, holder: "you@example.com/fe" }]);
   });
 
   test("board_post: a strict @id: refused after the attachment bind leaves the upload unsent", async () => {
@@ -387,8 +405,8 @@ describe("dedup and state answers (in process)", () => {
     const up = (await srv.uploadAs(you, "be", "notes.md", "v1")).body.id as number;
     const nobody = idAddress("f".repeat(64));
     await expect(be.call("board_post", { board: "e2e", body: `see @${nobody}`, attachment_ids: [up] })).rejects.toMatchObject({ code: "not_found" });
-    expect(q(`SELECT post_id, message_id FROM attachments WHERE id = ${up}`)).toEqual([{ post_id: null, message_id: null }]);
-    expect(n("SELECT COUNT(*) AS n FROM posts WHERE board = 'e2e'")).toBe(0);
+    expect(await q(`SELECT post_id, message_id FROM attachments WHERE id = ${up}`)).toEqual([{ post_id: null, message_id: null }]);
+    expect(await n("SELECT COUNT(*) AS n FROM posts WHERE board = 'e2e'")).toBe(0);
     // Still the caller's to send.
     expect((await be.call<{ post_id: number }>("board_post", { board: "e2e", body: "see file", attachment_ids: [up] })).post_id).toBeGreaterThan(0);
   });
@@ -410,10 +428,10 @@ describe("dedup and state answers (in process)", () => {
       await expect(be.call("board_post", { board: "e2e", body: "two files", attachment_ids: [a, b] }))
         .rejects.toMatchObject({ message: `attachment ${b} isn't an unsent upload of yours` });
     } finally { lost.mockRestore(); }
-    expect(n("SELECT COUNT(*) AS n FROM posts WHERE board = 'e2e'")).toBe(0);
-    expect(q(`SELECT id, post_id, message_id FROM attachments WHERE id IN (${a}, ${b}) ORDER BY id`))
+    expect(await n("SELECT COUNT(*) AS n FROM posts WHERE board = 'e2e'")).toBe(0);
+    expect(await q(`SELECT id, post_id, message_id FROM attachments WHERE id IN (${a}, ${b}) ORDER BY id`))
       .toEqual([{ id: a, post_id: null, message_id: null }, { id: b, post_id: null, message_id: null }]);
-    expect(n("SELECT COUNT(*) AS n FROM write_receipts WHERE tool = 'board_post'")).toBe(0);
+    expect(await n("SELECT COUNT(*) AS n FROM write_receipts WHERE tool = 'board_post'")).toBe(0);
   });
 
   // #296: the access checks run before the receipt lookup, so a repeat from a
@@ -428,7 +446,7 @@ describe("dedup and state answers (in process)", () => {
 
     expect((await srv.api(you, "POST", "/api/teams/eng/leave")).status).toBe(200);
     await expect(be.call("board_post", { board: "eng", body: "ship it" })).rejects.toMatchObject({ code: "bad_request", message: "no such board #eng; see board_list" });
-    expect(n("SELECT COUNT(*) AS n FROM posts WHERE body = 'ship it'")).toBe(1);
+    expect(await n("SELECT COUNT(*) AS n FROM posts WHERE body = 'ship it'")).toBe(1);
   });
 
   test("the window runs on the hub's clock: a repeat after it sends", async () => {
@@ -442,7 +460,7 @@ describe("dedup and state answers (in process)", () => {
     expect(later.replayed).toBeUndefined();
     expect(later.message_id).not.toBe(first.message_id);
     // Prune-on-write took the expired receipt with it.
-    expect(q("SELECT ref_id FROM write_receipts")).toEqual([{ ref_id: later.message_id }]);
+    expect(await q("SELECT ref_id FROM write_receipts")).toEqual([{ ref_id: later.message_id }]);
   });
 
   // #297: rows, audit and receipts read the one clock, so a replay's first_at is its row's own created_at.
@@ -455,9 +473,9 @@ describe("dedup and state answers (in process)", () => {
     clock += 1_000;
     const again = await dm(be, "clocked");
     expect(again.replayed!.ref.id).toBe(first.message_id);
-    expect(q("SELECT created_at FROM messages WHERE id = ?", first.message_id)).toEqual([{ created_at: sentAt }]);
+    expect(await q("SELECT created_at FROM messages WHERE id = ?", first.message_id)).toEqual([{ created_at: sentAt }]);
     expect(again.replayed!.first_at).toBe(new Date(sentAt).toISOString());
-    expect(q("SELECT at FROM access_log WHERE action = 'request.replayed'")).toEqual([{ at: clock }]);
+    expect(await q("SELECT at FROM access_log WHERE action = 'request.replayed'")).toEqual([{ at: clock }]);
   });
 
   test("delegate's inner send isn't a dm_send: the same body sent plainly afterwards sends", async () => {
@@ -467,13 +485,13 @@ describe("dedup and state answers (in process)", () => {
     const be = await session("be");
     const d = await be.delegate({ persona: "a researcher", task: "t", to: "lx" });
     expect(d).toMatchObject({ to: "you@example.com/lx" });
-    const body = (q("SELECT body FROM messages WHERE id = ?", d.message_id) as { body: string }[])[0]!.body;
+    const body = ((await q("SELECT body FROM messages WHERE id = ?", d.message_id)) as { body: string }[])[0]!.body;
     const plain = (await be.send("lx", body, { pending: true })) as Sent;
     expect(plain.replayed).toBeUndefined();
     // A refusal inside the dedup'd write rolls back and is still audited.
     await expect(be.delegate({ persona: "a researcher", task: "t", to: "sim" })).rejects.toMatchObject({ message: expect.stringContaining("isn't a launcher") });
-    expect(n("SELECT COUNT(*) AS n FROM access_log WHERE action = 'delegation.refused'")).toBe(1);
-    expect(n("SELECT COUNT(*) AS n FROM write_receipts WHERE tool = 'delegate'")).toBe(1);
+    expect(await n("SELECT COUNT(*) AS n FROM access_log WHERE action = 'delegation.refused'")).toBe(1);
+    expect(await n("SELECT COUNT(*) AS n FROM write_receipts WHERE tool = 'delegate'")).toBe(1);
   });
 
   // #302 (#254 AC3): delegate takes resend like the other append writes, in
@@ -496,9 +514,9 @@ describe("dedup and state answers (in process)", () => {
     expect(h2.replayed).toBeUndefined();
     expect(h2.message_id).not.toBe(h1.message_id);
 
-    expect(n("SELECT COUNT(*) AS n FROM messages WHERE recipient = 'you@example.com/lx' AND pending = 1")).toBe(4);
-    expect(n("SELECT COUNT(*) AS n FROM access_log WHERE action = 'delegation.requested'")).toBe(4);
-    const resent = (q("SELECT detail FROM access_log WHERE action = 'request.resent'") as { detail: string }[]).map((r) => JSON.parse(r.detail));
+    expect(await n("SELECT COUNT(*) AS n FROM messages WHERE recipient = 'you@example.com/lx' AND pending = TRUE")).toBe(4);
+    expect(await n("SELECT COUNT(*) AS n FROM access_log WHERE action = 'delegation.requested'")).toBe(4);
+    const resent = ((await q("SELECT detail FROM access_log WHERE action = 'request.resent'")) as { detail: string }[]).map((r) => JSON.parse(r.detail));
     expect(resent).toEqual([
       expect.objectContaining({ tool: "delegate", ref_kind: "message", ref_id: forced.message_id }),
       expect.objectContaining({ tool: "delegate", ref_kind: "message", ref_id: h2.message_id }),
@@ -535,7 +553,7 @@ describe("dedup and state answers (in process)", () => {
     expect(a.message_id).toBeGreaterThan(0);
     expect(b.replayed).toBeUndefined();
     expect(b.message_id).not.toBe(a.message_id);
-    expect(n("SELECT COUNT(*) AS n FROM write_receipts")).toBe(0);
+    expect(await n("SELECT COUNT(*) AS n FROM write_receipts")).toBe(0);
     const args = { name: "slack-made", purpose: "fixtures" };
     expect(await seed(repo, tx => srv.app.application.call(tx, session, "board_create", args))).toHaveProperty("name", "slack-made");
     await expect(seed(repo, tx => srv.app.application.call(tx, session, "board_create", args))).rejects.toThrow("already exists");

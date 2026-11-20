@@ -6,6 +6,7 @@ import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { refusal } from "../support/app_session.ts";
 import { direct } from "../support/events.ts";
 import { hostedPause } from "../support/hosted-pause.ts";
+import { drained, row, rows } from "../support/repo_sql.ts";
 import { TestServer } from "../support/server.ts";
 
 const A = "alice@example.com";
@@ -17,11 +18,15 @@ beforeEach(async () => {
 });
 afterEach(async () => { await srv.stop(); });
 
-const userId = (email: string) => (srv.app.db.query("SELECT id FROM users WHERE email = ?").get(email) as { id: number }).id;
-const decisions = (rule: string) =>
-  (srv.app.db.query("SELECT detail FROM access_log WHERE action = 'authz.decision' ORDER BY rowid").all() as { detail: string }[])
+const userId = async (email: string) => (await row<{ id: number }>(srv, "SELECT id FROM users WHERE email = ?", email))!.id;
+const decisions = async (rule: string) => {
+  await drained(srv);
+  return (await rows<{ detail: string }>(srv, "SELECT detail FROM access_log WHERE action = 'authz.decision' ORDER BY id"))
     .map((r) => JSON.parse(r.detail) as Record<string, unknown>)
     .filter((d) => d.rule === rule);
+};
+const holds = async (address: string) => { await drained(srv); return rows(srv, "SELECT address FROM alias_holds WHERE address = ?", address); };
+const messages = async () => { await drained(srv); return (await row<{ n: number }>(srv, "SELECT COUNT(*) AS n FROM messages"))!.n; };
 
 test("H-A: a recipient that closes while the wake decision awaits gets the queued answer, not delivered_now", async () => {
   const [alice, bob] = await Promise.all([srv.login(A), srv.login(B)]);
@@ -54,9 +59,10 @@ for (const point of ["bind:target:decided", "bind:alias:created"]) {
   test(`H-B: a session terminated while its bind awaits (${point}) is refused and holds nothing`, async () => {
     const bob = await srv.login(B);
     const s = await srv.connected(bob, null);
-    const err = await hostedPause(point, () => refusal(s.bind("fe")), async () => { srv.app.application.disconnectUser(userId(B)); });
+    const bobId = await userId(B);
+    const err = await hostedPause(point, () => refusal(s.bind("fe")), async () => { srv.app.application.disconnectUser(bobId); });
     expect(err.code).toBe("unauthenticated");
-    expect(srv.app.db.query("SELECT address FROM alias_holds WHERE address = ?").all(`${B}/fe`)).toEqual([]);
+    expect(await holds(`${B}/fe`)).toEqual([]);
   });
 }
 
@@ -67,10 +73,10 @@ test("a malformed delegate naming another user's launcher writes no decision row
   await srv.connected(bob, "eng/launcher", { launcher: true });
   const sim = await srv.connected(alice, "eng/sim");
   expect((await refusal(sim.delegate({ persona: "p", task: "", to: "eng/launcher" }))).code).toBe("bad_request");
-  expect(decisions("delegate.cross_user")).toEqual([]);
+  expect(await decisions("delegate.cross_user")).toEqual([]);
   // The same call well-formed asks reach, which denies and writes its row.
   await refusal(sim.delegate({ persona: "p", task: "t", to: "eng/launcher" }));
-  expect(decisions("delegate.cross_user")).toEqual([expect.objectContaining({ verb: "delegate.to", allow: false, from_user: A, to_user: B })]);
+  expect(await decisions("delegate.cross_user")).toEqual([expect.objectContaining({ verb: "delegate.to", allow: false, from_user: A, to_user: B })]);
 });
 
 test("a page of one writer's messages makes one wake decision", async () => {
@@ -97,17 +103,17 @@ test("a session closed while its bind's user read awaits is refused and holds no
   const err = await hostedPause("valid:user:read", () => refusal(s.bind("fe")), async () => { s.close(); });
   expect(err.code).toBe("unauthenticated");
   expect(err.message).toBe("session is closed");
-  expect(srv.app.db.query("SELECT address FROM alias_holds WHERE address = ?").all(`${B}/fe`)).toEqual([]);
-  expect(srv.app.db.query("SELECT event FROM binding_events WHERE name = ? AND event = 'bound'").all(`${B}/fe`)).toEqual([]);
+  expect(await holds(`${B}/fe`)).toEqual([]);
+  expect(await rows(srv, "SELECT event FROM binding_events WHERE name = ? AND event = 'bound'", `${B}/fe`)).toEqual([]);
 });
 
 test("a session closed while its send's user read awaits is refused and writes no message", async () => {
   const [alice, bob] = await Promise.all([srv.login(A), srv.login(B)]);
   await srv.connected(bob, "fe");
   const abe = await srv.connected(alice, "be");
-  const before = (srv.app.db.query("SELECT COUNT(*) AS n FROM messages").get() as { n: number }).n;
+  const before = await messages();
   const err = await hostedPause("valid:user:read", () => refusal(abe.send(`${B}/fe`, "while closing")), async () => { abe.close(); });
   expect(err.code).toBe("unauthenticated");
   expect(err.message).toBe("session is closed");
-  expect((srv.app.db.query("SELECT COUNT(*) AS n FROM messages").get() as { n: number }).n).toBe(before);
+  expect(await messages()).toBe(before);
 });

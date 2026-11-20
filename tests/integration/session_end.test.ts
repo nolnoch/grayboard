@@ -9,6 +9,7 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { runRetention } from "../../src/server/retention.ts";
 import { direct } from "../support/events.ts";
 import { TestServer } from "../support/server.ts";
+import { drained, row as sqlRow, rows } from "../support/repo_sql.ts";
 
 const A = "alice@example.com";
 let srv: TestServer;
@@ -25,10 +26,11 @@ afterEach(async () => {
   await srv.stop();
 });
 
-const row = (id: string) => srv.app.db.prepare(`SELECT ended_at, held_aliases_json FROM ids WHERE id = ?`).get(id) as { ended_at: number | null; held_aliases_json: string | null } | null;
-const holder = (address: string) => (srv.app.db.prepare(`SELECT id FROM alias_holds WHERE address = ?`).get(address) as { id: string } | null)?.id ?? null;
-const lastEvent = (address: string) => srv.app.db.prepare(`SELECT session_id, event, detail FROM binding_events WHERE name = ? ORDER BY id DESC LIMIT 1`).get(address);
-const ended = (id: string) => srv.app.db.prepare(`SELECT detail FROM access_log WHERE action = 'id.ended' AND target = ?`).all(id).map((r: any) => JSON.parse(r.detail));
+const row = (id: string) => sqlRow<{ ended_at: number | null; held_aliases_json: string | null }>(srv, `SELECT ended_at, held_aliases_json FROM ids WHERE id = ?`, id);
+const holder = async (address: string) => (await sqlRow<{ id: string }>(srv, `SELECT id FROM alias_holds WHERE address = ?`, address))?.id ?? null;
+const lastEvent = (address: string) => sqlRow(srv, `SELECT session_id, event, detail FROM binding_events WHERE name = ? ORDER BY id DESC LIMIT 1`, address);
+// An audit row is a post: queued on Postgres, so drain before reading it.
+const ended = async (id: string) => { await drained(srv); return (await rows<{ detail: string }>(srv, `SELECT detail FROM access_log WHERE action = 'id.ended' AND target = ?`, id)).map((r) => JSON.parse(r.detail)); };
 
 // The server restarts on its database: every session the hosted store doesn't
 // own, which nothing can reattach, is ended as it starts.
@@ -51,15 +53,15 @@ test("a restart ends a leftover session: holds released, claims of its ID releas
   await a.next(direct());
   // A closed session keeps its hold: nothing but an end releases it.
   a.close();
-  expect(holder(`${A}/be`)).toBe(a.id);
+  expect(await holder(`${A}/be`)).toBe(a.id);
 
   await restart();
   alice = await srv.login(A);
   bob = await srv.login("bob@example.com");
-  expect(row(a.id)).toEqual({ ended_at: clock, held_aliases_json: JSON.stringify([`${A}/be`]) });
-  expect(holder(`${A}/be`)).toBeNull();
-  expect(lastEvent(`${A}/be`)).toEqual({ session_id: a.id, event: "released", detail: "session_end: wss_removed" });
-  expect(ended(a.id)).toEqual([{ principal: A, held: [`${A}/be`], why: "wss_removed", bounced: 1 }]);
+  expect(await row(a.id)).toEqual({ ended_at: clock, held_aliases_json: JSON.stringify([`${A}/be`]) });
+  expect(await holder(`${A}/be`)).toBeNull();
+  expect(await lastEvent(`${A}/be`)).toEqual({ session_id: a.id, event: "released", detail: "session_end: wss_removed" });
+  expect(await ended(a.id)).toEqual([{ principal: A, held: [`${A}/be`], why: "wss_removed", bounced: 1 }]);
 
   // The bounce waits for the sender's alias, and its next holder gets it.
   const b2 = await srv.connected(bob, "fe");
@@ -92,17 +94,18 @@ test("a session whose end fails is audited and retried at the next revalidate; t
   };
 
   expect((await srv.api(alice, "POST", "/api/teams/eng/remove", { email: "bob@example.com" })).status).toBe(200);
-  expect(row(good.id)!.ended_at).toBe(clock);
+  expect((await row(good.id))!.ended_at).toBe(clock);
   // The failed end rolled back whole: the ID is as it was.
-  expect(row(bad.id)!.ended_at).toBeNull();
-  const failed = srv.app.db.prepare(`SELECT actor, detail FROM access_log WHERE action = 'id.end_failed' AND target = ?`).all(bad.id) as { actor: string | null; detail: string }[];
+  expect((await row(bad.id))!.ended_at).toBeNull();
+  await drained(srv);
+  const failed = await rows<{ actor: string | null; detail: string }>(srv, `SELECT actor, detail FROM access_log WHERE action = 'id.end_failed' AND target = ?`, bad.id);
   expect(failed.map((r) => ({ actor: r.actor, ...JSON.parse(r.detail) }))).toEqual([{ actor: null, why: "revoked", error: "Error: disk on fire" }]);
 
   // The session still writes as an alias it may not: the next revalidate ends it.
   repo.sessionEnd.end = end;
   await srv.app.revalidate();
-  expect(row(bad.id)!.ended_at).toBe(clock);
-  expect(ended(bad.id)).toEqual([expect.objectContaining({ why: "revoked" })]);
+  expect((await row(bad.id))!.ended_at).toBe(clock);
+  expect(await ended(bad.id)).toEqual([expect.objectContaining({ why: "revoked" })]);
 });
 
 // #328 (S10, S17): retention deletes an ended session's ids row on the
@@ -118,19 +121,18 @@ test("retention prunes ended sessions, never a live one, and leaves no tombstone
   alice = await srv.login(A);
   const live = await srv.connected(alice, "api");
 
-  const db = srv.app.db;
-  const tombstones = () => db.prepare(`SELECT id, ended_at, pruned_at FROM pruned_ids`).all();
+  const tombstones = () => rows(srv, `SELECT id, ended_at, pruned_at FROM pruned_ids`);
   // Inside the window nothing goes.
   await runRetention(srv.app.repo, srv.config, clock + 1);
-  expect(row(first.id)).not.toBeNull();
+  expect(await row(first.id)).not.toBeNull();
   const later = clock + (srv.config.messageRetentionDays + 1) * 86_400_000;
   await runRetention(srv.app.repo, srv.config, later);
-  expect([row(first.id), row(second.id)]).toEqual([null, null]);
+  expect([await row(first.id), await row(second.id)]).toEqual([null, null]);
   // A live session is never pruned, however old.
-  expect(row(live.id)).toEqual({ ended_at: null, held_aliases_json: null });
-  expect(tombstones()).toEqual([]);
+  expect(await row(live.id)).toEqual({ ended_at: null, held_aliases_json: null });
+  expect(await tombstones()).toEqual([]);
   // Provenance naming the pruned IDs stays: each alias keeps its last bind.
-  expect(lastEvent(`${A}/be`)).toEqual({ session_id: first.id, event: "bound", detail: null });
+  expect(await lastEvent(`${A}/be`)).toEqual({ session_id: first.id, event: "bound", detail: null });
 });
 
 // #284 S18: a send or mention naming an ID that can't receive is refused
@@ -156,8 +158,8 @@ test("a send or @id: mention to an ID that can't receive carries its code: not_f
   await expect(a.call("board_post", { board: "e2e", body: `@${gone.id} hi` })).rejects.toMatchObject({ code: "id_ended", message: `${gone.id} ended at ${at}; it held no alias` });
   await expect(a.call("board_post", { board: "e2e", body: `@${tools.id} hi` })).rejects.toMatchObject({ code: "no_delivery" });
   // Nothing was written.
-  expect(srv.app.db.prepare(`SELECT COUNT(*) AS n FROM messages`).get()).toEqual({ n: 0 });
-  expect(srv.app.db.prepare(`SELECT COUNT(*) AS n FROM posts`).get()).toEqual({ n: 0 });
+  expect(await sqlRow(srv, `SELECT COUNT(*) AS n FROM messages`)).toEqual({ n: 0 });
+  expect(await sqlRow(srv, `SELECT COUNT(*) AS n FROM posts`)).toEqual({ n: 0 });
 });
 
 // #284 S7: a hold session takes mail like local channels-off (#71): it gets
@@ -168,7 +170,7 @@ test("a hold session registers delivery push: a send to its ID is accepted and w
   const alice = await srv.login(A);
   const a = await srv.connected(alice, "be");
   const held = await srv.connected(alice, "fe", { push: false, hold: true });
-  expect(srv.app.db.prepare(`SELECT delivery FROM ids WHERE id = ?`).get(held.id)).toEqual({ delivery: "push" });
+  expect(await sqlRow(srv, `SELECT delivery FROM ids WHERE id = ?`, held.id)).toEqual({ delivery: "push" });
 
   expect(await a.send(held.id, "for later")).toMatchObject({ delivered_now: false });
   await held.none(direct());
@@ -189,10 +191,10 @@ test("a two-hold session is delivered to on each hold; a restart ends it and rel
   }
 
   s.close();
-  expect([holder(`${A}/be`), holder(`${A}/be2`)]).toEqual([s.id, s.id]);
+  expect([await holder(`${A}/be`), await holder(`${A}/be2`)]).toEqual([s.id, s.id]);
   await restart();
-  expect(row(s.id)!.ended_at).toBe(clock);
-  expect(row(s.id)!.held_aliases_json).toBe(JSON.stringify([`${A}/be`, `${A}/be2`]));
-  expect([holder(`${A}/be`), holder(`${A}/be2`)]).toEqual([null, null]);
-  expect(lastEvent(`${A}/be2`)).toEqual({ session_id: s.id, event: "released", detail: "session_end: wss_removed" });
+  expect((await row(s.id))!.ended_at).toBe(clock);
+  expect((await row(s.id))!.held_aliases_json).toBe(JSON.stringify([`${A}/be`, `${A}/be2`]));
+  expect([await holder(`${A}/be`), await holder(`${A}/be2`)]).toEqual([null, null]);
+  expect(await lastEvent(`${A}/be2`)).toEqual({ session_id: s.id, event: "released", detail: "session_end: wss_removed" });
 });

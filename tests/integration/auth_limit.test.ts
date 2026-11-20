@@ -54,7 +54,7 @@ const mcpList = (srv: TestServer, token: string, from: string) =>
     }),
   });
 const hostedToken = async (srv: TestServer) => (await issueOAuth(srv.app.repo, srv.app.oauth.resource, A, ["grayboard:tools"], Date.now(), OPENCODE_CLIENT)).token;
-const audit = (srv: TestServer, action: string) => accessAudits(srv.app.db, action);
+const audit = (srv: TestServer, action: string) => accessAudits(srv, action);
 
 const X = "198.51.100.1";
 const Y = "198.51.100.2";
@@ -119,11 +119,11 @@ test("sign-in calls are charged on entry, and refused uncharged unless JSON; dev
   for (let i = 0; i < 3; i++) expect((await devLogin(X)).status).toBe(403);
   expect((await devLogin(X)).status).toBe(429);
   // The audit's address is the resolved one, not the raw header.
-  expect(audit(srv, "auth.dev_login_refused").map((r) => r.detail.ip)).toEqual([X, X, X]);
-  expect(audit(srv, "auth.login")).toEqual([]);
+  expect((await audit(srv, "auth.dev_login_refused")).map((r) => r.detail.ip)).toEqual([X, X, X]);
+  expect(await audit(srv, "auth.login")).toEqual([]);
   // A client on the host signs in, its address audited.
   expect((await devLogin("127.0.0.5")).status).toBe(200);
-  expect(audit(srv, "auth.login").map((r) => r.detail.ip)).toEqual(["127.0.0.5"]);
+  expect((await audit(srv, "auth.login")).map((r) => r.detail.ip)).toEqual(["127.0.0.5"]);
 
   const off = await serve({ devAuth: false, googleClientSecret: "s", publicUrl: "https://grayboard.example.com" });
   const r = (from: string) => fetch(`${off.srv.base}/api/auth/dev-login`, { method: "POST", headers: { "X-Forwarded-For": from }, body: "{}" });
@@ -136,13 +136,13 @@ test("behind the trusted loopback each X-Forwarded-For has its own bucket, trust
   expect((await get(srv, "/api/whoami", "bad0", `6.6.6.6, ${X}, 127.0.0.1`)).status).toBe(401);
   expect((await get(srv, "/api/whoami", "bad1", X)).status).toBe(429);
   expect((await get(srv, "/api/whoami", "bad2", Y)).status).toBe(401);
-  expect(audit(srv, "auth.rate_limited").map((r) => r.target)).toEqual([X]);
+  expect((await audit(srv, "auth.rate_limited")).map((r) => r.target)).toEqual([X]);
 
   const none = await serve({ authFailLimit: { burst: 1, perSec: 0.1 }, trustedProxies: [] });
   expect((await get(none.srv, "/api/whoami", "bad0", X)).status).toBe(401);
   expect((await get(none.srv, "/api/whoami", "bad1", Y)).status).toBe(429);
   // Both keyed by the peer, whichever loopback address it was.
-  const targets = audit(none.srv, "auth.rate_limited").map((r) => r.target);
+  const targets = (await audit(none.srv, "auth.rate_limited")).map((r) => r.target);
   expect(targets).toHaveLength(1);
   expect([X, Y]).not.toContain(targets[0]);
 });
@@ -160,13 +160,13 @@ test("IPv6 /64s rotating under one /48 drain it on the auth gate and the OAuth r
     expect(refused.status).toBe(429);
     expect(((await refused.json()) as { message: string }).message).toContain("this network (/48)");
     expect((await get(srv, "/api/whoami", "bad9", v6(2, 9))).status).toBe(401);
-    expect(audit(srv, "auth.rate_limited").map((r) => r.target)).toEqual(["2001:db8:1::/48"]);
+    expect((await audit(srv, "auth.rate_limited")).map((r) => r.target)).toEqual(["2001:db8:1::/48"]);
     // OAuth: a browser route from four /64s of /48 3 spends its OAuth /48 sibling; the fifth is refused.
     const browse = (from: string) => fetch(`${srv.base}/oauth/unknown`, { headers: { "X-Forwarded-For": from } }).then((r) => r.status);
     for (let net = 0; net < 4; net++) expect(await browse(v6(3, net))).not.toBe(429);
     expect(await browse(v6(3, 9))).toBe(429);
     expect(await browse(v6(4, 9))).not.toBe(429);
-    const oauthScopes = audit(srv, "oauth.rate_limited").map((r) => [r.target, (r.detail as { scope: string }).scope]);
+    const oauthScopes = (await audit(srv, "oauth.rate_limited")).map((r) => [r.target, (r.detail as { scope: string }).scope]);
     expect(oauthScopes).toEqual([["2001:db8:3::/48", "site"]]);
   } finally {
     err.mockRestore();
@@ -182,7 +182,7 @@ test("a run of refusals writes one row and one log line at its start and one at 
   for (let i = 0; i < 3; i++) await get(srv, "/api/whoami", `bad${i}`, X);
   for (let i = 0; i < 4; i++) expect((await get(srv, "/api/claims", "bad", X)).status).toBe(429);
   expect(logged()).toEqual([`[grayboard] rate-limiting ${X} after repeated authentication failures`]);
-  const started = audit(srv, "auth.rate_limited");
+  const started = await audit(srv, "auth.rate_limited");
   expect(started.length).toBe(1);
   expect(started[0]!.actor).toBeNull();
   expect(started[0]!.target).toBe(X);
@@ -193,11 +193,11 @@ test("a run of refusals writes one row and one log line at its start and one at 
     addr: X, path: "/api/claims", retry_after_ms: 10_000,
     last_failure: { addr: X, path: "/api/whoami", reason: "refused token", ua: expect.any(String) },
   });
-  expect(audit(srv, "auth.rate_limit_ended")).toEqual([]);
+  expect(await audit(srv, "auth.rate_limit_ended")).toEqual([]);
   // Refilled (30s at 0.1/s), seen by the heartbeat's sweep.
   clock.t += 30_000;
   srv.app.sweepLimits();
-  const ended = audit(srv, "auth.rate_limit_ended");
+  const ended = await audit(srv, "auth.rate_limit_ended");
   expect(ended.length).toBe(1);
   expect(ended[0]!.target).toBe(X);
   expect(ended[0]!.at).toBe(clock.t);
@@ -219,7 +219,7 @@ test("a stale token looping from a shared address is answered from memory: one l
   }
   expect(lookups()).toBe(1);
   expect(srv.app.authGate.refusedSize).toBe(1);
-  expect(audit(srv, "auth.rate_limited")).toEqual([]);
+  expect(await audit(srv, "auth.rate_limited")).toEqual([]);
   expect((await get(srv, "/api/whoami", alice, X)).status).toBe(200);
   // Remembered per path: the same token elsewhere is looked up and charged again.
   expect((await get(srv, "/api/claims", "stale", X)).status).toBe(401);

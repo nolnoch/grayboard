@@ -11,6 +11,7 @@ import type { AppSession } from "../support/app_session.ts";
 import { board, direct } from "../support/events.ts";
 import { closeSessions } from "../support/mcp.ts";
 import { TestServer } from "../support/server.ts";
+import { txSpy } from "../support/repo_sql.ts";
 
 const ADMIN = "dana@example.com";
 let srv: TestServer;
@@ -243,13 +244,14 @@ test("a reply to a team alias reads its parent on the send body's Tx (#807 P1c-1
   await outsider.next(direct((m) => m.body === "from the team"));
   const repo = srv.app.repo;
   const checks: string[] = [];
+  const tx = txSpy(srv);
   const original = repo.messages.getById.bind(repo.messages);
   const spy = spyOn(repo.messages, "getById").mockImplementation((r, id) => {
-    if (new Error().stack?.includes("replyingTo")) checks.push(`${r === repo.read ? "pool" : "tx"}:${srv.app.db.inTransaction}`);
+    if (new Error().stack?.includes("replyingTo")) checks.push(`${r === repo.read ? "pool" : "tx"}:${tx.open}`);
     return original(r, id);
   });
   try {
     expect((await outsider.send("eng/build", "reply", { parent_id: first.message_id })).message_id).toBeGreaterThan(0);
-  } finally { spy.mockRestore(); }
+  } finally { spy.mockRestore(); tx.restore(); }
   expect(checks).toEqual(["tx:true"]);
 });
