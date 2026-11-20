@@ -2,7 +2,7 @@ import type { Database } from "bun:sqlite";
 import { describeLocation } from "../shared/identity.ts";
 import type { Pending, Post } from "../shared/notifications.ts";
 import { bindAttachments, dropAttachments, withAttachments, type FileSend } from "./attachments.ts";
-import { CoreError, IdCollision } from "./errors.ts";
+import { CoreError, IdCollision, notAPostText } from "./errors.ts";
 import { cleanFact, cleanPlace, oneLine } from "./text.ts";
 import { ackQueueClaim, logEvent } from "./claims.ts";
 import { addressParts, aliasScope, type AliasScope, type ScopeKind } from "./addresses.ts";
@@ -948,17 +948,13 @@ export function queueLaneRowsSql(): string {
 // bus writes when it ends unclaimed is that user's. Caller is inside post's transaction.
 // `push: false`: the caller queues the lane's push itself (a mention's, #219).
 // Returns whether this run took the claim (false: a row already held the key).
+// The claim goes first and the push only to the key's holder (#1357): a run
+// that finds the key held by another lane offers that lane nothing.
 export function claimQueuePost(
   db: Database, board: string, postId: number, lane: string, now: number, { note = "queue post", push = true }: { note?: string; push?: boolean } = {},
 ): boolean {
   const key = `queue:${board}:${postId}`;
   const expires = now + QUEUE_CLAIM_TTL_MS;
-  // Redelivery to a lane that already had this post resets its push, so the
-  // re-offer actually reaches it (at-least-once).
-  if (push) db.prepare(
-    `INSERT INTO outbox (handle, post_id, reason, wake) VALUES (?, ?, 'subscription', 1)
-     ON CONFLICT(handle, post_id) DO UPDATE SET delivered_at = NULL, wake = 1`,
-  ).run(lane, postId);
   const res = db
     .prepare(
       `INSERT OR IGNORE INTO claims (key, holder, note, board, acquired_at, expires_at, holder_user)
@@ -966,6 +962,14 @@ export function claimQueuePost(
          (SELECT i.principal FROM alias_holds h JOIN ids i ON i.id = h.id WHERE h.address = ?2)))`,
     )
     .run(key, lane, note, board, now, expires);
+  // Redelivery to a lane that already had this post resets its push, so the
+  // re-offer actually reaches it (at-least-once): when this run took the key,
+  // or the lane already holds it.
+  if (push) db.prepare(
+    `INSERT INTO outbox (handle, post_id, reason, wake)
+     SELECT ?1, ?2, 'subscription', 1 WHERE EXISTS (SELECT 1 FROM claims WHERE key = ?3 AND holder = ?1)
+     ON CONFLICT(handle, post_id) DO UPDATE SET delivered_at = NULL, wake = 1`,
+  ).run(lane, postId, key);
   // The claim is the idempotency token: when a row already holds the key,
   // this run isn't the lane's delivery and must not read as one in the
   // audit - the lane's reply-ack checks the claim's holder, not the outbox
@@ -1115,7 +1119,7 @@ export function postGateRule(
   if (parentId !== null) {
     const p = parent();
     if (!p || p.board !== b.name) {
-      throw new CoreError(`parent_id ${parentId} is not a post on #${b.name}`);
+      throw new CoreError(notAPostText(parentId, b.name));
     }
   }
   const announce = b.name === announceBoard;

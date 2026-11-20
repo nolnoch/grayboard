@@ -8,8 +8,7 @@ import { isThenable } from "./store/tx_base.ts";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 
-import { acknowledge, redeliveryFacts, type RedeliveryFacts, aliasScopeRows, authorAddresses, claimQueuePost, humansAmong, insertOutbox, insertPost, queueLaneRows, subscriberRows, threadFacts, type NewPost, type PostTarget, type ThreadFacts, insertBoard, isHuman, readRows, setArchived, setMute, threadRoot, type AliasScopeRow, type ReadResult, ALIAS_SESSION_SQL, boardViewRows, openSummaryRows, setQueueParticipation, whoRows, writeStatus, type BoardSummary, type BoardView, type UnboundFacts, type WhoRow, ensureBoard, forgetHandle, isSubscribed, markHuman, prunePosts, setSubscription, unsubscribeScope, type SubMode, catalogPage, getBoard, getPost, HOLD_ORDER, lastSeen, pendingDigests, pendingPushes, snapshotPage, type Board, type BoardSnapshot, type DigestRow, type PendingRef, type PushRow, type SnapshotOptions, pruneEndedIds, registerId, setAccess, writeAliasMeta, setIdFacts, setPlace, touchAlias, touchId, type CoreDb } from "../core/boards.ts";
-import type { Post } from "../shared/notifications.ts";
+import { acknowledge, redeliveryFacts, aliasScopeRows, authorAddresses, claimQueuePost, humansAmong, insertOutbox, insertPost, queueLaneRows, subscriberRows, threadFacts, insertBoard, isHuman, readRows, setArchived, setMute, threadRoot, type AliasScopeRow, ALIAS_SESSION_SQL, boardViewRows, openSummaryRows, setQueueParticipation, whoRows, writeStatus, type UnboundFacts, ensureBoard, forgetHandle, isSubscribed, markHuman, prunePosts, setSubscription, unsubscribeScope, catalogPage, getBoard, getPost, HOLD_ORDER, lastSeen, pendingDigests, pendingPushes, snapshotPage, pruneEndedIds, registerId, setAccess, writeAliasMeta, setIdFacts, setPlace, touchAlias, touchId, type CoreDb } from "../core/boards.ts";
 import { ackQueueClaim, addClaimWatch, claimRow, claimWatchers, expireClaims, holderUser, listClaims, liveClaim, logEvent, recentClaimEvents, releaseClaim, removeClaimWatch, takeClaim, takeClaimWatchers } from "../core/claims.ts";
 import { addressSet, aliasUser, aliasUses, dropHold, holderOf, holdsOf, idRow, idStatuses, logBinding, unendedIds } from "../core/bindings.ts";
 import type { AuditAction } from "./audit.ts";
@@ -28,7 +27,7 @@ import type { WriteTx } from "../core/write_tx.ts";
 import { isTx, type Read, type Tx, sqliteOf, sqliteRead, sqliteTx } from "./store/tx.ts";
 import { serverAccess } from "./access.ts";
 import type { AccessReadsSync, HumanReach, PolicyReadsSync } from "./policy.ts";
-import { DEFAULT_ATTACHMENT_LIMITS, DEFAULT_ATTACHMENT_USER_QUOTA, type AttachmentInfo, type AttachmentLimits } from "../shared/attachments.ts";
+import { DEFAULT_ATTACHMENT_LIMITS, DEFAULT_ATTACHMENT_USER_QUOTA, type AttachmentLimits } from "../shared/attachments.ts";
 import { DiskBlobs } from "./blobs.ts";
 import { detached, inRequest, requestOrigin } from "./request_context.ts";
 import { GOOGLE_ISSUER } from "./idp_google.ts";
@@ -37,11 +36,12 @@ import type { CredentialSource, ServiceCredential, OAuthStore, OAuthAuthorizatio
 import { accessFits, accessLookup, BROWSER_SESSIONS, browserData, browserSessionInput, clampPair, clientLookup, codeData, codeInput, grantInput, isLogin, LIVE_SECRETS,
   loginInput, lookup, MINT_WINDOW_MS, mintInput, requestData, requestInput, REQUESTS_PER_BROWSER, REQUESTS_TOTAL, sameAuthorization, rotationBinding, secretLookup,
   serviceCredentialInput, serviceSecretInput, successorInput, time } from "./oauth-rules.ts";
-import { AuthorityLost, LastOwner, MissingParent, PrincipalTaken } from "./store/errors.ts";
+import { AuthorityLost, LastOwner, MissingParent, MissingPost, PrincipalTaken } from "./store/errors.ts";
 import type { Alias, AliasesStore } from "./store/aliases.ts";
 import type { MessageRow, MessagesStore, RetractResult } from "./store/messages.ts";
 import type { AttachmentsStore } from "./store/attachments.ts";
 import type { BindingsStore } from "./store/bindings.ts";
+import type { BoardsStore } from "./store/boards.ts";
 import type { ClaimsStore } from "./store/claims.ts";
 import type { CursorsStore } from "./store/cursors.ts";
 import type { WriteReceipt, WriteReceiptsStore } from "./store/write_receipts.ts";
@@ -262,73 +262,8 @@ export interface Repo {
   attachments: AttachmentsStore;
   // Claims, their watches and events (store/claims.ts).
   claims: ClaimsStore;
-  // Board reads and the delivery acknowledgement (#807 P3 B5a1), on the caller's handle. Visibility is the caller's
-  // (BoardAccess, src/server/access.ts): nothing here filters by it. Board writes stay with callBoardTool (B5b).
-  boards: {
-    get(r: Read, name: string): Promise<Board | undefined>;
-    post(r: Read, id: number): Promise<Post | undefined>;
-    // Up to CATALOG_PAGE boards named after `cursor`, in name order (core catalogPage).
-    catalogPage(r: Read, cursor: string): Promise<Board[]>;
-    // A snapshot's page of a board already judged visible: options checked, posts with attachments (core snapshotPage).
-    snapshotPage(r: Read, board: string, opts: SnapshotOptions): Promise<Omit<BoardSnapshot, "board">>;
-    // The handle's undelivered pushes, oldest first, and its due digests (core pendingPushes, pendingDigests).
-    pendingPushes(r: Read, handle: string): Promise<PushRow[]>;
-    pendingDigests(r: Read, handle: string): Promise<DigestRow[]>;
-    // Marks a pending item delivered to `handle` (core acknowledge): a push's outbox row, a push-mode cursor, a digest's catch-up.
-    acknowledge(tx: Tx, handle: string, ref: PendingRef): Promise<void>;
-    // The board writes outside the board tools (#807 P3 B5b1): a mode's bookkeeping, unchecked. The caller judges
-    // visibility first where it matters (teams.ts follow).
-    // Creates the board unless one has the name (core ensureBoard): no creator subscription; false when it existed.
-    ensure(tx: Tx, name: string, purpose: string, scope: string | null, createdBy: string): Promise<boolean>;
-    isSubscribed(r: Read, handle: string, board: string): Promise<boolean>;
-    // Subscribes at the board's tip, or changes the mode of a subscription; "off" deletes it (core setSubscription).
-    setSubscription(tx: Tx, handle: string, board: string, mode: SubMode | "off"): Promise<void>;
-    // Deletes the handle's subscriptions to every board of `scope` (core unsubscribeScope).
-    unsubscribeScope(tx: Tx, handle: string, scope: string): Promise<void>;
-    // A deleted handle's subscriptions, pushes, mutes, watches and holds (core forgetHandle); its posts and claims stay.
-    forget(tx: Tx, handle: string): Promise<void>;
-    // Retention (core prunePosts): posts, claim and binding events older than `olderThan`; returns the boards that lost posts.
-    prunePosts(tx: Tx, olderThan: number): Promise<string[]>;
-    // The board tools' reads (#807 P3 B5b1b1), unjudged. Each of `handles`' view of every board (of `board` alone),
-    // in handle order, then board name (core boardViewRows).
-    views(r: Read, handles: string[], board: string | null): Promise<BoardView[]>;
-    // Every open board with no mode and nothing unread, by name (core openSummaryRows).
-    openSummaries(r: Read): Promise<BoardSummary[]>;
-    // peer_list's roster: every alias that has had a session, or a board's subscribers (core whoRows).
-    roster(r: Read, board: string | null): Promise<WhoRow[]>;
-    // The board tools' writes (#807 P3 B5b1b2), their arguments and access already checked. The new board, or null
-    // when the name is taken (core insertBoard); no creator subscription.
-    create(tx: Tx, b: { name: string; purpose: string; scope: string | null; kind: string; createdBy: string; now: number }): Promise<Board | null>;
-    // Archives the board as `by`, or with `by` null reopens it: the board after, or null when it was already in that
-    // state (core setArchived).
-    setArchived(tx: Tx, name: string, by: string | null, now: number): Promise<Board | null>;
-    // A read of a board already judged visible (core readRows): `handle`'s cursor and pushes advance, unless null.
-    read(tx: Tx, board: string, handle: string | null, opts: { limit?: number; before_id?: number; thread?: number }): Promise<ReadResult>;
-    // The root of the thread postId is in (core threadRoot).
-    threadRoot(r: Read, postId: number): Promise<number>;
-    // Mutes or unmutes the thread at `root` for `handle` (core setMute).
-    mute(tx: Tx, handle: string, root: number, muted: boolean): Promise<void>;
-    // board_post's reads and writes (#807 P3 B5b2), its gate passed: the rows core post reads and writes, unjudged.
-    // Writes a post's row (core insertPost).
-    insertPost(tx: Tx, p: NewPost): Promise<Post>;
-    // Binds `from`'s unsent uploads `ids` to the post under the size caps; rejects with CoreError on an id that isn't
-    // one or a total over the cap (core bindAttachments).
-    bindAttachments(tx: Tx, ids: number[], from: Uploader, postId: number, limits: AttachmentLimits): Promise<AttachmentInfo[]>;
-    // An author's address set: itself, its writing session's ID and holds, and a child's root's (core authorAddresses).
-    authorAddresses(r: Read, author: string, authorId: string | null): Promise<string[]>;
-    // A board's subscriptions by handle (core subscriberRows).
-    subscribers(r: Read, board: string): Promise<{ handle: string; mode: SubMode }[]>;
-    // What a reply to parentId, a post that exists, reads of its thread (core threadFacts).
-    threadFacts(r: Read, parentId: number): Promise<ThreadFacts>;
-    // A queue board's lanes less `poster`, least-recently-woken first (core queueLaneRows).
-    laneRows(r: Read, board: string, poster: string[]): Promise<string[]>;
-    // Claims a queue post for `lane`, with its push unless `push` is false; whether the claim was taken (core claimQueuePost).
-    claimQueuePost(tx: Tx, board: string, postId: number, lane: string, now: number, o: { note: string; push: boolean }): Promise<boolean>;
-    // A post plan's outbox rows, in its order (core insertOutbox).
-    insertOutbox(tx: Tx, postId: number, targets: [string, PostTarget][]): Promise<void>;
-    // A queue post's redelivery facts for a claim on `key` that `prevHolder` held (core redeliveryFacts), or null.
-    redeliveryFacts(r: Read, key: string, prevHolder: string): Promise<RedeliveryFacts | null>;
-  };
+  // Boards, posts, subscriptions, pushes and a queue post's claim (store/boards.ts).
+  boards: BoardsStore;
   // A session's end and its ID's deliverability (store/session_end.ts).
   sessionEnd: SessionEndStore;
   // What a delegate decides on (store/delegation.ts).
@@ -1450,7 +1385,16 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       read: async (tx, board, handle, opts) => readRows(sqliteOf(tx), board, handle, opts),
       threadRoot: async (r, postId) => threadRoot(sqliteOf(r), postId),
       mute: async (tx, handle, root, muted) => setMute(sqliteOf(tx), handle, root, muted),
-      insertPost: async (tx, p) => insertPost(sqliteOf(tx), p),
+      insertPost: async (tx, p) => {
+        const db = sqliteOf(tx);
+        try {
+          return insertPost(db, p);
+        } catch (e) {
+          // A parent that isn't there fails the posts.parent_id foreign key (the statement alone rolls back).
+          if (p.parentId !== null && (e as { code?: string }).code === "SQLITE_CONSTRAINT_FOREIGNKEY" && !getPost(db, p.parentId)) throw new MissingPost(p.parentId, p.board);
+          throw e;
+        }
+      },
       bindAttachments: async (tx, ids, from, postId, limits) => bindAttachments(sqliteOf(tx), ids, from, { post_id: postId }, limits),
       authorAddresses: async (r, author, authorId) => authorAddresses(sqliteOf(r), author, authorId),
       subscribers: async (r, board) => subscriberRows(sqliteOf(r), board),

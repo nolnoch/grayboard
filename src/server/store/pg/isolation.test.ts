@@ -91,6 +91,10 @@ test("the walk follows relative imports and skips type-only ones", () => {
   // throws, in core/errors.ts so a pg module can import it without reaching core/boards.ts.
   expect(forbiddenReach([join(SRC, "server/store/bindings.ts")])).toEqual([]);
   expect(forbiddenReach([join(SRC, "core/errors.ts")])).toEqual([]);
+  // The boards group's type (#807 P3 C10e-a), which the Postgres store (C10e1/C10e2) implements, and the MissingPost
+  // its insertPost throws (store/errors.ts, over core/errors.ts's text).
+  expect(forbiddenReach([join(SRC, "server/store/boards.ts")])).toEqual([]);
+  expect(forbiddenReach([join(SRC, "server/store/errors.ts")])).toEqual([]);
   // The Postgres aliases and messages stores and the attachment rows they share with C10c (#807 P3 C5b), which restate
   // core/boards.ts's and core/attachments.ts's SQL (those take a bun:sqlite Database and go with local mode).
   for (const m of ["aliases.ts", "messages.ts", "attachment_rows.ts"]) expect(forbiddenReach([join(import.meta.dir, m)])).toEqual([]);

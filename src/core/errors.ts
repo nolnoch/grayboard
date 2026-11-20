@@ -22,6 +22,11 @@ export class BlobMissing extends Error {
   }
 }
 
+/** The refusal for a reply whose parent isn't a post on its board: the post gate's, and the store's backstop (MissingPost). */
+export function notAPostText(parentId: number, board: string): string {
+  return `parent_id ${parentId} is not a post on #${board}`;
+}
+
 /** The id_collision refusal's text, both modes: `id` and why it's taken. */
 export function idCollisionText(id: string, why: string): string {
   return `id_collision: ${id} ${why}; start with a new session key`;
