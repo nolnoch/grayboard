@@ -54,7 +54,12 @@ Bun.spawn([process.execPath, ...cmd], { stdio: ["inherit", "inherit", "inherit"]
 // and that stand-in's pid under a session's harness.
 const standIn = (dir: string, harness = "claude") =>
   [join(dir, harness), join(dir, "host.ts"), "--dangerously-load-development-channels", "server:grayboard", "::"];
-const standInPid = (dir: string, s: Session) => processDescendants(s.harnessPid).find((p) => p.command.includes(join(dir, "host.ts")))!.pid;
+const standInPid = (dir: string, s: Session) => {
+  const host = join(dir, "host.ts");
+  const p = processDescendants(s.harnessPid).find((p) => p.command.includes(host));
+  if (!p) throw new Error(`no process running ${host} under the session's harness ${s.harnessPid}`);
+  return p.pid;
+};
 
 // The hook events Claude Code would run for this session's harness.
 const hook = (b: Bus, event: "session-start" | "pre-tool-use", input: Record<string, unknown>) =>
@@ -147,15 +152,17 @@ test("settings without the hooks run every call as the root, audited once and sa
 
 // #1412: a harness launched from a Claude Code shell (omp here) passes
 // CLAUDECODE on to its grayboard. That grayboard isn't Claude Code's: it
-// neither warns that attribution is off nor reads hook records, even one
-// written under its harness's pid. Under the claude stand-in, both hold.
+// neither warns that hooks are missing nor reads hook records, even one
+// written under its harness's pid. Under the claude stand-in, both hold. A
+// call carrying Claude's tool_use_id (omp sends none; Claude Code under an
+// unrecognized launcher does) is the root's, audited as such.
 for (const harness of ["omp", "claude"]) test(`under ${harness} with CLAUDECODE=1, Claude hook records and the attribution-off note ${harness === "claude" ? "apply" : "don't apply"}`, async () => {
   const claude = harness === "claude";
   const off = await claudeBus(false, undefined, harness);
   expect((await dm(off, "no-hooks", toolUse())).isError).toBeFalsy();
   expect(off.s.c.getInstructions()!.includes("subagent attribution is off")).toBe(claude);
-  expect(((await off.s.call("whoami")).note ?? "").includes("subagent attribution is off")).toBe(claude);
-  expect(audits(off, "claude.attribution_off")).toEqual(claude ? [{ tool: "dm_send" }] : []);
+  expect((await off.s.call("whoami")).note).toContain(claude ? "hooks aren't in Claude Code's user settings" : "can't find Claude Code");
+  expect(audits(off, "claude.attribution_off")).toEqual([claude ? { tool: "dm_send" } : { tool: "dm_send", reason: "harness_not_claude" }]);
 
   const on = await claudeBus(true, undefined, harness);
   hook(on, "session-start", {});
@@ -167,6 +174,21 @@ for (const harness of ["omp", "claude"]) test(`under ${harness} with CLAUDECODE=
   // No record for this call: refused under Claude, the root's call elsewhere.
   expect(!!(await dm(on, "unrecorded", toolUse())).isError).toBe(claude);
   expect(audits(on, "claude.agent_record_missing").length).toBe(claude ? 1 : 0);
+});
+
+// #1412: Claude Code under a launcher claudeAmong doesn't know (`node
+// wrapper.js`) can't be found among this process's parents, so no hook record
+// can be read. Its subagents' calls act as the root: not refused, but audited
+// once and said in whoami once a call shows Claude's tool_use_id.
+test("Claude Code under an unrecognized launcher runs subagents' calls as the root, audited once and said in whoami", async () => {
+  const b = await claudeBus(true, undefined, "node");
+  expect((await b.s.call("whoami")).note).toBeUndefined();
+  for (const body of ["wrapped-1", "wrapped-2"]) expect((await dm(b, body, toolUse())).isError).toBeFalsy();
+  for (const body of ["wrapped-1", "wrapped-2"]) expect(sent(b, body)).toEqual({ via: null });
+  expect(audits(b, "claude.attribution_off")).toEqual([{ tool: "dm_send", reason: "harness_not_claude" }]);
+  expect(audits(b, "claude.agent_record_missing")).toEqual([]);
+  expect((await b.s.call("whoami")).note).toContain("subagent attribution is off");
+  expect(b.s.c.getInstructions()).not.toContain("subagent attribution is off");
 });
 
 test("Claude's acknowledged clear barrier selects remembered B before calls/pushes and rejects an A call", async () => {
@@ -273,21 +295,25 @@ test("a genuinely new configured root has the same correct title before and afte
   expect(JSON.parse(out).hookSpecificOutput.sessionTitle).toBe("cc");
 });
 
-test("an adapter's selected identity ignores inherited Claude environment and needs no Claude hook record", async () => {
+// Under the claude stand-in, with hooks installed, either guard alone keeps
+// Claude's conversation record from steering a session that isn't Claude
+// Code's: BUS_ADAPTER_OWNER (the adapter selects its conversation) or
+// BUS_HARNESS_SESSION (the harness names it at start). Every shipping adapter
+// sets both; each is tested without the other.
+for (const guard of ["owner", "harness session"] as const) test(`an adapter's identity ignores inherited Claude environment and needs no Claude hook record (${guard} alone)`, async () => {
   const b = await claudeBus(true);
   const owner = "adapter-not-claude";
-  // Under the claude stand-in, with hooks installed, so only BUS_ADAPTER_OWNER
-  // keeps Claude's conversation record from steering it: no BUS_HARNESS_SESSION
-  // at start; the adapter selects its conversation as an adapter does.
   const adapter = await localSession(b.dir, "adapter", { via: standIn(b.dir), extra: {
-    BUS_ADAPTER_OWNER: owner,
+    ...(guard === "owner" ? { BUS_ADAPTER_OWNER: owner } : { BUS_HARNESS_SESSION: "pi-current" }),
     CLAUDECODE: "1", CLAUDE_CODE_ENTRYPOINT: "cli", CLAUDE_CODE_SESSION_ID: "claude-stale", CLAUDE_CONFIG_DIR: b.cfg,
   } });
   await adapter.c.listTools();
   // Claude's hook says the conversation under this harness is claude-stale.
   runHook("session-start", JSON.stringify({ session_id: "claude-stale" }), { base: b.dir, env: { CLAUDE_PID: String(standInPid(b.dir, adapter)) }, hosted: false });
-  await adapter.c.request({ method: "grayboard/session", params: { owner, epoch: 1, session: "pi-current" } }, z.object({}).passthrough());
-  await adapter.c.request({ method: "grayboard/session/ready", params: { owner, epoch: 1 } }, z.object({}).passthrough());
+  if (guard === "owner") {
+    await adapter.c.request({ method: "grayboard/session", params: { owner, epoch: 1, session: "pi-current" } }, z.object({}).passthrough());
+    await adapter.c.request({ method: "grayboard/session/ready", params: { owner, epoch: 1 } }, z.object({}).passthrough());
+  }
   const identity = await adapter.call("whoami");
   expect(identity.aliases).toEqual(["adapter"]);
   expect(b.db.query<{ harness_session: string }, [string]>("SELECT harness_session FROM ids WHERE id=?").get(identity.id)?.harness_session).toBe("pi-current");
@@ -295,8 +321,10 @@ test("an adapter's selected identity ignores inherited Claude environment and ne
   await peer.call("dm_send", { to: "adapter", body: "adapter-current-push" });
   await until(() => adapter.pushes.length === 1);
   const push = adapter.pushes[0]!;
-  expect(push.meta.grayboard_session).toBe("pi-current");
-  await adapter.c.request({ method: "grayboard/delivery", params: { owner, token: push.meta.grayboard_delivery, accepted: true } }, z.object({}).passthrough());
+  // Only an adapter owner's pushes name the conversation they're for.
+  if (guard === "owner") expect(push.meta.grayboard_session).toBe("pi-current");
+  else expect(push.meta.grayboard_session).toBeUndefined();
+  if (guard === "owner") await adapter.c.request({ method: "grayboard/delivery", params: { owner, token: push.meta.grayboard_delivery, accepted: true } }, z.object({}).passthrough());
 });
 
 for (const fail of [false, true]) test(`native post-list activation ${fail ? "refusal preserves pending mail and surfaces failure" : "acknowledgement releases current guidance before mail"}`, async () => {
