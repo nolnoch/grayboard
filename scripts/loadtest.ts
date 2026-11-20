@@ -5,6 +5,10 @@
 //   bun scripts/loadtest.ts                 # the exit bar: 1,000 sessions for an hour
 //   bun scripts/loadtest.ts --quick         # a minute's smoke at 40 sessions
 //   bun scripts/loadtest.ts --sessions 500 --duration 900 --period 20
+//   bun scripts/loadtest.ts --pg postgres://u:p@host:5432/postgres   # the server on Postgres (#807)
+//
+// --pg names a cluster: the run creates an empty database there (gb_loadtest_<time>), the server migrates it at
+// startup, and the run drops it at the end unless --keep-db.
 //
 // Exit bar (#805): every session leased throughout; each steady window's native tool calls at
 // p99 < 100 ms (at least 99% at or under the 0.1 s bucket edge: no interpolation); RSS flat over
@@ -27,7 +31,9 @@ import { parseArgs } from "node:util";
 import { Database } from "bun:sqlite";
 import { DEFAULT_HOSTED_CAPS, DEFAULT_MCP_LIMITS } from "../src/server/config.ts";
 import { DEFAULT_HOSTED_REQUEST_LIMIT, DEFAULT_HOSTED_SUBSCRIBER_LIMIT, type RateLimit } from "../src/server/rate_limit.ts";
-import { openDatabase } from "../src/server/db.ts";
+import { openDatabase, type Repo } from "../src/server/db.ts";
+import { makePgRepo } from "../src/server/pg_repo.ts";
+import { openPg } from "../src/server/store/pg/sql.ts";
 import { sessionEndPort } from "../src/server/session_end.ts";
 import { OAUTH_TTL } from "../src/server/oauth-types.ts";
 import { issueOAuth } from "../tests/helpers/oauth.ts";
@@ -41,6 +47,8 @@ export type Options = {
   sessions: number; users: number; drivers: number; durationS: number; warmupS: number; periodS: number;
   boards: number; postShare: number; burst: number; churn: number; churnEveryS: number; windowS: number;
   graceS: number; server: string[]; out: string; keepDb: boolean; rssGate: boolean; env: Record<string, string>;
+  // A Postgres cluster URL; absent runs the server on a SQLite file.
+  pg?: string;
 };
 
 export function options(argv: string[]): Options {
@@ -49,7 +57,7 @@ export function options(argv: string[]): Options {
       quick: { type: "boolean" }, sessions: { type: "string" }, users: { type: "string" }, drivers: { type: "string" },
       duration: { type: "string" }, warmup: { type: "string" }, period: { type: "string" }, boards: { type: "string" },
       "post-share": { type: "string" }, burst: { type: "string" }, churn: { type: "string" }, "churn-every": { type: "string" },
-      window: { type: "string" }, grace: { type: "string" }, server: { type: "string" }, out: { type: "string" }, "keep-db": { type: "boolean" },
+      window: { type: "string" }, grace: { type: "string" }, server: { type: "string" }, out: { type: "string" }, "keep-db": { type: "boolean" }, pg: { type: "string" },
       // Server env overrides, KEY=VALUE, applied after the caps the run computes.
       env: { type: "string", multiple: true },
     },
@@ -72,6 +80,7 @@ export function options(argv: string[]): Options {
     server: v.server ? [resolve(v.server)] : [process.execPath, join(ROOT, "src/server/main.ts")],
     out: v.out ? resolve(v.out) : join(ROOT, ".e2e-runs", `loadtest-${new Date().toISOString().replace(/[:.]/g, "-")}`),
     keepDb: v["keep-db"] === true,
+    ...(v.pg ? { pg: v.pg } : {}),
     env: Object.fromEntries((v.env ?? []).map((kv) => {
       const eq = kv.indexOf("=");
       if (eq < 1) throw new Error(`--env takes KEY=VALUE, not "${kv}"`);
@@ -184,11 +193,25 @@ type Window = {
   driverLagP99: number; ops: number; loadavg: number[];
 };
 
+// Every hosted_sessions row left once the fleet has closed, parked children included.
+async function hostedRows(pgDbUrl: string | undefined, dbPath: string): Promise<number> {
+  if (pgDbUrl) {
+    const sql = openPg(pgDbUrl, { max: 1, applicationName: "gb-loadtest-count" });
+    try { return Number((await sql`SELECT count(*) AS n FROM hosted_sessions`)[0].n); } finally { await sql.close(); }
+  }
+  const ro = new Database(dbPath, { readonly: true });
+  try { return (ro.query("SELECT count(*) AS n FROM hosted_sessions").get() as { n: number }).n; } finally { ro.close(); }
+}
+
 async function main() {
   const o = options(process.argv.slice(2));
   mkdirSync(o.out, { recursive: true });
   const scratch = mkdtempSync(join(tmpdir(), "gb-loadtest-"));
-  const dbPath = join(scratch, "grayboard.db");
+  const dbPath = join(scratch, "grayboard.db"), blobDir = join(scratch, "blobs");
+  // On Postgres: an empty database on the cluster, which the server migrates when it opens it.
+  const pgName = `gb_loadtest_${Date.now()}`;
+  const pgAdmin = o.pg ? openPg(o.pg, { max: 1, applicationName: "gb-loadtest-admin" }) : undefined;
+  const pgDbUrl = o.pg ? (() => { const u = new URL(o.pg!); u.pathname = `/${pgName}`; return u.toString(); })() : undefined;
   const log = (s: string) => { console.log(s); appendFileSync(join(o.out, "run.log"), s + "\n"); };
   log(`loadtest: ${o.sessions} sessions, ${o.users} users, ${o.drivers} drivers, ${o.durationS}s (${o.warmupS}s warm-up), op every ${o.periodS}s, ${o.boards} boards (~${Math.round(o.sessions / o.boards)} subscribers each), post share ${o.postShare}, burst ${o.burst}, churn ${o.churn} every ${o.churnEveryS}s; ${cpus().length} CPUs, load ${loadavg().map(x => x.toFixed(2)).join(" ")}`);
   log(`run dir: ${o.out}`);
@@ -206,7 +229,8 @@ async function main() {
   // A driver killed by a signal (the scope's OOM killer) keeps a null exitCode.
   const exited = (d: Driver) => d.proc.exitCode !== null || d.proc.signalCode !== null;
   try {
-    srv = await ServerProcess.start(o.server, { dbPath: dbPath }, env);
+    if (pgAdmin) await pgAdmin.unsafe(`CREATE DATABASE "${pgName}"`);
+    srv = await ServerProcess.start(o.server, pgDbUrl ? { url: pgDbUrl, blobDir } : { dbPath }, env);
     const server = srv;
     let metricsUrl: string | undefined;
     for (const deadline = Date.now() + 10_000; !metricsUrl; await Bun.sleep(50)) {
@@ -221,13 +245,14 @@ async function main() {
     // from it, and the server checks only expiry against its clock.
     const runMs = (o.durationS + o.graceS + 600) * 1000;
     const issuedAt = Date.now() + Math.max(0, runMs - OAUTH_TTL.access);
-    const { db, repo } = openDatabase(dbPath, { blobDir: join(scratch, "blobs"), sessionEnd: sessionEndPort("team") });
+    const repo: Repo = pgDbUrl ? await makePgRepo(pgDbUrl, { blobDir, humanReach: "team", max: 2, applicationName: "gb-loadtest-seed" })
+      : openDatabase(dbPath, { blobDir, sessionEnd: sessionEndPort("team") }).repo;
     const resource = "http://localhost/mcp";
     const users = await Promise.all(Array.from({ length: o.users }, async (_, u) => {
       const email = `load${u}@example.com`;
       return { email, token: (await issueOAuth(repo, resource, email, HOSTED_SCOPES, issuedAt, HOSTED_CLIENT)).token };
     }));
-    db.close();
+    await repo.close();
 
     const scrape = async () => parseMetrics(await (await fetch(metricsUrl!)).text());
 
@@ -363,9 +388,7 @@ async function main() {
     await Bun.sleep(o.windowS * 1000 + 500);
     const after = await scrape();
     const drained = { leases: one(after, "grayboard_delivery_leases"), listens: one(after, "grayboard_mcp_admissions", { kind: "listen" }), posts: one(after, "grayboard_mcp_admissions", { kind: "post" }), holding: one(after, "grayboard_hosted_sessions_holding"), watches: one(after, "grayboard_resource_watches"), exchanges: one(after, "grayboard_mcp_exchanges_in_flight") };
-    const ro = new Database(dbPath, { readonly: true });
-    const rows = (ro.query("SELECT count(*) AS n FROM hosted_sessions").get() as { n: number }).n;
-    ro.close();
+    const rows = await hostedRows(pgDbUrl, dbPath);
 
     // Gates.
     const steady = windows.filter(w => w.steady);
@@ -452,8 +475,11 @@ async function main() {
   } finally {
     for (const d of drivers) if (!exited(d)) d.proc.kill("SIGKILL");
     if (srv) { await srv.stop(); writeFileSync(join(o.out, "server.log"), srv.log()); }
-    if (!o.keepDb) rmSync(scratch, { recursive: true, force: true });
-    else log(`database kept: ${dbPath}`);
+    if (!o.keepDb) {
+      rmSync(scratch, { recursive: true, force: true });
+      if (pgAdmin) await pgAdmin.unsafe(`DROP DATABASE IF EXISTS "${pgName}" WITH (FORCE)`).catch(e => log(`dropping ${pgName}: ${e instanceof Error ? e.message : e}`));
+    } else log(`database kept: ${pgDbUrl ? `${pgName} (blobs ${blobDir})` : dbPath}`);
+    await pgAdmin?.close();
   }
   process.exit(exitCode);
 }
