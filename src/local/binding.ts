@@ -20,7 +20,7 @@ import { endSession, type EndedSession } from "../core/session_end.ts";
 import { HUMAN_NAME } from "../shared/addressing.ts";
 import { describeLocation } from "../shared/identity.ts";
 import { testPause } from "../shared/testpause.ts";
-import { aliveRows, ancestors, commandName, harnessAncestor, isAlive, procStart } from "../shared/proc.ts";
+import { aliveRows, ancestors, commandName, harnessAncestor, isAlive, parentOf, procStart } from "../shared/proc.ts";
 import { localMail } from "./mailbox.ts";
 import { deliverEnded, poke } from "./wakeup.ts";
 
@@ -717,10 +717,14 @@ export function setHeldMeta(db: Database, sessionId: string, name: string, meta:
 // root under the same harness pid with no harness session, which receives.
 // An adapter's own child always has a harness session, so a restart's
 // predecessor is never displaced: it is waited for (siblingGone).
+// The recorded harness pid alone could be a dead harness's, reused by this
+// one while the holder outlived it (#1401): the holder must still be that
+// pid's child now (an unkeyed root's harness pid is its parent at start, and
+// an orphan is reparented). An unreadable parent displaces nothing.
 function displaceableRow(db: Database, r: SessionRow, harnessPid: number): boolean {
   return r.harness_pid === harnessPid && r.harness_rule === null && db.prepare(
     `SELECT 1 FROM ids WHERE id = ? AND harness_session IS NULL AND keyed = 0 AND viewer = 0 AND delivery = 'push' AND ended_at IS NULL`,
-  ).get(r.session_id) !== null;
+  ).get(r.session_id) !== null && parentOf(r.pid) === harnessPid;
 }
 
 /** Whether `name`'s live holder is one `displace` would take it from, for a restart deciding whether to wait. */
@@ -747,7 +751,23 @@ export function recordYields(db: Database, sessionId: string, harnessPid: number
     `${SESSION_SQL} AND b.harness_pid = ? AND b.session_id <> ? AND b.harness_rule IS NULL
       AND i.harness_session IS NOT NULL AND i.keyed = 0 AND i.viewer = 0 AND i.delivery = 'push' AND i.ended_at IS NULL`,
   ).all(harnessPid, sessionId) as RawSessionRow[];
-  return rows.length > 0 && aliveRows(rows).alive.length > 0;
+  // Still that pid's child, as displaceableRow requires: an orphan under a reused pid isn't (#1401).
+  return rows.length > 0 && aliveRows(rows).alive.some((r) => parentOf(r.pid) === harnessPid);
+}
+
+/**
+ * Whether `writer`, the session that wrote the name record a restarting
+ * session found, can be its predecessor (#1457). The record is keyed by
+ * harness pid, so an adapter's child and a sibling grayboard under it share
+ * one (recordYields), and an adapter's child that exited bound leaves its
+ * names there: a session with no harness session never restarts one that has
+ * one, so it doesn't restore that record as its restart (nor inherit that
+ * session's status). A writer whose row retention pruned is taken at its word.
+ */
+export function recordPredecessor(db: Database, writer: string, harnessSession: string | undefined): boolean {
+  if (harnessSession !== undefined) return true;
+  const row = db.prepare(`SELECT harness_session FROM ids WHERE id = ?`).get(writer) as { harness_session: string | null } | null;
+  return row === null || row.harness_session === null;
 }
 
 // The displaced session's hold goes as an unbind's does (releaseName), logged
