@@ -2725,3 +2725,23 @@ test("#1299: sessionContext reads a launcher declaration for a service credentia
   expect(() => sessionContext({ ...svc, source: "generic" }, { ...meta, [GRAYBOARD_LAUNCHER_META]: "yes" })).toThrow(`_meta["${GRAYBOARD_LAUNCHER_META}"] must be a boolean`);
   expect(sessionContext({ ...svc, source: "generic" }, { ...meta, [GRAYBOARD_LAUNCHER_META]: false })).not.toHaveProperty("launcher");
 });
+
+// #1355: the server records a post's human mark on its row when written: a post and a claim's system posts written
+// before the handle is marked human stay 0; the marked handle's own words are 1.
+test("#1355: the server records the human mark at write time; a system post never bears it", async () => {
+  const a = context("h1355");
+  await hosted.bind(principal, a, { name: "h1355", create: true });
+  const call = (tool: string, args: Record<string, unknown>) => hosted.run(principal, a, tool, (session, tx) => application.call(tx, session, tool, args));
+  const mark = () => database.db.query<{ body: string; human: number | null }, []>("SELECT body, human FROM posts WHERE board = 'h1355' ORDER BY id").all();
+  await call("board_create", { name: "h1355", purpose: "tests" });
+  await call("board_post", { board: "h1355", body: "before" });
+  await call("claim_take", { key: "h1355:x", board: "h1355" });
+  await call("claim_release", { key: "h1355:x" });
+  // The server marks only `<email>/human` (slack.ts), never a bound alias; marking one here drives the write path's gate.
+  // Hosted delivery reads no column: adapters mark by that reserved author name (own-human.ts).
+  await seed(database.repo, tx => database.repo.aliases.markHuman(tx, "you@example.com/h1355", true));
+  await call("board_post", { board: "h1355", body: "after" });
+  expect(mark()).toEqual([
+    { body: "before", human: 0 }, { body: "[claim] h1355:x", human: 0 }, { body: "[release] h1355:x", human: 0 }, { body: "after", human: 1 },
+  ]);
+});

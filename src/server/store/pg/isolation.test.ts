@@ -59,7 +59,7 @@ function pgModules(): string[] {
 test("no non-test module under src/server/store/pg/ reaches bun:sqlite or the SQLite store, even transitively", () => {
   const roots = pgModules();
   // The scan sees this directory's modules (a scan that read nothing would pass vacuously).
-  expect(roots.map(p => relative(import.meta.dir, p))).toEqual(expect.arrayContaining(["aliases.ts", "attachment_rows.ts", "audit.ts", "audit_row.ts", "bindings.ts", "claims.ts", "cursors.ts", "errors.ts", "hosted.ts", "hosted_port.ts", "identity.ts", "messages.ts", "migrate.ts", "oauth.ts", "slack.ts", "sql.ts", "tx.ts", "write_receipts.ts"]));
+  expect(roots.map(p => relative(import.meta.dir, p))).toEqual(expect.arrayContaining(["aliases.ts", "attachment_rows.ts", "audit.ts", "audit_row.ts", "bindings.ts", "claims.ts", "cursors.ts", "delegation.ts", "errors.ts", "hosted.ts", "hosted_port.ts", "identity.ts", "messages.ts", "migrate.ts", "oauth.ts", "session_end.ts", "slack.ts", "sql.ts", "tx.ts", "write_receipts.ts"]));
   expect(forbiddenReach(roots)).toEqual([]);
 });
 
@@ -103,6 +103,10 @@ test("the walk follows relative imports and skips type-only ones", () => {
   // The auth cache (#807 P3 C9a), which the Postgres Repo composes over its own generation source (C11).
   expect(forbiddenReach([join(SRC, "server/store/auth_cache.ts")])).toEqual([]);
   for (const m of ["hosted.ts", "hosted_port.ts"]) expect(forbiddenReach([join(import.meta.dir, m)])).toEqual([]);
+  // The session end and delegation groups' interfaces, the deliverability rule both stores run, and their Postgres stores
+  // (#807 P3 C10d1), which restate core/session_end.ts's, core/delegation.ts's and core/boards.ts's SQL.
+  for (const m of ["server/store/session_end.ts", "server/store/delegation.ts", "core/undeliverable.ts"]) expect(forbiddenReach([join(SRC, m)])).toEqual([]);
+  for (const m of ["session_end.ts", "delegation.ts"]) expect(forbiddenReach([join(import.meta.dir, m)])).toEqual([]);
   // The claims group's interface, the holder rule both stores run, and the Postgres claims store (#807 P3 C10b), which
   // restates core/claims.ts's SQL.
   expect(forbiddenReach([join(SRC, "server/store/claims.ts")])).toEqual([]);

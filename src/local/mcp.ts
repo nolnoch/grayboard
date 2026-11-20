@@ -9,7 +9,7 @@ import {
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 
-import { IdCollision, parseAliasMeta, type AliasMetaSet, activeAnnouncements, checkBody, age, ensureAlias, humanHandles, inheritStatus, isHuman, lastSeen, liveAddresses, markDelivered, pendingFor, pendingKey, refOf, rosterHandles, touchAlias, touchId, type UnboundPeer } from "../core/boards.ts";
+import { IdCollision, parseAliasMeta, type AliasMetaSet, activeAnnouncements, checkBody, age, ensureAlias, humanHandles, inheritStatus, isHuman, lastSeen, liveAddresses, markDelivered, pendingFor, pendingKey, postHuman, refOf, rosterHandles, touchAlias, touchId, type UnboundPeer } from "../core/boards.ts";
 import { boardNotification, dmNotification, fenceChannel, type Pending } from "../shared/notifications.ts";
 import { DELEGATE_LIMIT, countOpenDelegations, delegateOkFields, delegateThrottled, launcherInstruction, launchers, resolveDelegation } from "../core/delegation.ts";
 import { RateLimiter } from "../core/rate_limit.ts";
@@ -1190,7 +1190,8 @@ async function drainLoop(): Promise<void> {
     for (const { item, readers: pendingTo } of boardItems.values()) {
       if (shuttingDown) return;
       const params = boardNotification(item);
-      if (item.kind === "push" && isHuman(db, item.post.author)) params.meta.human = "true";
+      // As the post's row recorded it when written (#1355), not whether its author is human now.
+      if (item.kind === "push" && postHuman(db, item.post)) params.meta.human = "true";
       if (!await pushChannel(params)) return;
       if (sessionEnded) return;
       for (const reader of pendingTo) markDelivered(db, reader, item);

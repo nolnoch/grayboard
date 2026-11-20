@@ -812,8 +812,9 @@ export type PostOpts = {
   via?: string;
   ttl_ms?: number;
   attachments?: { ids: number[]; send?: FileSend };
-  // An author's own words: an @id: that can't receive refuses the post.
-  // Unset (system posts), it goes unresolved.
+  // An author's own words: an @id: that can't receive refuses the post, and
+  // a declared human's bears the human mark (postMark). Unset (system posts),
+  // it goes unresolved, and the post never bears the mark.
   strictIds?: boolean;
   // A system post ending something already announced on the board (a claim's
   // release, update or expiry) still lands once the board is archived (#635).
@@ -1112,17 +1113,20 @@ export function post(
   parentId: number | null = null,
   opts: PostOpts = {},
 ): PostResult {
-  const { b, a, announce, human, announcement } = postGate(db, handle, boardInput, parentId, opts.allowArchived, opts.seenBy);
-  const board = b.name;
-  postPreChecks(board, body, announcement, opts);
-  const files = opts.attachments ?? { ids: [] };
-  const isViewer = viewers(db);
-
+  // The gate reads inside the write's transaction, IMMEDIATE so its write lock is held from the start: the human it
+  // judges, which the row's mark records (#1355), is the declaration when the row lands; a `grayboard human` can't
+  // slip between the two. Nested in a caller's transaction (a claim's system post) it's a savepoint.
   return db.transaction((): PostResult => {
+    const { b, a, announce, human, announcement } = postGate(db, handle, boardInput, parentId, opts.allowArchived, opts.seenBy);
+    const board = b.name;
+    postPreChecks(board, body, announcement, opts);
+    const files = opts.attachments ?? { ids: [] };
+    const isViewer = viewers(db);
     const now = Date.now();
     const p = insertPost(db, {
       board, author: handle, body, parentId, now, expiresAt: opts.ttl_ms ? now + opts.ttl_ms : null,
       authorId: opts.author_id ?? null, via: opts.via ?? null, authorUser: opts.author_user ?? null,
+      human: postMark({ human }, opts.strictIds === true),
     });
     const { send } = files;
     const attachments = send ? bindAttachments(db, files.ids, { addresses: opts.addresses ?? [handle], principal: send.principal }, { post_id: p.id }, send.limits) : [];
@@ -1167,7 +1171,7 @@ export function post(
       ...postWakes(plan.targets),
       unresolved: plan.unresolved,
     };
-  })();
+  }).immediate();
 }
 
 /** Who a post reaches and why. Highest-priority reason wins per handle: mention > thread > subscription. */
@@ -1340,20 +1344,38 @@ export function postWakes(targets: [string, PostTarget][]): { wake: string[]; de
   };
 }
 
-/** A post's row before it's written. */
+/** A post's row before it's written. `human`: the post bears the human mark (postMark), judged at write time. */
 export type NewPost = {
   board: string; author: string; body: string; parentId: number | null; now: number; expiresAt: number | null;
-  authorId: string | null; via: string | null; authorUser: string | null;
+  authorId: string | null; via: string | null; authorUser: string | null; human: boolean;
 };
 
 /** Writes a post's row. */
 export function insertPost(db: Database, p: NewPost): Post {
   return showPost(db
     .prepare(
-      `INSERT INTO posts (board, author, body, parent_id, created_at, expires_at, author_id, via, author_user)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING ${POST_COLS}`,
+      `INSERT INTO posts (board, author, body, parent_id, created_at, expires_at, author_id, via, author_user, human)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING ${POST_COLS}`,
     )
-    .get(p.board, p.author, p.body, p.parentId, p.now, p.expiresAt, p.authorId, p.via, p.authorUser) as PostRow);
+    .get(p.board, p.author, p.body, p.parentId, p.now, p.expiresAt, p.authorId, p.via, p.authorUser, p.human ? 1 : 0) as PostRow);
+}
+
+/**
+ * Whether a post being written bears the human mark (#1355): only a declared human's own words (`ownWords`, the
+ * strict write a tool or `grayboard announce` makes), its gate having judged the author human at write time. A system
+ * post (a claim's `[release]`/`[expired]`/`[unclaimed]`) never does, whoever it's written as (principle 10,
+ * docs/slack-bridge.md §3).
+ */
+export const postMark = (gate: Pick<PostGate, "human">, ownWords: boolean): boolean => ownWords && gate.human;
+
+/**
+ * Whether a delivered post bears the human mark: as its row recorded it when written (#1355), so a handle declared
+ * human later never marks what it wrote before. A row from before the column (null), or one already pruned, bears
+ * none: losing a pre-upgrade human post's mark is harmless, forging one onto a system post isn't.
+ */
+export function postHuman(db: Database, post: Pick<Post, "id">): boolean {
+  const row = db.prepare(`SELECT human FROM posts WHERE id = ?`).get(post.id) as { human: number | null } | undefined;
+  return row?.human === 1;
 }
 
 /** A board's subscriptions, unjudged, by handle. */

@@ -16,6 +16,7 @@ import { forgetHandle } from "./boards.ts";
 import { holdsOf, logBinding, primaryOf } from "./bindings.ts";
 import { logEvent, release, sweepIn, type Claim } from "./claims.ts";
 import { CoreError } from "./errors.ts";
+import { heldText, Undeliverable, undeliverableFrom } from "./undeliverable.ts";
 import type { ErrorCode } from "../shared/protocol.ts";
 import { testPause } from "../shared/testpause.ts";
 
@@ -145,10 +146,6 @@ function liveIdOrAlias(db: Database, address: string): boolean {
   return r != null && r.ended_at == null;
 }
 
-function heldText(held: string[]): string {
-  return held.length ? `it held ${held.map((a) => `\`${a}\``).join(", ")}` : "it held no alias";
-}
-
 /** A bounce's text. `earlier`: the sender's other unread message ids, ascending; the bounce threads under the latest. */
 export function bounceBody(id: string, endedAt: number, held: string[], earlier: number[] = []): string {
   const also = earlier.length ? ` or your earlier ${earlier.length === 1 ? "message" : "messages"} ${earlier.join(", ")}` : "";
@@ -169,19 +166,8 @@ export function assertDeliverableId(db: Database, id: string): void {
   if (why) throw why;
 }
 
-/**
- * assertDeliverableId's refusal. Its message reads `<code>: <detail>`, the
- * text a local tool error shows; the server sends `code` as the error
- * frame's code and `detail` as its message, so both modes read the same.
- */
-export class Undeliverable extends CoreError {
-  constructor(
-    readonly code: "not_found" | "id_ended" | "no_delivery" | "child_session",
-    readonly detail: string,
-  ) {
-    super(`${code}: ${detail}`);
-  }
-}
+// assertDeliverableId's refusal (core/undeliverable.ts, which the Postgres store shares).
+export { Undeliverable };
 
 /** A refused core call's wire code, both modes: an ID that can't receive names its own (#284 S18), as does a CoreError built with one; any other is a bad request. */
 export function coreRefusalCode(e: CoreError): ErrorCode {
@@ -193,18 +179,11 @@ export function undeliverableId(db: Database, id: string): Undeliverable | null 
   const r = db.prepare(`SELECT ended_at, held_aliases_json, delivery, writes_as, viewer, root_id FROM ids WHERE id = ?`).get(id) as
     | { ended_at: number | null; held_aliases_json: string | null; delivery: string; writes_as: string | null; viewer: number; root_id: string | null }
     | null;
-  if (!r || r.viewer) return new Undeliverable("not_found", `no session ${id}`);
-  if (r.root_id !== null) {
-    return new Undeliverable("child_session", `${id} is a subagent acting under session ${r.root_id} and receives nothing; send to ${rootPrimary(db, r.root_id)}`);
-  }
-  if (r.ended_at != null) {
-    const held = r.held_aliases_json ? (JSON.parse(r.held_aliases_json) as string[]) : [];
-    return new Undeliverable("id_ended", `${id} ended at ${new Date(r.ended_at).toISOString()}; ${heldText(held)}`);
-  }
-  if (r.delivery === "none") {
-    return new Undeliverable("no_delivery", `${id} is a tools-only session and receives nothing${r.writes_as ? `; send to ${r.writes_as}` : ""}`);
-  }
-  return null;
+  return undeliverableFrom(id, r && {
+    ...r,
+    viewer: !!r.viewer,
+    held: () => r.held_aliases_json ? (JSON.parse(r.held_aliases_json) as string[]) : [],
+  }, (root) => rootPrimary(db, root));
 }
 
 /**
