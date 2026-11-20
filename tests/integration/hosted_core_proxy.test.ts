@@ -624,13 +624,16 @@ test("a call cut off after its request left reports its outcome unknown and is s
   const { token } = await issue();
   const p = proxy({ token: async () => token });
   const list = NativeWire.prototype.listTools, fetch0 = globalThis.fetch;
-  let lists = 0, mode: "pass" | "503" | "reset" | "refused" = "pass";
+  let lists = 0, mode: "pass" | "503" | "reset" | "refused" | "hold" = "pass";
+  const { promise: holding, resolve: held } = Promise.withResolvers<void>();
+  const { promise: released, resolve: release } = Promise.withResolvers<void>();
   const posts: string[] = [];
   NativeWire.prototype.listTools = async function () { lists++; return list.call(this); };
   globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
     if (mode !== "pass" && input instanceof Request && input.method === "POST") {
       const body = await input.clone().text();
       if (body.includes(`"method":"tools/call"`) && body.includes(`"name":"board_post"`)) {
+        if (mode === "hold") { held(); await released; return fetch0(input, init); }
         posts.push(mode);
         if (mode === "503") return new Response("", { status: 503 });
         if (mode === "refused") return fetch0(`http://127.0.0.1:${deadPort}/mcp`, { method: "POST", body: "x" });
@@ -679,6 +682,43 @@ test("a call cut off after its request left reports its outcome unknown and is s
     // One request per call: nothing resent any of them.
     expect(posts).toEqual(["503", "reset", "refused"]);
 
+    // A credential's own outage ran nothing, so it stays unreachable: a refresh on the request's token() (after
+    // signedOut()'s), and one after the server refused a stale token with 401. Both on an open connection.
+    let armed = false, fetches = 0, current = token;
+    const refreshing = proxy({ token: async () => {
+      if (armed && ++fetches === 2) throw new ServerUnreachable(new Error("token endpoint down"));
+      return current;
+    }, onUnauthorized: async () => { throw new ServerUnreachable(new Error("token endpoint down")); } });
+    // Each refresh outage drops the shared connection, so each case first opens a new one with a good token.
+    const opened = async () => expect(JSON.parse(textOf(await refreshing.call("whoami", {}, "pi-root")))).toMatchObject({ primary: "alice@example.com/proxy-outage" });
+    await opened();
+    current = "bogus";
+    const afterRefusal = await refreshing.call("board_post", { board: "outage", body: "refused" }, "pi-root").then(() => undefined, (error: unknown) => error);
+    current = token;
+    await opened();
+    armed = true;
+    const beforeSend = await refreshing.call("board_post", { board: "outage", body: "unsent" }, "pi-root").then(() => undefined, (error: unknown) => error);
+    armed = false;
+    for (const error of [beforeSend, afterRefusal]) {
+      expect(error).toBeInstanceOf(ServerUnreachable);
+      expect(error).not.toBeInstanceOf(OutcomeUnknown);
+      expect(failureText(error, "call the tool again")).toBe("Server unreachable; call the tool again");
+    }
+    expect(fetches).toBe(2);
+    expect(await bodies()).toEqual(["landed"]);
+
+    // A call in flight when its proxy closes: the wire's own abort is a stop, never an outage (reachable()'s rule).
+    const closing = proxy({ token: async () => token });
+    expect(JSON.parse(textOf(await closing.call("whoami", {}, "pi-root")))).toMatchObject({ primary: "alice@example.com/proxy-outage" });
+    mode = "hold";
+    const inFlight = closing.call("board_post", { board: "outage", body: "held" }, "pi-root").then(() => undefined, (error: unknown) => error);
+    await holding;
+    await closing.close();
+    const stopped = await inFlight;
+    expect(stopped).toBeInstanceOf(Error);
+    expect(stopped).not.toBeInstanceOf(ServerUnreachable);
+    mode = "pass";
+
     // A shared connect that can't open its socket: unreachable, as before.
     const dead = proxy({ token: async () => token }, { wire: { url: `http://127.0.0.1:${deadPort}/mcp`, sessionKey: GRAYBOARD_SESSION_META, client: { name: "grayboard-pi", version: "1.0.0" } } });
     const down = await dead.call("board_post", { board: "outage", body: "down" }, "pi-root").then(() => undefined, (error: unknown) => error);
@@ -686,6 +726,7 @@ test("a call cut off after its request left reports its outcome unknown and is s
     expect(down).not.toBeInstanceOf(OutcomeUnknown);
     expect(failureText(down, "call the tool again")).toBe("Server unreachable; call the tool again");
   } finally {
+    release();
     globalThis.fetch = fetch0;
     NativeWire.prototype.listTools = list;
     resetter.close();
