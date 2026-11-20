@@ -314,7 +314,10 @@ describePg("Postgres transactions", () => {
       expect(order).toEqual([]);
       release.open();
       await Promise.all([a, bw]);
-      expect(order).toEqual(["a", "b"]);
+      // Both after-commit callbacks ran once. Their order is not asserted: once A's COMMIT releases the lock, B can
+      // commit and its client handle B's acknowledgement before A's client handles A's (#1389). The row is what
+      // proves B's UPDATE ran after A's commit.
+      expect(order.toSorted()).toEqual(["a", "b"]);
       expect(await rows(x.s.read)).toEqual(["a+b"]);
     } finally { await b.close(); }
   });

@@ -189,8 +189,12 @@ export const parityRows = (repo: Repo, tx: Read) => {
   };
 };
 const TIMES = new Set(["created_at", "acquired_at", "expires_at", "at", "delivered_at"]);
-// An expiry past T1 keeps its distance from T1 in whole minutes, so a port that drops a renewal's ttl_minutes or until shows (#1230).
-const settled = (T1: number, v: unknown) => JSON.parse(JSON.stringify(v, (k, x) => (TIMES.has(k) && typeof x === "number" && x > T1 ? (k === "expires_at" ? `later+${Math.round((x - T1) / 60_000)}m` : "now") : x)));
+/**
+ * A time `x` past T1 under key `k`, settled: an expiry keeps its distance from T1 in whole minutes ("later+<minutes>m"),
+ * so a port that drops a renewal's ttl_minutes or until shows (#1230); any other time reads "now".
+ */
+export const settleTime = (T1: number, k: string, x: number) => (k === "expires_at" ? `later+${Math.round((x - T1) / 60_000)}m` : "now");
+const settled = (T1: number, v: unknown) => JSON.parse(JSON.stringify(v, (k, x) => (TIMES.has(k) && typeof x === "number" && x > T1 ? settleTime(T1, k, x) : x)));
 
 class Rollback { constructor(readonly value: unknown) {} }
 /** f's answer and the rows it left, in a write body rolled back after; times past `T1` settle to "now" or "later+<minutes>m". */

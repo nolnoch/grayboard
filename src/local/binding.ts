@@ -729,6 +729,27 @@ export function displaceableHolder(db: Database, name: string, harnessPid: numbe
   return r !== null && isAlive(r.pid, r.proc_start) && displaceableRow(db, r, harnessPid);
 }
 
+/**
+ * Whether `sessionId` leaves the name record for `harnessPid` alone (#1404):
+ * it has no harness session, and a live root that may be an adapter's child
+ * (unkeyed, receiving, with a harness session) runs under the same pid. The
+ * record is keyed by harness pid, so the two share it; the adapter's child,
+ * its harness session's delivery owner, keeps it. The caller writes records
+ * only for an unkeyed, receiving root (mcp.ts RECORDS), so a missing harness
+ * session is all that's left of displaceableRow's test on this side. Run in
+ * the caller's write transaction with the record write, so such a sibling
+ * can't register between the check and the write (its own record write
+ * follows its register); the candidates' liveness is one batched read.
+ */
+export function recordYields(db: Database, sessionId: string, harnessPid: number): boolean {
+  if (db.prepare(`SELECT 1 FROM ids WHERE id = ? AND harness_session IS NULL`).get(sessionId) === null) return false;
+  const rows = db.prepare(
+    `${SESSION_SQL} AND b.harness_pid = ? AND b.session_id <> ? AND b.harness_rule IS NULL
+      AND i.harness_session IS NOT NULL AND i.keyed = 0 AND i.viewer = 0 AND i.delivery = 'push' AND i.ended_at IS NULL`,
+  ).all(harnessPid, sessionId) as RawSessionRow[];
+  return rows.length > 0 && aliveRows(rows).alive.length > 0;
+}
+
 // The displaced session's hold goes as an unbind's does (releaseName), logged
 // as released with who took it, and audited. Inside acquireName's transaction.
 function displaceHold(db: Database, r: SessionRow, name: string, by: string, now: number): void {
