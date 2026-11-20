@@ -171,6 +171,8 @@ for (const from of ["child", "root"] as const) test(`session_end from the ${from
   expect(await app.mcp.sessions.end(principal, context)).toEqual({ ended: false });
   expect(hostedRowCount(app.db)).toBe(0);
   expect(started()).toBe(before);
+  // The child ended with its root, not parked then evicted.
+  expect(app.db.query("SELECT 1 FROM access_log WHERE action = 'hosted.child_parked'").all()).toEqual([]);
 });
 
 // #1097: an ending call (session_end, delivery_release) under an ID the server no longer holds ends nothing and starts
