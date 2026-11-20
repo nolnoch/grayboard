@@ -331,18 +331,20 @@ test("a startup write that fails rejects ready, and the server stops and serves 
 
 // #1085: the startup leftover-session ends (#807 P3 A1) reject `ready` when their whole write fails, not only a
 // per-ID end, which rolls back alone in its savepoint and is audited id.end_failed. The triggers fail the leftover's
-// end and then that audit, which is written on the write's own Tx, so the write rolls back whole.
+// end and then that audit, which is written on the write's own Tx, so the write rolls back whole. Two untriggered
+// leftovers, one before the failing one in both rowid and id order, stay unended only if the whole write rolls back.
 test("a startup leftover-session ends write that fails rejects ready, and the server stops and serves nothing", async () => {
   const dir = mkdtempSync(join(tmpdir(), "gb-ready-ends-"));
   const config = restartConfig(dir);
-  const leftover = randomUUID();
+  const leftover = "77777777-7777-4777-8777-777777777777";
+  const clean = ["00000000-0000-4000-8000-000000000000", "ffffffff-ffff-4fff-8fff-ffffffffffff"];
   const log = spyOn(console, "error").mockImplementation(() => {});
   let app: ReturnType<typeof startServer> | undefined;
   try {
     app = startServer(config, { hostname, background: false }); await app.ready;
     await app.stop(); app = undefined;
     const db = new Database(config.store.path);
-    db.run("INSERT INTO ids (id, started_at, last_seen) VALUES (?, ?, ?)", [leftover, Date.now(), Date.now()]);
+    for (const id of [clean[0], leftover, clean[1]]) db.run("INSERT INTO ids (id, started_at, last_seen) VALUES (?, ?, ?)", [id, Date.now(), Date.now()]);
     db.run(`CREATE TRIGGER fail_leftover_end BEFORE UPDATE ON ids WHEN OLD.id = '${leftover}' BEGIN SELECT RAISE(ABORT, 'leftover end refused'); END`);
     db.run("CREATE TRIGGER fail_end_audit BEFORE INSERT ON access_log WHEN NEW.action = 'id.end_failed' BEGIN SELECT RAISE(ABORT, 'ends write refused'); END");
     db.close();
@@ -352,7 +354,7 @@ test("a startup leftover-session ends write that fails rejects ready, and the se
     expect((await fetch(`http://${hostname}:${app.server.port}/healthz`)).status).toBe(500);
     await app.stop(); app = undefined;
     const after = new Database(config.store.path, { readonly: true });
-    expect(after.query<{ ended_at: number | null }, [string]>("SELECT ended_at FROM ids WHERE id = ?").get(leftover)).toEqual({ ended_at: null });
+    for (const id of [leftover, ...clean]) expect(after.query<{ ended_at: number | null }, [string]>("SELECT ended_at FROM ids WHERE id = ?").get(id)).toEqual({ ended_at: null });
     after.close();
   } finally {
     log.mockRestore();
