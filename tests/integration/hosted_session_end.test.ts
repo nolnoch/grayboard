@@ -9,7 +9,7 @@ import { DEFAULT_HELLO_LIMIT, DEFAULT_AUTH_FAIL_LIMIT } from "../../src/server/r
 import { DEFAULT_TRUSTED_PROXIES } from "../../src/server/client_addr.ts";
 import { MCP_PROTOCOL_VERSIONS } from "../../src/server/mcp.ts";
 import { MAX_CHILDREN } from "../../src/core/bindings.ts";
-import { sessionContext } from "../../src/server/hosted.ts";
+import { sessionContext, sourceContext } from "../../src/server/hosted.ts";
 import { issueOAuth } from "../helpers/oauth.ts";
 import { OPENCODE_CLIENT, OPENCODE_SESSION_META } from "../../src/server/oauth-config.ts";
 import { withMeta } from "../helpers/hosted.ts";
@@ -152,6 +152,37 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: a parked child's 
   expect(await value(sleeper, "session_end")).toEqual({ ended: true });
   expect(await app.repo.hosted.get(app.repo.read, child)).toBeUndefined();
   expect(app.db.query("SELECT 1 FROM access_log WHERE action = 'hosted.child_unparked'").all()).toEqual([]);
+});
+
+// #1077: a child ID that is another principal's session is refused id_collision, and its id.collision row outlives
+// the refusal's rollback; the root keeps no child.
+test("session_register of another principal's session ID is refused id_collision and audited", async () => {
+  const grant = await issue();
+  await connect("2026-07-28", grant.token, "collide-root");
+  const principal = await app.oauth.authenticate(new Request(`${base}/mcp`, { headers: { Authorization: `Bearer ${grant.token}` } }));
+  if (principal instanceof Response) throw new Error("fixture authorization failed");
+  const rootContext = sessionContext(principal, { "ai.opencode/sessionID": "collide-root" });
+  const taken = sourceContext(principal, "taken");
+  if (!("id" in taken)) throw new Error("fixture source failed");
+  await app.repo.write(tx => app.repo.bindings.registerId(tx, { id: taken.id, principal: "bob@example.com", launcher: false }));
+  await expect(app.mcp.sessions.register(principal, rootContext, "taken")).rejects.toMatchObject({ code: "id_collision" });
+  expect(app.db.query<{ actor: string; target: string; detail: string }, []>("SELECT actor, target, detail FROM access_log WHERE action = 'id.collision'").all())
+    .toEqual([{ actor: "alice@example.com", target: taken.id, detail: JSON.stringify({ why: "is another principal's session" }) }]);
+  expect(await app.repo.hosted.get(app.repo.read, taken.id)).toBeUndefined();
+});
+
+// #1077: the same refusal at a session's start (rowFor admitting the caller's own ID) keeps its row too.
+test("a session whose own ID is another principal's is refused id_collision at its start and audited", async () => {
+  const grant = await issue();
+  const principal = await app.oauth.authenticate(new Request(`${base}/mcp`, { headers: { Authorization: `Bearer ${grant.token}` } }));
+  if (principal instanceof Response) throw new Error("fixture authorization failed");
+  const planted = sessionContext(principal, { "ai.opencode/sessionID": "planted-root" });
+  if (!("id" in planted)) throw new Error("fixture source failed");
+  await app.repo.write(tx => app.repo.bindings.registerId(tx, { id: planted.id, principal: "bob@example.com", launcher: false }));
+  await expect(app.mcp.sessions.register(principal, planted, "a-child")).rejects.toMatchObject({ code: "id_collision" });
+  expect(app.db.query<{ actor: string; target: string }, []>("SELECT actor, target FROM access_log WHERE action = 'id.collision'").all())
+    .toEqual([{ actor: "alice@example.com", target: planted.id }]);
+  expect(hostedRowCount(app.db)).toBe(0);
 });
 
 // #1101: settle (inside end's gate) ends an idle root, and its child with it; end then reports ended: false and admits
