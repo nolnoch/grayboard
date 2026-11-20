@@ -60,7 +60,8 @@ async function parseBody<T>(req: Request): Promise<T | null> {
 
 // /healthz is unauthenticated, so its database probe is cached per repo for HEALTH_TTL_MS, success and failure
 // alike (#275): a flood costs one probe a second, and a down database logs one line a second. The probe is an awaited
-// store read on the read handle (#807 P3 C10d2-a); requests that arrive while one is in flight share it.
+// store read on the read handle (#807 P3 C10d2-a); requests that arrive while one is in flight share it. It probes the
+// reader connection only: a writer that can no longer write passes it.
 export const HEALTH_TTL_MS = 1000;
 const health = new WeakMap<Repo, { at: number; ok: boolean; lagging?: boolean }>();
 const probing = new WeakMap<Repo, Promise<boolean>>();

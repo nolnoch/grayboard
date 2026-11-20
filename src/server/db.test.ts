@@ -7,7 +7,7 @@ import { Glob } from "bun";
 import { ACCESS_LOG_LAST_SQL, INVOKE_BINDING_SQL, openDatabase, QUEUED_TO_SQL, RETRACTABLE_SQL, SENT_PENDING_SQL, UNDELIVERED_FROM_SQL, type Repo } from "./db.ts";
 import type { Tx } from "./store/tx.ts";
 import { scratchDbPath } from "../../tests/support/scratch_db.ts";
-import { createBoard, post, registerId, subscribe } from "../core/boards.ts";
+import { activeAnnouncements, createBoard, openAccess, post, registerId, setAccess, subscribe } from "../core/boards.ts";
 import { claim, watch } from "../core/claims.ts";
 import { seed } from "../../tests/support/seed.ts";
 import { GOOGLE_ISSUER } from "./idp_google.ts";
@@ -834,6 +834,7 @@ test("#807 P3 B4a: sessionEnd runs on the Tx it's given and rolls back with its 
 // their body.
 test("#807 P3 B5: the aliases and claims methods the board tools call run on the handle they're given", async () => {
   const { repo, db } = fresh();
+  setAccess(db, openAccess(db)); // core seeds on a server database opt in to local mode's open Access
   const [be, fe] = ["a@example.com/be", "a@example.com/fe"];
   const kept = await seed(repo, async tx => {
     await repo.users.upsertByEmail(tx, "a@example.com", null);
@@ -885,6 +886,7 @@ test("#807 P3 B5b1: a team follow refuses an alias that can't see the team board
 // given, and the writes roll back with their body. boards.redeliveryFacts' rows are in boards.contract.ts.
 test("#807 P3 B5b3b: the claim sweep's repo reads and writes run on the handle they're given", async () => {
   const { repo, db } = fresh();
+  setAccess(db, openAccess(db)); // core seeds on a server database opt in to local mode's open Access
   const [be, fe] = ["a@example.com/be", "a@example.com/fe"];
   const kept = await seed(repo, async tx => {
     await repo.users.upsertByEmail(tx, "a@example.com", null);
@@ -935,6 +937,7 @@ test("#807 P3 B5b3b: the claim sweep's repo reads and writes run on the handle t
 // unwatch) run on the handle they're given, and the writes roll back with their body.
 test("#807 P3 B5b3c: the claim tools' repo reads and writes run on the handle they're given", async () => {
   const { repo, db } = fresh();
+  setAccess(db, openAccess(db)); // core seeds on a server database opt in to local mode's open Access
   const [be, fe] = ["a@example.com/be", "a@example.com/fe"];
   const kept = await seed(repo, async tx => {
     await repo.users.upsertByEmail(tx, "a@example.com", null);
@@ -988,4 +991,13 @@ test("#807 P3 B5b3c: the claim tools' repo reads and writes run on the handle th
     await cl.addWatch(tx, "ticket:1", fe);
   });
   expect(tally()).toEqual({ claims: before.claims + 1, watches: before.watches + 1 });
+});
+
+// A server database installs a core Access that refuses every use (C10d2-a audit finding 1): a server path that called
+// core's board functions would otherwise judge visibility by local mode's open Access, every board open.
+test("#807 P3 C10d2-a: core's Access on a server database refuses, so no server path falls back to open access", () => {
+  const { db } = fresh();
+  expect(() => activeAnnouncements(db)).toThrow("server paths use boardAccess");
+  setAccess(db, openAccess(db));
+  expect(activeAnnouncements(db)).toEqual([]);
 });

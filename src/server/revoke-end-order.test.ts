@@ -195,4 +195,32 @@ for (const c of CASES) {
     expect(snapshot(f)).toEqual(before);
     expect(before).toMatchObject({ audits: [], bounces: [], childEnded: false, hostedRows: 2 });
   });
+
+  // The method's own savepoint, not the caller's transaction, is what undoes it: a caller that catches the failure and
+  // writes on commits its own write and nothing of the revocation.
+  test(`${c.name}: a caught failure inside the end leaves nothing of the revocation in a committed body`, async () => {
+    const i = await issue("you@example.com");
+    const f = await fixture(i);
+    await c.setup?.(i);
+    markNow(f);
+    const before = snapshot(f);
+    const state = () => database.db.query<{ key: string }, []>("SELECT key FROM server_state ORDER BY key").all().map(r => r.key);
+    const keys = state();
+    await seed(database.repo, () => {
+      database.db.run(`CREATE TRIGGER fail_end BEFORE UPDATE OF ended_at ON ids WHEN NEW.ended_at IS NOT NULL
+        BEGIN SELECT RAISE(ABORT, 'injected end failure'); END`);
+    });
+    const caught = await seed(database.repo, async tx => {
+      const error = await c.run(tx, i).then(() => null, (e: unknown) => e);
+      database.db.run("INSERT INTO server_state(key, value) VALUES ('probe', 1)");
+      return error;
+    });
+    await seed(database.repo, () => { database.db.run("DROP TRIGGER fail_end"); });
+    expect(String(caught)).toContain("injected end failure");
+    expect(state()).toEqual([...keys, "probe"].sort());
+    expect(c.revoked(i)).toBe(false);
+    expect(disabled(i.userId)).toBe(false);
+    expect(database.db.query<{ n: number }, [number]>("SELECT count(*) AS n FROM sessions WHERE user_id = ? AND revoked_at IS NOT NULL").get(i.userId)!.n).toBe(0);
+    expect(snapshot(f)).toEqual(before);
+  });
 }

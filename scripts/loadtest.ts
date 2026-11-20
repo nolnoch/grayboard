@@ -28,6 +28,7 @@ import { Database } from "bun:sqlite";
 import { DEFAULT_HOSTED_CAPS, DEFAULT_MCP_LIMITS } from "../src/server/config.ts";
 import { DEFAULT_HOSTED_REQUEST_LIMIT, DEFAULT_HOSTED_SUBSCRIBER_LIMIT, type RateLimit } from "../src/server/rate_limit.ts";
 import { openDatabase } from "../src/server/db.ts";
+import { sessionEndPort } from "../src/server/session_end.ts";
 import { OAUTH_TTL } from "../src/server/oauth-types.ts";
 import { issueOAuth } from "../tests/helpers/oauth.ts";
 import { HOSTED_CLIENT, HOSTED_SCOPES } from "../tests/support/hosted_session.ts";
@@ -220,7 +221,7 @@ async function main() {
     // from it, and the server checks only expiry against its clock.
     const runMs = (o.durationS + o.graceS + 600) * 1000;
     const issuedAt = Date.now() + Math.max(0, runMs - OAUTH_TTL.access);
-    const { db, repo } = openDatabase(dbPath, { blobDir: join(scratch, "blobs") });
+    const { db, repo } = openDatabase(dbPath, { blobDir: join(scratch, "blobs"), sessionEnd: sessionEndPort("team") });
     const resource = "http://localhost/mcp";
     const users = await Promise.all(Array.from({ length: o.users }, async (_, u) => {
       const email = `load${u}@example.com`;

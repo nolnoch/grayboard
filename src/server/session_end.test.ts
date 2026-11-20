@@ -165,3 +165,31 @@ test("a child alone, an ended ID and an ID with no row end the same way on both"
     for (const t of Object.keys(core.rows)) expect({ id, t, rows: server.rows[t] }).toEqual({ id, t, rows: core.rows[t] });
   }
 });
+
+// A sender's latest unread message retracted after the end read it (Postgres's READ COMMITTED; SQLite's single writer
+// can't interleave, so the store's bounce is stubbed to answer as a gone parent does): the bounce threads under the
+// next-latest and names only what's left; with every parent gone the sender gets nothing, and none of it counts.
+test("a bounce whose parent is gone retries under the next-latest unread message from that sender", async () => {
+  const fromBe = await seed(repo, async tx => (await repo.messages.unreadFor(tx, WADE_ID)).filter(m => m.sender === `${B}/be`).map(m => m.id).sort((a, b) => a - b));
+  expect(fromBe).toHaveLength(3);
+  const run = (gone: Set<number>) => rolledBack(tx => {
+    const stub: Repo = { ...repo, messages: { ...repo.messages, bounce: (t, from, to, parentId, body, now) =>
+      to === `${B}/be` && gone.has(parentId) ? Promise.resolve(null) : repo.messages.bounce(t, from, to, parentId, body, now) } };
+    return endSessionServer(stub, boardAccess(repo), tx, WADE_ID, { why: "test", now: NOW, audit: async (...a) => audit(tx)(...a) });
+  });
+  const detail = (r: { rows: Record<string, unknown> }) =>
+    JSON.parse((r.rows.access_log as { action: string; target: string; detail: string }[]).find(a => a.action === "id.ended" && a.target === WADE_ID)!.detail);
+  const toBe = (r: { rows: Record<string, unknown> }) => (r.rows.messages as { kind: string; recipient: string; parent_id: number; body: string }[])
+    .filter(m => m.kind === "bounce" && m.recipient === `${B}/be`);
+
+  const one = await run(new Set([fromBe[2]!]));
+  expect(toBe(one).map(m => m.parent_id)).toEqual([fromBe[1]!]);
+  expect(toBe(one)[0]!.body).toMatch(new RegExp(`earlier message ${fromBe[0]};`));
+  expect(detail(one)).toMatchObject({ bounced: 4, unbounced: 1 });
+  expect((one.out as { wake: string[] }).wake).toContain(`${B}/be`);
+
+  const all = await run(new Set(fromBe));
+  expect(toBe(all)).toEqual([]);
+  expect(detail(all)).toMatchObject({ bounced: 2, unbounced: 1 });
+  expect((all.out as { wake: string[] }).wake).not.toContain(`${B}/be`);
+});

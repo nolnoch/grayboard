@@ -9,7 +9,7 @@ import { join } from "node:path";
 import { ApplicationError, createApplication, type ApplicationSession } from "./application.ts";
 import { openDatabase, queuedTx } from "./db.ts";
 import { boardResourceUri, createResources, parseBoardResourceUri } from "./resources.ts";
-import { isSubscribed, subscribe } from "../core/boards.ts";
+import { isSubscribed, subscribe, openAccess, setAccess } from "../core/boards.ts";
 import { storeAttachment } from "../core/attachments.ts";
 import { createTouchQueue, type AuthedUser } from "./auth.ts";
 import { runRetention } from "./retention.ts";
@@ -52,6 +52,7 @@ async function call<T = unknown>(session: ApplicationSession, tool: string, args
 beforeEach(async () => {
   dir = mkdtempSync(join(tmpdir(), "gb-resources-"));
   store = openDatabase(scratchDbPath(), { blobDir: dir });
+  setAccess(store.db, openAccess(store.db)); // core seeds on a server database opt in to local mode's open Access
   application = createApplication(store.repo);
   revoked = new Set();
   resources = createResources(application, { isCurrent: () => true, isAuthorized: s => !revoked.has(s) });

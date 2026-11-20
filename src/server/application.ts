@@ -801,6 +801,8 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
       try {
         // The end's bounces are read in its savepoint, so they're pushed at the commit (#807 P3 A7i), before any
         // newer message to their senders can commit; a failed read rolls back this end alone.
+        // writeAudit on a Tx writes at once (AuditStore.write is synchronous by contract; Postgres sends it eagerly and a
+        // failed insert aborts the transaction), so the sink drops no promise.
         ended = await tx.savepoint(async sp => {
           const end = await endSessionServer(repo, hub.access, sp, id, { why, now: at, audit: async (action, actor, target, detail) => writeAudit(repo, sp, action, actor, target, detail) });
           return { ...end, bounces: end.ended ? await repo.messages.bouncesFrom(sp, id, at) : [] };

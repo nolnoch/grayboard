@@ -51,11 +51,17 @@ export async function endSessionServer(
       unbounced += ids.length;
       continue;
     }
-    const latest = Math.max(...ids);
-    // A parent retracted first (Postgres only) bounces nothing and wakes no one.
-    if (!(await repo.messages.bounce(tx, id, sender, latest, bounceBody(id, now, held, ids.filter((x) => x !== latest).sort((a, b) => a - b)), now))) continue;
-    bounced += ids.length;
-    wake.add(sender);
+    // Threaded under the latest unread message. A parent the sender retracted after unreadFor read it (Postgres only:
+    // SQLite's single writer can't interleave) is gone, so the bounce retries under the next-latest, naming only those
+    // left; a sender whose unread mail was all retracted gets nothing, and none of it counts.
+    const left = [...ids].sort((a, b) => b - a);
+    while (left.length) {
+      const latest = left.shift()!;
+      if (!(await repo.messages.bounce(tx, id, sender, latest, bounceBody(id, now, held, [...left].sort((a, b) => a - b)), now))) continue;
+      bounced += left.length + 1;
+      wake.add(sender);
+      break;
+    }
   }
 
   // Lapsed claims first, so they end as lapses (announced, redelivered) rather than releases.

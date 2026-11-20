@@ -8,7 +8,7 @@ import { isThenable } from "./store/tx_base.ts";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 
-import { acknowledge, redeliveryFacts, aliasScopeRows, authorAddresses, claimQueuePost, humansAmong, insertOutbox, insertPost, queueLaneRows, subscriberRows, threadFacts, insertBoard, isHuman, readRows, setArchived, setMute, threadRoot, type AliasScopeRow, ALIAS_SESSION_SQL, boardViewRows, openSummaryRows, setQueueParticipation, whoRows, writeStatus, type UnboundFacts, ensureBoard, forgetHandle, isSubscribed, markHuman, prunePosts, setSubscription, unsubscribeScope, catalogPage, getBoard, getPost, HOLD_ORDER, lastSeen, pendingDigests, pendingPushes, snapshotPage, pruneEndedIds, registerId, writeAliasMeta, setIdFacts, setPlace, touchAlias, touchId, type CoreDb } from "../core/boards.ts";
+import { acknowledge, redeliveryFacts, aliasScopeRows, authorAddresses, claimQueuePost, humansAmong, insertOutbox, insertPost, queueLaneRows, subscriberRows, threadFacts, insertBoard, isHuman, readRows, setArchived, setMute, threadRoot, type AliasScopeRow, ALIAS_SESSION_SQL, boardViewRows, openSummaryRows, setQueueParticipation, whoRows, writeStatus, type UnboundFacts, ensureBoard, forgetHandle, isSubscribed, markHuman, prunePosts, setSubscription, unsubscribeScope, catalogPage, getBoard, getPost, HOLD_ORDER, lastSeen, pendingDigests, pendingPushes, snapshotPage, pruneEndedIds, registerId, writeAliasMeta, setIdFacts, setPlace, touchAlias, touchId, type CoreDb, setAccess, type Access } from "../core/boards.ts";
 import { ackQueueClaim, addClaimWatch, claimRow, claimWatchers, expireClaims, holderUser, listClaims, liveClaim, logEvent, recentClaimEvents, releaseClaim, removeClaimWatch, takeClaim, takeClaimWatchers } from "../core/claims.ts";
 import { addressSet, aliasUser, aliasUses, dropHold, holderOf, holdsOf, idRow, idStatuses, logBinding, unendedIds } from "../core/bindings.ts";
 import type { AuditAction } from "./audit.ts";
@@ -350,6 +350,11 @@ export function openDatabase(path: string, opts: OpenOptions): { db: Database; r
     seedSchema(d, first, firstRoles);
   });
   authGenerationTriggers(db);
+  // Core's board and claim functions judge visibility through the Access installed on their connection, and fall back
+  // to local mode's open one. No server path calls them (its ports check the async boardAccess), so a server database
+  // installs one that refuses every use: a future caller fails loudly instead of skipping team and service visibility.
+  // A test that seeds through core opts in with setAccess(db, openAccess(db)), or the parity oracle.
+  setAccess(db, SERVER_REFUSES_CORE_ACCESS);
   routeReads(db, openReader(path));
   const queue = queueFor(db);
   ownWriter(db, { holds: () => queue.mine, check: () => queue.assertMine() });
@@ -358,6 +363,10 @@ export function openDatabase(path: string, opts: OpenOptions): { db: Database; r
   const repo = makeRepo(db, new DiskBlobs(opts.blobDir), opts.attachmentLimits ?? DEFAULT_ATTACHMENT_LIMITS, opts.attachmentUserQuota ?? DEFAULT_ATTACHMENT_USER_QUOTA, sessionEnd, opts.now);
   return { db, repo };
 }
+
+const SERVER_REFUSES_CORE_ACCESS = new Proxy({} as Access, {
+  get(_t, key) { throw new Error(`core Access.${String(key)} on a server database: server paths use boardAccess (src/server/access.ts)`); },
+});
 
 // #853: a connection-local counter every write to the authorization tables bumps, by trigger, so no
 // write site can forget to. TEMP objects live and die with this connection, outside the schema, and

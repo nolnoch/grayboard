@@ -7,7 +7,7 @@
 // read's promise is resolved when returned). The Access glue around those calls (which principal an ID is judged as,
 // a board scope's team or service, the mention grammar) is the deleted serverAccess as it was, and
 // src/server/board-access-parity.test.ts holds it equal to production `boardAccess`, as it held the two forms before.
-// Test-only: nothing under src/ but *.test.ts imports it (src/server/policy.test.ts checks).
+// Test-only: nothing under src/, scripts/ or adapters/ but *.test.ts imports it (src/server/policy.test.ts checks).
 import { addressParts, type AliasScope } from "../../src/core/addresses.ts";
 import { holdsOf, idRow } from "../../src/core/bindings.ts";
 import type { Access, Board, CoreDb } from "../../src/core/boards.ts";

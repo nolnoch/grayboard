@@ -43,11 +43,12 @@ test("no synchronous policy loader comes back", () => {
   expect(counts).toEqual(SYNC_TWIN_CEILING);
 });
 
-// The synchronous access oracle (tests/support/sync_access.ts) is the parity tests' alone: no production module loads it.
+// The synchronous access oracle (tests/support/sync_access.ts) is the parity tests' alone: no production module or
+// script loads it.
 test("only tests import the synchronous access oracle", () => {
   const importers: string[] = [];
-  for (const file of new Glob("src/**/*.ts").scanSync({ cwd: ROOT })) {
-    if (file.endsWith(".test.ts")) continue;
+  for (const file of ["src", "scripts", "adapters"].flatMap(d => [...new Glob(`${d}/**/*.ts`).scanSync({ cwd: ROOT })])) {
+    if (file.endsWith(".test.ts") || file.includes("node_modules/")) continue;
     if (/sync_access(\.ts)?["']/.test(readFileSync(join(ROOT, file), "utf8"))) importers.push(file);
   }
   expect(importers).toEqual([]);

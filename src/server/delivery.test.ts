@@ -13,7 +13,7 @@ import { createHostedSessions, sessionContext, type SessionContext } from "./hos
 import { OPENCODE_CLIENT, OPENCODE_SESSION_META } from "./oauth-config.ts";
 import { openDatabase } from "./db.ts";
 import { sessionEndPort } from "./session_end.ts";
-import { createBoard, post, subscribe } from "../core/boards.ts";
+import { createBoard, post, subscribe, openAccess, setAccess } from "../core/boards.ts";
 import { scratchDbPath } from "../../tests/support/scratch_db.ts";
 import { seed } from "../../tests/support/seed.ts";
 import { liveGrants } from "../../tests/support/grants.ts";
@@ -34,6 +34,7 @@ const checked = async (c: SessionContext) => ({ row: "id" in c ? await store.rep
 beforeEach(async () => {
   dir = mkdtempSync(join(tmpdir(), "gb-delivery-"));
   store = openDatabase(scratchDbPath(), { blobDir: dir , sessionEnd: sessionEndPort("team") });
+  setAccess(store.db, openAccess(store.db)); // core seeds on a server database opt in to local mode's open Access
   application = createApplication(store.repo);
   const principal = async (email: string): Promise<DeliveryPrincipal> => {
     const user = await seed(store.repo, tx => store.repo.users.upsertByEmail(tx, email, null));
