@@ -4,10 +4,11 @@ import { afterEach, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { openDatabase, queuedTx } from "./db.ts";
+import { openDatabase } from "./db.ts";
+import { createApplication } from "./application.ts";
 import { runRetention } from "./retention.ts";
 import type { Config } from "./config.ts";
-import { claim, claimExpiryTimer } from "../core/claims.ts";
+import { claim } from "../core/claims.ts";
 import { queueFor } from "./store/queue.ts";
 import { createBoard, openAccess, setAccess } from "../core/boards.ts";
 import { until } from "../../tests/support/until.ts";
@@ -49,28 +50,41 @@ test("#807: retention while another body holds the write queue waits, then prune
   expect((await repo.messages.getById(repo.read, m.id))).toBeUndefined();
 });
 
-test("#807: a server claim expiry timer's sweep waits behind another body holding the write queue", async () => {
+// #1207: the application's own timer, whose sweep is `repo.write(tx => sweepClaims(…, repo.now()))`: it waits behind a
+// held queue, and its clock is read inside the queued body, after the queue frees (D4), so the expiry it logs is no
+// earlier than the release.
+test("#807: the application's claim expiry sweep waits behind a body holding the write queue, and reads the clock inside it", async () => {
   const { db, repo } = setup();
-  const woken: string[][] = [];
-  const timer = claimExpiryTimer(db, h => { woken.push(h); }, undefined, queuedTx(repo));
-  cleanups.push(() => timer.stop());
+  const application = createApplication(repo);
+  cleanups.push(() => application.stopExpiry());
   await seed(repo, async tx => {
     await repo.users.upsertByEmail(tx, "a@example.com", null);
     await repo.aliases.create(tx, { scope_kind: "person", scope_ref: "a@example.com", name: "be" }, "a@example.com");
     createBoard(db, "a@example.com/be", "e2e", "test");
     claim(db, "a@example.com/be", "soon", { board: "e2e", ttl_minutes: 0.001 });
   });
-  // The old sync sweep would hit the queue's top-level guard and retry 5s later: a failure is a test failure.
   const errors = spyOn(console, "error").mockImplementation(() => {});
   cleanups.push(() => errors.mockRestore());
+  const writes = spyOn(repo, "write");
+  cleanups.push(() => writes.mockRestore());
   const holder = hold(db);
-  timer.arm();
-  await Bun.sleep(150);
+  application.wake([]);
+  // Past the claim's expiry, so the timer has fired: an earlier write of anything else would count a second.
+  const due = (db.query("SELECT expires_at FROM claims WHERE key = 'soon'").get() as { expires_at: number }).expires_at;
+  await until(() => Date.now() > due && writes.mock.calls.length > 0, 2000, "the timer's sweep asked for the write queue");
   await ticks();
   // listClaims hides an expired claim: the row itself is what the sweep deletes.
   expect(rows(db)).toEqual(["soon"]);
+  // The one write since the spy is the sweep's: another would let the queue free before the timer fired.
+  expect(writes.mock.calls.length).toBe(1);
+  const fired = Date.now();
+  while (Date.now() <= fired) { /* the next millisecond */ }
+  const released = Date.now();
   holder.release();
   await holder.done;
   await until(() => rows(db).length === 0, 2000, "the expired claim was swept");
+  const expired = db.query("SELECT at FROM claim_events WHERE event = 'expire'").all() as { at: number }[];
+  expect(expired.length).toBe(1);
+  expect(expired[0]!.at).toBeGreaterThanOrEqual(released);
   expect(errors.mock.calls.map(c => c.map(String).join(" ")).filter(m => m.includes("claim expiry"))).toEqual([]);
 });
