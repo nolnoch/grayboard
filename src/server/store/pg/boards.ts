@@ -127,10 +127,17 @@ const liveSession = (sql: PgSql, sid: PgFragment) => sql.fragment`EXISTS (SELECT
 // it is a session ID, else NULL.
 const holdingSession = (sql: PgSql, h: PgFragment) =>
   sql.fragment`COALESCE((SELECT hs.id FROM alias_holds hs WHERE hs.address = ${h}), (SELECT hi.id FROM ids hi WHERE hi.id = ${h}))`;
-// core creditQueueTakes (#1461): each post's newest take under `handle` re-records the session holding it now, while
-// the post's claim still names `handle`.
-async function creditQueueTakes(sql: PgSql, handle: string, board: string, postIds: number[]): Promise<void> {
-  await sql`UPDATE claim_events SET session_id = ${holdingSession(sql, sql.fragment`${handle}::text`)}
+// The session a delivery to `handle` credits (#1461, #1466): `receiver` when the caller names it, else `handle`'s holder.
+const credited = (sql: PgSql, handle: string, receiver?: string) =>
+  receiver === undefined ? holdingSession(sql, sql.fragment`${handle}::text`) : sql.fragment`${receiver}::text`;
+// core heldBy (#1466), in the statement that marks: `handle` is `receiver`'s ID or an alias it holds; TRUE with none.
+// Judged in that statement's snapshot, so a hold that moved in a transaction committed before it is seen.
+const heldBy = (sql: PgSql, handle: string, receiver?: string) => receiver === undefined ? sql.fragment`TRUE`
+  : sql.fragment`(${handle}::text = ${receiver}::text OR EXISTS (SELECT 1 FROM alias_holds hb WHERE hb.address = ${handle}::text AND hb.id = ${receiver}::text))`;
+// core creditQueueTakes (#1461): each post's newest take under `handle` re-records the session credited (`receiver`,
+// else the one holding `handle` now), while the post's claim still names `handle`.
+async function creditQueueTakes(sql: PgSql, handle: string, board: string, postIds: number[], receiver?: string): Promise<void> {
+  await sql`UPDATE claim_events SET session_id = ${credited(sql, handle, receiver)}
     WHERE id IN (SELECT MAX(ce.id) FROM claim_events ce WHERE ce.key = ANY(${postIds.map(id => `queue:${board}:${id}`)}::text[])
       AND ce.handle = ${handle} AND ce.event = 'take'
       AND EXISTS (SELECT 1 FROM claims c WHERE c.key = ce.key AND c.holder = ${handle}) GROUP BY ce.key)`;
@@ -264,27 +271,34 @@ export function makePgBoards({ clock }: { clock: () => number }): BoardsStore {
       return rows.map((x): DigestRow => ({ board: x.digest_board as string, unread: int8(x.unread), latest: toPost(x) }));
     },
     // Core acknowledge; each GREATEST re-evaluates after the row lock (header).
-    async acknowledge(tx, handle, ref) {
+    async acknowledge(tx, handle, ref, receiver) {
       const sql = pgOf(tx);
+      // core: with `receiver`, only while `handle` is still its address (#1466). Each marking statement carries the
+      // check in its WHERE, so it is judged with the mark, not by a read before it.
+      const held = heldBy(sql, handle, receiver);
       if (ref.kind === "digest") {
-        await sql`UPDATE subscriptions SET notified_id = GREATEST(notified_id, ${ref.latest_id}::int8) WHERE board = ${ref.board} AND handle = ${handle}`;
+        await sql`UPDATE subscriptions SET notified_id = GREATEST(notified_id, ${ref.latest_id}::int8) WHERE board = ${ref.board} AND handle = ${handle} AND ${held}`;
         return;
       }
       const [row] = await sql`SELECT o.reason, p.board, b.kind FROM outbox o JOIN posts p ON p.id = o.post_id
         JOIN boards b ON b.name = p.board WHERE o.handle = ${handle} AND o.post_id = ${ref.post_id}`;
       if (!row) return;
-      // core: credited to the session holding `handle` now, on its first delivery (#1461). The update itself decides
-      // "first": its WHERE is re-checked on the newest row version after the row lock, so of two concurrent acks only
-      // one matches (the SELECT above is unlocked and would let both credit).
+      // core: credited to `receiver`, else the session holding `handle` now, on its first delivery (#1461). The update
+      // itself decides "first": its WHERE is re-checked on the newest row version after the row lock, so of two
+      // concurrent acks only one matches (the SELECT above is unlocked and would let both credit). The repeat stamp
+      // touches only a row already delivered, so a hold that moves back between the two never marks without crediting.
       const now = clock();
-      const first: Row[] = await sql`UPDATE outbox SET delivered_at = ${now}, session_id = ${holdingSession(sql, sql.fragment`${handle}::text`)}
-        WHERE handle = ${handle} AND post_id = ${ref.post_id} AND delivered_at IS NULL RETURNING post_id`;
-      if (first.length === 0) await sql`UPDATE outbox SET delivered_at = ${now} WHERE handle = ${handle} AND post_id = ${ref.post_id}`;
-      else if (row.kind === "queue") await creditQueueTakes(sql, handle, row.board as string, [ref.post_id]);
+      const first: Row[] = await sql`UPDATE outbox SET delivered_at = ${now}, session_id = ${credited(sql, handle, receiver)}
+        WHERE handle = ${handle} AND post_id = ${ref.post_id} AND delivered_at IS NULL AND ${held} RETURNING post_id`;
+      if (first.length === 0) {
+        const again: Row[] = await sql`UPDATE outbox SET delivered_at = ${now}
+          WHERE handle = ${handle} AND post_id = ${ref.post_id} AND delivered_at IS NOT NULL AND ${held} RETURNING post_id`;
+        if (again.length === 0 && receiver !== undefined) return;
+      } else if (row.kind === "queue") await creditQueueTakes(sql, handle, row.board as string, [ref.post_id], receiver);
       // Push-mode subscribers have now seen it in full: count it as read.
       if (row.reason === "subscription") {
         await sql`UPDATE subscriptions SET cursor = GREATEST(cursor, ${ref.post_id}::int8), notified_id = GREATEST(notified_id, ${ref.post_id}::int8)
-          WHERE board = ${row.board as string} AND handle = ${handle} AND mode = 'push'`;
+          WHERE board = ${row.board as string} AND handle = ${handle} AND mode = 'push' AND ${held}`;
       }
     },
 
@@ -413,7 +427,7 @@ export function makePgBoards({ clock }: { clock: () => number }): BoardsStore {
       return row ? toBoard(row) : null;
     },
     // Core readRows; the cursor's GREATEST re-evaluates after the row lock (header).
-    async read(tx, board, handle, opts) {
+    async read(tx, board, handle, opts, receiver) {
       const sql = pgOf(tx);
       const limit = Math.min(Math.max(opts.limit ?? 20, 1), 200);
       let posts: Post[];
@@ -441,13 +455,15 @@ export function makePgBoards({ clock }: { clock: () => number }): BoardsStore {
       if (maxId > 0) {
         // What this read showed no longer needs pushing; what it skipped (a pending push it filters out, a post
         // outside the thread) still does. Outbox before the cursor: the header's lock order (core runs the reverse).
-        // core: what it delivers is credited to the session holding `handle` now (#1461).
-        const fresh: Row[] = await sql`UPDATE outbox SET delivered_at = ${clock()}, session_id = ${holdingSession(sql, sql.fragment`${handle}::text`)}
-          WHERE handle = ${handle} AND delivered_at IS NULL AND post_id = ANY(${posts.map(p => p.id)}::int8[]) RETURNING post_id`;
+        // core: what it delivers is credited to `receiver`, else the session holding `handle` now (#1461); a read by a
+        // `receiver` that no longer holds `handle` changes nothing (#1466), each write judging it in its own WHERE.
+        const held = heldBy(sql, handle, receiver);
+        const fresh: Row[] = await sql`UPDATE outbox SET delivered_at = ${clock()}, session_id = ${credited(sql, handle, receiver)}
+          WHERE handle = ${handle} AND delivered_at IS NULL AND post_id = ANY(${posts.map(p => p.id)}::int8[]) AND ${held} RETURNING post_id`;
         if (fresh.length > 0 && (await sql`SELECT 1 FROM boards WHERE name = ${board} AND kind = 'queue'`).length > 0) {
-          await creditQueueTakes(sql, handle, board, fresh.map(x => int8(x.post_id)));
+          await creditQueueTakes(sql, handle, board, fresh.map(x => int8(x.post_id)), receiver);
         }
-        await sql`UPDATE subscriptions SET cursor = GREATEST(cursor, ${maxId}::int8) WHERE board = ${board} AND handle = ${handle}`;
+        await sql`UPDATE subscriptions SET cursor = GREATEST(cursor, ${maxId}::int8) WHERE board = ${board} AND handle = ${handle} AND ${held}`;
       }
       const [n] = await sql`SELECT COUNT(*) AS n FROM posts p JOIN subscriptions s ON s.board = p.board AND s.handle = ${handle}
         WHERE p.board = ${board} AND p.id > s.cursor AND ${notOwn(sql, h)} AND ${notPushedYet(sql, h)}`;

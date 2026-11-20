@@ -80,6 +80,38 @@ test("#807: a push on a board its reader lost is acknowledged through the write 
   await until(async () => (await deliveredAt()) !== null, 5000, "the lost push was acknowledged");
 });
 
+// #1466: a receipt (or a read) from a session whose addresses still list a name another session took in a write that
+// committed first, as an in-flight receipt's do on Postgres. The session's in-memory addresses (and primary, which a read acts
+// as) are put back as they stood when its receipt began. The push stays undelivered and its outbox row keeps s1's session, rather than being
+// marked and credited to s2 (the name's holder); s2's own receipt then credits s2. Mutation: receiptBoards (or
+// board_read) not passing the session marks it under s2.
+for (const via of ["receipt", "read"] as const) {
+  test(`#1466: a ${via} after the session's name moved marks nothing; the new holder's credits it`, async () => {
+    const alice = await login(A);
+    const a = await srv.hosted(A, "be");
+    await a.call("board_create", { name: "ops", purpose: "jobs" });
+    const s1 = await srv.connected(alice, "sim");
+    // sim alone subscribes, so a read of #ops acts as sim (dev has no view there).
+    await s1.call("board_subscribe", { board: "ops", mode: "push" });
+    await s1.bind("dev", { create: true });
+    await a.call("board_post", { board: "ops", body: "ping" });
+    const id = postOf((await s1.next(board())).item).id;
+    const outbox = () => row<{ delivered_at: number | null; session_id: string | null }>(srv, `SELECT delivered_at, session_id FROM outbox WHERE handle = ? AND post_id = ?`, `${A}/sim`, id);
+    expect(await outbox()).toEqual({ delivered_at: null, session_id: s1.id });
+    const before = { addresses: [...s1.session.addresses], primary: s1.session.primary };
+    await s1.unbind("sim");
+    const s2 = await srv.connected(alice, "sim");
+    Object.assign(s1.session, before);
+    if (via === "receipt") await s1.boardAck([{ kind: "push", post_id: id }]);
+    else expect((await s1.call("board_read", { board: "ops" }) as ReadResult).posts.map(p => p.id)).toContain(id);
+    expect(await outbox()).toEqual({ delivered_at: null, session_id: s1.id });
+    if (via === "receipt") await s2.boardAck([{ kind: "push", post_id: id }]);
+    else await s2.call("board_read", { board: "ops" });
+    expect(await outbox()).toMatchObject({ session_id: s2.id });
+    expect((await outbox())!.delivered_at).not.toBeNull();
+  });
+}
+
 // hosted twin: #451 (a reconnect on the session's key)
 test("unacked board pushes are resent after reconnect; acked ones aren't", async () => {
   const alice = await login(A);

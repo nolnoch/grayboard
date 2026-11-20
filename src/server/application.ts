@@ -251,10 +251,17 @@ const onCommit = (h: Read): Commit => (effect) => afterCommitOf(h, effect);
 // A push its reader can no longer see, acknowledged as pendingOf finds it, on `h`: inside a body (a delivery
 // receipt's `pending`) on its `Tx`, awaited; outside one (a drain, a lease's pull) queued on the write queue and not
 // awaited (#807 D4; never `repo.post`, which refuses an async body, B5a1 H2).
-const lostAck = (hub: Hub, h: Read, handle: string) => async (ref: PendingRef): Promise<void> => {
-  if (isTx(h)) return hub.repo.boards.acknowledge(h, handle, ref);
-  void hub.repo.write((tx: Tx) => hub.repo.boards.acknowledge(tx, handle, ref)).catch((error) => console.error("lost-visibility push ack failed", error));
+const lostAck = (hub: Hub, h: Read, handle: string, receiver: string | undefined) => async (ref: PendingRef): Promise<void> => {
+  if (isTx(h)) return hub.repo.boards.acknowledge(h, handle, ref, receiver);
+  void hub.repo.write((tx: Tx) => hub.repo.boards.acknowledge(tx, handle, ref, receiver)).catch((error) => console.error("lost-visibility push ack failed", error));
 };
+
+// The session a receipt or read by `s` credits, and must still hold the address it marks (#1466): the one whose ID
+// ends its addresses and whose holds the rest are (a hosted child's root). Its in-memory addresses can trail a hold
+// that moved in a transaction committed first; the store judges the hold with the mark. None for a session whose
+// addresses aren't holds (a tools-only session's writes_as, the Slack bridge's humans): the address's holder is credited.
+const receiverOf = (s: ApplicationSession): string | undefined =>
+  s.human || s.toolsOnly || !s.sessionId ? undefined : s.addresses[s.addresses.length - 1];
 
 // A pending item's identity down to the post a digest names: a receipt for it means the drain that read it must not
 // send it again; a newer digest of the same board is another item.
@@ -301,7 +308,7 @@ function drainBoards(session: ApplicationSession, hub: Hub, all = false): Promis
 
 async function drainBoardsOnce(session: ApplicationSession, hub: Hub, all: boolean, acked: Set<string>): Promise<void> {
   for (const address of [...session.addresses]) {
-    const items = await pendingOf(hub.repo, hub.access, hub.repo.read, address, all, lostAck(hub, hub.repo.read, address));
+    const items = await pendingOf(hub.repo, hub.access, hub.repo.read, address, all, lostAck(hub, hub.repo.read, address, receiverOf(session)));
     // Closed while the read awaited: nothing more to send. Unbound from this address: the holds change dropped its
     // in-flight items.
     if (!session.active) return;
@@ -1412,7 +1419,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
       // Each item's post and the address it was read for: a service board's wake rule judges that address (#270 D6).
       const readers = new Map<number, string>();
       for (const a of session.addresses) {
-        for (const item of await pendingOf(repo, hub.access, r, a, true, lostAck(hub, r, a))) {
+        for (const item of await pendingOf(repo, hub.access, r, a, true, lostAck(hub, r, a, receiverOf(session)))) {
           const key = pendingKey(refOf(item));
           if (!seen.has(key)) { seen.add(key); all.push(item); readers.set((item.kind === "push" ? item.post : item.latest).id, a); }
         }
@@ -1468,11 +1475,13 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     },
     // A ref carries no handle: the item was sent for one of this session's
     // addresses, and acknowledging is a no-op on one with no such row, so
-    // each address acks it.
+    // each address acks it, as this session (receiverOf): an address it no
+    // longer holds in this transaction is left to its new holder (#1466).
     async receiptBoards(tx: Tx, session: ApplicationSession, refs: PendingRef[]) {
       await valid(session, false, tx);
+      const receiver = receiverOf(session);
       for (const r of refs) {
-        for (const a of session.addresses) await repo.boards.acknowledge(tx, a, r);
+        for (const a of session.addresses) await repo.boards.acknowledge(tx, a, r, receiver);
         tx.afterCommit(() => {
           session.inflight.delete(pendingKey(r));
           session.boardDrain?.acked.add(ackKey(r));
@@ -2125,7 +2134,8 @@ async function handleCall(hub: Hub, tx: Tx, session: ApplicationSession, tool: s
     if (a?.d.allow) recordDecision(repo, sp, sessionActor(session, as), a.req, a.d, { post_id: postId });
   };
   let outcome;
-  try { outcome = await callBoardTool(repo, hub.access, tx, actor, tool, rest, { ...ctx, ...(session.readOnly ? { principal: userOf(session) } : {}), announced }); }
+  const receiver = receiverOf(session);
+  try { outcome = await callBoardTool(repo, hub.access, tx, actor, tool, rest, { ...ctx, ...(session.readOnly ? { principal: userOf(session) } : {}), ...(receiver ? { receiver } : {}), announced }); }
   catch (e) {
     if (e instanceof CoreError) throw coreRefusal(e);
     console.error(`[grayboard] ${tool} failed:`, e);

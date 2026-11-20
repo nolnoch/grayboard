@@ -946,6 +946,53 @@ function queue(it: It): void {
     expect(await h.boards.laneRows(h.read, "jobs", [])).toEqual(before);
   });
 
+  // #1466: a receipt or read by S1, the session the push reached while it held OPS, after S2 took OPS in a transaction
+  // that committed first. Nothing is marked: the outbox row stays undelivered and S1's, the take stays S1's, the
+  // subscription's cursor and notified_id stay put (a digest's too), and the rotation is unchanged; S2 receives it
+  // later and is credited. Mutation: acknowledge or read ignoring `receiver` marks it and credits S2 (OPS's holder).
+  for (const via of ["acknowledge", "read"] as const) {
+    it(`a ${via} by a receiver that no longer holds the address marks nothing; its holder's credits it`, async h => {
+      await board(h, "jobs", { kind: "queue" });
+      await board(h, "hall");
+      for (const a of [BE, FE, OPS]) await h.alias(a);
+      await h.session(S1, ME);
+      await h.session(S2, ME);
+      await h.hold(BE, S1, T0);
+      await h.hold(FE, S2, T0);
+      await h.hold(OPS, S2, T0 + 1);
+      await sub(h, S1, "jobs", "push");
+      await sub(h, S2, "jobs", "push");
+      await sub(h, OPS, "jobs", "push");
+      await sub(h, OPS, "hall", "digest");
+      const p = await write(h, np("jobs", QA, "job", T0 + 50));
+      const d = await write(h, np("hall", QA, "news", T0 + 51));
+      await h.claim({ key: `queue:jobs:${p}`, holder: OPS, board: "jobs", at: T0 + 60 });
+      await h.claimEvent({ key: `queue:jobs:${p}`, handle: OPS, event: "take", board: "jobs", at: T0 + 60, session: S1 });
+      await h.push(OPS, p, S1);
+      const lanes = await h.boards.laneRows(h.read, "jobs", []);
+      const mark = (receiver: string) => h.write(async tx => {
+        if (via === "acknowledge") {
+          await h.boards.acknowledge(tx, OPS, { kind: "push", post_id: p }, receiver);
+          await h.boards.acknowledge(tx, OPS, { kind: "digest", board: "hall", latest_id: d }, receiver);
+        } else {
+          await h.boards.read(tx, "jobs", OPS, {}, receiver);
+        }
+      });
+      await mark(S1);
+      expect((await h.outboxRows()).map(r => [r.handle, r.post_id, r.delivered])).toEqual([[OPS, p, false]]);
+      expect(await h.takeSessions()).toEqual([{ key: `queue:jobs:${p}`, handle: OPS, session_id: S1 }]);
+      expect(await h.subscription("jobs", OPS)).toEqual({ mode: "push", cursor: 0, notified_id: 0 });
+      expect(await h.subscription("hall", OPS)).toEqual({ mode: "digest", cursor: 0, notified_id: 0 });
+      expect(await h.boards.laneRows(h.read, "jobs", [])).toEqual(lanes);
+      // S2, OPS's holder, receives it: credited, and the cursor moves.
+      await mark(S2);
+      expect(await h.outboxSessions()).toEqual([{ handle: OPS, post_id: p, session_id: S2 }]);
+      expect(await h.takeSessions()).toEqual([{ key: `queue:jobs:${p}`, handle: OPS, session_id: S2 }]);
+      expect((await h.subscription("jobs", OPS))?.cursor).toBe(p);
+      if (via === "acknowledge") expect((await h.subscription("hall", OPS))?.notified_id).toBe(d);
+    });
+  }
+
   it("insertOutbox and claimQueuePost record the receiving session: an alias's holder, a session ID itself, null for an alias no session holds", async h => {
     await board(h, "jobs", { kind: "queue" });
     await h.session(S1, ME);

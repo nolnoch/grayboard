@@ -901,13 +901,23 @@ export function holdingSessionSql(h: string): string {
  * while the post's claim still names `handle`: once it lapsed or was released (and maybe redelivered to another lane),
  * that turn is over, and a stale push read later by whoever holds `handle` then must not take it from the old session.
  */
-export function creditQueueTakes(db: Database, handle: string, board: string, postIds: number[]): void {
+export function creditQueueTakes(db: Database, handle: string, board: string, postIds: number[], receiver?: string): void {
   const take = db.prepare(
-    `UPDATE claim_events SET session_id = ${holdingSessionSql("?1")}
+    `UPDATE claim_events SET session_id = ${receiver === undefined ? holdingSessionSql("?1") : "?3"}
       WHERE id = (SELECT MAX(id) FROM claim_events WHERE key = ?2 AND handle = ?1 AND event = 'take')
         AND EXISTS (SELECT 1 FROM claims WHERE key = ?2 AND holder = ?1)`,
   );
-  for (const id of postIds) take.run(handle, `queue:${board}:${id}`);
+  for (const id of postIds) receiver === undefined ? take.run(handle, `queue:${board}:${id}`) : take.run(handle, `queue:${board}:${id}`, receiver);
+}
+
+/**
+ * Whether address `handle` is session `receiver`'s now: its ID, or an alias it holds (#1466). A server's receipt or
+ * read names the session the item reached (`receiver`); its in-memory addresses can trail a hold that moved in a
+ * transaction that committed first, so the mark checks the holds it writes beside, and credits `receiver`, not
+ * whoever holds `handle` by then. Local mode's drain checks in its own transaction (markIfMine) and names none.
+ */
+export function heldBy(db: Database, handle: string, receiver: string): boolean {
+  return handle === receiver || !!db.prepare(`SELECT 1 FROM alias_holds WHERE address = ? AND id = ?`).get(handle, receiver);
 }
 
 /**
@@ -2046,7 +2056,7 @@ export function read(
  * read on a board already judged visible: `handle` is whose cursor and pushes the read uses and advances, or null
  * for a read that changes nothing (a predicate viewer, a peek).
  */
-export function readRows(db: Database, board: string, handle: string | null, opts: { limit?: number; before_id?: number; thread?: number } = {}): ReadResult {
+export function readRows(db: Database, board: string, handle: string | null, opts: { limit?: number; before_id?: number; thread?: number } = {}, receiver?: string): ReadResult {
   const limit = Math.min(Math.max(opts.limit ?? 20, 1), 200);
   let posts: PostRow[];
 
@@ -2090,18 +2100,21 @@ export function readRows(db: Database, board: string, handle: string | null, opt
 
   if (handle === null) return { board, posts: withAttachments(db, "post", posts.map(showPost)), unread_remaining: 0 };
   const maxId = posts.reduce((m, p) => Math.max(m, p.id), 0);
-  if (maxId > 0) {
+  // A server read by a session that no longer holds `handle` (#1466) shows the posts and changes nothing: the read
+  // state is the new holder's.
+  if (maxId > 0 && (receiver === undefined || heldBy(db, handle, receiver))) {
     db.prepare(
       `UPDATE subscriptions SET cursor = MAX(cursor, ?) WHERE board = ? AND handle = ?`,
     ).run(maxId, board, handle);
     // What you've now read no longer needs pushing; what this read skipped
     // (a pending push it filters out, a post outside the thread) still does.
-    // The pushes it delivers are credited to the session reading them, the one holding `handle` now (#1461).
+    // The pushes it delivers are credited to the session reading them: `receiver`, else the one holding `handle` now
+    // (#1461).
     const fresh = db.prepare(
-      `UPDATE outbox SET delivered_at = ?1, session_id = ${holdingSessionSql("?2")} WHERE handle = ?2 AND delivered_at IS NULL
+      `UPDATE outbox SET delivered_at = ?1, session_id = ${receiver === undefined ? holdingSessionSql("?2") : "?4"} WHERE handle = ?2 AND delivered_at IS NULL
          AND post_id IN (SELECT value FROM json_each(?3)) RETURNING post_id`,
-    ).all(Date.now(), handle, JSON.stringify(posts.map((p) => p.id))) as { post_id: number }[];
-    if (fresh.length > 0 && getBoard(db, board)?.kind === "queue") creditQueueTakes(db, handle, board, fresh.map((r) => r.post_id));
+    ).all(Date.now(), handle, JSON.stringify(posts.map((p) => p.id)), ...(receiver === undefined ? [] : [receiver])) as { post_id: number }[];
+    if (fresh.length > 0 && getBoard(db, board)?.kind === "queue") creditQueueTakes(db, handle, board, fresh.map((r) => r.post_id), receiver);
   }
 
   const remaining = db
@@ -2221,7 +2234,10 @@ export function markDelivered(db: Database, handle: string, item: Pending): void
   acknowledge(db, handle, refOf(item));
 }
 
-export function acknowledge(db: Database, handle: string, ref: PendingRef): void {
+// `receiver`: the session the item reached (a server's receipt, #1466). Given, nothing is marked unless `handle` is still
+// its address (heldBy), and a first delivery credits it.
+export function acknowledge(db: Database, handle: string, ref: PendingRef, receiver?: string): void {
+  if (receiver !== undefined && !heldBy(db, handle, receiver)) return;
   if (ref.kind === "push") {
     const row = db
       .prepare(
@@ -2230,13 +2246,13 @@ export function acknowledge(db: Database, handle: string, ref: PendingRef): void
       )
       .get(handle, ref.post_id) as { reason: string; delivered_at: number | null; board: string; kind: string } | undefined;
     if (!row) return;
-    // Delivered now: credited to the session it reached, the one holding `handle` now (#1461); a repeat ack keeps the
-    // first delivery's session.
+    // Delivered now: credited to the session it reached, `receiver`, else the one holding `handle` now (#1461); a
+    // repeat ack keeps the first delivery's session.
     db.prepare(
-      `UPDATE outbox SET delivered_at = ?1, session_id = CASE WHEN delivered_at IS NULL THEN ${holdingSessionSql("?2")} ELSE session_id END
+      `UPDATE outbox SET delivered_at = ?1, session_id = CASE WHEN delivered_at IS NULL THEN ${receiver === undefined ? holdingSessionSql("?2") : "?4"} ELSE session_id END
         WHERE handle = ?2 AND post_id = ?3`,
-    ).run(Date.now(), handle, ref.post_id);
-    if (row.delivered_at === null && row.kind === "queue") creditQueueTakes(db, handle, row.board, [ref.post_id]);
+    ).run(Date.now(), handle, ref.post_id, ...(receiver === undefined ? [] : [receiver]));
+    if (row.delivered_at === null && row.kind === "queue") creditQueueTakes(db, handle, row.board, [ref.post_id], receiver);
     // Push-mode subscribers have now seen it in full: count it as read.
     if (row.reason === "subscription") {
       db.prepare(
