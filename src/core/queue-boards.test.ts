@@ -748,8 +748,8 @@ describe("a take follows its taking session while it is live (#1351)", () => {
     expect(replies(r.post.id)).toEqual([unclaimed(key, 1)]);
   });
 
-  for (const sub of ["z", "y"]) {
-    test(`move: an alias that moved to another live session doesn't take its turn (subscribed as ${sub === "z" ? "its primary" : "a non-primary alias"})`, () => {
+  for (const sub of ["z", "y", "x"]) {
+    test(`move: an alias that moved to another live session doesn't take its turn (subscribed as ${sub === "z" ? "its primary" : sub === "y" ? "a non-primary alias" : "the moved alias itself"})`, () => {
       db.prepare(`DELETE FROM subscriptions WHERE handle = 'sim'`).run();
       holdAlias(db, "x", A, 100);
       subscribe(db, A, "work", "push"); // A's lane is x

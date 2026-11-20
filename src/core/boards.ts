@@ -1040,7 +1040,7 @@ export type RedeliveryFacts = { board: Board; postId: number; poster: string[]; 
 /** What a queue post's redelivery reads (#807 B5b3a): its board and post, the post's author addresses (no lane they
  * name gets it back) and its writer (who the `[unclaimed]` reply falls back to, #1175), how many sessions took it (the
  * `[unclaimed]` reply's count), and `held`: every address of each session that took it (#1174, #1351; a session-keyed
- * take adds its taking session's addresses now, not its raw handle; an address-keyed one adds its handle and the
+ * take adds its taking session's addresses now, and its raw handle only while no other session holds it; an address-keyed one adds its handle and the
  * addresses of whoever holds it now). Null when `key` names no queue post. */
 export function redeliveryFacts(db: Database, key: string, prevHolder: string): RedeliveryFacts | null {
   const m = /^queue:([^:]+):(\d+)$/.exec(key);
