@@ -29,6 +29,13 @@ afterEach(async () => {
 });
 
 const OWNER = "displace-test-owner";
+// A session started paused, awaited only after expects that may throw: on a
+// failure afterEach releases the pause and closes it, and its rejection then
+// ("Connection closed") must not land on the next test. Awaiting it still throws.
+const paused = (p: Promise<Session>): Promise<Session> => {
+  p.catch(() => {});
+  return p;
+};
 const rows = <T>(sql: string, ...args: (string | number)[]): T[] => busRows<T>(dir, sql, ...args);
 const holder = (name: string) => rows<{ id: string }>(`SELECT id FROM alias_holds WHERE address = ?`, name)[0]?.id ?? null;
 const holds = (id: string) => rows<{ address: string }>(`SELECT address FROM alias_holds WHERE id = ?`, id).map((r) => r.address);
@@ -45,7 +52,7 @@ const texts = async (s: Session, name: string) => ((await s.c.callTool({ name, a
 test("client first (forced: the adapter's child pauses before it registers): the adapter's child takes the name from its sibling, audited; the sibling holds nothing, is told, and a DM to the name reaches only the adapter's child", async () => {
   // The adapter's child is the harness's own child, paused; its sibling, the
   // client's plain push grayboard, starts and takes omp-local meanwhile.
-  const adapterP = localSession(dir, "omp-local", { extra: { [SIBLINGS]: sock, ...pauseEnv(dir, "mcp:before-register"), BUS_ADAPTER_OWNER: OWNER, BUS_HARNESS_SESSION: "conv-1" } });
+  const adapterP = paused(localSession(dir, "omp-local", { extra: { [SIBLINGS]: sock, ...pauseEnv(dir, "mcp:before-register"), BUS_ADAPTER_OWNER: OWNER, BUS_HARNESS_SESSION: "conv-1" } }));
   const client = await siblingSession(sock, { BUS_ADAPTER_OWNER: null, BUS_HARNESS_SESSION: null, BUS_TEST_PAUSE: null, BUS_TEST_PAUSE_FILE: null });
   const clientId = (await who(client)).id;
   expect(holder("omp-local")).toBe(clientId);
@@ -112,7 +119,7 @@ test("a board push the sibling was making when the name was taken stays pending 
 
 test("a sibling that acquires and listens between the adapter's child's holder read and its socket probe is displaced, and the child holds the name: the live socket is the displaced holder's, never a refusal beside a committed displacement", async () => {
   // The adapter's child reads no holder, then pauses before the probe.
-  const adapterP = localSession(dir, "omp-local", { extra: { [SIBLINGS]: sock, ...pauseEnv(dir, "bind:before-poke"), BUS_ADAPTER_OWNER: OWNER, BUS_HARNESS_SESSION: "conv-1" } });
+  const adapterP = paused(localSession(dir, "omp-local", { extra: { [SIBLINGS]: sock, ...pauseEnv(dir, "bind:before-poke"), BUS_ADAPTER_OWNER: OWNER, BUS_HARNESS_SESSION: "conv-1" } }));
   // Its registration runs synchronously into the pause (no await between).
   await until(() => {
     try {
@@ -204,7 +211,7 @@ const inheritedClaude = { CLAUDECODE: "1", CLAUDE_CODE_SESSION_ID: "claude-shell
 const harnessSession = (id: string) => rows<{ harness_session: string | null }>(`SELECT harness_session FROM ids WHERE id = ?`, id)[0]!.harness_session;
 
 test("a sibling that inherited Claude Code's env from the shell that launched its harness records no harness session and is displaced", async () => {
-  const adapterP = localSession(dir, "omp-local", { extra: { [SIBLINGS]: sock, ...pauseEnv(dir, "mcp:before-register"), BUS_ADAPTER_OWNER: OWNER, BUS_HARNESS_SESSION: "conv-1" } });
+  const adapterP = paused(localSession(dir, "omp-local", { extra: { [SIBLINGS]: sock, ...pauseEnv(dir, "mcp:before-register"), BUS_ADAPTER_OWNER: OWNER, BUS_HARNESS_SESSION: "conv-1" } }));
   const client = await siblingSession(sock, { BUS_ADAPTER_OWNER: null, BUS_HARNESS_SESSION: null, BUS_TEST_PAUSE: null, BUS_TEST_PAUSE_FILE: null, ...inheritedClaude });
   const clientId = (await who(client)).id;
   expect(holder("omp-local")).toBe(clientId);

@@ -1,7 +1,7 @@
 // Liveness (#182 audit 9): a row is dead only on evidence, the pid gone or a
 // start time that differs; an unknown start time counts as alive.
 import { afterEach, expect, spyOn, test } from "bun:test";
-import { aliveRows, isAlive, procStart } from "./proc.ts";
+import { aliveRows, isAlive, isClaudeCode, procStart } from "./proc.ts";
 import { until } from "../../tests/support/until.ts";
 
 const PATH = process.env.PATH;
@@ -72,4 +72,19 @@ test.skipIf(process.platform === "linux")("macOS: when ps can't run, a present p
   } finally {
     err.mockRestore();
   }
+});
+
+// #1403: what counts as Claude Code when it is this process's harness.
+test("isClaudeCode: Claude Code's process titles, binaries and older npm installs; not other harnesses", () => {
+  expect(isClaudeCode("claude", "claude", "claude --resume")).toBe(true);
+  expect(isClaudeCode("claude daemon", "", "")).toBe(true);
+  expect(isClaudeCode("claude.exe", "", "")).toBe(true);
+  // A path holding spaces stays one argv[0] (Linux's NUL-split cmdline).
+  expect(isClaudeCode("node", "/Users/u/Library/Application Support/claude/claude", "")).toBe(true);
+  expect(isClaudeCode(null, "/opt/n/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe", "")).toBe(true);
+  expect(isClaudeCode("node", "node", "node /usr/lib/node_modules/@anthropic-ai/claude-code/cli.js --resume")).toBe(true);
+  expect(isClaudeCode("omp", "omp", "omp --mode acp")).toBe(false);
+  expect(isClaudeCode("bun", "bun", "bun /home/u/claude-tools/run.ts")).toBe(false);
+  expect(isClaudeCode("claudette", "claudette", "claudette")).toBe(false);
+  expect(isClaudeCode(null, "", "")).toBe(false);
 });

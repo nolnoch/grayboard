@@ -174,11 +174,24 @@ export function wrapperName(pid: number): string | null {
 
 /** `pid`'s command line, space-joined, or "" when unreadable. */
 function commandLine(pid: number): string {
-  if (process.platform !== "linux") return ps("args", [pid])?.get(pid) ?? "";
+  return argv(pid).join(" ").trim();
+}
+
+/**
+ * `pid`'s argv. Linux splits /proc/<pid>/cmdline on NUL, so an argument
+ * holding spaces stays whole. Elsewhere ps gives one space-joined line, which
+ * can't be split back: it comes back as a single element.
+ */
+function argv(pid: number): string[] {
+  if (process.platform !== "linux") {
+    const line = ps("args", [pid])?.get(pid);
+    return line ? [line] : [];
+  }
   try {
-    return readFileSync(`/proc/${pid}/cmdline`, "utf8").split("\0").join(" ").trim();
+    const raw = readFileSync(`/proc/${pid}/cmdline`, "utf8").replace(/\0$/, "");
+    return raw ? raw.split("\0") : [];
   } catch {
-    return "";
+    return [];
   }
 }
 
@@ -192,9 +205,8 @@ export function harnessAncestor(pid = process.pid): number | null {
 }
 
 /**
- * Whether this process's harness (harnessAncestor) is Claude Code: its command
- * name or its argv[0]'s basename is `claude`, or it is the npm package's
- * cli.js under node. Null when that can't be read (no ancestors readable, as
+ * Whether this process's harness (harnessAncestor) is Claude Code
+ * (isClaudeCode). Null when that can't be read (no ancestors readable, as
  * where neither /proc nor ps exists, or every ancestor a wrapper): an unknown,
  * never evidence that it isn't. CLAUDECODE and CLAUDE_CODE_SESSION_ID are
  * inherited by anything Claude Code launches, harnesses included (#1403), so
@@ -204,8 +216,26 @@ export function claudeIsHarness(pid = process.pid): boolean | null {
   const h = harnessAncestor(pid);
   if (h === null) return null;
   const comm = commandName(h);
-  const args = commandLine(h);
-  if (comm === null && !args) return null;
-  const argv0 = args.split(/\s+/)[0]?.split("/").pop() ?? "";
-  return comm === "claude" || argv0 === "claude" || /[\\/]@anthropic-ai[\\/]claude-code[\\/]cli\.js(?:\s|$)/.test(args);
+  const args = argv(h);
+  if (comm === null && !args.length) return null;
+  // macOS: argv is ps's joined line, so its argv[0] is cut at the first space
+  // (an install under "Application Support" loses it); comm there is the
+  // executable's full path, whose basename (commandName) carries the match.
+  const argv0 = process.platform === "linux" ? (args[0] ?? "") : (args[0]?.split(/\s+/)[0] ?? "");
+  return isClaudeCode(comm, argv0, args.join(" "));
+}
+
+/**
+ * Whether a process with command name `comm`, argv[0] `argv0` and
+ * space-joined command line `args` is Claude Code: its comm is `claude`
+ * (Claude Code sets process.title, which also gives "claude daemon"), its
+ * argv[0]'s basename is `claude` or `claude.exe` (the npm package's
+ * `bin/claude.exe` native binary), or it is an older npm install's `cli.js`
+ * under node (current releases ship no cli.js; kept for installs that predate
+ * the native binary).
+ */
+export function isClaudeCode(comm: string | null, argv0: string, args: string): boolean {
+  if (comm !== null && /^claude(\.exe)?( |$)/.test(comm)) return true;
+  if (/^claude(\.exe)?$/.test(argv0.split(/[\\/]/).pop() ?? "")) return true;
+  return /[\\/]@anthropic-ai[\\/]claude-code[\\/]cli\.js(?:\s|$)/.test(args);
 }
