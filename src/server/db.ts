@@ -18,8 +18,10 @@ import { addressParts } from "../core/addresses.ts";
 import { HUMAN_NAME } from "../shared/addressing.ts";
 import type { Principal } from "../core/resolver.ts";
 import { initCoreSchema } from "../core/schema.ts";
-import { addressUser, countOpenDelegations, everConnected, isLauncher, launchers, type DelegationFacts } from "../core/delegation.ts";
-import { endSession, undeliverableId, type EndedSession, type MailPort, type Undeliverable } from "../core/session_end.ts";
+import { addressUser, countOpenDelegations, everConnected, isLauncher, launchers } from "../core/delegation.ts";
+import { delegationFacts, type DelegationStore } from "./store/delegation.ts";
+import type { SessionEndStore } from "./store/session_end.ts";
+import { endSession, undeliverableId, type MailPort } from "../core/session_end.ts";
 import type { AuditSink } from "../core/audit.ts";
 import { afterCommit, type Boundary, onCommit, openBoundary, openReader, openSqlite, ownsTx, ownWriter, reclaimFreePages, routeReads } from "../core/sqlite.ts";
 import type { WriteTx } from "../core/write_tx.ts";
@@ -58,6 +60,9 @@ export { AUDIT_WRITE_ON_READ, type AccessLogRow, type AuditStore } from "./store
 export type { SlackLink, SlackProgress, SlackThread, SlackStore } from "./store/slack.ts";
 // The hosted group's in store/hosted.ts (#807 P3 C8a); its row types in hosted-types.ts.
 export type { HostedPatch, HostedStore } from "./store/hosted.ts";
+// The session end and delegation groups' in store/session_end.ts and store/delegation.ts (#807 P3 C10d1).
+export type { SessionEndStore } from "./store/session_end.ts";
+export type { DelegationStore, ReadDelegationFacts } from "./store/delegation.ts";
 
 // Row types
 // Every read of a user row goes through this, so `kind` is never missing (a "SELECT *" would type-check without it).
@@ -416,28 +421,10 @@ export interface Repo {
     // A queue post's redelivery facts for a claim on `key` that `prevHolder` held (core redeliveryFacts), or null.
     redeliveryFacts(r: Read, key: string, prevHolder: string): Promise<RedeliveryFacts | null>;
   };
-  // A session's end and its ID's deliverability (#807 P3 B4a), on the caller's handle.
-  sessionEnd: {
-    // Ends `id` and its children in the caller's transaction (core endSession over the server's mail, #284 decision 4):
-    // holds and claims released, unread mail bounced, cursors and acks dropped. One method: its claim releases post
-    // through core under the synchronous Access seam until B5b.
-    end(tx: Tx, id: string, opts: { why: string; now: number; audit?: AuditSink }): Promise<EndedSession>;
-    // Why `id` can't receive a send or @mention (core undeliverableId), or null. On the send's Tx: on Postgres it is
-    // the send side of an end's race (D3).
-    refusal(tx: Tx, id: string): Promise<Undeliverable | null>;
-    // Deletes the ended ids rows ended before `olderThanMs`, leaving keyed tombstones (core pruneEndedIds); returns how many.
-    pruneEnded(tx: Tx, olderThanMs: number, now: number): Promise<number>;
-  };
-  // What a delegate decides on (#807 P3 B4b), on the caller's handle: read first, then core's synchronous decision
-  // (resolveDelegationWith) runs over it.
-  delegation: {
-    // The user behind an address (core addressUser): an ID's principal, an alias's holder's or last holder's;
-    // undefined with no session behind it.
-    addressUser(r: Read, address: string): Promise<string | null | undefined>;
-    // Everything the decision can ask for this call: with `to`, that target's; without, every launcher's user and
-    // open count (requests since `since` it hasn't taken, #252). A fact not read throws when asked.
-    facts(r: Read, q: { to?: string; since: number }): Promise<ReadDelegationFacts>;
-  };
+  // A session's end and its ID's deliverability (store/session_end.ts).
+  sessionEnd: SessionEndStore;
+  // What a delegate decides on (store/delegation.ts).
+  delegation: DelegationStore;
   teams: TeamsStore;
   roles: RolesStore;
   services: ServicesStore;
@@ -2552,32 +2539,6 @@ function oauthOps(db: Database, hosted: HostedStoreOf): OAuthOps {
         return ok({ expiresAt: row.expires_at });
       }).immediate();
     },
-  };
-}
-
-// A delegate's facts, read first (repo.delegation.facts): the decision's reads, and each candidate's open count.
-export interface ReadDelegationFacts extends DelegationFacts {
-  open(handle: string): number;
-}
-
-// Maps over what was read; a question about anything else throws, so a decision that asks for a fact the read left
-// out fails loudly instead of reading as false or zero. The human fallback's reads are local mode's only.
-function delegationFacts(read: {
-  launchers?: string[];
-  to?: { address: string; everConnected: boolean; isLauncher: boolean };
-  users: Map<string, string | null | undefined>;
-  open: Map<string, number>;
-}): ReadDelegationFacts {
-  const missing = (what: string): never => { throw new Error(`delegation facts: ${what} was not read`); };
-  const from = <T>(m: Map<string, T>, what: string) => (h: string): T => m.has(h) ? m.get(h) as T : missing(`${what} of "${h}"`);
-  return {
-    launchers: () => read.launchers ?? missing("the launcher list"),
-    userOf: from(read.users, "the user"),
-    everConnected: (h) => read.to?.address === h ? read.to.everConnected : missing(`whether "${h}" connected`),
-    isLauncher: (h) => read.to?.address === h ? read.to.isLauncher : missing(`whether "${h}" is a launcher`),
-    open: from(read.open, "the open count"),
-    humanHandles: () => missing("the human handles"),
-    lastSeen: () => missing("a last-seen"),
   };
 }
 

@@ -34,6 +34,9 @@ import { hostedContract } from "./store/hosted.contract.ts";
 import { sqliteHostedBackend } from "./store/hosted.contract.sqlite.ts";
 import { authCacheContract } from "./store/auth_cache.contract.ts";
 import { sqliteAuthCacheBackend } from "./store/auth_cache.contract.sqlite.ts";
+import { sessionEndContract } from "./store/session_end.contract.ts";
+import { delegationContract } from "./store/delegation.contract.ts";
+import { sqliteIdsBackend } from "./store/session_end.contract.sqlite.ts";
 
 const person = (email: string, name: string) => ({ scope_kind: "person" as const, scope_ref: email, name });
 
@@ -249,6 +252,8 @@ describe("slack contract (SQLite)", () => slackContract(sqliteSlackBackend));
 // The hosted sessions group's rows, shared with the Postgres store (#807 P3 C8a); its settled-Tx refusals moved there.
 describe("hosted contract (SQLite)", () => hostedContract(sqliteHostedBackend));
 describe("auth cache contract (SQLite)", () => authCacheContract(sqliteAuthCacheBackend));
+describe("session end contract (SQLite)", () => sessionEndContract(sqliteIdsBackend));
+describe("delegation contract (SQLite)", () => delegationContract(sqliteIdsBackend));
 
 // Sign-in fixtures for the rows below (security audit F-13, #928 D4).
 const G = GOOGLE_ISSUER, OKTA = "https://example.okta.com";
@@ -1199,61 +1204,6 @@ test("#807 P3 B5b1: a team follow refuses an alias that can't see the team board
   await expect(seed(repo, tx => onTeamJoined(repo, tx, team, "b@example.com"))).rejects.toThrow("no such board #crew; see board_list");
   expect(await repo.boards.get(repo.read, "crew")).toBeUndefined();
   expect(await repo.boards.isSubscribed(repo.read, "b@example.com/be", "crew")).toBe(false);
-});
-
-// #807 P3 B4b: repo.delegation reads on the handle it's given, and its facts answer only what they read: a question
-// about anything else throws rather than reading as false or zero.
-test("#807 P3 B4b: repo.delegation runs on the handle it's given; its facts answer only what they read", async () => {
-  const { repo } = openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
-  const [s1, s2, idle] = ["id:0000000000001", "id:0000000000002", "id:0000000000003"];
-  const [be, ops, sim] = ["b@example.com/be", "b@example.com/ops", "c@example.com/sim"];
-  const d = repo.delegation;
-  const kept = await seed(repo, async tx => {
-    await repo.users.upsertByEmail(tx, "b@example.com", null);
-    await repo.users.upsertByEmail(tx, "c@example.com", null);
-    for (const n of ["be", "ops"]) await repo.aliases.create(tx, person("b@example.com", n), "b@example.com");
-    await repo.aliases.create(tx, person("c@example.com", "sim"), "c@example.com");
-    const core = repo.coreOn(tx);
-    registerId(core, { id: s1, principal: "b@example.com", launcher: true });
-    registerId(core, { id: s2, principal: "c@example.com", launcher: false });
-    registerId(core, { id: idle, principal: "b@example.com", launcher: true });
-    holdAlias(core, be, s1, 100);
-    holdAlias(core, sim, s2, 100);
-    // sim is on the roster (it has been seen); ops never connected.
-    touchAlias(core, sim);
-    // Inside the body that wrote them, on its Tx.
-    expect(await d.addressUser(tx, be)).toBe("b@example.com");
-    expect((await d.facts(tx, { since: 0 })).launchers()).toEqual([be, idle]);
-    return tx;
-  });
-  const settled = /used after its transaction settled/;
-  await expect(d.addressUser(kept, be)).rejects.toThrow(settled);
-  await expect(d.facts(kept, { since: 0 })).rejects.toThrow(settled);
-  await expect(d.facts({} as Tx, { since: 0 })).rejects.toThrow("not a SQLite store handle");
-  const r = repo.read;
-  expect(await d.addressUser(r, sim)).toBe("c@example.com");
-  expect(await d.addressUser(r, s2)).toBe("c@example.com");
-  expect(await d.addressUser(r, ops)).toBeUndefined();
-  // Auto-pick: every launcher (the named one, then the unbound ID), each one's user and open count.
-  const auto = await d.facts(r, { since: 0 });
-  expect(auto.launchers()).toEqual([be, idle]);
-  expect([auto.userOf(be), auto.userOf(idle)]).toEqual(["b@example.com", "b@example.com"]);
-  expect([auto.open(be), auto.open(idle)]).toEqual([0, 0]);
-  expect(() => auto.userOf(sim)).toThrow(/the user of "c@example.com\/sim" was not read/);
-  expect(() => auto.open(sim)).toThrow(/the open count of "c@example.com\/sim" was not read/);
-  expect(() => auto.everConnected(be)).toThrow(/was not read/);
-  expect(() => auto.humanHandles()).toThrow(/the human handles was not read/);
-  expect(() => auto.lastSeen(be)).toThrow(/was not read/);
-  // A named target: its own facts only.
-  const named = await d.facts(r, { to: sim, since: 0 });
-  expect([named.everConnected(sim), named.isLauncher(sim), named.userOf(sim), named.open(sim)]).toEqual([true, false, "c@example.com", 0]);
-  expect((await d.facts(r, { to: idle, since: 0 })).isLauncher(idle)).toBe(true);
-  expect((await d.facts(r, { to: "b@example.com/none", since: 0 })).everConnected("b@example.com/none")).toBe(false);
-  expect(() => named.launchers()).toThrow(/the launcher list was not read/);
-  expect(() => named.open(be)).toThrow(/was not read/);
-  // The target's facts answer for that address only.
-  expect(() => named.everConnected(be)).toThrow(/whether "b@example.com\/be" connected was not read/);
-  expect(() => named.isLauncher(be)).toThrow(/whether "b@example.com\/be" is a launcher was not read/);
 });
 
 // #807 P3 B5b3b: the sweep's repo steps (claims.expire, logEvent, takeWatchers, holderUser; boards.redeliveryFacts)
