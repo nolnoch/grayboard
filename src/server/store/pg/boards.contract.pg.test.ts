@@ -52,6 +52,9 @@ async function openPg(): Promise<{ h: BoardsHarness; sql: PgDatabase["sql"] }> {
       await sql`INSERT INTO claim_events (key, handle, event, board, at, session_id)
         VALUES (${e.key}, ${e.handle}, ${e.event}, ${e.board}::text, ${e.at}, ${e.session ?? null}::text)`;
     },
+    async push(handle, postId, session) {
+      await sql`INSERT INTO outbox (handle, post_id, reason, session_id) VALUES (${handle}, ${postId}, 'subscription', ${session ?? null}::text)`;
+    },
     async bindingEvent(e) {
       await sql`INSERT INTO binding_events (session_id, name, event, at) VALUES (${e.session}, ${e.name}, ${e.event}, ${e.at})`;
     },
@@ -67,6 +70,8 @@ async function openPg(): Promise<{ h: BoardsHarness; sql: PgDatabase["sql"] }> {
       r => ({ mode: r.mode as string, cursor: int8(r.cursor), notified_id: int8(r.notified_id) })))[0],
     outboxRows: () => rows(sql`SELECT handle, post_id, reason, wake, delivered_at IS NOT NULL AS delivered FROM outbox ORDER BY post_id, handle COLLATE "C"`,
       r => ({ handle: r.handle as string, post_id: int8(r.post_id), reason: r.reason as string, wake: r.wake === true, delivered: r.delivered === true })),
+    outboxSessions: () => rows(sql`SELECT handle, post_id, session_id FROM outbox ORDER BY post_id, handle COLLATE "C"`,
+      r => ({ handle: r.handle as string, post_id: int8(r.post_id), session_id: r.session_id as string | null })),
     muteRows: () => rows(sql`SELECT handle, root_id FROM thread_mutes ORDER BY handle COLLATE "C", root_id`,
       r => ({ handle: r.handle as string, root_id: int8(r.root_id) })),
     postRow: async id => (await rows(sql`SELECT parent_id, human FROM posts WHERE id = ${id}`,
@@ -137,7 +142,8 @@ test("the Postgres store's normalizeBoard is core's", () => {
 
 // #807 P3 C10 §1.6 (#1174 audit H1's index, without SQLite's `+e.key` pin): on a seeded, analyzed claim_events, the
 // take subqueries still read idx_claim_events_take (board, handle, at) and, for the session-keyed takes (#1351),
-// idx_claim_events_take_sid (board, session_id, at), not idx_claim_events_key's prefix range.
+// idx_claim_events_take_sid (board, session_id, at), not idx_claim_events_key's prefix range; the session-keyed pushes
+// (#1370) read idx_outbox_session.
 describePg("laneRows' plan (Postgres)", () => {
   test("the take subqueries use idx_claim_events_take and idx_claim_events_take_sid on a seeded table", async () => {
     const db = await pgDatabase({ max: 2 });
@@ -155,6 +161,10 @@ describePg("laneRows' plan (Postgres)", () => {
         SELECT 'queue:q' || (n % 50) || ':' || n, 'h' || (n % 200), CASE WHEN n % 5 = 0 THEN 'release' ELSE 'take' END, 'q' || (n % 50), n,
           CASE WHEN n % 2 = 1 THEN 's' || (n % 200) END
         FROM generate_series(0, 99999) n`;
+      // 50k posts across the boards, each pushed to one handle; two in three carry their receiving session (#1370).
+      await sql`INSERT INTO posts (board, author, body, created_at) SELECT 'q' || (n % 50), 'x', 'x', n FROM generate_series(0, 49999) n`;
+      await sql`INSERT INTO outbox (handle, post_id, reason, session_id)
+        SELECT 'h' || (p.id % 200), p.id, 'subscription', CASE WHEN p.id % 3 <> 1 THEN 's' || (p.id % 200) END FROM posts p`;
       await sql`ANALYZE`;
       const s = makePgTransactions(db.url, { max: 2, applicationName: "gb-test-boards-plan" });
       try {
@@ -163,6 +173,9 @@ describePg("laneRows' plan (Postgres)", () => {
         expect(plan).toMatch(/\bidx_claim_events_take\b(?!_)/);
         expect(plan).toContain("idx_claim_events_take_sid");
         expect(plan).not.toContain("idx_claim_events_key");
+        // The session-keyed pushes (#1370) by idx_outbox_session (session_id, post_id), and no outbox read a scan.
+        expect(plan).toContain("idx_outbox_session");
+        expect(plan).not.toContain("Seq Scan on outbox");
         // And the statement answers on the seeded table: every lane, the poster left out.
         const lanes = await makePgBoards({ clock: () => CLOCK }).laneRows(s.read, "q0", ["h1"]);
         expect(lanes).toHaveLength(19);

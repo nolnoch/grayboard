@@ -37,6 +37,8 @@ export type BoardsHarness = {
   claim(c: { key: string; holder: string; board: string | null; at: number }): Promise<void>;
   // session: claim_events.session_id (#1351), the session that took it; absent, a row from before the column (null).
   claimEvent(e: { key: string; handle: string; event: string; board: string | null; at: number; session?: string }): Promise<void>;
+  // An undelivered waking push of `postId` to `handle`; session: outbox.session_id (#1370), absent a row from before it.
+  push(handle: string, postId: number, session?: string): Promise<void>;
   bindingEvent(e: { session: string; name: string; event: string; at: number }): Promise<void>;
   watch(key: string, handle: string): Promise<void>;
   upload(uploader: string, principal: string | null, size: number): Promise<number>;
@@ -45,6 +47,8 @@ export type BoardsHarness = {
   // binding event in write order; every watch by key then handle; every hold by address; each attachment's post by id.
   subscription(board: string, handle: string): Promise<{ mode: string; cursor: number; notified_id: number } | undefined>;
   outboxRows(): Promise<{ handle: string; post_id: number; reason: string; wake: boolean; delivered: boolean }[]>;
+  // Every outbox row's receiving session (#1370), by post id then handle.
+  outboxSessions(): Promise<{ handle: string; post_id: number; session_id: string | null }[]>;
   muteRows(): Promise<{ handle: string; root_id: number }[]>;
   postRow(id: number): Promise<{ parent_id: number | null; human: boolean | null } | undefined>;
   claimRows(): Promise<{ key: string; holder: string; note: string | null; board: string | null; acquired_at: number; expires_at: number; holder_user: string | null }[]>;
@@ -832,6 +836,49 @@ function queue(it: It): void {
     await h.claimEvent({ key: "queue:jobs:5", handle: FE, event: "take", board: "jobs", at: T0 + 70, session: S1 });
     expect(await h.boards.laneRows(h.read, "jobs", [])).toEqual([FE, BE]);
   });
+  // #1370: the push half follows the receiving session as the take half does (#1351).
+  it("laneRows with session-keyed pushes: a live session's push counts for its lane, an ended one's or an old row's for its handle's holder now", async h => {
+    await board(h, "jobs", { kind: "queue" });
+    const OLD = `${ME}/old`;
+    await h.alias(BE);
+    await h.alias(FE);
+    await h.session(S1, ME);
+    await h.session(S2, ME);
+    await h.session(S3, ME, { endedAt: T0 });
+    await h.hold(BE, S1, T0);
+    await h.hold(FE, S2, T0);
+    await sub(h, S1, "jobs", "push");
+    await sub(h, S2, "jobs", "push");
+    const at = (t: number) => write(h, np("jobs", QA, "job", T0 + t));
+    // S1 was pushed one as OLD, an alias it has since let go: still S1's, so BE's lane, at T0+50.
+    await h.push(OLD, await at(50), S1);
+    // An old row to FE at T0+10, and one S3 (ended) received as FE at T0+20: both FE's now.
+    await h.push(FE, await at(10));
+    await h.push(FE, await at(20), S3);
+    expect(await h.boards.laneRows(h.read, "jobs", [])).toEqual([FE, BE]);
+    // S2's own push as FE, later than BE's: FE goes last.
+    await h.push(FE, await at(60), S2);
+    expect(await h.boards.laneRows(h.read, "jobs", [])).toEqual([BE, FE]);
+    // S1's push as FE, which S2 holds now (a moved alias): S1's turn, so BE's lane, never FE's.
+    await h.push(FE, await at(70), S1);
+    expect(await h.boards.laneRows(h.read, "jobs", [])).toEqual([FE, BE]);
+  });
+
+  it("insertOutbox and claimQueuePost record the receiving session: an alias's holder, a session ID itself, null for an alias no session holds", async h => {
+    await board(h, "jobs", { kind: "queue" });
+    await h.session(S1, ME);
+    await h.session(S2, ME);
+    await h.hold(FE, S1, T0);
+    const [p1, p2] = [await write(h, np("jobs", QA, "one", T0)), await write(h, np("jobs", QA, "two", T0))];
+    await h.write(tx => h.boards.insertOutbox(tx, p1, [[FE, target("mention", true)], [S2, target("subscription", true)], [BE, target("thread", false)]]));
+    expect(await h.write(tx => h.boards.claimQueuePost(tx, "jobs", p2, FE, T0 + 5, { note: "queue post", push: true }))).toBe(true);
+    expect(await h.outboxSessions()).toEqual([
+      ...[{ handle: BE, post_id: p1, session_id: null }, { handle: FE, post_id: p1, session_id: S1 }, { handle: S2, post_id: p1, session_id: S2 }]
+        .sort((x, y) => bytewise(x.handle, y.handle)),
+      { handle: FE, post_id: p2, session_id: S1 },
+    ]);
+  });
+
   it("claimQueuePost on a free key: the claim with its holder's user, a take event and the lane's waking push; push false writes no push", async h => {
     const b = h.boards;
     await board(h, "jobs", { kind: "queue" });

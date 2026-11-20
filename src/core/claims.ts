@@ -1,6 +1,6 @@
 import type { Database } from "bun:sqlite";
 
-import { REDELIVERED_NOTE, canSeeBoard, getBoard, isHuman, normalizeBoard, post, redeliverQueuePost, seenHandles, systemBody, userViewer, type BoardPredicate, type PostOpts, type PostResult, type Viewer } from "./boards.ts";
+import { REDELIVERED_NOTE, canSeeBoard, getBoard, holdingSessionSql, isHuman, normalizeBoard, post, redeliverQueuePost, seenHandles, systemBody, userViewer, type BoardPredicate, type PostOpts, type PostResult, type Viewer } from "./boards.ts";
 import { holderUserRule } from "./claim_holder.ts";
 import { idRow } from "./bindings.ts";
 import { CoreError } from "./errors.ts";
@@ -122,8 +122,7 @@ export type ClaimEventRow = { handle: string; event: ClaimEvent; note: string | 
 export function logEvent(db: Database, event: ClaimEvent, handle: string, c: Partial<Claim> & { key: string }, at: number, heldBy?: string): void {
   db.prepare(
     `INSERT INTO claim_events (key, handle, event, note, board, expires_at, held_by, at, session_id)
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
-       COALESCE((SELECT id FROM alias_holds WHERE address = ?2), (SELECT id FROM ids WHERE id = ?2)))`,
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ${holdingSessionSql("?2")})`,
   ).run(c.key, handle, event, c.note ?? null, c.board ?? null, c.expires_at ?? null, heldBy ?? null, at);
 }
 

@@ -34,6 +34,8 @@ export const sqliteBoardsBackend: BoardsBackend = {
         [c.key, c.holder, c.board, c.at, c.at + 60_000]),
       claimEvent: e => run("INSERT INTO claim_events (key, handle, event, board, at, session_id) VALUES (?, ?, ?, ?, ?, ?)",
         [e.key, e.handle, e.event, e.board, e.at, e.session ?? null]),
+      push: (handle, postId, session) => run("INSERT INTO outbox (handle, post_id, reason, session_id) VALUES (?, ?, 'subscription', ?)",
+        [handle, postId, session ?? null]),
       bindingEvent: e => run("INSERT INTO binding_events (session_id, name, event, at) VALUES (?, ?, ?, ?)", [e.session, e.name, e.event, e.at]),
       watch: (key, handle) => run("INSERT INTO claim_watches (key, handle) VALUES (?, ?)", [key, handle]),
       upload: (uploader, principal, size) => repo.write(async tx => {
@@ -49,6 +51,7 @@ export const sqliteBoardsBackend: BoardsBackend = {
       outboxRows: async () => all<{ handle: string; post_id: number; reason: string; wake: number; delivered: number }>(
         "SELECT handle, post_id, reason, wake, delivered_at IS NOT NULL AS delivered FROM outbox ORDER BY post_id, handle")
         .map(r => ({ ...r, wake: r.wake === 1, delivered: r.delivered === 1 })),
+      outboxSessions: async () => all("SELECT handle, post_id, session_id FROM outbox ORDER BY post_id, handle"),
       muteRows: async () => all("SELECT handle, root_id FROM thread_mutes ORDER BY handle, root_id"),
       postRow: async id => all<{ parent_id: number | null; human: number | null }>("SELECT parent_id, human FROM posts WHERE id = ?", [id])
         .map(r => ({ parent_id: r.parent_id, human: bool(r.human) }))[0],

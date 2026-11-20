@@ -120,8 +120,12 @@ const laneSession = (sql: PgSql, h: PgFragment) => sql.fragment`COALESCE((SELECT
 // core laneAddressesSql: `lane`'s session's ID and every alias it holds, as a one-column subquery.
 const laneAddresses = (sql: PgSql, lane: PgFragment) =>
   sql.fragment`(SELECT ${laneSession(sql, lane)} AS address UNION ALL SELECT la.address FROM alias_holds la WHERE la.id = ${laneSession(sql, lane)})`;
-// core liveSessionSql (#1351): `sid` names a live session, so a claim_events row with it is session-keyed.
+// core liveSessionSql (#1351): `sid` names a live session, so a claim_events or outbox (#1370) row with it is session-keyed.
 const liveSession = (sql: PgSql, sid: PgFragment) => sql.fragment`EXISTS (SELECT 1 FROM ids x WHERE x.id = ${sid} AND x.ended_at IS NULL)`;
+// core holdingSessionSql (#1351, #1370): the session holding `h` as a row is written, the alias's holder, else `h` when
+// it is a session ID, else NULL.
+const holdingSession = (sql: PgSql, h: PgFragment) =>
+  sql.fragment`COALESCE((SELECT hs.id FROM alias_holds hs WHERE hs.address = ${h}), (SELECT hi.id FROM ids hi WHERE hi.id = ${h}))`;
 // core primaryHoldSql: session `id`'s oldest hold (HOLD_ORDER), or NULL.
 const primaryHold = (sql: PgSql, id: PgFragment) =>
   sql.fragment`(SELECT ph.address FROM alias_holds ph WHERE ph.id = ${id} ORDER BY ph.bound_at, ph.address COLLATE "C" LIMIT 1)`;
@@ -133,9 +137,10 @@ const aliasSession = (sql: PgSql) => sql.fragment`COALESCE(
 
 // queueLaneRows' statement ($board, $poster), exported for its plan test (#1174 audit H1: it runs inside every queue
 // post's and requeue's write transaction). A lane's takes are two subqueries, as core's (#1351): `es`, its session's
-// session-keyed takes, and `e`, the address-keyed takes under its addresses now. No planner pins: Postgres picks
-// idx_claim_events_take_sid (board, session_id, at) and idx_claim_events_take (board, handle, at) on its own; the plan
-// test asserts it does.
+// session-keyed takes, and `e`, the address-keyed takes under its addresses now; its pushes the same (#1370): `os`, its
+// session's session-keyed outbox rows, and `o2`, the address-keyed ones. No planner pins: Postgres picks
+// idx_claim_events_take_sid (board, session_id, at), idx_claim_events_take (board, handle, at) and idx_outbox_session
+// (session_id, post_id) on its own; the plan test asserts it does.
 export function laneRowsStatement(sql: PgSql, board: string, poster: string[]): PgFragment {
   const lane = sql.fragment`l.lane`;
   return sql.fragment`WITH lanes AS (
@@ -154,8 +159,12 @@ export function laneRowsStatement(sql: PgSql, board: string, poster: string[]): 
         COALESCE((SELECT MAX(e.at) FROM claim_events e
                   WHERE e.board = ${board} AND e.handle IN ${laneAddresses(sql, lane)} AND e.event = 'take' AND e.key LIKE 'queue:%'
                     AND NOT ${liveSession(sql, sql.fragment`e.session_id`)}), 0),
+        COALESCE((SELECT MAX(ps.created_at) FROM outbox os JOIN posts ps ON ps.id = os.post_id
+                  WHERE os.session_id = ${laneSession(sql, lane)} AND ps.board = ${board}
+                    AND ${liveSession(sql, sql.fragment`os.session_id`)}), 0),
         COALESCE((SELECT MAX(p2.created_at) FROM outbox o2 JOIN posts p2 ON p2.id = o2.post_id
-                  WHERE o2.handle IN ${laneAddresses(sql, lane)} AND p2.board = ${board}), 0)), 0) ASC NULLS FIRST,
+                  WHERE o2.handle IN ${laneAddresses(sql, lane)} AND p2.board = ${board}
+                    AND NOT ${liveSession(sql, sql.fragment`o2.session_id`)}), 0)), 0) ASC NULLS FIRST,
       l.lane COLLATE "C" ASC`;
 }
 
@@ -501,9 +510,11 @@ export function makePgBoards({ clock }: { clock: () => number }): BoardsStore {
           (SELECT i.principal FROM alias_holds h JOIN ids i ON i.id = h.id WHERE h.address = ${lane})))
         ON CONFLICT (key) DO NOTHING RETURNING key`;
       if (push) {
-        await sql`INSERT INTO outbox (handle, post_id, reason, wake)
-          SELECT ${lane}::text, ${postId}::int8, 'subscription', true WHERE EXISTS (SELECT 1 FROM claims WHERE key = ${key} AND holder = ${lane})
-          ON CONFLICT (handle, post_id) DO UPDATE SET delivered_at = NULL, wake = true`;
+        // core's reset re-records the receiving session (#1370).
+        await sql`INSERT INTO outbox (handle, post_id, reason, wake, session_id)
+          SELECT ${lane}::text, ${postId}::int8, 'subscription', true, ${holdingSession(sql, sql.fragment`${lane}::text`)}
+          WHERE EXISTS (SELECT 1 FROM claims WHERE key = ${key} AND holder = ${lane})
+          ON CONFLICT (handle, post_id) DO UPDATE SET delivered_at = NULL, wake = true, session_id = excluded.session_id`;
       }
       if (took.length === 0) return false;
       await insertClaimEvent(sql, "take", lane, { key, note, board, expires_at: expires }, now);
@@ -515,8 +526,8 @@ export function makePgBoards({ clock }: { clock: () => number }): BoardsStore {
       const seen = new Set<string>();
       const first = targets.filter(([h]) => !seen.has(h) && (seen.add(h), true));
       if (first.length === 0) return;
-      await sql`INSERT INTO outbox (handle, post_id, reason, wake)
-        SELECT t.handle, ${postId}::int8, t.reason, t.wake
+      await sql`INSERT INTO outbox (handle, post_id, reason, wake, session_id)
+        SELECT t.handle, ${postId}::int8, t.reason, t.wake, ${holdingSession(sql, sql.fragment`t.handle`)}
           FROM unnest(${first.map(([h]) => h)}::text[], ${first.map(([, t]) => t.reason)}::text[], ${first.map(([, t]) => t.wake)}::boolean[]) AS t(handle, reason, wake)
         ON CONFLICT DO NOTHING`;
     },
