@@ -457,16 +457,24 @@ async function teamCreate(req: Request, authed: AuthedUser, repo: Repo): Promise
     const taken = conflict(`the name "${name}" belongs to another user, team or service`);
     if (await repo.teams.findByName(tx, name)) return taken;
     // The team's board shares its name, so the name must be free as a board too.
-    if (await repo.boards.get(tx, name)) return conflict(`a board named "#${name}" already exists`);
+    const boardTaken = conflict(`a board named "#${name}" already exists`);
+    if (await repo.boards.get(tx, name)) return boardTaken;
     let team: Team;
     try {
-      team = await repo.teams.create(tx, name, authed.user_id);
+      // The check above reads before the insert, and on Postgres a board_create of the name can commit between them
+      // (#1069): ensure's ON CONFLICT DO NOTHING would then hand the team a board it doesn't scope (public, or another
+      // team's). ensure's false means that board_create won: refuse as the check would, and roll the team back.
+      team = await tx.savepoint(async sp => {
+        const t = await repo.teams.create(sp, name, authed.user_id);
+        if (!(await ensureTeamBoard(repo, sp, t, authed.user_email))) throw new Refused(boardTaken);
+        return t;
+      });
     } catch (e) {
       if (e instanceof PrincipalTaken) return taken;
+      if (e instanceof Refused) return e.response;
       throw e;
     }
     await repo.teams.addMember(tx, team.id, authed.user_id);
-    await ensureTeamBoard(repo, tx, team, authed.user_email);
     await onTeamJoined(repo, tx, team, authed.user_email);
     writeAudit(repo, tx, "team.created", authed.user_email, name);
     writeAudit(repo, tx, "team.member_added", authed.user_email, name, { member: authed.user_email });

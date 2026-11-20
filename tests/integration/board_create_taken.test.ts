@@ -1,9 +1,10 @@
 // #1257 (A): board names are one global key, so board_create with a hidden board's name must refuse. The refusal is
 // the one a visible open board's name gets: it says the name is taken and nothing else (not its scope, kind or
 // whether it's archived). Accepted in docs/server-access.md.
+import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { HostedSession, HostedToolError } from "../support/hosted_session.ts";
-import { TestServer } from "../support/server.ts";
+import { TestServer, testSqlite } from "../support/server.ts";
 
 let srv: TestServer;
 let sessions: HostedSession[] = [];
@@ -82,4 +83,25 @@ test("team create on a taken name says only that it's taken, a private team's in
   expect((await srv.api(alice, "GET", "/api/teams/qa/members")).status).toBe(404);
   expect(await srv.api(alice, "POST", "/api/teams", { name: "qa" })).toEqual(taken("qa"));
   expect(await srv.api(bob, "POST", "/api/teams", { name: "qa" })).toEqual(taken("qa"));
+});
+
+// #1069: a board of the name created between team create's board check and its insert (on Postgres, a board_create
+// committing there; tests/integration/pg_team_board_race.pg.test.ts races it). SQLite serializes the two, so a trigger
+// on the team's insert lands the board in that gap. The team is refused as the check refuses it, and rolls back whole:
+// the name is free again once the board is gone.
+testSqlite("team create whose board name is taken after its check refuses and leaves no team behind", async () => {
+  const bob = await srv.login("bob@example.com");
+  const db = new Database(srv.dbPath);
+  try {
+    db.run(`CREATE TRIGGER board_first AFTER INSERT ON teams WHEN NEW.name = 'qa'
+      BEGIN INSERT INTO boards (name, purpose, scope, created_by, created_at) VALUES ('qa', 'lobby', NULL, 'alice@example.com/fe', 0); END`);
+    expect(await srv.api(bob, "POST", "/api/teams", { name: "qa" })).toEqual({ status: 409, body: { code: "conflict", message: 'a board named "#qa" already exists' } });
+    expect((await srv.api(bob, "GET", "/api/teams")).body).toEqual([]);
+    expect(db.query(`SELECT action FROM access_log WHERE target = 'qa'`).all()).toEqual([]);
+    db.run("DROP TRIGGER board_first");
+    expect((await srv.api(bob, "POST", "/api/teams", { name: "qa" })).status).toBe(201);
+    expect(db.query(`SELECT scope FROM boards WHERE name = 'qa'`).get()).toEqual({ scope: "team:qa" });
+  } finally {
+    db.close();
+  }
 });
