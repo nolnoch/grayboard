@@ -84,7 +84,7 @@ export const INSTRUCTIONS_WAIT_MS = 2_000;
 export const INSTRUCTIONS_BACKOFF_MS = 30_000;
 // How long a shutdown waits for a non-root session's running calls before its
 // end (#1160): under omp's 2 s cap on shutdown handlers, so the end still goes.
-export const SHUTDOWN_CALLS_WAIT_MS = 1_000;
+const SHUTDOWN_CALLS_WAIT_MS = 1_000;
 const LATE = Symbol("late");
 
 // A tool's arguments and MCP result as both entries' tools take and return
@@ -192,7 +192,7 @@ export function createGrayboard(h: Harness): Grayboard {
   let registered = false;             // that register succeeded
   let attempted = false;              // a register went out (a timed-out one may have committed)
   let used = false;                   // a call went out under this (non-root) session's id
-  const inflight = new Set<Promise<CallToolResult>>(); // calls running now, which an idle end lands after
+  const inflight = new Set<Promise<unknown>>(); // calls and instructions fetches running now, which an end lands after
   // An explicit BUS_IDENTITY: each new root binds it at its first start (#443),
   // which also says one the naming rule refuses (the host has no UI at load).
   const configured = configuredIdentity(process.env, process.cwd());
@@ -327,7 +327,7 @@ export function createGrayboard(h: Harness): Grayboard {
   // error wrapper sits outside it: a converted failure never probes.
   const attributed = async (p: ToolProxy, tool: string, args: Record<string, unknown>, id: string, signal?: AbortSignal): Promise<CallToolResult> => {
     let result = await p.call(tool, args, id, signal);
-    if (role.kind === "child" && registered && result.isError && await unattributed(p, id, signal)) {
+    if (role.kind === "child" && registered && !closed && result.isError && await unattributed(p, id, signal)) {
       registered = false; registration = undefined;
       result = await p.call(tool, args, id, signal);
     }
@@ -516,9 +516,15 @@ export function createGrayboard(h: Harness): Grayboard {
       if (root) return await root.instructions();
       if (!proxy) return undefined;
       if (role.kind === "child") await enlist(role, s.id);
+      // Not after a shutdown began: its end and this fetch's connect would race (#1160).
+      if (closed) return undefined;
       return await proxy.instructions(s.id);
     })();
     fetching.catch(() => {}); // a fetch that outlives the deadline settles unobserved
+    // A fetch is a request under this session's id too: shutdown lets it land before the end (#1160).
+    inflight.add(fetching);
+    const landed = () => { inflight.delete(fetching); };
+    fetching.then(landed, landed);
     let timer: ReturnType<typeof setTimeout> | undefined;
     const late = new Promise<typeof LATE>(resolve => { timer = setTimeout(() => resolve(LATE), INSTRUCTIONS_WAIT_MS); });
     let why: string;
