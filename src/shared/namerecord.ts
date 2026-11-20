@@ -40,9 +40,11 @@ export function recordPath(dir: string, harnessPid: number): string {
  * Record this session's name for its harness. Written to a temp file and
  * renamed, so a reader never sees half a record. Null if the harness's start
  * time can't be read (the record could never be checked, so none is written).
+ * `harnessStart`: that start time, read by a caller that writes under a lock
+ * and reads the process table before taking it.
  */
-export function writeRecord(dir: string, r: Omit<NameRecord, "harness_start" | "at">, now = Date.now()): NameRecord | null {
-  const harness_start = procStart(r.harness_pid);
+export function writeRecord(dir: string, r: Omit<NameRecord, "harness_start" | "at">, harnessStart: string | null | undefined = procStart(r.harness_pid), now = Date.now()): NameRecord | null {
+  const harness_start = harnessStart;
   if (!harness_start) {
     console.error(`[grayboard] can't read harness pid ${r.harness_pid}'s start time; no name record written, so a restart comes back unbound`);
     return null;

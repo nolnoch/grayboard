@@ -407,12 +407,19 @@ const RECORDS = PUSH && !HUMAN && !KEYED && PARENT_SESSION === undefined;
 // A sibling an adapter's child shares the harness pid with leaves the record
 // to that child while it lives (#1404, recordYields): a displaced sibling's
 // stale start-time write or later bind would otherwise overwrite the child's.
+// A session with a harness session never yields, so it takes no lock; the
+// harness's start time is read before the lock either way.
 const writeNames = () => {
   if (!RECORDS) return;
   try {
+    const rec = { names: held, session_id: SESSION_ID, harness_pid: process.ppid, bus: localDbPath() };
+    const start = procStart(process.ppid) ?? null;
+    if (HARNESS_SESSION !== undefined) {
+      writeRecord(RECORD_DIR, rec, start);
+      return;
+    }
     db.transaction(() => {
-      if (recordYields(db, SESSION_ID, process.ppid)) return;
-      writeRecord(RECORD_DIR, { names: held, session_id: SESSION_ID, harness_pid: process.ppid, bus: localDbPath() });
+      if (!recordYields(db, SESSION_ID, process.ppid)) writeRecord(RECORD_DIR, rec, start);
     }).immediate();
   } catch (e) {
     console.error(`[grayboard] name record for harness pid ${process.ppid} not written:`, e);
