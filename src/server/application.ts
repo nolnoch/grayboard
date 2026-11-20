@@ -13,7 +13,7 @@ import { ALIAS_SCOPE_CAP, aliasCapRefusal } from "./alias_cap.ts";
 import { lockedUserOf } from "./alias_use.ts";
 import { DELEGATE_LIMIT, DELEGATE_OPEN_CAP, crossUserRefusal, delegateOkFields, delegateThrottled, neverConnected, resolveDelegationWith, type DelegateReach } from "../core/delegation.ts";
 import {
-  MAX_CANDIDATES, MAX_HOLDS, actingAs, aliasHeldText, childStateRefusal, closestNames,
+  MAX_CANDIDATES, MAX_HOLDS, TOUCH_EVERY_MS, actingAs, aliasHeldText, childStateRefusal, closestNames,
   orderCandidates, primaryOf, replyPeer, replyPeerError, replySender, replySenderError, tooManyHolds, unboundPeer, unknownNameError,
   type AliasUse, type Candidate,
 } from "../core/bindings.ts";
@@ -704,6 +704,17 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
   // back with it, as they did written inline); else each is its own queued write. Close stays synchronous, and its
   // callers include the write queue's holder (a reconcile apply, a commit callback), where an async post throws, so
   // the outside-a-body write is a `repo.write` not awaited, its failure logged (#807 P3 B1c).
+  // The close's last-seen touch, at most one per writer ID per TOUCH_EVERY_MS, as local mode's (#894): every hosted
+  // request closes a session, and on Postgres an unthrottled touch was ~13% of the write queue at 300 sessions (#807).
+  // ids.last_seen is shown, never judged, on a server; a touch rolled back with its body leaves it up to a window behind.
+  const touchedIds = new Map<string, number>();
+  function touchDue(id: string): boolean {
+    const t = now(), at = touchedIds.get(id);
+    if (at !== undefined && t - at < TOUCH_EVERY_MS) return false;
+    if (touchedIds.size >= 4096) for (const [k, v] of touchedIds) if (t - v >= TOUCH_EVERY_MS) touchedIds.delete(k);
+    touchedIds.set(id, t);
+    return true;
+  }
   function close(session: ApplicationSession, h: Read = repo.read) {
     const write = (row: (tx: Tx) => Promise<void>, what: string) => {
       if (isTx(h)) h.beforeCommit({}, row);
@@ -728,7 +739,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     // Close runs from sync finally blocks and commit callbacks: the touch is written at `h`'s commit or queued, not
     // awaited (#807 P1b-4b, P3 B1c).
     const writer = session.writerId;
-    if (writer) write(tx => repo.bindings.touchId(tx, writer), "last-seen touch");
+    if (writer && touchDue(writer)) write(tx => repo.bindings.touchId(tx, writer), "last-seen touch");
   }
   // The server closes the session: it leaves the hub, and its transport is
   // told why and closes. `h`: the body it runs in, whose `Tx` takes close's rows (#807 P3 A3).
