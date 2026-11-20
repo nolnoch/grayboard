@@ -6,7 +6,7 @@
 // whoami.
 import { Database } from "bun:sqlite";
 import { afterEach, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, realpathSync, utimesSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { installClaudeHooks, sessionStartOutput } from "../../src/cli/claude_hooks.ts";
@@ -15,6 +15,7 @@ import { syncIdentity } from "../../src/shared/claude_identity.ts";
 import { localEnv } from "../support/env.ts";
 import { closeSessions, localSession, mcpSession, stopSession, type Session } from "../support/mcp.ts";
 import { CLI } from "../support/paths.ts";
+import { processDescendants } from "../support/procs.ts";
 import { until } from "../support/until.ts";
 import { z } from "zod";
 import { ErrorCode, McpError, PingRequestSchema } from "@modelcontextprotocol/sdk/types.js";
@@ -22,25 +23,37 @@ import type { ClientShape } from "../support/mcp.ts";
 
 afterEach(closeSessions);
 
-type Bus = { dir: string; cfg: string; s: Session; db: Database };
+// `pid`: the Claude Code stand-in's, which its hook records are kept under.
+type Bus = { dir: string; cfg: string; s: Session; db: Database; pid: number };
 
 // A Claude Code session's grayboard on a fresh bus: `hooks` installs the record
 // hooks in its user settings (else settings without them), and a peer to DM.
-async function claudeBus(hooks: boolean, client?: ClientShape): Promise<Bus> {
+// Its parent is a stand-in for Claude Code, as local.test.ts's: bun under the
+// name `claude`, started with channels, running grayboard mcp as its child on
+// inherited stdio (CLAUDECODE alone isn't Claude Code: #1412). `harness`, in
+// its place, runs grayboard under bun under that name instead (omp).
+async function claudeBus(hooks: boolean, client?: ClientShape, harness?: string): Promise<Bus> {
   const dir = realpathSync(mkdtempSync(join(tmpdir(), "gb-cc-rec-")));
-  const cfg = join(dir, "claude");
+  const cfg = join(dir, "claude-config");
   mkdirSync(cfg);
   if (hooks) expect(installClaudeHooks([process.execPath, CLI], join(cfg, "settings.json"))).toBe(true);
   else writeFileSync(join(cfg, "settings.json"), "{}");
   await localSession(dir, "peer");
-  const s = await mcpSession({ env: localEnv(dir, "cc", { CLAUDECODE: "1", CLAUDE_CONFIG_DIR: cfg }), cwd: dir, args: ["mcp", "--mode", "local"], client });
+  const fake = join(dir, harness ?? "claude");
+  symlinkSync(process.execPath, fake);
+  const host = join(dir, "host.ts");
+  writeFileSync(host, `const cmd = process.argv.slice(process.argv.indexOf("::") + 1);
+Bun.spawn([process.execPath, ...cmd], { stdio: ["inherit", "inherit", "inherit"] }).exited.then((c) => process.exit(c ?? 0));`);
+  const env = localEnv(dir, "cc", { CLAUDECODE: "1", CLAUDE_CODE_ENTRYPOINT: "cli", CLAUDE_CONFIG_DIR: cfg });
+  const s = await mcpSession({ env, cwd: dir, args: ["mcp", "--mode", "local"], client, via: [fake, host, "--dangerously-load-development-channels", "server:grayboard", "::"] });
   await s.c.listTools();
-  return { dir, cfg, s, db: new Database(join(dir, "bus.db"), { readonly: true }) };
+  const pid = processDescendants(s.harnessPid).find((p) => p.command.includes(host))!.pid;
+  return { dir, cfg, s, db: new Database(join(dir, "bus.db"), { readonly: true }), pid };
 }
 
 // The hook events Claude Code would run for this session's harness.
 const hook = (b: Bus, event: "session-start" | "pre-tool-use", input: Record<string, unknown>) =>
-  runHook(event, JSON.stringify(input), { base: b.dir, env: { CLAUDE_PID: String(b.s.harnessPid) }, hosted: false });
+  runHook(event, JSON.stringify(input), { base: b.dir, env: { CLAUDE_PID: String(b.pid) }, hosted: false });
 
 let seq = 0;
 const toolUse = () => `toolu_rec${++seq}`;
@@ -87,7 +100,7 @@ test("a call with no usable record is refused and audited, never run as the root
   const old = toolUse();
   hook(b, "pre-tool-use", { tool_use_id: old, agent_id: "agent-a1" });
   const then = new Date(Date.now() - 60 * 60_000);
-  utimesSync(join(sessionDir(b.dir, b.s.harnessPid), old), then, then);
+  utimesSync(join(sessionDir(b.dir, b.pid), old), then, then);
   r = await dm(b, "approved-late", old);
   expect(r.isError).toBeFalsy();
   expect(sent(b, "approved-late")!.via).toBeString();
@@ -95,7 +108,7 @@ test("a call with no usable record is refused and audited, never run as the root
   // The dir's start time is another process's: a recycled pid.
   const recycled = toolUse();
   hook(b, "pre-tool-use", { tool_use_id: recycled, agent_id: "agent-a1" });
-  writeFileSync(join(sessionDir(b.dir, b.s.harnessPid), "start"), "Thu Jan  1 00:00:00 1970");
+  writeFileSync(join(sessionDir(b.dir, b.pid), "start"), "Thu Jan  1 00:00:00 1970");
   r = await dm(b, "recycled", recycled);
   expect(r.isError).toBe(true);
   expect(textOf(r)).toContain("earlier process with the same pid");
@@ -127,12 +140,36 @@ test("settings without the hooks run every call as the root, audited once and sa
   expect(b.s.c.getInstructions()).toContain("subagent attribution is off");
 });
 
+// #1412: a harness launched from a Claude Code shell (omp here) passes
+// CLAUDECODE on to its grayboard. That grayboard isn't Claude Code's: it
+// neither warns that attribution is off nor reads hook records, even one
+// written under its harness's pid. Under the claude stand-in, both hold.
+for (const harness of ["omp", "claude"]) test(`under ${harness} with CLAUDECODE=1, Claude hook records and the attribution-off note ${harness === "claude" ? "apply" : "don't apply"}`, async () => {
+  const claude = harness === "claude";
+  const off = await claudeBus(false, undefined, harness);
+  expect((await dm(off, "no-hooks", toolUse())).isError).toBeFalsy();
+  expect(off.s.c.getInstructions()!.includes("subagent attribution is off")).toBe(claude);
+  expect(((await off.s.call("whoami")).note ?? "").includes("subagent attribution is off")).toBe(claude);
+  expect(audits(off, "claude.attribution_off")).toEqual(claude ? [{ tool: "dm_send" }] : []);
+
+  const on = await claudeBus(true, undefined, harness);
+  hook(on, "session-start", {});
+  const sub = toolUse();
+  hook(on, "pre-tool-use", { tool_use_id: sub, agent_id: "agent-a1" });
+  expect((await dm(on, "recorded", sub)).isError).toBeFalsy();
+  // Claude's: the subagent's child session sent it. Not Claude's: the root did.
+  expect(sent(on, "recorded")!.via === null).toBe(!claude);
+  // No record for this call: refused under Claude, the root's call elsewhere.
+  expect(!!(await dm(on, "unrecorded", toolUse())).isError).toBe(claude);
+  expect(audits(on, "claude.agent_record_missing").length).toBe(claude ? 1 : 0);
+});
+
 test("Claude's acknowledged clear barrier selects remembered B before calls/pushes and rejects an A call", async () => {
   const b = await claudeBus(true);
   const remembered = await localSession(b.dir, undefined, { extra: { BUS_HARNESS_SESSION: "B" } });
   await remembered.call("bind", { name: "selected", create: true });
   await stopSession(remembered.c);
-  const env = { CLAUDE_PID: String(b.s.harnessPid) };
+  const env = { CLAUDE_PID: String(b.pid) };
   hook(b, "session-start", { session_id: "A" });
   await syncIdentity("session-start", JSON.stringify({ session_id: "A" }), b.dir, env);
   const a = await b.s.call("whoami");
@@ -160,14 +197,14 @@ test("Claude's acknowledged clear barrier selects remembered B before calls/push
 
 test("failed authoritative B publication does not reactivate A or deliver its queued mail", async () => {
   const b = await claudeBus(true);
-  const env = { CLAUDE_PID: String(b.s.harnessPid) };
+  const env = { CLAUDE_PID: String(b.pid) };
   hook(b, "session-start", { session_id: "A" });
   await syncIdentity("session-start", JSON.stringify({ session_id: "A" }), b.dir, env);
   const a = await b.s.call("whoami");
   await syncIdentity("session-end", JSON.stringify({ reason: "clear" }), b.dir, env);
   const peer = await localSession(b.dir, "sender");
   const mail = await peer.call("dm_send", { to: "cc", body: "must-stay-paused-A" });
-  mkdirSync(join(sessionDir(b.dir, b.s.harnessPid), `current.tmp.${process.pid}`));
+  mkdirSync(join(sessionDir(b.dir, b.pid), `current.tmp.${process.pid}`));
   let publicationError: unknown, barrierError: unknown;
   try { hook(b, "session-start", { session_id: "B", source: "clear" }); } catch (error) { publicationError = error; }
   try { await syncIdentity("session-start", JSON.stringify({ session_id: "B" }), b.dir, env); } catch (error) { barrierError = error; }
@@ -188,7 +225,7 @@ for (const empty of [false, true]) test(`a ${empty ? "remembered empty" : "remem
     await remembered.call("unbind", { name: "renamed" });
   }
   await stopSession(remembered.c);
-  const env = { CLAUDE_PID: String(b.s.harnessPid), BUS_SOCK_DIR: b.dir, BUS_DB_PATH: join(b.dir, "bus.db"), BUS_IDENTITY: "configured-fallback" };
+  const env = { CLAUDE_PID: String(b.pid), BUS_SOCK_DIR: b.dir, BUS_DB_PATH: join(b.dir, "bus.db"), BUS_IDENTITY: "configured-fallback" };
   for (const source of ["startup", "resume", "fork"]) {
     const input = JSON.stringify({ cwd: b.dir, source, session_id: "remembered-title" });
     expect(sessionStartOutput(input, env)).toBeNull();
@@ -203,7 +240,7 @@ test("an absent selected snapshot still puts outgoing PID carry ahead of configu
   const b = await claudeBus(true);
   await b.s.call("bind", { name: "aux", create: true });
   await b.s.call("unbind", { name: "cc" });
-  const env = { CLAUDE_PID: String(b.s.harnessPid), BUS_SOCK_DIR: b.dir, BUS_DB_PATH: join(b.dir, "bus.db"), BUS_IDENTITY: "configured-fallback" };
+  const env = { CLAUDE_PID: String(b.pid), BUS_SOCK_DIR: b.dir, BUS_DB_PATH: join(b.dir, "bus.db"), BUS_IDENTITY: "configured-fallback" };
   const input = JSON.stringify({ cwd: b.dir, source: "fork", session_id: "new-carried" });
   expect(sessionStartOutput(input, env)).toBeNull();
   hook(b, "session-start", { source: "fork", session_id: "new-carried" });
@@ -214,7 +251,7 @@ test("an absent selected snapshot still puts outgoing PID carry ahead of configu
 
 test("a genuinely new configured root has the same correct title before and after authoritative selection", async () => {
   const b = await claudeBus(true);
-  const env = { CLAUDE_PID: String(b.s.harnessPid), BUS_SOCK_DIR: b.dir, BUS_DB_PATH: join(b.dir, "bus.db"), BUS_IDENTITY: "cc" };
+  const env = { CLAUDE_PID: String(b.pid), BUS_SOCK_DIR: b.dir, BUS_DB_PATH: join(b.dir, "bus.db"), BUS_IDENTITY: "cc" };
   const input = JSON.stringify({ cwd: b.dir, source: "startup", session_id: "genuinely-new-title" });
   expect(sessionStartOutput(input, env)!.hookSpecificOutput.sessionTitle).toBe("cc");
   hook(b, "session-start", { source: "startup", session_id: "genuinely-new-title" });
@@ -260,7 +297,7 @@ for (const fail of [false, true]) test(`native post-list activation ${fail ? "re
   }) });
   await entered.promise;
   hook(b, "session-start", { session_id: "activation" });
-  await syncIdentity("session-start", JSON.stringify({ session_id: "activation" }), b.dir, { CLAUDE_PID: String(b.s.harnessPid) });
+  await syncIdentity("session-start", JSON.stringify({ session_id: "activation" }), b.dir, { CLAUDE_PID: String(b.pid) });
   const peer = await localSession(b.dir, "sender");
   const mail = await peer.call("dm_send", { to: "cc", body: "queued-until-native-activation" });
   const delivery = () => b.db.query<{ delivered_at: number | null }, [number]>("SELECT delivered_at FROM messages WHERE id=?").get(mail.message_id)?.delivered_at;

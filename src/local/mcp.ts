@@ -172,12 +172,15 @@ const harnessId = (key: string): string | undefined => {
   }
   return v;
 };
-// Claude Code's own, CLAUDE_CODE_SESSION_ID, only when Claude Code is this
-// process's harness: a harness launched from a Claude Code shell (omp, pi)
-// inherits it with CLAUDECODE, and a sibling recorded under it would never be
-// displaced (#1403). An unreadable harness keeps the env's word.
+// Whether Claude Code is this process's harness, decided once at start. A
+// harness launched from a Claude Code shell (omp, pi, opencode) inherits
+// CLAUDECODE and CLAUDE_CODE_SESSION_ID, so the env alone can't say; the
+// process table can (#1403, #1412). An unreadable one keeps the env's word.
+const UNDER_CLAUDE = process.env.CLAUDECODE === "1" && claudeIsHarness() !== false;
+// Claude Code's own, CLAUDE_CODE_SESSION_ID, only under Claude Code: a sibling
+// recorded under an inherited one would never be displaced (#1403).
 let HARNESS_SESSION = harnessId("BUS_HARNESS_SESSION") ??
-  (process.env.CLAUDECODE === "1" && process.env.CLAUDE_CODE_SESSION_ID && claudeIsHarness() !== false ? harnessId("CLAUDE_CODE_SESSION_ID") : undefined);
+  (UNDER_CLAUDE && process.env.CLAUDE_CODE_SESSION_ID ? harnessId("CLAUDE_CODE_SESSION_ID") : undefined);
 const PARENT_SESSION = harnessId("BUS_PARENT_SESSION");
 // A runner child stands in for a session that would own its delivery, so
 // it falls back to (or is promoted to) one.
@@ -285,8 +288,8 @@ if (PARENT_SESSION !== undefined) {
 // Read once at start: whether that hook is in user settings, and the harness
 // the records are kept under (the pid bindings hold; its start time catches a
 // recycled pid). Without the hook (settings from before it), calls act as the
-// root, audited once and said in the instructions and whoami.
-const UNDER_CLAUDE = process.env.CLAUDECODE === "1";
+// root, audited once and said in the instructions and whoami. Only under
+// Claude Code (UNDER_CLAUDE): another harness has no such hooks to miss.
 const CLAUDE_HARNESS = UNDER_CLAUDE && recordHookInstalled()
   ? { pid: HARNESS?.pid ?? process.ppid, start: HARNESS ? HARNESS.proc_start : procStart(process.ppid) ?? null }
   : null;
