@@ -36,6 +36,8 @@ import { authCacheContract } from "./store/auth_cache.contract.ts";
 import { bindingsContract } from "./store/bindings.contract.ts";
 import { sqliteBindingsBackend } from "./store/bindings.contract.sqlite.ts";
 import { sqliteAuthCacheBackend } from "./store/auth_cache.contract.sqlite.ts";
+import { attachmentsContract } from "./store/attachments.contract.ts";
+import { sqliteAttachmentsBackend } from "./store/attachments.contract.sqlite.ts";
 import { sessionEndContract } from "./store/session_end.contract.ts";
 import { delegationContract } from "./store/delegation.contract.ts";
 import { sqliteIdsBackend } from "./store/session_end.contract.sqlite.ts";
@@ -257,6 +259,7 @@ describe("slack contract (SQLite)", () => slackContract(sqliteSlackBackend));
 // The hosted sessions group's rows, shared with the Postgres store (#807 P3 C8a); its settled-Tx refusals moved there.
 describe("hosted contract (SQLite)", () => hostedContract(sqliteHostedBackend));
 describe("auth cache contract (SQLite)", () => authCacheContract(sqliteAuthCacheBackend));
+describe("attachments contract (SQLite)", () => attachmentsContract(sqliteAttachmentsBackend));
 describe("session end contract (SQLite)", () => sessionEndContract(sqliteIdsBackend));
 describe("delegation contract (SQLite)", () => delegationContract(sqliteIdsBackend));
 describe("claims contract (SQLite)", () => claimsContract(sqliteClaimsBackend));
