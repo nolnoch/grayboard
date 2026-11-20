@@ -196,6 +196,8 @@ export async function transactionRace(f: TransactionRace) {
         const principal: OAuthPrincipal = { authed: { user_id: user, user_email: "you@example.com", kind: "user", session_id: 0 }, grantId: g1, clientId: OPENCODE_CLIENT, sourceKey: OPENCODE_SESSION_META, scopes: ["tools", "delivery"], accessHash: "", accessExpiry: 0 };
         const releaseFile = join(f.pauses, "revoke-release");
         const revoker = transactionProcess("tests/support/hosted-operation.ts", [f.dbPath, f.blobDir, JSON.stringify({ principal, operation: "revoke", refreshHash: refresh, now: Date.now() })], f.boundary === "before" ? "" : "hosted:revoke:in-txn", releaseFile, "REVOKER");
+        // The "after" branch's mark of the plugin's calls before its bind, so the outcome can count every bind it sent.
+        let mark = 0;
         try {
           await bounded(revoker.wait("READY"), 20_000, "Revoker ready");
           let binding: Promise<void>;
@@ -216,7 +218,8 @@ export async function transactionRace(f: TransactionRace) {
             // Armed before the revoke takes the lock (#1288): once it holds it, every hosted timer tick's sweep and
             // heartbeat write stalls the server's one thread in that busy handler, so a stdin command sent then could
             // go unread past its deadline, and the hit's deadline covers several such stalls before the bind's turn.
-            const mark = f.calls.length, marked = f.methods.length, waiting = await server.trace("hosted:gate:checked");
+            mark = f.calls.length;
+            const marked = f.methods.length, waiting = await server.trace("hosted:gate:checked");
             revoker.proc.stdin.end();
             await bounded(revoker.wait("test pause hit: hosted:revoke:in-txn"), 10_000, "Revoke held in its transaction");
             binding = f.invoke(root, "bind", { name: "final", create: true });
@@ -243,8 +246,14 @@ export async function transactionRace(f: TransactionRace) {
         } else {
           assert.deepEqual(attached, [], "Released first: nothing attaches");
           assert.deepEqual(revoked, [{ session_id: before.session_id, name: RACE, reason: "revoked" }], "One released(revoked) per held name");
-          await until(() => { const r = row(root); return !!r && r.ownership_id !== before.ownership_id && r.held.includes("final"); }, 30_000, "The plugin's bind lands under a new ownership");
+          await until(() => { const r = row(root); return !!r && r.ownership_id !== before.ownership_id && r.held.includes("final"); }, 30_000, "The plugin's bind lands under a new ownership (a bind held past the 5 s busy_timeout fails SQLITE_BUSY and is not retried)");
           assert.notEqual(row(root)!.grant_id, g1, "The new ownership is G2's");
+          // The traced bind was still waiting when the revoke released (#1181): its BEGIN IMMEDIATE waits out the lock in
+          // SQLite's busy handler for 5 s, and a release later than that fails it with SQLITE_BUSY, which nothing on the
+          // server retries. So the bind that landed is that one only if the plugin sent no other: a retry after the
+          // commit (by the plugin or its transport, both under the fetch shim that records calls) would land the same.
+          // No other bind is legitimate here: the root is paused after G2's sign-in, so the subscriber's bindAll can't run.
+          assert.deepEqual(f.calls.slice(mark).filter(c => c.name === "bind").map(c => c.session), [root], "The bind that landed is the one traced at the gate: the plugin sent no other");
         }
         console.log("REAL_TXN_ATTACH_REVOKE_OK", JSON.stringify({ boundary: f.boundary, attached: attached.length, revoked: revoked.length }));
         break;
