@@ -284,7 +284,8 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     return true;
   }
   // `admit: false` skips hosted admission, for a re-selection the prompting request already paid for (#431).
-  async function select(request: Request, admit = true): Promise<Context> {
+  // `instruct: false` skips the bound text's facts, for a selection no makeServer is built for (#1196).
+  async function select(request: Request, admit = true, instruct = true): Promise<Context> {
     const role = hostedRole(request);
     const principal = await oauth.authenticate(request, roleScopes(role));
     if (principal instanceof Response) {
@@ -349,7 +350,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
       if (closed || request.signal.aborted) throw new Error("MCP request is closed");
       // The bound text's facts, for a context makeServer would give it (boundInstruction): read here, since the
       // server's instructions are built synchronously. The selection read the root moments ago (#907).
-      if (role !== "subscriber" && !context.session.via && !context.session.readOnly && "id" in routing) {
+      if (instruct && role !== "subscriber" && !context.session.via && !context.session.readOnly && "id" in routing) {
         const row = context.verdict ? undefined : await hosted.readRow(routing.id);
         const root = context.verdict?.root ?? (row && await hosted.readRoot(row));
         context.instruction = { launcher: await application.hostedLauncher(routing.id), leased: root?.lease_deadline != null };
@@ -421,11 +422,13 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     if (moved(live.rows, checked.seq)) return recheck(live);
     live.bound = { row: checked.row, root: checked.root };
   }
+  // A re-read a notice raced in turn queues another and is judged on the bound as notices left it, a real pair since
+  // the live's creation (#1196). Tests hold a re-read before its read at `mcp:live:recheck`.
   function recheck(live: Live) {
     const context = live.context;
     if (live.rechecking === context) return;
     live.rechecking = context;
-    track(rowCheck(context).then(checked => {
+    track(testPauseAsync("mcp:live:recheck").then(() => rowCheck(context)).then(checked => {
       if (live.rechecking === context) live.rechecking = undefined;
       if (live.stopped || live.context !== context) return;
       adopt(live, checked);
@@ -493,13 +496,16 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
   }
   // One authorize for the live's every uri: watchable and describe reuse its row (#853). The uris are read after
   // the awaits, as they stand then (#807 P3 A7d).
+  // The rows are adopted only while the live keeps the context they were read for: an attach meanwhile replaced it
+  // and adopted its own selection's (#1196).
   async function valid(live: Live): Promise<Checked> {
-    const checked = validChecked(live, await authorizeFor(live.context, () => live.uris.keys()));
-    adopt(live, checked);
+    const context = live.context;
+    const checked = validChecked(live, await authorizeFor(context, () => live.uris.keys()), context);
+    if (live.context === context) adopt(live, checked);
     return checked;
   }
-  function validChecked(live: Live, checked: Checked): Checked {
-    for (const [uri, cap] of live.uris) if (watchable(live.context, uri, checked) !== cap) throw new ApplicationError("not_found", "resource not found");
+  function validChecked(live: Live, checked: Checked, context = live.context): Checked {
+    for (const [uri, cap] of live.uris) if (watchable(context, uri, checked) !== cap) throw new ApplicationError("not_found", "resource not found");
     return checked;
   }
   // valid for a live whose stamp is fresh (#899), from the auth cache (phase A): every check but the binding's row,
@@ -533,7 +539,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     const request = new Request(via.url, { method: "GET", headers: via.headers, signal: live.context.request.signal });
     const exchange: Exchange = { ...exchanges.getStore()!, request, refusal: undefined, context: undefined, failure: undefined, logged: false };
     let next: Context;
-    try { next = await exchanges.run(exchange, () => select(request, false)); }
+    try { next = await exchanges.run(exchange, () => select(request, false, false)); }
     catch (error) {
       if (error instanceof ApplicationError) throw error;
       if (exchange.refusal || closed || request.signal.aborted) throw new ApplicationError("unauthenticated", "unauthenticated");
@@ -544,14 +550,17 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     unindexRows(live);
     live.context = next; live.rows = bindingRows(next, next.verdict?.row);
     indexRows(live);
-    // The selection's rows, read after `start`.
-    adopt(live, { row: next.verdict?.row, root: next.verdict?.root, seq: start });
+    // The selection's rows, read after `start`, replace the previous context's pair at once, as a new live's do (#1196).
+    live.bound = { row: next.verdict?.row, root: next.verdict?.root };
+    adopt(live, { ...live.bound, seq: start });
     if (live.stream) streamContexts.set(live.stream, next);
     previous.finish();
   }
   // `checked`: the authorize its caller judged the uris with.
   function makeLive(context: Context, checked: Checked, uris: Map<string, string | null>, handler?: McpHttpHandler, legacy?: Legacy): Live {
-    const live: Live = { context, rows: bindingRows(context, checked.row), bound: { row: undefined }, uris, watches: [], handler, legacy, stopped: false,
+    // `bound` starts from the creator's read, never a placeholder: a moved one is re-read (`adopt`), and a notice
+    // meanwhile notes into a real pair, half of which may be older than the read (#1196).
+    const live: Live = { context, rows: bindingRows(context, checked.row), bound: { row: checked.row, root: checked.root }, uris, watches: [], handler, legacy, stopped: false,
       // A hint arrives from a commit's afterCommit, inside the queue's holder: nothing waits for its check, and a
       // live stopped, or a uri dropped, while the check awaited gets no notification (#807 P3 A7d).
       hint(uri) {
@@ -843,7 +852,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
   // `context`: the live's as the tick queued it; an attach that re-selected it since leaves the answer unused.
   async function checkLive(live: Live, context: Context, t: number) {
     try {
-      const { gen, start, checked } = await fullCheck(context, checked => validChecked(live, checked), () => live.uris.keys());
+      const { gen, start, checked } = await fullCheck(context, checked => validChecked(live, checked, context), () => live.uris.keys());
       // Stopped, or re-selected by an attach, while the check awaited: its answer is about a context the live no
       // longer has.
       if (closed || live.stopped || live.context !== context) return;
@@ -1078,7 +1087,8 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
               if (sid && !legacy) { releasePost(); return new Response("unknown MCP session", { status: 404 }); }
               // A GET or DELETE replays the creating POST's `_meta` for routing; its model and effort are stale by then (#364).
               if (req.method !== "POST" && legacy) exchange.meta = withoutFacts(legacy.meta);
-              const context = exchange.context = await select(req);
+              // Only a session's creating POST builds a server (makeServer): the rest skip the bound text's facts.
+              const context = exchange.context = await select(req, true, !legacy);
               // The timer may have dropped this sid while identity selection awaited.
               if (legacy?.stopped) { context.finish(); releasePost(); return new Response("unknown MCP session", { status: 404 }); }
               if (legacy?.dormant) {
