@@ -11,6 +11,7 @@ import { createDelivery } from "./delivery.ts";
 import { createHostedSessions, sessionContext } from "./hosted.ts";
 import { OPENCODE_CLIENT, OPENCODE_SESSION_META } from "./oauth-config.ts";
 import type { OAuthPrincipal } from "./oauth.ts";
+import { sessionEndPort } from "./session_end.ts";
 import { hostedPause } from "../../tests/support/hosted-pause.ts";
 import { hostedRowCount } from "../../tests/support/hosted_rows.ts";
 import { transactionProcess } from "../../tests/support/transaction-process.ts";
@@ -24,7 +25,7 @@ let delivery: ReturnType<typeof createDelivery>;
 const resource = "https://grayboard.example/mcp";
 const context = (p: OAuthPrincipal, raw = "root") => sessionContext(p, { [OPENCODE_SESSION_META]: raw });
 async function open() {
-  database = openDatabase(join(dir, "bus.db"), { blobDir: join(dir, "blobs") });
+  database = openDatabase(join(dir, "bus.db"), { blobDir: join(dir, "blobs") , sessionEnd: sessionEndPort("team") });
   application = createApplication(database.repo);
   const isAuthorized = (p: OAuthPrincipal, r: Read = database.repo.read) => database.repo.oauth.isGrantActive(r, p.grantId, now);
   hosted = createHostedSessions(application, { now: () => now, isAuthorized }); await hosted.ready;

@@ -64,6 +64,7 @@ export function claimsContract(backend: ClaimsBackend): void {
   takeAndRelease(it);
   readsAndWatches(it);
   ack(it);
+  heldBy(it);
 }
 
 type It = (name: string, fn: (h: ClaimsHarness) => Promise<void>) => void;
@@ -286,5 +287,22 @@ function ack(it: It): void {
       { key: "queue:jobs:1", handle: FE, event: "release", note: "ack", board: "jobs", expires_at: T0 + 1, held_by: null, at: T0, session_id: null },
       { key: "queue:jobs:3", handle: FE, event: "release", note: "ack (late)", board: "jobs", expires_at: T0, held_by: null, at: T0, session_id: null },
     ]);
+  });
+}
+
+function heldBy(it: It): void {
+  // K-H1 (#807 P3 C10d2-a): a session end's claims. Its order is the store's; the end releases each, so compare sets.
+  it("heldBy is the holder's claims live at now: not a lapsed one, not another holder's", async h => {
+    for (const r of [row("b", FE, T0 + 10), row("a", FE, T0 + 10), row("lapsed", FE, T0), row("theirs", BE, T0 + 10)]) await h.claim(r);
+    const held = async (holder: string, now: number) => (await h.claims.heldBy(h.read, holder, now)).sort(bytewise);
+    expect(await held(FE, T0)).toEqual(["a", "b"]);
+    expect(await held(FE, T0 - 1)).toEqual(["a", "b", "lapsed"]);
+    expect(await held(BE, T0)).toEqual(["theirs"]);
+    expect(await held(`${ME}/qa`, T0)).toEqual([]);
+    // On a body's Tx it sees the body's own take.
+    expect(await h.write(async tx => {
+      await h.claims.take(tx, take({ key: "c", as: FE, now: T0, expires: T0 + 10 }));
+      return (await h.claims.heldBy(tx, FE, T0)).sort(bytewise);
+    })).toEqual(["a", "b", "c"]);
   });
 }

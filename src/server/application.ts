@@ -24,7 +24,8 @@ import { MissingParent } from "./store/errors.ts";
 import { HUMAN_NAME, HUMAN_RESERVED, formatTeamAddress } from "../shared/addressing.ts";
 import { describeLocation } from "../shared/identity.ts";
 import { authorize, recordDecision, type Actor, type AuthzRequest, type Decision, type HumanReach, type WakePost } from "./policy.ts";
-import { serverAuditSink, writeAudit } from "./audit.ts";
+import { writeAudit } from "./audit.ts";
+import { endSessionServer } from "./session_end.ts";
 import { principalOfAuthed, type AuthedUser } from "./auth.ts";
 import {
   age, checkBody, parseAliasMeta, pendingKey, refOf,
@@ -801,7 +802,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
         // The end's bounces are read in its savepoint, so they're pushed at the commit (#807 P3 A7i), before any
         // newer message to their senders can commit; a failed read rolls back this end alone.
         ended = await tx.savepoint(async sp => {
-          const end = await repo.sessionEnd.end(sp, id, { why, now: at, audit: serverAuditSink(repo, sp) });
+          const end = await endSessionServer(repo, hub.access, sp, id, { why, now: at, audit: async (action, actor, target, detail) => writeAudit(repo, sp, action, actor, target, detail) });
           return { ...end, bounces: end.ended ? await repo.messages.bouncesFrom(sp, id, at) : [] };
         });
       } catch (e) {

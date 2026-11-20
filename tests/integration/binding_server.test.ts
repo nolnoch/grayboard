@@ -16,6 +16,7 @@ import { board, direct } from "../support/events.ts";
 import { TestServer } from "../support/server.ts";
 import { until } from "../support/until.ts";
 import { seed } from "../support/seed.ts";
+import { endId } from "../support/end_id.ts";
 
 let srv: TestServer;
 let alice: string;
@@ -61,7 +62,7 @@ const connect = (identity: string | null, { token, ...opts }: AppSessionOptions 
 // (#282: no grace, no clean-exit frame), so tests that need an ended session end it.
 async function endIt(s: AppSession): Promise<void> {
   s.close();
-  await seed(srv.app.repo, tx => srv.app.repo.sessionEnd.end(tx, s.id, { why: "exit", now: Date.now() }));
+  await seed(srv.app.repo, tx => endId(srv.app.repo, tx, s.id, "exit"));
 }
 // The server restarts on the same database, a new in-process TestServer.
 async function restarted(): Promise<void> {

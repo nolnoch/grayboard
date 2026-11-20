@@ -1,9 +1,11 @@
 // The SQLite store as a hosted-contract backend (hosted.contract.ts), registered by db.test.ts: the Repo's hosted group,
-// with the harness's fixture writes and raw reads on its connection. A child's ID end is core endSession here.
+// with the harness's fixture writes and raw reads on its connection. A child's ID end is the server's
+// (server/session_end.ts), through the port the server passes.
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDatabase } from "../db.ts";
+import { sessionEndPort } from "../session_end.ts";
 import { scratchDbPath } from "../../../tests/support/scratch_db.ts";
 import type { HostedBackend, HostedHarness } from "./hosted.contract.ts";
 import { sqliteOf } from "./tx.ts";
@@ -13,7 +15,7 @@ type Arg = string | number | null;
 export const sqliteHostedBackend: HostedBackend = {
   kind: "sqlite",
   async open(): Promise<HostedHarness> {
-    const { repo } = openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
+    const { repo } = openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")), sessionEnd: sessionEndPort("team") });
     const run = (sql: string, args: Arg[]) => repo.write(async tx => sqliteOf(tx).run(sql, args));
     const all = <T>(sql: string, args: Arg[] = []) => sqliteOf(repo.read).query<T, Arg[]>(sql).all(...args);
     return {

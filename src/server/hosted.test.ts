@@ -24,6 +24,7 @@ import { createDelivery } from "./delivery.ts";
 import { claim, listClaims } from "../core/claims.ts";
 import { scratchDbPath } from "../../tests/support/scratch_db.ts";
 import { queueFor } from "./store/queue.ts";
+import { sessionEndPort } from "./session_end.ts";
 import { seed } from "../../tests/support/seed.ts";
 import { liveGrants } from "../../tests/support/grants.ts";
 
@@ -38,7 +39,7 @@ let blobDir: string;
 const context = (raw: string) => sessionContext(principal, { [OPENCODE_SESSION_META]: raw });
 beforeEach(async () => {
   blobDir = mkdtempSync(join(tmpdir(), "gb-hosted-"));
-  database = openDatabase(scratchDbPath(), { blobDir });
+  database = openDatabase(scratchDbPath(), { blobDir , sessionEnd: sessionEndPort("team") });
   application = createApplication(database.repo);
   const user = await seed(database.repo, tx => database.repo.users.upsertByEmail(tx, "you@example.com", null));
   principal = { authed: { user_id: user.id, user_email: user.email, kind: "user", session_id: 0 }, clientId: OPENCODE_CLIENT, sourceKey: OPENCODE_SESSION_META, grantId: "G1", accessHash: "test", accessExpiry: Number.MAX_SAFE_INTEGER, scopes: ["tools", "delivery"] };
@@ -156,8 +157,8 @@ test("#998 audit: delivery's access check inside the renew, receipt and release 
 
 // #807 P1c-13: the alias reads and writes a hosted body makes (bind's lazy create and cap, alias_held's holder,
 // a tools-only root's writes_as, a send's peer, a create:false bind's unknown name, a bare name outside the sender's
-// scope, unbind's candidates) run on that body's Tx. access.ts's mention resolver reads aliases through
-// repo.policyNow (#807 P3 A7e1), not these store reads; the attachment guard moved to its body's handle in #1053.
+// scope, unbind's candidates) run on that body's Tx. access.ts's mention resolver reads aliases on its caller's
+// handle (#807 P3 C10d2-a deleted repo.policyNow); the attachment guard moved to its body's handle in #1053.
 test("#807 P1c-13: alias reads inside hosted bodies run on that body's Tx", async () => {
   const checks: { op: string; inTxn: boolean; handle: "pool" | "tx"; site: string }[] = [];
   const spies = (["find", "countForScope", "listForScope", "findAllByName", "create", "remove"] as const).map(name => {

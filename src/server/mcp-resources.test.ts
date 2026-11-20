@@ -14,6 +14,7 @@ import { issueOAuth, type IssuedOAuth } from "../../tests/helpers/oauth.ts";
 import { sessionContext } from "./hosted.ts";
 import { OPENCODE_CLIENT } from "./oauth-config.ts";
 import { OAUTH_TTL } from "./oauth-types.ts";
+import { sessionEndPort } from "./session_end.ts";
 import { createBoard, post, subscribe } from "../core/boards.ts";
 import { stubAuthRead } from "../../tests/support/auth_stub.ts";
 import { scratchDbPath } from "../../tests/support/scratch_db.ts";
@@ -27,7 +28,7 @@ let dir: string, grant: IssuedOAuth;
 const clients: Client[] = [];
 beforeEach(async () => {
   dir = mkdtempSync(join(tmpdir(), "gb-mcp-resource-unit-"));
-  store = openDatabase(scratchDbPath(), { blobDir: dir });
+  store = openDatabase(scratchDbPath(), { blobDir: dir , sessionEnd: sessionEndPort("team") });
   application = createApplication(store.repo);
   oauth = createOAuthServer(store.repo, { dbPath: scratchDbPath(), blobDir: dir, httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl: "https://grayboard.example.com:443", messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES });
   hosted = createHostedMcp(application, oauth, { trustedOrigin: oauth.issuer });

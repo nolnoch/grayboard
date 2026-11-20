@@ -22,13 +22,14 @@
 //
 // Runtime imports stay off bun:sqlite and db.ts (pg/isolation.test.ts).
 import { SQL } from "bun";
-import type { AuditSink } from "../../../core/audit.ts";
 import { errorDiagnostic } from "../../diagnostics.ts";
 import { requestOrigin } from "../../request_context.ts";
 import { AUDIT_WRITE_ON_READ, type AccessLogRow, type AuditStore } from "../audit.ts";
+import type { EndAuditSink } from "../session_end.ts";
+import { insertAudit } from "./audit_row.ts";
 import { isTx, type Tx } from "../tx_base.ts";
 import { jsonSafe, textSafeOrNull } from "../json_safe.ts";
-import { int8 } from "./sql.ts";
+import { int8, type AuditDetail } from "./sql.ts";
 import { pgOf } from "./tx.ts";
 
 // pg_advisory_xact_lock(class, key) for a dedup read and the write it decides, per (action, target): the two-int4 form
@@ -74,9 +75,9 @@ export function makePgAudit(): AuditStore {
   };
 }
 
-// Core's audit rows on Postgres (an AuditSink: core endSession's id.ended), at `now` on tx through write, as db.ts
-// coreAudit writes them to SQLite's access_log: what the hosted store hands its session-end port (pg/hosted.ts).
-export function pgCoreAuditSink(tx: Tx, now: number): AuditSink {
-  const audit = makePgAudit();
-  return (action, actor, target, detail) => audit.write(tx, { at: now, actor, action, target, detail: detail ? JSON.stringify(detail) : null });
+// A session end's id.ended row on Postgres (an EndAuditSink, #807 P3 C10 Q3): awaited, at `now` on tx, as db.ts
+// hostedEnds writes it to SQLite's access_log; what the hosted store hands its session-end port (pg/hosted.ts). A
+// missing detail binds SQL NULL, as SQLite stores it.
+export function pgCoreAuditSink(tx: Tx, now: number): EndAuditSink {
+  return (action, actor, target, detail) => insertAudit(pgOf(tx), now, actor, action, target, (detail ?? null) as AuditDetail);
 }

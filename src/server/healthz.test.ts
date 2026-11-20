@@ -21,38 +21,38 @@ afterEach(() => {
 
 // #275: an unauthenticated flood costs one database probe per HEALTH_TTL_MS.
 test("healthz probes the database at most once per window and reports the version", async () => {
-  const probe = spyOn(store.repo.policyNow, "userByEmail");
+  const probe = spyOn(store.repo.users, "findByEmail");
   for (let i = 0; i < 100; i++) {
-    const r = healthz(store.repo, 5_000 + i);
+    const r = await healthz(store.repo, 5_000 + i);
     expect(r.status).toBe(200);
   }
   expect(probe).toHaveBeenCalledTimes(1);
-  expect(await healthz(store.repo, 5_000 + HEALTH_TTL_MS - 1).json()).toMatchObject({ ok: true, version: expect.any(String) });
+  expect(await (await healthz(store.repo, 5_000 + HEALTH_TTL_MS - 1)).json()).toMatchObject({ ok: true, version: expect.any(String) });
   expect(probe).toHaveBeenCalledTimes(1);
-  healthz(store.repo, 5_000 + HEALTH_TTL_MS);
+  await healthz(store.repo, 5_000 + HEALTH_TTL_MS);
   expect(probe).toHaveBeenCalledTimes(2);
 });
 
-test("a failed probe is cached too: one 503 and one log line per window, then recovery is seen", () => {
-  const probe = spyOn(store.repo.policyNow, "userByEmail").mockImplementation(() => { throw new Error("disk I/O error"); });
+test("a failed probe is cached too: one 503 and one log line per window, then recovery is seen", async () => {
+  const probe = spyOn(store.repo.users, "findByEmail").mockImplementation(() => { throw new Error("disk I/O error"); });
   const log = spyOn(console, "error").mockImplementation(() => {});
   try {
-    for (let i = 0; i < 50; i++) expect(healthz(store.repo, 9_000 + i).status).toBe(503);
+    for (let i = 0; i < 50; i++) expect((await healthz(store.repo, 9_000 + i)).status).toBe(503);
     expect(probe).toHaveBeenCalledTimes(1);
     expect(log).toHaveBeenCalledTimes(1);
     probe.mockRestore();
-    expect(healthz(store.repo, 9_000 + HEALTH_TTL_MS).status).toBe(200);
+    expect((await healthz(store.repo, 9_000 + HEALTH_TTL_MS)).status).toBe(200);
   } finally { log.mockRestore(); probe.mockRestore(); }
 });
 
-test("each repo has its own cache", () => {
+test("each repo has its own cache", async () => {
   const other = openDatabase(scratchDbPath(), { blobDir: dir });
   try {
-    const failing = spyOn(other.repo.policyNow, "userByEmail").mockImplementation(() => { throw new Error("gone"); });
+    const failing = spyOn(other.repo.users, "findByEmail").mockImplementation(() => { throw new Error("gone"); });
     const log = spyOn(console, "error").mockImplementation(() => {});
     try {
-      expect(healthz(store.repo, 1_000).status).toBe(200);
-      expect(healthz(other.repo, 1_000).status).toBe(503);
+      expect((await healthz(store.repo, 1_000)).status).toBe(200);
+      expect((await healthz(other.repo, 1_000)).status).toBe(503);
     } finally { failing.mockRestore(); log.mockRestore(); }
   } finally { other.db.close(); }
 });
@@ -64,25 +64,25 @@ test("healthz fails only on sustained event-loop lag, keeps the version, and rec
   const errors = spyOn(console, "error").mockImplementation(() => {});
   try {
     // Fewer finished windows than the gate needs, as after a restart: ok, whatever they hold.
-    expect(healthz(store.repo, 20_000, gate, []).status).toBe(200);
-    expect(healthz(store.repo, 20_000, gate, [slow, slow]).status).toBe(200);
+    expect((await healthz(store.repo, 20_000, gate, [])).status).toBe(200);
+    expect((await healthz(store.repo, 20_000, gate, [slow, slow])).status).toBe(200);
     // One fast window among the last three: ok.
-    expect(healthz(store.repo, 20_000, gate, [slow, fast, slow, slow]).status).toBe(200);
-    const failing = healthz(store.repo, 20_000, gate, [fast, slow, slow, slow]);
+    expect((await healthz(store.repo, 20_000, gate, [slow, fast, slow, slow])).status).toBe(200);
+    const failing = await healthz(store.repo, 20_000, gate, [fast, slow, slow, slow]);
     expect(failing.status).toBe(503);
     const body = await failing.json() as Record<string, unknown>;
     expect(body).toMatchObject({ ok: false, code: "lagging", version: expect.any(String) });
     // The public body carries no telemetry: the p99s go to the journal.
     expect(Object.keys(body).sort()).toEqual(["code", "message", "ok", "version"]);
     expect(errors.mock.calls.some(c => String(c[0]).includes("p99 1.50/1.50/1.50 s"))).toBe(true);
-    expect(healthz(store.repo, 20_000, gate, [slow, slow, slow, fast]).status).toBe(200);
+    expect((await healthz(store.repo, 20_000, gate, [slow, slow, slow, fast])).status).toBe(200);
     // One journal line per change of state, not per request.
     expect(errors.mock.calls.filter(c => String(c[0]).includes("healthz:"))).toHaveLength(2);
     // Still lagging across many probe windows: still only the one line when it starts.
-    for (let i = 1; i <= 5; i++) expect(healthz(store.repo, 20_000 + i * HEALTH_TTL_MS, gate, [slow, slow, slow]).status).toBe(503);
+    for (let i = 1; i <= 5; i++) expect((await healthz(store.repo, 20_000 + i * HEALTH_TTL_MS, gate, [slow, slow, slow])).status).toBe(503);
     expect(errors.mock.calls.filter(c => String(c[0]).includes("healthz:"))).toHaveLength(3);
     // p99Ms 0 is off.
-    expect(healthz(store.repo, 20_000, { p99Ms: 0, windows: 3 }, [slow, slow, slow]).status).toBe(200);
+    expect((await healthz(store.repo, 20_000, { p99Ms: 0, windows: 3 }, [slow, slow, slow])).status).toBe(200);
   } finally { errors.mockRestore(); }
 });
 
@@ -94,29 +94,29 @@ test("a sampler that has finished no window for the gate's span fails healthz, w
   const errors = spyOn(console, "error").mockImplementation(() => {});
   try {
     // Just under three windows' time plus the jitter allowance: ok, even with no finished window yet.
-    expect(healthz(store.repo, 50_000, gate, [], { ageMs: 30_999, windowMs: 10_000 }).status).toBe(200);
+    expect((await healthz(store.repo, 50_000, gate, [], { ageMs: 30_999, windowMs: 10_000 })).status).toBe(200);
     // Past them with none finished: lagging, though the last windows were fast and too few.
-    const stalled = healthz(store.repo, 50_000, gate, [fast], { ageMs: 41_500, windowMs: 10_000 });
+    const stalled = await healthz(store.repo, 50_000, gate, [fast], { ageMs: 41_500, windowMs: 10_000 });
     expect(stalled.status).toBe(503);
     expect(await stalled.json()).toMatchObject({ ok: false, code: "lagging" });
     expect(errors.mock.calls.some(c => String(c[0]).includes("no lag window finished for 41.5 s"))).toBe(true);
     // A window finished: the age resets and the gate recovers, with one line for each change.
-    expect(healthz(store.repo, 50_000, gate, [fast, fast], { ageMs: 5, windowMs: 10_000 }).status).toBe(200);
+    expect((await healthz(store.repo, 50_000, gate, [fast, fast], { ageMs: 5, windowMs: 10_000 })).status).toBe(200);
     expect(errors.mock.calls.filter(c => String(c[0]).includes("healthz:"))).toHaveLength(2);
     expect(String(errors.mock.calls.at(-1)?.[0])).toContain("recovered");
     // p99Ms 0 turns this rule off too.
-    expect(healthz(store.repo, 50_000, { p99Ms: 0, windows: 3 }, [], { ageMs: 120_000, windowMs: 10_000 }).status).toBe(200);
+    expect((await healthz(store.repo, 50_000, { p99Ms: 0, windows: 3 }, [], { ageMs: 120_000, windowMs: 10_000 })).status).toBe(200);
   } finally { errors.mockRestore(); }
 });
 
 // The wiring, end to end: a loop that never yields to its timers fails healthz through the real sampler's age.
-test("a loop blocked past the gate's span fails healthz from the real sampler before any window lands", () => {
+test("a loop blocked past the gate's span fails healthz from the real sampler before any window lands", async () => {
   const errors = spyOn(console, "error").mockImplementation(() => {});
   const stop = startLagSampler(20);
   try {
     const end = performance.now() + 120;
     while (performance.now() < end) { /* block the loop: no timer runs */ }
-    expect(healthz(store.repo, 60_000, { p99Ms: 5, windows: 3 }).status).toBe(503);
+    expect((await healthz(store.repo, 60_000, { p99Ms: 5, windows: 3 })).status).toBe(503);
   } finally { stop(); errors.mockRestore(); }
 });
 
@@ -127,14 +127,14 @@ test("a really blocked loop fails healthz through the sampler's windows; the rin
   try {
     const gate = { p99Ms: 5, windows: 3 };
     // Block in 30 ms slices, yielding between them, until three windows in a row saw the delay.
-    await until(() => {
+    await until(async () => {
       const end = performance.now() + 30;
       while (performance.now() < end) { /* block the loop */ }
       // No sampler (null): the windows alone carry this verdict, not the age rule (#941).
-      return healthz(store.repo, 30_000, gate, lagWindows(), null).status === 503;
+      return (await healthz(store.repo, 30_000, gate, lagWindows(), null)).status === 503;
     }, 5_000, "three blocked windows never failed healthz");
     // The same history with the gate off passes.
-    expect(healthz(store.repo, 30_000, { p99Ms: 0, windows: 3 }).status).toBe(200);
+    expect((await healthz(store.repo, 30_000, { p99Ms: 0, windows: 3 })).status).toBe(200);
     await until(() => lagWindows().length === LAG_HISTORY, 5_000, `the ring never reached ${LAG_HISTORY} windows`);
     const before = lagWindows()[0];
     await until(() => lagWindows()[0] !== before, 2_000, "the full ring never dropped its oldest window");
@@ -144,11 +144,11 @@ test("a really blocked loop fails healthz through the sampler's windows; the rin
 });
 
 test("a down database wins over a lagging loop", async () => {
-  const probe = spyOn(store.repo.policyNow, "userByEmail").mockImplementation(() => { throw new Error("gone"); });
+  const probe = spyOn(store.repo.users, "findByEmail").mockImplementation(() => { throw new Error("gone"); });
   const errors = spyOn(console, "error").mockImplementation(() => {});
   try {
     const slow = { p50: 1, p99: 2, max: 3 };
-    const r = healthz(store.repo, 40_000, { p99Ms: 1000, windows: 3 }, [slow, slow, slow]);
+    const r = await healthz(store.repo, 40_000, { p99Ms: 1000, windows: 3 }, [slow, slow, slow]);
     expect(r.status).toBe(503);
     expect(await r.json()).toMatchObject({ code: "internal" });
   } finally { probe.mockRestore(); errors.mockRestore(); }

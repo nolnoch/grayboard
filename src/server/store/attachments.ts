@@ -23,6 +23,8 @@ export interface AttachmentsStore {
   // row (core insertUpload). On Postgres the quota check holds the principal's lock (D3), taken first.
   insertUpload(tx: Tx, upload: NewUpload): Promise<{ row: AttachmentRow; pruned: boolean }>;
   remove(tx: Tx, id: number): Promise<void>;
+  // Deletes every unbound upload `uploader` made (a session end's, #807 P3 C10d2-a); the bytes are the sweep's.
+  dropUnboundOf(tx: Tx, uploader: string): Promise<void>;
   // The catalog's blobs no attachment names; whether one is named; its entry dropped while unnamed (0 or 1). A drop
   // that meets an upload naming the blob, committed or committing, answers 0 and leaves the entry, never failing the
   // caller's transaction; on Postgres an upload locks an existing entry first (insertUpload), so a drop between the

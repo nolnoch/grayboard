@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Glob } from "bun";
-import { ACCESS_LOG_LAST_SQL, INVOKE_BINDING_SQL, mailPort, openDatabase, QUEUED_TO_SQL, RETRACTABLE_SQL, SENT_PENDING_SQL, UNDELIVERED_FROM_SQL, type Repo } from "./db.ts";
+import { ACCESS_LOG_LAST_SQL, INVOKE_BINDING_SQL, openDatabase, QUEUED_TO_SQL, RETRACTABLE_SQL, SENT_PENDING_SQL, UNDELIVERED_FROM_SQL, type Repo } from "./db.ts";
 import type { Tx } from "./store/tx.ts";
 import { scratchDbPath } from "../../tests/support/scratch_db.ts";
 import { createBoard, post, registerId, subscribe } from "../core/boards.ts";
@@ -215,7 +215,7 @@ describe("Repo", () => {
     repo = r;
   });
 
-  // #284 S5: the MailPort core endSession runs on the server (repo.sessionEnd.end's, #807 P3 B4a).
+  // #284 S5: the mail steps of the server's session end (server/session_end.ts; #807 P3 C10d2-a: the store's methods).
   test("mail: unread is the ID's unread direct mail from others; bounce and dropReader", async () => {
     const [id, peer] = ["id:s1", "b@example.com/be"];
     const { read, unread } = await seed(repo, async tx => {
@@ -227,9 +227,9 @@ describe("Repo", () => {
       await repo.cursors.advance(tx, id, "direct", id, read.id);
       return { read, unread };
     });
-    expect(await seed(repo, tx => mailPort(repo.coreOn(tx)).unread(id))).toEqual([{ id: unread.id, sender: peer }]);
+    expect(await seed(repo, tx => repo.messages.unreadFor(tx, id))).toEqual([{ id: unread.id, sender: peer }]);
 
-    await seed(repo, tx => mailPort(repo.coreOn(tx)).bounce(id, peer, unread.id, "returned", 1234));
+    await seed(repo, tx => repo.messages.bounce(tx, id, peer, unread.id, "returned", 1234));
     const [bounce] = (await repo.messages.history(repo.read, [peer])).filter((m) => m.kind === "bounce");
     expect(bounce).toMatchObject({ sender: id, recipient_type: "user", recipient: peer, body: "returned", parent_id: unread.id, created_at: 1234, pending: 0, kind: "bounce" });
     expect((await repo.messages.getById(repo.read, unread.id))?.kind).toBeNull();
@@ -237,7 +237,7 @@ describe("Repo", () => {
     await seed(repo, async tx => {
       await repo.messages.ack(tx, id, unread.id);
       await repo.messages.ack(tx, peer, bounce!.id);
-      mailPort(repo.coreOn(tx)).dropReader(id);
+      await repo.messages.dropReader(tx, id);
     });
     expect(await repo.cursors.directFor(repo.read, id)).toBe(0);
     expect((await repo.messages.receivedUnacked(repo.read, [id], 0)).map((m) => m.id)).toEqual([read.id, unread.id]);
@@ -797,8 +797,8 @@ test("#807 P1c-14b: the messages reads and aliases.seen run on the handle they'r
 
 // #807 P3 B1a, B1c: the bindings group is a contract (store/bindings.contract.ts), registered above.
 
-// #807 P3 B4a: repo.sessionEnd runs on the handle it's given: a kept Tx and a non-store handle are refused, and an end
-// rolls back with its body (its bounce, cursor drop and ended_at with it).
+// #807 P3 B4a: repo.sessionEnd runs on the handle it's given: a kept Tx and a non-store handle are refused, and its row
+// step rolls back with its body (C10d2-a: the bounces and the rest are server/session_end.ts's, tested there).
 test("#807 P3 B4a: sessionEnd runs on the Tx it's given and rolls back with its body", async () => {
   const { repo } = openDatabase(scratchDbPath(), { blobDir: mkdtempSync(join(tmpdir(), "gb-blobs-")) });
   const [id, peer] = ["id:0000000000001", "b@example.com/be"];
@@ -811,22 +811,22 @@ test("#807 P3 B4a: sessionEnd runs on the Tx it's given and rolls back with its 
   });
   const settled = /used after its transaction settled/;
   const e = repo.sessionEnd;
-  await expect(e.end(kept, id, { why: "t", now: 1 })).rejects.toThrow(settled);
+  await expect(e.end(kept, id, 1)).rejects.toThrow(settled);
   await expect(e.refusal(kept, id)).rejects.toThrow(settled);
   await expect(e.pruneEnded(kept, 1, 1)).rejects.toThrow(settled);
   await expect(e.refusal({} as Tx, id)).rejects.toThrow("not a SQLite store handle");
   await expect(seed(repo, async tx => {
-    expect((await e.end(tx, id, { why: "t", now: 5 })).ended).toBe(true);
+    expect(await e.end(tx, id, 5)).toEqual({ principal: "a@example.com", held: [], children: [] });
     expect((await e.refusal(tx, id))?.code).toBe("id_ended");
     throw new Error("rolled back");
   })).rejects.toThrow("rolled back");
   expect(await seed(repo, tx => e.refusal(tx, id))).toBeNull();
-  expect((await repo.messages.history(repo.read, [peer])).filter(m => m.kind === "bounce")).toEqual([]);
-  expect(await repo.cursors.directFor(repo.read, id)).toBeGreaterThan(0);
-  // Committed, the end bounces the unread message and the ID refuses delivery.
-  expect((await seed(repo, tx => e.end(tx, id, { why: "t", now: 5 }))).ended).toBe(true);
-  expect((await repo.messages.history(repo.read, [peer])).filter(m => m.kind === "bounce").map(m => m.parent_id)).toEqual([unread.id]);
+  // Committed, the ID refuses delivery and a second end finds it ended; the row step bounces nothing.
+  expect(await seed(repo, tx => e.end(tx, id, 5))).toEqual({ principal: "a@example.com", held: [], children: [] });
+  expect(await seed(repo, tx => e.end(tx, id, 6))).toBeNull();
   expect((await seed(repo, tx => e.refusal(tx, id)))?.code).toBe("id_ended");
+  expect((await repo.messages.history(repo.read, [peer])).filter(m => m.kind === "bounce")).toEqual([]);
+  expect(await seed(repo, tx => repo.messages.unreadFor(tx, id))).toEqual([{ id: unread.id, sender: peer }]);
 });
 
 // #807 P3 B5a1..B5b2b's rows for the groups the board tools call besides boards (whose rows moved to

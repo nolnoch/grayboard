@@ -12,7 +12,9 @@ import { logEvent, sweepChanges } from "../core/claims.ts";
 import { CoreError } from "../core/errors.ts";
 import { callBoardTool as coreCallBoardTool, type ToolContext } from "../core/tools.ts";
 import { boardAccess } from "./access.ts";
+import { writeAudit } from "./audit.ts";
 import { callClaimTool, sweepClaims } from "./claims.ts";
+import { endSessionServer } from "./session_end.ts";
 import type { Repo } from "./db.ts";
 import type { Tx } from "./store/tx.ts";
 import { B, BOB_ID, CHILD_ID, D, DAN_WRITER, diverging, E, ENDED_ID, ENG_ID, EVE_ID, inBody as inBodyOn, ONLINE, openPostParity, outcome, outcomeAsync, TAIL_ID, team, W, WADE_ID } from "../../tests/support/board_parity.ts";
@@ -347,7 +349,7 @@ test("a session end's requeue of a confined holder's queue post replies as the p
     const { id, ...rest } = p;
     return { ...rest, told: r.rows.outbox.filter(o => o.post_id === id).map(o => o.handle) };
   };
-  const ended = await inBody(tx => repo.sessionEnd.end(tx, ENG_ID, { why: "test", now: Date.now() })) as R;
+  const ended = await inBody(tx => endSessionServer(repo, access, tx, ENG_ID, { why: "test", now: Date.now(), audit: async (a, actor, target, detail) => writeAudit(repo, tx, a, actor, target, detail) })) as R;
   const engBound: ToolContext = { user: W, addresses: ["eng/build", ENG_ID], session: ENG_ID };
   const declined = await inBody(tx => callClaimTool(repo, access, tx, "eng/build", "claim_release", { key: `queue:opsq:${OPSQ_LIVE}` }, engBound)) as R;
   expect(ended.rows.claims.map(c => c.key)).not.toContain(`queue:opsq:${OPSQ_LIVE}`);

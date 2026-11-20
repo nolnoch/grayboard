@@ -1,13 +1,15 @@
 // The async board access (#807 P3 B5a0) gives serverAccess's answers: every method and branch, on the store's read
-// handle and inside a write body, against the sync seam core still calls; and its reads go on the handle it's given,
+// handle and inside a write body, against the synchronous access the server installed until #807 P3 C10d2-a, kept as
+// the parity tests' oracle (tests/support/sync_access.ts); and its reads go on the handle it's given,
 // so a body sees its own uncommitted rows and not its rollback.
 import { describe, test, expect, beforeEach } from "bun:test";
 import type { CoreDb } from "../core/boards.ts";
 import type { Principal } from "../core/resolver.ts";
-import { boardAccess, principalCanSee, scopeKey, serverAccess } from "./access.ts";
+import { boardAccess, scopeKey } from "./access.ts";
 import type { Repo } from "./db.ts";
 import type { Read, Tx } from "./store/tx.ts";
 import { AUTHORS, B, BOARDS, D, E, ENG_ID, HANDLES, openBoardParity, SCOPES, TOKENS, TOOLS_ID, W, WADE_ID } from "../../tests/support/board_parity.ts";
+import { principalCanSee, serverAccess } from "../../tests/support/sync_access.ts";
 
 let repo: Repo;
 let db: CoreDb;
@@ -37,7 +39,7 @@ async function rows(r: Read, tx: Tx | null, humanReach: "team" | "all"): Promise
   // A principal viewer (the read-only seer) against principalCanSee; a service principal sees only unscoped boards.
   const principals: Principal[] = [{ kind: "user", name: W }, { kind: "user", name: D }, { kind: "team", name: "ops" }, { kind: "service", name: "svc" }];
   for (const v of [...HANDLES, ...principals]) {
-    const want = BOARDS.filter(b => typeof v === "string" ? sync.canSee(v, b) : principalCanSee(repo, v, b)).map(b => b.name).sort();
+    const want = BOARDS.filter(b => typeof v === "string" ? sync.canSee(v, b) : principalCanSee(repo, db, v, b)).map(b => b.name).sort();
     out.push([`visibleTo ${typeof v === "string" ? v : `${v.kind}:${v.name}`}`, want, sorted(await async.visibleTo(r, v, BOARDS))]);
   }
   // A claimant's user by its principal's name (#1286): a person, a team, a service, and a name nobody has.

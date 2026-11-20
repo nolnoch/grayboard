@@ -1,7 +1,6 @@
 // The authorization seam is one module (#806): every allow-or-deny decision
 // goes through policy.ts decide(), so the pre-seam rule helpers live there
-// and nothing else under src/ calls them. Unit tests may (can_send.test.ts,
-// access.test.ts exercise each rule directly).
+// and nothing else under src/ calls them.
 import { expect, test } from "bun:test";
 import { Glob } from "bun";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
@@ -25,28 +24,15 @@ test("no source file outside policy.ts calls a pre-seam rule helper", () => {
   expect(offenders).toEqual([]);
 });
 
-// The synchronous loader is SQLite-only (#807 P3 A7e1): every `authorizeNow`, `policyNow` and hand-driven `decide(`
-// outside tests is a caller #807 A7f/B must convert to the async `authorize`, so their count only falls. The table is
-// exact: a new use fails until it's argued for, and a removed one fails until its row is lowered, so a freed slot
-// can't be reused. A7e3 raised application.ts, http.ts and teams.ts once: the store's team, principal and user reads
-// went async, and their synchronous callers that couldn't await yet moved to policyNow. A7f1 moved http.ts's team
-// guards, roster, claim list and act-as check, and teams.ts's onAliasCreated, to `authorize` and the store's reads;
-// http.ts keeps healthz's probe. A7f2 moved application.ts's binds, alias recheck, sends, delegation reach and writer
-// marks; it kept helloOkFields's team list until A7g1. A7u2 raised hosted.ts by 2 (its rebuild read holders' users
-// through policyNow); A7g1 read both on the committing Tx and freed all three. policy.ts counts its drivers' `decide(`.
-// #270 step 5 raised access.ts by 3: core's synchronous Access (still installed on the server's database) takes the
-// service board's visibility, create scope and lane rules, the twins of boardAccess's, so no core path is left open.
-// #1273 L4 lowered it by 1: canSee, seesAlias and seesAliasMeta read their principal through one `seer`.
-// #1286 raised it by 1: core Access.userSees, the twin of boardAccess.userSees, reads a claimant's user's principal.
+// The synchronous loader is gone (#807 P3 C10d2-a deleted authorizeNow, policyNow and the server's synchronous core
+// Access): nothing outside policy.ts may name either, nor drive `decide(` by hand. policy.ts's three are authorize's
+// driver, decidePure's and decide itself. tests/support/sync_access.ts keeps a synchronous oracle for the parity tests.
 const SYNC_TWIN = /\bauthorizeNow\b|\bpolicyNow\b|\bdecide\(/g;
 const SYNC_TWIN_CEILING: Record<string, number> = {
-  "src/server/access.ts": 19,
-  "src/server/db.ts": 2,
-  "src/server/http.ts": 1,
-  "src/server/policy.ts": 9,
+  "src/server/policy.ts": 3,
 };
 
-test("the synchronous policy loader gains no callers", () => {
+test("no synchronous policy loader comes back", () => {
   const counts: Record<string, number> = {};
   for (const file of new Glob("src/**/*.ts").scanSync({ cwd: ROOT })) {
     if (file.endsWith(".test.ts")) continue;
@@ -55,6 +41,16 @@ test("the synchronous policy loader gains no callers", () => {
     if (n) counts[file] = n;
   }
   expect(counts).toEqual(SYNC_TWIN_CEILING);
+});
+
+// The synchronous access oracle (tests/support/sync_access.ts) is the parity tests' alone: no production module loads it.
+test("only tests import the synchronous access oracle", () => {
+  const importers: string[] = [];
+  for (const file of new Glob("src/**/*.ts").scanSync({ cwd: ROOT })) {
+    if (file.endsWith(".test.ts")) continue;
+    if (/sync_access(\.ts)?["']/.test(readFileSync(join(ROOT, file), "utf8"))) importers.push(file);
+  }
+  expect(importers).toEqual([]);
 });
 
 test("decidePure refuses a verb whose rule reads storage", () => {
