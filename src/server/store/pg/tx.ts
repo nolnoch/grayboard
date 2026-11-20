@@ -202,6 +202,8 @@ export type PgTransactions = {
   queue: WriteQueue;
   // Whether the store's root transaction is open (from BEGIN until `begin` settles).
   inTransaction(): boolean;
+  // NOTIFY through the pool, outside any transaction (the auth generation's heartbeat, pg/auth_generation.ts).
+  notify(channel: string, payload: string): Promise<void>;
   close(): Promise<void>;
 };
 
@@ -212,9 +214,10 @@ export type PgTransactions = {
 // Isolation is READ COMMITTED on every BEGIN, whatever the database default (D3, D6). No retries.
 //
 // `ownAuthCommit` (postgres-server.md D5; #807 P3 C9b): called once a transaction that wrote an auth table (users,
-// oauth_grants, oauth_tokens, service_credential_secrets) has committed (0001's triggers mark it gb.auth_touched; ROLLBACK TO undoes the mark), before the effects,
-// `committed` and the queue's next body; also when such a COMMIT's outcome is unknown, since a bump is always safe.
-// Set, it costs each write one round trip before COMMIT to read the mark.
+// oauth_grants, oauth_tokens, service_credential_secrets, service_credentials, principals) has committed (0001's
+// triggers mark it gb.auth_touched; ROLLBACK TO undoes the mark), before the effects, `committed` and the queue's next
+// body; also when such a COMMIT's outcome is unknown, since a bump is always safe. Set, it costs each write one round
+// trip before COMMIT to read the mark.
 export function makePgTransactions(url: string, { ownAuthCommit, ...opts }: Omit<PgOptions, "connection"> & { ownAuthCommit?: () => void } = {}): PgTransactions {
   const sql = openPg(url, { ...opts, connection: { default_transaction_read_only: "on", lock_timeout: "5000" } });
   const store: Store = { sql, queue: queueFor(sql), open: undefined };
@@ -287,6 +290,7 @@ export function makePgTransactions(url: string, { ownAuthCommit, ...opts }: Omit
     read: new PgRead(store) as unknown as Read,
     queue,
     inTransaction: () => store.open !== undefined,
+    notify: (channel, payload) => sql.notify(channel, payload),
     close: () => sql.close(),
   };
 }
