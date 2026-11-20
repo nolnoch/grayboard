@@ -778,6 +778,24 @@ test("#1174: a take under a lane's other alias keeps its place in the rotation, 
   ]);
 }, 30_000);
 
+// #1175: a human isn't a work lane. The Slack bridge's human (marked when its user links) push-subscribed to a queue
+// board is never handed a post, first delivery or redelivery; with no other lane, the decline ends unclaimed.
+test("#1175: a marked human push-subscribed to a queue board is never its lane", async () => {
+  const poster = await connect("fe");
+  await poster.call("board_create", { name: "lanes", purpose: "rotation", kind: "queue" });
+  const s = await connect("lane-b");
+  const human = await connect("lane-h");
+  for (const l of [s, human]) await l.call("board_subscribe", { board: "lanes", mode: "push" });
+  await srv.app.repo.write((tx) => srv.app.repo.aliases.markHuman(tx, `${A}/lane-h`, true));
+  const holder = (key: string) => rows<{ holder: string }>(`SELECT holder FROM claims WHERE key = ?`, key);
+  const postId = (await poster.call<{ post_id: number }>("board_post", { board: "lanes", body: "item" })).post_id;
+  const key = `queue:lanes:${postId}`;
+  expect(holder(key)).toEqual([{ holder: `${A}/lane-b` }]);
+  await s.call("claim_release", { key, note: "pass" });
+  expect(holder(key)).toEqual([]);
+  expect(rows<{ author: string }>(`SELECT author FROM posts WHERE parent_id = ?`, postId)).toEqual([{ author: `${A}/lane-b` }]);
+}, 30_000);
+
 // #284 PR 4: an upload is the session's across its address set. One made as
 // a rides a send as b, and a reply that defaults to b.
 test("an upload made as one alias attaches to a send as another, and to a reply defaulting to it", async () => {

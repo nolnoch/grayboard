@@ -863,8 +863,9 @@ export type PostOpts = {
 // the newest board post in its outbox (a mention or a thread reply), whichever is later, under any address of its
 // session now (its ID or an alias it holds, #1174: a take as its ID before it bound counts). A lane is a push subscriber who isn't
 // one of the poster's addresses (its address set: a session's own lane never
-// takes its own post, whichever alias it posted as), hasn't opted out (peer_status queue:"off"), and isn't a
-// read-only viewer. A lane is named by the address subscribed, but a
+// takes its own post, whichever alias it posted as), hasn't opted out (peer_status queue:"off"), isn't a
+// declared human (#1175: a human isn't a work lane, so no queue claim, and no system text written as its holder,
+// ever bears the human mark), and isn't a read-only viewer. A lane is named by the address subscribed, but a
 // subscription under an ID names the session's primary, the oldest alias it
 // holds, else the ID (#284 S8, S13; an ID can't opt out): a session that
 // subscribed unbound stays in the rotation after it binds, once however many
@@ -941,6 +942,7 @@ export function queueLaneRowsSql(): string {
          LEFT JOIN ids i ON i.id = l.lane
          WHERE l.lane NOT IN (SELECT value FROM json_each(?2))
            AND (h.address IS NOT NULL AND h.queue_off IS NULL OR i.id IS NOT NULL AND i.ended_at IS NULL)
+           AND h.human IS NOT 1
          GROUP BY l.lane
          ORDER BY NULLIF(MAX(
              COALESCE((SELECT MAX(e.at) FROM claim_events e
@@ -989,15 +991,9 @@ export function claimQueuePost(
 // decline's own redelivery from a later claim (#254).
 export const REDELIVERED_NOTE = "queue post (redelivered)";
 
-// A post's author's address set as of now: the author, and its writing
-// session's ID and the aliases that session holds (#284 S5); for a child's
-// post (#523), its root's ID and holds, the addresses the child acted under.
-function postAddresses(db: Database, postId: number): string[] {
-  const p = db.prepare(`SELECT author, author_id FROM posts WHERE id = ?`).get(postId) as { author: string; author_id: string | null } | undefined;
-  return p ? authorAddresses(db, p.author, p.author_id) : [];
-}
-
-/** postAddresses over a post's author and author_id, for a post not yet written or not read back. */
+/** A post's author's address set as of now, from its author and author_id: the author, and its writing session's ID
+ * and the aliases that session holds (#284 S5); for a child's post (#523), its root's ID and holds, the addresses the
+ * child acted under. */
 export function authorAddresses(db: Database, author: string, authorId: string | null): string[] {
   return (db.prepare(
     `SELECT ?1 AS a
@@ -1016,23 +1012,27 @@ export function authorAddresses(db: Database, author: string, authorId: string |
 // any alias it holds was its turn, whatever its primary is now. Presence-blind: the sweep has no online predicate, so an offline
 // lane holds the re-offer in its outbox until it wakes, and its own TTL lapse
 // re-rotates. Caller is inside a transaction. Returns the lane woken; with no
-// lane left, the post and how many lanes held it, for the caller to say so in
-// its thread; null for a key that isn't a live queue post.
-export type Requeue = { lane: string } | { board: string; postId: number; held: number } | null;
+// lane left, the post, how many lanes held it and its writer, for the caller to
+// say so in its thread; null for a key that isn't a live queue post.
+export type Requeue = { lane: string } | { board: string; postId: number; held: number; author: PostWriter } | null;
 export function redeliverQueuePost(db: Database, key: string, prevHolder: string, now = Date.now()): Requeue {
   const f = redeliveryFacts(db, key, prevHolder);
   if (!f) return null;
   const lane = requeuePick(queueLanes(db, f.board, f.poster), f.held);
-  if (!lane) return { board: f.board.name, postId: f.postId, held: f.takers };
+  if (!lane) return { board: f.board.name, postId: f.postId, held: f.takers, author: f.author };
   claimQueuePost(db, f.board.name, f.postId, lane, now, { note: REDELIVERED_NOTE });
   return { lane };
 }
 
-export type RedeliveryFacts = { board: Board; postId: number; poster: string[]; takers: number; held: Set<string> };
+/** A post's writer as its row records it: its author, writing session and user. */
+export type PostWriter = { handle: string; id: string | null; user: string | null };
+
+export type RedeliveryFacts = { board: Board; postId: number; poster: string[]; author: PostWriter; takers: number; held: Set<string> };
 
 /** What a queue post's redelivery reads (#807 B5b3a): its board and post, the post's author addresses (no lane they
- * name gets it back), how many sessions took it (the `[unclaimed]` reply's count), and every address that held it with
- * every address of its session now (#1174). Null when `key` names no queue post. */
+ * name gets it back) and its writer (who the `[unclaimed]` reply falls back to, #1175), how many sessions took it (the
+ * `[unclaimed]` reply's count), and every address that held it with every address of its session now (#1174). Null
+ * when `key` names no queue post. */
 export function redeliveryFacts(db: Database, key: string, prevHolder: string): RedeliveryFacts | null {
   const m = /^queue:([^:]+):(\d+)$/.exec(key);
   if (!m) return null;
@@ -1053,7 +1053,10 @@ export function redeliveryFacts(db: Database, key: string, prevHolder: string): 
     sessions.add((sessionOf.get(h) as { sid: string }).sid);
     for (const r of addressesOf.all(h) as { address: string }[]) held.add(r.address);
   }
-  return { board: b, postId: p.id, poster: postAddresses(db, p.id), takers: sessions.size, held };
+  const w = db.prepare(`SELECT author, author_id, author_user FROM posts WHERE id = ?`).get(p.id) as
+    { author: string; author_id: string | null; author_user: string | null };
+  const author = { handle: w.author, id: w.author_id, user: w.author_user };
+  return { board: b, postId: p.id, poster: authorAddresses(db, w.author, w.author_id), author, takers: sessions.size, held };
 }
 
 /** The lane a declined or lapsed queue post goes to next: the first of `lanes` (queueLanes' order) that hasn't held it. */

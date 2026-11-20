@@ -1,6 +1,6 @@
 import type { Database } from "bun:sqlite";
 
-import { REDELIVERED_NOTE, canSeeBoard, getBoard, normalizeBoard, post, redeliverQueuePost, seenHandles, systemBody, userViewer, type BoardPredicate, type PostOpts, type Viewer } from "./boards.ts";
+import { REDELIVERED_NOTE, canSeeBoard, getBoard, isHuman, normalizeBoard, post, redeliverQueuePost, seenHandles, systemBody, userViewer, type BoardPredicate, type PostOpts, type PostResult, type Viewer } from "./boards.ts";
 import { addressParts } from "./addresses.ts";
 import { idRow } from "./bindings.ts";
 import { CoreError } from "./errors.ts";
@@ -395,24 +395,44 @@ export function claim(
 // (`ctx`); a lapse's is the claimant's user (#855). A holder that lost the
 // board ends it as release does (endReach, #1286): the reply is posted for the
 // claimant's user when that user still sees the board, never as the caller's
-// session, else quietly.
+// session. When neither can write it, or it's refused, the post's own author
+// writes it (#1175), else it ends quietly.
 function requeue(db: Database, c: ClaimRow, now: number, ctx: ClaimCtx = {}): ClaimChanges {
   const cc = takeClaimWatchers(db, c.key);
   const r = redeliverQueuePost(db, c.key, c.holder, now);
   if (!r) return { wake: [], boards: [] };
   if ("lane" in r) return { wake: [r.lane], boards: [] };
-  // Judged on the post's board, the key's, which claimQueuePost also recorded as the claim's.
-  const end = endReach(db, { ...c, board: r.board });
-  if (!end) return { wake: [], boards: [] };
-  // The system's reply for the claimant's user: no caller's session, via or name set reaches it.
-  const opts: PostOpts = end.user
-    ? { author_user: end.user.name, allowArchived: true, seenBy: end.user.sees }
-    : { author_id: ctx.session, via: ctx.via, addresses: ctx.addresses, author_user: ctx.user ?? holderUser(db, c), allowArchived: true };
+  const text = systemBody(unclaimedText(c.key, r.held, cc));
+  const changes = (res: PostResult): ClaimChanges => ({ wake: res.wake, boards: [res.post.board] });
+  // Judged on the post's board, the key's, which claimQueuePost also recorded as the claim's. A human holder (a
+  // claim from before humans left the lanes) never writes it: system text never bears the human mark (#1175).
+  const end = isHuman(db, c.holder) ? null : endReach(db, { ...c, board: r.board });
+  if (end) {
+    // The system's reply for the claimant's user: no caller's session, via or name set reaches it.
+    const opts: PostOpts = end.user
+      ? { author_user: end.user.name, allowArchived: true, seenBy: end.user.sees }
+      : { author_id: ctx.session, via: ctx.via, addresses: ctx.addresses, author_user: ctx.user ?? holderUser(db, c), allowArchived: true };
+    const res = refusedAsNull(() => post(db, c.holder, r.board, text, r.postId, opts));
+    if (res) return changes(res);
+  }
+  // No holder can write it (#1175): the post's own author, the reader it informs, writes it into its own thread as the
+  // post's writer (its session and user as the post records them), so post's own-exclusion keeps the post's address
+  // set (authorAddresses) out of the fan-out: it never wakes itself; the claim's watchers are told as before. Only while the author sees the board (the post's
+  // gate judges it), and never a declared human's: system text never bears the human mark (principle 10,
+  // docs/slack-bridge.md §3), so a human's post ends quietly.
+  if (isHuman(db, r.author.handle)) return { wake: [], boards: [] };
+  const res = refusedAsNull(() => post(db, r.author.handle, r.board, text, r.postId, {
+    author_id: r.author.id ?? undefined, author_user: r.author.user ?? undefined, allowArchived: true,
+  }));
+  return res ? changes(res) : { wake: [], boards: [] };
+}
+
+/** `f`'s result, or null when it's refused (a CoreError): a system post that can't land writes nothing. */
+function refusedAsNull<T>(f: () => T): T | null {
   try {
-    const res = post(db, c.holder, r.board, systemBody(unclaimedText(c.key, r.held, cc)), r.postId, opts);
-    return { wake: res.wake, boards: [res.post.board] };
+    return f();
   } catch (e) {
-    if (e instanceof CoreError) return { wake: [], boards: [] };
+    if (e instanceof CoreError) return null;
     throw e;
   }
 }

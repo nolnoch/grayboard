@@ -243,3 +243,23 @@ test("#807 P3 B5b3b: the server's expiry timer sweeps a lapse through repo.claim
     expect(expire).toHaveBeenCalled();
   } finally { next.mockRestore(); expire.mockRestore(); }
 });
+
+// #1175 (a #220 gap): a queue post's `[unclaimed]` reply is its last lane's, so when that lane is a team alias held
+// by another user's session, the poster's push carries that user's marks: another user's, and ungranted without a
+// grant, as any post that user's session writes.
+test("an [unclaimed] reply by another user's team-alias lane reaches the poster marked other_user and ungranted", async () => {
+  await team();
+  const lane = await srv.hosted(A, "eng/lane");
+  await lane.call("board_create", { name: "jobs", purpose: "eng work", team: "eng", kind: "queue" });
+  await lane.call("board_subscribe", { board: "jobs", mode: "push" });
+  const bfe = await srv.hosted(B, "fe");
+  const { post_id: postId } = await bfe.call<{ post_id: number }>("board_post", { board: "jobs", body: "a job" });
+  const key = `queue:jobs:${postId}`;
+  await lane.next(pushed("a job"));
+  await lane.call("claim_release", { key, note: "pass" });
+  const reply = srv.app.db.query("SELECT author, author_user FROM posts WHERE parent_id = ?").all(postId);
+  expect(reply).toEqual([{ author: "eng/lane", author_user: A }]);
+  const got = await bfe.next(board((i) => i.kind === "push" && i.post.body.startsWith(`[unclaimed] ${key}:`)));
+  expect(got.actionable).toBe(false);
+  expect(got.event).toMatchObject({ item: { post: { author: "eng/lane", other_user: true, ungranted: true } } });
+});

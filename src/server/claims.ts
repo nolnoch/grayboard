@@ -55,8 +55,9 @@ export async function sweepClaims(repo: Repo, access: BoardAccess, tx: Tx, now: 
  * core requeue on `tx`: a queue post's claim ended (a lapse, or a decline in `ctx`'s name). Its watches go; the post goes
  * to the next lane that hasn't held it, presence-blind; with none left, an `[unclaimed]` reply in its thread. A holder
  * who lost the board ends it as serverRelease does (core endReachRule, #1286): the reply is posted for the claimant's
- * user when that user still sees the board, never as the caller's session, else nothing. A reply refused all the same
- * (a CoreError) is nothing too, its savepoint rolled back and the rest kept.
+ * user when that user still sees the board, never as the caller's session. When neither can write it (or a human
+ * holds it), or it's refused (a CoreError, its savepoint rolled back), the post's own author writes it unless it's a
+ * human (#1175), else nothing; the rest is kept.
  */
 export async function requeue(repo: Repo, access: BoardAccess, tx: Tx, c: ClaimRow, now: number, ctx: ClaimCtx = {}): Promise<ClaimChanges> {
   const cc = await repo.claims.takeWatchers(tx, c.key);
@@ -71,19 +72,31 @@ export async function requeue(repo: Repo, access: BoardAccess, tx: Tx, c: ClaimR
     await repo.boards.claimQueuePost(tx, f.board.name, f.postId, lane, now, { note: REDELIVERED_NOTE, push: true });
     return { wake: [lane], boards: [] };
   }
-  // Judged on the post's board, the key's, which claimQueuePost also recorded as the claim's.
-  const end = await endReach(repo, access, tx, { ...c, board: f.board.name });
-  if (!end) return { wake: [], boards: [] };
-  // The system's reply for the claimant's user: no caller's session, via or name set reaches it.
-  const opts = end.user
-    ? { allowArchived: true, user: end.user, seenBy: end.user }
-    : { allowArchived: true, session: ctx.session, via: ctx.via, addresses: ctx.addresses, user: ctx.user ?? (await repo.claims.holderUser(tx, c)) };
-  try {
-    return await tx.savepoint((sp) => systemPost(repo, access, sp, c.holder, f.board.name, unclaimedText(c.key, f.takers, cc), f.postId, opts));
-  } catch (e) {
-    if (e instanceof CoreError) return { wake: [], boards: [] };
-    throw e;
+  const text = unclaimedText(c.key, f.takers, cc);
+  const refusedAsNull = async (o: Parameters<typeof systemPost>[7], as: string): Promise<ClaimChanges | null> => {
+    try {
+      return await tx.savepoint((sp) => systemPost(repo, access, sp, as, f.board.name, text, f.postId, o));
+    } catch (e) {
+      if (e instanceof CoreError) return null;
+      throw e;
+    }
+  };
+  // Judged on the post's board, the key's, which claimQueuePost also recorded as the claim's; never as a human (core requeue).
+  const end = (await repo.aliases.isHuman(tx, c.holder)) ? null : await endReach(repo, access, tx, { ...c, board: f.board.name });
+  if (end) {
+    // The system's reply for the claimant's user: no caller's session, via or name set reaches it.
+    const opts = end.user
+      ? { allowArchived: true, user: end.user, seenBy: end.user }
+      : { allowArchived: true, session: ctx.session, via: ctx.via, addresses: ctx.addresses, user: ctx.user ?? (await repo.claims.holderUser(tx, c)) };
+    const done = await refusedAsNull(opts, c.holder);
+    if (done) return done;
   }
+  // The post's own author, as its post's writer, so its address set is kept out of its own fan-out (core requeue).
+  if (await repo.aliases.isHuman(tx, f.author.handle)) return { wake: [], boards: [] };
+  const done = await refusedAsNull(
+    { allowArchived: true, session: f.author.id ?? undefined, user: f.author.user ?? undefined }, f.author.handle,
+  );
+  return done ?? { wake: [], boards: [] };
 }
 
 /**

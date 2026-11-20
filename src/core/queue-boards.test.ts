@@ -4,6 +4,8 @@ import { beforeEach, describe, expect, test } from "bun:test";
 import {
   acknowledge,
   createBoard,
+  declareHuman,
+  openAccess,
   getBoard,
   queueLanes,
   queueLaneRowsSql,
@@ -20,6 +22,7 @@ import {
 import { holdAlias } from "./bindings.ts";
 import { claim, logEvent, release, sweepExpired, listClaims, watch } from "./claims.ts";
 import { initCoreSchema } from "./schema.ts";
+import { CoreError } from "./errors.ts";
 
 let db: Database;
 
@@ -722,4 +725,113 @@ describe("queueLaneRows' plan stays indexed (#1174 audit)", () => {
       expect(first("o2")).toBeLessThan(first("p2"));
     });
   }
+});
+
+// #1175: a declared human isn't a work lane, and a queue post nobody takes still ends visibly when its last holder
+// can't write the [unclaimed] reply: its own author writes it, never as a human.
+describe("#1175: humans aren't lanes; the [unclaimed] reply falls back to the post's author", () => {
+  const replies = (postId: number) => db.prepare(`SELECT author, author_id, author_user, body FROM posts WHERE parent_id = ?`).all(postId);
+  const later = () => Date.now() + 31 * 60_000;
+  // sim leaves the work board's lanes: fe is the only one.
+  const oneLane = () => db.prepare(`DELETE FROM subscriptions WHERE handle = 'sim'`).run();
+  // fe, the only lane, loses the scoped board after it took a post there; be and sim still see it.
+  const lostBoard = () => {
+    const sees = new Set(["be", "sim", "fe"]);
+    setAccess(db, { ...openAccess(db), canSee: (h, b) => b.scope === null || sees.has(h), checkCreate: () => null });
+    createBoard(db, "be", "eng", "team queue", "team:eng", { kind: "queue" });
+    subscribe(db, "fe", "eng", "push");
+    return sees;
+  };
+
+  test("a push-subscribed human is never a lane, by rotation or by mention", () => {
+    declareHuman(db, "sim");
+    expect(queueLanes(db, getBoard(db, "work")!, ["be"])).toEqual(["fe"]);
+    const r = post(db, "be", "work", "work item"); // fe claims
+    release(db, "fe", claimKey(r.post.id), "pass");
+    // sim, the human, is never offered it: fe's decline leaves no lane.
+    expect(replies(r.post.id)).toEqual([expect.objectContaining({ author: "fe", body: expect.stringContaining("its one lane passed on it") })]);
+    // A mention tells the human but claims nothing: no queue claim is a human's.
+    const named = post(db, "be", "work", "@sim have a look");
+    expect(named.wake).toEqual(["sim"]);
+    expect(listClaims(db).filter((c) => c.key.startsWith("queue:"))).toEqual([]);
+  });
+
+  test("a last holder that lost the board: the post's author writes the reply, unwoken; its watchers are told", () => {
+    const sees = lostBoard();
+    registerId(db, { id: "id:0000000000be1", principal: "u-be", launcher: false });
+    const r = post(db, "be", "eng", "eng work", null, { author_id: "id:0000000000be1", author_user: "u-be" }); // fe claims
+    const key = `queue:eng:${r.post.id}`;
+    watch(db, "sim", key);
+    sees.delete("fe");
+    const swept = sweepExpired(db, later());
+    expect(replies(r.post.id)).toEqual([{
+      author: "be", author_id: "id:0000000000be1", author_user: "u-be",
+      body: `[unclaimed] ${key}: its one lane passed on it, and no other lane is left; it stays here unclaimed cc @sim`,
+    }]);
+    expect(swept.wake).toEqual(["sim"]);
+    // Neither the author nor its writing session is handed its own reply.
+    const handed = db.prepare(`SELECT handle FROM outbox WHERE post_id = (SELECT id FROM posts WHERE parent_id = ?)`).all(r.post.id);
+    expect(handed).toEqual([{ handle: "sim" }]);
+  });
+
+  test("a decline's reply refused for its holder falls back to the author", () => {
+    oneLane();
+    setAccess(db, { ...openAccess(db), resolveMention: (t, author) => { if (author === "fe") throw new CoreError("fe can't mention"); return t; } });
+    const r = post(db, "be", "work", "work item"); // fe claims
+    const key = claimKey(r.post.id);
+    watch(db, "sim", key);
+    expect(release(db, "fe", key, "pass", { session: "id:00000000000fe", user: "u-fe" }).wake).toEqual(["sim"]);
+    expect(replies(r.post.id)).toEqual([expect.objectContaining({ author: "be", author_id: null, author_user: null })]);
+  });
+
+  test("the author can't see the board either: the post ends quietly", () => {
+    const sees = lostBoard();
+    const r = post(db, "be", "eng", "eng work"); // fe claims
+    sees.delete("fe");
+    sees.delete("be");
+    expect(sweepExpired(db, later()).wake).toEqual([]);
+    expect(replies(r.post.id)).toEqual([]);
+  });
+
+  test("a human's post ends quietly when its last holder can't write the reply: no system text bears the human mark", () => {
+    declareHuman(db, "be");
+    const sees = lostBoard();
+    const r = post(db, "be", "eng", "eng work"); // fe claims
+    sees.delete("fe");
+    expect(sweepExpired(db, later()).wake).toEqual([]);
+    expect(replies(r.post.id)).toEqual([]);
+  });
+
+  test("a human holding a queue claim (one taken before humans left the lanes) never writes its reply", () => {
+    oneLane();
+    const r = post(db, "be", "work", "work item"); // fe claims
+    declareHuman(db, "fe");
+    sweepExpired(db, later());
+    expect(replies(r.post.id)).toEqual([expect.objectContaining({ author: "be" })]);
+  });
+
+  // #1175 test gap: a decline's reply leaves out the caller's whole address set, a tools-only session's writes-as alias
+  // among them, which no session holds, so only ctx.addresses names it.
+  test("a decline's reply never reaches the declining caller's other addresses", () => {
+    oneLane();
+    ensureAlias(db, "fe-w", "test");
+    const r = post(db, "be", "work", "work item"); // fe claims
+    const key = claimKey(r.post.id);
+    watch(db, "fe-w", key);
+    const out = release(db, "fe", key, "pass", { addresses: ["fe", "fe-w"] });
+    expect(replies(r.post.id)).toEqual([expect.objectContaining({ author: "fe", body: expect.stringMatching(/ cc @fe-w$/) })]);
+    expect(out.wake).toEqual(["be"]);
+  });
+
+  // #1175 test gap: claimQueuePost's holder_user from an ID lane's own principal.
+  test("a lane subscribed as an unbound session's ID records that session's user", () => {
+    oneLane();
+    db.prepare(`DELETE FROM subscriptions WHERE handle = 'fe'`).run();
+    registerId(db, { id: "id:0000000000ln1", principal: "u-lane", launcher: false });
+    subscribe(db, "id:0000000000ln1", "work", "push");
+    const r = post(db, "be", "work", "work item");
+    expect(db.prepare(`SELECT holder, holder_user FROM claims WHERE key = ?`).get(claimKey(r.post.id))).toEqual({ holder: "id:0000000000ln1", holder_user: "u-lane" });
+    sweepExpired(db, later());
+    expect(replies(r.post.id)).toEqual([expect.objectContaining({ author: "id:0000000000ln1", author_user: "u-lane" })]);
+  });
 });
