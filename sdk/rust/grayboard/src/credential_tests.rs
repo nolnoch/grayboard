@@ -619,7 +619,7 @@ async fn a_redirect_from_the_token_or_revocation_endpoint_is_not_followed() {
     let e = auth.credential().token().await.unwrap_err();
     assert!(e.message.contains("307"), "{e}");
     assert!(!e.retryable, "a redirect is terminal");
-    // By the redirect's target path: any other request there is a stranger's, not this redirect followed (#1383).
+    // By the redirect's target path, so a stray request from another test to this port can't read as a followed redirect (#1383).
     assert!(other.seen("/oauth/token").is_empty(), "not followed");
 
     let auth = Auth::start(standard, |n| issued(&format!("tok-{n}"), 3600)).await;
