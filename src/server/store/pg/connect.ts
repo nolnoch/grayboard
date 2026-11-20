@@ -3,27 +3,20 @@
 // The server waits for one successful round trip, up to a deadline, before it migrates. Only a failure that a wait can
 // cure is retried; a wrong password or a missing database fails the start at once.
 import { SQL } from "bun";
+import { transientConnectFailure } from "./errors.ts";
 import { openPg } from "./sql.ts";
 
 export const DEFAULT_CONNECT_SECONDS = 60;
 // The first retry's wait, doubling to the cap.
 const FIRST_DELAY_MS = 500;
 const MAX_DELAY_MS = 5_000;
-// One probe's connection timeout, so a black-holed address can't spend the whole deadline on one attempt.
-const PROBE_TIMEOUT_SECONDS = 10;
-
-// Bun's connection-level codes (refused, which includes a name that doesn't resolve; timed out; closed), and the
-// SQLSTATEs of a server not taking connections yet: 57P03 cannot_connect_now (starting up, resuming), 53300
-// too_many_connections, class 08 connection exceptions.
-export function transientConnectFailure(e: unknown): boolean {
-  if (!(e instanceof SQL.PostgresError)) return false;
-  if (e.code.startsWith("ERR_POSTGRES_CONNECTION_")) return true;
-  const state = e.errno ?? "";
-  return state === "57P03" || state === "53300" || state.startsWith("08");
-}
+// Each try's connection timeout, so a black-holed address can't spend the whole deadline on one try. Not clipped to
+// the deadline: a slow handshake (TLS across regions, a cluster resuming) needs its seconds however few are left, so the
+// deadline bounds when the last try starts, and the start can run up to this much past it.
+export const PROBE_TIMEOUT_SECONDS = 10;
 
 export type ConnectWait = {
-  // How long to keep retrying; 0 tries once.
+  // How long to keep starting tries; 0 tries once.
   seconds: number;
   log?: (line: string) => void;
   // For tests: the clock, the wait, and the round trip.
@@ -48,9 +41,8 @@ export async function waitForPg(url: string, opts: ConnectWait): Promise<void> {
   const deadline = now() + opts.seconds * 1000;
   let delay = FIRST_DELAY_MS;
   for (;;) {
-    const left = Math.ceil((deadline - now()) / 1000);
     try {
-      await probe(Math.max(1, Math.min(PROBE_TIMEOUT_SECONDS, left)));
+      await probe(PROBE_TIMEOUT_SECONDS);
       return;
     } catch (e) {
       if (!transientConnectFailure(e)) throw e;

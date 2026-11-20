@@ -1,7 +1,8 @@
 // #1418: the startup wait for a Postgres store retries only what a wait can cure, and stops at its deadline.
 import { describe, expect, test } from "bun:test";
 import { SQL } from "bun";
-import { transientConnectFailure, waitForPg } from "./connect.ts";
+import { PROBE_TIMEOUT_SECONDS, waitForPg } from "./connect.ts";
+import { transientConnectFailure } from "./errors.ts";
 import { describePg, PG_URL, pgUrl } from "../../../../tests/support/pg.ts";
 
 const pgError = (code: string, errno?: string) => new SQL.PostgresError("x", { code, ...(errno ? { errno } : {}) } as never);
@@ -69,14 +70,14 @@ describe("waitForPg", () => {
     expect(err.cause).toBe(refused);
     // 500 + 1000 + 1500 (the last sleep clipped to the deadline) = 3000.
     expect(r.sleeps).toEqual([500, 1000, 1500]);
-    // A probe never waits past the deadline either: 3 s left, then 3, 2, 1 (rounded up, at least 1).
-    expect(r.calls).toEqual([3, 3, 2, 1]);
+    // Every try gets the whole connection timeout, the last one too: a slow handshake isn't cut short by the deadline.
+    expect(r.calls).toEqual(Array(4).fill(PROBE_TIMEOUT_SECONDS));
   });
 
   test("0 seconds tries once", async () => {
     const r = rig([pgError("ERR_POSTGRES_CONNECTION_REFUSED")]);
     await expect(waitForPg("unused", r.opts(0))).rejects.toThrow("did not answer within 0 s");
-    expect(r.calls.length).toBe(1);
+    expect(r.calls).toEqual([PROBE_TIMEOUT_SECONDS]);
   });
 
   // The driver's real code for a closed port, so the classifier matches what Bun throws.

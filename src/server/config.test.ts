@@ -174,7 +174,10 @@ describe("loadConfig", () => {
       // The trailing line break an editor or `echo` leaves is not part of the secret.
       process.env.GRAYBOARD_DATABASE_URL_FILE = file("db-url", `${url}\r\n`);
       expect(loadConfig().store).toEqual({ kind: "postgres", url });
+      // Resolution leaves NAME set; loading again reads the same value rather than seeing two sources.
+      expect(loadConfig().store).toEqual({ kind: "postgres", url });
       // Both forms is a refusal, not a precedence rule.
+      process.env.GRAYBOARD_DATABASE_URL = "postgres://gb:other@db.example.com:5432/grayboard";
       expect(() => loadConfig()).toThrow("Set one of GRAYBOARD_DATABASE_URL, GRAYBOARD_DATABASE_URL_FILE, not both");
       delete process.env.GRAYBOARD_DATABASE_URL;
       process.env.GRAYBOARD_DATABASE_URL_FILE = file("empty", "\n");

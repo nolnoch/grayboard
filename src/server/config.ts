@@ -109,14 +109,13 @@ export const FILE_SECRETS = [
   "GRAYBOARD_OKTA_CLIENT_SECRET", "SLACK_APP_TOKEN", "SLACK_BOT_TOKEN",
 ] as const;
 
-// Resolves each NAME_FILE into env.NAME before anything reads it. Both set is refused: which one wins would be a
-// guess. Trailing line breaks are dropped (an editor or `echo` adds one); an empty or unreadable file is refused,
+// Resolves each NAME_FILE into env.NAME before anything reads it. Both set (to different values) is refused: which
+// one wins would be a guess. Trailing line breaks are dropped (an editor or `echo` adds one); an empty or unreadable file is refused,
 // naming the variable and path, never the contents.
 export function resolveFileSecrets(env: Record<string, string | undefined>): void {
   for (const name of FILE_SECRETS) {
     const path = env[`${name}_FILE`];
     if (!path) continue;
-    if (env[name]) throw new Error(`Set one of ${name}, ${name}_FILE, not both`);
     let value: string;
     try {
       value = readFileSync(path, "utf8");
@@ -125,6 +124,8 @@ export function resolveFileSecrets(env: Record<string, string | undefined>): voi
     }
     value = value.replace(/[\r\n]+$/, "");
     if (!value) throw new Error(`${name}_FILE: ${path} is empty`);
+    // NAME equal to the file is this resolution run before (a second loadConfig), not a second source.
+    if (env[name] && env[name] !== value) throw new Error(`Set one of ${name}, ${name}_FILE, not both`);
     env[name] = value;
   }
 }

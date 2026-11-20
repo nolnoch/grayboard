@@ -1,7 +1,8 @@
 // SQLSTATE classification for the Postgres store (#807 P3 C1, docs/future/postgres-server.md D6). A classifier, not a
 // policy: the store group that catches an error decides what a constraint means, as db.ts does for SQLite's.
 // Bun.SQL puts the SQLSTATE in `errno`; `code` is Bun's own class (ERR_POSTGRES_SERVER_ERROR), so nothing here reads
-// `code` but for Bun's rolled-back COMMIT, which carries no SQLSTATE, and only a real PostgresError is classified.
+// `code` but for Bun's rolled-back COMMIT and its connection failures, which carry no SQLSTATE, and only a real
+// PostgresError is classified.
 import { SQL } from "bun";
 import { MissingParent, PrincipalTaken } from "../errors.ts";
 
@@ -60,4 +61,15 @@ export const MESSAGE_PARENT_CONSTRAINT = "messages_parent_id_fkey";
 // can fail; a failed insert has already aborted the transaction, and the caller's commit fails TxAborted.
 export function missingParent(e: unknown, parentId: number): MissingParent | undefined {
   return foreignKeyViolation(e) === MESSAGE_PARENT_CONSTRAINT ? new MissingParent(parentId) : undefined;
+}
+
+// Bun's connection-level codes (refused, which includes a name that doesn't resolve; timed out; closed), and the
+// SQLSTATEs of a server not taking connections yet: 57P03 cannot_connect_now (starting up, resuming), 53300
+// too_many_connections, class 08 connection exceptions.
+// The startup wait retries these (connect.ts, #1418).
+export function transientConnectFailure(e: unknown): boolean {
+  if (!(e instanceof SQL.PostgresError)) return false;
+  if (e.code.startsWith("ERR_POSTGRES_CONNECTION_")) return true;
+  const state = e.errno ?? "";
+  return state === "57P03" || state === "53300" || state.startsWith("08");
 }
