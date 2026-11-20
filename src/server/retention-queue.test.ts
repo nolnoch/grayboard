@@ -69,7 +69,9 @@ test("#807: the application's claim expiry sweep waits behind a body holding the
   cleanups.push(() => writes.mockRestore());
   const holder = hold(db);
   application.wake([]);
-  await until(() => writes.mock.calls.length > 0, 2000, "the timer's sweep asked for the write queue");
+  // Past the claim's expiry, so the timer has fired: an earlier write of anything else would count a second.
+  const due = (db.query("SELECT expires_at FROM claims WHERE key = 'soon'").get() as { expires_at: number }).expires_at;
+  await until(() => Date.now() > due && writes.mock.calls.length > 0, 2000, "the timer's sweep asked for the write queue");
   await ticks();
   // listClaims hides an expired claim: the row itself is what the sweep deletes.
   expect(rows(db)).toEqual(["soon"]);
