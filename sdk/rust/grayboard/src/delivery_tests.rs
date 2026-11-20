@@ -129,6 +129,16 @@ impl Bus {
         v
     }
 
+    /// An acknowledged listen stream on the inbox, kept for `hint`.
+    fn listen(&mut self) -> Reply {
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.streams.push(tx);
+        let ack = event(
+            json!({"jsonrpc": "2.0", "method": "notifications/subscriptions/acknowledged", "params": {"notifications": {"resourceSubscriptions": [INBOX]}}}),
+        );
+        Reply::live(vec![ack], rx)
+    }
+
     fn leased(&self, req: &Req) -> bool {
         self.lease.is_some() && req.headers.get("x-grayboard-lease") == self.lease.as_ref()
     }
@@ -267,14 +277,7 @@ impl Bus {
                     json!({"contents": [{"uri": INBOX, "mimeType": "application/json", "text": text}]}),
                 )
             }
-            "listen" => {
-                let (tx, rx) = mpsc::unbounded_channel();
-                self.streams.push(tx);
-                let ack = event(
-                    json!({"jsonrpc": "2.0", "method": "notifications/subscriptions/acknowledged", "params": {"notifications": {"resourceSubscriptions": [INBOX]}}}),
-                );
-                Reply::live(vec![ack], rx)
-            }
+            "listen" => self.listen(),
             _ => Reply::result(req, json!({"content": [{"type": "text", "text": "ok"}]})),
         }
     }
@@ -1577,12 +1580,12 @@ async fn a_terminal_credential_failure_at_a_reopen_stops_the_stream() {
 
 /// A credential whose token the test replaces, reporting each replacement through `changes` as `ClientCredentials` does on a renewal.
 #[derive(Clone)]
-struct Rotating {
+struct Renewing {
     token: Arc<Mutex<String>>,
     generation: Arc<tokio::sync::watch::Sender<u64>>,
 }
 
-impl Rotating {
+impl Renewing {
     fn new() -> Self {
         Self {
             token: Arc::new(Mutex::new("tok-1".into())),
@@ -1596,7 +1599,7 @@ impl Rotating {
     }
 }
 
-impl Credential for Rotating {
+impl Credential for Renewing {
     fn token(&self) -> BoxFuture<'_, Result<String, AuthError>> {
         let token = self.token.lock().unwrap().clone();
         Box::pin(async move { Ok(token) })
@@ -1618,15 +1621,20 @@ fn slow_backoff(t: &mut Timeouts) {
 // Decision (#1265): a renewed token reopens the listen stream at once on the new token, under the same lease: no whoami, delivery_open or backoff, and the inbox is re-read. Exactly one reopen per renewal.
 #[tokio::test]
 async fn a_renewed_token_reopens_the_listen_stream_at_once_under_the_same_lease() {
-    let credential = Rotating::new();
+    let credential = Renewing::new();
     let w = World::with_credential(Bus::new(&["a"]), slow_backoff, credential.clone()).await;
     let mut stream = w.s().deliveries();
-    w.until("the lease listens", |b| ops_count(b, "listen") == 1)
+    w.until("the first read", |b| ops_count(b, "read") == 1)
         .await;
-    let reads = w.count("read");
+    // An item that arrives while the stream is replaced, its hint lost in the gap: only the re-read after the reopen finds it, well inside the renew interval (10 s).
+    w.bus().on("listen", |_, b| {
+        b.direct(1);
+        b.listen()
+    });
     credential.rotate("tok-2");
-    w.until("the stream listens again", |b| ops_count(b, "listen") == 2)
-        .await;
+    let d = next(&mut stream).await.unwrap();
+    assert_eq!(d.id, "direct:1", "found by the re-read");
+    d.receipt().await.unwrap();
     let listens = w.calls("listen");
     assert_eq!(listens[0].auth.as_deref(), Some("Bearer tok-1"));
     assert_eq!(listens[1].auth.as_deref(), Some("Bearer tok-2"));
@@ -1640,13 +1648,11 @@ async fn a_renewed_token_reopens_the_listen_stream_at_once_under_the_same_lease(
         Some(tail.iter().position(|o| o == "listen").unwrap() - 1),
         "{ops:?}"
     );
-    w.until("the inbox is re-read", |b| ops_count(b, "read") > reads)
-        .await;
     // The new stream carries hints; the reopen happened once.
-    w.bus().direct(1);
+    w.bus().direct(2);
     w.bus().hint();
     let d = next(&mut stream).await.unwrap();
-    assert_eq!(d.id, "direct:1");
+    assert_eq!(d.id, "direct:2");
     d.receipt().await.unwrap();
     assert_eq!(w.count("listen"), 2, "{:?}", w.ops());
     assert_eq!(w.count("sub:delivery_open"), 1);
@@ -1655,12 +1661,17 @@ async fn a_renewed_token_reopens_the_listen_stream_at_once_under_the_same_lease(
 // Decision (#1265): with an item out, a renewal reopens the listen stream too, and the handle still receipts under the same lease.
 #[tokio::test]
 async fn a_renewal_with_an_item_out_reopens_the_listen_stream_and_keeps_the_handle() {
-    let credential = Rotating::new();
+    let credential = Renewing::new();
     let mut bus = Bus::new(&["a"]);
     bus.direct(1);
     let w = World::with_credential(bus, slow_backoff, credential.clone()).await;
     let mut stream = w.s().deliveries();
     let d = next(&mut stream).await.unwrap();
+    // An item that arrives in the gap with no hint: the re-read after the receipt finds it.
+    w.bus().on("listen", |_, b| {
+        b.direct(2);
+        b.listen()
+    });
     credential.rotate("tok-2");
     w.until("the stream listens again", |b| ops_count(b, "listen") == 2)
         .await;
@@ -1670,6 +1681,7 @@ async fn a_renewal_with_an_item_out_reopens_the_listen_stream_and_keeps_the_hand
     let receipts = w.calls("sub:delivery_receipt");
     assert_eq!(receipts.len(), 1);
     assert_eq!(receipts[0].auth.as_deref(), Some("Bearer tok-2"));
+    assert_eq!(next(&mut stream).await.unwrap().id, "direct:2");
 }
 
 // Decision (#1265): a credential that reports no changes (a static token) never reopens on its own: idle renews pass on the one listen stream.
@@ -1689,7 +1701,7 @@ async fn a_static_token_never_reopens_the_listen_stream() {
 // Decision (#1265): a reopen after a renewal that fails is an ordinary outage: the lease is dropped, the stream backs off, and the next round starts from whoami.
 #[tokio::test]
 async fn a_failed_reopen_after_a_renewal_backs_off_like_any_outage() {
-    let credential = Rotating::new();
+    let credential = Renewing::new();
     let unit = Duration::from_millis(100);
     let w = World::with_credential(
         Bus::new(&["a"]),

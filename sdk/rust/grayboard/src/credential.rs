@@ -68,6 +68,8 @@ const LIFETIME_MAX: Duration = Duration::from_secs(366 * 24 * 60 * 60);
 /// It reads the server's authorization-server metadata once (RFC 8414) and refuses metadata that names another issuer, so the caller pins the issuer; then it posts `grant_type=client_credentials` with the secret in the Basic header (`client_secret_basic`) and `resource` set to the MCP endpoint. A token is cached and re-minted at 80% of its lifetime, and once more when the server rejects it. A capacity refusal (`slow_down`, 429), a 5xx or an unreachable server backs off, the current token serving while it lasts; `invalid_client` (a revoked or expired credential or secret, a disabled service) and any other refusal are terminal: every later call fails without asking the server again.
 ///
 /// Cheap to clone: clones share one cache, so several `Client`s on one credential share its token (the server caps mints per credential per minute). The secret never appears in `Debug` output or in an error.
+///
+/// Use it within one Tokio runtime: `token` spawns the 80% renewal onto the current runtime (#1375), so it panics outside one, and a renewal parked on a runtime nobody drives leaves the current token serving until it expires.
 #[derive(Clone)]
 pub struct ClientCredentials {
     inner: Arc<Inner>,
@@ -119,9 +121,9 @@ struct State {
     dead: Option<String>,
     /// While set and in the future, no mint is attempted.
     retry_at: Option<Instant>,
-    /// The renewal task, if one was spawned (#1375 F3): aborted when the last clone drops.
+    /// The latest renewal task, if one was spawned (#1375 F3): aborted when the last clone drops. Never cleared when the task ends: aborting a finished task does nothing.
     renewal: Option<tokio::task::AbortHandle>,
-    /// `unauthorized` is answering a rejection: the next token installed, whoever minted it, is that answer and takes `replaced_rejected` (#1375 F4). Cleared by any mint's end.
+    /// `unauthorized` is answering a rejection: the next token installed, whoever minted it, is that answer and takes `replaced_rejected` (#1375 F4). Cleared only by that install (or a terminal refusal): a mint that fails transiently or is cancelled leaves it, so the retry after the backoff still answers the rejection.
     answering_rejection: bool,
     failures: u32,
     last_failure: String,
@@ -460,7 +462,6 @@ impl Drop for MintGuard<'_> {
             // Cut off mid-mint (the transport's request bound, a caller's timeout, a renewal aborted with the credential): a transient failure, so the next mint backs off.
             let mut s = self.inner.state();
             s.minting = false;
-            s.answering_rejection = false;
             self.inner
                 .back_off(&mut s, "a token request was cancelled".into(), None);
         }
@@ -642,11 +643,10 @@ impl Inner {
         let mut s = self.state();
         s.minting = false;
         guard.done = true;
-        // The mark goes with the token installed after the rejection, whichever caller minted it (#1375 F4); a failed mint answers the rejection with its error.
-        let answers_rejection = std::mem::take(&mut s.answering_rejection);
         match outcome {
             Ok(mut minted) => {
-                minted.replaced_rejected = answers_rejection;
+                // The mark goes with the token installed after the rejection, whichever caller minted it and however many attempts failed first (#1375 F4).
+                minted.replaced_rejected = std::mem::take(&mut s.answering_rejection);
                 minted.served = served;
                 let token = minted.token.clone();
                 s.current = Some(minted);
@@ -660,6 +660,7 @@ impl Inner {
                 let message = format!("the service credential is refused: {message}");
                 s.dead = Some(message.clone());
                 s.current = None;
+                s.answering_rejection = false;
                 Err(AuthError::terminal(message))
             }
             Err(MintError::Transient {
@@ -746,11 +747,13 @@ impl Inner {
     /// Spawns the renewal `step` claimed (`minting` set). The task holds the state, not the credential; the last clone's drop aborts it, and its guard records that as a cancelled mint.
     fn renew(self: &Arc<Self>) {
         let inner = Arc::clone(self);
+        // Spawned under the lock (spawning never blocks or awaits), so the handle is stored before the task can finish and another caller start a newer renewal: the newest handle is always the one kept. The task takes the lock only after its request.
+        let mut s = self.state();
         let task = tokio::spawn(async move {
             // Its outcome is recorded in the state; a failure leaves the current token serving until it expires.
             let _ = inner.mint_recorded(false).await;
         });
-        self.state().renewal = Some(task.abort_handle());
+        s.renewal = Some(task.abort_handle());
     }
 
     async fn token(self: &Arc<Self>) -> Result<String, AuthError> {

@@ -1137,3 +1137,25 @@ async fn an_unused_token_reaching_its_renewal_keeps_the_rejection_count() {
         "the second rejection in a row: two units"
     );
 }
+
+// #1375 F4 (audit F1): a transient failure of the rejection's own mint keeps the mark for the retry's token, so the server rejecting that one too mints no third token.
+#[tokio::test]
+async fn a_transient_mint_failure_keeps_the_rejection_mark() {
+    let auth = Auth::start(standard, |n| match n {
+        1 => refused(503, "temporarily_unavailable"),
+        _ => issued(&format!("tok-{n}"), 3600),
+    })
+    .await;
+    let c = auth
+        .credential()
+        .with_backoff_unit(Duration::from_millis(50));
+    assert_eq!(c.token().await.unwrap(), "tok-0");
+    c.unauthorized("tok-0").await.unwrap();
+    assert_eq!(c.token().await.unwrap(), "tok-2");
+    assert!(
+        c.unauthorized("tok-2").await.is_err(),
+        "{} mints",
+        auth.seen("/oauth/token").len()
+    );
+    assert_eq!(auth.seen("/oauth/token").len(), 3);
+}

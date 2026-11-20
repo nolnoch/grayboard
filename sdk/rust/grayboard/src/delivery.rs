@@ -735,7 +735,7 @@ impl Task {
         fail
     }
 
-    /// The credential installed a new token: the server closes this listen stream when the token it was opened with expires, so it is replaced now, under the same lease (#1265). Close, then open: listens count against a per-user cap, and every session on one credential renews at once, so opening first could need twice the slots. Hints are nonconsuming and the server keeps the inbox position, so the caller re-reads afterwards and a hint lost in the gap costs nothing. Not an outage, failure, lease loss or throttle, and no backoff; a reopen that fails is an ordinary round failure.
+    /// The credential installed a new token: the server closes this listen stream when the token it was opened with expires, so it is replaced now, under the same lease (#1265). Close, then open: listens count against a per-user cap, and every session on one credential renews at once, so opening first could need twice the slots; the server frees the old slot when it notices the dropped request, so at the cap the new listen can still be refused (an ordinary round failure). Hints are nonconsuming and the server keeps the inbox position, so the caller re-reads afterwards and a hint lost in the gap costs nothing. Not an outage, failure, lease loss or throttle, and no backoff; a reopen that fails is an ordinary round failure.
     async fn relisten(
         &mut self,
         sub: &Arc<Connection>,
