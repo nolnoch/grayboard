@@ -792,6 +792,9 @@ for (const mode of ["switch", "shutdown"] as const) {
       }
       await sigkill(grayboardChildPids(oc.pid)[0]!);
       await until(() => current.notices().some(n => n.includes("restarting it (3 of 3)")), 1_000, "the longest backoff scheduled");
+      // The notice is reported as the 5 s restart timer is set (RESTART_DELAYS_MS), so a prompt that waited for that
+      // restart couldn't complete before `scheduled + 5_000`; the bound below sits under it, less polling slack (#1252).
+      const scheduled = Date.now();
       let waiting: Promise<OpenCodeMessage> | undefined;
       if (mode === "switch") {
         // The old root's tool has entered the restart wait, not just queued a prompt.
@@ -805,7 +808,6 @@ for (const mode of ["switch", "shutdown"] as const) {
         expect(grayboardChildPids(oc.pid)).toEqual([]);
       }
       const fresh = await oc.create();
-      const before = Date.now();
       const result = opencodeTool(await oc.prompt(fresh, "who"), "whoami");
       expect(result.state.status).toBe("completed");
       expect(JSON.parse(result.state.output!).primary).toBe("oc-cancel");
@@ -814,7 +816,7 @@ for (const mode of ["switch", "shutdown"] as const) {
         expect(old.state.status).toBe("error");
         expect(old.state.error).toContain("root session changed");
       }
-      expect(Date.now() - before).toBeLessThan(2_000);
+      expect(Date.now() - scheduled).toBeLessThan(4_500);
       // Exercise a complete fresh retry cycle instead of sleeping past the
       // cancelled timer: its 5 s restart outlasts the outgoing deadline.
       for (let attempt = 0; attempt < 3; attempt++) {
