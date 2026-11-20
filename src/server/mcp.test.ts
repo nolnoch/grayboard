@@ -60,7 +60,7 @@ afterEach(async () => {
   expect(hosted.dormantLegacySessions).toBe(0);
   expect(hosted.activePosts).toBe(0);
   oauth.close();
-  application.stopExpiry();
+  await application.stopExpiry();
   await Bun.sleep(0);
   store.db.close();
   rmSync(blobDir, { recursive: true, force: true });
@@ -1590,7 +1590,7 @@ test("#807 P3 A7h2: a full pass whose rebuild throws still stops a live whose bi
 test("#899: another connection's commit reaches a stamped listen within a tick", async () => {
   const { Database } = await import("bun:sqlite");
   // Reopen the fixture on a file, so a second connection can commit to it.
-  await hosted.close(); oauth.close(); application.stopExpiry(); store.db.close();
+  await hosted.close(); oauth.close(); await application.stopExpiry(); store.db.close();
   const path = join(blobDir, "gb.db");
   store = openDatabase(path, { blobDir , sessionEnd: sessionEndPort("team") });
   application = createApplication(store.repo, { helloLimit: { burst: 10000, perSec: 10000 }, hostedRequestLimit: { burst: 10000, perSec: 10000 }, hostedSubscriberLimit: { burst: 10000, perSec: 10000 } });

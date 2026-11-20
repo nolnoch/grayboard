@@ -39,7 +39,7 @@ beforeEach(async () => {
 });
 afterEach(async () => {
   await hosted.close();
-  application.stopExpiry();
+  await application.stopExpiry();
   database.db.close();
   rmSync(dir, { recursive: true, force: true });
 });

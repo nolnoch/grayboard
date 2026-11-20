@@ -40,7 +40,7 @@ beforeEach(async () => {
   principal = authed;
 });
 afterEach(async () => {
-  await hosted.close(); application.stopExpiry(); oauth.close();
+  await hosted.close(); await application.stopExpiry(); oauth.close();
   store.db.close();
   rmSync(dir, { recursive: true, force: true });
 });

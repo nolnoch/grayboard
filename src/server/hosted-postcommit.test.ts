@@ -52,7 +52,7 @@ beforeEach(async () => {
   events = recipient.events;
 });
 afterEach(async () => {
-  await mcp.close(); oauth.close(); application.stopExpiry(); database.db.close();
+  await mcp.close(); oauth.close(); await application.stopExpiry(); database.db.close();
   rmSync(dir, { recursive: true, force: true });
 });
 
