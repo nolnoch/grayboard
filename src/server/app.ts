@@ -118,23 +118,51 @@ export function startServer(config: Config, opts: StartOptions = {}) {
     void response.then(() => inFlight.delete(response), () => inFlight.delete(response));
     return response;
   };
+  // The background passes running when stop() began (a revalidate tick, the retention pass, a claim expiry sweep), by
+  // name: stop() waits for them too, or one resumes from an await onto a closed database (#1489). None starts once
+  // `stopping` is set.
+  const passes = new Map<Promise<void>, string>();
+  let stopping = false;
+  const pass = (what: string, running: Promise<unknown>) => {
+    const settled = running.then(() => {}, () => {});
+    passes.set(settled, what);
+    void settled.then(() => passes.delete(settled));
+  };
+  // The revalidate tick, and the one tests call by hand; its promise is revalidate's own.
+  const runRevalidate = (): Promise<void> => {
+    if (stopping) return Promise.resolve();
+    let running: Promise<void>;
+    try { running = revalidate(); } catch (e) { running = Promise.reject(e); }
+    pass("revalidate pass", running);
+    return running;
+  };
+  // One deadline for all of it: the requests and passes, then the writes they (and the touch queue, the OAuth sweep)
+  // posted and nobody awaits, which a final write queued behind them outlasts (the queue is FIFO).
   async function drain(ms: number): Promise<void> {
-    if (inFlight.size === 0) return;
-    const plural = (n: number) => `${n} request${n === 1 ? "" : "s"}`;
+    const count = (suffix: string) => [
+      inFlight.size ? `${inFlight.size} request${inFlight.size === 1 ? "" : "s"}${suffix}` : "",
+      passes.size ? `${passes.size} background pass${passes.size === 1 ? "" : "es"}` : "",
+    ].filter(Boolean).join(" and ");
     // Bounded: unauthenticated requests are tracked too, so the list and each path are capped.
-    const named = () => { const all = [...inFlight.values()].map(w => w.length > 120 ? `${w.slice(0, 120)}…` : w); return all.length > 10 ? `${all.slice(0, 10).join(", ")} +${all.length - 10} more` : all.join(", "); };
-    console.error(`[grayboard] stopping: waiting for ${plural(inFlight.size)} in flight: ${named()}`);
+    const named = () => { const all = [...inFlight.values(), ...passes.values()].map(w => w.length > 120 ? `${w.slice(0, 120)}…` : w); return all.length > 10 ? `${all.slice(0, 10).join(", ")} +${all.length - 10} more` : all.join(", "); };
     let timer: ReturnType<typeof setTimeout> | undefined;
     const expired = new Promise<"expired">(resolve => { timer = setTimeout(() => resolve("expired"), ms); });
+    const fail = (what: string): never => {
+      // Said here as well: main.ts redacts a failed stop's error, and a method and path or a pass's name carry no secret.
+      const message = `stop: ${what}`;
+      console.error(`[grayboard] ${message}`);
+      throw new Error(message);
+    };
     try {
-      while (inFlight.size) {
-        if (await Promise.race([Promise.allSettled([...inFlight.keys()]), expired]) === "expired") {
-          // Said here as well: main.ts redacts a failed stop's error, and a method and path carry no secret.
-          const message = `stop: ${plural(inFlight.size)} never finished within ${ms} ms: ${named()}`;
-          console.error(`[grayboard] ${message}`);
-          throw new Error(message);
+      if (inFlight.size || passes.size) {
+        console.error(`[grayboard] stopping: waiting for ${count(" in flight")}: ${named()}`);
+        while (inFlight.size || passes.size) {
+          if (await Promise.race([Promise.allSettled([...inFlight.keys(), ...passes.keys()]), expired]) === "expired") {
+            fail(`${count("")} never finished within ${ms} ms: ${named()}`);
+          }
         }
       }
+      if (await Promise.race([repo.write(() => {}).then(() => {}, () => {}), expired]) === "expired") fail(`the queued writes never finished within ${ms} ms`);
     } finally { clearTimeout(timer); }
   }
 
@@ -214,14 +242,14 @@ export function startServer(config: Config, opts: StartOptions = {}) {
   catch (e) { void server.stop(true); throw e; }
 
   const timers: ReturnType<typeof setInterval>[] = [];
-  let stopRetention: (() => void) | undefined;
+  let stopRetention: (() => Promise<void>) | undefined;
   let stopPromise: Promise<void> | undefined;
   if (opts.background !== false) {
     timers.push(setInterval(sweepLimits, 30_000), setInterval(() => {
       // A throw here would surface as an unhandled error every 30 s with no context; log it and let the next tick retry.
       // Async since #807 P3 A7u2: a rejection is logged the same way, never left unhandled (Bun exits on one).
       const failed = (e: unknown) => console.error(`[grayboard] revalidate failed: ${(e as Error).stack ?? e}`);
-      try { revalidate().catch(failed); } catch (e) { failed(e); }
+      runRevalidate().catch(failed);
     }, 30_000));
     stopRetention = startRetentionJobs(repo, config, opts.retentionFirstDelayMs !== undefined ? { firstDelayMs: opts.retentionFirstDelayMs } : undefined, application.boardsChanged);
   }
@@ -238,8 +266,8 @@ export function startServer(config: Config, opts: StartOptions = {}) {
     db: testDb,
     // Exposed for tests: the bridge instance, to drive fatal stops directly.
     slack,
-    // The auth re-check and limiter sweep, for tests that run without it.
-    revalidate,
+    // The auth re-check and limiter sweep, for tests that run without it. Tracked as the timer's is: stop() waits for it.
+    revalidate: runRevalidate,
     sweepLimits,
     authGate,
     // Settles once the startup writes have committed (the listener waits for it); rejects when one failed.
@@ -251,16 +279,18 @@ export function startServer(config: Config, opts: StartOptions = {}) {
     metrics,
     stop() {
       if (stopPromise) return stopPromise;
+      stopping = true;
       slack?.stop();
       for (const t of timers) clearInterval(t);
-      stopRetention?.();
+      if (stopRetention) pass("retention pass", stopRetention());
       stopLag?.();
       void metrics?.stop(true);
-      stopExpiry();
+      pass("claim expiry pass", stopExpiry());
       touches.cancelAll();
       void server.stop(true);
       // After the startup writes settle: closing the database under a queued one would fail it mid-flight. Then the
-      // requests still in flight, once hosted MCP and the attachment routes have refused theirs (#218).
+      // requests still in flight, once hosted MCP and the attachment routes have refused theirs (#218), and the
+      // background passes already running (#1489).
       stopPromise = ready.catch(() => {}).then(() => Promise.allSettled([mcp.close(), attachments.close()])).then(async outcomes => {
         const drained = await drain(opts.stopDrainMs ?? STOP_DRAIN_MS).then(() => undefined, (error: unknown) => error);
         const failure = outcomes.find(outcome => outcome.status === "rejected");

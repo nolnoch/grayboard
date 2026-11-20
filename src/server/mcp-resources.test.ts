@@ -47,7 +47,7 @@ afterEach(async () => {
   expect(hosted.activeContexts).toBe(hosted.activeGetStreams);
   expect(hosted.activeResourceContexts).toBe(hosted.activeGetStreams);
   oauth.close();
-  application.stopExpiry();
+  await application.stopExpiry();
   store.db.close();
   rmSync(dir, { recursive: true, force: true });
 });
