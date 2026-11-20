@@ -819,6 +819,8 @@ export type PostOpts = {
   // A system post ending something already announced on the board (a claim's
   // release, update or expiry) still lands once the board is archived (#635).
   allowArchived?: boolean;
+  // A system post (a claim's announcement): on a queue board it's a broadcast, never work for the rotation (#1185).
+  system?: boolean;
   // Whose sight passes the gate in the author's stead: only a claim's end post for the claimant's user, when the
   // holder lost the board (#1286), derived from the claim row. No tool's arguments reach it.
   seenBy?: BoardPredicate;
@@ -1181,17 +1183,18 @@ export function post(
     const own = [...new Set([...(opts.addresses ?? [handle]), ...authorAddresses(db, handle, opts.author_id ?? null)])];
     const strict = opts.strictIds === true;
     const viewer = opts.author_id ?? handle;
-    const branch = postBranch(b, parentId, announcement);
+    const system = opts.system === true;
+    const branch = postBranch(b, parentId, announcement, system);
     const sees = (h: string) => a.canSee(h, b);
     const mayLane = laneHook(a, b);
     const facts: PostTargetFacts = {
-      board: b, handle, parentId, strict, gate: { announce, human, announcement }, own,
+      board: b, handle, parentId, strict, system, gate: { announce, human, announcement }, own,
       ackAddresses: opts.addresses ?? [handle], isViewer, isHuman: (h) => isHuman(db, h), sees, mayLane,
       mentions: { handles: [], unresolved: [] },
     };
     if (branch === "queue") {
       facts.mentions = resolveMentions(db, body, handle, b, strict, viewer);
-      facts.seenMentioned = seenHandles(db, viewer, facts.mentions.handles);
+      facts.seenMentioned = seenHandles(db, viewer, facts.mentions.handles).filter((h) => !own.includes(h));
       facts.lanesOnly = strict && !own.some(mayLane);
       if (needsRotation(facts.seenMentioned, mayLane, facts.lanesOnly)) {
         facts.lanes = orderLanes(queueLaneRows(db, board, own), isViewer, sees, mayLane, opts.online);
@@ -1226,22 +1229,22 @@ export type PostTarget = { reason: "mention" | "thread" | "subscription"; wake: 
 export type PostBranch = "queue" | "announcement" | "thread" | "broadcast";
 
 /**
- * A queue-kind board delivers each top-level post to exactly ONE subscriber: the claim IS the delivery. An archived
- * queue board takes no new work (#635): a claim's [release] or [expired] post landing there is a broadcast, never a
- * delivery. Replies follow thread semantics.
+ * A queue-kind board delivers each top-level post to exactly ONE subscriber: the claim IS the delivery. A system post
+ * (a claim's [claim], [release] or [expired]) is a notice, not work (#1185), and an archived queue board takes no new
+ * work (#635): either is a broadcast, never a delivery. Replies follow thread semantics.
  */
-export function postBranch(b: Board, parentId: number | null, announcement: boolean): PostBranch {
+export function postBranch(b: Board, parentId: number | null, announcement: boolean, system: boolean): PostBranch {
   if (announcement) return "announcement";
   if (parentId !== null) return "thread";
-  return !b.archived_at && (b.kind ?? "broadcast") === "queue" ? "queue" : "broadcast";
+  return !system && !b.archived_at && (b.kind ?? "broadcast") === "queue" ? "queue" : "broadcast";
 }
 
 /**
  * Whether a queue post goes to the rotation: no mention the author may see exists names anyone (#219, #871). With
  * `lanesOnly` (an author's own words, from a poster that may not be the board's lane), only a name that may be a lane
  * holds the post back: on a service's board an invoker named there is told, but the post still rotates to a lane
- * (#1256). A lane's own post and a system post's `cc @watcher` keep the plain rule: a lane answering an invoker, or a
- * claim's notice, isn't new work. Elsewhere every name may be a lane, so the two rules agree.
+ * (#1256). A lane's own post keeps the plain rule: a lane answering an invoker isn't new work (a claim's notice never
+ * reaches the queue branch: postBranch). Elsewhere every name may be a lane, so the two rules agree.
  */
 export const needsRotation = (seenMentioned: string[], mayLane: (h: string) => boolean, lanesOnly: boolean): boolean =>
   lanesOnly ? !seenMentioned.some(mayLane) : seenMentioned.length === 0;
@@ -1257,6 +1260,8 @@ export type PostTargetFacts = {
   handle: string;
   parentId: number | null;
   strict: boolean;
+  // A system post (PostOpts.system): postBranch never rotates it.
+  system: boolean;
   gate: PostGate;
   // The poster's address set and its writing session's (authorAddresses): never a target.
   own: string[];
@@ -1276,6 +1281,8 @@ export type PostTargetFacts = {
   thread?: ThreadFacts;
   // The poster may reach (access mayReach; always true where the mode has no such rule).
   reaches?: (h: string) => boolean;
+  // The visible mentions less the poster's own addresses (`own`): a self-mention names nobody else, so it doesn't hold
+  // the post back from the rotation (#1185).
   seenMentioned?: string[];
   // needsRotation's `lanesOnly`: strict, and no address in `own` may be a lane. Read only when `seenMentioned` is
   // non-empty and names no possible lane (otherwise both rules agree), so a caller may leave it false there.
@@ -1302,7 +1309,7 @@ function need<T>(v: T | undefined, what: string): T {
  */
 export function planPostTargets(f: PostTargetFacts): PostPlan {
   const { board: b, gate } = f;
-  const branch = postBranch(b, f.parentId, gate.announcement);
+  const branch = postBranch(b, f.parentId, gate.announcement, f.system);
   const targets = new Map<string, PostTarget>();
   let claim: PostPlan["claim"] = null;
   if (branch === "queue") {
