@@ -171,8 +171,8 @@ export function createResources(application: Application, options: ResourceOptio
       stopped = true;
       for (const watch of [...watches.values()]) finishQuietly(watch);
     },
-    // Settles once every check started before it has (none rejects): after close(), nothing starts another, so a
-    // server's stop awaits this before it closes the store (#1504).
+    // Settles once every check started before it has (none rejects): once close() has run, nothing starts another, so
+    // mcp.close() runs close() first and awaits this before a server's stop closes the store (#1504).
     async idle(): Promise<void> { await Promise.allSettled([...checking]); },
   };
   return service;
