@@ -600,6 +600,12 @@ async function main() {
     // The load: a scrape per window; a churn wave every churnEveryS.
     const start = Date.now(), end = start + o.durationS * 1000;
     let prev = await scrape(), prevTools = toolCumulative(prev), prevRef = refusalsTotal(prev), prevQueue = queueCumulative(prev), prevAt = Date.now();
+    // The connect storm's write bodies (#1537a): the first scrape is cumulative since the server started.
+    {
+      const bodies = [...prevQueue.hold.values()].reduce((a, h) => a + h.count, 0), keyed = [...prevQueue.keyed.values()].reduce((a, n) => a + n, 0);
+      const methods = [...prevQueue.gateMethod].filter(([, n]) => n).map(([k, n]) => `${k} ${n}`).join(", ");
+      log(`connect storm: ${bodies} bodies, ${bodies - keyed} exclusive, world stop ${prevQueue.worldStop.toFixed(1)} s; gate bodies by method:outcome: ${methods || "none"}`);
+    }
     let nextChurn = start + o.churnEveryS * 1000, churnUntil = 0, churnsSent = 0;
     // Each scrape asks every driver for its window since the last ask, so the two cover one span.
     // Report 0 opens the first window: what drivers did before the load started is dropped.
