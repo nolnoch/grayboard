@@ -67,6 +67,13 @@ export class ConnectRefused extends SubscriberError {
 export class ServerUnreachable extends Error {
   constructor(cause: unknown) { super("Server unreachable", { cause }); }
 }
+// A connect (`server/discover`, `initialize`) still refused `rate_limited` after
+// its last retry (#1536): the server is up but at capacity. A ServerUnreachable,
+// so every outage path retries it rather than reading the SDK's causeless
+// version-negotiation failure the 429 would otherwise become.
+export class ServerBusy extends ServerUnreachable {
+  constructor(readonly retryAfterMs: number) { super(new Error(`server at capacity (rate_limited); retry after ${retryAfterMs} ms`)); }
+}
 // A tool call's request left, then the transport failed (a reset, a gateway
 // 502-504, a stream cut short, a timeout): the server may have run it, so the
 // agent checks before calling again (#1345, the Rust SDK's OutcomeUnknown). A
@@ -164,6 +171,7 @@ abstract class Connection {
   admissionRetryAfterMs?: number;
   readonly connect: () => Promise<void>;
   private refusal?: ConnectRefused;
+  private busy?: ServerBusy;
   protected constructor(protected readonly wireOptions: WireOptions, authProvider: AuthProvider, readonly signal: AbortSignal, beforeRetry?: () => Promise<void>) {
     this.client = new Client(wireOptions.client, { versionNegotiation: { mode: { pin: "2026-07-28" } } });
     const endpoint = new URL(wireOptions.url);
@@ -187,12 +195,16 @@ abstract class Connection {
           if (method && connectMethods.has(method) && !response.ok && ![401, 403, 429].includes(response.status) && !gatewayStatuses.has(response.status)) {
             this.refusal = new ConnectRefused(response.status, (await response.clone().text().catch(() => "")).slice(0, 4096));
           }
+          if (response.ok) this.admissionRetryAfterMs = undefined;
           if (response.status !== 429) return response;
           const body = await response.clone().json().catch(() => undefined) as { error?: { data?: { code?: string; retry_after_ms?: number } } } | undefined;
           const data = body?.error?.data;
           if (data?.code !== "rate_limited" || typeof data.retry_after_ms !== "number" || !Number.isFinite(data.retry_after_ms) || data.retry_after_ms <= 0) return response;
           this.admissionRetryAfterMs = data.retry_after_ms;
-          if (attempt === 7) return response;
+          if (attempt === 7) {
+            if (method && connectMethods.has(method)) this.busy = new ServerBusy(data.retry_after_ms);
+            return response;
+          }
           await response.body?.cancel().catch(() => {});
           await sleep(Math.ceil(data.retry_after_ms), undefined, { signal });
         }
@@ -205,7 +217,7 @@ abstract class Connection {
     };
     this.connect = async () => {
       try { await this.reachable(this.client.connect(transport, { signal, timeout: 10_000 })); }
-      catch (error) { throw this.refusal ?? error; }
+      catch (error) { throw this.refusal ?? (this.signal.aborted ? undefined : this.busy) ?? error; }
     };
   }
   // Role headers and the `_meta` every request carries unless it names its own.
