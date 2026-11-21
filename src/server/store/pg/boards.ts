@@ -560,7 +560,7 @@ export function makePgBoards({ clock }: { clock: () => number }): BoardsStore {
           ON CONFLICT (handle, post_id) DO UPDATE SET delivered_at = NULL, wake = true, session_id = excluded.session_id`;
       }
       if (took.length === 0) return false;
-      await insertClaimEvent(sql, "take", lane, { key, note, board, expires_at: expires }, now);
+      await insertClaimEvent(tx, "take", lane, { key, note, board, expires_at: expires }, now);
       return true;
     },
     // core insertOutbox as one statement; a handle given twice keeps its first target, as core's row-by-row insert does.

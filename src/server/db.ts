@@ -237,6 +237,11 @@ export interface Repo {
   // `keys`; on SQLite it is post, run-now branch and all. For a write that reads no in-memory state and writes rows no
   // other body orders by (a posted audit row, audit.ts writeAudit).
   postKeyed<T>(keys: readonly string[], fn: (tx: Tx) => T | Promise<T>, committed?: (value: T) => unknown, what?: string): boolean;
+  // Runs fn in a read-only probe of `tx`'s transaction (#1510, docs/future/postgres-server.md D4): a statement fn sends
+  // on it that would write refuses ProbeWrite (store/tx_base.ts) before it's sent, and the probe rejects with it even if
+  // fn swallowed it. Postgres only (store/pg/tx.ts readsOnly): absent on SQLite, whose one writer has nothing to gain
+  // from a keyed body, so the hosted gate's keyed fast path is Postgres's.
+  readsOnly?<T>(tx: Tx, fn: () => Promise<T>): Promise<T>;
   // The store's read handle outside any transaction (#807 P1c): reads committed state. The task holding an open
   // transaction can't use it (sqliteOf refuses, #807 P3 A7e2): it passes its body's Tx. A Postgres Read is a pool
   // handle and must never resolve to a transaction's connection.

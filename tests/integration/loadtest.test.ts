@@ -99,7 +99,7 @@ describe("loadtest sizing", () => {
 
 describe("loadtest write-queue report (#1510)", () => {
   // Two scrapes' worth of exposition, in the server's format: hold by site, wait by site, depth.
-  const expo = (holdCum: number[], holdSum: number, depthCum: number[], keyed = 0, stop = 0) => [
+  const expo = (holdCum: number[], holdSum: number, depthCum: number[], keyed = 0, stop = 0, gate: [number, number, number] = [0, 0, 0]) => [
     ...["0.001", "0.002", "0.004", "+Inf"].map((le, i) => `grayboard_write_queue_hold_seconds_bucket{site="gate",le="${le}"} ${holdCum[i]}`),
     `grayboard_write_queue_hold_seconds_sum{site="gate"} ${holdSum}`, `grayboard_write_queue_hold_seconds_count{site="gate"} ${holdCum[3]}`,
     ...["0.001", "0.002", "0.004", "+Inf"].map((le, i) => `grayboard_write_queue_wait_seconds_bucket{site="gate",le="${le}"} ${holdCum[i]}`),
@@ -107,6 +107,7 @@ describe("loadtest write-queue report (#1510)", () => {
     ...["0", "1", "2", "+Inf"].map((le, i) => `grayboard_write_queue_depth_bucket{le="${le}"} ${depthCum[i]}`),
     `grayboard_write_queue_depth_sum 0`, `grayboard_write_queue_depth_count ${depthCum[3]}`,
     `grayboard_write_queue_keyed_bodies_total{site="gate"} ${keyed}`, `grayboard_write_queue_world_stop_seconds_total ${stop}`,
+    ...(["keyed", "miss", "skipped"] as const).map((o, i) => `grayboard_hosted_gate_bodies_total{site="gate",outcome="${o}"} ${gate[i]}`),
   ].join("\n");
 
   test("quantiles interpolate within a bucket, and one past the last edge reads as that edge", () => {
@@ -118,8 +119,8 @@ describe("loadtest write-queue report (#1510)", () => {
   });
 
   test("a window's numbers come from the deltas between two scrapes", () => {
-    const a = queueCumulative(parseMetrics(expo([10, 10, 10, 10], 0.005, [3, 3, 3, 3], 4, 0.5)));
-    const b = queueCumulative(parseMetrics(expo([10, 60, 110, 110], 0.205, [3, 5, 7, 7], 29, 1.3)));
+    const a = queueCumulative(parseMetrics(expo([10, 10, 10, 10], 0.005, [3, 3, 3, 3], 4, 0.5, [2, 1, 5])));
+    const b = queueCumulative(parseMetrics(expo([10, 60, 110, 110], 0.205, [3, 5, 7, 7], 29, 1.3, [20, 4, 9])));
     const q = queueStats(combineQueue(b, a, -1), 2);
     expect(q.bodies).toBe(100);
     expect(q.bodiesPerS).toBe(50);
@@ -132,6 +133,8 @@ describe("loadtest write-queue report (#1510)", () => {
     expect(q.keyed).toBeCloseTo(0.25, 9);
     expect(q.sites.gate!.keyed).toBeCloseTo(0.25, 9);
     expect(q.worldStop).toBeCloseTo(0.4, 9);
+    // The gate's fast path in the window: 18 keyed, 3 missed, 4 skipped; 3 of 21 attempts missed (#1510 chunk 3).
+    expect(q.gate).toEqual({ gate: { keyed: 18, miss: 3, skipped: 4, missRate: 3 / 21 } });
   });
 
   test("--pg-latency needs --pg", () => {

@@ -297,9 +297,14 @@ export function makePgHosted({ sessionEnd }: { sessionEnd: PgSessionEndPort }): 
     async restateWritesAs(tx, id, writesAs) {
       await pgOf(tx)`UPDATE ids SET writes_as = ${writesAs} WHERE id = ${id} AND writes_as IS NULL`;
     },
-    // One statement: two declarers get one true between them.
+    // Read first (#1510): every request of an ownership may declare and only its first writes, so the common call is a
+    // read, which the hosted gate's keyed fast path can make in its read-only probe (D4). The UPDATE alone decides: two
+    // declarers get one true between them.
     async declareLauncher(tx, id) {
-      return (await pgOf(tx)`UPDATE ids SET launcher = true WHERE id = ${id} AND launcher IS DISTINCT FROM true RETURNING 1`).length > 0;
+      const sql = pgOf(tx);
+      const [row] = await sql`SELECT launcher FROM ids WHERE id = ${id}`;
+      if (!row || row.launcher === true) return false;
+      return (await sql`UPDATE ids SET launcher = true WHERE id = ${id} AND launcher IS DISTINCT FROM true RETURNING 1`).length > 0;
     },
     async launcher(r, id) {
       const [row] = await pgOf(r)`SELECT launcher FROM ids WHERE id = ${id}`;
