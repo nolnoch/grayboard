@@ -12,7 +12,7 @@ import { AppSession } from "../../tests/support/app_session.ts";
 import { describePg, pgDatabase } from "../../tests/support/pg.ts";
 import { seed } from "../../tests/support/seed.ts";
 import { until } from "../../tests/support/until.ts";
-import { createApplication } from "./application.ts";
+import { createApplication, KeyedSendMiss } from "./application.ts";
 import { writeAudit } from "./audit.ts";
 import { createDelivery } from "./delivery.ts";
 import { createHostedSessions, sessionContext } from "./hosted.ts";
@@ -1049,7 +1049,7 @@ describePg("a first contact's creating entry is released on every exit (Postgres
 // renew is held at its lease UPDATE and a keyed receipt at its first markDelivered or board acknowledge (`state.hold`);
 // `state.entry`, while set, holds a renew or receipt after its gate, before its keyed body queues, so two of one root
 // can both be past their gates. Every wait has a deadline. Without GRAYBOARD_TEST_PG_URL it skips.
-async function leaseInstance(url: string, opts: { keyed?: false; side?: string } = {}) {
+async function leaseInstance(url: string, opts: { keyed?: false; keyedTools?: false; side?: string } = {}) {
   const blobDir = mkdtempSync(join(tmpdir(), "gb-pg-blobs-"));
   let clock = T0;
   const repo: PgRepo = await makePgRepo(url, { blobDir, applicationName: `gb-test-lease-${opts.side ?? "a"}`, max: 4, now: () => clock });
@@ -1099,7 +1099,7 @@ async function leaseInstance(url: string, opts: { keyed?: false; side?: string }
     }) as PgRepo["write"];
   }
   const application = createApplication(repo);
-  const hosted = createHostedSessions(application, { now: () => clock, isAuthorized: () => true });
+  const hosted = createHostedSessions(application, { now: () => clock, isAuthorized: () => true, ...(opts.keyedTools === false ? { keyedTools: false as const } : {}) });
   await hosted.ready;
   const delivery = createDelivery(hosted, { isAuthorized: () => true, ...(opts.keyed === false ? { keyed: false as const } : {}) });
   const user = await seed(repo, tx => repo.users.upsertByEmail(tx, ME, null));
@@ -1733,4 +1733,362 @@ describePg("control and owning reuse the exchange's verdict (#1537 C5, C7) (Post
       expect(seen.length).toBeGreaterThan(0);
     }, 600_000);
   }
+});
+
+// #1537 PR 5 (#1510 chunk 6a, docs/future/postgres-server.md D4): dm_send's tool body keyed on Postgres under the
+// sender's root, the recipient's stream (`dm:<address>`) and, when the recipient has a live holder, that holder's root
+// (D5's conservative key). A keyed send is held right after its INSERT (its id allocated, its row and FK locks taken)
+// by a gate on messages.insert, with the timer's bodies deferred meanwhile (an exclusive one queued behind a held keyed
+// body would hold every later body behind it); every wait has a deadline. Results and mutation killers: p1537/c5/result.md.
+const toolDelta = () => {
+  const at = { keyed: gateCount("tool", "keyed"), miss: gateCount("tool", "miss"), skipped: gateCount("tool", "skipped") };
+  return () => ({ keyed: gateCount("tool", "keyed") - at.keyed, miss: gateCount("tool", "miss") - at.miss, skipped: gateCount("tool", "skipped") - at.skipped });
+};
+const keyedTx = (tx: unknown) => (tx as { txn?: { keys?: ReadonlySet<string> } }).txn?.keys !== undefined;
+// Bodies queued under a call's own sites (its gate body, its tool body), not a timer's.
+const callWaiting = (x: LeaseInstance) => x.q.waitingAt("gate") + x.q.waitingAt("prior") + x.q.waitingAt("tool");
+// Keyed sends held after their insert while `hold` is set; `entered`: `<sender> > <recipient>` in insert order.
+function holdSends(x: LeaseInstance) {
+  const sends = { hold: undefined as Gate | undefined, held: 0, entered: [] as string[] };
+  const insert = x.repo.messages.insert;
+  x.repo.messages.insert = (async (tx: Tx, sender: string, type: string, recipient: string, ...rest: unknown[]) => {
+    const row = await (insert as (...a: unknown[]) => Promise<unknown>)(tx, sender, type, recipient, ...rest);
+    if (keyedTx(tx) && currentSite() === "tool" && sends.hold) {
+      sends.entered.push(`${sender} > ${recipient}`); sends.held++;
+      try { await sends.hold.wait; } finally { sends.held--; }
+    }
+    return row;
+  }) as typeof insert;
+  return sends;
+}
+const bound = (x: LeaseInstance, p: OAuthPrincipal, source: string, name: string) => x.hosted.bind(p, ctx(p, source), { name, create: true });
+const dm = (x: LeaseInstance, p: OAuthPrincipal, source: string, to: string, body: string, options: Parameters<LeaseInstance["application"]["send"]>[4] = {}) =>
+  x.hosted.dmSend(p, ctx(p, source), to, body, options);
+
+describePg("keyed dm_send (Postgres)", () => {
+  // Two sends to one recipient (from different roots, the recipient with no live holder) run one at a time on its
+  // stream key; a send to another recipient enters beside the held one. Ids then commit in allocation order per
+  // address. Mutation: the `dm:` key dropped from runTool's keys (the second send to r1 enters beside the first).
+  test("two sends to one recipient never overlap; a send to another recipient overlaps them", async () => {
+    await using db = await pgDatabase({ max: 2 });
+    await using x = await leaseInstance(db.url);
+    const p = await leasePrincipal(x, db.sql);
+    for (const [s, n] of [["root-s1", "s1"], ["root-s2", "s2"], ["root-s3", "s3"], ["root-r1", "r1"], ["root-r2", "r2"]]) await bound(x, p, s!, n!);
+    const sends = holdSends(x);
+    const d = toolDelta();
+    sends.hold = gate(); x.state.defer = gate();
+    const first = dm(x, p, "root-s1", `${ME}/r1`, "one");
+    await until(() => sends.held === 1, 10_000, "s1's send to r1 held after its insert");
+    const second = dm(x, p, "root-s2", `${ME}/r1`, "two");
+    try {
+      // Queued on r1's stream in its tool body, or (a slow run past the gate's fast path) earlier, in an exclusive body.
+      await until(() => callWaiting(x) === 1 || sends.held > 1, 10_000, "s2's send to r1 queued");
+      expect(sends.held).toBe(1);
+      const other = dm(x, p, "root-s3", `${ME}/r2`, "three");
+      await until(() => sends.held === 2, 10_000, "s3's send to r2 entered beside s1's to r1");
+      sends.hold.open();
+      await Promise.all([first, second, other]);
+    } finally { sends.hold.open(); x.state.defer?.open(); }
+    expect(sends.entered).toEqual([`${ME}/s1 > ${ME}/r1`, `${ME}/s3 > ${ME}/r2`, `${ME}/s2 > ${ME}/r1`]);
+    const r1 = await db.sql`SELECT id, body FROM messages WHERE recipient = ${`${ME}/r1`} ORDER BY id`;
+    expect(r1.map((r: { body: string }) => r.body)).toEqual(["one", "two"]);
+    expect(d()).toEqual({ keyed: 3, miss: 0, skipped: 0 });
+  });
+
+  // Two sends of one sender root run one at a time, whatever their recipients. Mutation: the sender's `root:` key
+  // dropped (the second enters beside the first).
+  test("two sends of one sender root run one at a time", async () => {
+    await using db = await pgDatabase({ max: 2 });
+    await using x = await leaseInstance(db.url);
+    const p = await leasePrincipal(x, db.sql);
+    for (const [s, n] of [["root-s1", "s1"], ["root-r1", "r1"], ["root-r2", "r2"]]) await bound(x, p, s!, n!);
+    const sends = holdSends(x);
+    sends.hold = gate(); x.state.defer = gate();
+    const first = dm(x, p, "root-s1", `${ME}/r1`, "one");
+    await until(() => sends.held === 1, 10_000, "the first send held");
+    const second = dm(x, p, "root-s1", `${ME}/r2`, "two");
+    try {
+      // It queues on the root key, in its gate body (site prior) or its tool body.
+      await until(() => callWaiting(x) === 1 || sends.held > 1, 10_000, "the second send queued on the sender's root");
+      expect(sends.held).toBe(1);
+    } finally { sends.hold.open(); x.state.defer?.open(); }
+    await Promise.all([first, second]);
+    expect(sends.entered).toEqual([`${ME}/s1 > ${ME}/r1`, `${ME}/s1 > ${ME}/r2`]);
+  });
+
+  // D5: a send to a recipient with a live holder (an open lease) waits for a keyed renew of that holder's root, which
+  // can finish or rebuild the holder (its notice), then lands and wakes the lease. Mutation: the holder's `root:` key
+  // dropped (the send commits while the renew is held).
+  test("a send to a live holder waits for a running keyed renew of its root, then wakes the lease", async () => {
+    await using db = await pgDatabase({ max: 2 });
+    await using x = await leaseInstance(db.url);
+    const p = await leasePrincipal(x, db.sql);
+    await bound(x, p, "root-s1", "s1");
+    const { c, id, lease, wakes } = await leased(x, p, "root-a", "fe");
+    const d = toolDelta();
+    x.advance(1_000);
+    x.state.hold = gate(); x.state.defer = gate();
+    const renewed = x.delivery.renew(p, c, lease.capability);
+    await until(() => x.state.held === 1, 10_000, "the renew held at its update");
+    const before = wakes.n;
+    // Whether the send's insert ran while the renew was held.
+    let early = false;
+    const insert = x.repo.messages.insert;
+    x.repo.messages.insert = ((...a: Parameters<typeof insert>) => { if (x.state.held > 0) early = true; return insert(...a); }) as typeof insert;
+    const sent = dm(x, p, "root-s1", `${ME}/fe`, "to the holder");
+    try {
+      // Queued on the holder's root in its tool body, or (a slow run past the gate's fast path) earlier, exclusive.
+      await until(() => callWaiting(x) === 1 || early, 10_000, "the send queued behind the held renew");
+      expect(early).toBe(false);
+      expect(x.state.entered).toEqual([`renew ${id}`]);
+    } finally { x.state.hold.open(); x.state.defer?.open(); }
+    await renewed;
+    expect(await sent).toMatchObject({ delivered_now: true });
+    await until(() => wakes.n > before, 10_000, "the lease woke for the DM");
+    expect(d()).toEqual({ keyed: 1, miss: 0, skipped: 0 });
+  });
+
+  // A→B beside B→A (neither recipient with a live holder, so their keys are disjoint): both held after their inserts
+  // at once, neither waits on the other's locks (their rows in common take share locks at most: a reply's parent
+  // FOR KEY SHARE), and both commit, with no 40P01.
+  test("A to B and B to A held at once commit with no lock wait and no deadlock", async () => {
+    await using db = await pgDatabase({ max: 3 });
+    await using x = await leaseInstance(db.url);
+    const p = await leasePrincipal(x, db.sql);
+    await bound(x, p, "root-a", "fa"); await bound(x, p, "root-b", "fb");
+    const sends = holdSends(x);
+    const d = toolDelta();
+    sends.hold = gate(); x.state.defer = gate();
+    const ab = dm(x, p, "root-a", `${ME}/fb`, "a to b"), ba = dm(x, p, "root-b", `${ME}/fa`, "b to a");
+    try {
+      await until(() => sends.held === 2, 10_000, "both sends held after their inserts");
+      expect(await lockWaiters(db.sql)).toBe(0);
+    } finally { sends.hold.open(); x.state.defer?.open(); }
+    await Promise.all([ab, ba]);
+    expect(d()).toEqual({ keyed: 2, miss: 0, skipped: 0 });
+    expect((await db.sql`SELECT count(*)::int AS n FROM messages`)[0].n).toBe(2);
+  });
+
+  // A drain whose read lands mid-burst (a push session binding the recipient, held after its read) loses nothing:
+  // sends committed before the read come through the drain, sends committed while it's held go to session.draining
+  // through deliverSend (the keyed body's afterCommit effect), and each arrives once, in id order. Mutation: the keyed
+  // body without effects (deliverSend refuses; the sends reject).
+  test("a drain read in the middle of a burst of keyed sends loses nothing and delivers in id order", async () => {
+    await using db = await pgDatabase({ max: 2 });
+    await using x = await leaseInstance(db.url);
+    const p = await leasePrincipal(x, db.sql);
+    await bound(x, p, "root-s1", "s1"); await bound(x, p, "root-s2", "s2");
+    const first = new AppSession(x.application, x.repo, p.authed, "rx", { key: "rx-key", bind: { create: true } });
+    await first.connect();
+    first.close();
+    const d = toolDelta();
+    const ids: number[] = [];
+    const burst = async (tag: string) => {
+      const out = await Promise.all([dm(x, p, "root-s1", `${ME}/rx`, `${tag} s1`), dm(x, p, "root-s2", `${ME}/rx`, `${tag} s2`)]);
+      ids.push(...out.map(r => (r as { message_id: number }).message_id));
+    };
+    await burst("before");
+    const rx = new AppSession(x.application, x.repo, p.authed, "rx", { key: "rx-key", bind: { create: true } });
+    try {
+      await hostedPause("server:drain:after-read", () => rx.connect(), async () => { await burst("during"); });
+      await burst("after");
+      const got = () => rx.events.filter(e => e.kind === "direct").map(e => (e as { message: { id: number } }).message.id);
+      await until(() => got().length >= ids.length, 10_000, "every message delivered to rx");
+      expect(got()).toEqual([...ids].sort((a, b) => a - b));
+    } finally { rx.close(); }
+    expect(d().keyed).toBe(6);
+  });
+
+  // The plan's live holder changed before the keyed body (a lease opened for the recipient after the pool's plan, so
+  // the body holds no key of that root): the body's check before its insert misses, writing nothing, and the
+  // exclusive body sends and wakes the new lease. Mutation: handleSend's holder guard dropped (the send runs keyed).
+  test("a recipient whose live holder changed after the plan misses before the insert, and the exclusive body sends", async () => {
+    await using db = await pgDatabase({ max: 2 });
+    await using x = await leaseInstance(db.url);
+    const p = await leasePrincipal(x, db.sql);
+    await bound(x, p, "root-s1", "s1"); await bound(x, p, "root-a", "fe");
+    const planned = gate(), arrived = gate();
+    const plan = x.application.sendPlan;
+    x.application.sendPlan = async (...a) => { const out = await plan(...a); arrived.open(); await planned.wait; return out; };
+    const d = toolDelta();
+    const sent = dm(x, p, "root-s1", `${ME}/fe`, "to a new holder");
+    await arrived.wait;
+    const wakes = { n: 0 };
+    let lease;
+    try {
+      lease = await x.delivery.open(p, ctx(p, "root-a"), { changed: () => { wakes.n++; } });
+      x.delivery.accept(lease);
+    } finally { planned.open(); }
+    expect(await sent).toMatchObject({ delivered_now: true });
+    expect(d()).toEqual({ keyed: 0, miss: 1, skipped: 0 });
+    await until(() => wakes.n > 0, 10_000, "the new lease woke for the DM");
+    expect((await db.sql`SELECT count(*)::int AS n FROM messages`)[0].n).toBe(1);
+  });
+
+  // A plan whose recipient the body resolves differently misses before anything is written (the store's refusal of a
+  // keyed insert without its `dm:` key is the backstop). Mutation: handleSend's recipient check dropped (the insert
+  // refuses with a plain error and the send rejects).
+  test("a plan whose recipient the body resolves differently misses, and the exclusive body sends", async () => {
+    await using db = await pgDatabase({ max: 2 });
+    await using x = await leaseInstance(db.url);
+    const p = await leasePrincipal(x, db.sql);
+    await bound(x, p, "root-s1", "s1"); await bound(x, p, "root-r1", "r1");
+    const plan = x.application.sendPlan;
+    x.application.sendPlan = async (...a) => { const out = await plan(...a); return out && { ...out, to: `${ME}/elsewhere` }; };
+    const d = toolDelta();
+    expect(await dm(x, p, "root-s1", `${ME}/r1`, "one")).toMatchObject({ delivered_now: false });
+    expect(d()).toEqual({ keyed: 0, miss: 1, skipped: 0 });
+    expect((await db.sql`SELECT recipient FROM messages`).map((r: { recipient: string }) => r.recipient)).toEqual([`${ME}/r1`]);
+  });
+
+  // A Slack-bridge human's session never plans keyed (its bodies share one afterRollback), nor runs sendKeyed; a send to
+  // a human holder (the bridge's registered session) plans none either. Mutation: sendPlan's or sendKeyed's
+  // `session.human` check dropped; sendPlan's human-holder check dropped.
+  test("a human sender's send, or one to a human holder, has no keyed plan, and sendKeyed refuses a human as a miss", async () => {
+    await using db = await pgDatabase({ max: 2 });
+    await using x = await leaseInstance(db.url);
+    const p = await leasePrincipal(x, db.sql);
+    await bound(x, p, "root-r1", "r1");
+    const { session: human } = await x.application.attachHuman(p.authed, { deliver() {}, closed() {} });
+    expect(await x.application.sendPlan(human, `${ME}/r1`)).toBeUndefined();
+    const agent = new AppSession(x.application, x.repo, p.authed, "s1", { bind: { create: true } });
+    await agent.connect();
+    try {
+      expect(await x.application.sendPlan(agent.session, `${ME}/r1`)).toMatchObject({ to: `${ME}/r1` });
+      expect(await x.application.sendPlan(agent.session, `${ME}/human`)).toBeUndefined();
+    } finally { agent.close(); }
+    const plan = { from: human.primary, to: `${ME}/r1`, live: undefined, holder: null };
+    await expect(x.repo.writeKeyedSend!([`root:none`, `dm:${ME}/r1`], tx => x.application.sendKeyed(tx, human, plan, `${ME}/r1`, "hi"))).rejects.toBeInstanceOf(KeyedSendMiss);
+    expect((await db.sql`SELECT count(*)::int AS n FROM messages`)[0].n).toBe(0);
+  });
+
+  // The enforcement (D4): a keyed body without the recipient's `dm:` key refuses messages.insert before any statement;
+  // writeKeyedSend takes only a root and exactly one stream, and lets its afterCommit effects run where a plain keyed
+  // body refuses them. Mutation: writeKeyedSend's key check dropped (the malformed key sets run).
+  test("a keyed insert without its dm: key refuses; writeKeyedSend takes a root and exactly one stream, and runs its effects", async () => {
+    await using db = await pgDatabase({ max: 2 });
+    await using x = await leaseInstance(db.url);
+    const p = await leasePrincipal(x, db.sql);
+    await bound(x, p, "root-r1", "r1");
+    const insert = (tx: Tx) => x.repo.messages.insert(tx, `${ME}/s`, "user", `${ME}/r1`, "x", null);
+    await expect(x.repo.writeKeyed(["root:a"], insert)).rejects.toThrow(`without the key dm:${ME}/r1`);
+    await expect(x.repo.writeKeyedSend!(["root:a", `dm:${ME}/r2`], insert)).rejects.toThrow(`without the key dm:${ME}/r1`);
+    for (const keys of [[`dm:${ME}/r1`], ["root:a"], ["root:a", `dm:${ME}/r1`, `dm:${ME}/r2`], ["root:", `dm:${ME}/r1`], ["root:a", "dm:"]]) {
+      await expect(x.repo.writeKeyedSend!(keys, insert)).rejects.toThrow("writeKeyedSend: a keyed send names a root and exactly one recipient stream");
+    }
+    let ran = 0;
+    await expect(x.repo.writeKeyed(["root:a"], async tx => { tx.afterCommit(() => { ran++; }); })).rejects.toThrow("afterCommit effect refused in a keyed write body");
+    await x.repo.writeKeyedSend!(["root:a", `dm:${ME}/r1`], async tx => { await insert(tx); tx.afterCommit(() => { ran++; }); });
+    expect(ran).toBe(1);
+    expect((await db.sql`SELECT count(*)::int AS n FROM messages`)[0].n).toBe(1);
+  });
+
+  // A normal exchange: the selection's verdict, then dm_send reusing it (withPrior), keyed in its tool body: counted as
+  // the tool site's dm_send keyed, the prior's tool keyed, and one keyed body at the queue's `tool` site. The body's
+  // statements are pinned so a later cut changes them on purpose (#1537 C6 among them): to a same-user recipient with
+  // no live holder (isAuthorized stubbed, so fence's authorization reads nothing; fence takes no grant lock), 17
+  // statements in 13 round trips: BEGIN; fence's store.lock (the root probe, then the row FOR UPDATE; rootOf reuses
+  // them); sendKeyed's disabled read; the recipient's alias find (memoized: aliasHidden and the wake reuse it); dedup's
+  // SAVEPOINT, prune and first claim (one flight); isHuman; the insert; lastSeen and the undelivered count (one
+  // flight); the receipt upsert; RELEASE; the hosted.write audit and the auth-mark read (one flight); COMMIT.
+  test("dm_send in a normal exchange runs keyed, counted by method, with a pinned statement count", async () => {
+    await using db = await pgDatabase({ max: 2 });
+    await using x = await leaseInstance(db.url);
+    const p = await leasePrincipal(x, db.sql);
+    await bound(x, p, "root-s1", "s1"); await bound(x, p, "root-r1", "r1");
+    const c = ctx(p, "root-s1");
+    await dm(x, p, "root-s1", `${ME}/r1`, "warm");
+    const at = statementTotals("tool"), prior = gateCount("prior", "keyed", "tool"), d = toolDelta(), method = gateCount("tool", "keyed", "dm_send");
+    const { verdict } = await x.hosted.snapshot(p, c, false);
+    await x.hosted.dmSend(p, c, `${ME}/r1`, "in an exchange", {}, undefined, verdict);
+    const now = statementTotals("tool");
+    expect(d()).toEqual({ keyed: 1, miss: 0, skipped: 0 });
+    expect(gateCount("tool", "keyed", "dm_send") - method).toBe(1);
+    expect(gateCount("prior", "keyed", "tool") - prior).toBe(1);
+    expect({ bodies: now.bodies - at.bodies, statements: now.statements - at.statements, roundTrips: now.roundTrips - at.roundTrips }).toEqual({ bodies: 1, statements: 17, roundTrips: 13 });
+  });
+});
+
+describePg("keyed dm_send rows (Postgres)", () => {
+  // The sender's binding changed after the call's gate (its root's bind_gen moved while the call waits at
+  // hosted:tool:in-gate): the keyed body's fence refuses it unbound, a miss with nothing written, and the exclusive
+  // body's fence refuses it again. Mutation: runTool's keyed body without its fence (the send commits keyed).
+  test("a sender whose binding changed after the gate is refused unbound, keyed attempt and exclusive body alike", async () => {
+    await using db = await pgDatabase({ max: 2 });
+    await using x = await leaseInstance(db.url);
+    const p = await leasePrincipal(x, db.sql);
+    await bound(x, p, "root-s1", "s1"); await bound(x, p, "root-r1", "r1");
+    const d = toolDelta();
+    const out = await hostedPause("hosted:tool:in-gate", () => dm(x, p, "root-s1", `${ME}/r1`, "after rebind"), async () => {
+      const bumped = await db.sql`UPDATE hosted_sessions SET bind_gen = bind_gen + 1 WHERE source_session_id = 'root-s1' AND root_session_id IS NULL RETURNING session_id`;
+      expect(bumped).toHaveLength(1);
+    }).then(r => `sent ${JSON.stringify(r)}`, (e: { code?: string; message?: string }) => `refused ${e.code}: ${e.message}`);
+    expect(out).toBe("refused unbound: session binding changed; select the current binding again");
+    expect(d()).toEqual({ keyed: 0, miss: 1, skipped: 0 });
+    expect((await db.sql`SELECT count(*)::int AS n FROM messages`)[0].n).toBe(0);
+  });
+
+  // One script on two databases, keyed tool bodies on and off: keyed sends (plain, a replay, a resend, pending, a reply,
+  // to a live holder), misses (a policy deny, whose authz.decision row the exclusive body writes once; a missing
+  // alias's refusal; a disabled user, whose session the exclusive body terminates) and a skip (a send with files). Every row matches, message ids included (no keyed attempt
+  // allocated one). Mutations: runTool's miss path skipping the exclusive body (the deny row and refusal differ);
+  // the keyed attempt's refusal rows flushed as well as the exclusive body's (two deny rows).
+  test("keyed sends and miss-then-exclusive write the same rows as the exclusive bodies alone", async () => {
+    const script = async (x: LeaseInstance, sql: Awaited<ReturnType<typeof pgDatabase>>["sql"]) => {
+      const p = await leasePrincipal(x, sql);
+      const other = await seed(x.repo, async tx => {
+        const u = await x.repo.users.upsertByEmail(tx, "other@example.com", null);
+        await x.repo.aliases.create(tx, { scope_kind: "person", scope_ref: u.email, name: "human" }, u.email);
+        return u;
+      });
+      await bound(x, p, "root-s1", "s1"); await bound(x, p, "root-r1", "r1");
+      await leased(x, p, "root-a", "fe");
+      const d = toolDelta();
+      // The replay's note and first_at, and last_seen's age, carry the wall clock the two runs don't share.
+      const outcome = (q: Promise<unknown>) => q.then(r => JSON.stringify(r), (e: { code?: string; message?: string }) => `refused ${e.code}: ${e.message}`)
+        .then(t => t.replace(/\d{4}-\d\d-\d\dT[\d:.]+Z/g, "<time>").replace(/-?\d+[smhd] ago/g, "<ago>"));
+      const out: string[] = [];
+      const step = async (q: Promise<unknown>) => { out.push(await outcome(q)); x.advance(10); };
+      await step(dm(x, p, "root-s1", `${ME}/r1`, "one"));
+      await step(dm(x, p, "root-s1", `${ME}/r1`, "one"));
+      await step(dm(x, p, "root-s1", `${ME}/r1`, "one", { resend: true }));
+      await step(dm(x, p, "root-s1", `${ME}/r1`, "owe me", { pending: true }));
+      const parent = Number((await sql`SELECT min(id) AS id FROM messages`)[0].id);
+      await step(dm(x, p, "root-r1", `${ME}/s1`, "reply", { parent_id: parent }));
+      await step(dm(x, p, "root-s1", `${ME}/fe`, "to the holder"));
+      await step(dm(x, p, "root-s1", `${other.email}/human`, "denied"));
+      await step(dm(x, p, "root-s1", `${ME}/nobody`, "missing"));
+      await step(dm(x, p, "root-s1", `${ME}/r1`, "with files", { attachment_ids: [999] }));
+      // Last: the user's row marked disabled after the call's gate, before its tool body, by a bare UPDATE (users.setDisabled
+      // would also end the sessions, which fence then refuses first; isAuthorized is stubbed, so fence passes): the keyed
+      // body misses on its own user read, and the exclusive body's valid() terminates the session and refuses.
+      await step(hostedPause("hosted:tool:in-gate", () => dm(x, p, "root-s1", `${ME}/r1`, "disabled"),
+        async () => { await sql`UPDATE users SET disabled_at = ${x.clock} WHERE id = ${p.authed.user_id}`; }));
+      await atSite("other", () => x.repo.write(() => {}));
+      return { counts: d(), out };
+    };
+    const dump = async (sql: Awaited<ReturnType<typeof pgDatabase>>["sql"]) => {
+      const out: Record<string, string[]> = {};
+      // Receipts' `at`, holds' bound_at, a replay's first_at and last_seen's age are the wall clock, which the runs don't share.
+      for (const [table, drop] of [["messages", []], ["write_receipts", ["at"]], ["mailbox_cursors", []], ["access_log", ["id"]], ["hosted_sessions", []], ["binding_events", ["id"]], ["ids", []], ["alias_holds", ["bound_at"]]] as const) {
+        const rows: Array<Record<string, unknown>> = await sql.unsafe(`SELECT * FROM ${table}`);
+        out[table] = rows.map(r => JSON.stringify(Object.fromEntries(Object.entries(r).filter(([k]) => !(drop as readonly string[]).includes(k)).sort(([a], [b]) => a < b ? -1 : 1)), (_k, v) => typeof v === "bigint" ? String(v) : v)
+          .replace(/\d{4}-\d\d-\d\dT[\d:.]+Z/g, "<time>").replace(/-?\d+[smhd] ago/g, "<ago>")).sort();
+      }
+      return out;
+    };
+    await using fastDb = await pgDatabase({ max: 2 });
+    await using refDb = await pgDatabase({ max: 2 });
+    let fastRows: Record<string, string[]>, refRows: Record<string, string[]>, fast: Awaited<ReturnType<typeof script>>, ref: Awaited<ReturnType<typeof script>>;
+    { await using x = await leaseInstance(fastDb.url, { side: "fast" }); fast = await script(x, fastDb.sql); fastRows = await dump(fastDb.sql); }
+    { await using x = await leaseInstance(refDb.url, { side: "ref", keyedTools: false }); ref = await script(x, refDb.sql); refRows = await dump(refDb.sql); }
+    expect(fast.out).toEqual(ref.out);
+    expect(fast.counts).toEqual({ keyed: 6, miss: 3, skipped: 1 });
+    expect(ref.counts).toEqual({ keyed: 0, miss: 0, skipped: 10 });
+    expect(fast.out.at(-1)).toMatch(/^refused/);
+    expect(fastRows).toEqual(refRows);
+    expect(fastRows.access_log!.filter(r => r.includes('"authz.decision"'))).toHaveLength(1);
+    expect(fastRows.access_log!.filter(r => r.includes('"request.replayed"'))).toHaveLength(1);
+    expect(fastRows.access_log!.filter(r => r.includes('"request.resent"'))).toHaveLength(1);
+  });
 });

@@ -122,15 +122,17 @@ export function statementTotals(site: QueueSite): { bodies: number; statements: 
 // exchange's `selection`, a tool call's own `tool` gate, `control`'s renew, receipt, pending and release, `owning`'s
 // open, bind and unbind, and the rest by name); for the `prior` site the call that reused its exchange's verdict in
 // place of that gate body (withPrior: a native tool call's `tool`, and since #1537 C5/C7 the subscriber's renew,
-// receipt, pending, open and bind); renew and receipt have one each, their own.
-export const GATE_SITES = ["gate", "prior", "renew", "receipt"] as const;
+// receipt, pending, open and bind); renew and receipt have one each, their own. The `tool` site is a keyed tool body
+// (#1537 PR 5, hosted.ts dmSend), its method the tool (dm_send, the one so far): `skipped` there is SQLite, the keyed
+// path turned off, or a send whose plan says exclusive (application.sendPlan).
+export const GATE_SITES = ["gate", "prior", "renew", "receipt", "tool"] as const;
 export const GATE_OUTCOMES = ["keyed", "miss", "skipped"] as const;
-export const GATE_METHODS = ["selection", "tool", "transfer", "whoami", "end", "open", "bind", "unbind", "owning", "renew", "receipt", "pending", "release", "control"] as const;
+export const GATE_METHODS = ["selection", "tool", "transfer", "whoami", "end", "open", "bind", "unbind", "owning", "renew", "receipt", "pending", "release", "control", "dm_send"] as const;
 export type GateSite = typeof GATE_SITES[number];
 export type GateOutcome = typeof GATE_OUTCOMES[number];
 export type GateMethod = typeof GATE_METHODS[number];
 export const PRIOR_METHODS = ["tool", "renew", "receipt", "pending", "open", "bind"] as const satisfies readonly GateMethod[];
-const SITE_METHOD: Record<"renew" | "receipt", GateMethod> = { renew: "renew", receipt: "receipt" };
+const SITE_METHOD: Record<"renew" | "receipt" | "tool", GateMethod> = { renew: "renew", receipt: "receipt", tool: "dm_send" };
 const gateKey = (site: GateSite, method: GateMethod, outcome: GateOutcome) => `${site}:${method}:${outcome}`;
 // Every series present from the start, so a rate() over a fresh process starts at zero.
 const gateFast = new Map<string, number>([

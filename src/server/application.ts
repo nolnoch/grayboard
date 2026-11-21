@@ -1445,6 +1445,43 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
       await valid(session, false, tx);
       return handleSend(hub, tx, session, recipient, body, options.parent_id ?? null, options.pending === true, options.attachment_ids, options.resend === true, options.as);
     },
+    // A dm_send's plan for a keyed body (#1537 PR 5, D4), read on the pool, or undefined when it runs exclusive
+    // (`send` as ever): a Slack-bridge human's session (its bodies share one afterRollback, 808 §1.5), a closed or
+    // read-only one, a send with files (a replay's blob sweep and the upload quota stay exclusive in v1), one whose
+    // recipient doesn't resolve (the exclusive body gives the refusal and writes its row), and one to a Slack-bridge
+    // human's live session (its sink would run the bridge's delivery in the keyed body's commit).
+    async sendPlan(session: ApplicationSession, recipient: string, options: { parent_id?: number; attachment_ids?: unknown; as?: string } = {}): Promise<SendPlan | undefined> {
+      if (session.human || session.readOnly || !session.active || hub.delegateRows !== undefined) return undefined;
+      if (options.attachment_ids !== undefined && !(Array.isArray(options.attachment_ids) && options.attachment_ids.length === 0)) return undefined;
+      try {
+        const from = await sendAs(hub, repo.read, session, options.as, options.parent_id ?? null);
+        const to = await resolvePeer(repo, repo.read, from, recipient, session.sessionId || from);
+        if (to.kind === "team") return undefined;
+        const live = hub.registry.get(to.address);
+        if (live?.human) return undefined;
+        return { from, to: to.address, live, holder: live ? live.hostedRoot || live.sessionId || null : null };
+      } catch (error) {
+        if (error instanceof ApplicationError || error instanceof CoreError) return undefined;
+        throw error;
+      }
+    },
+    // `send` in a keyed body under `plan` (hosted.ts dmSend): valid()'s checks without its terminate, whose row
+    // writes and registry changes stay exclusive (a disabled user, a closed or read-only session each throw
+    // KeyedSendMiss or the refusal, and the exclusive body then refuses and writes as it would have); a delegate's
+    // rows in flight (hub.delegateRows, a delegate body's) the same; then handleSend checking its resolution
+    // against the plan.
+    async sendKeyed(
+      tx: Tx, session: ApplicationSession, plan: SendPlan, recipient: string, body: string,
+      options: { parent_id?: number; pending?: boolean; attachment_ids?: number[]; resend?: boolean; as?: string } = {},
+    ) {
+      stillOpen(session);
+      if (session.human || session.readOnly || hub.delegateRows !== undefined) throw new KeyedSendMiss("the session's state needs the exclusive body");
+      const disabled = await repo.users.isDisabled(tx, session.authed.user_id);
+      await testPauseAsync("valid:user:read");
+      stillOpen(session);
+      if (disabled) throw new KeyedSendMiss("its user is disabled");
+      return handleSend(hub, tx, session, recipient, body, options.parent_id ?? null, options.pending === true, options.attachment_ids, options.resend === true, options.as, plan);
+    },
     async delegate(tx: Tx, session: ApplicationSession, request: Omit<DelegateRequest, "type" | "req_id">) {
       await valid(session, false, tx);
       return handleDelegate(hub, tx, session, request);
@@ -1709,13 +1746,14 @@ type Peer = Exclude<ParsedAddress, { kind: "bare" }>;
 // `viewer` (the session's ID, else `from`) is whose sight the not-found
 // suggestions follow (#348), as peer_list's: the session's user, not the
 // address it acts as.
-async function resolvePeer(repo: Repo, r: Read, from: string, input: string, viewer: string = from): Promise<Peer> {
+// `find`: the caller's alias lookup (a send's memo, aliasFinder); the store's by default.
+async function resolvePeer(repo: Repo, r: Read, from: string, input: string, viewer: string = from, find: AliasFind = directFind(repo)): Promise<Peer> {
   const p = addressParts(input);
   if (!p) fail("bad_request", `invalid address "${input}": expected "id:…", "scope/name" or "team:name"`);
   if (p.kind !== "bare") return p;
   const scope = await ownScopeOn(repo, r, from);
   const own = scope ? addressParts(`${scope}/${p.name}`) : null;
-  if (own?.kind === "alias" && (await repo.aliases.find(r, own.address))) return own;
+  if (own?.kind === "alias" && (await find(r, own.address))) return own;
   if (p.name === HUMAN_NAME) {
     // A bare "human" is always your own (addressing.ts HUMAN_NAME), never the
     // one alias anyone has with the name: another user's is reached by its
@@ -1742,12 +1780,38 @@ async function resolvePeer(repo: Repo, r: Read, from: string, input: string, vie
 // see exists: to anyone outside the team its names read as missing (alias.see, #348), for mail too (#1014); a
 // service's names are its own and its service_invoke holders' (alias.see_service, #270 D4), so anyone else's mail to
 // one reads like mail to a missing name. A person's names are an open directory.
-async function aliasHidden(repo: Repo, r: Read, viewer: string, address: string): Promise<boolean> {
-  const a = await repo.aliases.find(r, address);
+async function aliasHidden(repo: Repo, r: Read, viewer: string, address: string, find: AliasFind = directFind(repo)): Promise<boolean> {
+  const a = await find(r, address);
   if (!a || a.scope_kind === "person" || a.scope_ref === null) return false;
   const vp = await seerIn(repo, r, viewer, a.scope_kind === "service");
   return vp === null || !(await authorize(repo, r, {}, { verb: "alias.see", principal: vp, scope: { scope_kind: a.scope_kind, scope_ref: a.scope_ref } })).allow;
 }
+
+// An alias lookup by address on the handle given (#1537 C6). `aliasFinder`'s is one send body's memo: resolvePeer,
+// prepareSend, aliasHidden and wakeUser each read the recipient's alias, up to five times per send, and the body
+// writes no alias, so the first read answers the rest. On Postgres (READ COMMITTED) each statement already saw its
+// own instant, so the memo only fixes which one; every check here reads one alias row and decides on it alone. The
+// handle is the caller's per call (a savepoint's inside writeOnce), all of one transaction.
+type AliasFind = (r: Read, address: string) => ReturnType<Repo["aliases"]["find"]>;
+const directFind = (repo: Repo): AliasFind => (r, address) => repo.aliases.find(r, address);
+function aliasFinder(repo: Repo): AliasFind {
+  const seen = new Map<string, ReturnType<Repo["aliases"]["find"]>>();
+  return (r, address) => {
+    let found = seen.get(address);
+    if (!found) seen.set(address, found = repo.aliases.find(r, address));
+    return found;
+  };
+}
+
+// A keyed dm_send's plan (#1537 PR 5, docs/future/postgres-server.md D4), resolved on the pool before its body:
+// `from` the address it goes out as, `to` the recipient's full handle, `live` the recipient's registered holder then
+// (undefined: none), and `holder` that holder's root, whose key the body also takes (D5's conservative key: a renew of
+// that root rebuilds or finishes the holder). The body resolves all three again (handleSend `keyed`); any difference
+// is a KeyedSendMiss.
+export type SendPlan = { from: string; to: string; live: ApplicationSession | undefined; holder: string | null };
+// A keyed send that must run exclusive instead: thrown inside its keyed body, before the message's insert, so the body
+// rolls back with nothing written and its caller runs the exclusive body (hosted.ts dmSend).
+export class KeyedSendMiss extends Error {}
 
 // A send checked and resolved, ready to write: `from` the address it goes
 // out as, `to` the recipient's full handle, `digests` its files' blob
@@ -1776,6 +1840,7 @@ async function sendAs(hub: Hub, r: Read, session: ApplicationSession, as: string
 // write is still ambient until the audit slice).
 async function prepareSend(
   hub: Hub, r: Tx, session: ApplicationSession, from: string, recipientStr: string, body: string, parentId: number | null, pending: boolean, attachmentIdsRaw: unknown,
+  find: AliasFind = directFind(hub.repo),
 ): Promise<PreparedSend> {
   const { repo } = hub;
   let ids: number[];
@@ -1789,7 +1854,7 @@ async function prepareSend(
     throw e;
   }
 
-  const to = await resolvePeer(repo, r, from, recipientStr, session.sessionId || from);
+  const to = await resolvePeer(repo, r, from, recipientStr, session.sessionId || from, find);
   if (to.kind === "team") fail("bad_request", `${to.address} isn't a person; to reach a team, board_post to its board #${to.name}`);
   // An ID's deliverability is checked in the write's transaction (writeSend).
   // A team's alias the sender may not see reads as one nobody has (#1014), unless this replies in a thread with it:
@@ -1800,7 +1865,7 @@ async function prepareSend(
     const parent = await repo.messages.getById(r, parentId);
     return participant(parent, session.addresses) && replyPeer(parent, session.addresses) === address;
   }
-  if (to.kind === "alias" && (!(await repo.aliases.find(r, to.address)) || ((await aliasHidden(repo, r, session.sessionId || from, to.address)) && !(await replyingTo(to.address))))) {
+  if (to.kind === "alias" && (!(await find(r, to.address)) || ((await aliasHidden(repo, r, session.sessionId || from, to.address, find)) && !(await replyingTo(to.address))))) {
     fail("not_found", `identity "${to.address}" not found; peer_list shows exact handles`);
   }
   const req: AuthzRequest = { verb: "msg.send", from, to: to.address };
@@ -1826,17 +1891,21 @@ async function prepareSend(
 // queued body. Binds change the registry only in queued bodies or afterCommit (D4), but a session's close
 // (a request's end, the bridge's detach, a revalidate's terminate) changes it at once, outside the queue: so the
 // recipient is read again after the wake decision's await, and the result says what deliverSend would do then.
-async function writeSend(hub: Hub, tx: Tx, session: ApplicationSession, p: PreparedSend): Promise<Written<SendResult> & { msg: MessageRow }> {
+// `find`: the send's alias memo (aliasFinder). `guard`: called with no await before the insert's statement is sent (a
+// keyed send's last resolution check, sendKeyed); a throw there writes nothing.
+async function writeSend(hub: Hub, tx: Tx, session: ApplicationSession, p: PreparedSend, find: AliasFind = directFind(hub.repo), guard?: () => void): Promise<Written<SendResult> & { msg: MessageRow }> {
   const { repo, registry } = hub;
   let msg: MessageRow;
   try {
-    if (addressParts(p.to)?.kind === "id") {
-      const why = await repo.sessionEnd.refusal(tx, p.to);
-      if (why) throw why;
-    }
     // Every send is its sender's own words (dm_send, delegate): the row records whether the sender bears the human
-    // mark now, in the write's transaction (#1364), as a post's does (#1355).
-    const human = await repo.aliases.isHuman(tx, p.from);
+    // mark now, in the write's transaction (#1364), as a post's does (#1355). Read beside an ID's end check, which is
+    // independent of it (#1537 C6: one round trip on Postgres).
+    const [why, human] = await Promise.all([
+      addressParts(p.to)?.kind === "id" ? repo.sessionEnd.refusal(tx, p.to) : undefined,
+      repo.aliases.isHuman(tx, p.from),
+    ]);
+    if (why) throw why;
+    guard?.();
     msg = await repo.messages.insert(tx, p.from, "user", p.to, p.body, p.parentId, p.pending, { ids: p.ids, uploader: uploaderOf(session) }, session.writerId ?? null, session.via ?? null, session.authed.user_email, human);
   } catch (e) {
     if (e instanceof CoreError) throw coreRefusal(e);
@@ -1849,14 +1918,21 @@ async function writeSend(hub: Hub, tx: Tx, session: ApplicationSession, p: Prepa
     // Named whenever it isn't the primary (S4).
     ...(p.from !== session.primary ? { sent_as: p.from } : {}),
   };
-  const seen = (await repo.bindings.lastSeen(tx, [p.to])).get(p.to) ?? null;
-  const decided = await unwoken(repo, tx, session, registry.get(p.to), p.to);
+  // Independent reads, in one flight on Postgres (#1537 C6): the recipient's last sight, the wake decision, and, when
+  // no live holder is there to take the message now, the sender's undelivered count for the queued answer.
+  const before = registry.get(p.to);
+  const [seenOf, decided, undeliveredEarly] = await Promise.all([
+    repo.bindings.lastSeen(tx, [p.to]),
+    unwoken(repo, tx, session, before, p.to, find),
+    before?.active ? undefined : repo.messages.undeliveredFrom(tx, session.addresses),
+  ]);
+  const seen = seenOf.get(p.to) ?? null;
   await testPauseAsync("send:wake:decided");
   // Read after the await (#807 P3 A7f2, H-A): a wake note about a holder that closed meanwhile is dropped.
   const live = registry.get(p.to);
   // Snapshot with `live`: wakeUser may await an alias read (#807 P3 A7f3), and the payload must describe one instant.
   const liveActive = live?.active;
-  const wake = (await wakeUser(repo, tx, live, p.to)) === decided.user ? decided.fields : {};
+  const wake = (await wakeUser(repo, tx, live, p.to, find)) === decided.user ? decided.fields : {};
   const payload: SendResult = liveActive
     ? { message_id: msg.id, delivered_now: true, ...f, ...wake }
     : {
@@ -1864,7 +1940,7 @@ async function writeSend(hub: Hub, tx: Tx, session: ApplicationSession, p: Prepa
         delivered_now: false,
         ...f,
         ...(seen ? { recipient_last_seen: `${age(hub.now() - seen)} ago` } : {}),
-        undelivered_from_you: (await repo.messages.undeliveredFrom(tx, session.addresses)).find((u) => u.recipient === p.to)?.n ?? 1,
+        undelivered_from_you: (undeliveredEarly ?? await repo.messages.undeliveredFrom(tx, session.addresses)).find((u) => u.recipient === p.to)?.n ?? 1,
         note: queuedNote(p.to, seen),
         ...wake,
       };
@@ -1875,10 +1951,10 @@ async function writeSend(hub: Hub, tx: Tx, session: ApplicationSession, p: Prepa
 }
 
 // The user a wake is judged against: `live`'s, else a person alias's; undefined says nothing.
-async function wakeUser(repo: Repo, r: Read, live: ApplicationSession | undefined, to: string): Promise<string | undefined> {
+async function wakeUser(repo: Repo, r: Read, live: ApplicationSession | undefined, to: string, find: AliasFind = directFind(repo)): Promise<string | undefined> {
   if (live?.human || to.endsWith(`/${HUMAN_NAME}`)) return undefined;
   if (live) return live.authed.user_email;
-  const a = await repo.aliases.find(r, to);
+  const a = await find(r, to);
   return a?.scope_kind === "person" ? a.scope_ref ?? undefined : undefined;
 }
 
@@ -1890,8 +1966,8 @@ async function wakeUser(repo: Repo, r: Read, live: ApplicationSession | undefine
 // alias or an ID with no live holder says nothing, as does a human (a person
 // reads it; msg.send already decided reach). Each pull decides again
 // (pending()), so this reflects the grant at send time, not a promise.
-async function unwoken(repo: Repo, r: Read, session: ApplicationSession, live: ApplicationSession | undefined, to: string): Promise<{ user: string | undefined; fields: { wakes?: false; wake_note?: string } }> {
-  const toUser = await wakeUser(repo, r, live, to);
+async function unwoken(repo: Repo, r: Read, session: ApplicationSession, live: ApplicationSession | undefined, to: string, find: AliasFind = directFind(repo)): Promise<{ user: string | undefined; fields: { wakes?: false; wake_note?: string } }> {
+  const toUser = await wakeUser(repo, r, live, to, find);
   if (toUser === undefined) return { user: undefined, fields: {} };
   const decision = await authorize(repo, r, {}, { verb: "msg.wake", from_user: session.authed.user_email, to_user: toUser });
   if (decision.allow) return { user: toUser, fields: {} };
@@ -1951,13 +2027,22 @@ async function writeOnce<W extends Written>(
   return out;
 }
 
+// `keyed`: the plan a keyed body runs under (application.sendKeyed): this body's own resolution must give the same
+// sender, recipient and live holder, or it throws KeyedSendMiss, the last check right before the insert's statement.
 async function handleSend(
   hub: Hub, tx: Tx, session: ApplicationSession, recipient: string, body: string, parentId: number | null, pending: boolean, ids: unknown, resend: boolean, as: string | undefined,
+  keyed?: SendPlan,
 ): Promise<SendResult> {
-  const p = await prepareSend(hub, tx, session, await sendAs(hub, tx, session, as, parentId), recipient, body, parentId, pending, ids);
+  const find = aliasFinder(hub.repo);
+  const from = await sendAs(hub, tx, session, as, parentId);
+  if (keyed && from !== keyed.from) throw new KeyedSendMiss("its sender resolved differently in the body");
+  const p = await prepareSend(hub, tx, session, from, recipient, body, parentId, pending, ids, find);
+  if (keyed && p.to !== keyed.to) throw new KeyedSendMiss("its recipient resolved differently in the body");
+  if (keyed && p.ids.length) throw new KeyedSendMiss("it carries files");
+  const guard = keyed && (() => { if (hub.registry.get(p.to) !== keyed.live) throw new KeyedSendMiss("the recipient's live holder changed"); });
   // Keyed by what the server resolved, so two spellings of one call collide.
   const args = { to: p.to, body: p.body, parent_id: p.parentId, pending: p.pending, attachments: p.digests };
-  const out = await writeOnce(hub, tx, session, "dm_send", p.from, args, resend, p.ids, sp => writeSend(hub, sp, session, p));
+  const out = await writeOnce(hub, tx, session, "dm_send", p.from, args, resend, p.ids, sp => writeSend(hub, sp, session, p, find, guard || undefined));
   if ("replay" in out) return out.replay;
   tx.afterCommit(() => {
     // Committed, not yet answered: a lost answer's window (tests force it here).

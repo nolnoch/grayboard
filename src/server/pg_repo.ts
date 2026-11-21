@@ -99,6 +99,15 @@ export async function makePgRepo(url: string, opts: PgRepoOptions): Promise<PgRe
     if (other !== undefined) return Promise.reject(new Error(`writeKeyedEffects: a keyed body may not queue ${other}'s notices; only ${[...KEYED_NOTICE_OPS].join(", ")} (docs/future/postgres-server.md D4)`));
     return t.writeKeyed(keys, fn, committed, { effects: true, notices });
   }) as NonNullable<Repo["writeKeyedEffects"]>;
+  // dm_send's keyed body (#1537 PR 5, D4): effects on (deliverSend's afterCommit), no notice, no `committed`. The keys
+  // are checked here, not trusted to the caller: a root and exactly one recipient stream.
+  const writeKeyedSend = (<T>(keys: readonly string[], fn: (tx: Tx) => Promise<T>): Promise<T> => {
+    const streams = keys.filter(k => k.startsWith("dm:") && k.length > 3);
+    if (!keys.some(k => k.startsWith("root:") && k.length > 5) || streams.length !== 1) {
+      return Promise.reject(new Error(`writeKeyedSend: a keyed send names a root and exactly one recipient stream (dm:<address>); got ${keys.join(", ")} (docs/future/postgres-server.md D4)`));
+    }
+    return t.writeKeyed(keys, fn, undefined, { effects: true });
+  }) as NonNullable<Repo["writeKeyedSend"]>;
   // The end a released hosted child's ID ends through, made from the finished Repo on first use, as db.ts openDatabase does.
   let port: SessionEndPort | undefined;
   const hosted = makePgHosted({ sessionEnd: deferredSessionEnd(() => port ??= sessionEndPort(opts.humanReach ?? "team")(repo)) });
@@ -127,6 +136,7 @@ export async function makePgRepo(url: string, opts: PgRepoOptions): Promise<PgRe
     postKeyed: t.postKeyed,
     readsOnly: t.readsOnly,
     writeKeyedEffects,
+    writeKeyedSend,
     writeQueue: t.queue,
     read: t.read,
     authRead: auth.authRead,

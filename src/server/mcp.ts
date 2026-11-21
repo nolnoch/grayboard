@@ -1324,16 +1324,19 @@ function registerNativeTools(server: McpServer, application: Application, hosted
   // the agent reads, stays `error: <message>`.
   const shown = (e: unknown) => e instanceof ApplicationError && e.code !== "internal" || e instanceof CoreError ? e.message : "internal error";
   const refusal = (e: unknown): CallToolResult => ({ ...text(`error: ${shown(e)}`), structuredContent: domainData(e), isError: true });
-  const run = async (ctx: ServerContext, tool: string, call: (session: ApplicationSession, tx: Tx) => unknown): Promise<CallToolResult> => {
+  // A tool through `go` (hosted.run, or dmSend's keyed path, #1537 PR 5): its result, or its refusal, with any notice.
+  const runAs = async (ctx: ServerContext, tool: string, go: (context: Context, told: (notice: string) => void) => Promise<unknown>): Promise<CallToolResult> => {
     let notice: string | undefined;
     try {
-      return said(text(await timeTool(tool, async () => { const context = await current(ctx); return hosted.run(context.principal, context.sessionContext, tool, call, n => { notice = n; }, context.verdict, context.request.signal); }) ?? "ok"), notice);
+      return said(text(await timeTool(tool, async () => go(await current(ctx), n => { notice = n; })) ?? "ok"), notice);
     }
     catch (e) {
       report(e, tool);
       return said(refusal(e), notice);
     }
   };
+  const run = (ctx: ServerContext, tool: string, call: (session: ApplicationSession, tx: Tx) => unknown) =>
+    runAs(ctx, tool, (context, told) => hosted.run(context.principal, context.sessionContext, tool, call, told, context.verdict, context.request.signal));
   server.registerTool("whoami", { description: "This request's current session binding, or unbound candidates.", inputSchema: WHOAMI_INPUT }, async (_, ctx) => {
     let notice: string | undefined;
     try {
@@ -1363,7 +1366,7 @@ function registerNativeTools(server: McpServer, application: Application, hosted
   }
   const dm = NATIVE_DM_TOOLS;
   server.registerTool("dm_send", dm.dm_send,
-    (a, ctx) => run(ctx, "dm_send", (session, tx) => application.send(tx, session, a.to as string, a.body as string, a as Parameters<typeof application.send>[4])));
+    (a, ctx) => runAs(ctx, "dm_send", (context, told) => hosted.dmSend(context.principal, context.sessionContext, a.to as string, a.body as string, a as Parameters<typeof application.send>[4], told, context.verdict, context.request.signal)));
   server.registerTool(DELEGATE_TOOL.name, {
     description: DELEGATE_TOOL.description,
     inputSchema: NATIVE_DELEGATE_INPUT,
