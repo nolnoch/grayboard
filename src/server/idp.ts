@@ -10,6 +10,7 @@ import type { Tx } from "./store/tx.ts";
 import { googleProvider } from "./idp_google.ts";
 import { oidcProvider } from "./idp_oidc.ts";
 import { keycloakDirectoryStatus } from "./idp_keycloak_directory.ts";
+import { oktaDirectoryStatus } from "./idp_okta_directory.ts";
 
 // issuer: half of the stored key, the provider's constant, never a token's `iss`.
 export type UpstreamIdentity = { issuer: string; subject: string; email: string; displayName: string | null };
@@ -43,12 +44,13 @@ export const callbackPath = (p: Pick<IdentityProvider, "id">) => `/oauth/${p.id}
 
 // The providers a server signs in with when OAuthOptions.providers doesn't inject any, built from Config alone in
 // GRAYBOARD_IDPS's order (#928 D6): Google with the client pair the AS uses (mcpGoogle, else the primary), Okta and
-// oidc (#1418) as the generic OIDC provider, with Keycloak's directory check when configured (#1555). loadConfig has checked the list (checkIdpConfig); nothing is fetched here (D2).
+// oidc (#1418) as the generic OIDC provider, with Okta's (#1563) and Keycloak's (#1555) directory checks when configured. loadConfig has checked the list (checkIdpConfig); nothing is fetched here (D2).
 export function defaultProviders(config: Config): IdentityProvider[] {
   return (config.idps ?? ["google"]).map(id => {
     if (id === "okta") {
       if (!config.okta) throw new Error("GRAYBOARD_IDPS lists okta without its configuration");
-      return oidcProvider({ id: "okta", label: "Okta", ...config.okta });
+      const provider = oidcProvider({ id: "okta", label: "Okta", ...config.okta });
+      return config.oktaDirectory ? { ...provider, status: oktaDirectoryStatus(config.oktaDirectory) } : provider;
     }
     if (id === "oidc") {
       if (!config.oidc) throw new Error("GRAYBOARD_IDPS lists oidc without its configuration");

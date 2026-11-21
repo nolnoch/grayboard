@@ -8,6 +8,7 @@ import { GOOGLE_ISSUER, googleProvider } from "../../src/server/idp_google.ts";
 import { exportPKCS8, generateKeyPair } from "jose";
 import { oidcProvider } from "../../src/server/idp_oidc.ts";
 import { keycloakDirectoryStatus } from "../../src/server/idp_keycloak_directory.ts";
+import { oktaDirectoryStatus, parseOktaDirectoryKey } from "../../src/server/idp_okta_directory.ts";
 import { createIdpRecheck, TRANSIENT_BACKOFF_MS } from "../../src/server/idp_recheck.ts";
 import { accessAudits } from "../support/audit.ts";
 import { exec, row } from "../support/repo_sql.ts";
@@ -357,4 +358,45 @@ test("Keycloak's directory check: enabled confirms, disabled or gone disables; a
   expect((await refresh(b.refreshToken)).status).toBe(200);
   expect((await user(B))!.disabled_at).toBeNull();
   expect((await accessAudits(srv, "auth.idp_check_failed")).map(x => x.detail.error_class)).toEqual(["keycloak_locked_out"]);
+});
+
+// #1563: the okta provider with Okta's directory check, pointed at a scripted org (DPoP off, Bearer tokens), through the
+// same refresh path.
+test("Okta's directory check: ACTIVE confirms, SUSPENDED, DEPROVISIONED or gone disables; STAGED is transient and classed", async () => {
+  const ORG = "https://example.okta.com", OKTA_ISSUER = `${ORG}/oauth2/default`;
+  const statuses: Record<string, string> = { "00uC": "LOCKED_OUT", "00uA": "SUSPENDED", "00uB": "STAGED", "00uE": "DEPROVISIONED" };
+  const fakeOkta = (async (input: string | URL | Request) => {
+    const url = String(input);
+    if (url === `${ORG}/oauth2/v1/token`) return Response.json({ access_token: "t", expires_in: 3600, token_type: "Bearer" });
+    const id = url.slice(url.lastIndexOf("/") + 1);
+    if (url.startsWith(`${ORG}/api/v1/users/`))
+      return statuses[id] ? Response.json({ id, status: statuses[id] }) : Response.json({ errorCode: "E0000007", errorSummary: "Not found" }, { status: 404 });
+    return new Response("", { status: 599 });
+  }) as typeof fetch;
+  const pem = await exportPKCS8((await generateKeyPair("RS256", { extractable: true })).privateKey);
+  const okta: IdentityProvider = {
+    ...oidcProvider({ id: "okta", label: "Okta", issuer: OKTA_ISSUER, clientId: "grayboard", clientSecret: "s", allowedDomains: ["example.com"] }),
+    status: oktaDirectoryStatus({ orgUrl: ORG, clientId: "0oa1checker", ...parseOktaDirectoryKey(pem, undefined) }, { fetch: fakeOkta, now: () => clock }),
+  };
+  clock = Date.now(); calls = [];
+  srv = await TestServer.open({ idpRecheck: { recheckHours: 24, maxStaleHours: 72, disableLimit: 5 }, admins: [ROOT] },
+    { now: () => clock, oauth: { now: () => clock, providers: [okta] } });
+  await srv.app.ready;
+  const D = "dave@example.com", E = "erin@example.com";
+  const link = (email: string, subject: string, hoursAgo: number) =>
+    exec(srv, "UPDATE users SET idp_issuer = ?, idp_subject = ?, idp_checked_at = ? WHERE email = ?", OKTA_ISSUER, subject, clock - hoursAgo * HOUR, email);
+  const c = await grant(C), a = await grant(A), b = await grant(B), d = await grant(D), e = await grant(E);
+  await link(C, "00uC", 25); await link(A, "00uA", 25); await link(B, "00uB", 25); await link(D, "00uGone", 25); await link(E, "00uE", 25);
+  // A password lockout is active, and the positive arms the guard for the disables below.
+  expect((await refresh(c.refreshToken)).status).toBe(200);
+  expect((await user(C))!.idp_checked_at).toBe(clock);
+  for (const [who, t] of [[A, a], [D, d], [E, e]] as const) {
+    expect((await refresh(t.refreshToken)).status).toBe(400);
+    expect((await user(who))!.disabled_at).not.toBeNull();
+  }
+  expect((await accessAudits(srv, "auth.idp_disabled")).map(x => x.detail)).toEqual(Array(3).fill({ provider: "okta", issuer: OKTA_ISSUER, reason: "inactive" }));
+  // STAGED is neither answer: Bob keeps working within the stale bound, and the class says why.
+  expect((await refresh(b.refreshToken)).status).toBe(200);
+  expect((await user(B))!.disabled_at).toBeNull();
+  expect((await accessAudits(srv, "auth.idp_check_failed")).map(x => x.detail.error_class)).toEqual(["okta_status_unknown"]);
 });
