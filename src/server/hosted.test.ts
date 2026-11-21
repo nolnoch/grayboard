@@ -1082,6 +1082,55 @@ test("an aborted request's queued gate body is skipped and creates no row (#1535
   expect(hostedRowCount(database.db)).toBe(rows + 1);
 });
 
+// Bind and unbind (`owning`'s body, site "other"), held past their gate at `hosted:owning:before-txn`, then queued
+// behind a holder and aborted: each rejects RequestAbortedError and leaves the holds as they were. Mutation: owning's
+// write without its signal (the bind holds, the unbind releases).
+for (const op of ["bind", "unbind"] as const) test(`an aborted ${op}'s queued body is skipped and leaves the holds as they were (#1535)`, async () => {
+  await hosted.bind(principal, context("root"), { name: "fe", create: true });
+  const q = queueFor(database.db);
+  const ac = new AbortController();
+  let release!: () => void, holder!: Promise<void>;
+  const start = () => op === "bind"
+    ? hosted.bind(principal, context("root"), { name: "skipme", create: true }, undefined, ac.signal)
+    : hosted.unbind(principal, context("root"), { name: "fe" }, undefined, ac.signal);
+  const call = paused("hosted:owning:before-txn", start, async () => {
+    holder = q.run(() => new Promise<void>(r => { release = r; }));
+    void until(() => q.waitingAt("other") === 1, 5000, `the ${op} body to queue behind the holder`).then(() => ac.abort());
+  });
+  const failed = await call.then(() => undefined, (e: unknown) => e);
+  release();
+  await holder;
+  expect(failed).toBeInstanceOf(RequestAbortedError);
+  await database.repo.write(() => {});
+  expect(await application.aliasHolderId(application.repo.read, "you@example.com/skipme")).toBeNull();
+  expect(await application.aliasHolderId(application.repo.read, "you@example.com/fe")).not.toBeNull();
+});
+
+// A tool call reusing its exchange's verdict (`prior`): its keyed touch queued behind a holder and aborted rejects
+// RequestAbortedError, without falling back to the full gate, and the tool never runs. Mutation: withPrior's write
+// without its signal (the touch runs and the tool after it).
+test("an aborted call's queued prior touch is skipped, with no fallback to the gate (#1535)", async () => {
+  await hosted.bind(principal, context("root"), { name: "fe", create: true });
+  const verdict = (await hosted.snapshot(principal, context("root"), false)).verdict;
+  expect(verdict).toBeDefined();
+  now += 10_000;
+  const q = queueFor(database.db);
+  let release!: () => void;
+  const holder = q.run(() => new Promise<void>(r => { release = r; }));
+  const ac = new AbortController();
+  let ran = false;
+  const call = hosted.run(principal, context("root"), "whoami", () => { ran = true; }, undefined, verdict, ac.signal).then(() => undefined, (e: unknown) => e);
+  try {
+    await until(() => q.waitingAt("prior") === 1, 5000, "the prior touch to queue behind the holder");
+    ac.abort();
+    expect(await call).toBeInstanceOf(RequestAbortedError);
+    expect(q.waitingAt("gate")).toBe(0);
+  } finally { release(); }
+  await holder;
+  await database.repo.write(() => {});
+  expect(ran).toBe(false);
+});
+
 test("bind publishes its new hold before the after-commit pause and the first hold's mail still reaches the root", async () => {
   await hosted.bind(principal, context("root"), { name: "fe", create: true });
   const sender = new AppSession(application, database.repo, principal.authed, "sender", { push: false });

@@ -711,6 +711,64 @@ for (const stage of ["selection", "tool body"] as const) test(`HTTP native: a cl
   if (stage === "tool body") expect(await app.repo.boards.get(app.repo.read, "abandoned")).toBeUndefined();
 });
 
+// #1535: an ending call's selection is never skipped. A subscriber's session_end or delivery_release whose client
+// aborts while its selection waits behind a held queue: the selection's gate body still runs (no skip counted). The
+// call itself is then refused by select()'s post-selection abort check, as before #1535. Mutation: mcp.ts passing
+// request.signal to an ending call's snapshot (the gate body is skipped and counted).
+for (const ending of ["session_end", "delivery_release"] as const) test(`HTTP subscriber: a client abort while ${ending}'s selection waits never skips its gate body (#1535)`, async () => {
+  const identity = `ending-${ending === "session_end" ? "end" : "release"}`;
+  const issued = await issueOAuth(app.repo, app.oauth.resource, "carol@example.com", ["grayboard:tools", "grayboard:delivery"], Date.now(), OPENCODE_CLIENT);
+  const headers = new Headers({ Authorization: `Bearer ${issued.token}`, "X-Grayboard-Client": "subscriber" });
+  const abort = new AbortController();
+  let target = false;
+  const client = new Client({ name: "http-test", version: "1" }, { supportedProtocolVersions: ["2026-07-28"], versionNegotiation: { mode: { pin: "2026-07-28" } } });
+  clients.push(client);
+  await client.connect(new StreamableHTTPClientTransport(new URL(`${base}/mcp`), {
+    fetch: async (input, init) => {
+      const plain = new Request(input, init);
+      for (const [k, v] of headers) plain.headers.set(k, v);
+      const req = await withMeta(plain, OPENCODE_SESSION_META, identity);
+      return target ? app.mcp.fetch(new Request(req, { signal: abort.signal }), "127.0.0.1") : fetch(req);
+    },
+  }));
+  const ok = async (name: string, args: Record<string, unknown> = {}) => {
+    const r = await client.callTool({ name, arguments: args });
+    if (r.isError) throw new Error(JSON.stringify(r));
+    const first = r.content?.[0];
+    if (first?.type !== "text") return undefined;
+    try { return JSON.parse(first.text); } catch { return first.text; }
+  };
+  await ok("bind", { name: identity, create: true });
+  const address = `carol@example.com/${identity}`;
+  expect(await app.application.aliasHolderId(app.repo.read, address)).not.toBeNull();
+  if (ending === "delivery_release") {
+    headers.set("X-Grayboard-Lease", (await ok("delivery_open")).capability);
+    expect(app.mcp.activeLeases).toBe(1);
+  }
+  const q = writeQueue();
+  const skipped = queueSkippedCount("gate");
+  const lines: string[] = [];
+  const said = spyOn(console, "error").mockImplementation((...args: unknown[]) => { lines.push(args.join(" ")); });
+  const warned = spyOn(console, "warn").mockImplementation((...args: unknown[]) => { lines.push(args.join(" ")); });
+  let release!: () => void;
+  const holder = q.run(() => new Promise<void>(r => { release = r; }));
+  try {
+    target = true;
+    const call = client.callTool({ name: ending, arguments: {} }).then(r => ({ result: r }), (error: unknown) => ({ error }));
+    await until(() => q.waitingAt("gate") === 1, 10_000, `${ending}'s selection queued behind the holder`);
+    abort.abort();
+    release();
+    await call;
+    await app.repo.write(() => {});
+  } finally {
+    release();
+    await holder;
+    said.mockRestore(); warned.mockRestore();
+  }
+  expect(queueSkippedCount("gate") - skipped).toBe(0);
+  expect(lines.filter(l => l.includes('"operation":"admission"'))).toEqual([]);
+});
+
 // #1342: the close-time 500 the SDK makes of the modern factory's own closed check (the endpoint closed while the
 // factory's authenticate awaited). Nothing was dispatched: the pre-dispatch 503 and its body, over real HTTP.
 test("HTTP native: a call whose factory meets the close answers 503, not 500 (#1342)", async () => {
