@@ -166,6 +166,35 @@ function users(it: It, sqliteOnly: (name: string, why: string, fn: (h: IdentityS
     await expect(h.setIdp(c.id, G, "same")).rejects.toThrow(/unique/i);
   });
 
+  // #930: every verified sign-in stamps the user's IdP clock (create, link and by-subject paths), and the returned user
+  // carries the stored stamp; a refusal leaves it; an upsert (dev login) has none; unlinking keeps it.
+  it("users.signIn stamps idp_checked_at on every ok path, never on a refusal; clearSubject keeps it, or zeroes a missing one; stampIdpChecked stamps", async h => {
+    const stamp = async (id: number) => (await h.users.findById(h.read, id))!.idp_checked_at;
+    const created = await signIn(h, G, "s-1", A, null);
+    expect(typeof created.user.idp_checked_at).toBe("number");
+    expect(await stamp(created.user.id)).toBe(created.user.idp_checked_at);
+    const again = await signIn(h, G, "s-1", A, null);
+    expect(again.user.idp_checked_at!).toBeGreaterThanOrEqual(created.user.idp_checked_at!);
+    expect(await stamp(created.user.id)).toBe(again.user.idp_checked_at);
+    const dev = await upsert(h, B);
+    expect(dev.idp_checked_at).toBeNull();
+    const linked = await signIn(h, G, "s-2", B, null);
+    expect(linked).toMatchObject({ status: "ok", linked: true });
+    expect(await stamp(dev.id)).toBe(linked.user.idp_checked_at);
+    expect(typeof linked.user.idp_checked_at).toBe("number");
+    const before = await stamp(created.user.id);
+    for (const r of [await signIn(h, G, "s-intruder", A, null), await signIn(h, OKTA, "o-1", A, null), await signIn(h, G, "s-1", "renamed@example.com", null)]) expect(r.status).not.toBe("ok");
+    expect(await stamp(created.user.id)).toBe(before);
+    await h.write(tx => h.users.clearSubject(tx, created.user.id));
+    expect(await stamp(created.user.id)).toBe(before);
+    // A row with no clock that loses its issuer would read as exempt (#930): it starts at 0, due at once.
+    const bare = await upsert(h, "bare@example.com");
+    await h.write(tx => h.users.clearSubject(tx, bare.id));
+    expect(await stamp(bare.id)).toBe(0);
+    await h.write(tx => h.users.stampIdpChecked(tx, bare.id));
+    expect(await stamp(bare.id)).toBeGreaterThan(0);
+  });
+
   it("users.clearSubject clears issuer and subject, so the next sign-in from any issuer takes the email", async h => {
     const u = (await signIn(h, G, "s-1", A, null)).user;
     await h.write(tx => h.users.clearSubject(tx, u.id));

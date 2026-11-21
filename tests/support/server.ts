@@ -177,7 +177,7 @@ export class TestServer {
   }
 
   private async authed(token: string): Promise<AuthedUser> {
-    const authed = await verifySessionToken(token, this.app.repo, this.app.touches, 0);
+    const authed = await verifySessionToken(token, this.app.repo, this.app.touches, 0, 0);
     if (!authed) throw new Error("the token doesn't authenticate");
     return authed;
   }

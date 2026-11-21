@@ -73,7 +73,7 @@ export type { DelegationStore, ReadDelegationFacts } from "./store/delegation.ts
 // Row types
 // Every read of a user row goes through this, so `kind` is never missing (a "SELECT *" would type-check without it).
 // A users row with no service principal is a person's: user principals are seeded on every open.
-const USER_SQL = `SELECT u.id, u.email, u.display_name, u.created_at, u.disabled_at, u.idp_issuer, u.idp_subject,
+const USER_SQL = `SELECT u.id, u.email, u.display_name, u.created_at, u.disabled_at, u.idp_issuer, u.idp_subject, u.idp_checked_at,
   CASE WHEN p.id IS NULL THEN 'user' ELSE 'service' END AS kind
   FROM users u LEFT JOIN principals p ON p.user_id = u.id AND p.kind = 'service'`;
 // A user row by id, the auth cache's read (tests count it).
@@ -777,6 +777,13 @@ function initSchema(db: Database): void {
     // by Google (or dev login). Never on a later open, which would re-stamp a row unlink-idp cleared.
     db.run("UPDATE users SET idp_issuer = ?", [GOOGLE_ISSUER]);
   }
+  // users.idp_checked_at (#930): when the IdP last vouched for the user. Once, with the column, every row is stamped
+  // now, so an upgrade starts each clock rather than finding every user stale, and a row unlink-idp cleared before the
+  // upgrade (no issuer) gets a clock rather than reading as exempt (pg migration 0003).
+  if (!userColumns.some(c => c.name === "idp_checked_at")) {
+    db.exec(`ALTER TABLE users ADD COLUMN idp_checked_at INTEGER`);
+    db.run("UPDATE users SET idp_checked_at = ?", [Date.now()]);
+  }
   // Every open: a rolled-back binary (which knows only Google) links or creates users with a subject and no issuer.
   db.run("UPDATE users SET idp_issuer = ? WHERE idp_issuer IS NULL AND idp_subject IS NOT NULL", [GOOGLE_ISSUER]);
   // Every open, since a rolled-back binary recreates it: one `sub` is not unique across issuers.
@@ -1115,20 +1122,22 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       },
       async signIn(tx, issuer, subject, email, displayName) {
         const db = sqliteOf(tx);
+        // Each verified sign-in restamps the user's IdP clock (#930), which the reauth fallback reads.
+        const at = clock();
         return db.transaction((): IdpSignIn => {
           // A link is conditional on the row still being unlinked and enabled (D3): on Postgres another sign-in may
           // link it, or an admin disable it, between the read and the write. Zero rows: re-read and decide again.
           const link = (id: number) => db.run(
-            `UPDATE users SET idp_issuer = ?, idp_subject = ?, display_name = ?
+            `UPDATE users SET idp_issuer = ?, idp_subject = ?, display_name = ?, idp_checked_at = ?
              WHERE id = ? AND idp_subject IS NULL AND (idp_issuer IS NULL OR idp_issuer = ?) AND disabled_at IS NULL`,
-            [issuer, subject, displayName, id, issuer]).changes === 1;
+            [issuer, subject, displayName, at, id, issuer]).changes === 1;
           for (let attempt = 0; attempt < 3; attempt++) {
             // 1. This IdP account's user.
             const bySubject = db.query<User, [string, string]>(`${USER_SQL} WHERE u.idp_issuer = ? AND u.idp_subject = ?`).get(issuer, subject);
             if (bySubject) {
               if (bySubject.email !== email) return { status: "email_changed", user: bySubject };
-              db.run("UPDATE users SET display_name = ? WHERE id = ?", [displayName, bySubject.id]);
-              return { status: "ok", user: { ...bySubject, display_name: displayName }, linked: false };
+              db.run("UPDATE users SET display_name = ?, idp_checked_at = ? WHERE id = ?", [displayName, at, bySubject.id]);
+              return { status: "ok", user: { ...bySubject, display_name: displayName, idp_checked_at: at }, linked: false };
             }
             const byEmail = db.query<User, [string]>(`${USER_SQL} WHERE u.email = ?`).get(email);
             // A service's row (#270 D1): no IdP account links to it, whatever the issuer.
@@ -1142,18 +1151,21 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
               // must not bind it to whoever tried (security audit F-13).
               if (byEmail.disabled_at !== null) return { status: "ok", user: byEmail, linked: false };
               // 4 and 5. This IdP's unlinked row, or a row with neither.
-              if (link(byEmail.id)) return { status: "ok", user: { ...byEmail, idp_issuer: issuer, idp_subject: subject, display_name: displayName }, linked: true };
+              if (link(byEmail.id)) return { status: "ok", user: { ...byEmail, idp_issuer: issuer, idp_subject: subject, display_name: displayName, idp_checked_at: at }, linked: true };
               continue;
             }
             // 6. A new user, created with both.
             const user = upsertUser(db, email, displayName, clock());
-            if (link(user.id)) return { status: "ok", user: { ...user, idp_issuer: issuer, idp_subject: subject }, linked: false };
+            if (link(user.id)) return { status: "ok", user: { ...user, idp_issuer: issuer, idp_subject: subject, idp_checked_at: at }, linked: false };
           }
           throw new Error(`sign-in for ${email} kept losing its link to concurrent sign-ins`);
         }).immediate();
       },
       async clearSubject(tx, userId) {
-        sqliteOf(tx).run("UPDATE users SET idp_issuer = NULL, idp_subject = NULL WHERE id = ?", [userId]);
+        sqliteOf(tx).run("UPDATE users SET idp_issuer = NULL, idp_subject = NULL, idp_checked_at = COALESCE(idp_checked_at, 0) WHERE id = ?", [userId]);
+      },
+      async stampIdpChecked(tx, userId) {
+        sqliteOf(tx).run("UPDATE users SET idp_checked_at = ? WHERE id = ?", [clock(), userId]);
       },
       async findByEmail(r, email) { return userByEmail(sqliteOf(r), email); },
       async findById(r, userId) { return userById(sqliteOf(r), userId); },

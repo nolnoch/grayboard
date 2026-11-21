@@ -121,6 +121,42 @@ test("an existing pre-OAuth database opens additively without losing old data", 
   }
 });
 
+// #930: the column arrives with every user's IdP clock started at the upgrade, so no one is stale on day one, and a row
+// with no issuer (one unlink-idp cleared, which would otherwise read as exempt) is on the clock too; a later open never
+// re-stamps.
+test("opening a database from before users.idp_checked_at stamps every row once", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "gb-idp-clock-"));
+  const path = join(dir, "db.sqlite");
+  const opts = { blobDir: join(dir, "blobs") };
+  const old = openDatabase(path, opts);
+  await seed(old.repo, async tx => {
+    await old.repo.users.upsertByEmail(tx, "linked@example.com", null);
+    await old.repo.users.upsertByEmail(tx, "dev@example.com", null);
+    old.db.run("UPDATE users SET idp_issuer = 'https://idp.example', idp_subject = 's-1' WHERE email = 'linked@example.com'");
+    old.db.exec("ALTER TABLE users DROP COLUMN idp_checked_at");
+  });
+  old.db.close();
+  const before = Date.now();
+  const reopened = openDatabase(path, opts);
+  const clocks = (db: Database) => db.query<{ email: string; idp_checked_at: number | null }, []>("SELECT email, idp_checked_at FROM users ORDER BY email").all();
+  try {
+    const [unlinked, linked] = clocks(reopened.db);
+    expect(unlinked!.idp_checked_at!).toBeGreaterThanOrEqual(before);
+    expect(linked!.idp_checked_at!).toBeGreaterThanOrEqual(before);
+    await seed(reopened.repo, () => reopened.db.run("UPDATE users SET idp_checked_at = NULL WHERE email = 'dev@example.com'"));
+    await seed(reopened.repo, () => reopened.db.run("UPDATE users SET idp_checked_at = 1 WHERE email = 'linked@example.com'"));
+  } finally {
+    reopened.db.close();
+  }
+  const again = openDatabase(path, opts);
+  try {
+    expect(clocks(again.db).map(r => r.idp_checked_at)).toEqual([null, 1]);
+  } finally {
+    again.db.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 // #523 audit 5: a hosted child registered before ids.root_id existed (or by an
 // older release sharing the file) gets its root from its live source row when
 // the file opens; a child whose source row is already gone, and a root, stay null.

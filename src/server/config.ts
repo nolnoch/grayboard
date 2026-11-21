@@ -75,6 +75,8 @@ export type Config = {
   devAuth: boolean;
   // Days a CLI session token may go unused before it's refused (security audit F-14); 0 never.
   cliTokenIdleDays?: number;
+  // Days a user's grants and CLI tokens keep working after the IdP last vouched for them (#930); 0 never.
+  idpReauthDays?: number;
   // Emails allowed to run admin commands. Empty means nobody can.
   admins: string[];
   oauthClients?: OAuthClient[];
@@ -202,6 +204,7 @@ export function loadConfig(): Config {
     auditRetentionDays:   retentionDays("GRAYBOARD_AUDIT_RETENTION_DAYS",   process.env.GRAYBOARD_AUDIT_RETENTION_DAYS,   90),
     devAuth,
     cliTokenIdleDays: idleDays(process.env.GRAYBOARD_CLI_TOKEN_IDLE_DAYS),
+    idpReauthDays: reauthDays(process.env.GRAYBOARD_IDP_REAUTH_DAYS),
     admins: parseList(process.env.GRAYBOARD_ADMINS),
     oauthClients: parseOAuthClients(process.env.GRAYBOARD_OAUTH_CLIENTS),
     oauthCimdClients: parseCimdClients(process.env.GRAYBOARD_OAUTH_CIMD_CLIENTS),
@@ -615,6 +618,24 @@ function idleDays(raw: string | undefined): number {
     throw new Error(`GRAYBOARD_CLI_TOKEN_IDLE_DAYS must be a whole number of days from 0 (never expire) to 3650, not "${raw}"`);
   }
   return Number(raw);
+}
+
+// IdP re-auth days (#930): as the idle days, unset is the default and 0 is never.
+export const DEFAULT_IDP_REAUTH_DAYS = 30;
+function reauthDays(raw: string | undefined): number {
+  if (raw === undefined || raw === "") return DEFAULT_IDP_REAUTH_DAYS;
+  if (!/^(0|[1-9][0-9]*)$/.test(raw) || Number(raw) > 3650) {
+    throw new Error(`GRAYBOARD_IDP_REAUTH_DAYS must be a whole number of days from 0 (never) to 3650, not "${raw}"`);
+  }
+  return Number(raw);
+}
+
+// The startup line for #930's fallback: which sign-in providers the server can't ask about a user's status, so their
+// users re-authenticate every GRAYBOARD_IDP_REAUTH_DAYS instead. No provider has a directory check yet.
+export function describeReauth(config: Pick<Config, "idps" | "idpReauthDays">): string {
+  const days = config.idpReauthDays ?? DEFAULT_IDP_REAUTH_DAYS;
+  const unchecked = (config.idps ?? ["google"]).join(", ");
+  return days > 0 ? `sign-in every ${days} days (no directory check: ${unchecked})` : `off (GRAYBOARD_IDP_REAUTH_DAYS=0; no directory check: ${unchecked})`;
 }
 
 // Port 0 (an ephemeral port, what tests use) through 65535. Gated to plain digits so

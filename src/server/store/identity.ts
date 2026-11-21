@@ -12,7 +12,7 @@ import type { Read, Tx } from "./tx_base.ts";
 // Neither: a dev-auth user, or one an admin unlinked.
 // A user row (#270 D1): a person, or a service whose `email` holds its name (never an email: it has no "@"). The kind
 // is its principal row's, read with the row (USER_SQL): there's no users.kind column.
-export type User     = { id: number; email: string; display_name: string | null; created_at: number; disabled_at: number | null; idp_issuer: string | null; idp_subject: string | null; kind: "user" | "service" };
+export type User     = { id: number; email: string; display_name: string | null; created_at: number; disabled_at: number | null; idp_issuer: string | null; idp_subject: string | null; idp_checked_at: number | null; kind: "user" | "service" };
 // What an IdP sign-in resolved to (security audit F-13, #928 D4). `linked`: the
 // user had no subject yet and now has this one. Refusals: `subject_mismatch`,
 // the email's user belongs to another account at the same IdP (the email was
@@ -88,8 +88,11 @@ export interface UsersStore {
   upsertByEmail(tx: Tx, email: string, displayName: string | null): Promise<User>;
   // An IdP sign-in: matches (issuer, subject) first, then the email (F-13, #928 D4).
   signIn(tx: Tx, issuer: string, subject: string, email: string, displayName: string | null): Promise<IdpSignIn>;
-  // Forgets a user's IdP issuer and subject, so the next sign-in with the email, from any IdP, links its account.
+  // Forgets a user's IdP issuer and subject, so the next sign-in with the email, from any IdP, links its account. The
+  // IdP clock stays, and a missing one starts at 0: with no issuer, a null clock would read as exempt (#930).
   clearSubject(tx: Tx, userId: number): Promise<void>;
+  // Starts the user's IdP clock now (#930): a dev login, the one sign-in with no IdP to stamp it.
+  stampIdpChecked(tx: Tx, userId: number): Promise<void>;
   findByEmail(r: Read, email: string): Promise<User | undefined>;
   // Uncached: a fresh read on the caller's handle.
   findById(r: Read, userId: number): Promise<User | undefined>;

@@ -3,7 +3,7 @@ import { randomBytes } from "node:crypto";
 import { mcpResource, SERVICE_CLIENT_PREFIX } from "./oauth-config.ts";
 import { CREDENTIAL_NO_EXPIRY, CREDENTIAL_SOURCES, DEFAULT_SERVICE_TOKEN_LIMITS, GRANT_LIST_MAX, OAUTH_TTL, SERVICE_TOKEN_MIN_SECONDS, type CredentialSource } from "./oauth-types.ts";
 import { AuthorityLost, DEV_SESSION_LABEL, LastOwner, PrincipalTaken, TEAM_POLICIES, type Repo, type RoleFilter, type Team, type TeamPolicy, type User } from "./db.ts";
-import { DEFAULT_CLI_TOKEN_IDLE_DAYS, type Config } from "./config.ts";
+import { DEFAULT_CLI_TOKEN_IDLE_DAYS, DEFAULT_IDP_REAUTH_DAYS, type Config } from "./config.ts";
 import {
   verifySessionToken, extractBearer,
   mintToken, hashToken, principalOfAuthed, signedIn, type AuthedUser, type TouchQueue,
@@ -46,10 +46,10 @@ function badRequest(msg: string): Response { return jsonErr("bad_request", msg, 
 function conflict(msg: string): Response { return jsonErr("conflict", msg, 409); }
 function forbidden(msg: string): Response { return jsonErr("forbidden", msg, 403); }
 
-async function requireAuth(req: Request, repo: Repo, touches: TouchQueue, idleDays: number): Promise<AuthedUser | null> {
+async function requireAuth(req: Request, repo: Repo, touches: TouchQueue, idleDays: number, reauthDays: number): Promise<AuthedUser | null> {
   const raw = extractBearer(req);
   if (!raw) return null;
-  return verifySessionToken(raw, repo, touches, idleDays);
+  return verifySessionToken(raw, repo, touches, idleDays, reauthDays);
 }
 
 async function parseBody<T>(req: Request): Promise<T | null> {
@@ -130,6 +130,8 @@ async function devLogin(req: Request, repo: Repo, ip: string | null): Promise<Re
     const user  = await repo.users.upsertByEmail(tx, email, null);
     const disabled = refuseDisabled(repo, tx, user, { dev: true, ip: ip ?? undefined });
     if (disabled) return disabled;
+    // Dev login has no IdP to stamp the re-auth clock, so it stamps it itself (#930).
+    await repo.users.stampIdpChecked(tx, user.id);
     const raw   = mintToken();
     await repo.sessions.create(tx, user.id, hashToken(raw), DEV_SESSION_LABEL);
     writeAudit(repo, tx, "auth.login", email, null, { dev: true, ip: ip ?? undefined });
@@ -1076,7 +1078,7 @@ export async function handleHttp(
   const signIn = signInRoute(method, path, config);
   if (signIn) return signIn.handle(req, repo, config, ip);
 
-  const authed = await requireAuth(req, repo, touches, config.cliTokenIdleDays ?? DEFAULT_CLI_TOKEN_IDLE_DAYS);
+  const authed = await requireAuth(req, repo, touches, config.cliTokenIdleDays ?? DEFAULT_CLI_TOKEN_IDLE_DAYS, config.idpReauthDays ?? DEFAULT_IDP_REAUTH_DAYS);
   if (!authed) return jsonErr("unauthenticated", "invalid or missing token", 401);
 
   if (path === "/api/auth/logout" && method === "POST") return authLogout(authed, repo);
