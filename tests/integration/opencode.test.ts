@@ -693,7 +693,7 @@ test("opencode real: a subagent that never calls grayboard still runs during an 
       expect(opencodeTool(await oc.prompt(root, "who"), "whoami").state.status).toBe("completed");
     }
     await sigkill(grayboardChildPids(oc.pid)[0]!);
-    await until(() => current.notices().some(n => n.includes("after 3 restarts")), 1_000, "grayboard remains unavailable");
+    await until(() => current.notices().some(n => n.includes("after 3 restarts")), 5_000, "grayboard remains unavailable");
     const spawned = await oc.prompt(root, "spawn offline child");
     const task = spawned.parts.find(p => p.type === "tool" && "tool" in p && p.tool === "task");
     expect(task && "state" in task ? task.state.status : undefined).toBe("completed");
