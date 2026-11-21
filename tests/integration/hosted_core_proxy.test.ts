@@ -14,7 +14,7 @@ import { Client, SdkError, SdkErrorCode, type AuthProvider, type CallToolResult 
 import { AccessExpired } from "../../adapters/hosted-core/src/model.ts";
 import type { CallOutcome } from "../../adapters/hosted-core/src/controller.ts";
 import { CallAborted, hostTools, unlessAborted, loadMode, snapshotTools, ToolProxy, type CallHooks, type NativeTool, type ProxyOptions } from "../../adapters/hosted-core/src/proxy.ts";
-import { NativeWire, OutcomeUnknown, ServerUnreachable } from "../../adapters/hosted-core/src/wire.ts";
+import { NativeWire, OutcomeUnknown, ServerBusy, ServerUnreachable } from "../../adapters/hosted-core/src/wire.ts";
 import { failureText } from "../../adapters/hosted-core/src/client.ts";
 import { hashToken } from "../../src/server/auth.ts";
 import { hostedSessionId } from "../../src/server/hosted.ts";
@@ -696,6 +696,7 @@ test("a call cut off after its request left reports its outcome unknown and is s
     expect(refused).toBeInstanceOf(ServerUnreachable);
     expect(refused).not.toBeInstanceOf(OutcomeUnknown);
     expect(failureText(refused, "call the tool again")).toBe("Server unreachable; call the tool again");
+    expect(failureText(new ServerBusy(800), "call the tool again")).toBe("Server at capacity; call the tool again"); // #1553
     mode = "pass";
     expect(await bodies()).toEqual(["landed"]);
     expect(lists).toBe(4);
