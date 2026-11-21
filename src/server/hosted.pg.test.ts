@@ -125,7 +125,7 @@ async function keyedInstance(url: string) {
   const store = repo.hosted;
   // The touch gate: an end-of-call touch's UPDATE (a keyed body at the queue site "touch": a keyed gate body's touch, at
   // "gate", passes) waits on `hold` while it's set.
-  // `defer`: while set, a hosted exclusive body (the timer's sweep or heartbeat) waits on it before it queues, so none
+  // `defer`: while set, a hosted exclusive body (the timer's sweep; the heartbeat is keyed) waits on it before it queues, so none
   // lands between two touches a test has released into the queue together.
   const state = { hold: undefined as Gate | undefined, defer: undefined as Gate | undefined, held: 0, entered: [] as string[], touchQueued: 0 };
   // End-of-call touch bodies (touchAfter: the hosted store's writeKeyed at the site "touch") queued and not yet started:
