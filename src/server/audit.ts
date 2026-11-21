@@ -129,6 +129,14 @@ export function userAgent(req: Request): string | null {
 // `h`: the caller's live `Tx` inside a write body, whose transaction the row joins (and rolls back with); outside one,
 // `repo.read`, and the row is posted: through the write queue, waiting behind another body's transaction rather than
 // landing inside it (#807 P1b-4b). A post inside an open transaction refuses (#807 P3 A3), so an in-body caller passes its Tx.
+// A posted row is keyed (#1510, docs/future/postgres-server.md D4) by its subject: `audit:t:<target>`, or
+// `audit:a:<actor>` for a row with no target. On Postgres it overlaps every keyed body but one posting about the same
+// subject, and conflicts with exclusive ones. The body is one INSERT into access_log, which has no foreign key or unique
+// column beyond its identity, takes no lock another body waits on, and reads no in-memory state (the row is built here).
+// A subject's rows commit in posting order, so its history reads in order by id (a session's legacy_dormant before its
+// legacy_dropped), and audit.last, a (action, target) pair's newest by time then id, never sees an older row as newest.
+// Rows of different subjects may commit out of posting order; nothing orders across subjects. The one read-then-write
+// over access_log, the bridge-notice dedup (audit.lock, then audit.last), runs in exclusive bodies.
 export function writeAudit(
   repo: Repo,
   h: Read,
@@ -139,5 +147,5 @@ export function writeAudit(
 ): void {
   const row = { at: repo.now(), actor, action, target, detail: detail ? JSON.stringify(detail) : null };
   if (isTx(h)) { repo.audit.write(h, row); return; }
-  atSite("audit", () => repo.post((tx) => repo.audit.write(tx, row), undefined, `audit ${action}`));
+  atSite("audit", () => repo.postKeyed([target === null ? `audit:a:${actor ?? ""}` : `audit:t:${target}`], (tx) => repo.audit.write(tx, row), undefined, `audit ${action}`));
 }

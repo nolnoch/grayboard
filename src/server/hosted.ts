@@ -387,9 +387,14 @@ export function createHostedSessions(application: Application, options: { now?: 
   // start-of-call touch stands. `seen`: the older last_seen_at the start-of-call touch left on the row and its root.
   // While both are within the touch window, the touch below would write nothing (no write moves last_seen_at back
   // but a full-row update), so the call ends without a transaction (#998).
+  // Keyed by the row's root (#1510, docs/future/postgres-server.md D4): it writes last_seen_at of that root and of the
+  // row, which is the root or one of its children, and nothing else. Plain reads, then two single-row UPDATEs, root
+  // first: every other body that writes those rows is exclusive (gate, end, bind, sweep, revoke, park) or carries the
+  // same key, so it never overlaps one, and a touch of another root writes disjoint rows. hosted_sessions has no
+  // trigger, and an UPDATE that leaves the grant column alone runs no foreign-key check.
   async function touchAfter(row: HostedSession, seen: number) {
     if (stopped || now() - seen < touchEvery) return;
-    try { await atSite("touch", () => store.write(async tx => {
+    try { await atSite("touch", () => store.writeKeyed([`root:${row.root_session_id ?? row.session_id}`], async tx => {
       const current = await store.get(tx, row.session_id), root = row.root_session_id ? await store.get(tx, row.root_session_id) : current;
       if (!current || !root || current.ownership_id !== row.ownership_id || current.root_session_id !== row.root_session_id || current.parked_at !== null || root.ownership_id !== row.ownership_id) return;
       const t = now();

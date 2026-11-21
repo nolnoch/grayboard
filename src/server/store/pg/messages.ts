@@ -31,7 +31,7 @@ import { insertAudit } from "./audit_row.ts";
 import { bindLocked, dropAttachments, lockUnsent, withAttachments } from "./attachment_rows.ts";
 import { missingParent } from "./errors.ts";
 import { int8, int8OrNull } from "./sql.ts";
-import { pgOf, type PgSql } from "./tx.ts";
+import { pgOf, refuseKeyed, type PgSql } from "./tx.ts";
 
 type Row = Record<string, unknown>;
 const toMessage = (r: Row): MessageRow => ({
@@ -49,6 +49,8 @@ export function makePgMessages({ clock, attachmentLimits }: { clock: () => numbe
   const att = (sql: PgSql, list: MessageRow[]) => withAttachments(sql, "message", list);
   return {
     async insert(tx, sender, recipientType, recipient, body, parentId, pending = false, files, senderId = null, via = null, senderUser = null, human = false) {
+      // Ids commit in allocation order only among bodies that exclude each other on the recipient's stream (G1, D4).
+      refuseKeyed(tx, "messages.insert", `dm:${recipient}`);
       const sql = pgOf(tx);
       // Every refusal before the first write (decision 5, 8): the transaction stays usable when the caller catches it.
       if (parentId !== null && (await sql`SELECT id FROM messages WHERE id = ${parentId} FOR KEY SHARE`).length === 0) throw new MissingParent(parentId);
@@ -213,6 +215,8 @@ export function makePgMessages({ clock, attachmentLimits }: { clock: () => numbe
     // The parent FOR KEY SHARE first, as insert's reply does: a retract that committed first leaves no parent, and the
     // bounce writes nothing (null) rather than fail 23503 and abort the end's transaction.
     async bounce(tx, from, to, parentId, body, now) {
+      // An insert too: the same stream key as insert's (G1, D4).
+      refuseKeyed(tx, "messages.bounce", `dm:${to}`);
       const sql = pgOf(tx);
       if ((await sql`SELECT id FROM messages WHERE id = ${parentId} FOR KEY SHARE`).length === 0) return null;
       const [row] = await rows(sql`INSERT INTO messages (sender, sender_id, recipient_type, recipient, body, parent_id, created_at, pending, kind, human)

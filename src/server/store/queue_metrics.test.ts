@@ -118,3 +118,17 @@ test("#1510: a keyed body counts in the keyed counter under its site as well as 
   expect(bodies(before, after, "gate")).toBe(3);
   expect(value(after, "grayboard_write_queue_keyed_bodies_total", { site: "gate" }) - value(before, "grayboard_write_queue_keyed_bodies_total", { site: "gate" })).toBe(2);
 });
+
+// Mutation: credit the world-stop clock only when the exclusive count falls to zero (a saturated queue reads 0).
+test("#1510: the world-stop clock credits each exclusive body as it releases, while another exclusive body still waits", async () => {
+  const q = new WriteQueue(2), before = scrape(), go = deferred(), held = deferred();
+  const first = q.run(async () => { await go.promise; spin(5); });
+  const second = q.run(() => held.promise);
+  expect(q.waiting).toBe(1);
+  go.resolve();
+  await first;
+  const mid = value(scrape(), "grayboard_write_queue_world_stop_seconds_total") - value(before, "grayboard_write_queue_world_stop_seconds_total");
+  expect(mid).toBeGreaterThanOrEqual(0.005);
+  held.resolve();
+  await second;
+});

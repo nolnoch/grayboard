@@ -180,9 +180,10 @@ function refusalsTotal(s: Sample[]): Record<string, number> {
 // The write queue's histograms (#1510), cumulative as scraped: per site for wait and hold, and the depth at enqueue.
 // `cum[i]` counts observations at or under `le[i]`; the last edge is +Inf.
 export type CumHist = { le: number[]; cum: number[]; sum: number; count: number };
-export type QueueCum = { wait: Map<string, CumHist>; hold: Map<string, CumHist>; depth?: CumHist };
+// `keyed`: bodies that ran keyed, per site; `worldStop`: seconds in which an exclusive body waited or ran (chunk 2).
+export type QueueCum = { wait: Map<string, CumHist>; hold: Map<string, CumHist>; depth?: CumHist; keyed: Map<string, number>; worldStop: number };
 export function queueCumulative(s: Sample[]): QueueCum {
-  const q: QueueCum = { wait: new Map(), hold: new Map() };
+  const q: QueueCum = { wait: new Map(), hold: new Map(), keyed: new Map(), worldStop: 0 };
   const slot = (name: string, labels: Record<string, string>): CumHist | undefined => {
     const m = /^grayboard_write_queue_(wait|hold)_seconds_/.exec(name);
     if (m) { const map = q[m[1] as "wait" | "hold"]; return map.get(labels.site!) ?? map.set(labels.site!, { le: [], cum: [], sum: 0, count: 0 }).get(labels.site!)!; }
@@ -190,6 +191,8 @@ export function queueCumulative(s: Sample[]): QueueCum {
     return undefined;
   };
   for (const x of s) {
+    if (x.name === "grayboard_write_queue_keyed_bodies_total") { q.keyed.set(x.labels.site!, x.value); continue; }
+    if (x.name === "grayboard_write_queue_world_stop_seconds_total") { q.worldStop = x.value; continue; }
     const h = slot(x.name, x.labels);
     if (!h) continue;
     if (x.name.endsWith("_bucket")) { h.le.push(x.labels.le === "+Inf" ? Infinity : Number(x.labels.le)); h.cum.push(x.value); }
@@ -210,7 +213,10 @@ export function combineQueue(a: QueueCum, b: QueueCum, sign: 1 | -1): QueueCum {
     if (sign === 1) for (const [k, h] of y) if (!x.has(k)) out.set(k, h);
     return out;
   };
-  return { wait: maps(a.wait, b.wait), hold: maps(a.hold, b.hold), ...(a.depth ? { depth: combine(a.depth, b.depth, sign) } : b.depth && sign === 1 ? { depth: b.depth } : {}) };
+  const keyed = new Map(a.keyed);
+  for (const [k, n] of b.keyed) keyed.set(k, (keyed.get(k) ?? 0) + sign * n);
+  return { wait: maps(a.wait, b.wait), hold: maps(a.hold, b.hold), ...(a.depth ? { depth: combine(a.depth, b.depth, sign) } : b.depth && sign === 1 ? { depth: b.depth } : {}),
+    keyed, worldStop: a.worldStop + sign * b.worldStop };
 }
 // The q-quantile, interpolated linearly within its bucket (histogram_quantile's rule); one in the +Inf bucket reads as
 // the last finite edge. Null with no observations.
@@ -229,9 +235,12 @@ type Dist = { p50: number | null; p99: number | null; mean: number | null };
 const dist = (h: CumHist | undefined): Dist => h && h.count ? { p50: quantile(h, 0.5), p99: quantile(h, 0.99), mean: h.sum / h.count } : { p50: null, p99: null, mean: null };
 export type QueueStats = {
   bodies: number; bodiesPerS: number; busy: number; wait: Dist; hold: Dist;
+  // `worldStop`: the share of wall time in which an exclusive body waited or ran; `keyed`: the share of bodies that ran
+  // keyed (#1510 chunk 2).
+  worldStop: number; keyed: number;
   // The highest depth bucket edge any body that queued met (null: none queued; past the last edge reads as it + 1).
   maxDepth: number | null;
-  sites: Record<string, { bodies: number; bodiesPerS: number; busy: number; wait: Dist; hold: Dist }>;
+  sites: Record<string, { bodies: number; bodiesPerS: number; busy: number; wait: Dist; hold: Dist; keyed: number }>;
 };
 // A span's queue numbers from its histogram deltas over `wallS` seconds.
 export function queueStats(d: QueueCum, wallS: number): QueueStats {
@@ -239,8 +248,14 @@ export function queueStats(d: QueueCum, wallS: number): QueueStats {
   let maxDepth: number | null = null;
   if (d.depth) for (let i = 0; i < d.depth.le.length; i++) if (d.depth.cum[i]! - (i ? d.depth.cum[i - 1]! : 0) > 0) maxDepth = d.depth.le[i] === Infinity ? d.depth.le[i - 1]! + 1 : d.depth.le[i]!;
   const sites: QueueStats["sites"] = {};
-  for (const [site, h] of d.hold) if (h.count) sites[site] = { bodies: h.count, bodiesPerS: h.count / wallS, busy: h.sum / wallS, wait: dist(d.wait.get(site)), hold: dist(h) };
-  return { bodies: hold?.count ?? 0, bodiesPerS: (hold?.count ?? 0) / wallS, busy: (hold?.sum ?? 0) / wallS, wait: dist(wait), hold: dist(hold), maxDepth, sites };
+  let keyed = 0;
+  for (const [site, h] of d.hold) if (h.count) {
+    const k = d.keyed.get(site) ?? 0;
+    keyed += k;
+    sites[site] = { bodies: h.count, bodiesPerS: h.count / wallS, busy: h.sum / wallS, wait: dist(d.wait.get(site)), hold: dist(h), keyed: k / h.count };
+  }
+  const bodies = hold?.count ?? 0;
+  return { bodies, bodiesPerS: bodies / wallS, busy: (hold?.sum ?? 0) / wallS, wait: dist(wait), hold: dist(hold), worldStop: d.worldStop / wallS, keyed: bodies ? keyed / bodies : 0, maxDepth, sites };
 }
 const ms = (x: number | null) => x === null ? "-" : (x * 1000).toFixed(2);
 
@@ -415,7 +430,7 @@ async function main() {
   let srv: ServerProcess | undefined;
   let proxy: DelayProxy | undefined;
   // The steady period's write-queue deltas, kept outside the try so an aborted run still reports them.
-  let steadyQueue: QueueCum = { wait: new Map(), hold: new Map() }, steadyQueueS = 0;
+  let steadyQueue: QueueCum = { wait: new Map(), hold: new Map(), keyed: new Map(), worldStop: 0 }, steadyQueueS = 0;
   // A driver killed by a signal (the scope's OOM killer) keeps a null exitCode.
   const exited = (d: Driver) => d.proc.exitCode !== null || d.proc.signalCode !== null;
   try {
@@ -571,7 +586,7 @@ async function main() {
       windows.push(w);
       appendFileSync(join(o.out, "windows.jsonl"), JSON.stringify(w) + "\n");
       const toolAll = Object.values(tools).reduce((a, x) => ({ count: a.count + x.count, fast: a.fast + x.fast }), { count: 0, fast: 0 });
-      log(`t=${w.t.toFixed(0)}s${w.steady ? "" : " (warm-up)"}${w.churning ? " (churn)" : ""} leases=${w.leases} listens=${w.listens} live=${w.live} rss=${(w.rss / 2 ** 20).toFixed(0)}MB heap=${(w.heap / 2 ** 20).toFixed(0)}MB lag.p99=${w.lag ? (w.lag.p99 * 1000).toFixed(1) : "-"}ms tools=${toolAll.count} (${(100 * (toolAll.count ? toolAll.fast / toolAll.count : 1)).toFixed(2)}% ≤100ms) ops=${w.ops} inbox≤100ms=${client.inbox ? (100 * fastShare(client.inbox)).toFixed(2) : "-"}% drvlag=${(driverLagP99 * 1000).toFixed(0)}ms load=${w.loadavg[0]!.toFixed(1)}${w.queue ? ` queue: ${w.queue.bodiesPerS.toFixed(0)}/s busy=${(100 * w.queue.busy).toFixed(1)}% wait.p50/p99=${ms(w.queue.wait.p50)}/${ms(w.queue.wait.p99)}ms hold.p50/p99=${ms(w.queue.hold.p50)}/${ms(w.queue.hold.p99)}ms depth≤${w.queue.maxDepth ?? 0}` : ""}${Object.keys(refusals).length ? ` REFUSED ${JSON.stringify(refusals)}` : ""}${Object.keys(clientErrors).length ? ` ERRORS ${JSON.stringify(clientErrors)}` : ""}`);
+      log(`t=${w.t.toFixed(0)}s${w.steady ? "" : " (warm-up)"}${w.churning ? " (churn)" : ""} leases=${w.leases} listens=${w.listens} live=${w.live} rss=${(w.rss / 2 ** 20).toFixed(0)}MB heap=${(w.heap / 2 ** 20).toFixed(0)}MB lag.p99=${w.lag ? (w.lag.p99 * 1000).toFixed(1) : "-"}ms tools=${toolAll.count} (${(100 * (toolAll.count ? toolAll.fast / toolAll.count : 1)).toFixed(2)}% ≤100ms) ops=${w.ops} inbox≤100ms=${client.inbox ? (100 * fastShare(client.inbox)).toFixed(2) : "-"}% drvlag=${(driverLagP99 * 1000).toFixed(0)}ms load=${w.loadavg[0]!.toFixed(1)}${w.queue ? ` queue: ${w.queue.bodiesPerS.toFixed(0)}/s busy=${(100 * w.queue.busy).toFixed(1)}% wait.p50/p99=${ms(w.queue.wait.p50)}/${ms(w.queue.wait.p99)}ms hold.p50/p99=${ms(w.queue.hold.p50)}/${ms(w.queue.hold.p99)}ms depth≤${w.queue.maxDepth ?? 0} stop=${(100 * w.queue.worldStop).toFixed(1)}% keyed=${(100 * w.queue.keyed).toFixed(1)}%` : ""}${Object.keys(refusals).length ? ` REFUSED ${JSON.stringify(refusals)}` : ""}${Object.keys(clientErrors).length ? ` ERRORS ${JSON.stringify(clientErrors)}` : ""}`);
       prev = s; prevTools = toolCumulative(s); prevRef = ref; prevQueue = queueNow; prevAt = now;
       if (o.churn > 0 && o.churnEveryS > 0 && now >= nextChurn && next + o.windowS * 1000 <= end) {
         send(`churn ${o.churn}`); churnsSent++;
@@ -718,8 +733,8 @@ async function main() {
     log(`summary: ${JSON.stringify({ connected, dms: summary.dms, posts, boardDeliveries: boardRecv, service: summary.service, rss: summary.rss, heapGrowthMB: summary.heapGrowthMB.toFixed(1), lag: summary.lag, hostedRowsAfter: rows })}`);
     if (queueSteady) {
       const q = queueSteady;
-      log(`write queue, steady: ${q.bodiesPerS.toFixed(0)} bodies/s, busy ${(100 * q.busy).toFixed(1)}%, wait p50/p99 ${ms(q.wait.p50)}/${ms(q.wait.p99)} ms, hold p50/p99 ${ms(q.hold.p50)}/${ms(q.hold.p99)} ms, depth ≤ ${q.maxDepth ?? 0}`);
-      for (const [site, x] of Object.entries(q.sites).sort((a, b) => b[1].busy - a[1].busy)) log(`  ${site}: ${x.bodiesPerS.toFixed(1)}/s, busy ${(100 * x.busy).toFixed(1)}%, hold p50/p99 ${ms(x.hold.p50)}/${ms(x.hold.p99)} ms, wait p99 ${ms(x.wait.p99)} ms`);
+      log(`write queue, steady: ${q.bodiesPerS.toFixed(0)} bodies/s, busy ${(100 * q.busy).toFixed(1)}%, wait p50/p99 ${ms(q.wait.p50)}/${ms(q.wait.p99)} ms, hold p50/p99 ${ms(q.hold.p50)}/${ms(q.hold.p99)} ms, depth ≤ ${q.maxDepth ?? 0}, world stop ${(100 * q.worldStop).toFixed(1)}%, keyed ${(100 * q.keyed).toFixed(1)}%`);
+      for (const [site, x] of Object.entries(q.sites).sort((a, b) => b[1].busy - a[1].busy)) log(`  ${site}: ${x.bodiesPerS.toFixed(1)}/s, busy ${(100 * x.busy).toFixed(1)}%, hold p50/p99 ${ms(x.hold.p50)}/${ms(x.hold.p99)} ms, wait p50/p99 ${ms(x.wait.p50)}/${ms(x.wait.p99)} ms, keyed ${(100 * x.keyed).toFixed(0)}%`);
     }
     if (failures.length) { log(`FAIL (${failures.length}):`); for (const f of failures.slice(0, 50)) log(`  ${f}`); exitCode = 1; }
     else log("PASS");

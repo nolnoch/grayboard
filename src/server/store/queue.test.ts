@@ -57,7 +57,14 @@ test("a body that throws or rejects releases the queue and rejects its caller", 
   await expect(q.run(() => { throw new Error("sync"); })).rejects.toThrow("sync");
   await expect(q.run(async () => { throw new Error("async"); })).rejects.toThrow("async");
   expect(q.held).toBe(false);
+  // #1520 L2: a slot a throw leaked fails here by name, not as a later hang.
+  expect(q.idle).toBe(true);
   expect(await q.run(() => 2)).toBe(2);
+  const k = new WriteQueue(2);
+  await expect(k.runKeyed(["root:1"], () => { throw new Error("keyed sync"); })).rejects.toThrow("keyed sync");
+  await expect(k.runKeyed(["root:1"], async () => { throw new Error("keyed async"); })).rejects.toThrow("keyed async");
+  await until(() => k.idle, 2000, "the keyed scheduler idle after its bodies threw");
+  expect(await k.runKeyed(["root:1"], () => 3)).toBe(3);
 });
 
 test("#925: a backlog of synchronous bodies drains in a loop, not one stack frame per body", async () => {
@@ -313,6 +320,111 @@ describe("#1510 write scheduler", () => {
     await expect(q.runKeyed([], () => 1)).rejects.toThrow("at least one key");
     await expect(q.runKeyed([""], () => 1)).rejects.toThrow("non-empty string");
     expect(q.held).toBe(false);
+  });
+
+  // #1520 L3: the indexed scheduler starts exactly what chunk 1's scan started. The model below is that scan (queue.ts at
+  // #1519): `behind` over every waiter at arrival, then `startNext` walking the waiters with a set of blocked keys.
+  // Random runs of arrivals (exclusive or keyed on 1-3 of 4 keys; synchronous, or async held until the run releases
+  // them) and releases, at caps 1-4 (200 runs), must start the same bodies in the same order after every step.
+  test("the indexed scheduler starts the same bodies in the same order as chunk 1's scan, over random runs", async () => {
+    type M = { id: number; keys?: Set<string>; sync: boolean };
+    class Model {
+      running = new Map<number, M>();
+      waiters: M[] = [];
+      started: number[] = [];
+      constructor(readonly cap: number) {}
+      private free(w: M): boolean {
+        if (this.running.size >= this.cap) return false;
+        if (!w.keys) return this.running.size === 0;
+        for (const r of this.running.values()) if (!r.keys || [...w.keys].some(k => r.keys!.has(k))) return false;
+        return true;
+      }
+      private behind(w: M, n: number): boolean {
+        if (n === 0) return false;
+        if (!w.keys) return true;
+        for (let i = 0; i < n; i++) { const e = this.waiters[i]!; if (!e.keys || [...w.keys].some(k => e.keys!.has(k))) return true; }
+        return false;
+      }
+      private start(w: M) { this.started.push(w.id); if (!w.sync) this.running.set(w.id, w); }
+      private startNext(): boolean {
+        if (this.running.size >= this.cap) return false;
+        const blocked = new Set<string>();
+        for (let i = 0; i < this.waiters.length; i++) {
+          const w = this.waiters[i]!;
+          const ahead = !w.keys ? i > 0 : [...w.keys].some(k => blocked.has(k));
+          if (!ahead && this.free(w)) { this.waiters.splice(i, 1); this.start(w); return true; }
+          if (!w.keys) return false;
+          for (const k of w.keys) blocked.add(k);
+        }
+        return false;
+      }
+      arrive(w: M) {
+        if (this.free(w) && !this.behind(w, this.waiters.length)) this.start(w); else this.waiters.push(w);
+        while (this.startNext());
+      }
+      release(id: number) { this.running.delete(id); while (this.startNext()); }
+    }
+    // mulberry32: an LCG's low bits cycle too fast for `% 4`.
+    let seed = 1510;
+    const rand = (n: number) => {
+      seed = (seed + 0x6d2b79f5) | 0;
+      let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) % n;
+    };
+    const flush = () => new Promise<void>(r => setImmediate(r));
+    for (let run = 0; run < 200; run++) {
+      const cap = 1 + (run % 4);
+      const q = new WriteQueue(cap), model = new Model(cap);
+      const started: number[] = [];
+      const opens = new Map<number, () => void>();
+      const done: Promise<unknown>[] = [];
+      for (let id = 0, step = 0; step < 40; step++) {
+        const live = [...model.running.keys()];
+        if (live.length && rand(3) === 0) {
+          const victim = live[rand(live.length)]!;
+          model.release(victim);
+          opens.get(victim)!();
+        } else {
+          const me = id++;
+          const keys = rand(5) === 0 ? undefined : [...new Set(Array.from({ length: 1 + rand(3) }, () => `k${rand(4)}`))];
+          const sync = rand(3) === 0;
+          model.arrive({ id: me, ...(keys ? { keys: new Set(keys) } : {}), sync });
+          const fn = sync ? () => { started.push(me); } : async () => { started.push(me); await new Promise<void>(r => { opens.set(me, r); }); };
+          done.push(keys ? q.runKeyed(keys, fn) : q.run(fn));
+        }
+        await flush();
+        expect({ run, step, started }).toEqual({ run, step, started: model.started });
+      }
+      while (model.running.size) { const id = model.running.keys().next().value!; model.release(id); opens.get(id)!(); await flush(); }
+      expect(started).toEqual(model.started);
+      await Promise.all(done);
+      await until(() => q.idle, 2000, `run ${run}'s scheduler idle`);
+    }
+  });
+
+  // #1520 L3: deciding what starts doesn't walk the waiters. The shape that was quadratic under chunk 1's scan: a
+  // backlog of N bodies waiting on one running key while N bodies on keys of their own arrive and finish beside it
+  // (each arrival's `behind` and each pump's `startNext` walked the whole backlog), then the backlog drains. Steps are
+  // the scheduler's own count (queue.ts `steps`), so the bound needs no clock: doubling N at most a bit more than
+  // doubles them.
+  test("a long backlog behind a hot key drains in scheduler steps linear in its length", async () => {
+    const drain = async (n: number): Promise<number> => {
+      const q = new WriteQueue(4);
+      let open!: () => void;
+      const hot = q.runKeyed(["hot"], () => new Promise<void>(r => { open = r; }));
+      const runs: Promise<unknown>[] = [];
+      for (let i = 0; i < n; i++) runs.push(q.runKeyed(["hot"], () => {}));
+      for (let i = 0; i < n; i++) runs.push(q.runKeyed([`own:${i}`], () => {}));
+      expect(q.waiting).toBe(n);
+      open();
+      await Promise.all([hot, ...runs]);
+      expect(q.idle).toBe(true);
+      return q.steps;
+    };
+    const small = await drain(500), large = await drain(2000);
+    expect(large / small).toBeLessThan(4 * 1.25);
+    expect(large).toBeLessThan(2000 * 40);
   });
 
   test("#1408 holds for keyed waiters: each starts in its enqueuer's context with its own token", async () => {

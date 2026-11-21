@@ -7,6 +7,7 @@ import { DEFAULT_SERVICE_TOKEN_LIMITS, SERVICE_TOKEN_MIN_SECONDS, type ServiceTo
 
 import type { HumanReach } from "./policy.ts";
 import { DEFAULT_LAG_GATE, LAG_HISTORY, type LagGate } from "./metrics.ts";
+import { DEFAULT_DATABASE_WRITERS } from "./store/queue.ts";
 import { DEFAULT_AUTH_FAIL_LIMIT, DEFAULT_HELLO_LIMIT, DEFAULT_HOSTED_REQUEST_LIMIT, DEFAULT_HOSTED_SUBSCRIBER_LIMIT, type RateLimit } from "./rate_limit.ts";
 import { DEFAULT_TRUSTED_PROXIES, parseCidr } from "./client_addr.ts";
 import { DEFAULT_ATTACHMENT_LIMITS, DEFAULT_ATTACHMENT_USER_QUOTA, type AttachmentLimits } from "../shared/attachments.ts";
@@ -598,7 +599,8 @@ function connectSeconds(raw: string | undefined): { databaseConnectSeconds?: num
   return { databaseConnectSeconds: Number(raw) };
 }
 
-export const DEFAULT_DATABASE_WRITERS = 4;
+// Defined beside the scheduler it caps (store/queue.ts), so the Postgres store defaults to it without importing config.
+export { DEFAULT_DATABASE_WRITERS };
 function databaseWriters(raw: string | undefined): { databaseWriters?: number } {
   if (raw === undefined || raw === "") return {};
   if (!/^[1-9][0-9]*$/.test(raw) || Number(raw) > 64) {
