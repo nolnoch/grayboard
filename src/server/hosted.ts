@@ -7,9 +7,10 @@ import { DEFAULT_IDLE_SECONDS, MAX_CHILDREN, aliasLostNotice, childCapacity, asS
 import { launcherInstruction } from "../core/delegation.ts";
 import { channelInstructions, COORDINATION_INSTRUCTIONS, DEFAULT_CHANNEL_SOURCE, ownHumanInstruction } from "../core/tools.ts";
 import { normalizeAliasName } from "../core/addresses.ts";
+import { CoreError } from "../core/errors.ts";
 import { cleanFact } from "../core/text.ts";
 import { HUMAN_NAME, normalizeIdentityName } from "../shared/addressing.ts";
-import { ApplicationError, UNBOUND_READS, type Application, type ApplicationSession, type BuildFacts, type DeliverySink, type IdentityInfo, type RefusalRow } from "./application.ts";
+import { ApplicationError, KeyedSendMiss, UNBOUND_READS, type Application, type ApplicationSession, type BuildFacts, type DeliverySink, type IdentityInfo, type RefusalRow } from "./application.ts";
 import type { AuthedUser } from "./auth.ts";
 import type { OAuthPrincipal } from "./oauth.ts";
 import { BUILTIN_CLIENT_IDS, OPENCODE_CLIENT, harnessFor } from "./oauth-config.ts";
@@ -208,7 +209,8 @@ const RECONCILE_EVERY = 120;
 // of the idle window, so the idle sweep sees a row at most that much older than its last call.
 const TOUCH_EVERY_MS = 5_000;
 // `keyedGate: false` turns the gate's keyed fast path off (#1510): tests' reference for what the exclusive body writes.
-export function createHostedSessions(application: Application, options: { now?: () => number; idleSeconds?: number; caps?: HostedCaps["sessions"]; keyedGate?: false; isAuthorized(principal: OAuthPrincipal, r?: Read): boolean | Promise<boolean> }) {
+// `keyedTools: false` the same for keyed tool bodies (dm_send's, #1537 PR 5).
+export function createHostedSessions(application: Application, options: { now?: () => number; idleSeconds?: number; caps?: HostedCaps["sessions"]; keyedGate?: false; keyedTools?: false; isAuthorized(principal: OAuthPrincipal, r?: Read): boolean | Promise<boolean> }) {
   const repo = application.repo, store = repo.hosted;
   const now = options.now ?? Date.now;
   // GRAYBOARD_HOSTED_IDLE_SECONDS is parsed strictly in config.ts and arrives here as options.idleSeconds.
@@ -680,6 +682,8 @@ export function createHostedSessions(application: Application, options: { now?: 
   }
   // The gate's keyed fast path (#1510 chunk 3, docs/future/postgres-server.md D4), Postgres only (Repo.readsOnly).
   const keyedFast = options.keyedGate !== false && repo.readsOnly !== undefined;
+  // dm_send's keyed body (#1537 PR 5, D4), Postgres only (Repo.writeKeyedSend).
+  const keyedSend = options.keyedTools !== false && repo.writeKeyedSend !== undefined;
   // A keyed attempt that would have written more than the touch, or refused: it wrote nothing, and its caller runs the
   // exclusive body, which writes (or refuses) as it would have without the attempt.
   const MISS = Symbol("keyed gate miss");
@@ -967,6 +971,66 @@ export function createHostedSessions(application: Application, options: { now?: 
     const short = shortOf(p.authed.user_email), primary = (await application.hostedHolds(repo.read, row.session_id))[0];
     return aliasLostNotice(lost.map(l => ({ alias: short(l.alias), reason: l.reason })), primary === undefined ? null : short(primary), lost.some(l => l.primary), LOST_ALL);
   }
+  // A tool call's body after its gate (or prior). `keyed` (dm_send's, #1537 PR 5, D4): where keyedSend is on, the
+  // call's plan, read on the pool, picks a keyed body under the sender's root, the recipient's stream and the
+  // recipient's live holder's root (D5's conservative key); that body fences, runs `keyed.fn`, which checks the plan
+  // again before it inserts, and audits as the exclusive body does. A KeyedSendMiss or a refusal (ApplicationError,
+  // CoreError) inside it rolls it back with nothing committed: its refusal rows are dropped unwritten, and the exclusive
+  // body runs and refuses, or writes, as it would have alone. No plan (application.sendPlan's exclusive cases) runs
+  // the exclusive body at once. A request aborted while the keyed body waits rejects with no exclusive fallback.
+  async function runTool<T, P>(p: OAuthPrincipal, context: SessionContext, tool: string, fn: (session: ApplicationSession, tx: Tx) => T | Promise<T>, told: ((notice: string) => void) | undefined, prior: Verdict | undefined, signal: AbortSignal | undefined,
+    keyed?: { plan: (session: ApplicationSession) => Promise<(P & { to: string; holder: string | null }) | undefined>; fn: (session: ApplicationSession, tx: Tx, plan: P & { to: string; holder: string | null }) => Promise<T> }): Promise<T> {
+    const body = async (row: HostedSession | undefined) => {
+      const taken = told ? await takeLost(p, row, "agent") : [];
+      if (taken.length) told!(await lostNotice(p, row!, taken));
+      const root = row ? await rootOf(repo.read, row) : undefined;
+      const held = root ? await application.hostedHolds(repo.read, root.session_id) : [];
+      if (!(root && named(root, held)) && !UNBOUND_READS.has(tool) && tool !== "whoami") {
+        throw new ApplicationError("unbound", row?.root_session_id ? childUnbound(row.root_session_id) : "unbound; bind a name first, or have this session's root register it as a child (session_register)");
+      }
+      const selected = await snapshot(p, row, held, root);
+      const late = refusalRows();
+      selected.session.afterRollback = late.defer;
+      const audited = async (tx: Tx) => {
+        if (!writeReads.has(tool)) await audit(tx, row!.session_id, "hosted.write", { tool, session: row!.session_id, root: root!.session_id, grant: p.grantId, held: selected.session.holds, writes_as: root!.writes_as }, p);
+      };
+      try {
+        await testPauseAsync("hosted:tool:in-gate");
+        if (keyed && keyedSend && row && root) {
+          const plan = await keyed.plan(selected.session);
+          if (!plan) countGate("tool", "skipped");
+          else {
+            const keys = [...new Set([`root:${root.session_id}`, `dm:${plan.to}`, ...(plan.holder ? [`root:${plan.holder}`] : [])])];
+            const attempt = refusalRows();
+            selected.session.afterRollback = attempt.defer;
+            try {
+              const value = await abandonable(signal, () => atSite("tool", () => repo.writeKeyedSend!(keys, async tx => {
+                await fence(tx, p, row, root);
+                const v = await keyed.fn(selected.session, tx, plan);
+                await audited(tx);
+                return v;
+              })));
+              countGate("tool", "keyed");
+              return value;
+            } catch (error) {
+              if (!(error instanceof KeyedSendMiss || error instanceof ApplicationError || error instanceof CoreError)) throw error;
+            } finally { selected.session.afterRollback = late.defer; }
+            countGate("tool", "miss");
+          }
+        } else if (keyed) countGate("tool", "skipped");
+        return await abandonable(signal, () => atSite("tool", () => store.write<T>(async tx => {
+          await fence(tx, p, row, root);
+          const value = await fn(selected.session, tx);
+          await audited(tx);
+          return value;
+        })));
+      } catch (error) {
+        await late.flushQueued();
+        throw error;
+      } finally { application.close(selected.session); }
+    };
+    return prior ? withPrior(p, context, prior, body, signal) : withGate(p, context, false, body, true, true, true, true, signal);
+  }
   const service = {
     application,
     limits,
@@ -1017,31 +1081,14 @@ export function createHostedSessions(application: Application, options: { now?: 
     // verdict (#907). `signal`: the request's (withGate): the gate, the prior and the tool body are each skipped if it
     // fires while they wait in the write queue; the end-of-call touch and refusal rows always run.
     async run<T>(p: OAuthPrincipal, context: SessionContext, tool: string, fn: (session: ApplicationSession, tx: Tx) => T | Promise<T>, told?: (notice: string) => void, prior?: Verdict, signal?: AbortSignal): Promise<T> {
-      const body = async (row: HostedSession | undefined) => {
-        const taken = told ? await takeLost(p, row, "agent") : [];
-        if (taken.length) told!(await lostNotice(p, row!, taken));
-        const root = row ? await rootOf(repo.read, row) : undefined;
-        const held = root ? await application.hostedHolds(repo.read, root.session_id) : [];
-        if (!(root && named(root, held)) && !UNBOUND_READS.has(tool) && tool !== "whoami") {
-          throw new ApplicationError("unbound", row?.root_session_id ? childUnbound(row.root_session_id) : "unbound; bind a name first, or have this session's root register it as a child (session_register)");
-        }
-        const selected = await snapshot(p, row, held, root);
-        const late = refusalRows();
-        selected.session.afterRollback = late.defer;
-        try {
-          await testPauseAsync("hosted:tool:in-gate");
-          return await abandonable(signal, () => atSite("tool", () => store.write<T>(async tx => {
-            await fence(tx, p, row, root);
-            const value = await fn(selected.session, tx);
-            if (!writeReads.has(tool)) await audit(tx, row!.session_id, "hosted.write", { tool, session: row!.session_id, root: root!.session_id, grant: p.grantId, held: selected.session.holds, writes_as: root!.writes_as }, p);
-            return value;
-          })));
-        } catch (error) {
-          await late.flushQueued();
-          throw error;
-        } finally { application.close(selected.session); }
-      };
-      return prior ? withPrior(p, context, prior, body, signal) : withGate(p, context, false, body, true, true, true, true, signal);
+      return runTool(p, context, tool, fn, told, prior, signal);
+    },
+    // The dm_send tool: `run`, with a keyed body first on Postgres (#1537 PR 5, docs/future/postgres-server.md D4).
+    async dmSend(p: OAuthPrincipal, context: SessionContext, to: string, body: string, options: Parameters<Application["send"]>[4] = {}, told?: (notice: string) => void, prior?: Verdict, signal?: AbortSignal) {
+      return runTool(p, context, "dm_send", (session, tx) => application.send(tx, session, to, body, options), told, prior, signal, {
+        plan: session => application.sendPlan(session, to, options),
+        fn: (session, tx, plan) => application.sendKeyed(tx, session, plan, to, body, options),
+      });
     },
     async transfer<T>(p: OAuthPrincipal, context: SessionContext, fn: (session: ApplicationSession, guard: (r: Read) => Promise<void>) => Promise<T>): Promise<T> {
       return withGate(p, context, false, async row => {
