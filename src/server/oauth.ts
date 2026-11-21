@@ -1,7 +1,7 @@
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
-import { hashToken, mintToken, type AuthedUser } from "./auth.ts";
+import { hashToken, mintToken, reauthDue, type AuthedUser } from "./auth.ts";
 import { callbackPath, defaultProviders, DomainRefused, idpSignIn, type IdentityProvider, type UpstreamIdentity } from "./idp.ts";
-import { checkIdpConfig, type Config } from "./config.ts";
+import { checkIdpConfig, DEFAULT_IDP_REAUTH_DAYS, type Config } from "./config.ts";
 import type { AuthPeek, Repo } from "./db.ts";
 import type { Read, Tx } from "./store/tx.ts";
 import { BUILTIN_CLIENT_IDS, BUILTIN_CLIENTS, CLI_CLIENT, CLI_CLIENT_ID, isServiceClientId, LOGIN_SCOPE, matchesRedirect, mcpResource, oauthPublicUrl, OAUTH_SCOPES, OPENCODE_CLIENT, parseOAuthClients, sourceKeyFor, type OAuthClient } from "./oauth-config.ts";
@@ -133,6 +133,7 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
   // Built-ins and the CLI first; parseOAuthClients refuses an operator entry that reuses one of their IDs.
   const clients = new Map([...BUILTIN_CLIENTS, CLI_CLIENT, ...parseOAuthClients(JSON.stringify(config.oauthClients ?? []))].map(c => [c.clientId, c]));
   const now = options.now ?? Date.now;
+  const reauthDays = config.idpReauthDays ?? DEFAULT_IDP_REAUTH_DAYS;
   // Before any request (the server's `ready` waits for it, #807 P3 A4), and only once the config parsed: a grant an
   // operator client issued under a now-built-in ID (before #429) would otherwise act as a built-in's.
   // Both writes are queued here, in order, so the built-in cutover commits before the CLI's and both before
@@ -665,7 +666,14 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
             if (!grant) fail("invalid_grant");
             const selected = scopes(optional(p, "scope"), grant!.scopes);
             if (!selected.every(s => grant!.scopes.includes(s))) fail("invalid_scope");
-            return { t, result: await repo.oauth.rotateRefresh(tx, { clientId: client.clientId, resource, scopes: selected, refreshHash, tokens: pair(selected, t) }, t) };
+            const result = await repo.oauth.rotateRefresh(tx, { clientId: client.clientId, resource, scopes: selected, refreshHash, tokens: pair(selected, t) }, t);
+            // Re-auth due (#930): refused after the rotation, so the throw rolls it back and the token stays unspent for
+            // after a fresh sign-in, while a replay (not ok) still commits its family revocation.
+            if (result.status === "ok") {
+              const user = await repo.users.findById(tx, grant!.userId);
+              if (!user || reauthDue(user, t, reauthDays)) fail("invalid_grant");
+            }
+            return { t, result };
           }));
         }
         if (result.status !== "ok") { if (result.status === "replay") hostedFailure("oauth.replay", undefined, "warning"); fail("invalid_grant"); }

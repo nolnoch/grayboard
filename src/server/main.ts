@@ -1,6 +1,6 @@
 import "./zod_config.ts";
 import pkg from "../../package.json" with { type: "json" };
-import { describeBlobs, describeStore, loadConfig } from "./config.ts";
+import { describeBlobs, describeReauth, describeStore, loadConfig } from "./config.ts";
 import { startServer } from "./app.ts";
 import { openRepo } from "./open_repo.ts";
 import { BUILTIN_CLIENT_IDS } from "./oauth-config.ts";
@@ -56,6 +56,8 @@ console.log(`grayboard server: metrics ${metrics ? `on ${metrics.hostname}:${met
 const sourced = (config.oauthClients ?? []).filter(c => c.sessionSource).map(c => c.clientId);
 console.log(`grayboard server: operator clients with sessionSource: ${sourced.length ? sourced.join(", ") : "none"}`);
 console.log(`grayboard server: built-in clients: ${BUILTIN_CLIENT_IDS.join(", ")}`);
+// A provider with no directory check leaves an offboarded user's grants working until the re-auth window ends (#930).
+console.log(`grayboard server: IdP re-auth: ${describeReauth(config)}`);
 const cimdClients = config.oauthCimdClients ?? [];
 console.log(`grayboard server: metadata-document clients: ${cimdClients.length ? cimdClients.join(", ") : "none"}`);
 
