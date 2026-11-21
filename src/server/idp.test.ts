@@ -66,6 +66,14 @@ test("defaultProviders is Google alone by default, on the MCP pair when set, els
   }
 });
 
+// #930 A2b: Google has a directory status check exactly when the server has a directory key; Okta has none yet.
+test("defaultProviders gives Google a status check only with GRAYBOARD_GOOGLE_DIRECTORY_KEY", () => {
+  const directory = { clientEmail: "sa@p.iam.gserviceaccount.com", privateKey: "unused until the first check" };
+  expect(defaultProviders({ ...base, okta: undefined } as Config)[0]!.status).toBeUndefined();
+  const providers = defaultProviders({ ...base, idps: ["okta", "google"], googleDirectory: directory });
+  expect(providers.map(p => [p.id, typeof p.status])).toEqual([["okta", "undefined"], ["google", "function"]]);
+});
+
 test("defaultProviders builds Okta from Config in the listed order, fetching nothing until first use, with its own client", async () => {
   const fetched: string[] = [];
   let tokenAuthorization: string | null = null;
