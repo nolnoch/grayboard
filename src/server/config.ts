@@ -55,6 +55,10 @@ export type Config = {
   // GRAYBOARD_DATABASE_CONNECT_SECONDS (#1418): how long a Postgres store's first connection retries; absent, the
   // default (store/pg/connect.ts).
   databaseConnectSeconds?: number;
+  // GRAYBOARD_DATABASE_WRITERS (#1510): a Postgres store's write pool size and its write scheduler's cap (store/queue.ts):
+  // at most this many keyed write bodies overlap. Absent, DEFAULT_DATABASE_WRITERS. 1 is one write at a time, the
+  // single queue. Ignored by a SQLite store (one connection, one writer).
+  databaseWriters?: number;
   httpPort: number;
   googleClientId: string;
   googleClientSecret: string;
@@ -183,6 +187,7 @@ export function loadConfig(): Config {
     store,
     ...(blobS3 ? { blobS3 } : { blobDir }),
     ...connectSeconds(process.env.GRAYBOARD_DATABASE_CONNECT_SECONDS),
+    ...databaseWriters(process.env.GRAYBOARD_DATABASE_WRITERS),
     httpPort: parsePort(process.env.GRAYBOARD_HTTP_PORT),
     googleClientId,
     googleClientSecret,
@@ -543,14 +548,16 @@ export function describeBlobs(config: Pick<Config, "blobDir" | "blobS3">): strin
   return `s3://${s3.bucket}/${s3.prefix} (${s3.region}${s3.endpoint ? `, endpoint ${s3.endpoint}` : ""}; ${describeCredentials(s3.credentials)})`;
 }
 
-// What the startup line names: the backend and where, never a URL's credentials.
-export function describeStore(store: Store): string {
+// What the startup line names: the backend and where, never a URL's credentials. Given `writers` (the config's
+// databaseWriters), a Postgres store's line says how many write connections it opens, so a run's W is on record.
+export function describeStore(store: Store, opts?: { writers: number | undefined }): string {
   if (store.kind === "sqlite") return `sqlite ${store.path}`;
+  const writers = opts ? `, ${opts.writers ?? DEFAULT_DATABASE_WRITERS} writers` : "";
   try {
     const u = new URL(store.url);
-    return `postgres ${u.host}${u.pathname}`;
+    return `postgres ${u.host}${u.pathname}${writers}`;
   } catch {
-    return "postgres (unparsable URL)";
+    return `postgres (unparsable URL)${writers}`;
   }
 }
 
@@ -589,6 +596,15 @@ function connectSeconds(raw: string | undefined): { databaseConnectSeconds?: num
     throw new Error(`GRAYBOARD_DATABASE_CONNECT_SECONDS must be a whole number of seconds from 0 (one try) to 3600, not "${raw}"`);
   }
   return { databaseConnectSeconds: Number(raw) };
+}
+
+export const DEFAULT_DATABASE_WRITERS = 4;
+function databaseWriters(raw: string | undefined): { databaseWriters?: number } {
+  if (raw === undefined || raw === "") return {};
+  if (!/^[1-9][0-9]*$/.test(raw) || Number(raw) > 64) {
+    throw new Error(`GRAYBOARD_DATABASE_WRITERS must be a whole number of connections from 1 to 64, not "${raw}"`);
+  }
+  return { databaseWriters: Number(raw) };
 }
 
 function idleDays(raw: string | undefined): number {

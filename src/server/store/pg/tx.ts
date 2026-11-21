@@ -1,6 +1,7 @@
 // The Postgres store's transaction handles and write path (#807 P3 C2, docs/future/postgres-server.md D2, D4, D6): a
-// `Read` is the pool, a `Tx` one transaction's connection, both over tx_base.ts's backend-neutral contract, and
-// `write`/`post` run through the same write queue (store/queue.ts) as SQLite's. A store function takes a handle and
+// `Read` is the read pool, a `Tx` one transaction's connection from the write pool, both over tx_base.ts's
+// backend-neutral contract, and `write`/`writeKeyed`/`post` run through the write scheduler (store/queue.ts), as
+// SQLite's write and post do. A store function takes a handle and
 // runs its statements on `pgOf(handle)`, which sends each as it's built (PgSql).
 //
 // What differs from SQLite (tx.ts, db.ts `queued`/`posted`):
@@ -13,8 +14,8 @@
 //   one's rows although its body threw. On Postgres the stack carries weight: RELEASE or ROLLBACK TO naming a
 //   savepoint an enclosing statement already destroyed fails 3B001 and aborts the whole transaction, so a frame an
 //   enclosing ROLLBACK TO or RELEASE ended (or its transaction's end) sends nothing.
-// - Writer ownership (D4): the pool is read-only (default_transaction_read_only), each BEGIN says `read write`, a `Tx`
-//   dies with its body, and pgOf's handle has no begin, reserve or savepoint. There is no shared writer connection to
+// - Writer ownership (D4): both pools are read-only (default_transaction_read_only), each BEGIN says `read write`, a
+//   `Tx` dies with its body, and pgOf's handle has no begin, reserve or savepoint. There is no shared writer connection to
 //   guard per statement; SQL text that changes a pooled session's settings is caught only in review.
 // - An error a body catches without a savepoint aborts the transaction; the failure surfaces later as 25P02 or a
 //   rolled-back COMMIT, and the write rejects with TxAborted, which names the cause. A statement a store function sends
@@ -25,15 +26,23 @@
 // nothing that reaches it.
 import { SQL } from "bun";
 import { errorDiagnostic } from "../../diagnostics.ts";
-import { queueFor, type WriteQueue } from "../queue.ts";
+import { WriteQueue } from "../queue.ts";
 import { BaseRead, BaseTx, flushEffect, isThenable, type Read, type SavepointFrame, type Tx } from "../tx_base.ts";
 import { pgFailure } from "./errors.ts";
 import { openPg, type PgOptions } from "./sql.ts";
 
 type Effect = () => void | Promise<void>;
 
-// The store's state the handles share: its pool, its queue, and the root Tx of the transaction in progress.
-type Store = { readonly sql: SQL; readonly queue: WriteQueue; open: PgTx | undefined };
+// The store's state the handles share: its read pool, its scheduler, and each running body's root Tx while its
+// transaction is open, keyed on the body's scheduler token (queue.token): bodies overlap once one is keyed (#1510), so
+// "the open transaction" is the calling body's, never one slot for the store.
+type Store = { readonly sql: SQL; readonly queue: WriteQueue; readonly open: WeakMap<object, PgTx> };
+
+// The calling body's open root Tx: set from BEGIN until its `begin` settles, for the body and the tasks it started.
+function openOf(store: Store): PgTx | undefined {
+  const token = store.queue.token;
+  return token === undefined ? undefined : store.open.get(token);
+}
 
 // One transaction's savepoint bookkeeping: its connection, the open frames innermost last, and a counter for names.
 // A frame missing from `stack` is dead: its transaction ended, or an enclosing ROLLBACK TO or RELEASE ended it.
@@ -204,16 +213,16 @@ function statements(conn: SQL, check: () => void): PgSql {
   return sql;
 }
 
-// The statements of a Postgres store function: a live Tx's transaction, or the pool. Refuses a settled Tx (or one
-// whose savepoint is open), a handle from another backend, and the store's Read from the task holding its open
-// transaction: a pool read there sees none of the body's rows and, on a small pool, waits forever for the connection
-// the transaction holds. Such a caller passes its body's Tx. Checked here and again as each statement is sent. The
-// refusals read as SQLite's.
+// The statements of a Postgres store function: a live Tx's transaction, or the read pool. Refuses a settled Tx (or one
+// whose savepoint is open), a handle from another backend, and the store's Read from a body whose transaction is open
+// (or a task it started): a pool read there sees none of the body's rows. Such a caller passes its body's Tx. Judged
+// per body (openOf): another body's open transaction doesn't refuse this caller's read. Checked here and again as each
+// statement is sent. The refusals read as SQLite's.
 export function pgOf(r: Read): PgSql {
   if (r instanceof PgTx) { r.assertLive(); return statements(r.txn.conn, () => r.assertLive()); }
   if (!(r instanceof PgRead)) throw new Error("not a Postgres store handle");
   const { store } = r;
-  const check = () => { if (store.open && store.queue.mine) throw new Error(READ_REFUSAL); };
+  const check = () => { if (openOf(store)) throw new Error(READ_REFUSAL); };
   check();
   return statements(store.sql, check);
 }
@@ -226,52 +235,74 @@ function loggable(error: unknown): unknown {
 }
 
 export type PgTransactions = {
-  // A top-level write transaction through the store's queue: SQLite's Repo.write contract (db.ts `queued`). fn's
-  // Tx is live until fn settles; the beforeCommit hooks run after it fulfils; COMMIT, then the afterCommit effects'
-  // synchronous parts, then `committed`, all before the queue's next body. A synchronous fn commits async too.
+  // A top-level write transaction through the store's scheduler, exclusive: SQLite's Repo.write contract (db.ts
+  // `queued`). fn's Tx is live until fn settles; the beforeCommit hooks run after it fulfils; COMMIT, then the
+  // afterCommit effects' synchronous parts, then `committed`, all before the scheduler's next body. A synchronous fn
+  // commits async too.
   write<T, R = T>(fn: (tx: Tx) => T | PromiseLike<T>, committed?: (value: T) => R): Promise<Awaited<R>>;
+  // write, keyed (store/queue.ts runKeyed, #1510): it overlaps running keyed bodies that share none of `keys`, on a
+  // connection of its own; its effects and `committed` still run before any body that conflicts with it starts.
+  writeKeyed<T, R = T>(keys: readonly string[], fn: (tx: Tx) => T | PromiseLike<T>, committed?: (value: T) => R): Promise<Awaited<R>>;
   // A write no caller awaits: always queued, so always false. Refuses inside the caller's open transaction; a
   // failure, or a rejection of a promise `committed` returns, is logged as `what` failed.
   post<T>(fn: (tx: Tx) => T | PromiseLike<T>, committed?: (value: T) => unknown, what?: string): boolean;
   read: Read;
   queue: WriteQueue;
-  // Whether the store's root transaction is open (from BEGIN until `begin` settles).
+  // Whether the calling body's root transaction is open (from BEGIN until `begin` settles): false outside any body,
+  // whatever other bodies have open.
   inTransaction(): boolean;
   // NOTIFY through the pool, outside any transaction (the auth generation's heartbeat, pg/auth_generation.ts).
   notify(channel: string, payload: string): Promise<void>;
   close(): Promise<void>;
 };
 
-// The Postgres store's transactions over a pool of its own: the pool's settings are the store's invariants, so no
-// caller can open it without them. Read-only by default, with `read write` on each BEGIN: a pool statement that
-// writes fails 25006 (the stand-in for SQLite's writer check). lock_timeout bounds a wait on a lock an outside writer
-// (psql, a seeding script) holds: one queue serves every write, so an unbounded wait would stall them all (55P03).
-// Isolation is READ COMMITTED on every BEGIN, whatever the database default (D3, D6). No retries.
+// The Postgres store's transactions over two pools of its own: their settings are the store's invariants, so no
+// caller can open one without them. Reads and NOTIFY go on the read pool (`max`); every write body's transaction on the
+// write pool (`writers`, W, also the scheduler's cap, so a body that starts never waits for a connection: Bun releases
+// a transaction's connection before its `begin` settles, and the scheduler releases the body's slot after that). Two
+// Bun.SQL instances, because a pool shares nothing: Bun's pool serves its callers FIFO and a plain query behind as many
+// waiting transactions as it has connections isn't served, so on one pool reads would queue behind writers (Bun
+// v1.4.4 src/js/internal/sql/pool.ts #serveNext; `begin` queues a reservation there, src/js/bun/sql.ts). Each pool
+// dials up to its max on first use (pool.ts #dial), so a store holds up to `max` + W connections. Read-only by default,
+// with `read write` on each BEGIN: a pool statement that writes fails 25006 (the stand-in for SQLite's writer check).
+// lock_timeout bounds a wait on a lock an outside writer (psql, a seeding script) holds: an exclusive body that waited
+// without bound would stall every write behind it (55P03). Isolation is READ COMMITTED on every BEGIN, whatever the
+// database default (D3, D6). No retries.
 //
 // `ownAuthCommit` (postgres-server.md D5; #807 P3 C9b): called once a transaction that wrote an auth table (users,
 // oauth_grants, oauth_tokens, service_credential_secrets, service_credentials, principals) has committed (0001's
 // triggers mark it gb.auth_touched; ROLLBACK TO undoes the mark), before the effects, `committed` and the queue's next
 // body; also when such a COMMIT's outcome is unknown, since a bump is always safe. Set, it costs each write one round
 // trip before COMMIT to read the mark.
-export function makePgTransactions(url: string, { ownAuthCommit, ...opts }: Omit<PgOptions, "connection"> & { ownAuthCommit?: () => void } = {}): PgTransactions {
-  const sql = openPg(url, { ...opts, connection: { default_transaction_read_only: "on", lock_timeout: "5000" } });
-  const store: Store = { sql, queue: queueFor(sql), open: undefined };
-  const { queue } = store;
+//
+// `writers` (W, default 1): the write pool's size and the scheduler's cap. With every body exclusive, any W runs them
+// one at a time, as the single queue did; W bounds only how many keyed bodies overlap.
+export function makePgTransactions(url: string, { ownAuthCommit, writers = 1, ...opts }: Omit<PgOptions, "connection"> & { ownAuthCommit?: () => void; writers?: number } = {}): PgTransactions {
+  const connection = { default_transaction_read_only: "on", lock_timeout: "5000" };
+  const queue = new WriteQueue(writers);
+  const sql = openPg(url, { ...opts, connection });
+  const writePool = openPg(url, { ...opts, max: writers, connection });
+  const store: Store = { sql, queue, open: new WeakMap() };
 
-  function write<T, R = T>(fn: (tx: Tx) => T | PromiseLike<T>, committed?: (value: T) => R): Promise<Awaited<R>> {
-    if (store.open && queue.mine) return Promise.reject(new Error("write() inside an open transaction: nested code calls its Tx's savepoint"));
+  const write = <T, R = T>(fn: (tx: Tx) => T | PromiseLike<T>, committed?: (value: T) => R) => run(undefined, fn, committed);
+  const writeKeyed = <T, R = T>(keys: readonly string[], fn: (tx: Tx) => T | PromiseLike<T>, committed?: (value: T) => R) => run(keys, fn, committed);
+
+  function run<T, R = T>(keys: readonly string[] | undefined, fn: (tx: Tx) => T | PromiseLike<T>, committed?: (value: T) => R): Promise<Awaited<R>> {
+    if (openOf(store)) return Promise.reject(new Error("write() inside an open transaction: nested code calls its Tx's savepoint"));
     // fn and committed run as the work of the request that called write(), or of none (db.ts queued, #1042, #1408).
-    return queue.run(body).then(box => box.out) as Promise<Awaited<R>>;
+    return (keys === undefined ? queue.run(body) : queue.runKeyed(keys, body)).then(box => box.out) as Promise<Awaited<R>>;
 
     async function body(): Promise<{ out: R }> {
+      // This body's identity for its own open transaction (openOf): the scheduler sets it before calling here.
+      const token = queue.token!;
       let root: PgTx | undefined;
       let fulfilled = false, touched = false;
       let box: { v: T };
       try {
-        box = await sql.begin("isolation level read committed, read write", async conn => {
+        box = await writePool.begin("isolation level read committed, read write", async conn => {
           const txn: Txn = { conn, stack: [], n: 0, ended: false };
           root = new PgTx(store, txn);
-          store.open = root;
+          store.open.set(token, root);
           try {
             const v = await fn(root as unknown as Tx);
             if (root.hasBeforeCommit) await root.runBeforeCommit();
@@ -290,7 +321,7 @@ export function makePgTransactions(url: string, { ownAuthCommit, ...opts }: Omit
         });
       } catch (error) {
         root?.close();
-        store.open = undefined;
+        store.open.delete(token);
         // The body fulfilled and COMMIT failed without a SQLSTATE (the connection lost): the server may have
         // committed. The effects don't run, so memory may lag the database until a restart.
         if (fulfilled && !(error instanceof SQL.PostgresError && (typeof error.errno === "string" || pgFailure(error)))) {
@@ -301,14 +332,14 @@ export function makePgTransactions(url: string, { ownAuthCommit, ...opts }: Omit
         throw TxAborted.wrap(error, root?.txn);
       }
       if (touched) ownAuthCommit!();
-      store.open = undefined;
+      store.open.delete(token);
       for (const effect of root!.effects) flushEffect(effect);
       return { out: committed ? committed(box.v) : box.v as unknown as R };
     }
   }
 
   function post<T>(fn: (tx: Tx) => T | PromiseLike<T>, given?: (value: T) => unknown, what = "write"): boolean {
-    if (store.open && queue.mine) throw new Error(`post inside an open transaction (${what}): a body's write goes on its Tx`);
+    if (openOf(store)) throw new Error(`post inside an open transaction (${what}): a body's write goes on its Tx`);
     // No caller awaits a post: a promise committed returns is caught and logged here (#1051), its throw by the
     // write's own catch, once either way.
     const committed = given && ((value: T) => {
@@ -320,11 +351,11 @@ export function makePgTransactions(url: string, { ownAuthCommit, ...opts }: Omit
   }
 
   return {
-    write, post,
+    write, writeKeyed, post,
     read: new PgRead(store) as unknown as Read,
     queue,
-    inTransaction: () => store.open !== undefined,
+    inTransaction: () => openOf(store) !== undefined,
     notify: (channel, payload) => sql.notify(channel, payload),
-    close: () => sql.close(),
+    close: async () => { await Promise.all([sql.close(), writePool.close()]); },
   };
 }

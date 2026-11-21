@@ -50,8 +50,10 @@ export type PgRepoOptions = {
   // Labels the pool's connections in pg_stat_activity; the LISTEN's is `<applicationName>-listen`, the migration's
   // `<applicationName>-migrate`.
   applicationName?: string;
-  // Pool size (Bun's default is 10).
+  // Read pool size (Bun's default is 10).
   max?: number;
+  // Write pool size and the write scheduler's cap (store/pg/tx.ts makePgTransactions; default 1).
+  writers?: number;
 };
 
 export async function makePgRepo(url: string, opts: PgRepoOptions): Promise<Repo> {
@@ -61,7 +63,7 @@ export async function makePgRepo(url: string, opts: PgRepoOptions): Promise<Repo
   // The write path bumps the generation (ownAuthCommit), which reads the store's queue: each needs the other, so the
   // generation binds late.
   let gen!: PgAuthGeneration;
-  const t = makePgTransactions(url, { max: opts.max, applicationName: app, ownAuthCommit: () => gen.ownCommit() });
+  const t = makePgTransactions(url, { max: opts.max, writers: opts.writers, applicationName: app, ownAuthCommit: () => gen.ownCommit() });
   gen = makePgAuthGeneration({ url, transactions: t, openListener: openPgListener(url, `${app}-listen`) });
   const close = async () => { await gen.close(); await t.close(); };
   try {
@@ -92,12 +94,14 @@ export async function makePgRepo(url: string, opts: PgRepoOptions): Promise<Repo
     end: marks(hosted.end, (_tx, session) => session), childEnd: marks(hosted.childEnd, (_tx, session) => session),
     park: marks(hosted.park, (_tx, session) => session), unpark: marks(hosted.unpark, (_tx, session) => session),
     write: t.write,
+    writeKeyed: t.writeKeyed,
     subscribe: notices.subscribe,
   };
 
   const repo: Repo = {
     now: clock,
     write: t.write,
+    writeKeyed: t.writeKeyed,
     post: t.post,
     read: t.read,
     authRead: auth.authRead,

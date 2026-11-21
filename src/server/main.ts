@@ -48,7 +48,7 @@ try {
   process.exit(1);
 }
 console.log(`grayboard server ${pkg.version} listening on port ${server.port}`);
-console.log(`grayboard server: store ${describeStore(config.store)}`);
+console.log(`grayboard server: store ${describeStore(config.store, { writers: config.databaseWriters })}`);
 console.log(`grayboard server: attachments ${describeBlobs(config)}`);
 // An unauthenticated listener: say where it bound, every start.
 console.log(`grayboard server: metrics ${metrics ? `on ${metrics.hostname}:${metrics.port}` : "off"}`);

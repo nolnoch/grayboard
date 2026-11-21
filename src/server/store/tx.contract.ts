@@ -20,6 +20,8 @@ import { afterCommitOf, isTx, type Read, type Tx } from "./tx_base.ts";
 // One store, fresh per test, over a table of text values in insertion order.
 export type TxStore = {
   write<T, R = T>(fn: (tx: Tx) => T | Promise<T>, committed?: (value: T) => R): Promise<Awaited<R>>;
+  // Repo.writeKeyed (#1510): write, overlapping only keyed bodies that share none of `keys` where the backend can.
+  writeKeyed<T, R = T>(keys: readonly string[], fn: (tx: Tx) => T | Promise<T>, committed?: (value: T) => R): Promise<Awaited<R>>;
   post<T>(fn: (tx: Tx) => T | Promise<T>, committed?: (value: T) => unknown, what?: string): boolean;
   read: Read;
   // The store's write queue (store/queue.ts).
@@ -612,6 +614,51 @@ function writePath(backend: TxBackend, it: It): void {
     expect(h.queue.held).toBe(false);
     await h.write(tx => h.put(tx, "next"));
     expect(await h.rows(h.read)).toEqual(["next"]);
+  });
+
+  // #1510: a keyed body keeps write's whole contract; what may overlap it is the backend's (one connection: nothing).
+  it("writeKeyed commits like write: rows, effects then committed, a rollback on throw, the nested refusal", async h => {
+    const seen: string[] = [];
+    expect(await h.writeKeyed(["root:a"], async tx => {
+      await h.put(tx, "keyed");
+      tx.afterCommit(() => { seen.push(`effect (${h.inTransaction() ? "in" : "after"} txn)`); });
+      return 1;
+    }, v => { seen.push(`committed ${v}`); return v + 1; })).toBe(2);
+    expect(seen).toEqual(["effect (after txn)", "committed 1"]);
+    await expect(h.writeKeyed(["root:a"], async tx => { await h.put(tx, "gone"); throw new Error("keyed boom"); })).rejects.toThrow("keyed boom");
+    let nested: Promise<unknown> | undefined;
+    await h.writeKeyed(["root:a"], async () => { nested = h.writeKeyed(["root:b"], () => 1).catch(e => e); });
+    expect(String(await nested)).toContain("nested code calls its Tx's savepoint");
+    await h.write(async () => { nested = h.writeKeyed(["root:b"], () => 1).catch(e => e); });
+    expect(String(await nested)).toContain("nested code calls its Tx's savepoint");
+    expect(await h.rows(h.read)).toEqual(["keyed"]);
+    expect(h.queue.held).toBe(false);
+  });
+
+  it("writeKeyed refuses an empty key list or an empty key, and writes nothing", async h => {
+    await expect(h.writeKeyed([], tx => h.put(tx, "none"))).rejects.toThrow("at least one key");
+    await expect(h.writeKeyed(["root:a", ""], tx => h.put(tx, "empty"))).rejects.toThrow("each a non-empty string");
+    expect(await h.rows(h.read)).toEqual([]);
+  });
+
+  it("an exclusive write waits for a keyed body, and keyed bodies of one key run in arrival order, each after the last one's effects", async h => {
+    const seen: string[] = [];
+    const hold = gate(), entered = gate();
+    const first = h.writeKeyed(["root:a"], async tx => {
+      seen.push("1");
+      entered.open();
+      await hold.wait;
+      await h.put(tx, "1");
+      tx.afterCommit(() => { seen.push("1:effect"); });
+    }, () => { seen.push("1:committed"); });
+    await entered.wait;
+    const exclusive = h.write(async tx => { seen.push("x"); await h.put(tx, "x"); });
+    const second = h.writeKeyed(["root:a"], async tx => { seen.push("2"); await h.put(tx, "2"); });
+    expect(seen).toEqual(["1"]);
+    hold.open();
+    await Promise.all([first, exclusive, second]);
+    expect(seen).toEqual(["1", "1:effect", "1:committed", "x", "2"]);
+    expect(await h.rows(h.read)).toEqual(["1", "x", "2"]);
   });
 
   // post (#807 P1b-4b): a write no caller awaits.

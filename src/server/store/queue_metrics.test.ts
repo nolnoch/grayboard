@@ -104,3 +104,17 @@ test("the exposition parses with the loadtest's parser: cumulative buckets, +Inf
   const depth = s.filter(x => x.name === "grayboard_write_queue_depth_bucket");
   expect(depth.at(-1)!.labels.le).toBe("+Inf");
 });
+
+test("#1510: a keyed body counts in the keyed counter under its site as well as in bodies; the running gauge counts bodies running at once", async () => {
+  const q = new WriteQueue(2), before = scrape(), a = deferred(), b = deferred();
+  const first = atSite("gate", () => q.runKeyed(["root:1"], () => a.promise));
+  const second = atSite("gate", () => q.runKeyed(["root:2"], () => b.promise));
+  expect(value(scrape(), "grayboard_write_queue_running") - value(before, "grayboard_write_queue_running")).toBe(2);
+  a.resolve(); b.resolve();
+  await Promise.all([first, second]);
+  await atSite("gate", () => q.run(() => 1));
+  const after = scrape();
+  expect(value(after, "grayboard_write_queue_running")).toBe(value(before, "grayboard_write_queue_running"));
+  expect(bodies(before, after, "gate")).toBe(3);
+  expect(value(after, "grayboard_write_queue_keyed_bodies_total", { site: "gate" }) - value(before, "grayboard_write_queue_keyed_bodies_total", { site: "gate" })).toBe(2);
+});

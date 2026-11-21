@@ -27,7 +27,7 @@ const KEYS = [
   "GRAYBOARD_BLOB_S3_BUCKET", "GRAYBOARD_BLOB_S3_REGION", "GRAYBOARD_BLOB_S3_PREFIX", "GRAYBOARD_BLOB_S3_ENDPOINT",
   "AWS_REGION", "AWS_ROLE_ARN", "AWS_WEB_IDENTITY_TOKEN_FILE", "AWS_ROLE_SESSION_NAME", "AWS_ENDPOINT_URL_STS",
   "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "S3_SESSION_TOKEN",
-  "GRAYBOARD_DATABASE_CONNECT_SECONDS", "SLACK_APP_TOKEN", "SLACK_BOT_TOKEN", ...FILE_SECRETS.map(name => `${name}_FILE`),
+  "GRAYBOARD_DATABASE_CONNECT_SECONDS", "GRAYBOARD_DATABASE_WRITERS", "SLACK_APP_TOKEN", "SLACK_BOT_TOKEN", ...FILE_SECRETS.map(name => `${name}_FILE`),
 ];
 
 describe("loadConfig", () => {
@@ -146,6 +146,9 @@ describe("loadConfig", () => {
     expect(config.blobDir).toBe("/var/lib/grayboard/blobs");
     // The startup line's description carries no credentials.
     expect(describeStore(config.store)).toBe("postgres db.example.com:5432/grayboard");
+    expect(describeStore(config.store, { writers: undefined })).toBe("postgres db.example.com:5432/grayboard, 4 writers");
+    expect(describeStore(config.store, { writers: 8 })).toBe("postgres db.example.com:5432/grayboard, 8 writers");
+    expect(describeStore({ kind: "sqlite", path: "/x.db" }, { writers: 8 })).toBe("sqlite /x.db");
     expect(describeStore({ kind: "postgres", url: "not a url s3cret" })).not.toContain("s3cret");
     delete process.env.GRAYBOARD_DATABASE_URL;
     expect(() => loadConfig()).toThrow("Required env var GRAYBOARD_DB_PATH (or GRAYBOARD_DATABASE_URL) is not set");
@@ -162,6 +165,20 @@ describe("loadConfig", () => {
     for (const bad of ["3601", "-1", "1.5", "015", " 5", "5s"]) {
       process.env.GRAYBOARD_DATABASE_CONNECT_SECONDS = bad;
       expect(() => loadConfig()).toThrow(`GRAYBOARD_DATABASE_CONNECT_SECONDS must be a whole number of seconds from 0 (one try) to 3600, not "${bad}"`);
+    }
+  });
+
+  // #1510: the write pool's size and the write scheduler's cap; unset leaves the default (open_repo.ts).
+  test("GRAYBOARD_DATABASE_WRITERS is 1 to 64 whole connections", () => {
+    process.env.GRAYBOARD_DEV_AUTH = "1";
+    expect(loadConfig().databaseWriters).toBeUndefined();
+    for (const ok of ["1", "8", "64"]) {
+      process.env.GRAYBOARD_DATABASE_WRITERS = ok;
+      expect(loadConfig().databaseWriters).toBe(Number(ok));
+    }
+    for (const bad of ["0", "65", "-1", "1.5", "08", " 4", "4x"]) {
+      process.env.GRAYBOARD_DATABASE_WRITERS = bad;
+      expect(() => loadConfig()).toThrow(`GRAYBOARD_DATABASE_WRITERS must be a whole number of connections from 1 to 64, not "${bad}"`);
     }
   });
 
