@@ -550,15 +550,14 @@ export function describeBlobs(config: Pick<Config, "blobDir" | "blobS3">): strin
 }
 
 // What the startup line names: the backend and where, never a URL's credentials. Given `writers` (the config's
-// databaseWriters), a Postgres store's line says how many write connections it opens and its sslmode, so a run's W and TLS are on record.
-export function describeStore(store: Store, opts?: { writers: number | undefined }): string {
+// databaseWriters), a Postgres store's line says how many write connections it opens, and given `tls` (store/pg/sql.ts pgTlsMode), the
+// TLS mode, so a run's W and TLS are on record.
+export function describeStore(store: Store, opts?: { writers: number | undefined; tls?: string }): string {
   if (store.kind === "sqlite") return `sqlite ${store.path}`;
   const writers = opts ? `, ${opts.writers ?? DEFAULT_DATABASE_WRITERS} writers` : "";
   try {
     const u = new URL(store.url);
-    // On the startup line, the TLS mode too: no sslmode means no TLS at all under Bun.SQL, so say so where the operator looks.
-    const mode = u.searchParams.get("sslmode");
-    const tls = opts ? `, ${mode ? `sslmode=${mode}` : "no TLS (no sslmode)"}` : "";
+    const tls = opts?.tls ? `, ${opts.tls}` : "";
     return `postgres ${u.host}${u.pathname}${writers}${tls}`;
   } catch {
     return `postgres (unparsable URL)${writers}`;

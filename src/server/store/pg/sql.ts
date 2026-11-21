@@ -30,6 +30,19 @@ export function openPg(url: string, opts: PgOptions = {}): SQL {
 
 // An int8 column as a number. Throws on null and on a value a double can't hold exactly: ids, times and counts in
 // this schema stay far below 2^53, so one that doesn't is corruption, not data to round.
+// The TLS mode Bun.SQL resolved from a URL, for the startup line: it reads `sslmode`, `ssl` and `tls` in any case, and
+// no TLS parameter means none at all. `options.sslMode` is Bun's internal enum (src/js/internal/sql/shared.ts), so
+// sql.test.ts pins it: a Bun upgrade that moves it fails there. `prefer` falls back to plaintext silently.
+const PG_TLS_MODES = ["no TLS", "TLS if offered (prefer: may be plaintext)", "TLS, certificate unchecked (require)", "TLS, CA checked (verify-ca)", "TLS, verified (verify-full)"];
+export function pgTlsMode(url: string): string {
+  try {
+    const sql = new SQL(url);
+    const mode = (sql as unknown as { options?: { sslMode?: unknown } }).options?.sslMode;
+    sql.close().catch(() => {});
+    return typeof mode === "number" && PG_TLS_MODES[mode] ? PG_TLS_MODES[mode]! : "TLS mode unknown";
+  } catch { return "TLS mode unknown"; }
+}
+
 export function int8(v: unknown): number {
   if (v === null || v === undefined) throw new Error("int8: unexpected null");
   return safe(v);

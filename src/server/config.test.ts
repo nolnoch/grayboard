@@ -144,9 +144,8 @@ describe("loadConfig", () => {
     expect(config.blobDir).toBe("/var/lib/grayboard/blobs");
     // The startup line's description carries no credentials.
     expect(describeStore(config.store)).toBe("postgres db.example.com:5432/grayboard");
-    expect(describeStore(config.store, { writers: undefined })).toBe("postgres db.example.com:5432/grayboard, 8 writers, no TLS (no sslmode)");
-    expect(describeStore(config.store, { writers: 8 })).toBe("postgres db.example.com:5432/grayboard, 8 writers, no TLS (no sslmode)");
-    expect(describeStore({ kind: "postgres", url: `${url}?sslmode=verify-full&sslrootcert=/ca.pem` }, { writers: 4 })).toBe("postgres db.example.com:5432/grayboard, 4 writers, sslmode=verify-full");
+    expect(describeStore(config.store, { writers: undefined })).toBe("postgres db.example.com:5432/grayboard, 8 writers");
+    expect(describeStore(config.store, { writers: 8, tls: "no TLS" })).toBe("postgres db.example.com:5432/grayboard, 8 writers, no TLS");
     expect(describeStore({ kind: "sqlite", path: "/x.db" }, { writers: 8 })).toBe("sqlite /x.db");
     expect(describeStore({ kind: "postgres", url: "not a url s3cret" })).not.toContain("s3cret");
     // Bun.SQL would pick another adapter from another scheme.
