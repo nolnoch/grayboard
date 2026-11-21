@@ -1169,6 +1169,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       },
       async findByEmail(r, email) { return userByEmail(sqliteOf(r), email); },
       async findById(r, userId) { return userById(sqliteOf(r), userId); },
+      async lockById(tx, userId) { return userById(sqliteOf(tx), userId); },
       isDisabled: auth.isDisabled,
       active: auth.active,
       async setDisabled(tx, userId, disabled) {

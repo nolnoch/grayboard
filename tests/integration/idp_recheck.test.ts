@@ -4,12 +4,13 @@
 import { afterEach, expect, test } from "bun:test";
 import { issueOAuth } from "../helpers/oauth.ts";
 import type { IdentityProvider } from "../../src/server/idp.ts";
+import { createIdpRecheck, TRANSIENT_BACKOFF_MS } from "../../src/server/idp_recheck.ts";
 import { accessAudits } from "../support/audit.ts";
 import { exec, row } from "../support/repo_sql.ts";
 import { TestServer } from "../support/server.ts";
 import { until } from "../support/until.ts";
 
-const A = "alice@example.com", B = "bob@example.com", C = "carol@example.com", HOUR = 3_600_000, ISSUER = "https://idp.example";
+const A = "alice@example.com", B = "bob@example.com", C = "carol@example.com", ROOT = "root@example.com", HOUR = 3_600_000, ISSUER = "https://idp.example";
 type Answer = "active" | "inactive" | Error | Promise<"active" | "inactive">;
 let srv: TestServer, clock: number, calls: string[], answer: (subject: string) => Answer;
 
@@ -27,7 +28,7 @@ const stub: IdentityProvider = {
 
 async function open(recheck = { recheckHours: 24, maxStaleHours: 72, disableLimit: 5 }) {
   clock = Date.now(); calls = []; answer = () => "active";
-  srv = await TestServer.open({ idpRecheck: recheck }, { now: () => clock, oauth: { now: () => clock, providers: [stub] } });
+  srv = await TestServer.open({ idpRecheck: recheck, admins: [ROOT] }, { now: () => clock, oauth: { now: () => clock, providers: [stub] } });
   await srv.app.ready;
 }
 afterEach(() => srv.stop());
@@ -93,6 +94,7 @@ test("an IdP outage fails open within the stale bound, then answers 503 with the
   await vouched(A, 25);
   answer = () => new Error("upstream 502");
   expect((await refresh(g.refreshToken)).status).toBe(200);
+  clock += TRANSIENT_BACKOFF_MS;
   const g2 = await grant();
   await vouched(A, 73);
   const unavailable = await refresh(g2.refreshToken);
@@ -100,8 +102,9 @@ test("an IdP outage fails open within the stale bound, then answers 503 with the
   expect(await unavailable.json()).toEqual({ error: "temporarily_unavailable" });
   expect((await user(A))!.disabled_at).toBeNull();
   expect((await accessAudits(srv, "auth.idp_check_failed")).map(a => a.detail.error_class)).toEqual(["Error", "Error"]);
-  // The IdP back: the same token rotates.
+  // The IdP back: once the backoff lapses, the same token rotates.
   answer = () => "active";
+  clock += TRANSIENT_BACKOFF_MS;
   expect((await refresh(g2.refreshToken)).status).toBe(200);
 });
 
@@ -125,6 +128,77 @@ test("past the disable limit in an hour automatic disables stop, and the check f
   expect((await user(A))!.disabled_at).not.toBeNull();
   expect((await user(B))!.disabled_at).toBeNull();
   expect((await accessAudits(srv, "auth.idp_recheck_tripped")).map(r => r.detail)).toEqual([{ provider: "stub", limit: 1, level: "error" }]);
+  expect((await accessAudits(srv, "auth.idp_check_failed")).map(r => [r.target, r.detail.error_class])).toEqual([[B, "breaker_tripped"]]);
+});
+
+test("after a transient answer the user is backed off: no status call and no audit row until it lapses", async () => {
+  await open();
+  const g = await grant();
+  await vouched(A, 25);
+  answer = () => new Error("down");
+  const first = await refresh(g.refreshToken);
+  expect(first.status).toBe(200);
+  clock += TRANSIENT_BACKOFF_MS - 1;
+  const second = await refresh((await first.json()).refresh_token);
+  expect(second.status).toBe(200);
+  expect(calls).toEqual(["s-alice"]);
+  // Past the stale bound a backed-off user's refresh still answers 503, from the cached transient.
+  await vouched(A, 73);
+  const g2 = await grant();
+  expect((await refresh(g2.refreshToken)).status).toBe(503);
+  expect(calls).toEqual(["s-alice"]);
+  clock += 1;
+  expect((await refresh((await second.json()).refresh_token)).status).toBe(503);
+  expect(calls).toEqual(["s-alice", "s-alice"]);
+  expect((await accessAudits(srv, "auth.idp_check_failed")).length).toBe(2);
+});
+
+test("a sign-in that restamps the clock while the status call runs keeps the user, and the no-op disable isn't counted", async () => {
+  await open({ recheckHours: 24, maxStaleHours: 72, disableLimit: 1 });
+  await confirm();
+  const a = await grant(A), b = await grant(B);
+  await vouched(A, 25); await vouched(B, 25);
+  answer = subject => subject === "s-alice"
+    ? exec(srv, "UPDATE users SET idp_checked_at = ? WHERE email = ?", clock, A).then(() => "inactive" as const)
+    : "inactive";
+  expect((await refresh(a.refreshToken)).status).toBe(200);
+  expect((await user(A))!.disabled_at).toBeNull();
+  expect(await accessAudits(srv, "auth.idp_disabled")).toEqual([]);
+  // The limit of one is still unspent.
+  expect((await refresh(b.refreshToken)).status).toBe(400);
+  expect((await user(B))!.disabled_at).not.toBeNull();
+  expect(await accessAudits(srv, "auth.idp_recheck_tripped")).toEqual([]);
+});
+
+test("a disable calls the disconnect and Slack hooks once it commits, and names the services it orphans", async () => {
+  await open();
+  const root = await srv.login(ROOT);
+  await srv.login(A); await srv.login(C);
+  expect((await srv.api(root, "POST", "/api/admin/services", { name: "solo", owners: [A] })).status).toBe(201);
+  await vouched(A, 25);
+  const disconnected: number[] = [], changed: number[] = [];
+  const recheck = createIdpRecheck(srv.app.repo, [stub], { recheckHours: 24, maxStaleHours: 72, disableLimit: 5, reauthDays: 30 }, {
+    disconnectUser: id => disconnected.push(id), userChanged: id => { changed.push(id); }, background: () => {},
+  }, () => clock);
+  const id = (await row<{ id: number }>(srv, "SELECT id FROM users WHERE email = ?", A))!.id;
+  const carol = (await row<{ id: number }>(srv, "SELECT id FROM users WHERE email = ?", C))!.id;
+  // Carol's active answer confirms the provider.
+  await vouched(C, 25);
+  expect(await recheck.beforeRefresh(carol)).toBe("ok");
+  answer = () => "inactive";
+  expect(await recheck.beforeRefresh(id)).toBe("refuse");
+  expect(disconnected).toEqual([id]);
+  expect(changed).toEqual([id]);
+  expect((await accessAudits(srv, "auth.idp_disabled")).map(a => a.detail)).toEqual([{ provider: "stub", issuer: ISSUER, reason: "inactive", orphaned_services: ["solo"] }]);
+});
+
+test("a covered user with no clock (a row an older release linked) is checked at once", async () => {
+  await open();
+  const g = await grant();
+  await vouched(A, null);
+  expect((await refresh(g.refreshToken)).status).toBe(200);
+  expect(calls).toEqual(["s-alice"]);
+  expect((await user(A))!.idp_checked_at).toBe(clock);
 });
 
 test("concurrent refreshes of one user's grants make one IdP call", async () => {
@@ -165,18 +239,20 @@ test("a stale user's CLI token works while the background check runs, which disa
   expect((await srv.api(cli, "GET", "/api/whoami")).status).toBe(401);
 });
 
-test("past the stale bound a CLI token waits for the check and is refused while the IdP is down", async () => {
+test("past the stale bound a CLI token waits for the check and answers a retryable 503 while the IdP is down", async () => {
   await open();
   const cli = await srv.login(A);
   await vouched(A, 73);
   answer = () => new Error("down");
-  expect((await srv.api(cli, "GET", "/api/whoami")).status).toBe(401);
+  const down = await fetch(`${srv.base}/api/whoami`, { headers: { Authorization: `Bearer ${cli}` } });
+  expect(down.status).toBe(503);
+  expect(down.headers.get("retry-after")).toBe("60");
+  expect(await down.json()).toEqual({ code: "temporarily_unavailable", message: "the identity provider is unreachable; retry in a minute" });
   expect(calls).toEqual(["s-alice"]);
   expect((await user(A))!.disabled_at).toBeNull();
-  // The IdP back: once the auth gate's minute-long refusal cache lapses, the same token works, and the answer
-  // restamps the clock.
+  // The IdP back: once the backoff lapses, the same token works, and the answer restamps the clock.
   answer = () => "active";
-  clock += 61_000;
+  clock += TRANSIENT_BACKOFF_MS;
   expect((await srv.api(cli, "GET", "/api/whoami")).status).toBe(200);
   expect(calls).toEqual(["s-alice", "s-alice"]);
   expect((await user(A))!.idp_checked_at).toBe(clock);

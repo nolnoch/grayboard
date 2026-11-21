@@ -2,15 +2,21 @@
 // status query (IdentityProvider.status) is asked again once their IdP clock (users.idp_checked_at) is older than
 // recheckHours: blocking on a refresh, in the background on a CLI token's use. An inactive answer disables them as
 // admin disable-user does; an active one restamps the clock; anything else is transient and fails open until the
-// clock is maxStaleHours old, when a refresh answers 503 and a CLI token is refused instead. Every other user stays on the GRAYBOARD_IDP_REAUTH_DAYS
+// clock is maxStaleHours old, when a refresh and a CLI token's use both answer 503 instead. A transient answer
+// backs the user off for TRANSIENT_BACKOFF_MS: no status call and no audit row until it passes. Every other user stays on the GRAYBOARD_IDP_REAUTH_DAYS
 // fallback (reauthDue). Nothing here runs inside a caller's transaction: the IdP call never holds the write queue.
 import { reauthDue } from "./auth.ts";
 import { writeAudit } from "./audit.ts";
 import type { Repo, User } from "./db.ts";
 import type { IdentityProvider } from "./idp.ts";
 
-// A status call that hasn't answered by then is transient.
-export const IDP_STATUS_TIMEOUT_MS = 5_000;
+// A status call that hasn't answered by then is transient. Well inside hosted-core's 10 s refresh abort
+// (adapters/hosted-core/src/login.ts), which a slow IdP plus a busy write queue must not reach.
+export const IDP_STATUS_TIMEOUT_MS = 3_000;
+// After a transient answer, how long that user's re-checks answer transient without asking the IdP again.
+export const TRANSIENT_BACKOFF_MS = 5 * 60_000;
+// Past this many backed-off users, expired entries are swept on the next insert.
+const BACKOFF_SWEEP_AT = 1_000;
 const HOUR = 3_600_000;
 
 export type RecheckConfig = { recheckHours: number; maxStaleHours: number; disableLimit: number; reauthDays: number };
@@ -25,6 +31,9 @@ export type RecheckHooks = {
 // What a refresh does: rotate, refuse with invalid_grant (the user is now disabled), or answer 503
 // temporarily_unavailable with the refresh token unspent.
 export type RefreshVerdict = "ok" | "refuse" | "unavailable";
+// What a CLI token's use does: work, 401 (the fallback clock ran out, or the user is now disabled), or answer 503
+// temporarily_unavailable with the token untouched.
+export type CliVerdict = RefreshVerdict;
 type Outcome = "active" | "inactive" | "transient";
 
 type Checked = Pick<User, "id" | "email" | "kind" | "idp_issuer" | "idp_subject" | "idp_checked_at">;
@@ -32,11 +41,11 @@ type Checked = Pick<User, "id" | "email" | "kind" | "idp_issuer" | "idp_subject"
 export type IdpRecheck = {
   // Before a refresh's rotation, for the user behind an unspent refresh token (oauth.findRefreshUser).
   beforeRefresh(userId: number): Promise<RefreshVerdict>;
-  // On a CLI token's use: true refuses it. With no status provider, the fallback clock decides. A user with one is
-  // checked in the background once stale, and the token works meanwhile; past maxStaleHours the check blocks, as a
-  // refresh's does, and only an active answer lets the token through, so a directory that stops answering bounds
-  // CLI tokens as it bounds refresh.
-  cliRefused(user: Checked): Promise<boolean>;
+  // On a CLI token's use. With no status provider, the fallback clock decides. A user with one is checked in the
+  // background once stale, and the token works meanwhile; past maxStaleHours the check blocks, as a refresh's does:
+  // active lets the token through, inactive refuses it, and anything else answers "unavailable", so a directory
+  // that stops answering bounds CLI tokens as it bounds refresh without signing anyone out.
+  cliVerdict(user: Checked): Promise<CliVerdict>;
   // Inside a refresh's rotation: the fallback, for a user no status provider covers.
   fallbackDue(user: Checked): boolean;
 };
@@ -50,6 +59,8 @@ export function createIdpRecheck(
   // everyone disables nobody).
   const confirmed = new Set<IdentityProvider>();
   const inflight = new Map<number, Promise<Outcome>>();
+  // userId → when its backoff ends.
+  const backoff = new Map<number, number>();
   const disables: number[] = [];
   let tripped = false;
 
@@ -61,10 +72,11 @@ export function createIdpRecheck(
     writeAudit(repo, repo.read, "auth.idp_check_failed", null, u.email, { provider: p.id, error_class, level: "warning" });
 
   // Disables as admin disable-user does, unless the user changed since the read the check started from: a sign-in
-  // meanwhile restamped the clock (the IdP vouched again), or someone else disabled or unlinked them.
+  // meanwhile restamped the clock (the IdP vouched again), or someone else disabled or unlinked them. The re-read
+  // locks the row, so on a multi-writer store a sign-in's restamp can't commit between it and the disable.
   async function disable(u: Checked, p: IdentityProvider): Promise<boolean> {
     const done = await repo.write(async tx => {
-      const cur = await repo.users.findById(tx, u.id);
+      const cur = await repo.users.lockById(tx, u.id);
       if (!cur || cur.disabled_at !== null || cur.idp_checked_at !== u.idp_checked_at || cur.idp_issuer !== u.idp_issuer || cur.idp_subject !== u.idp_subject) return null;
       await repo.users.setDisabled(tx, cur.id, true);
       const orphaned = await repo.services.orphanedBy(tx, cur.id);
@@ -103,18 +115,34 @@ export function createIdpRecheck(
         writeAudit(repo, repo.read, "auth.idp_recheck_tripped", null, u.email, { provider: p.id, limit: config.disableLimit, level: "error" });
         console.error(`[grayboard] IdP re-check: more than ${config.disableLimit} automatic disables in an hour; automatic disables are off until restart`);
       }
+      failed(p, u, "breaker_tripped");
       return "transient";
     }
-    // Counted before the write, so concurrent checks of different users can't each pass the limit.
+    // Counted before the write, so concurrent checks of different users can't each pass the limit; uncounted when
+    // the disable turned out a no-op.
     disables.push(t);
-    return await disable(u, p) ? "inactive" : "active";
+    if (await disable(u, p)) return "inactive";
+    const i = disables.indexOf(t);
+    if (i >= 0) disables.splice(i, 1);
+    return "active";
   }
 
-  // One status call per user at a time in this process; a second caller shares the first's answer.
+  // One status call per user at a time in this process; a second caller shares the first's answer. A user backed
+  // off after a transient answer is transient again without a call.
   function check(u: Checked, p: IdentityProvider): Promise<Outcome> {
     const running = inflight.get(u.id);
     if (running) return running;
-    const next = ask(u, p).finally(() => inflight.delete(u.id));
+    const until = backoff.get(u.id);
+    if (until !== undefined) {
+      if (until > now()) return Promise.resolve("transient");
+      backoff.delete(u.id);
+    }
+    const next = ask(u, p).then(out => {
+      if (out !== "transient") return out;
+      if (backoff.size >= BACKOFF_SWEEP_AT) { const t = now(); for (const [id, end] of backoff) if (end <= t) backoff.delete(id); }
+      backoff.set(u.id, now() + TRANSIENT_BACKOFF_MS);
+      return out;
+    }).finally(() => inflight.delete(u.id));
     inflight.set(u.id, next);
     return next;
   }
@@ -130,12 +158,15 @@ export function createIdpRecheck(
       if (out === "active") return "ok";
       return olderThan(u, config.maxStaleHours) ? "unavailable" : "ok";
     },
-    async cliRefused(u) {
+    async cliVerdict(u) {
       const p = providerFor(u);
-      if (!p) return reauthDue(u, now(), config.reauthDays);
-      if (olderThan(u, config.maxStaleHours)) return await check(u, p) !== "active";
+      if (!p) return reauthDue(u, now(), config.reauthDays) ? "refuse" : "ok";
+      if (olderThan(u, config.maxStaleHours)) {
+        const out = await check(u, p);
+        return out === "active" ? "ok" : out === "inactive" ? "refuse" : "unavailable";
+      }
       if (olderThan(u, config.recheckHours)) hooks.background("IdP re-check", () => check(u, p));
-      return false;
+      return "ok";
     },
     fallbackDue(u) {
       return !providerFor(u) && reauthDue(u, now(), config.reauthDays);

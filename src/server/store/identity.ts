@@ -96,6 +96,9 @@ export interface UsersStore {
   findByEmail(r: Read, email: string): Promise<User | undefined>;
   // Uncached: a fresh read on the caller's handle.
   findById(r: Read, userId: number): Promise<User | undefined>;
+  // findById inside a write, holding the users row until it commits (Postgres FOR UPDATE; SQLite's one writer
+  // already serializes): a check-then-write on the row sees no concurrent change between the two (#930).
+  lockById(tx: Tx, userId: number): Promise<User | undefined>;
   // findById(r, id)?.disabled_at != null, cached on authGeneration (#853); inside the caller's own transaction it
   // reads on its Tx, uncached.
   isDisabled(r: Read, userId: number): Promise<boolean>;

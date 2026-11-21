@@ -242,6 +242,7 @@ export function makePgIdentity({ now, hosted }: { now: () => number; hosted: PgH
       },
       findByEmail: (r, email) => userByEmail(pgOf(r), email),
       findById: (r, userId) => userById(pgOf(r), userId),
+      lockById: (tx, userId) => first(pgOf(tx)`${userFrom(pgOf(tx))} WHERE u.id = ${userId} FOR UPDATE OF u`, toUser),
       // The UPDATE is the users row's lock: it waits for a mint holding FOR SHARE, and a mint after it waits, then finds
       // the user disabled. Re-enabling revives nothing the disable revoked.
       async setDisabled(tx, userId, disabled) {
