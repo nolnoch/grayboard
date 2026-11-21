@@ -1986,11 +1986,11 @@ describePg("keyed dm_send (Postgres)", () => {
   // A normal exchange: the selection's verdict, then dm_send reusing it (withPrior), keyed in its tool body: counted as
   // the tool site's dm_send keyed, the prior's tool keyed, and one keyed body at the queue's `tool` site. The body's
   // statements are pinned so a later cut changes them on purpose (#1537 C6 among them): to a same-user recipient with
-  // no live holder (isAuthorized stubbed, so no access read), 17 statements in 13 round trips: BEGIN; grantLive's FOR
-  // SHARE; store.lock's root probe and row FOR UPDATE, and the root re-read; sendKeyed's disabled read; the recipient's
-  // alias find (memoized: aliasHidden and the wake reuse it); dedup's prune and first claim (one flight); isHuman; the
-  // insert; lastSeen and the undelivered count (one flight); the receipt upsert; the hosted.write audit (riding the
-  // next flight); the auth-mark read; COMMIT. Trace: p1537/c5/dmsend-trace.txt.
+  // no live holder (isAuthorized stubbed, so fence's authorization reads nothing; fence takes no grant lock), 17
+  // statements in 13 round trips: BEGIN; fence's store.lock (the root probe, then the row FOR UPDATE; rootOf reuses
+  // them); sendKeyed's disabled read; the recipient's alias find (memoized: aliasHidden and the wake reuse it); dedup's
+  // SAVEPOINT, prune and first claim (one flight); isHuman; the insert; lastSeen and the undelivered count (one
+  // flight); the receipt upsert; RELEASE; the hosted.write audit and the auth-mark read (one flight); COMMIT.
   test("dm_send in a normal exchange runs keyed, counted by method, with a pinned statement count", async () => {
     await using db = await pgDatabase({ max: 2 });
     await using x = await leaseInstance(db.url);
@@ -2010,6 +2010,24 @@ describePg("keyed dm_send (Postgres)", () => {
 });
 
 describePg("keyed dm_send rows (Postgres)", () => {
+  // The sender's binding changed after the call's gate (its root's bind_gen moved while the call waits at
+  // hosted:tool:in-gate): the keyed body's fence refuses it unbound, a miss with nothing written, and the exclusive
+  // body's fence refuses it again. Mutation: runTool's keyed body without its fence (the send commits keyed).
+  test("a sender whose binding changed after the gate is refused unbound, keyed attempt and exclusive body alike", async () => {
+    await using db = await pgDatabase({ max: 2 });
+    await using x = await leaseInstance(db.url);
+    const p = await leasePrincipal(x, db.sql);
+    await bound(x, p, "root-s1", "s1"); await bound(x, p, "root-r1", "r1");
+    const d = toolDelta();
+    const out = await hostedPause("hosted:tool:in-gate", () => dm(x, p, "root-s1", `${ME}/r1`, "after rebind"), async () => {
+      const bumped = await db.sql`UPDATE hosted_sessions SET bind_gen = bind_gen + 1 WHERE source_session_id = 'root-s1' AND root_session_id IS NULL RETURNING session_id`;
+      expect(bumped).toHaveLength(1);
+    }).then(r => `sent ${JSON.stringify(r)}`, (e: { code?: string; message?: string }) => `refused ${e.code}: ${e.message}`);
+    expect(out).toBe("refused unbound: session binding changed; select the current binding again");
+    expect(d()).toEqual({ keyed: 0, miss: 1, skipped: 0 });
+    expect((await db.sql`SELECT count(*)::int AS n FROM messages`)[0].n).toBe(0);
+  });
+
   // One script on two databases, keyed tool bodies on and off: keyed sends (plain, a replay, a resend, pending, a reply,
   // to a live holder), misses (a policy deny, whose authz.decision row the exclusive body writes once; a missing
   // alias's refusal; a disabled user, whose session the exclusive body terminates) and a skip (a send with files). Every row matches, message ids included (no keyed attempt
