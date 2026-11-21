@@ -6,6 +6,8 @@ import { issueOAuth } from "../helpers/oauth.ts";
 import type { IdentityProvider } from "../../src/server/idp.ts";
 import { GOOGLE_ISSUER, googleProvider } from "../../src/server/idp_google.ts";
 import { exportPKCS8, generateKeyPair } from "jose";
+import { oidcProvider } from "../../src/server/idp_oidc.ts";
+import { keycloakDirectoryStatus } from "../../src/server/idp_keycloak_directory.ts";
 import { createIdpRecheck, TRANSIENT_BACKOFF_MS } from "../../src/server/idp_recheck.ts";
 import { accessAudits } from "../support/audit.ts";
 import { exec, row } from "../support/repo_sql.ts";
@@ -314,4 +316,45 @@ test("Google's directory check: an active answer confirms it, a suspended one di
   try { expect((await refresh(b.refreshToken)).status).toBe(200); } finally { console.warn = warn; }
   expect((await user(B))!.disabled_at).toBeNull();
   expect((await accessAudits(srv, "auth.idp_check_failed")).map(x => x.detail.error_class)).toEqual(["google_token_refused"]);
+});
+
+// #1555: the oidc provider with Keycloak's directory check, pointed at a scripted Keycloak, through the same refresh path.
+test("Keycloak's directory check: enabled confirms, disabled or gone disables; a brute-force lockout is transient and classed", async () => {
+  const KC = "https://sso.example.com", KC_ISSUER = `${KC}/realms/eng`;
+  const users: Record<string, { enabled: boolean; locked?: boolean }> = { "u-c": { enabled: true }, "u-a": { enabled: false }, "u-b": { enabled: false, locked: true } };
+  const fakeKeycloak = (async (input: string | URL | Request) => {
+    const url = String(input);
+    if (url === `${KC}/realms/eng/protocol/openid-connect/token`) return Response.json({ access_token: "t", expires_in: 300 });
+    const id = decodeURIComponent(url.slice(url.lastIndexOf("/") + 1));
+    if (url.startsWith(`${KC}/admin/realms/eng/attack-detection/brute-force/users/`)) return Response.json({ disabled: users[id]?.locked ?? false });
+    if (url.startsWith(`${KC}/admin/realms/eng/users/`))
+      return users[id] ? Response.json({ id, enabled: users[id]!.enabled }) : Response.json({ error: "User not found" }, { status: 404 });
+    return new Response("", { status: 599 });
+  }) as typeof fetch;
+  const keycloak: IdentityProvider = {
+    ...oidcProvider({ id: "oidc", label: "SSO", issuer: KC_ISSUER, clientId: "grayboard", allowedDomains: ["example.com"] }),
+    status: keycloakDirectoryStatus({ baseUrl: KC, realm: "eng", clientId: "grayboard-directory", clientSecret: "s" }, { fetch: fakeKeycloak, now: () => clock }),
+  };
+  clock = Date.now(); calls = [];
+  srv = await TestServer.open({ idpRecheck: { recheckHours: 24, maxStaleHours: 72, disableLimit: 5 }, admins: [ROOT] },
+    { now: () => clock, oauth: { now: () => clock, providers: [keycloak] } });
+  await srv.app.ready;
+  const D = "dave@example.com";
+  const link = (email: string, subject: string, hoursAgo: number) =>
+    exec(srv, "UPDATE users SET idp_issuer = ?, idp_subject = ?, idp_checked_at = ? WHERE email = ?", KC_ISSUER, subject, clock - hoursAgo * HOUR, email);
+  const c = await grant(C), a = await grant(A), b = await grant(B), d = await grant(D);
+  await link(C, "u-c", 25); await link(A, "u-a", 25); await link(B, "u-b", 25); await link(D, "u-gone", 25);
+  expect((await refresh(c.refreshToken)).status).toBe(200);
+  expect((await user(C))!.idp_checked_at).toBe(clock);
+  expect((await refresh(a.refreshToken)).status).toBe(400);
+  expect((await user(A))!.disabled_at).not.toBeNull();
+  expect((await refresh(d.refreshToken)).status).toBe(400);
+  expect((await user(D))!.disabled_at).not.toBeNull();
+  expect((await accessAudits(srv, "auth.idp_disabled")).map(x => x.detail)).toEqual([
+    { provider: "oidc", issuer: KC_ISSUER, reason: "inactive" }, { provider: "oidc", issuer: KC_ISSUER, reason: "inactive" }]);
+  // Locked out by brute-force detection: an attack on the account, not an offboarding. Bob keeps working within the
+  // stale bound, and the class says why.
+  expect((await refresh(b.refreshToken)).status).toBe(200);
+  expect((await user(B))!.disabled_at).toBeNull();
+  expect((await accessAudits(srv, "auth.idp_check_failed")).map(x => x.detail.error_class)).toEqual(["keycloak_locked_out"]);
 });

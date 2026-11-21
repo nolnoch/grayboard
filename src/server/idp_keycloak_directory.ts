@@ -51,7 +51,8 @@ export function keycloakDirectoryStatus(config: KeycloakDirectoryConfig, options
   }
   const errorText = (body: unknown) => {
     const b = body as { error?: unknown; error_description?: unknown } | null;
-    return [b?.error, b?.error_description].filter(v => typeof v === "string").map(v => (v as string).slice(0, 100)).join(": ");
+    const text = [b?.error, b?.error_description].filter(v => typeof v === "string").map(v => (v as string).slice(0, 100)).join(": ");
+    return text ? `: ${text}` : "";
   };
   const object = (body: unknown, what: string): Record<string, unknown> => {
     if (typeof body !== "object" || body === null || Array.isArray(body)) throw new DirectoryError("keycloak_directory_error", `${what} is not a JSON object`);
@@ -67,7 +68,7 @@ export function keycloakDirectoryStatus(config: KeycloakDirectoryConfig, options
     });
     // invalid_client, unauthorized_client: the id, the secret or the service account switch.
     if (res.status === 400 || res.status === 401)
-      throw refused(new DirectoryError("keycloak_token_refused", `Keycloak token request failed (${res.status}): ${errorText(res.body)}`));
+      throw refused(new DirectoryError("keycloak_token_refused", `Keycloak token request failed (${res.status})${errorText(res.body)}`));
     if (!res.ok) throw new DirectoryError("keycloak_directory_error", `Keycloak token request failed (${res.status})`);
     const body = object(res.body, "Keycloak token response");
     if (typeof body.access_token !== "string" || typeof body.expires_in !== "number") throw new DirectoryError("keycloak_directory_error", "Keycloak token response is malformed");
@@ -79,7 +80,7 @@ export function keycloakDirectoryStatus(config: KeycloakDirectoryConfig, options
     const res = await request(`${adminBase}${path}`, { signal, headers: { Authorization: `Bearer ${token}`, Accept: "application/json" } });
     if (res.status === 401) tokens.drop();
     if (res.status === 401 || res.status === 403)
-      throw refused(new DirectoryError("keycloak_directory_refused", `Keycloak ${what} failed (${res.status}): ${errorText(res.body)}`));
+      throw refused(new DirectoryError("keycloak_directory_refused", `Keycloak ${what} failed (${res.status})${errorText(res.body)}`));
     return res;
   }
 
