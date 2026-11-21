@@ -360,13 +360,13 @@ async function gateInstance(url: string, opts: { oauth?: boolean; keyedGate?: fa
   const repo: PgRepo = await makePgRepo(url, { blobDir, applicationName: `gb-test-gate-${opts.side ?? "a"}`, max: 4, now: () => clock });
   const store = repo.hosted;
   const state = { hold: undefined as Gate | undefined, held: 0, keyedQueued: 0, defer: undefined as Gate | undefined, exclusive: [] as Array<{ site: string | undefined; startedHeld?: boolean }>,
-    beforePrior: undefined as (() => Promise<void>) | undefined, priorHold: undefined as Gate | undefined, absent: new Map<string, number>() };
+    beforePrior: undefined as (() => Promise<void>) | undefined, priorHold: undefined as Gate | undefined, absent: new Map<string, number>(), onAbsent: undefined as ((id: string) => void) | undefined, denyNext: false };
   const isKeyed = (tx: unknown) => (tx as { txn?: { keys?: ReadonlySet<string> } }).txn?.keys !== undefined;
   const get = store.get.bind(store);
   store.get = (async (r: Parameters<typeof store.get>[0], id: string) => {
     if (isKeyed(r) && currentSite() === "prior" && state.priorHold) { state.held++; try { await state.priorHold.wait; } finally { state.held--; } }
     const row = await get(r, id);
-    if (!isTx(r) && row === undefined) state.absent.set(id, (state.absent.get(id) ?? 0) + 1);
+    if (!isTx(r) && row === undefined) { state.absent.set(id, (state.absent.get(id) ?? 0) + 1); state.onAbsent?.(id); }
     return row;
   }) as typeof store.get;
   const lock = store.lock.bind(store);
@@ -401,7 +401,7 @@ async function gateInstance(url: string, opts: { oauth?: boolean; keyedGate?: fa
   const application = createApplication(repo);
   const oauth = opts.oauth ? createOAuthServer(repo, { store: { kind: "postgres", url }, blobDir, httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl: `${ORIGIN}:443/hosted`, messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES }, { now: () => clock }) : undefined;
   await oauth?.ready;
-  const hosted = createHostedSessions(application, { now: () => clock, isAuthorized: oauth ? (p, r) => oauth.isAuthorized(p, r) : () => true, ...(opts.keyedGate === false ? { keyedGate: false as const } : {}), ...(opts.idleSeconds ? { idleSeconds: opts.idleSeconds } : {}), ...(opts.caps ? { caps: opts.caps } : {}) });
+  const hosted = createHostedSessions(application, { now: () => clock, isAuthorized: (p, r) => { if (state.denyNext) { state.denyNext = false; return false; } return oauth ? oauth.isAuthorized(p, r) : true; }, ...(opts.keyedGate === false ? { keyedGate: false as const } : {}), ...(opts.idleSeconds ? { idleSeconds: opts.idleSeconds } : {}), ...(opts.caps ? { caps: opts.caps } : {}) });
   await hosted.ready;
   return {
     repo, hosted, state, oauth, q: repo.writeQueue,
@@ -1001,6 +1001,44 @@ describePg("a first contact's second wire waits for the in-flight create (Postgr
     const decisions = await db.sql`SELECT actor, detail->>'rule' AS rule, detail->>'verb' AS verb FROM access_log WHERE action = 'authz.decision' AND target = ${id}`;
     expect(decisions.map((r: Record<string, unknown>) => ({ ...r }))).toEqual([{ actor: "other@example.com", rule: "hosted.other_user", verb: "hosted.session" }]);
     expect(await rows(db.sql, id)).toEqual({ sessions: 1, ownerships: 1 });
+  });
+});
+
+describePg("AUDIT 1537a", () => {
+  const absent = (x: GateInstance, id: string) => x.state.absent.get(id) ?? 0;
+  const deadline = <T>(q: Promise<T>, ms: number, what: string) => Promise.race([q, new Promise<never>((_, rej) => setTimeout(() => rej(new Error(`deadline: ${what}`)), ms))]);
+  test("AUDIT A: a registrant that throws before its exclusive body (auth refused in the gate) leaves no entry", async () => {
+    await using db = await pgDatabase({ max: 2 });
+    await using x = await gateInstance(db.url, { oauth: true });
+    const { p } = await issued(x);
+    const id = idOf(p, "aud-a");
+    let armed = true;
+    x.state.onAbsent = k => { if (k === id && armed) { armed = false; x.state.denyNext = true; } };
+    const e = await whoami(x, p, "aud-a").catch((err: unknown) => err);
+    expect((e as { code?: string }).code).toBe("unauthenticated");
+    x.state.onAbsent = undefined;
+    const d = delta();
+    expect(await deadline(whoami(x, p, "aud-a"), 5000, "the next first contact hung on a stale entry")).toBeNull();
+    expect(d()).toEqual({ keyed: 0, miss: 0, skipped: 1 });
+  });
+  test("AUDIT B: the waiter runs keyed while the creator's fn is still running (entry released before fn)", async () => {
+    await using db = await pgDatabase({ max: 2 });
+    await using x = await gateInstance(db.url, { oauth: true });
+    const { p } = await issued(x);
+    const id = idOf(p, "aud-b");
+    let release!: () => void; const held = new Promise<void>(r => { release = r; });
+    let creatorDone = false, waiterSawCreatorRunning: boolean | undefined;
+    const d = delta();
+    let waiter!: Promise<unknown>;
+    const out = await hostedPause("hosted:gate:checked", () => x.hosted.control(p, ctx(p, "aud-b"), false, async () => { await held; return 1; }).finally(() => { creatorDone = true; }), async () => {
+      waiter = deadline(whoami(x, p, "aud-b"), 4000, "waiter blocked behind creator fn").then(v => { waiterSawCreatorRunning = !creatorDone; release(); return v; }, e => { release(); throw e; });
+      void waiter.catch(() => {});
+      await until(() => absent(x, id) >= 2, 10_000, "waiter read");
+    });
+    expect(out).toBe(1);
+    expect(await waiter).toBeNull();
+    expect(waiterSawCreatorRunning).toBe(true);
+    expect(d()).toEqual({ keyed: 1, miss: 0, skipped: 1 });
   });
 });
 
