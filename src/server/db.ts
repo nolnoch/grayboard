@@ -252,6 +252,11 @@ export interface Repo {
   // (`dm:<address>`), so the one message it may insert (messages.insert refuses without its `dm:` key) is ordered on
   // its stream and its effects run under that key. Postgres only, for hosted.ts dmSend; absent on SQLite.
   writeKeyedSend?<T>(keys: readonly string[], fn: (tx: Tx) => Promise<T>): Promise<T>;
+  // writeKeyed for board_post's keyed body (#1537 PR 6, D4): writeKeyedSend's terms with the board for the stream.
+  // Refused unless `keys` are exactly one root (`root:<id>`) and one board (`board:<name>`), so the one post it may
+  // insert (boards.insertPost refuses without its `board:` key) is ordered on its board. Postgres only, for hosted.ts
+  // boardPost; absent on SQLite.
+  writeKeyedPost?<T>(keys: readonly string[], fn: (tx: Tx) => Promise<T>): Promise<T>;
   // The store's read handle outside any transaction (#807 P1c): reads committed state. The task holding an open
   // transaction can't use it (sqliteOf refuses, #807 P3 A7e2): it passes its body's Tx. A Postgres Read is a pool
   // handle and must never resolve to a transaction's connection.

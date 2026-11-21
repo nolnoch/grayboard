@@ -30,7 +30,7 @@ import { endSessionServer } from "./session_end.ts";
 import { principalOfAuthed, type AuthedUser } from "./auth.ts";
 import {
   age, checkBody, parseAliasMeta, pendingKey, postPreChecks, refOf,
-  cleanFact, idCollisionText, normalizeBoard, getBoard,
+  cleanFact, idCollisionText, normalizeBoard, getBoard, mentionTokens, postBranch,
   type AliasMetaSet, type Board, type CoreDb, type PendingRef, type ReadResult, type SnapshotOptions, type UnboundPeer,
 } from "../core/boards.ts";
 import { addressParts, aliasScope, type AliasScope, type ParsedAddress } from "../core/addresses.ts";
@@ -48,7 +48,7 @@ import { expiryTimer } from "../core/claims.ts";
 import { detached } from "./request_context.ts";
 import { onAliasCreated } from "./teams.ts";
 import { boardAccess, ownScopeOn, seerIn, type BoardAccess } from "./access.ts";
-import { boardCatalog, boardSnapshot, pendingOf, visibleBoards } from "./board_reads.ts";
+import { boardCatalog, boardSnapshot, pendingOf, readableBoard, visibleBoards } from "./board_reads.ts";
 import { callBoardTool, claimsSeen, serverBoardActor } from "./boards.ts";
 import { PROMISE_DAYS, STALE_UNDELIVERED_MS, alreadyRetracted, historyLimit, inboxDays, promised, queuedNote, retractRefusal, showMessage, unanswered, undeliveredInstruction, type InboxItem, type PromiseItem } from "../shared/inbox.ts";
 import type { Pending } from "../shared/notifications.ts";
@@ -278,7 +278,7 @@ const trackedCommit = (hub: Hub, h: Read, what: string): Commit => (effect) => a
 // awaited (#807 D4; never `repo.post`, which refuses an async body, B5a1 H2).
 const lostAck = (hub: Hub, h: Read, handle: string, receiver: string | undefined) => async (ref: PendingRef): Promise<void> => {
   if (isTx(h)) return hub.repo.boards.acknowledge(h, handle, ref, receiver);
-  void hub.repo.write((tx: Tx) => hub.repo.boards.acknowledge(tx, handle, ref, receiver)).catch((error) => console.error("lost-visibility push ack failed", error));
+  void atSite("boards", () => hub.repo.write((tx: Tx) => hub.repo.boards.acknowledge(tx, handle, ref, receiver))).catch((error) => console.error("lost-visibility push ack failed", error));
 };
 
 // The session a receipt or read by `s` credits, and must still hold the address it marks (#1466): the one whose ID
@@ -643,7 +643,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
   // refused take always rolls it back. Outside a bind (a sweep, outside any body) the row is posted.
   let streakAt: { tx: Tx; afterRollback?: (write: RefusalRow) => void } | undefined;
   const streakRow = (write: SyncRow) => {
-    if (!streakAt) { repo.post(write, undefined, "bind rate-limit row"); return; }
+    if (!streakAt) { atSite("limiter", () => repo.post(write, undefined, "bind rate-limit row")); return; }
     write(streakAt.tx); streakAt.afterRollback?.(write);
   };
   const bindLimiter = (limit: RateLimit) => new RateLimiter(limit, {
@@ -656,7 +656,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
       streakRow(w => writeAudit(repo, w, "bind.rate_limit_ended", email, null, { refused }));
     },
   }, opts.now);
-  const delegateRow = (write: SyncRow) => { if (hub.delegateRows) hub.delegateRows.push(write); else repo.post(write, undefined, "delegation throttle row"); };
+  const delegateRow = (write: SyncRow) => { if (hub.delegateRows) hub.delegateRows.push(write); else atSite("limiter", () => repo.post(write, undefined, "delegation throttle row")); };
   const hub: Hub = {
     repo,
     registry: new Map(),
@@ -765,7 +765,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
   // on the pool (#807 P3 B2).
   const claimTimer = expiryTimer({
     next: () => repo.claims.nextExpiry(repo.read),
-    sweep: () => repo.write(tx => sweepClaims(repo, hub.access, tx, repo.now())),
+    sweep: () => atSite("claims", () => repo.write(tx => sweepClaims(repo, hub.access, tx, repo.now()))),
     now: () => repo.now(),
   }, handles => wake(hub, backgroundCommit("claim expiry wake"), handles), boards => boardsChanged(backgroundCommit("claim expiry board change"), boards));
   const expiry = { arm: () => detached(() => claimTimer.arm()), stop: () => claimTimer.stop() };
@@ -798,7 +798,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
   // last_seen; the one-statement touch waits on it and on nothing after, so no cycle forms. Close's other write, the
   // human release row, stays exclusive.
   function close(session: ApplicationSession, h: Read = repo.read) {
-    const write = (row: (tx: Tx) => Promise<void>, what: string, site: "touch" | "other" = "other", keys?: string[]) => {
+    const write = (row: (tx: Tx) => Promise<void>, what: string, site: "touch" | "human" = "human", keys?: string[]) => {
       if (isTx(h)) h.beforeCommit({}, row);
       else void atSite(site, () => keys ? repo.writeKeyed(keys, row) : repo.write(row)).catch(e => console.error(`[grayboard] ${what} failed:`, e));
     };
@@ -880,10 +880,10 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
   // `ready` then rejects and the server exits, as the idle-queue post this replaced threw out of startup (#807 P3 A1).
   // `ids` reads the IDs to end on the write's Tx (#807 P3 A7h1: the hosted filter's reads await); none ends nothing.
   function endIds(ids: (tx: Tx) => Promise<string[]>, why: string): Promise<void> {
-    return repo.write(async tx => {
+    return atSite("alias", () => repo.write(async tx => {
       const list = await ids(tx);
       return list.length ? endIdsIn(tx, list, why) : null;
-    }, ends => { if (ends) afterEnds(ends.woken, ends.bounces); }).then(() => {});
+    }, ends => { if (ends) afterEnds(ends.woken, ends.bounces); })).then(() => {});
   }
   type Ends = { woken: Set<string>; bounces: MessageRow[] };
   // endIds's body, inside a write body: `tx` is that body's. Each end's savepoint runs on its own Tx.
@@ -987,7 +987,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
       afterEnds(ends.woken, ends.bounces);
     };
     if (isTx(h)) return body(h).then(value => { h.afterCommit(() => committed(value)); });
-    return repo.write(body, committed).then(() => {}, error => console.error("[grayboard] alias recheck failed:", error));
+    return atSite("alias", () => repo.write(body, committed)).then(() => {}, error => console.error("[grayboard] alias recheck failed:", error));
   }
   // Takes aliases from sessions whose principals may no longer act in their
   // scopes (S9). A holder keeps its ID and its other holds: only the revoked
@@ -1056,7 +1056,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
   // caller that never replays leaves it down, or live direct messages would wait for a drain that never runs.
   async function attachHuman(authed: AuthedUser, sink: DeliverySink, current?: (tx: Tx) => string | null | Promise<string | null>, replays = false): Promise<{ session: ApplicationSession; ok: HelloResult }> {
     const addr = `${authed.user_email}/${HUMAN_NAME}`;
-    return repo.write(async tx => {
+    return atSite("human", () => repo.write(async tx => {
       if ((await repo.users.findById(tx, authed.user_id))?.disabled_at != null) fail("unauthenticated", "session is closed");
       const stale = await current?.(tx);
       if (stale) fail("unauthenticated", stale);
@@ -1084,7 +1084,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
       hub.registry.set(addr, session);
       if (replays) owe(session);
       return { session, ok: { id: HUMAN_NAME, ...helloFields(hub, authed, hello) } };
-    });
+    }));
   }
 
   // bind (#284 S2, PR 4 S1): add an alias to this session's holds. One it
@@ -1482,6 +1482,44 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
       if (disabled) throw new KeyedSendMiss("its user is disabled");
       return handleSend(hub, tx, session, recipient, body, options.parent_id ?? null, options.pending === true, options.attachment_ids, options.resend === true, options.as, plan);
     },
+    // A board_post's plan for a keyed body (#1537 PR 6, D4), read on the pool, or undefined when it runs exclusive
+    // (`call` as ever): a Slack-bridge human's session, a closed or read-only one, a delegate's rows in flight; a post
+    // with files or `attachments` (the upload binding and quota stay exclusive in v1); one whose body names an `@id:`
+    // (until the mention sort of #808 pair 9); one on a service's board (its invocation decision); one on a queue
+    // board (its claim_events rotation, id order); one by a human address; and one the pool refuses (the exclusive body
+    // gives the refusal and writes its row).
+    async postPlan(session: ApplicationSession, args: Record<string, unknown>): Promise<PostPlan | undefined> {
+      if (session.human || session.readOnly || !session.active || hub.delegateRows !== undefined) return undefined;
+      if (args.attachments !== undefined) return undefined;
+      if (args.attachment_ids !== undefined && !(Array.isArray(args.attachment_ids) && args.attachment_ids.length === 0)) return undefined;
+      if (typeof args.board !== "string" || typeof args.body !== "string" || idMention(args.body)) return undefined;
+      const parentId = args.parent_id ?? null;
+      if (parentId !== null && typeof parentId !== "number") return undefined;
+      try {
+        childState(session, "board_post");
+        const actor = await serverBoardActor(repo, hub.access, repo.read, "board_post", args, { addresses: session.addresses, asAddresses: asAddresses(session), ownScope: session.authed.user_email });
+        if (await invocation(repo, repo.read, actor, args.board)) return undefined;
+        const b = await readableBoard(repo, hub.access, repo.read, actor, args.board);
+        if ((b.kind ?? "broadcast") === "queue") return undefined;
+        if (await repo.aliases.isHuman(repo.read, actor)) return undefined;
+        return { board: b.name };
+      } catch (error) {
+        if (error instanceof ApplicationError || error instanceof CoreError) return undefined;
+        throw error;
+      }
+    },
+    // `call` for board_post in a keyed body under `plan` (hosted.ts boardPost): valid()'s checks without its terminate
+    // (sendKeyed's), then handleBoardPost checking its own resolution against the plan before the insert.
+    async postKeyed(tx: Tx, session: ApplicationSession, plan: PostPlan, args: Record<string, unknown>) {
+      stillOpen(session);
+      if (session.human || session.readOnly || hub.delegateRows !== undefined) throw new KeyedSendMiss("the session's state needs the exclusive body");
+      const disabled = await repo.users.isDisabled(tx, session.authed.user_id);
+      await testPauseAsync("valid:user:read");
+      stillOpen(session);
+      if (disabled) throw new KeyedSendMiss("its user is disabled");
+      try { return await handleCall(hub, tx, session, "board_post", args, undefined, plan); }
+      finally { tx.afterCommit(() => expiry.arm()); }
+    },
     async delegate(tx: Tx, session: ApplicationSession, request: Omit<DelegateRequest, "type" | "req_id">) {
       await valid(session, false, tx);
       return handleDelegate(hub, tx, session, request);
@@ -1812,6 +1850,11 @@ export type SendPlan = { from: string; to: string; live: ApplicationSession | un
 // A keyed send that must run exclusive instead: thrown inside its keyed body, before the message's insert, so the body
 // rolls back with nothing written and its caller runs the exclusive body (hosted.ts dmSend).
 export class KeyedSendMiss extends Error {}
+// A board_post's plan for a keyed body (#1537 PR 6, D4): the board it posts on, as the pool resolved it. The body's
+// own resolution must name the same board, or it throws KeyedSendMiss before the post's insert.
+export type PostPlan = { board: string };
+// An `@id:` mention in an author's body: board_post's keyed body leaves those to the exclusive one (D4).
+const idMention = (body: string) => mentionTokens(body).some(t => t.startsWith("id:"));
 
 // A send checked and resolved, ready to write: `from` the address it goes
 // out as, `to` the recipient's full handle, `digests` its files' blob
@@ -2241,7 +2284,7 @@ async function handleRetract(hub: Hub, tx: Tx, session: ApplicationSession, id: 
   return {};
 }
 
-async function handleCall(hub: Hub, tx: Tx, session: ApplicationSession, tool: string, args: Record<string, unknown>, publish?: (result: unknown) => void): Promise<unknown> {
+async function handleCall(hub: Hub, tx: Tx, session: ApplicationSession, tool: string, args: Record<string, unknown>, publish?: (result: unknown) => void, keyed?: PostPlan): Promise<unknown> {
   const { repo } = hub;
   if (!isBoardTool(tool)) fail("bad_request", `unknown tool: ${tool}`);
   childState(session, tool);
@@ -2264,7 +2307,8 @@ async function handleCall(hub: Hub, tx: Tx, session: ApplicationSession, tool: s
     throw e;
   }
   const { as: _as, ...rest } = args;
-  if (tool === "board_post") return handleBoardPost(hub, tx, session, actor, rest, ctx, publish);
+  if (tool === "board_post") return handleBoardPost(hub, tx, session, actor, rest, ctx, publish, keyed);
+  if (keyed) throw new KeyedSendMiss(`${tool} has no keyed body`);
   // A claim announced on a service's board is a post there too (#270 D6): decided as board_post's is.
   const inv = tool === "claim_take" ? await invocation(repo, tx, actor, rest.board) : null;
   if (inv && !inv.d.allow) {
@@ -2302,9 +2346,13 @@ async function handleCall(hub: Hub, tx: Tx, session: ApplicationSession, tool: s
 }
 
 // board_post, deduplicated (#254): a repeat replays the first post's result,
-// and a queue board gets no second work item.
-async function handleBoardPost(hub: Hub, tx: Tx, session: ApplicationSession, me: string, args: Record<string, unknown>, ctx: ToolContext, publish?: (result: unknown) => void): Promise<unknown> {
+// and a queue board gets no second work item. `keyed`: the plan a keyed body runs under (application.postKeyed): any
+// case postPlan leaves exclusive, met here on the body's own reads, throws KeyedSendMiss before the post's insert, and
+// a registry read (`ctx.online`, a queue's lane order) does too: the body reads no in-memory state the exclusive
+// bodies change at their commits (D4).
+async function handleBoardPost(hub: Hub, tx: Tx, session: ApplicationSession, me: string, args: Record<string, unknown>, ctx: ToolContext, publish?: (result: unknown) => void, keyed?: PostPlan): Promise<unknown> {
   const { repo } = hub;
+  if (keyed) ctx = { ...ctx, online: () => { throw new KeyedSendMiss("it reads the registry"); } };
   const { resend, ...postArgs } = args;
   let out: DedupOutcome<Written<BoardPostResult> & { wake: string[] }>;
   try {
@@ -2320,12 +2368,19 @@ async function handleBoardPost(hub: Hub, tx: Tx, session: ApplicationSession, me
     // A post on a service's board is an invocation (#270 D6), decided here for the acting address's principal: a deny
     // is recorded after the rollback and answers as a missing board; an allow is recorded with the post it carries.
     const inv = await invocation(repo, tx, me, postArgs.board);
+    if (keyed && inv) throw new KeyedSendMiss("it posts on a service's board");
     if (inv && !inv.d.allow) {
       rowAfterRollback(session, tx, w => recordDecision(repo, w, sessionActor(session, me), inv.req, inv.d));
       throw hiddenBoard(inv);
     }
     // Its board is reused inside the savepoint: the same transaction, so the same row (b5b2 Decision 9).
     const { board, gate } = await postGateOn(repo, hub.access, tx, me, postArgs.board, parentId);
+    if (keyed) {
+      if (board.name !== keyed.board) throw new KeyedSendMiss("its board resolved differently in the body");
+      if (gate.human || gate.announcement || (board.kind ?? "broadcast") === "queue") throw new KeyedSendMiss("its post needs the exclusive body");
+      if (ids.length || postArgs.attachments !== undefined) throw new KeyedSendMiss("it carries files");
+      if (idMention(postArgs.body)) throw new KeyedSendMiss("it names an @id:");
+    }
     // Core's order (#1225): the gate, then the body and mode checks, then the uploads, so a call with several faults
     // is refused for the same one in both modes. serverPost runs the same checks again; they hold, so they pass.
     postPreChecks(board.name, postArgs.body, gate.announcement, { online: ctx.online, attachments: { ids, send: ctx.files } });
@@ -2339,7 +2394,9 @@ async function handleBoardPost(hub: Hub, tx: Tx, session: ApplicationSession, me
     });
   } catch (e) {
     if (e instanceof CoreError) throw coreRefusal(e);
-    if (e instanceof ApplicationError) throw e;
+    // A keyed body's fault (a store's refuseKeyed among them) fails the call as it is, as dm_send's does, rather than
+    // passing for a refusal its caller would answer with the exclusive body.
+    if (e instanceof ApplicationError || e instanceof KeyedSendMiss || keyed) throw e;
     console.error("[grayboard] board_post failed:", e);
     return fail("internal", "board_post failed");
   }

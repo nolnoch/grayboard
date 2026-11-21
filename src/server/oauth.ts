@@ -16,6 +16,7 @@ import { hostedFailure } from "./hosted-diagnostics.ts";
 import { isTrustedOrigin } from "./origin.ts";
 import { SITE_LIMIT_FACTOR } from "./auth_gate.ts";
 import { settleAll } from "./settle.ts";
+import { atSite } from "./store/queue.ts";
 
 // `sourceKey` is the `_meta` key that maps this client's hosted session source, or null
 // (unmapped: reads only). A pure function of the client ID, the startup config and, for a service credential,
@@ -144,11 +145,11 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
   // Both writes are queued here, in order, so the built-in cutover commits before the CLI's and both before
   // anything a request queues later.
   const ready = settleAll([
-    repo.write(tx => repo.oauth.revokePreBuiltinGrants(tx, BUILTIN_CLIENT_IDS, now())).then(revoked => {
+    atSite("oauth", () => repo.write(tx => repo.oauth.revokePreBuiltinGrants(tx, BUILTIN_CLIENT_IDS, now()))).then(revoked => {
       if (revoked) console.error(`[grayboard] revoked ${revoked} OAuth grant(s) issued under a built-in client ID (${BUILTIN_CLIENT_IDS.join(", ")}) before this server had built-in clients; those clients sign in again`);
     }),
     // The same once for grayboard-cli (#928 D8), under its own key: the cutover above already ran on most databases.
-    repo.write(tx => repo.oauth.revokePreBuiltinGrants(tx, [CLI_CLIENT_ID], now(), "builtin_clients_cli")).then(revokedCli => {
+    atSite("oauth", () => repo.write(tx => repo.oauth.revokePreBuiltinGrants(tx, [CLI_CLIENT_ID], now(), "builtin_clients_cli"))).then(revokedCli => {
       if (revokedCli) console.error(`[grayboard] revoked ${revokedCli} OAuth grant(s) issued under ${CLI_CLIENT_ID} before this server reserved it for CLI sign-in`);
     }),
   ]);
@@ -247,7 +248,7 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
     for (const [id, at] of mintBackoff) if (at + STREAK_MS < t) mintBackoff.delete(id);
     // The store's cleanup is async (#807 P3 A6c), so its failure arrives as a rejection: caught here, as the timer
     // catches a synchronous one, so neither reaches a log that prints the error itself.
-    repo.write(tx => repo.oauth.cleanup(tx, t)).catch(e => hostedFailure("oauth.sweep", e));
+    atSite("oauth", () => repo.write(tx => repo.oauth.cleanup(tx, t))).catch(e => hostedFailure("oauth.sweep", e));
   };
   // A failed housekeeping transaction is retried next tick, never treated as credential failure.
   const timer = setInterval(() => { try { sweep(); } catch (e) { hostedFailure("oauth.sweep", e); } }, 60_000);
@@ -452,12 +453,12 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
       const binding = c.binding ?? random();
       const id = random(), csrf = random();
       // Each write body reads the clock itself (#971): a body that waited in the write queue judges and stamps at its write.
-      const { t, request } = await repo.write(async tx => {
+      const { t, request } = await atSite("oauth", () => repo.write(async tx => {
         const t = now();
         return { t, request: await repo.oauth.createRequest(tx, { clientId: client.clientId, redirectUri, resource, scopes: selected, codeChallenge,
           requestHash: hashToken(id), browserHash: hashToken(binding), csrfHash: hashToken(csrf), stateHash: hashToken(state),
           consentSessionHash: null, createdAt: t, expiresAt: t + OAUTH_TTL.request }, t) };
-      });
+      }));
       if (request.status !== "ok") fail("temporarily_unavailable", 429);
       const f: Flow = { client, state, csrf, expiresAt: t + OAUTH_TTL.request };
       flows.set(hashToken(id), f);
@@ -512,19 +513,19 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
       }
       if (f.expiresAt <= now() || closed) fail();
       if (!isValidEmail(identity!.email)) { writeAudit(repo, repo.read, "oauth.domain_refused", null, null, { client_id: r.clientId, provider: provider.id }); return refuse(REFUSED.provider); }
-      const signedIn = await repo.write(tx => idpSignIn(repo, tx, provider, identity!, { client_id: r.clientId }, providers));
+      const signedIn = await atSite("oauth", () => repo.write(tx => idpSignIn(repo, tx, provider, identity!, { client_id: r.clientId }, providers)));
       // idpSignIn's text names only the person's email(s), the provider labels and the admin's unlink-idp remedy.
       if ("refused" in signedIn) return refuse(signedIn.refused);
       const { user } = signedIn;
       if (user.disabled_at !== null) { writeAudit(repo, repo.read, "oauth.user_refused", user.email, null, { client_id: r.clientId }); return refuse(REFUSED.disabled); }
       const session = random();
-      const created = await repo.write(async tx => {
+      const created = await atSite("oauth", () => repo.write(async tx => {
         const t = now();
         // The flow may have lapsed while the sign-in and this write waited (#971): no session for a dead flow.
         if (f.expiresAt <= t || closed) fail();
         return await repo.oauth.createBrowserSession(tx, { sessionHash: hashToken(session), userId: user.id, createdAt: t, expiresAt: t + OAUTH_TTL.browser }, t,
           c.session && hashToken(c.session));
-      });
+      }));
       if (created.status !== "ok") fail("temporarily_unavailable", 503);
       const response = redirect(endpoint("/oauth/consent") + "?request=" + id);
       response.headers.append("Set-Cookie", cookie("session", session, OAUTH_TTL.browser / 1000));
@@ -534,7 +535,7 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
     if (path === "/oauth/consent" && req.method === "GET") {
       const p = parameters(u.search.slice(1), ["request"]);
       // The session check and its bind are one transaction; a refusal binds nothing.
-      return repo.write(tx => consent(tx, req, required(p, "request")));
+      return atSite("oauth", () => repo.write(tx => consent(tx, req, required(p, "request"))));
     }
     if (path === "/oauth/consent" && req.method === "POST") {
       sameOrigin(req, true);
@@ -548,14 +549,14 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
       const code = random();
       // The browser session is read in the decision's transaction, so it can't lapse between them.
       // The deciding user's email is read there too, for the audit row after it (#807 P3 A7u2).
-      const { email, result } = await repo.write(async tx => {
+      const { email, result } = await atSite("oauth", () => repo.write(async tx => {
         const t = now();
         const b = await repo.oauth.findBrowserSession(tx, sessionHash, t);
         if (!b) fail();
         const email = (await repo.users.findById(tx, b!.userId))?.email ?? null;
         return { email, result: await repo.oauth.decideRequest(tx, { requestHash: r.requestHash, browserHash: r.browserHash, sessionHash, csrfHash: hashToken(required(p, "csrf")),
           approve: decision === "approve", code: { ...r, codeHash: hashToken(code), userId: b!.userId, createdAt: t, expiresAt: t + OAUTH_TTL.code } }, t) };
-      });
+      }));
       if (result.status !== "ok") fail();
       writeAudit(repo, repo.read, decision === "approve" ? "oauth.consent_approved" : "oauth.consent_denied", email, null, { client_id: r.clientId });
       flows.delete(r.requestHash);
@@ -583,7 +584,7 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
         if (path === "/oauth/revoke") {
           const p = recognized(submitted, ["token", "token_type_hint"]);
           const token = hashToken(required(p, "token"));
-          await repo.write(tx => repo.oauth.revokeToken(tx, token, client.clientId, now()));
+          await atSite("oauth", () => repo.write(tx => repo.oauth.revokeToken(tx, token, client.clientId, now())));
           // A revoke can free the cap a slow_down answered for, so the credential's next mint asks the store again.
           mintBackoff.delete(client.clientId);
           writeAudit(repo, repo.read, "oauth.revoke_requested", null, null, { client_id: client.clientId });
@@ -617,10 +618,10 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
             await testPauseAsync("oauth:mint:before-write");
             // A run token (RFC 6749 §4.4.3: no refresh token). The store checks the credential, its grant, the secret and
             // the service live, and the bucket and cap, in its one insert; its row's expiry is the answer's.
-            const { t, minted } = await repo.write(async tx => {
+            const { t, minted } = await atSite("oauth", () => repo.write(async tx => {
               const t = now();
               return { t, minted: await repo.oauth.mintServiceToken(tx, { clientId: client.clientId, secretId: client.credential!.secretId!, tokenHash: hashToken(token), scopes: selected, limits: serviceTokens }, t) };
-            });
+            }));
             if (minted.status === "capacity") {
               // The entry as it is now, not `held`: in a wave of concurrent first mints, the first refusal sets it, so
               // the rest of the wave is inside its streak and writes no row.
@@ -646,7 +647,7 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
           // The code's scopes are read in the redemption's transaction. A refusal before the redemption writes
           // nothing; the redemption's own (a replay revokes the grant or session) commits and is checked after.
           // The stored code's scopes alone pick the redemption: a login code becomes a CLI session (#928 D8).
-          const redeemed = await repo.write(async tx => {
+          const redeemed = await atSite("oauth", () => repo.write(async tx => {
             const t = now();
             const selected = await repo.oauth.findCodeScopes(tx, codeHash, client.clientId, resource, redirectUri, t) ?? [];
             if (!selected.length) fail("invalid_grant");
@@ -654,7 +655,7 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
             const authorization = { clientId: client.clientId, resource, scopes: selected, redirectUri, codeChallenge: challenge(verifier), codeHash };
             if (selected.includes(LOGIN_SCOPE)) return { t, login: await repo.oauth.redeemLoginCode(tx, { ...authorization, tokenHash: hashToken(sessionToken), label: userAgent(req) }, t) };
             return { t, grant: await repo.oauth.redeemCode(tx, { ...authorization, grantId: random(), grantExpiresAt: t + OAUTH_TTL.grant, tokens: pair(selected, t) }, t) };
-          });
+          }));
           if (redeemed.login) {
             if (redeemed.login.status !== "ok") { if (redeemed.login.status === "replay") hostedFailure("oauth.replay", undefined, "warning"); fail("invalid_grant"); }
             // The CLI's API token (verifySessionToken), not an OAuth access token: no expiry, no refresh.
@@ -674,7 +675,7 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
             if (verdict === "unavailable") return json({ error: "temporarily_unavailable" }, 503, { "Retry-After": "60" });
           }
           // As the code above: the grant is read in the rotation's transaction.
-          ({ t, result } = await repo.write(async tx => {
+          ({ t, result } = await atSite("oauth", () => repo.write(async tx => {
             const t = now();
             const grant = await repo.oauth.findRefreshGrant(tx, refreshHash, client.clientId, resource, t);
             if (!grant) fail("invalid_grant");
@@ -688,7 +689,7 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
               if (!user || recheck.fallbackDue(user)) fail("invalid_grant");
             }
             return { t, result };
-          }));
+          })));
         }
         if (result.status !== "ok") { if (result.status === "replay") hostedFailure("oauth.replay", undefined, "warning"); fail("invalid_grant"); }
         return json({ access_token: access, token_type: "Bearer", expires_in: Math.floor((result.value.tokens.accessExpiresAt - t) / 1000), scope: result.value.tokens.scopes.join(" "),

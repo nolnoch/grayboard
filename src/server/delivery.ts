@@ -369,10 +369,10 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
     },
     async release(p: DeliveryPrincipal, context: SessionContext, capability: string) {
       return hosted.control(p, context, true, async row => {
-        await store.write(async tx => {
+        await atSite("end", () => store.write(async tx => {
           await get(p, context, capability, await store.lock(tx, row.session_id), tx);
           await store.end(tx, row.session_id, "closed", now());
-        });
+        }));
       }, () => undefined, "release").catch(error => refused(p, context, error));
     },
     async cancel(result: DeliveryLease) {
@@ -385,12 +385,12 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
       const capability = result.capability;
       await hosted.gate(lease.sessionId).bind(async () => {
         if (leases.get(capability) !== lease || !lease.cancelledCreator || lease.pendingOpens.size || lease.acceptedVersion) return;
-        await store.write(async tx => {
+        await atSite("end", () => store.write(async tx => {
           if (matches(lease, await store.lock(tx, lease.sessionId))) await store.end(tx, lease.sessionId, "closed", now());
           await hosted.settle(tx, lease.sessionId);
         }, () => {
           finish(lease);
-        });
+        }));
       });
     },
     revalidate() { hosted.sweep().catch(e => hostedFailure("hosted.sweep", e)); },

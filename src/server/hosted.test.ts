@@ -1083,7 +1083,7 @@ test("an aborted request's queued gate body is skipped and creates no row (#1535
   expect(hostedRowCount(database.db)).toBe(rows + 1);
 });
 
-// Bind and unbind (`owning`'s body, site "other"), held past their gate at `hosted:owning:before-txn`, then queued
+// Bind and unbind (`owning`'s body, site "owning"), held past their gate at `hosted:owning:before-txn`, then queued
 // behind a holder and aborted: each rejects RequestAbortedError and leaves the holds as they were. Mutation: owning's
 // write without its signal (the bind holds, the unbind releases).
 for (const op of ["bind", "unbind"] as const) test(`an aborted ${op}'s queued body is skipped and leaves the holds as they were (#1535)`, async () => {
@@ -1096,7 +1096,7 @@ for (const op of ["bind", "unbind"] as const) test(`an aborted ${op}'s queued bo
     : hosted.unbind(principal, context("root"), { name: "fe" }, undefined, ac.signal);
   const call = paused("hosted:owning:before-txn", start, async () => {
     holder = q.run(() => new Promise<void>(r => { release = r; }));
-    void until(() => q.waitingAt("other") === 1, 5000, `the ${op} body to queue behind the holder`).then(() => ac.abort());
+    void until(() => q.waitingAt("owning") === 1, 5000, `the ${op} body to queue behind the holder`).then(() => ac.abort());
   });
   const failed = await call.then(() => undefined, (e: unknown) => e);
   release();

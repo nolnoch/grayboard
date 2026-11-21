@@ -4,6 +4,7 @@ import type { Repo } from "./db.ts";
 import type { User } from "./store/identity.ts";
 import type { SignedIn } from "./policy.ts";
 import type { IdpRecheck } from "./idp_recheck.ts";
+import { atSite } from "./store/queue.ts";
 
 // The signed-in principal: its users row's id and name (an email, or a service's name), and its kind, read with the
 // row (#270 D1). Every check that keys on "a user is a person" reads `kind`.
@@ -93,7 +94,7 @@ export async function verifySessionToken(
   if (verdict === "unavailable") throw new IdpUnavailable();
   // Off the request path: last-used is a stamp, not a result the caller waits on. Posted, so a touch that fires
   // while another body holds the write queue waits behind it (#807).
-  touches.schedule(() => { repo.post(tx => repo.sessions.touch(tx, session.id, repo.now()), undefined, "session touch"); });
+  touches.schedule(() => { atSite("session", () => repo.post(tx => repo.sessions.touch(tx, session.id, repo.now()), undefined, "session touch")); });
   return { user_id: session.user_id, user_email: user!.email, kind: user!.kind, session_id: session.id };
 }
 
