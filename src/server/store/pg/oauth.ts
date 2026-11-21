@@ -29,12 +29,13 @@ import {
   accessFits, accessLookup, browserData, browserSessionInput, BROWSER_SESSIONS, clampPair, clientLookup, codeData, codeInput,
   grantInput, isLogin, LIVE_SECRETS, loginInput, lookup, MINT_WINDOW_MS, mintInput, REQUESTS_PER_BROWSER, REQUESTS_TOTAL,
   requestData, requestInput, rotationBinding, sameAuthorization, secretLookup, serviceCredentialInput, serviceSecretInput,
-  successorInput, time,
+  successorInput, time, grantSummary, userGrantLookup, userLookup,
 } from "../../oauth-rules.ts";
 import type {
   CredentialSource, OAuthAccess, OAuthAuthorization, OAuthBrowserSession, OAuthCode, OAuthFailure, OAuthGrant, OAuthRequest,
   OAuthStore, OAuthTokenPair, ServiceCredential,
 } from "../../oauth-types.ts";
+import { GRANT_LIST_MAX } from "../../oauth-types.ts";
 import type { AuditAction } from "../../audit.ts";
 import type { Tx } from "../tx_base.ts";
 import { insertAudit } from "./audit_row.ts";
@@ -352,6 +353,28 @@ export function makePgOAuth({ hosted }: { hosted: PgHostedEnds }): OAuthStore {
       if (!time(now)) return false;
       return (await pgOf(r)`SELECT 1 FROM oauth_grants g JOIN users u ON u.id = g.user_id
         WHERE g.id = ${id} AND g.revoked_at IS NULL AND g.expires_at > ${now} AND u.disabled_at IS NULL`).length > 0;
+    },
+    async listGrants(r, userId, now) {
+      if (!userLookup(userId, now)) return [];
+      const rows = await pgOf(r)`SELECT g.data, c.id IS NOT NULL AS credential, u.last_used FROM oauth_grants g
+        LEFT JOIN service_credentials c ON c.grant_id = g.id
+        CROSS JOIN LATERAL (SELECT MAX(t.created_at) AS last_used FROM oauth_tokens t WHERE t.grant_id = g.id) u
+        WHERE g.user_id = ${userId} AND g.revoked_at IS NULL AND g.expires_at > ${now}
+        ORDER BY COALESCE(u.last_used, (g.data->>'createdAt')::bigint) DESC, g.id LIMIT ${GRANT_LIST_MAX}`;
+      return rows.map((row: Row) => grantSummary(row.data as OAuthGrant, row.credential as boolean, int8OrNull(row.last_used)));
+    },
+    async revokeUserGrant(tx, userId, grantId, now) {
+      if (!userGrantLookup(userId, grantId, now)) return invalid;
+      const sql = pgOf(tx);
+      // FOR NO KEY UPDATE on the grant, as a credential's revoke: a second revoke waits, re-checks after this one commits
+      // and answers missing (one revoke, one audit row); a rotation holds the same lock (#1066), so it either commits
+      // first, its pair then dying with the grant, or reads the revoked row after this commits.
+      const [g] = await sql`SELECT g.data, c.id IS NOT NULL AS credential FROM oauth_grants g LEFT JOIN service_credentials c ON c.grant_id = g.id
+        WHERE g.id = ${grantId} AND g.user_id = ${userId} AND g.revoked_at IS NULL AND g.expires_at > ${now} FOR NO KEY UPDATE OF g`;
+      if (!g) return missing;
+      if (g.credential) return invalid;
+      await revokeGrant(tx, grantId, now);
+      return ok({ clientId: (g.data as OAuthGrant).clientId });
     },
     async revokePreBuiltinGrants(tx, clientIds, now, key = "builtin_clients") {
       if (!time(now)) throw new RangeError("invalid OAuth cutover time");

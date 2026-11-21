@@ -1,7 +1,7 @@
 import pkg from "../../package.json" with { type: "json" };
 import { randomBytes } from "node:crypto";
 import { mcpResource, SERVICE_CLIENT_PREFIX } from "./oauth-config.ts";
-import { CREDENTIAL_NO_EXPIRY, CREDENTIAL_SOURCES, DEFAULT_SERVICE_TOKEN_LIMITS, OAUTH_TTL, SERVICE_TOKEN_MIN_SECONDS, type CredentialSource } from "./oauth-types.ts";
+import { CREDENTIAL_NO_EXPIRY, CREDENTIAL_SOURCES, DEFAULT_SERVICE_TOKEN_LIMITS, GRANT_LIST_MAX, OAUTH_TTL, SERVICE_TOKEN_MIN_SECONDS, type CredentialSource } from "./oauth-types.ts";
 import { AuthorityLost, DEV_SESSION_LABEL, LastOwner, PrincipalTaken, TEAM_POLICIES, type Repo, type RoleFilter, type Team, type TeamPolicy, type User } from "./db.ts";
 import { DEFAULT_CLI_TOKEN_IDLE_DAYS, type Config } from "./config.ts";
 import {
@@ -719,8 +719,8 @@ async function adminDisableUser(
     const refused = serviceRefused(target, "disable");
     if (refused) return refused;
     await repo.users.setDisabled(tx, target.id, true);
-    // Their service_owner bindings stay (#930 replaces disabled owners); the answer names the services left with no
-    // enabled owner, so the admin knows whose accountability lapsed (#270 D1).
+    // Their service_owner bindings stay, and the answer names the services left with no enabled owner, so the admin
+    // knows whose accountability lapsed (#270 D1) and grants a replacement: the server has no basis to pick one.
     const orphaned = await repo.services.orphanedBy(tx, target.id);
     writeAudit(repo, tx, "auth.user_disabled", authed.user_email, body.email, orphaned.length ? { orphaned_services: orphaned } : undefined);
     return { target, orphaned };
@@ -1011,6 +1011,42 @@ async function adminServiceCredentialRevoke(req: Request, authed: AuthedUser, re
   });
 }
 
+// The per-grant list and revoke (#930): a user's live OAuth grants (one harness sign-in on one machine; a service's
+// credential grants, read-only) and CLI tokens (`cli:<session id>`), so one lost device is revoked alone. The own
+// routes act on the caller; the admin routes, behind the org_admin gate, on `email`.
+const CLI_GRANT = /^cli:(\d{1,15})$/;
+async function grantList(target: { id: number }, current: number | null, repo: Repo, idleDays: number): Promise<Response> {
+  const now = Date.now();
+  const usedAfter = idleDays > 0 ? now - idleDays * 86_400_000 - 1 : 0;
+  const [grants, sessions] = await Promise.all([repo.oauth.listGrants(repo.read, target.id, now), repo.sessions.listLive(repo.read, target.id, usedAfter, GRANT_LIST_MAX)]);
+  return json({ grants: [
+    ...grants.map(g => ({ id: g.id, kind: g.credential ? "credential" : "oauth", client_id: g.clientId, created_at: g.createdAt, last_used_at: g.lastUsedAt, expires_at: g.expiresAt })),
+    ...sessions.map(s => ({ id: `cli:${s.id}`, kind: "cli", label: s.label, created_at: s.created_at, last_used_at: s.last_used_at, expires_at: null, ...(s.id === current ? { current: true } : {}) })),
+  ].sort((a, b) => b.last_used_at - a.last_used_at) });
+}
+async function grantRevoke(target: { id: number; email: string }, id: unknown, authed: AuthedUser, repo: Repo): Promise<Response> {
+  if (typeof id !== "string" || id === "" || id.length > 200) return badRequest("id required (from grants list)");
+  const cli = CLI_GRANT.exec(id);
+  return repo.write(async tx => {
+    if (cli) {
+      const sessionId = Number(cli[1]);
+      if (!await repo.sessions.revokeOwn(tx, target.id, sessionId)) return jsonErr("not_found", `no live grant ${id}`, 404);
+      writeAudit(repo, tx, "auth.session_revoked", authed.user_email, target.email, { token_session: sessionId });
+      return json({ ok: true, id });
+    }
+    const r = await repo.oauth.revokeUserGrant(tx, target.id, id, Date.now());
+    if (r.status === "invalid") return conflict(`${id} is a service credential's grant; revoke it with grayboard admin service credential revoke`);
+    if (r.status !== "ok") return jsonErr("not_found", `no live grant ${id}`, 404);
+    writeAudit(repo, tx, "auth.grant_revoked", authed.user_email, target.email, { grant_id: id, client_id: r.value.clientId });
+    return json({ ok: true, id });
+  });
+}
+async function adminGrantTarget(email: unknown, repo: Repo): Promise<User | Response> {
+  if (typeof email !== "string" || email === "") return badRequest("email required");
+  const target = await repo.users.findByEmail(repo.read, email.toLowerCase());
+  return target ?? notFound();
+}
+
 // ── main router ──────────────────────────────────────────────────────────────
 
 // What the server does when an HTTP action changes who a user's
@@ -1055,6 +1091,13 @@ export async function handleHttp(
     return identityDelete(path.slice("/api/identities/".length), authed, repo);
   }
 
+  const idleDays = config.cliTokenIdleDays ?? DEFAULT_CLI_TOKEN_IDLE_DAYS;
+  if (path === "/api/grants" && method === "GET") return grantList({ id: authed.user_id }, authed.session_id, repo, idleDays);
+  if (path === "/api/grants/revoke" && method === "POST") {
+    const body = await parseBody<{ id?: unknown }>(req);
+    return grantRevoke({ id: authed.user_id, email: authed.user_email }, body?.id, authed, repo);
+  }
+
   if (path.startsWith("/api/slack/") && !slack) {
     return jsonErr("not_found", "this server has no Slack bridge (its admin sets SLACK_APP_TOKEN and SLACK_BOT_TOKEN)", 404);
   }
@@ -1097,6 +1140,15 @@ export async function handleHttp(
   if (path === "/api/admin/disable-user"   && method === "POST") return adminDisableUser(req, authed, repo, sessions.disconnectUser, slack);
   if (path === "/api/admin/enable-user"    && method === "POST") return adminEnableUser(req, authed, repo, slack);
   if (path === "/api/admin/unlink-idp"     && method === "POST") return adminUnlinkIdp(req, authed, repo, config);
+  if (path === "/api/admin/grants" && method === "GET") {
+    const target = await adminGrantTarget(url.searchParams.get("email"), repo);
+    return target instanceof Response ? target : grantList(target, null, repo, idleDays);
+  }
+  if (path === "/api/admin/grants/revoke" && method === "POST") {
+    const body = await parseBody<{ email?: unknown; id?: unknown }>(req);
+    const target = await adminGrantTarget(body?.email, repo);
+    return target instanceof Response ? target : grantRevoke(target, body?.id, authed, repo);
+  }
   if (path === "/api/admin/services"       && method === "GET")  return adminServiceList(url, repo);
   if (path === "/api/admin/services"       && method === "POST") return adminServiceCreate(req, authed, repo, gate!);
   if (path === "/api/admin/services/disable" && method === "POST") return adminServiceSetDisabled(req, authed, repo, true, sessions.disconnectUser);
