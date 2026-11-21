@@ -184,18 +184,21 @@ abstract class Connection {
         this.decorate(outgoing);
         const signal = AbortSignal.any([request.signal, this.signal]);
         const method = await methodOf(request);
+        const connecting = method !== undefined && connectMethods.has(method);
         for (let attempt = 0; ; attempt++) {
           if (attempt) {
-            await beforeRetry?.();
-            const token = await authProvider.token();
-            if (token) outgoing.set("Authorization", `Bearer ${token}`); else outgoing.delete("Authorization");
+            // A guard's refusal or a credential's failure between tries is its own error, not the capacity wait's.
+            try {
+              await beforeRetry?.();
+              const token = await authProvider.token();
+              if (token) outgoing.set("Authorization", `Bearer ${token}`); else outgoing.delete("Authorization");
+            } catch (error) { if (connecting) this.busy = undefined; throw error; }
           }
           signal.throwIfAborted();
           const response = await fetch(request.clone(), { headers: outgoing, redirect: "error", signal });
-          if (method && connectMethods.has(method) && !response.ok && ![401, 403, 429].includes(response.status) && !gatewayStatuses.has(response.status)) {
+          if (connecting && !response.ok && ![401, 403, 429].includes(response.status) && !gatewayStatuses.has(response.status)) {
             this.refusal = new ConnectRefused(response.status, (await response.clone().text().catch(() => "")).slice(0, 4096));
           }
-          const connecting = method !== undefined && connectMethods.has(method);
           const body = response.status === 429 ? await response.clone().json().catch(() => undefined) as { error?: { data?: { code?: string; retry_after_ms?: number } } } | undefined : undefined;
           const data = body?.error?.data;
           if (data?.code !== "rate_limited" || typeof data.retry_after_ms !== "number" || !Number.isFinite(data.retry_after_ms) || data.retry_after_ms <= 0) {
