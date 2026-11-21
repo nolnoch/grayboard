@@ -299,6 +299,15 @@ describe("#1510 write scheduler", () => {
     expect(seen).toEqual(["outer", "inner"]);
   });
 
+  // Audit L1: the holder store is one AsyncLocalStorage for every queue; a token answers only for its own.
+  test("a body of one queue is not `mine` on another, and has no token there", async () => {
+    const a = new WriteQueue(), b = new WriteQueue(2);
+    const seen: unknown[] = [];
+    await a.run(() => { seen.push(a.mine, a.token !== undefined, b.mine, b.token, b.held); });
+    await b.runKeyed(["root:1"], async () => { await Promise.resolve(); seen.push(b.mine, a.mine, a.token); });
+    expect(seen).toEqual([true, true, false, undefined, false, true, false, undefined]);
+  });
+
   test("runKeyed refuses an empty key list or key", async () => {
     const q = new WriteQueue(2);
     await expect(q.runKeyed([], () => 1)).rejects.toThrow("at least one key");

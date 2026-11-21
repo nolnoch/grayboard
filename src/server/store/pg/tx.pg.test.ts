@@ -11,6 +11,7 @@ import { txContract, type TxBackend } from "../tx.contract.ts";
 import { sqliteOf, sqliteRead } from "../tx.ts";
 import type { Read, Tx } from "../tx_base.ts";
 import { makeNotices } from "../notices.ts";
+import { makePgAuthGeneration } from "./auth_generation.ts";
 import { makePgTransactions, pgOf, TxAborted, type PgTransactions } from "./tx.ts";
 
 // Written as a store function will be: a plain `await` on pgOf's statement, which pgOf sends as it's built.
@@ -491,7 +492,7 @@ describePg("Postgres write scheduler", () => {
     let exclusiveRan = false;
     const a = x.s.writeKeyed(["root:a"], body("a", aIn, bIn));
     const b = x.s.writeKeyed(["root:b"], body("b", bIn, aIn));
-    const exclusive = x.s.write(async tx => { exclusiveRan = true; expect(await rows(tx)).toEqual(["a", "b"].sort()); });
+    const exclusive = x.s.write(async tx => { exclusiveRan = true; expect((await rows(tx)).sort()).toEqual(["a", "b"]); });
     await Promise.all([a, b]);
     await exclusive;
     expect(exclusiveRan).toBe(true);
@@ -550,6 +551,48 @@ describePg("Postgres write scheduler", () => {
       outside: { inTx: false, rows: ["seed"] },
       // B is still open here: A's continuation is neither A (released) nor B.
       aLate: { inTx: false, mine: false, rows: ["a", "seed"] },
+    });
+  });
+
+  // Audit M2: a live body whose own transaction has closed (its afterCommit flush, its committed callback) is outside,
+  // though another body's transaction is open: "any open transaction while I hold a slot" would refuse its pool read
+  // and bypass the auth cache for it.
+  test("T-P22 a body past its own commit is outside while another's transaction is open: inTransaction, pool reads and ownsTx", async () => {
+    await using x = await scratch({ writers: 2 });
+    await x.s.write(tx => put(tx, "seed"));
+    // The production ownsTx (pg_repo.ts wires the same), never started: no listener.
+    const gen = makePgAuthGeneration({ url: x.db.url, transactions: x.s, openListener: (() => { throw new Error("test: not started"); }) as never });
+    const state = async () => ({ inTx: x.s.inTransaction(), ownsTx: gen.ownsTx(), rows: await rows(x.s.read).catch((e: Error) => e.message) });
+    const aIn = gate(), aGo = gate();
+    const seen: Record<string, unknown> = {};
+    const a = x.s.writeKeyed(["root:a"], async tx => {
+      await put(tx, "a");
+      seen.a = { inTx: x.s.inTransaction(), ownsTx: gen.ownsTx() };
+      aIn.open();
+      await within(aGo.wait, "the test to let A commit");
+    });
+    await within(aIn.wait, "A to open");
+    let flushed: Promise<void> | undefined;
+    const b = x.s.writeKeyed(["root:b"], async tx => {
+      await put(tx, "b");
+      seen.b = { inTx: x.s.inTransaction(), ownsTx: gen.ownsTx() };
+      tx.afterCommit(() => { flushed = state().then(v => { seen.bEffect = v; }); });
+    }, async () => {
+      seen.bMine = x.s.queue.mine;
+      seen.bCommitted = await state();
+    });
+    await b;
+    await flushed;
+    seen.outside = { inTx: x.s.inTransaction(), ownsTx: gen.ownsTx() };
+    aGo.open();
+    await a;
+    const after = { inTx: false, ownsTx: false, rows: ["seed", "b"] };
+    expect(seen).toEqual({
+      a: { inTx: true, ownsTx: true },
+      b: { inTx: true, ownsTx: true },
+      // B still holds its slot here, and A's transaction is open.
+      bMine: true, bEffect: after, bCommitted: after,
+      outside: { inTx: false, ownsTx: false },
     });
   });
 

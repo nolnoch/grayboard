@@ -34,7 +34,7 @@ export type Notices = {
 
 export function makeNotices(defer: (tx: Tx, effect: () => void) => void): Notices {
   const observers = new Set<Observer>();
-  // Per transaction, per observer; dropped with the transaction's root Tx, or after its notices flush.
+  // Per transaction, per observer; dropped with the transaction's root Tx. The facts read are cleared after its notices flush.
   const byTxn = new WeakMap<object, Map<Observer, Reads>>();
   const readsOf = (txn: object, o: Observer): Reads => {
     let m = byTxn.get(txn);
