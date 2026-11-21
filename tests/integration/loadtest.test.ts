@@ -69,10 +69,12 @@ describe("loadtest sizing", () => {
       expect({ argv, workers: o.serviceWorkers, teams: o.teams, users: userSessions(o) }).toEqual({ argv, workers, teams, users: o.sessions - workers });
       expect(o.svcShare).toBeGreaterThan(0);
       expect(o.peerShare).toBeGreaterThan(0);
+      expect(o.readShare).toBeGreaterThan(0);
     }
     expect(() => options(["--sessions", "4", "--users", "3", "--drivers", "1", "--service-workers", "2"])).toThrow(/--service-workers/);
     expect(() => options(["--users", "2", "--teams", "3"])).toThrow(/--teams/);
     expect(() => options(["--post-share", "0.5", "--svc-share", "0.4", "--peer-share", "0.2"])).toThrow(/sum to at most 1/);
+    expect(() => options(["--post-share", "0.5", "--svc-share", "0.2", "--peer-share", "0.2", "--read-share", "0.2"])).toThrow(/sum to at most 1/);
     expect(options(["--sessions", "4", "--users", "3", "--drivers", "1"]).serviceWorkers).toBe(1);
     // A fleet that leaves no room for a worker is refused unless the service is turned off explicitly.
     expect(() => options(["--sessions", "2", "--users", "2", "--drivers", "1"])).toThrow(/no room for a service worker.*--service-workers 0/);
@@ -100,8 +102,8 @@ async function run(extra: string[]): Promise<{ code: number; out: string; summar
   try {
     // runCli kills the whole process group on timeout: the coordinator, its drivers and the server.
     const { code, out, err } = await runCli([join(ROOT, "scripts/loadtest.ts"),
-      "--sessions", "8", "--service-workers", "2", "--svc-share", "0.2", "--peer-share", "0.1", "--users", "2", "--drivers", "2", "--duration", "10", "--warmup", "2", "--window", "2",
-      "--period", "1", "--boards", "2", "--post-share", "0.3", "--churn", "0.5", "--churn-every", "5", "--grace", "1",
+      "--sessions", "8", "--service-workers", "2", "--svc-share", "0.2", "--peer-share", "0.1", "--read-share", "0.4", "--users", "2", "--drivers", "2", "--duration", "10", "--warmup", "2", "--window", "2",
+      "--period", "1", "--boards", "2", "--post-share", "0.15", "--churn", "0.5", "--churn-every", "5", "--grace", "1",
       "--out", dir, ...extra], { bin: process.execPath, cwd: ROOT, env: { PATH: process.env.PATH ?? "" }, timeoutMs: 60_000 });
     let summary: any;
     try { summary = JSON.parse(readFileSync(join(dir, "summary.json"), "utf8")); } catch { summary = undefined; }
@@ -132,6 +134,13 @@ describe("loadtest run", () => {
     expect({ teamAllowed: svc.teamAllowed, boardScope: svc.boardScope, laneEchoes: svc.laneEchoes }).toEqual({ teamAllowed: svc.invocations, boardScope: "service:loadsvc", laneEchoes: 0 });
     for (const op of ["svc_invoke", "svc_reply", "svc_rtt", "peer_list"]) expect({ op, count: r.summary.clientSteady[op]?.count > 0 }).toEqual({ op, count: true });
     expect(r.summary.toolSteady.peer_list?.count).toBeGreaterThan(0);
+    // The service board's other canSee sites (#1511): board_list, board_read, the snapshot and the catalog each ran as
+    // its own op, and each result showed the board (the reads of its posts, some posts).
+    for (const op of ["board_list", "board_read", "snapshot", "catalog"]) {
+      expect({ op, count: r.summary.clientSteady[op]?.count > 0 }).toEqual({ op, count: true });
+      const p = svc.reads[op];
+      expect({ op, ok: p.ok > 0, named: p.named, content: op === "snapshot" ? p.content > 0 : p.content }).toEqual({ op, ok: true, named: p.ok, content: op === "snapshot" ? true : p.ok });
+    }
   }, 90_000);
 
   test("a lease cap below the fleet fails the run and names why", async () => {

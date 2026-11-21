@@ -10,6 +10,10 @@
 // board; every user session holds service_invoke through a team. A user's op is sometimes an invocation (a post on
 // that board: service.invoke, then queueLanes to pick its lane) or a peer_list (alias.see_service per service scope);
 // the lane answers each with a reply under the post, which wakes the invoker (principalCanSee on its delivery).
+// A user's op is also sometimes a read of that board through the other canSee sites R5 names (#1511): board_list, a
+// board_read of one of its own answered invocations' threads, the board's snapshot (resources/read) and the catalog
+// (resources/list), which every session also reads once it connects, as a harness host lists resources at its start.
+// Each read is checked for the service board in its result, so a read that couldn't see the board can't pass.
 // Reports are JSON lines on stdout. Bun runs this on one thread, like a C program with one event
 // loop: the driver's own loop lag is reported so a saturated driver's window is discarded, not
 // blamed on the server.
@@ -30,6 +34,8 @@ export type DriverConfig = {
   svcBoard: string | null;
   svcShare: number;
   peerShare: number;
+  // The share of a user's ops that read the service's board (board_list, board_read, snapshot, catalog in turn).
+  readShare: number;
   burst: number;
 };
 // Client-side latency buckets, seconds: the server's (src/server/metrics.ts LATENCY_BUCKETS).
@@ -44,10 +50,15 @@ export type DriverWindow = {
 // svcSent, those whose post returned; svcGot, those a lane read; svcDone, those whose reply its invoker read.
 // svcPosts: the invocations' post ids, which the coordinator matches to the server's authz.decision rows.
 // laneEcho: replies a lane read (it subscribes the board it answers on).
+// svcReads: per read op, the calls that returned (ok), those whose result named the service's board (named), and those
+// that also carried its posts (content: a board_read's thread holds the invocation and its reply; a snapshot, any post).
+export type ReadProof = { ok: number; named: number; content: number };
 export type DriverFinal = {
   type: "final"; driver: number; sentDm: string[]; recvDm: string[]; posts: number; boardRecv: number; misdelivered: number; misdeliveredFirst: string[];
-  svcSent: string[]; svcGot: string[]; svcDone: string[]; svcPosts: number[]; laneEcho: number; errors: Record<string, number>;
+  svcSent: string[]; svcGot: string[]; svcDone: string[]; svcPosts: number[]; laneEcho: number; svcReads: Record<string, ReadProof>; errors: Record<string, number>;
 };
+// The service board's reads, in the order a session takes them.
+export const SVC_READS = ["board_list", "board_read", "snapshot", "catalog"] as const;
 
 const RENEW_MS = 10_000;
 // Body marker: lt|<kind>|<sender index>|<seq>|<to: the target index, or the board>|<sent at ms>. An invocation (svc)
@@ -106,6 +117,11 @@ type Live = {
   stop: boolean;
   nextSend: number;
   seq: number;
+  // The next of SVC_READS this session takes; its invocations' post ids by seq; the last invocation whose reply it read
+  // and receipted, whose thread its board_read reads (a read of posts still pending for it would deliver them, #1511).
+  reads: number;
+  invoked: Map<number, number>;
+  doneThread?: number;
 };
 
 const sentDm = new Set<string>();
@@ -113,6 +129,7 @@ const recvDm = new Set<string>();
 const svcSent = new Set<string>(), svcGot = new Set<string>(), svcDone = new Set<string>();
 const svcPosts: number[] = [];
 let posts = 0, boardRecv = 0, misdelivered = 0, laneEcho = 0;
+const svcReads: Record<string, ReadProof> = Object.fromEntries(SVC_READS.map(op => [op, { ok: 0, named: 0, content: 0 }]));
 const misdeliveredFirst: string[] = [];
 let sending = true;
 
@@ -139,6 +156,7 @@ async function drain(l: Live) {
   if (!items.length) return;
   for (const item of items) {
     const text = JSON.stringify(item.event);
+    let answered: number | undefined;
     for (const m of text.matchAll(MARK)) {
       if (m[1] === "done" && l.spec.service) { laneEcho++; continue; }
       const meant = m[1] === "dm" || m[1] === "done" ? m[4] === String(l.spec.index) : m[1] === "svc" ? l.spec.service === true && m[4] === l.spec.board : m[4] === l.spec.board;
@@ -158,6 +176,7 @@ async function drain(l: Live) {
         await timed("svc_reply", () => l.s.call("board_post", { board: l.spec.board, body: `lt|done|${m[2]}|${m[3]}|${m[2]}|${m[5]}`, parent_id: parent }));
       } else if (m[1] === "done") {
         svcDone.add(`${m[2]}:${m[3]}`);
+        answered = l.invoked.get(Number(m[3])) ?? answered;
         // From the invocation's send to its reply's read: the round trip through the service.
         observe("svc_rtt", (Date.now() - Number(m[5])) / 1000, false);
       } else {
@@ -166,7 +185,9 @@ async function drain(l: Live) {
       }
     }
     await timed("renew", () => l.s.subscriber.call("delivery_renew"));
-    await timed("receipt", () => l.s.receipt([item.id]));
+    let receipted = false;
+    await timed("receipt", async () => { await l.s.receipt([item.id]); receipted = true; });
+    if (receipted && answered !== undefined) l.doneThread = answered;
   }
   if (items.length === 100) l.dirty = true;
 }
@@ -200,7 +221,7 @@ async function open(spec: DriverSession, url: string): Promise<Live> {
 
 async function openOnce(spec: DriverSession, url: string): Promise<Live> {
   const s = new HostedSession(url, spec.token, spec.name, { receipt: "manual" });
-  const l: Live = { spec, s, dirty: true, stop: false, nextSend: 0, seq: 0 };
+  const l: Live = { spec, s, dirty: true, stop: false, nextSend: 0, seq: 0, reads: spec.index % SVC_READS.length, invoked: new Map() };
   try { await s.connect(); } catch (e) { await s.drop(); throw e; }
   // board_create subscribes its creator; whoever loses the race subscribes. A worker's board is the service's queue.
   try { await s.call("board_create", { name: spec.board, purpose: "load test", ...(spec.service ? { kind: "queue" } : {}) }); }
@@ -214,7 +235,65 @@ async function openOnce(spec: DriverSession, url: string): Promise<Live> {
   const subscription = await s.subscriber.listen();
   l.stopWatch = () => subscription.close();
   l.loop = deliveryLoop(l);
+  // A harness host lists the resources at its start: the catalog, judged per board (a service board's binding read).
+  if (svcBoard) await timed("catalog", () => catalog(l, svcBoard!));
   return l;
+}
+
+// Reads started from the first report on are proved: by then every driver is ready, so the service's board exists (a
+// session that connects before the workers have created it lists a catalog without it). `counted`: proving at its start.
+let proving = false;
+const proved = (counted: boolean, op: string, named: boolean, content: boolean) => {
+  if (!counted) return;
+  const p = svcReads[op]!;
+  p.ok++; if (named) p.named++; if (named && content) p.content++;
+};
+const postsOf = (v: unknown): { id?: unknown; body?: unknown }[] => {
+  const posts = (v as { posts?: unknown } | null)?.posts;
+  return Array.isArray(posts) ? posts : [];
+};
+
+// The catalog (resources/list on the native role), every page; it must list the service's board.
+async function catalog(l: Live, board: string) {
+  const counted = proving, uris: string[] = [];
+  let cursor: string | undefined;
+  do {
+    const page = await l.s.native.client.listResources(cursor === undefined ? {} : { cursor }, { ...l.s.native.options(), cacheMode: "bypass" });
+    uris.push(...page.resources.map(r => r.uri));
+    cursor = page.nextCursor;
+  } while (cursor);
+  proved(counted, "catalog", uris.includes(`grayboard://boards/${board}`), true);
+}
+
+// One read of the service's board, the next of SVC_READS in this session's turn. board_read waits for a thread to read:
+// until the session's first answered invocation, its turn passes to the next read.
+function svcRead(l: Live, board: string) {
+  const counted = proving;
+  let op = SVC_READS[l.reads++ % SVC_READS.length]!;
+  if (op === "board_read" && l.doneThread === undefined) op = SVC_READS[l.reads++ % SVC_READS.length]!;
+  if (op === "board_list") {
+    void timed(op, async () => {
+      const v = await l.s.call<unknown>("board_list", {});
+      const rows = Array.isArray(v) ? v : (v as { boards?: unknown } | null)?.boards;
+      proved(counted, op, Array.isArray(rows) && rows.some(b => (b as { name?: unknown } | null)?.name === board), true);
+    });
+  } else if (op === "board_read") {
+    const thread = l.doneThread!;
+    void timed(op, async () => {
+      const v = await l.s.call<unknown>("board_read", { board, thread });
+      const posts = postsOf(v);
+      proved(counted, op, (v as { board?: unknown } | null)?.board === board, posts.some(p => p.id === thread) && posts.some(p => typeof p.body === "string" && p.body.startsWith("lt|done|")));
+    });
+  } else if (op === "snapshot") {
+    void timed(op, async () => {
+      const r = await l.s.native.client.readResource({ uri: `grayboard://boards/${board}` }, { ...l.s.native.options(), cacheMode: "bypass" });
+      const c = r.contents[0];
+      const v: unknown = c && "text" in c ? JSON.parse(c.text) : undefined;
+      proved(counted, op, (v as { board?: { name?: unknown } } | undefined)?.board?.name === board, postsOf(v).length > 0);
+    });
+  } else {
+    void timed(op, () => catalog(l, board));
+  }
 }
 
 // Stop the loop, drain what's left (a final pass, as an agent's last read), then release.
@@ -282,10 +361,13 @@ async function main() {
           const res = await l.s.call<{ post_id: number }>("board_post", { board, body: `lt|svc|${l.spec.index}|${seq}|${board}|${Date.now()}` });
           svcSent.add(id);
           svcPosts.push(res.post_id);
+          l.invoked.set(seq, res.post_id);
           return res;
         });
       } else if (svcBoard && r < config.postShare + config.svcShare + config.peerShare) {
         void timed("peer_list", () => l.s.call("peer_list", {}));
+      } else if (svcBoard && r < config.postShare + config.svcShare + config.peerShare + config.readShare) {
+        svcRead(l, svcBoard);
       } else {
         let to = Math.floor(Math.random() * (config.addresses.length - 1));
         if (to >= l.spec.index) to++;
@@ -310,7 +392,7 @@ async function main() {
         live.delete(l.spec.index);
         await timed("close", () => close(l));
         const fresh = await timed("connect", () => open(l.spec, config.url));
-        if (fresh) { fresh.nextSend = l.nextSend; fresh.seq = l.seq; live.set(l.spec.index, fresh); }
+        if (fresh) { fresh.nextSend = l.nextSend; fresh.seq = l.seq; fresh.reads = l.reads; fresh.invoked = l.invoked; fresh.doneThread = l.doneThread; live.set(l.spec.index, fresh); }
       }));
     }
     emit({ type: "churned", driver: config.driver, count: picked.length, live: live.size });
@@ -320,6 +402,7 @@ async function main() {
     const [cmd, arg] = line.trim().split(/\s+/);
     if (cmd === "report") {
       report(Number(arg));
+      proving = true;
     } else if (cmd === "churn") {
       churning = churning.then(() => churn(Number(arg)));
     } else if (cmd === "quiesce") {
@@ -332,7 +415,7 @@ async function main() {
       live.clear();
       const f: DriverFinal = {
         type: "final", driver: config.driver, sentDm: [...sentDm], recvDm: [...recvDm], posts, boardRecv, misdelivered, misdeliveredFirst,
-        svcSent: [...svcSent], svcGot: [...svcGot], svcDone: [...svcDone], svcPosts, laneEcho, errors: totalErrors,
+        svcSent: [...svcSent], svcGot: [...svcGot], svcDone: [...svcDone], svcPosts, laneEcho, svcReads, errors: totalErrors,
       };
       // The final line holds every DM id: tens of KB a pipe takes in several writes. process.exit
       // drops a write still queued, so exit only once this one has reached the pipe.

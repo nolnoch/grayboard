@@ -24,7 +24,10 @@
 // service (a post on load-svc: service.invoke and queueLanes) at --svc-share, or lists peers (alias.see_service per
 // service scope) at --peer-share; the lane replies under each invocation, which wakes the invoker. Those calls are
 // native tool calls, so the latency gates cover them, and the client reports them as their own ops (svc_invoke,
-// svc_reply, peer_list); every invocation must come back as a reply its invoker read.
+// svc_reply, peer_list); every invocation must come back as a reply its invoker read. At --read-share a user's op reads
+// the service's board through R5's other canSee sites (#1511), in turn: board_list, board_read (a thread of its own
+// answered invocations), the snapshot (resources/read) and the catalog (resources/list, also read by every session as
+// it connects). Each is its own op, and each result must show the board (and the reads its posts), or the run fails.
 //
 // The server runs with GRAYBOARD_DEV_AUTH=1 (tests/support/server.ts) on every interface, for as
 // long as the run: anyone who can reach this host's port can sign in to the scratch database.
@@ -47,7 +50,7 @@ import { DEFAULT_SERVICE_TOKEN_LIMITS, OAUTH_TTL, SERVICE_TOKEN_MIN_SECONDS } fr
 import { issueOAuth } from "../tests/helpers/oauth.ts";
 import { HOSTED_CLIENT, HOSTED_SCOPES } from "../tests/support/hosted_session.ts";
 import { devLogin, ServerProcess } from "../tests/support/server.ts";
-import { BUCKETS, type DriverConfig, type DriverFinal, type DriverSession, type DriverWindow, type Hist } from "./loadtest_driver.ts";
+import { BUCKETS, SVC_READS, type DriverConfig, type DriverFinal, type DriverSession, type DriverWindow, type Hist, type ReadProof } from "./loadtest_driver.ts";
 
 const ROOT = resolve(import.meta.dir, "..");
 
@@ -58,6 +61,8 @@ export type Options = {
   // The service's workers (of `sessions`), the teams its invokers hold service_invoke through, and the shares of a
   // user's ops that invoke it and list peers.
   serviceWorkers: number; teams: number; svcShare: number; peerShare: number;
+  // The share of a user's ops that read the service's board.
+  readShare: number;
   // A Postgres cluster URL; absent runs the server on a SQLite file.
   pg?: string;
 };
@@ -68,7 +73,7 @@ export function options(argv: string[]): Options {
       quick: { type: "boolean" }, sessions: { type: "string" }, users: { type: "string" }, drivers: { type: "string" },
       duration: { type: "string" }, warmup: { type: "string" }, period: { type: "string" }, boards: { type: "string" },
       "post-share": { type: "string" }, burst: { type: "string" }, churn: { type: "string" }, "churn-every": { type: "string" },
-      "service-workers": { type: "string" }, teams: { type: "string" }, "svc-share": { type: "string" }, "peer-share": { type: "string" },
+      "service-workers": { type: "string" }, teams: { type: "string" }, "svc-share": { type: "string" }, "peer-share": { type: "string" }, "read-share": { type: "string" },
       window: { type: "string" }, grace: { type: "string" }, server: { type: "string" }, out: { type: "string" }, "keep-db": { type: "boolean" }, pg: { type: "string" },
       // Server env overrides, KEY=VALUE, applied after the caps the run computes.
       env: { type: "string", multiple: true },
@@ -90,7 +95,7 @@ export function options(argv: string[]): Options {
     postShare: n("post-share", 0.05, 0.2), burst: n("burst", 100, 20), churn: n("churn", 0.1, 0.25),
     churnEveryS: n("churn-every", 900, 20), windowS: n("window", 10, 5), graceS: n("grace", 15, 5),
     // Unset, the workers shrink to what a small fleet leaves after its users' sessions (defaultWorkers).
-    serviceWorkers: v["service-workers"] === undefined ? defaultWorkers(n("service-workers", 4, 2), n("sessions", 1000, 40), n("users", 100, 4)) : n("service-workers", 4, 2), teams: v.teams === undefined ? Math.min(n("teams", 10, 2), Math.max(1, n("users", 100, 4))) : n("teams", 10, 2), svcShare: n("svc-share", 0.05, 0.2), peerShare: n("peer-share", 0.02, 0.1),
+    serviceWorkers: v["service-workers"] === undefined ? defaultWorkers(n("service-workers", 4, 2), n("sessions", 1000, 40), n("users", 100, 4)) : n("service-workers", 4, 2), teams: v.teams === undefined ? Math.min(n("teams", 10, 2), Math.max(1, n("users", 100, 4))) : n("teams", 10, 2), svcShare: n("svc-share", 0.05, 0.2), peerShare: n("peer-share", 0.02, 0.1), readShare: n("read-share", 0.02, 0.1),
     server: v.server ? [resolve(v.server)] : [process.execPath, join(ROOT, "src/server/main.ts")],
     out: v.out ? resolve(v.out) : join(ROOT, ".e2e-runs", `loadtest-${new Date().toISOString().replace(/[:.]/g, "-")}`),
     keepDb: v["keep-db"] === true,
@@ -107,7 +112,7 @@ export function options(argv: string[]): Options {
   if (o.warmupS >= o.durationS) throw new Error("--warmup must be shorter than --duration");
   if (!Number.isInteger(o.serviceWorkers) || userSessions(o) < Math.max(2, o.users)) throw new Error("--service-workers must be a whole number that leaves at least 2 sessions, and one per user, to the users");
   if (o.serviceWorkers && (!Number.isInteger(o.teams) || o.teams < 1 || o.teams > o.users)) throw new Error("--teams must be a whole number from 1 to --users");
-  if (o.postShare + (o.serviceWorkers ? o.svcShare + o.peerShare : 0) > 1) throw new Error("--post-share, --svc-share and --peer-share must sum to at most 1");
+  if (o.postShare + (o.serviceWorkers ? o.svcShare + o.peerShare + o.readShare : 0) > 1) throw new Error("--post-share, --svc-share, --peer-share and --read-share must sum to at most 1");
   return o;
 }
 
@@ -211,12 +216,12 @@ function bucket(prefix: string, d: RateLimit, rate: number): Record<string, stri
 // Hosted requests per second per user, per bucket, at hosted-core's cadence. Tool calls: the agent's
 // op every period. Delivery upkeep (role=subscriber): a renew and a read every 10 s, and up to three
 // requests per delivery (a read on its hint, a renew, a receipt; #845). A DM reaches one session; a
-// post reaches its board's other subscribers; an invocation's reply reaches its invoker; a peer_list reaches no one.
+// post reaches its board's other subscribers; an invocation's reply reaches its invoker; a peer_list or a read reaches no one.
 export function perUserRate(o: Options): { tools: number; subscriber: number; total: number } {
   const subscribers = Math.max(0, userSessions(o) / o.boards - 1);
   const perUser = userSessions(o) / o.users;
   const tools = perUser / o.periodS;
-  const peers = o.serviceWorkers ? o.peerShare : 0;
+  const peers = o.serviceWorkers ? o.peerShare + o.readShare : 0;
   const subscriber = perUser * (0.2 + (1 / o.periodS) * 3 * ((1 - o.postShare - peers) + o.postShare * subscribers));
   return { tools, subscriber, total: tools + subscriber };
 }
@@ -269,7 +274,7 @@ async function hostedRows(pgDbUrl: string | undefined, dbPath: string): Promise<
 }
 
 const ADMIN = "load-admin@example.com", SERVICE = "loadsvc", SVC_BOARD = "load-svc";
-const SERVICE_OPS = { svc_invoke: 1, svc_reply: 1, peer_list: 1 };
+const SERVICE_OPS = new Set<string>(["svc_invoke", "svc_reply", "peer_list", ...SVC_READS]);
 
 // The service, as an admin and a launcher set one up (tests/support/service_token.ts): the service (owned by the first
 // user), a credential whose run tokens outlast the run, one run token minted with client credentials, and T teams
@@ -310,7 +315,7 @@ async function main() {
   const pgAdmin = o.pg ? openPg(o.pg, { max: 1, applicationName: "gb-loadtest-admin" }) : undefined;
   const pgDbUrl = o.pg ? (() => { const u = new URL(o.pg!); u.pathname = `/${pgName}`; return u.toString(); })() : undefined;
   const log = (s: string) => { console.log(s); appendFileSync(join(o.out, "run.log"), s + "\n"); };
-  log(`loadtest: ${o.sessions} sessions, ${o.users} users, ${o.drivers} drivers, ${o.durationS}s (${o.warmupS}s warm-up), op every ${o.periodS}s, ${o.boards} boards (~${Math.round(o.sessions / o.boards)} subscribers each), post share ${o.postShare}, burst ${o.burst}, churn ${o.churn} every ${o.churnEveryS}s, ${o.serviceWorkers ? `${o.serviceWorkers} service workers, ${o.teams} invoker teams, svc share ${o.svcShare}, peer_list share ${o.peerShare}` : "no service"}; ${cpus().length} CPUs, load ${loadavg().map(x => x.toFixed(2)).join(" ")}`);
+  log(`loadtest: ${o.sessions} sessions, ${o.users} users, ${o.drivers} drivers, ${o.durationS}s (${o.warmupS}s warm-up), op every ${o.periodS}s, ${o.boards} boards (~${Math.round(o.sessions / o.boards)} subscribers each), post share ${o.postShare}, burst ${o.burst}, churn ${o.churn} every ${o.churnEveryS}s, ${o.serviceWorkers ? `${o.serviceWorkers} service workers, ${o.teams} invoker teams, svc share ${o.svcShare}, peer_list share ${o.peerShare}, read share ${o.readShare}` : "no service"}; ${cpus().length} CPUs, load ${loadavg().map(x => x.toFixed(2)).join(" ")}`);
   log(`run dir: ${o.out}`);
 
   const caps = capsEnv(o);
@@ -369,7 +374,7 @@ async function main() {
       const config: DriverConfig = {
         driver: k, url: `${server.base}/mcp`, sessions: specs.filter(s => s.index % o.drivers === k), addresses,
         periodMs: o.periodS * 1000, postShare: o.postShare, burst: Math.max(1, Math.ceil(o.burst / o.drivers)),
-        svcBoard: o.serviceWorkers ? SVC_BOARD : null, svcShare: o.svcShare, peerShare: o.peerShare,
+        svcBoard: o.serviceWorkers ? SVC_BOARD : null, svcShare: o.svcShare, peerShare: o.peerShare, readShare: o.readShare,
       };
       const proc = Bun.spawn([process.execPath, join(ROOT, "scripts/loadtest_driver.ts")], {
         cwd: ROOT, stdin: "pipe", stdout: "pipe", stderr: Bun.file(join(o.out, `driver-${k}.stderr`)),
@@ -465,7 +470,7 @@ async function main() {
         ...(lagSamples.every(x => x !== undefined) ? { lag: { p50: lagSamples[0]!, p99: lagSamples[1]!, max: lagSamples[2]! } } : {}),
         leases: one(s, "grayboard_delivery_leases") ?? -1, listens: one(s, "grayboard_mcp_admissions", { kind: "listen" }) ?? -1,
         holding: one(s, "grayboard_hosted_sessions_holding") ?? -1, live, refusals, tools, client, clientErrors, driverLagP99,
-        ops: ["dm_send", "board_post", "svc_invoke", "peer_list"].reduce((a, op) => a + (client[op]?.count ?? 0), 0), loadavg: loadavg(),
+        ops: ["dm_send", "board_post", "svc_invoke", "peer_list", ...SVC_READS].reduce((a, op) => a + (client[op]?.count ?? 0), 0), loadavg: loadavg(),
       };
       windows.push(w);
       appendFileSync(join(o.out, "windows.jsonl"), JSON.stringify(w) + "\n");
@@ -529,13 +534,17 @@ async function main() {
     const clientSteady: Record<string, Hist> = {};
     for (const w of clean) for (const [op, h] of Object.entries(w.client)) mergeHist(clientSteady[op] ??= newHist(), h);
     // The service's paths (#1258): each must have run, or a run without them would pass unmeasured.
-    const wanted: Record<string, boolean> = { board_post: o.postShare > 0, svc_invoke: o.serviceWorkers > 0 && o.svcShare > 0, svc_reply: o.serviceWorkers > 0 && o.svcShare > 0, peer_list: o.serviceWorkers > 0 && o.peerShare > 0 };
-    for (const op of ["inbox", "renew", "receipt", "dm_send", "board_post", "svc_invoke", "svc_reply", "peer_list"]) {
+    const wanted: Record<string, boolean> = {
+      board_post: o.postShare > 0, svc_invoke: o.serviceWorkers > 0 && o.svcShare > 0, svc_reply: o.serviceWorkers > 0 && o.svcShare > 0, peer_list: o.serviceWorkers > 0 && o.peerShare > 0,
+      // board_read reads an answered invocation's thread, so it needs invocations too.
+      ...Object.fromEntries(SVC_READS.map(op => [op, o.serviceWorkers > 0 && o.readShare > 0 && (op !== "board_read" || o.svcShare > 0)])),
+    };
+    for (const op of ["inbox", "renew", "receipt", "dm_send", "board_post", "svc_invoke", "svc_reply", "peer_list", ...SVC_READS]) {
       const h = clientSteady[op];
       if (!h && clean.length && (wanted[op] ?? true)) failures.push(`client ${op}: no samples in the clean steady windows`);
       if (h && h.count >= 100 && fastShare(h) < 0.99) failures.push(`client ${op}: ${(100 * fastShare(h)).toFixed(2)}% of ${h.count} at ≤ 100 ms (clean steady windows)`);
       // The service's ops are rare (tens a run below the full profile): each is held to the pooled small-pool rule.
-      else if (h && op in SERVICE_OPS && tooSlow(h.count, h.buckets[BUCKETS.indexOf(0.1)]!)) failures.push(`client ${op}: ${(100 * fastShare(h)).toFixed(2)}% of ${h.count} at ≤ 100 ms (clean steady windows); want at most 1% slower, rounded up`);
+      else if (h && SERVICE_OPS.has(op) && tooSlow(h.count, h.buckets[BUCKETS.indexOf(0.1)]!)) failures.push(`client ${op}: ${(100 * fastShare(h)).toFixed(2)}% of ${h.count} at ≤ 100 ms (clean steady windows); want at most 1% slower, rounded up`);
     }
     // Refusals since the server started, connect and close included: the windows see only the load.
     const refusedAll = Object.fromEntries(Object.entries(refusalsTotal(after)).filter(([, v]) => v > 0));
@@ -570,6 +579,20 @@ async function main() {
       if (unproven.length) failures.push(`${unproven.length} of ${svcPosts.length} invocations have no authz.decision row allowing service.invoke through a team's binding (e.g. posts ${unproven.slice(0, 5).join(", ")}; service.invoke rows by rule ${JSON.stringify(audit!.rules)})`);
       if (audit!.boardScope !== `service:${SERVICE}` || audit!.boardKind !== "queue") failures.push(`${SVC_BOARD} is scope ${audit!.boardScope}, kind ${audit!.boardKind}; want service:${SERVICE}, queue`);
     }
+    // Proof the reads saw the service's board (#1511): every result named it, and the reads of its posts returned some (a
+    // board_read's thread, every time: the invocation and its reply).
+    const svcReads: Record<string, ReadProof> = Object.fromEntries(SVC_READS.map(op => [op, drivers.reduce((a, d) => {
+      const p = d.final!.svcReads[op] ?? { ok: 0, named: 0, content: 0 };
+      return { ok: a.ok + p.ok, named: a.named + p.named, content: a.content + p.content };
+    }, { ok: 0, named: 0, content: 0 })]));
+    for (const op of SVC_READS) {
+      const p = svcReads[op]!;
+      if (!wanted[op]) continue;
+      if (!p.ok) failures.push(`no ${op} of ${SVC_BOARD} returned`);
+      if (p.named < p.ok) failures.push(`${p.ok - p.named} of ${p.ok} ${op} results didn't show ${SVC_BOARD}`);
+      if (op === "board_read" && p.content < p.ok) failures.push(`${p.ok - p.content} of ${p.ok} board_read threads of ${SVC_BOARD} lacked the invocation or its reply`);
+      if (op === "snapshot" && p.ok && !p.content) failures.push(`no snapshot of ${SVC_BOARD} carried a post`);
+    }
     const laneEchoes = drivers.reduce((a, d) => a + d.final!.laneEcho, 0);
     if (laneEchoes) failures.push(`${laneEchoes} replies reached a service lane; want 0 (a reply goes to its invoker)`);
     // RSS and heap over the steady period.
@@ -586,7 +609,7 @@ async function main() {
       toolSteady: Object.fromEntries(Object.entries(toolSteady).map(([t, x]) => [t, { count: x.count, fastShare: x.fast / x.count }])),
       clientSteady: Object.fromEntries(Object.entries(clientSteady).map(([op, h]) => [op, { count: h.count, fastShare: fastShare(h), p99Le: p99Edge(h), mean: h.sum / Math.max(1, h.count), errors: h.errors }])),
       dms: { sent: sent.size, received: recv.size, lost: lost.length }, misdelivered, posts, boardDeliveries: boardRecv,
-      service: o.serviceWorkers ? { name: SERVICE, board: SVC_BOARD, workers: o.serviceWorkers, teams: o.teams, invocations: svcSent.size, reachedLane: svcGot.size, replied: svcDone.size, lost: svcLost.length, laneEchoes, teamAllowed: audit!.teamAllowed.size, rules: audit!.rules, boardScope: audit!.boardScope } : null,
+      service: o.serviceWorkers ? { name: SERVICE, board: SVC_BOARD, workers: o.serviceWorkers, teams: o.teams, invocations: svcSent.size, reachedLane: svcGot.size, replied: svcDone.size, lost: svcLost.length, laneEchoes, teamAllowed: audit!.teamAllowed.size, rules: audit!.rules, boardScope: audit!.boardScope, reads: svcReads } : null,
       rss: { meanMB: meanRss / 2 ** 20, growthMB: rssGrowth / 2 ** 20, gated: o.rssGate }, heapGrowthMB: heapSlope * steadyS / 2 ** 20,
       lag: { windows: lagP99.length, p99Max: Math.max(0, ...lagP99), p99Median: lagP99.sort((a, b) => a - b)[Math.floor(lagP99.length / 2)] ?? null },
       drained, hostedRowsAfter: rows, refusals: refusedAll, clientErrors: erroredAll, failures,
