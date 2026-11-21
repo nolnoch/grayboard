@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
-import { refusalCount } from "./metrics.ts";
+import { gateCount, GATE_METHODS, type GateMethod, refusalCount } from "./metrics.ts";
 import { until } from "../../tests/support/until.ts";
 import { AppSession } from "../../tests/support/app_session.ts";
 import { hostedRowCount } from "../../tests/support/hosted_rows.ts";
@@ -49,7 +49,7 @@ beforeEach(async () => {
   await sender.connect();
   await hosted.bind(bob, context(bob), { name: "fe", create: true });
 });
-afterEach(async () => { delivery.close(); await hosted.close(); application.stopExpiry(); store.db.close(); rmSync(dir, { recursive: true, force: true }); });
+afterEach(async () => { delivery.close(); await hosted.close(); await application.stopExpiry(); store.db.close(); rmSync(dir, { recursive: true, force: true }); });
 const send = async (body = "hello", pending = false) => (await sender.send("bob@example.com/fe", body, { pending })).message_id;
 
 test("stale receipt audit survives rollback exactly once without committing any cursor", async () => {
@@ -65,6 +65,23 @@ test("stale receipt audit survives rollback exactly once without committing any 
   expect(JSON.stringify(rows)).not.toContain(lease.capability);
   await delivery.receipt(bob, context(bob), lease.capability, [items[0]!.id]);
   expect(store.db.query("SELECT count(*) AS n FROM access_log WHERE action = 'hosted.stale_capability'").get()).toEqual({ n: 1 });
+});
+
+// #1537 PR 0: each hosted call's gate body is counted under its own method (SQLite: every gate body is `skipped`), so
+// the subscriber calls' second gate (control) is told from the exchange's selection. Mutation: control's or owning's
+// method dropped (counted under `control` or `owning`); snapshot's (counted under `tool`).
+test("the gate counter labels each call's gate body by method: selection, open, renew, pending, receipt, release, whoami", async () => {
+  const at = Object.fromEntries(GATE_METHODS.map(m => [m, gateCount("gate", "skipped", m)])) as Record<GateMethod, number>;
+  const counted = () => Object.fromEntries(GATE_METHODS.map(m => [m, gateCount("gate", "skipped", m) - at[m]]).filter(([, n]) => n !== 0));
+  await hosted.snapshot(bob, context(bob));
+  const lease = await delivery.open(bob, context(bob));
+  await delivery.renew(bob, context(bob), lease.capability);
+  await send();
+  const items = await delivery.pending(bob, context(bob), lease.capability);
+  await delivery.receipt(bob, context(bob), lease.capability, [items[0]!.id]);
+  await hosted.whoami(bob, context(bob));
+  await delivery.release(bob, context(bob), lease.capability);
+  expect(counted()).toEqual({ selection: 1, open: 1, renew: 1, pending: 1, receipt: 1, whoami: 1, release: 1 });
 });
 
 test("shutdown detaches each accepted lease with one hosted.lease_detached row naming its session (#424)", async () => {
@@ -428,6 +445,25 @@ test("a lease finished while renew's update awaits stays finished: renew refuses
     expect(delivery.activeLeaseCount).toBe(0);
     // The refusal rolled the renew's new deadline back.
     expect(await deadlines()).toEqual(before);
+  } finally { release(); spy.mockRestore(); }
+});
+
+test("an open whose update awaits across a close is refused and tracks no lease (#1122)", async () => {
+  const update = store.repo.hosted.update.bind(store.repo.hosted);
+  let entered!: () => void, release!: () => void;
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  const held = new Promise<void>(resolve => { release = resolve; });
+  const spy = spyOn(store.repo.hosted, "update").mockImplementationOnce(async (tx, id, patch) => { entered(); await held; return update(tx, id, patch); });
+  try {
+    const opening = delivery.open(bob, context(bob));
+    await started;
+    delivery.close();
+    release();
+    await expect(opening).rejects.toHaveProperty("code", "not_found");
+    expect(delivery.activeLeaseCount).toBe(0);
+    // Its opened audit is matched by a detach, as close gives each lease it finished.
+    const actions = store.db.query<{ action: string }, []>("SELECT action FROM access_log WHERE action IN ('hosted.lease_opened', 'hosted.lease_detached') ORDER BY id").all();
+    expect(actions.map(a => a.action)).toEqual(["hosted.lease_opened", "hosted.lease_detached"]);
   } finally { release(); spy.mockRestore(); }
 });
 

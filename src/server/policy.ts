@@ -10,7 +10,7 @@
 // helpers below are this module's own: nothing else calls them (policy.test.ts).
 // One rule's body lives in core, shared with local mode: attachment.read names
 // the rule from core's attachmentReach facts (who may read is canReadAttachment's).
-import type { Read } from "./store/tx.ts";
+import { isTx, type Read } from "./store/tx.ts";
 import { addressParts, type ScopeKind } from "../core/addresses.ts";
 import type { AttachmentReach } from "../core/attachments.ts";
 import type { Principal } from "../core/resolver.ts";
@@ -302,16 +302,20 @@ function subject(req: AuthzRequest): { target: string | null; detail: Record<str
 // otherwise write a 90-day row per request. Past the burst a user's denies go
 // unrecorded until the bucket refills; the streak's end writes one
 // `authz.suppressed` row with the count. Allows aren't thinned: only owners
-// and admins reach them. One limiter per Repo (per server). The streak's end fires
-// inside recordDecision's sweep or take, so its row goes on the handle that call was
-// given (`suppressedOn`): the caller's body `Tx`, or a post outside any body.
+// and admins reach them. One limiter per Repo (per server). Inside a body only the
+// caller's own key is taken: its streak's end fires in that take and its row goes on
+// the body's `Tx` (`suppressedOn`), beside the decision row. Every other user's
+// refilled bucket is swept once the body commits (its afterCommit), each row posted:
+// a body that fails to commit sweeps nothing, so their buckets, and the counts the rows
+// will carry, wait for the next sweep (#1436). Outside a body the sweep runs now.
+// Buckets age on the store's clock (#1082), the one a test injects, like every row's stamp (#1390).
 export const DENY_ROW_LIMIT: RateLimit = { burst: 30, perSec: 0.5 };
 const denyLimiters = new WeakMap<Repo, RateLimiter>();
 let suppressedOn: Read | undefined;
 function denyLimiter(repo: Repo): RateLimiter {
   let l = denyLimiters.get(repo);
   if (!l) {
-    l = new RateLimiter(DENY_ROW_LIMIT, { start() {}, end: (user, refused) => writeAudit(repo, suppressedOn ?? repo.read, "authz.suppressed", user, null, { refused }) }, Date.now, 4096);
+    l = new RateLimiter(DENY_ROW_LIMIT, { start() {}, end: (user, refused) => writeAudit(repo, suppressedOn ?? repo.read, "authz.suppressed", user, null, { refused }) }, () => repo.now(), 4096);
     denyLimiters.set(repo, l);
   }
   return l;
@@ -328,9 +332,15 @@ const clip = (v: unknown): unknown => (typeof v === "string" && v.length > MAX_D
 export function recordDecision(repo: Repo, h: Read, actor: Actor, req: AuthzRequest, d: Decision, extra: Record<string, unknown> = {}): void {
   if (!d.allow) {
     const limiter = denyLimiter(repo);
-    suppressedOn = h;
     let ok: boolean;
-    try { limiter.sweep(); ok = limiter.take(actor.user ?? "").ok; } finally { suppressedOn = undefined; }
+    if (isTx(h)) {
+      suppressedOn = h;
+      try { ok = limiter.take(actor.user ?? "").ok; } finally { suppressedOn = undefined; }
+      h.afterCommit(() => limiter.sweep());
+    } else {
+      limiter.sweep();
+      ok = limiter.take(actor.user ?? "").ok;
+    }
     if (!ok) return;
   }
   const { target, detail } = subject(req);

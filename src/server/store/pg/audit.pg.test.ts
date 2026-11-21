@@ -10,7 +10,7 @@ import { owedBridgeNotice } from "../../application.ts";
 import type { Repo } from "../../db.ts";
 import { makePgAudit, PG_ACCESS_LOG_LAST_SQL } from "./audit.ts";
 import { makePgCursors } from "./cursors.ts";
-import { TxAborted } from "./tx.ts";
+import { pgOf, TxAborted } from "./tx.ts";
 
 const T0 = 1_800_000_000_000;
 const EMAIL = "a@example.com";
@@ -20,6 +20,7 @@ const audit = makePgAudit();
 const repo = {
   audit, now: () => T0,
   post: () => { throw new Error("writeAudit posted: the row left the body's transaction"); },
+  postKeyed: () => { throw new Error("writeAudit posted: the row left the body's transaction"); },
 } as unknown as Repo;
 
 const countAction = async (p: PgPair, action: string) => (await p.db.sql`SELECT count(*)::int AS n FROM access_log WHERE action = ${action}`)[0].n as number;
@@ -45,8 +46,9 @@ describePg("audit store (Postgres)", () => {
   });
 
   // Mutations: write sent outside the transaction (posted, or on afterCommit: the body's other rows commit and the
-  // write resolves); its .catch removed (no log lines: TxAborted's cause is the later failure, so the log is the only
-  // place the insert's own SQLSTATE shows; Bun 1.4.4 reports no unhandled rejection for an executed query).
+  // write resolves); its .catch removed (no log lines and no `first`: TxAborted's cause is the later failure, so the
+  // log and `first` (#1302) are the only places the insert's own SQLSTATE shows; Bun 1.4.4 reports no unhandled
+  // rejection for an executed query).
   test("T-C7-4: a write the database refuses aborts the body's transaction: the write rejects TxAborted and nothing commits", async () => {
     await using p = await pgPair();
     // A test trigger in this database only: an access_log row whose action is "refused" fails 23514.
@@ -73,6 +75,15 @@ describePg("audit store (Postgres)", () => {
     const cause = (s: typeof last) => s.ok ? "committed" : (s.error as TxAborted).cause as { code: string; errno?: string };
     expect(cause(last)).toMatchObject({ code: "ERR_POSTGRES_COMMIT_ROLLED_BACK" });
     expect(cause(after)).toMatchObject({ errno: "25P02" });
+    // #1302: the rejection names the refused insert, the transaction's first failure: its SQLSTATE in the message and
+    // errno, the error itself as `first`, never its text.
+    for (const s of [last, after]) {
+      const e = s.ok ? undefined : s.error as TxAborted;
+      expect(e?.first).toMatchObject({ errno: "23514" });
+      expect(e?.errno).toBe("23514");
+      expect(e?.message).toContain("(PostgresError ERR_POSTGRES_SERVER_ERROR 23514)");
+      expect(e?.message).not.toContain("secret-target");
+    }
     expect((await p.db.sql`SELECT count(*)::int AS n FROM access_log`)[0].n).toBe(0);
     expect((await p.db.sql`SELECT count(*)::int AS n FROM mailbox_cursors`)[0].n).toBe(0);
     // Each refused insert's own failure is logged once, as its class and SQLSTATE: never its text, which quotes the row.
@@ -82,6 +93,32 @@ describePg("audit store (Postgres)", () => {
       { class: "PostgresError", code: "ERR_POSTGRES_SERVER_ERROR", sqlstate: "23514" },
     ]);
     expect(JSON.stringify(errors.mock.calls)).not.toContain("secret-target");
+  });
+
+  // #1302: a savepoint that rolls a refused insert back undoes it, so a later, unrelated abort is not blamed on it.
+  // Mutation: no clear on ROLLBACK TO (`undone`), and the final rejection names the insert's 23514.
+  test("a savepoint that rolled a refused insert back clears it: a later abort does not name it", async () => {
+    await using p = await pgPair();
+    await p.db.sql.unsafe(`CREATE FUNCTION refuse_row() RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN IF NEW.action = 'refused' THEN RAISE EXCEPTION 'refused % row', NEW.target USING ERRCODE = '23514'; END IF; RETURN NEW; END $$`);
+    await p.db.sql.unsafe("CREATE TRIGGER refuse_row BEFORE INSERT ON access_log FOR EACH ROW EXECUTE FUNCTION refuse_row()");
+    errors = spyOn(console, "error").mockImplementation(() => {});
+    const row = (action: string) => ({ at: T0, actor: null, action, target: "t", detail: null });
+    let inner: unknown;
+    const s = await settle(p.a.write(async tx => {
+      // The savepoint's own rejection names the insert it rolls back.
+      inner = await tx.savepoint(async sp => { audit.write(sp, row("refused")); }).catch((e: unknown) => e);
+      // Then a failure the body swallows without a savepoint, and a statement after it: 25P02.
+      await pgOf(tx)`SELECT 1 / 0`.catch(() => {});
+      await pgOf(tx)`SELECT 1`;
+    }));
+    expect(inner).toBeInstanceOf(TxAborted);
+    expect((inner as TxAborted).errno).toBe("23514");
+    const e = s.ok ? undefined : s.error as TxAborted;
+    expect(e).toBeInstanceOf(TxAborted);
+    expect(e?.first).toBeUndefined();
+    expect(e?.errno).toBe("25P02");
+    expect(e?.message).toContain("a statement error was caught without a savepoint");
   });
 
   // C67a audit m2: Postgres breaks a tie in `at` by heap order, so no serial contract row (U3) tells `ORDER BY at DESC`

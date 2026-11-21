@@ -53,7 +53,7 @@ import {
 import { localDbPath } from "./open.ts";
 import { deliverEnded, listenForWakeup, poke } from "./wakeup.ts";
 import { sockDir } from "../shared/sockdir.ts";
-import { ChildSessions, acquireName, displaceableHolder, attachSession, candidateNames, childFallback, conversationSnapshot, detachSession, endLocalSession, keyedHarness, liveSessions, nothingEnded, registerChild, registerSession, releaseName, runnerRoot, runnerRootLive, setHeldMeta, SIBLING_WAIT_MS, siblingGone, thisSession, type Ended, type Leave, type SessionKind } from "./binding.ts";
+import { ChildSessions, acquireName, displaceableHolder, attachSession, candidateNames, childFallback, conversationSnapshot, detachSession, endLocalSession, keyedHarness, liveSessions, nothingEnded, recordPredecessor, recordYieldReads, recordYields, registerChild, registerSession, releaseName, runnerRoot, runnerRootLive, setHeldMeta, SIBLING_WAIT_MS, siblingGone, thisSession, type Ended, type Leave, type SessionKind } from "./binding.ts";
 import { GRAYBOARD_AGENT_META, validSourceId } from "../shared/session_meta.ts";
 import { MISSING_TEXT, TOOL_USE_META, readCurrent, takeRecord, type MissingCause } from "../shared/claude_agents.ts";
 import { listenIdentity, type IdentityRequest } from "../shared/claude_identity.ts";
@@ -370,7 +370,10 @@ const markIfMine = (readers: string[], mark: (reader: string) => void): boolean 
   db.transaction(() => {
     let all = true;
     for (const r of readers) {
-      if (stillMine(r)) mark(r);
+      const mine = stillMine(r);
+      // Inside the write lock: a displacement waits for the mark (#1404).
+      testPause("drain:in-mark");
+      if (mine) mark(r);
       else all = false;
     }
     return all;
@@ -401,10 +404,25 @@ let restoredFrom: string | null = null;
 const RECORD_DIR = sockDir();
 const RECORDS = PUSH && !HUMAN && !KEYED && PARENT_SESSION === undefined;
 // A failed write costs only the restore after a restart; the bind itself stands.
+// A sibling an adapter's child shares the harness pid with leaves the record
+// to that child while it lives (#1404, recordYields): a displaced sibling's
+// stale start-time write or later bind would otherwise overwrite the child's.
+// A session with a harness session never yields, so it takes no lock; the
+// harness's start time and the yield's process reads (#1463) are read before
+// the lock either way.
 const writeNames = () => {
   if (!RECORDS) return;
   try {
-    writeRecord(RECORD_DIR, { names: held, session_id: SESSION_ID, harness_pid: process.ppid, bus: localDbPath() });
+    const rec = { names: held, session_id: SESSION_ID, harness_pid: process.ppid, bus: localDbPath() };
+    const start = procStart(process.ppid) ?? null;
+    if (HARNESS_SESSION !== undefined) {
+      writeRecord(RECORD_DIR, rec, start);
+      return;
+    }
+    const pre = recordYieldReads(db, SESSION_ID, process.ppid);
+    db.transaction(() => {
+      if (!recordYields(db, SESSION_ID, process.ppid, pre)) writeRecord(RECORD_DIR, rec, start);
+    }).immediate();
   } catch (e) {
     console.error(`[grayboard] name record for harness pid ${process.ppid} not written:`, e);
   }
@@ -486,7 +504,11 @@ if (WRITES_AS) {
   // unbind, never an invitation to take PID carry or configured identity.
   const snapshot = ORDINARY && HARNESS_SESSION ? conversationSnapshot(db, HARNESS_SESSION) : null;
   claudeGuidancePending = CLAUDE_CURRENT && snapshot !== null;
-  const rec = snapshot ?? (RECORDS ? freshRecord(RECORD_DIR, process.ppid, localDbPath()) : null);
+  const found = snapshot === null && RECORDS ? freshRecord(RECORD_DIR, process.ppid, localDbPath()) : null;
+  // A record an adapter's child under this harness left isn't this session's to restore (#1457).
+  const foreign = found !== null && !recordPredecessor(db, found.session_id, HARNESS_SESSION);
+  if (foreign) console.error(`[grayboard] the name record for harness pid ${process.ppid} is session ${found.session_id}'s, which had a harness session; not restored`);
+  const rec = snapshot ?? (foreign ? null : found);
   if (snapshot !== null || rec?.names.length) {
     await restoreNames(rec!, snapshot === null);
   } else if (EXPLICIT && !attached) {
@@ -504,6 +526,8 @@ if (WRITES_AS) {
     const wrapper = wrapperName(process.ppid);
     if (wrapper) startNotes.push(wrapperNote(wrapper));
   }
+  // An adapter's child displacing this one here leaves `held` stale (#1404).
+  testPause("mcp:before-record");
   writeNames();
 }
 // A machine signed in to a server (#491): a bare `grayboard mcp` entry is
@@ -564,6 +588,11 @@ function localInstructions(general: boolean, notes: string[] = []): string[] {
 // an unbind leaves it holding nothing.
 let unboundCandidates = !WRITES_AS && liveParent === null && !held.length ? await candidateNames(db, SUGGESTED) : [];
 
+// Initialize's instructions, built when the result is sent (the transport.send rewrite below), so they're current
+// then; the Server takes none, since a constructor copy would never reach the wire (#1423). Unbound: the session acts
+// as its ID, with a line on binding a name.
+const initInstructions = (): string => [...(CHANNELS_OFF_NOTICE ? [CHANNELS_OFF_NOTICE] : []), ...(ATTRIBUTION_OFF ? [ATTRIBUTION_OFF_NOTE] : []), ...localInstructions(true, startNotes)].join(" ");
+
 const mcp = new Server(
   { name: DEFAULT_CHANNEL_SOURCE, version: pkg.version },
   {
@@ -571,8 +600,6 @@ const mcp = new Server(
       experimental: { "claude/channel": {} },
       tools: {},
     },
-    // Unbound: the session acts as its ID, with a line on binding a name.
-    instructions: [...(CHANNELS_OFF_NOTICE ? [CHANNELS_OFF_NOTICE] : []), ...(ATTRIBUTION_OFF ? [ATTRIBUTION_OFF_NOTE] : []), ...localInstructions(true, startNotes)].join(" "),
   },
 );
 
@@ -1252,6 +1279,8 @@ async function drainLoop(): Promise<void> {
     if (boardItems.size > 0) any = true;
     for (const { item, readers: pendingTo } of boardItems.values()) {
       if (shuttingDown) return;
+      // Between the read above and the check below, forced by a test (#1404).
+      await testPauseAsync("drain:before-board-push");
       // Only while every address is still this session's (#1381): a name
       // taken mid-drain is the taker's to push; the fresh drain re-reads.
       if (!pendingTo.every(stillMine)) return lostMidDrain();
@@ -1523,7 +1552,7 @@ if (CLAUDE_CURRENT) {
 const sendTransport = transport.send.bind(transport);
 transport.send = async message => {
   // Keep the SDK's negotiation and capabilities; only initialize's guidance is live.
-  if ("result" in message && "serverInfo" in message.result) message = { ...message, result: { ...message.result, instructions: [...(CHANNELS_OFF_NOTICE ? [CHANNELS_OFF_NOTICE] : []), ...(ATTRIBUTION_OFF ? [ATTRIBUTION_OFF_NOTE] : []), ...localInstructions(true, startNotes)].join(" ") } };
+  if ("result" in message && "serverInfo" in message.result) message = { ...message, result: { ...message.result, instructions: initInstructions() } };
   await sendTransport(message);
   if (claudeReady && !claudeActivationStarted && "result" in message && "tools" in message.result) {
     claudeActivationStarted = true;

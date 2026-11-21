@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { isLoopback, parseOAuthClients, type OAuthClient } from "./oauth-config.ts";
@@ -6,6 +7,7 @@ import { DEFAULT_SERVICE_TOKEN_LIMITS, SERVICE_TOKEN_MIN_SECONDS, type ServiceTo
 
 import type { HumanReach } from "./policy.ts";
 import { DEFAULT_LAG_GATE, LAG_HISTORY, type LagGate } from "./metrics.ts";
+import { DEFAULT_DATABASE_WRITERS } from "./store/queue.ts";
 import { DEFAULT_AUTH_FAIL_LIMIT, DEFAULT_HELLO_LIMIT, DEFAULT_HOSTED_REQUEST_LIMIT, DEFAULT_HOSTED_SUBSCRIBER_LIMIT, type RateLimit } from "./rate_limit.ts";
 import { DEFAULT_TRUSTED_PROXIES, parseCidr } from "./client_addr.ts";
 import { DEFAULT_ATTACHMENT_LIMITS, DEFAULT_ATTACHMENT_USER_QUOTA, type AttachmentLimits } from "../shared/attachments.ts";
@@ -13,6 +15,7 @@ import { DEFAULT_RETENTION_DAYS, parseRetentionDays } from "../core/boards.ts";
 import { DELEGATE_LIMIT, DELEGATE_OPEN_CAP } from "../core/delegation.ts";
 import { ALIAS_SCOPE_CAP } from "./alias_cap.ts";
 import { GOOGLE_ISSUER } from "./idp_google.ts";
+import { describeCredentials, type AwsCredentialSpec } from "./aws_credentials.ts";
 
 export type McpLimits = Record<"listen" | "legacy" | "post", { global: number; perUser: number }>;
 export const DEFAULT_MCP_LIMITS: McpLimits = { listen: { global: 128, perUser: 32 }, legacy: { global: 256, perUser: 32 }, post: { global: 256, perUser: 64 } };
@@ -41,13 +44,22 @@ export type OidcConfig = { issuer: string; clientId: string; clientSecret?: stri
 // the pilot deploys (docs/future/postgres-server.md D8).
 export type Store = { kind: "sqlite"; path: string } | { kind: "postgres"; url: string };
 
+// An S3 attachment store (#1509), in place of a blob directory: GRAYBOARD_BLOB_S3_*. `prefix` is "" or ends in "/".
+export type S3BlobConfig = { bucket: string; region: string; prefix: string; endpoint?: string; credentials: AwsCredentialSpec };
+
 export type Config = {
   store: Store;
-  // Where attachment bytes are kept (src/server/blobs.ts); default blobs/ beside a SQLite database, required with a URL.
-  blobDir: string;
+  // Where attachment bytes are kept: exactly one of a directory (src/server/blobs.ts; default blobs/ beside a SQLite
+  // database, required with a URL unless S3 is set) and an S3 bucket (src/server/s3_blobs.ts, #1509).
+  blobDir?: string;
+  blobS3?: S3BlobConfig;
   // GRAYBOARD_DATABASE_CONNECT_SECONDS (#1418): how long a Postgres store's first connection retries; absent, the
   // default (store/pg/connect.ts).
   databaseConnectSeconds?: number;
+  // GRAYBOARD_DATABASE_WRITERS (#1510): a Postgres store's write pool size and its write scheduler's cap (store/queue.ts):
+  // at most this many keyed write bodies overlap. Absent, DEFAULT_DATABASE_WRITERS. 1 is one write at a time, the
+  // single queue. Ignored by a SQLite store (one connection, one writer).
+  databaseWriters?: number;
   httpPort: number;
   googleClientId: string;
   googleClientSecret: string;
@@ -147,7 +159,7 @@ export function loadConfig(): Config {
   if (devAuth && process.env.GRAYBOARD_OIDC_ISSUER !== undefined)
     throw new Error("GRAYBOARD_DEV_AUTH=1 must not be set alongside GRAYBOARD_OIDC_ISSUER (prevents prod misconfig)");
 
-  const { store, blobDir } = storeConfig(process.env);
+  const { store, blobDir, blobS3 } = storeConfig(process.env);
   const publicUrl = requireEnv("GRAYBOARD_PUBLIC_URL");
 
   // Dev sign-in lets anyone who reaches the server act as anyone (#805 F-04): a
@@ -174,8 +186,9 @@ export function loadConfig(): Config {
 
   return {
     store,
-    blobDir,
+    ...(blobS3 ? { blobS3 } : { blobDir }),
     ...connectSeconds(process.env.GRAYBOARD_DATABASE_CONNECT_SECONDS),
+    ...databaseWriters(process.env.GRAYBOARD_DATABASE_WRITERS),
     httpPort: parsePort(process.env.GRAYBOARD_HTTP_PORT),
     googleClientId,
     googleClientSecret,
@@ -462,24 +475,88 @@ function urlHostname(raw: string): string {
 }
 
 // One of GRAYBOARD_DATABASE_URL and GRAYBOARD_DB_PATH: both set would hide a misconfigured deploy behind a silent
-// precedence. The URL needs an explicit blob directory (no database directory to put it beside).
-function storeConfig(env: Record<string, string | undefined>): { store: Store; blobDir: string } {
+// precedence. The URL needs somewhere to keep attachments: an explicit blob directory (no database directory to put
+// it beside) or an S3 bucket. Either store may keep them in S3 (#1509), and then has no blob directory.
+function storeConfig(env: Record<string, string | undefined>): { store: Store; blobDir?: string; blobS3?: S3BlobConfig } {
   const url = env.GRAYBOARD_DATABASE_URL, path = env.GRAYBOARD_DB_PATH, blobDir = env.GRAYBOARD_BLOB_DIR;
   if (url && path) throw new Error("Set one of GRAYBOARD_DATABASE_URL, GRAYBOARD_DB_PATH, not both");
-  if (path) return { store: { kind: "sqlite", path }, blobDir: blobDir || join(dirname(path), "blobs") };
+  const blobS3 = s3BlobConfig(env);
+  if (blobS3 && blobDir) throw new Error("Set one of GRAYBOARD_BLOB_S3_BUCKET, GRAYBOARD_BLOB_DIR, not both: attachments live in one place");
+  if (path) return blobS3 ? { store: { kind: "sqlite", path }, blobS3 } : { store: { kind: "sqlite", path }, blobDir: blobDir || join(dirname(path), "blobs") };
   if (!url) throw new Error("Required env var GRAYBOARD_DB_PATH (or GRAYBOARD_DATABASE_URL) is not set");
-  if (!blobDir) throw new Error("GRAYBOARD_DATABASE_URL needs GRAYBOARD_BLOB_DIR: there's no database directory to keep attachments beside");
+  if (blobS3) return { store: { kind: "postgres", url }, blobS3 };
+  if (!blobDir) throw new Error("GRAYBOARD_DATABASE_URL needs GRAYBOARD_BLOB_DIR or GRAYBOARD_BLOB_S3_BUCKET: there's no database directory to keep attachments beside");
   return { store: { kind: "postgres", url }, blobDir };
 }
 
-// What the startup line names: the backend and where, never a URL's credentials.
-export function describeStore(store: Store): string {
+const S3_BUCKET_NAME = /^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/;
+const S3_VARS = ["GRAYBOARD_BLOB_S3_REGION", "GRAYBOARD_BLOB_S3_PREFIX", "GRAYBOARD_BLOB_S3_ENDPOINT"] as const;
+
+// GRAYBOARD_BLOB_S3_BUCKET (empty is unset) with its region (else AWS_REGION), optional key prefix and endpoint, and
+// the credentials: the pod's role by web identity (IRSA's AWS_WEB_IDENTITY_TOKEN_FILE and AWS_ROLE_ARN), else static
+// AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY (and AWS_SESSION_TOKEN). Half of either pair is refused, as is no source.
+function s3BlobConfig(env: Record<string, string | undefined>): S3BlobConfig | undefined {
+  const bucket = env.GRAYBOARD_BLOB_S3_BUCKET;
+  if (!bucket) {
+    const stray = S3_VARS.find(v => env[v]);
+    if (stray) throw new Error(`${stray} is set without GRAYBOARD_BLOB_S3_BUCKET`);
+    return undefined;
+  }
+  if (!S3_BUCKET_NAME.test(bucket)) throw new Error(`GRAYBOARD_BLOB_S3_BUCKET must be an S3 bucket name (3-63 lowercase letters, digits, dots and hyphens), not "${bucket}"`);
+  const region = env.GRAYBOARD_BLOB_S3_REGION || env.AWS_REGION;
+  if (!region) throw new Error("GRAYBOARD_BLOB_S3_BUCKET needs a region: set GRAYBOARD_BLOB_S3_REGION (or AWS_REGION)");
+  if (!/^[a-z0-9-]+$/.test(region)) throw new Error(`the S3 region must be an AWS region name like us-east-1, not "${region}"`);
+  let prefix = env.GRAYBOARD_BLOB_S3_PREFIX ?? "";
+  if (prefix.startsWith("/")) throw new Error(`GRAYBOARD_BLOB_S3_PREFIX must not start with "/": S3 keys have no root, not "${prefix}"`);
+  // A dot segment or an empty one would leave the prefix: Bun normalizes a path-style key's "../" into another bucket's.
+  if (!/^[A-Za-z0-9!_.*'()/-]*$/.test(prefix) || prefix.includes("//") || prefix.split("/").some(seg => seg === "." || seg === ".."))
+    throw new Error(`GRAYBOARD_BLOB_S3_PREFIX must be "/"-separated segments of letters, digits and !_.*'()-, without "." or ".." segments, not "${prefix}"`);
+  if (prefix && !prefix.endsWith("/")) prefix += "/";
+  const endpoint = env.GRAYBOARD_BLOB_S3_ENDPOINT || undefined;
+  if (endpoint) {
+    let u: URL | undefined;
+    try { u = new URL(endpoint); } catch { /* refused below */ }
+    if (!u || (u.protocol !== "https:" && u.protocol !== "http:")) throw new Error(`GRAYBOARD_BLOB_S3_ENDPOINT must be an http(s) URL, not "${endpoint}"`);
+    // The endpoint is printed at startup; credentials go in AWS_* variables, never in it.
+    if (u.username || u.password) throw new Error("GRAYBOARD_BLOB_S3_ENDPOINT must not carry credentials (user:password@): use AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY");
+  }
+  // Bun's S3 client signs with S3_SESSION_TOKEN when it's handed no session token (static keys without one), and reads
+  // it from the environment as the process started: unsetting it at runtime doesn't help.
+  if (env.S3_SESSION_TOKEN) throw new Error("S3_SESSION_TOKEN is set: Bun's S3 client would sign attachment requests with it; unset it (the S3 attachment store reads AWS_SESSION_TOKEN)");
+  return { bucket, region, prefix, ...(endpoint ? { endpoint } : {}), credentials: awsCredentialSpec(env, region) };
+}
+
+function awsCredentialSpec(env: Record<string, string | undefined>, region: string): AwsCredentialSpec {
+  const tokenFile = env.AWS_WEB_IDENTITY_TOKEN_FILE, roleArn = env.AWS_ROLE_ARN;
+  if (tokenFile || roleArn) {
+    if (!tokenFile || !roleArn) throw new Error("set both AWS_WEB_IDENTITY_TOKEN_FILE and AWS_ROLE_ARN for the S3 attachment store's web identity, or neither");
+    // The regional STS endpoint, in the pod's region (AWS_REGION, which EKS injects) or else the bucket's.
+    const stsEndpoint = env.AWS_ENDPOINT_URL_STS || `https://sts.${env.AWS_REGION || region}.amazonaws.com/`;
+    return { kind: "web-identity", tokenFile, roleArn, stsEndpoint, sessionName: env.AWS_ROLE_SESSION_NAME || `grayboard-${randomBytes(6).toString("hex")}` };
+  }
+  const accessKeyId = env.AWS_ACCESS_KEY_ID, secretAccessKey = env.AWS_SECRET_ACCESS_KEY;
+  if (accessKeyId && secretAccessKey) return { kind: "static", accessKeyId, secretAccessKey, ...(env.AWS_SESSION_TOKEN ? { sessionToken: env.AWS_SESSION_TOKEN } : {}) };
+  if (accessKeyId || secretAccessKey) throw new Error("set both AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY for the S3 attachment store, or neither");
+  throw new Error("GRAYBOARD_BLOB_S3_BUCKET needs AWS credentials: AWS_WEB_IDENTITY_TOKEN_FILE and AWS_ROLE_ARN (an IAM role for the pod's service account), or AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY");
+}
+
+// What the startup line says about attachments: where they live and, for S3, the credential source, never a key.
+export function describeBlobs(config: Pick<Config, "blobDir" | "blobS3">): string {
+  const s3 = config.blobS3;
+  if (!s3) return `directory ${config.blobDir}`;
+  return `s3://${s3.bucket}/${s3.prefix} (${s3.region}${s3.endpoint ? `, endpoint ${s3.endpoint}` : ""}; ${describeCredentials(s3.credentials)})`;
+}
+
+// What the startup line names: the backend and where, never a URL's credentials. Given `writers` (the config's
+// databaseWriters), a Postgres store's line says how many write connections it opens, so a run's W is on record.
+export function describeStore(store: Store, opts?: { writers: number | undefined }): string {
   if (store.kind === "sqlite") return `sqlite ${store.path}`;
+  const writers = opts ? `, ${opts.writers ?? DEFAULT_DATABASE_WRITERS} writers` : "";
   try {
     const u = new URL(store.url);
-    return `postgres ${u.host}${u.pathname}`;
+    return `postgres ${u.host}${u.pathname}${writers}`;
   } catch {
-    return "postgres (unparsable URL)";
+    return `postgres (unparsable URL)${writers}`;
   }
 }
 
@@ -518,6 +595,16 @@ function connectSeconds(raw: string | undefined): { databaseConnectSeconds?: num
     throw new Error(`GRAYBOARD_DATABASE_CONNECT_SECONDS must be a whole number of seconds from 0 (one try) to 3600, not "${raw}"`);
   }
   return { databaseConnectSeconds: Number(raw) };
+}
+
+// Defined beside the scheduler it caps (store/queue.ts), so the Postgres store defaults to it without importing config.
+export { DEFAULT_DATABASE_WRITERS };
+function databaseWriters(raw: string | undefined): { databaseWriters?: number } {
+  if (raw === undefined || raw === "") return {};
+  if (!/^[1-9][0-9]*$/.test(raw) || Number(raw) > 64) {
+    throw new Error(`GRAYBOARD_DATABASE_WRITERS must be a whole number of connections from 1 to 64, not "${raw}"`);
+  }
+  return { databaseWriters: Number(raw) };
 }
 
 function idleDays(raw: string | undefined): number {

@@ -43,8 +43,8 @@ const grant = async (principal: string) => {
 const revoke = async (principal: string) => expect((await api(root, "POST", "/api/admin/roles/revoke", { role: "service_invoke", principal, scope: SVC })).status).toBe(200);
 
 // A run token for the service, minted as a launcher does (client credentials).
-async function runToken(): Promise<string> {
-  const c = await api(root, "POST", "/api/admin/services/credentials", { service: SVC });
+async function runToken(service = SVC): Promise<string> {
+  const c = await api(root, "POST", "/api/admin/services/credentials", { service });
   expect(c.status, JSON.stringify(c.body)).toBe(201);
   const r = await fetch(`${srv.base}/oauth/token`, {
     method: "POST",
@@ -212,6 +212,32 @@ describe("Tests item 4: the pilot gate", () => {
       expect((await invokes()).at(-1)).toMatchObject({ detail: { allow: false, rule: "role.service_invoke" } });
     }
     expect(await row(srv, "SELECT count(*) AS n FROM posts WHERE board = 'jobs'")).toEqual({ n: 0 });
+  });
+
+  // service.own is the service's own board alone (#1402): another service, holding no binding, is refused it as a
+  // missing board, the same as a user is; its own board's post is still service.own.
+  test("another service is refused the service's board as a missing one; its own board stays service.own", async () => {
+    await cast();
+    expect((await api(root, "POST", "/api/admin/services", { name: "other", owners: [A] })).status).toBe(201);
+    const o = new HostedSession(`${srv.base}/mcp`, await runToken("other"), "w-1", { receipt: "manual" });
+    sessions.push(o);
+    await o.connect();
+    await o.call("board_create", { name: "other-jobs", purpose: "other's work", kind: "queue" });
+    expect(await scopeOf("other-jobs")).toBe("service:other");
+    const missing = await refusal(post(o, "no-such-thing", "x"));
+    const before = (await invokes()).length;
+    const e = await refusal(post(o, "jobs", "let me in"));
+    expect(unnamed(e, "jobs")).toBe(unnamed(missing, "no-such-thing"));
+    expect(e.code).toBe(missing.code);
+    expect((await invokes()).slice(before)).toEqual([expect.objectContaining({ actor: "other", target: `service:${SVC}`, detail: expect.objectContaining({
+      address: "other/w-1", allow: false, rule: "role.service_invoke", code: "not_found", principal: "other", board: "jobs",
+    }) })]);
+    expect(unnamed(await refusal(o.call("board_read", { board: "jobs" })), "jobs")).toBe(await missingBoardRefusal(o, "board_read"));
+    const listed = await o.call<{ name: string }[] | { boards: { name: string }[] }>("board_list", {});
+    expect((Array.isArray(listed) ? listed : listed.boards).map(b => b.name)).not.toContain("jobs");
+    expect(await row(srv, "SELECT count(*) AS n FROM posts WHERE board = 'jobs'")).toEqual({ n: 0 });
+    await post(o, "other-jobs", "mine");
+    expect((await invokes()).at(-1)).toMatchObject({ actor: "other", detail: { address: "other/w-1", allow: true, rule: "service.own", board: "other-jobs" } });
   });
 
   test("a holder's push subscription is never a lane: not in rotation, not on a decline, not by an @mention", async () => {

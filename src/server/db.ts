@@ -26,8 +26,8 @@ import { afterCommit, type Boundary, onCommit, openBoundary, openReader, openSql
 import type { WriteTx } from "../core/write_tx.ts";
 import { isTx, type Read, type Tx, sqliteOf, sqliteRead, sqliteTx } from "./store/tx.ts";
 import { DEFAULT_ATTACHMENT_LIMITS, DEFAULT_ATTACHMENT_USER_QUOTA, type AttachmentLimits } from "../shared/attachments.ts";
-import { DiskBlobs } from "./blobs.ts";
-import { detached, inRequest, requestOrigin } from "./request_context.ts";
+import { blobStore } from "./blobs.ts";
+import { requestOrigin } from "./request_context.ts";
 import { GOOGLE_ISSUER } from "./idp_google.ts";
 import { LOGIN_SCOPE, OAUTH_SCOPES } from "./oauth-config.ts";
 import type { CredentialSource, ServiceCredential, OAuthStore, OAuthAuthorization, OAuthRequest, OAuthBrowserSession, OAuthCode, OAuthGrant, OAuthTokenPair, OAuthAccess, OAuthFailure } from "./oauth-types.ts";
@@ -100,6 +100,9 @@ export type RepoHosted = HostedStore & {
   // after the commit, before the queue's next body. fn may be async: `committed` gets its resolved value.
   write<T, R = T>(fn: (tx: Tx) => Promise<T>, committed?: (value: T) => R): Promise<Awaited<R>>;
   write<T, R = T>(fn: (tx: Tx) => Sync<T>, committed?: (value: T) => R): Promise<Awaited<R>>;
+  // Repo.writeKeyed, on the hosted store's scheduler (the Repo's).
+  writeKeyed<T, R = T>(keys: readonly string[], fn: (tx: Tx) => Promise<T>, committed?: (value: T) => R): Promise<Awaited<R>>;
+  writeKeyed<T, R = T>(keys: readonly string[], fn: (tx: Tx) => Sync<T>, committed?: (value: T) => R): Promise<Awaited<R>>;
   // Told after each commit that changed a row (#399): its session ID, or null when any row may have (a grant or
   // user change). A touch (`touch`) tells nothing: nothing that observes rows reads `last_seen_at`.
   // With `read`, a named row's notice carries `read`'s answer on the committing transaction, just before its COMMIT
@@ -117,17 +120,15 @@ export type { AuthPeek };
 // read committed state on the reader and their writes wait in the queue (core/sqlite.ts ownWriter).
 // fn gets the transaction's Tx (#807 P1c), closed when fn settles: a timer or un-awaited promise fn started that uses it
 // later throws instead of writing into whichever transaction is open by then.
-// fn and committed run as the work of the request that called write(), or of none (#1042): a body that waited starts
-// from the releasing holder's context, whose request origin its audit rows would otherwise carry (F-19). Only the
-// origin is set: binding the whole context (AsyncResource.bind) would also restore the queue's holder token.
+// fn and committed run as the work of the request that called write(), or of none (#1042, #1408): the queue starts a
+// body that waited in its enqueuer's async context (queue.ts), so its audit rows carry that request's origin (F-19).
 // `thrown` sees a failure the body throws synchronously (BEGIN, fn, COMMIT, committed), before the promise rejects
 // with it: posted's idle queue throws it to its caller.
 function queued<T, R>(db: Database, fn: (tx: Tx) => T | PromiseLike<T>, committed?: (value: T) => R, thrown?: (error: unknown) => void): Promise<Awaited<R>> {
   const queue = queueFor(db);
   if (queue.mine && db.inTransaction) return Promise.reject(new Error("write() inside an open transaction: nested code calls its Tx's savepoint"));
-  const o = requestOrigin();
   const run = () => {
-    try { return o ? inRequest(o, body) : detached(body); } catch (error) { thrown?.(error); throw error; }
+    try { return body(); } catch (error) { thrown?.(error); throw error; }
   };
   return queue.run(run).then(box => box.out) as Promise<Awaited<R>>;
   function body(): { out: R } | Promise<{ out: R }> {
@@ -144,6 +145,15 @@ function queued<T, R>(db: Database, fn: (tx: Tx) => T | PromiseLike<T>, committe
     // un-awaited write's caller resumes after it committed, not inside it.
     return Promise.resolve(out).then(value => tx.hasBeforeCommit ? tx.runBeforeCommit().then(() => settle(value), fail) : settle(value), fail);
   }
+}
+
+// Repo.writeKeyed on SQLite: write, once the keys pass the check Postgres's scheduler makes (store/queue.ts runKeyed),
+// so a caller's bad key fails on both stores.
+const BAD_KEYS = "runKeyed needs at least one key, each a non-empty string";
+const badKeys = (keys: readonly string[]) => !Array.isArray(keys) || keys.length === 0 || keys.some(k => typeof k !== "string" || k === "");
+function keyedOnSqlite<T, R>(db: Database, keys: readonly string[], fn: (tx: Tx) => T | PromiseLike<T>, committed?: (value: T) => R): Promise<Awaited<R>> {
+  if (badKeys(keys)) return Promise.reject(new Error(BAD_KEYS));
+  return queued(db, fn, committed);
 }
 
 // fn's synchronous transaction body with its own Tx, closed when it returns or throws. Its savepoint refuses: a
@@ -211,11 +221,31 @@ export interface Repo {
   // fn gets the transaction's Tx (#807 P1c), live until fn settles; a store function it calls writes through it.
   write<T, R = T>(fn: (tx: Tx) => Promise<T>, committed?: (value: T) => R): Promise<Awaited<R>>;
   write<T, R = T>(fn: (tx: Tx) => Sync<T>, committed?: (value: T) => R): Promise<Awaited<R>>;
+  // write, keyed (#1510, store/queue.ts runKeyed): on Postgres the body overlaps running keyed bodies that share none of
+  // `keys` (`root:<session id>` by convention), each on its own connection, up to the write pool's size; exclusive bodies
+  // still run alone. On SQLite it is write: one connection runs one body at a time. Only a body audited for overlap
+  // (docs/future/postgres-server.md D4) calls it: a keyed body must not depend on another's in-memory state or commit
+  // order.
+  writeKeyed<T, R = T>(keys: readonly string[], fn: (tx: Tx) => Promise<T>, committed?: (value: T) => R): Promise<Awaited<R>>;
+  writeKeyed<T, R = T>(keys: readonly string[], fn: (tx: Tx) => Sync<T>, committed?: (value: T) => R): Promise<Awaited<R>>;
   // A write no caller awaits, for code that can't (posted, above): true when it ran now, false when it waits behind
   // another body or awaits (always, on Postgres), its failure then logged as `what` failed. It refuses inside an open transaction (a body's
   // write goes on its Tx). A promise `committed` returns is caught and its rejection logged as `what` failed on every
   // branch (#1051). fn may be async (#807 P3 A3), except from the queue's holder; its Tx is live until fn settles.
   post<T>(fn: (tx: Tx) => T | Promise<T>, committed?: (value: T) => unknown, what?: string): boolean;
+  // post, keyed (#1510): on Postgres the body runs as writeKeyed's does, overlapping keyed bodies that share none of
+  // `keys`; on SQLite it is post, run-now branch and all. For a write that reads no in-memory state and writes rows no
+  // other body orders by (a posted audit row, audit.ts writeAudit).
+  postKeyed<T>(keys: readonly string[], fn: (tx: Tx) => T | Promise<T>, committed?: (value: T) => unknown, what?: string): boolean;
+  // Runs fn in a read-only probe of `tx`'s transaction (#1510, docs/future/postgres-server.md D4): a statement fn sends
+  // on it that would write refuses ProbeWrite (store/tx_base.ts) before it's sent, and the probe rejects with it even if
+  // fn swallowed it. Postgres only (store/pg/tx.ts readsOnly): absent on SQLite, whose one writer has nothing to gain
+  // from a keyed body, so the hosted gate's keyed fast path is Postgres's.
+  readsOnly?<T>(tx: Tx, fn: () => Promise<T>): Promise<T>;
+  // writeKeyed whose body may register afterCommit effects and pass `committed`, and queue the change notices of the ops
+  // `notices` names (store/notices.ts, by op name: `hosted.update`); every other notice still refuses (D4, #1510 chunk
+  // 4). Postgres only, for the reviewed callers D4 lists (delivery's renew and receipt); absent on SQLite.
+  writeKeyedEffects?<T, R = T>(keys: readonly string[], notices: readonly string[], fn: (tx: Tx) => Promise<T>, committed?: (value: T) => R): Promise<Awaited<R>>;
   // The store's read handle outside any transaction (#807 P1c): reads committed state. The task holding an open
   // transaction can't use it (sqliteOf refuses, #807 P3 A7e2): it passes its body's Tx. A Postgres Read is a pool
   // handle and must never resolve to a transaction's connection.
@@ -296,7 +326,8 @@ export interface Repo {
 // `now` is the hub's clock (application.ts): rows, audit and write receipts read one clock, so a test clock moves them together (#297).
 // `sessionEnd`: the session end a released hosted child's ID ends through (session_end.ts sessionEndPort), made from
 // the Repo on first use; a child end without it throws.
-export type OpenOptions = { blobDir: string; attachmentLimits?: AttachmentLimits; attachmentUserQuota?: number; now?: () => number; sessionEnd?: (repo: Repo) => SessionEndPort };
+// The attachment bytes' store: `blobs` when given (an S3 store, #1509), else a directory store at `blobDir`.
+export type OpenOptions = { blobDir?: string; blobs?: BlobStore; attachmentLimits?: AttachmentLimits; attachmentUserQuota?: number; now?: () => number; sessionEnd?: (repo: Repo) => SessionEndPort };
 
 // undeliveredFrom: messages a sender has sent that the recipient's read point
 // hasn't reached. The read point is the last delivered-and-handled message id
@@ -363,7 +394,7 @@ export function openDatabase(path: string, opts: OpenOptions): { db: Database; r
   ownWriter(db, { holds: () => queue.mine, check: () => queue.assertMine() });
   let port: SessionEndPort | undefined;
   const sessionEnd = () => port ??= opts.sessionEnd?.(repo) ?? (() => { throw new Error("no session-end port: pass OpenOptions.sessionEnd to end a hosted child"); })();
-  const repo = makeRepo(db, new DiskBlobs(opts.blobDir), opts.attachmentLimits ?? DEFAULT_ATTACHMENT_LIMITS, opts.attachmentUserQuota ?? DEFAULT_ATTACHMENT_USER_QUOTA, sessionEnd, opts.now);
+  const repo = makeRepo(db, blobStore(opts), opts.attachmentLimits ?? DEFAULT_ATTACHMENT_LIMITS, opts.attachmentUserQuota ?? DEFAULT_ATTACHMENT_USER_QUOTA, sessionEnd, opts.now);
   return { db, repo };
 }
 
@@ -411,11 +442,47 @@ function migrateHostedHolds(db: Database): void {
 // outlives the child's source row. A child registered before the column, or by
 // an older release sharing the file, gets it from its live source row here.
 // Runs after initCoreSchema, which adds ids.root_id.
+//
+// #540 2: a child that ended before then has no source row; its
+// hosted.child_registered audit rows (target: the root, detail.child: the
+// child) name its root. Each child takes its latest registration's, unless its
+// ID started as a root since (an ownership of its own begun after that
+// registration, when hostedRoot cleared root_id on purpose), and unless it has
+// a live hosted row (a live child got its root above; a live root has none,
+// whatever a stepped-back clock says of its ownership's start). The audit rows
+// are read once each: server_state's CHILD_ROOTS_AUDIT_KEY holds the last
+// access_log id read, so an open reads only rows written since the last one
+// (normally none: a registration by this code already set root_id), and never
+// refills a root_id a later role change cleared.
+const CHILD_ROOTS_AUDIT_KEY = "child_roots_audit_id";
 function recordChildRoots(db: Database): void {
   db.exec(`
     UPDATE ids SET root_id = (SELECT h.root_session_id FROM hosted_sessions h WHERE h.session_id = ids.id)
       WHERE root_id IS NULL AND id IN (SELECT session_id FROM hosted_sessions WHERE root_session_id IS NOT NULL);
   `);
+  const from = db.query<{ value: number }, [string]>(`SELECT value FROM server_state WHERE key = ?`).get(CHILD_ROOTS_AUDIT_KEY)?.value ?? 0;
+  const to = db.query<{ id: number | null }, []>(`SELECT MAX(id) AS id FROM access_log`).get()?.id ?? 0;
+  if (to <= from) return;
+  // `+action` keeps the action index out of both statements: the rowid range drives them, so an open reads only the
+  // rows written since the last one, not every retained registration. A window with none writes only the watermark.
+  const any = db.query(`SELECT 1 FROM access_log WHERE id > ?1 AND id <= ?2 AND +action = 'hosted.child_registered' LIMIT 1`).get(from, to);
+  if (any) {
+    // Materialized, so each statement below reads the window's rows once (inlined, the latest-per-child pick and the
+    // ownership probe were correlated rescans of it): latest is each child's last registration in the window, reborn
+    // the children whose ID began an ownership of its own after it.
+    db.run(`
+      WITH latest AS MATERIALIZED (
+             SELECT child, root, at FROM (
+               SELECT json_extract(detail, '$.child') AS child, target AS root, at,
+                      ROW_NUMBER() OVER (PARTITION BY json_extract(detail, '$.child') ORDER BY id DESC) AS n
+                 FROM access_log WHERE id > ?1 AND id <= ?2 AND +action = 'hosted.child_registered' AND target IS NOT NULL AND json_valid(detail))
+              WHERE n = 1 AND child IS NOT NULL),
+           reborn AS MATERIALIZED (SELECT DISTINCT l.child FROM latest l JOIN hosted_ownerships o ON o.session_id = l.child AND o.started_at > l.at)
+      UPDATE ids SET root_id = l.root FROM latest l
+        WHERE l.child = ids.id AND ids.root_id IS NULL AND l.child NOT IN (SELECT child FROM reborn)
+          AND ids.id NOT IN (SELECT session_id FROM hosted_sessions)`, [from, to]);
+  }
+  db.run(`INSERT INTO server_state (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`, [CHILD_ROOTS_AUDIT_KEY, to]);
 }
 
 // #521 5: a server sets ids.launcher only for a live hosted root's ownership (hostedDeclareLauncher), and that
@@ -1019,7 +1086,12 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
   return {
     now: clock,
     write: <T, R = T>(fn: (tx: Tx) => T | Promise<T>, committed?: (value: T) => R) => queued(db, fn, committed),
+    writeKeyed: <T, R = T>(keys: readonly string[], fn: (tx: Tx) => T | Promise<T>, committed?: (value: T) => R) => keyedOnSqlite(db, keys, fn, committed),
     post: <T>(fn: (tx: Tx) => T | Promise<T>, committed?: (value: T) => unknown, what = "write") => posted(db, fn, committed, what),
+    postKeyed: <T>(keys: readonly string[], fn: (tx: Tx) => T | Promise<T>, committed?: (value: T) => unknown, what = "write") => {
+      if (badKeys(keys)) throw new Error(BAD_KEYS);
+      return posted(db, fn, committed, what);
+    },
     read: sqliteRead(db),
     authRead: auth.authRead,
     authPeek: auth.authPeek,
@@ -1280,7 +1352,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
     },
 
     claims: {
-      list: async (r, prefix) => listClaims(sqliteOf(r), prefix),
+      list: async (r, prefix) => listClaims(sqliteOf(r), prefix, undefined, undefined, clock()),
       nextExpiry: async (r) => sqliteOf(r).query<{ next: number | null }, []>(`SELECT MIN(expires_at) AS next FROM claims WHERE board IS NOT NULL`).get()!.next,
       get: async (r, key) => claimRow(sqliteOf(r), key),
       take: async (tx, t) => takeClaim(sqliteOf(tx), t),
@@ -1322,7 +1394,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       snapshotPage: async (r, board, opts) => snapshotPage(sqliteOf(r), board, opts),
       pendingPushes: async (r, handle) => pendingPushes(sqliteOf(r), handle),
       pendingDigests: async (r, handle) => pendingDigests(sqliteOf(r), handle),
-      acknowledge: async (tx, handle, ref) => acknowledge(sqliteOf(tx), handle, ref),
+      acknowledge: async (tx, handle, ref, receiver) => acknowledge(sqliteOf(tx), handle, ref, receiver),
       ensure: async (tx, name, purpose, scope, createdBy) => ensureBoard(sqliteOf(tx), name, purpose, scope, createdBy),
       isSubscribed: async (r, handle, board) => isSubscribed(sqliteOf(r), handle, board),
       setSubscription: async (tx, handle, board, mode) => setSubscription(sqliteOf(tx), handle, board, mode),
@@ -1334,7 +1406,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       roster: async (r, board) => whoRows(sqliteOf(r), board),
       create: async (tx, b) => insertBoard(sqliteOf(tx), b),
       setArchived: async (tx, name, by, now) => setArchived(sqliteOf(tx), name, by, now),
-      read: async (tx, board, handle, opts) => readRows(sqliteOf(tx), board, handle, opts),
+      read: async (tx, board, handle, opts, receiver) => readRows(sqliteOf(tx), board, handle, opts, receiver),
       threadRoot: async (r, postId) => threadRoot(sqliteOf(r), postId),
       mute: async (tx, handle, root, muted) => setMute(sqliteOf(tx), handle, root, muted),
       insertPost: async (tx, p) => {
@@ -2420,6 +2492,7 @@ function makeHostedStore(db: Database, port: () => SessionEndPort): HostedStoreO
   const store: HostedStoreOf = {
     ends,
     write: (fn, committed) => queued(db, fn, committed),
+    writeKeyed: (keys, fn, committed) => keyedOnSqlite(db, keys, fn, committed),
     subscribe: () => () => {},
     get: async (r, id) => hostedRow(sqliteOf(r), id),
     // The single writer serializes every body, so the three lock seams lock nothing here (#807 P3 C8 decision 1): `lock`

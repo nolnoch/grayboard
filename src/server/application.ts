@@ -8,7 +8,7 @@ import type { BindRequest, DelegateRequest, DelegateResult, ErrorCode, Replayed,
 import { DEFAULT_HOSTED_CAPS, DEFAULT_SERVICE_LIMITS, type ServiceLimits } from "./config.ts";
 import { DEFAULT_HELLO_LIMIT, DEFAULT_HOSTED_REQUEST_LIMIT, DEFAULT_HOSTED_SUBSCRIBER_LIMIT, RateLimiter, retrySecs, type RateLimit, type Take } from "./rate_limit.ts";
 import { dedupWrite, type DedupOutcome, type DedupTool, type Written } from "./write_dedup.ts";
-import { testPause, testPauseAsync } from "../shared/testpause.ts";
+import { testPause, testPauseAsync, testPaused } from "../shared/testpause.ts";
 import { ALIAS_SCOPE_CAP, aliasCapRefusal } from "./alias_cap.ts";
 import { lockedUserOf } from "./alias_use.ts";
 import { DELEGATE_LIMIT, DELEGATE_OPEN_CAP, crossUserRefusal, delegateOkFields, delegateThrottled, neverConnected, resolveDelegationWith, type DelegateReach } from "../core/delegation.ts";
@@ -20,6 +20,7 @@ import {
 import { participant, type MessageRow, type Repo } from "./db.ts";
 import { sweepStoredBlobs } from "./attachments.ts";
 import { afterCommitOf, isTx, type Read, type Tx } from "./store/tx.ts";
+import { atSite } from "./store/queue.ts";
 import { MissingParent } from "./store/errors.ts";
 import { HUMAN_NAME, HUMAN_RESERVED, formatTeamAddress } from "../shared/addressing.ts";
 import { describeLocation } from "../shared/identity.ts";
@@ -28,7 +29,7 @@ import { writeAudit } from "./audit.ts";
 import { endSessionServer } from "./session_end.ts";
 import { principalOfAuthed, type AuthedUser } from "./auth.ts";
 import {
-  age, checkBody, parseAliasMeta, pendingKey, refOf,
+  age, checkBody, parseAliasMeta, pendingKey, postPreChecks, refOf,
   cleanFact, idCollisionText, normalizeBoard, getBoard,
   type AliasMetaSet, type Board, type CoreDb, type PendingRef, type ReadResult, type SnapshotOptions, type UnboundPeer,
 } from "../core/boards.ts";
@@ -111,6 +112,10 @@ export type ApplicationOptions = {
   // The hub's clock: the rate limiters' and the write-dedup window's
   // (src/server/write_dedup.ts). Tests move it instead of sleeping.
   now?: () => number;
+  // Runs work a commit or a background pass starts and nobody awaits (a wake's drains, a board change's fan-out, the
+  // blob sweep after ends), so a server's stop() can wait for it or, once stopping, skip it (#1493). `run` never
+  // rejects (it logs its own failure); `stopped` says the stop has begun. Absent, it runs at once, untracked.
+  runBackground?: (what: string, run: (stopped: () => boolean) => Promise<unknown>) => void;
 };
 // What a session's user facts are: the bridge's human attach answers them.
 export type HelloResult = { id: string } & SessionFacts;
@@ -134,6 +139,10 @@ export class ApplicationSession {
   // Set while a replay's direct-message drain is in flight (drainDirect): live DMs held for it, the ids its drains
   // sent, how many are running, and the chain that runs them one at a time.
   draining: { held: MessageRow[]; sent: Set<number>; runs: number; chain: Promise<void> } | null = null;
+  // Gates raised by a push session's registering commit (a bind or the Slack bridge's attach whose caller said it
+  // replays, #1090): each counts as a run in `draining` until a replay's direct drain is done. A replay settles one
+  // whichever commit raised it; a replay no commit owed would settle another's early, so callers pair them.
+  owedDrains = 0;
   // Set while a board drain runs (drainBoards, #807 P3 B5a1): a wake meanwhile asks for one more run (`all` when any
   // asks for it), and a receipt committed meanwhile names what the running drain read before it and mustn't resend.
   boardDrain: { rerun: boolean; all: boolean; acked: Set<string>; done: Promise<void> } | null = null;
@@ -150,6 +159,8 @@ export class ApplicationSession {
   // The ID its writes carry as provenance; unset for a writer with no
   // session (the bridge's humans, a hosted request with no context).
   writerId?: string;
+  // A hosted session's root ID: its own for a root. Keys its keyed writes (`root:<id>`, #1510).
+  hostedRoot = "";
   // A hosted child's own ID (#523): it acts under its root's addresses, and
   // its writes store this as `via` so readers see which subagent wrote them.
   // The root's read state isn't its: its board_read peeks, and dm_inbox and
@@ -236,21 +247,46 @@ type Hub = {
   delegateOpenCap: number;
   aliasScopeCap: number;
   now: () => number;
-  // `on`: when its effect runs (`onCommit(handle)`: after that handle's commit, or now for `repo.read`).
+  // `on`: when its effect runs: a request's `trackedCommit(hub, handle, what)` (after that handle's commit, or now for
+  // `repo.read`), or a background pass's `backgroundCommit(what)` (now).
   boardChanged: (on: Commit, board: string) => void;
+  // ApplicationOptions.runBackground, or a stand-in that runs the work at once, untracked.
+  background: Background;
 };
 
+type Background = (what: string, run: (stopped: () => boolean) => Promise<unknown>) => void;
 // Schedules an effect after the commit of the transaction a handle names, or now for a `Read` (#807 P1c-15a).
 type Commit = (effect: () => void | Promise<void>) => void;
-const onCommit = (h: Read): Commit => (effect) => afterCommitOf(h, effect);
+// An effect run now as background work `what` (#1493): its synchronous part runs in this turn, as flushEffect's
+// does, and the promise `background` tracks settles once its asynchronous part has. Each failure is logged; a test
+// holds it once the effect is done at "background:<what>".
+function runEffect(background: Background, what: string, effect: () => void | Promise<void>): void {
+  background(what, () => {
+    let done: Promise<unknown>;
+    try { done = Promise.resolve(effect()).catch((error) => console.error("postcommit effect failed", error)); }
+    catch (error) { console.error("postcommit effect failed", error); done = Promise.resolve(); }
+    return done.then(() => testPauseAsync(`background:${what}`)).catch((error) => console.error(`[grayboard] ${what} failed:`, error));
+  });
+}
+// A Commit whose effect runs after `h`'s commit (now, for a `Read`) as background work `what`: a server's stop()
+// waits for it, and once stopping skips it (#1496), as it does a pass's. Not stopping, it starts at the commit as an
+// untracked effect would, and the request doesn't await it.
+const trackedCommit = (hub: Hub, h: Read, what: string): Commit => (effect) => afterCommitOf(h, () => runEffect(hub.background, what, effect));
 
 // A push its reader can no longer see, acknowledged as pendingOf finds it, on `h`: inside a body (a delivery
 // receipt's `pending`) on its `Tx`, awaited; outside one (a drain, a lease's pull) queued on the write queue and not
 // awaited (#807 D4; never `repo.post`, which refuses an async body, B5a1 H2).
-const lostAck = (hub: Hub, h: Read, handle: string) => async (ref: PendingRef): Promise<void> => {
-  if (isTx(h)) return hub.repo.boards.acknowledge(h, handle, ref);
-  void hub.repo.write((tx: Tx) => hub.repo.boards.acknowledge(tx, handle, ref)).catch((error) => console.error("lost-visibility push ack failed", error));
+const lostAck = (hub: Hub, h: Read, handle: string, receiver: string | undefined) => async (ref: PendingRef): Promise<void> => {
+  if (isTx(h)) return hub.repo.boards.acknowledge(h, handle, ref, receiver);
+  void hub.repo.write((tx: Tx) => hub.repo.boards.acknowledge(tx, handle, ref, receiver)).catch((error) => console.error("lost-visibility push ack failed", error));
 };
+
+// The session a receipt or read by `s` credits, and must still hold the address it marks (#1466): the one whose ID
+// ends its addresses and whose holds the rest are (a hosted child's root). Its in-memory addresses can trail a hold
+// that moved in a transaction committed first; the store judges the hold with the mark. None for a session whose
+// addresses aren't holds (a tools-only session's writes_as, the Slack bridge's humans): the address's holder is credited.
+const receiverOf = (s: ApplicationSession): string | undefined =>
+  s.human || s.toolsOnly || !s.sessionId ? undefined : s.addresses[s.addresses.length - 1];
 
 // A pending item's identity down to the post a digest names: a receipt for it means the drain that read it must not
 // send it again; a newer digest of the same board is another item.
@@ -297,7 +333,8 @@ function drainBoards(session: ApplicationSession, hub: Hub, all = false): Promis
 
 async function drainBoardsOnce(session: ApplicationSession, hub: Hub, all: boolean, acked: Set<string>): Promise<void> {
   for (const address of [...session.addresses]) {
-    const items = await pendingOf(hub.repo, hub.access, hub.repo.read, address, all, lostAck(hub, hub.repo.read, address));
+    if (testPaused("server:drain-boards:before-read")) await testPauseAsync("server:drain-boards:before-read");
+    const items = await pendingOf(hub.repo, hub.access, hub.repo.read, address, all, lostAck(hub, hub.repo.read, address, receiverOf(session)));
     // Closed while the read awaited: nothing more to send. Unbound from this address: the holds change dropped its
     // in-flight items.
     if (!session.active) return;
@@ -349,25 +386,50 @@ async function drainDirect(hub: Hub, session: ApplicationSession, addresses: str
   try {
     await run;
   } finally {
-    if (--d.runs === 0) {
-      session.draining = null;
-      // Each on its own, as drainBoards delivers: one that throws leaves the rest delivered (it stays unacked).
-      for (const m of d.held.sort((a, b) => a.id - b.id)) {
-        if (d.sent.has(m.id)) continue;
-        try { deliverDirect(session, m); }
-        catch (error) { console.error("held direct delivery failed", error); }
-      }
-    }
+    endDrainRun(session, d);
   }
+}
+
+// One run of the session's gate is done; the last delivers what waited, in id order, less what a drain already sent.
+function endDrainRun(session: ApplicationSession, d: NonNullable<ApplicationSession["draining"]>): void {
+  if (--d.runs !== 0) return;
+  session.draining = null;
+  // Each on its own, as drainBoards delivers: one that throws leaves the rest delivered (it stays unacked).
+  for (const m of d.held.sort((a, b) => a.id - b.id)) {
+    if (d.sent.has(m.id)) continue;
+    try { deliverDirect(session, m); }
+    catch (error) { console.error("held direct delivery failed", error); }
+  }
+}
+
+// A push session became deliverable at a commit whose caller replays next (#1090): the gate goes up now, in the
+// commit's effects. On SQLite those run before the queue's next body, so no send commits in between; otherwise one
+// committed before the replay is pushed live and then read again by its drain (the cursor hasn't moved): m3, m1, m2,
+// m3. On Postgres a bind registers the session in its body, so a concurrent commit can still land before the gate:
+// #1090 part 2.
+function owe(session: ApplicationSession): void {
+  if (!session.push) return;
+  session.owedDrains++;
+  (session.draining ??= { held: [], sent: new Set(), runs: 0, chain: Promise.resolve() }).runs++;
+}
+
+// The replay's part of the gate: released once its drain is done, or at once when it drains nothing.
+function settleOwed(session: ApplicationSession): void {
+  if (session.owedDrains === 0 || !session.draining) return;
+  session.owedDrains--;
+  endDrainRun(session, session.draining);
 }
 
 // A human's session has no wakes to save: it gets deferred pushes and
 // digests at once.
+// The effect's promise settles once the drains have (a Commit run in the background tracks it, #1493); none rejects.
 function wake(hub: Hub, on: Commit, handles: string[]): void {
   on(() => {
+    const drains: Promise<unknown>[] = [];
     for (const session of new Set(handles.map((h) => hub.registry.get(h)))) {
-      if (session?.active) void drainBoards(session, hub, session.human).catch((error) => console.error("postcommit effect failed", error));
+      if (session?.active) drains.push(drainBoards(session, hub, session.human).catch((error) => console.error("postcommit effect failed", error)));
     }
+    return Promise.all(drains).then(() => {});
   });
 }
 
@@ -567,6 +629,14 @@ function sessionActor(session: ApplicationSession, address?: string): Actor {
 
 export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
   const now = opts.now ?? Date.now;
+  // The stand-in logs a failure as app.ts's tracked one does, so a sweep handed to it never rejects unhandled.
+  const background: Background = opts.runBackground ?? ((what, run) => {
+    let running: Promise<unknown>;
+    try { running = run(() => false); } catch (e) { running = Promise.reject(e); }
+    void running.catch(e => console.error(`[grayboard] ${what} failed:`, e));
+  });
+  // A Commit outside any body that runs its effect now, as background work `what` (#1493).
+  const backgroundCommit = (what: string): Commit => effect => runEffect(background, what, effect);
   // A bind spends the hello bucket inside its caller's transaction (hosted's `owning`, #467): while it does, this
   // holds the bind's `Tx` and the session's `afterRollback`; a streak's audit row is written on that `Tx`, where a
   // commit keeps it, and handed to `afterRollback` as well, to be written again if the transaction rolls back. A
@@ -595,6 +665,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     access: boardAccess(repo, opts.humanReach ?? "team"),
     slackRunning: opts.slackRunning ?? (() => false),
     now,
+    background,
     // Logged and audited once per run of refusals, so a loop floods neither.
     // Keyed by email, which is unique per user. A bind spends from the same
     // bucket (S2).
@@ -615,6 +686,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
       on(async () => {
         // A copy: liveObservers removes a dead observer from the set mid-walk.
         const live = await liveObservers(board, [...observersByBoard.get(board) ?? []]);
+        if (testPaused("board-change:observers-read")) await testPauseAsync("board-change:observers-read");
         // Still observing after the await: a close meanwhile isn't notified.
         for (const observer of live) if (observers.has(observer)) notify(() => observer.hooks.changed());
       });
@@ -684,8 +756,8 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
   function boardsChanged(on: Commit, boards: string[]) {
     for (const board of new Set(boards)) hub.boardChanged(on, board);
   }
-  // Core's claim expiry calls back after its sweep's write has committed, outside any body: its effects run now.
-  const expiryCommit = onCommit(repo.read);
+  // Core's claim expiry calls back after its sweep's write has committed, outside any body: its effects run now, as
+  // background work a server's stop waits for (#1493).
   // Announces claims that lapse on their boards.
   // Armed from requests, it fires for every holder: detached, so its rows
   // don't carry the arming request's address (security audit F-19).
@@ -693,8 +765,9 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
   // on the pool (#807 P3 B2).
   const claimTimer = expiryTimer({
     next: () => repo.claims.nextExpiry(repo.read),
-    sweep: () => repo.write(tx => sweepClaims(repo, hub.access, tx, Date.now())),
-  }, handles => wake(hub, expiryCommit, handles), boards => boardsChanged(expiryCommit, boards));
+    sweep: () => repo.write(tx => sweepClaims(repo, hub.access, tx, repo.now())),
+    now: () => repo.now(),
+  }, handles => wake(hub, backgroundCommit("claim expiry wake"), handles), boards => boardsChanged(backgroundCommit("claim expiry board change"), boards));
   const expiry = { arm: () => detached(() => claimTimer.arm()), stop: () => claimTimer.stop() };
   // The session leaves the hub's registry: superseded, revoked or closed.
   function detach(session: ApplicationSession): void {
@@ -715,10 +788,19 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     touchedIds.set(id, t);
     return true;
   }
+  // The last-seen touch outside a body is keyed by the writer's hosted root (#1510, docs/future/postgres-server.md D4): one
+  // UPDATE of ids.last_seen on the writer's row (the root's or a child's), a column no key or foreign key covers and no
+  // trigger watches. The root alone doesn't exclude every other writer of the row (#1527 L1): `hostedRoot` is fixed
+  // when the session is built, so two sessions of one writer ID (a child re-registered under a new root, a hosted and
+  // a non-hosted one) can carry different roots; their touches would commit out of order and move last_seen back. So
+  // the touch carries `id:<writer>` too: touches of one writer start in arrival order, each stamping the clock when it
+  // runs. A keyed gate body of the writer's root may hold the row FOR NO KEY UPDATE (its facts read) and writes no
+  // last_seen; the one-statement touch waits on it and on nothing after, so no cycle forms. Close's other write, the
+  // human release row, stays exclusive.
   function close(session: ApplicationSession, h: Read = repo.read) {
-    const write = (row: (tx: Tx) => Promise<void>, what: string) => {
+    const write = (row: (tx: Tx) => Promise<void>, what: string, site: "touch" | "other" = "other", keys?: string[]) => {
       if (isTx(h)) h.beforeCommit({}, row);
-      else void repo.write(row).catch(e => console.error(`[grayboard] ${what} failed:`, e));
+      else void atSite(site, () => keys ? repo.writeKeyed(keys, row) : repo.write(row)).catch(e => console.error(`[grayboard] ${what} failed:`, e));
     };
     if (!session.active) return;
     session.active = false;
@@ -739,15 +821,16 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     // Close runs from sync finally blocks and commit callbacks: the touch is written at `h`'s commit or queued, not
     // awaited (#807 P1b-4b, P3 B1c).
     const writer = session.writerId;
-    if (writer && touchDue(writer)) write(tx => repo.bindings.touchId(tx, writer), "last-seen touch");
+    if (writer && touchDue(writer)) write(tx => repo.bindings.touchId(tx, writer), "last-seen touch", "touch", [`root:${session.hostedRoot || writer}`, `id:${writer}`]);
   }
   // The server closes the session: it leaves the hub, and its transport is
   // told why and closes. `h`: the body it runs in, whose `Tx` takes close's rows (#807 P3 A3).
+  // The transport is told even when close's row writes refuse on `h` (a read-only probe's Tx, #1510 chunk 4 audit L2):
+  // the session is already out of the hub by then, and an untold sink would keep its delivery lease tracked.
   function terminate(session: ApplicationSession, error: ApplicationError, h: Read = repo.read) {
     detach(session);
     session.closedBy = error;
-    close(session, h);
-    session.sink.closed(error);
+    try { close(session, h); } finally { session.sink.closed(error); }
   }
   // The session open and current; a closed one is refused with why.
   function stillOpen(session: ApplicationSession) {
@@ -835,13 +918,14 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
   // resend that session's unacked messages too), the woken handles drain, and the freed upload bytes go. The
   // bounces were read in the ends' transaction (#807 P3 A7i), so they're pushed at the commit, synchronously, before
   // a newer message to their senders can be.
+  // The drains and the sweep are background work a server's stop waits for, and skips once stopping (#1493).
   function afterEnds(woken: Set<string>, bounces: MessageRow[]): void {
     for (const b of bounces) {
       const to = hub.registry.get(b.recipient);
       if (to) deliverDirect(to, b);
     }
-    wake(hub, onCommit(repo.read), [...woken]);
-    void sweepStoredBlobs(repo);
+    wake(hub, backgroundCommit("session end wake"), [...woken]);
+    background("blob sweep", stopped => sweepStoredBlobs(repo, stopped));
   }
   // The hosted store ends a released child's ID in the release's transaction (#475 item 1); this runs its
   // after-commit half for every hosted commit, whichever path released it.
@@ -968,7 +1052,9 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
   // Its alias, audit and binding row commit in one transaction through the write queue (#807 D4); the registry
   // changes after the commit, so a rolled-back attach leaves an earlier connection in place. `current` runs inside
   // that transaction: the bridge's checks went stale while the write waited (an unlink or stop queued ahead of it).
-  async function attachHuman(authed: AuthedUser, sink: DeliverySink, current?: (tx: Tx) => string | null | Promise<string | null>): Promise<{ session: ApplicationSession; ok: HelloResult }> {
+  // `replays`: the caller replays the session next (the bridge does), so the commit raises its drain gate (#1090); a
+  // caller that never replays leaves it down, or live direct messages would wait for a drain that never runs.
+  async function attachHuman(authed: AuthedUser, sink: DeliverySink, current?: (tx: Tx) => string | null | Promise<string | null>, replays = false): Promise<{ session: ApplicationSession; ok: HelloResult }> {
     const addr = `${authed.user_email}/${HUMAN_NAME}`;
     return repo.write(async tx => {
       if ((await repo.users.findById(tx, authed.user_id))?.disabled_at != null) fail("unauthenticated", "session is closed");
@@ -996,6 +1082,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
       if (prev && prev !== session) terminate(prev, new ApplicationError("superseded", "a newer Slack bridge connection took over this human"));
       hub.sessions.add(session);
       hub.registry.set(addr, session);
+      if (replays) owe(session);
       return { session, ok: { id: HUMAN_NAME, ...helloFields(hub, authed, hello) } };
     });
   }
@@ -1006,7 +1093,9 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
   // A refusal's binding row goes to the session's `afterRollback` when it has one: a hosted bind runs inside a
   // transaction the refusal's throw rolls back, and the row is written after it.
   // `tx`: the body the bind runs in; its alias reads and lazy create run on it.
-  async function bindNow(tx: Tx, session: ApplicationSession, m: Omit<BindRequest, "type" | "req_id">): Promise<BindResult> {
+  // `replays`: the caller replays the alias next, so a push session's commit raises its drain gate (#1090), as
+  // attachHuman's does; a caller that never replays leaves it down, or live direct messages would wait forever.
+  async function bindNow(tx: Tx, session: ApplicationSession, m: Omit<BindRequest, "type" | "req_id">, replays = false): Promise<BindResult> {
     await valid(session, true, tx);
     const { authed } = session;
     if (session.human) fail("bad_request", `the Slack bridge's connection is its user's "${HUMAN_NAME}"; it binds nothing`);
@@ -1044,6 +1133,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     if (session.holds.includes(address)) {
       // No binding event, and bound_at stays: the session already holds it.
       if (meta) await setAliasLabels(repo, tx, address, meta, id, authed.user_email);
+      if (replays) tx.afterCommit(() => owe(session));
       return { alias: address, held: [...session.holds] };
     }
     if (session.holds.length >= MAX_HOLDS) {
@@ -1111,6 +1201,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     // The first bind of a user's session after the bridge died carries the death notice, once.
     const owed = await owedBridgeNotice(repo, tx, authed.user_email);
     const notices = await noticesFor(hub, tx, session.addresses, owed ? [owed] : []);
+    if (replays) tx.afterCommit(() => owe(session));
     return { alias: address, held: [...session.holds], ...(notices.length ? { notices } : {}) };
   }
 
@@ -1142,6 +1233,9 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
   const application = {
     ready,
     repo,
+    // Runs `run` as background work `what` (#1506): the work a hook outside the hub starts and nobody awaits (a resource
+    // watch's check), so a server's stop() waits for it under its drain deadline and names it, or, once stopping, skips it.
+    runBackground(what: string, run: (stopped: () => boolean) => Promise<unknown>): void { background(what, run); },
     admitHosted,
     // `suggested`: the name the session's checkout suggested (#443), offered first while free.
     hostedCandidates(r: Read, authed: AuthedUser, suggested: string | null): Promise<Candidate[]> { return candidates(hub, r, authed, suggested); },
@@ -1167,6 +1261,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
       const session = new ApplicationSession(authed, sink, false, push);
       session.transport = "hosted";
       session.sessionId = id;
+      session.hostedRoot = root ?? id;
       session.place = row?.place ?? null;
       session.readOnly = holds.length === 0 && writesAs === null;
       session.toolsOnly = writesAs !== null;
@@ -1320,17 +1415,25 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     // messages and board items for `addresses` (every address by default; a
     // bind's alias after its answer).
     async replay(session: ApplicationSession, addresses?: string[]) {
-      await valid(session, true);
-      if (session.readOnly || !session.push) return;
-      // Called after the hello's or bind's commit, outside any body, so the drain runs now; awaited, so the replay
-      // answers once it's delivered (#807 P3 A6a). A failure is logged, as a commit effect's is.
+      // The gate its bind or attach raised (#1090) comes down once the direct drain is done, or on any way out
+      // before it; settled twice, the second is a no-op.
+      let settled = false;
+      const settle = () => { if (!settled) { settled = true; settleOwed(session); } };
       try {
-        await drainDirect(hub, session, addresses ?? session.addresses);
-        // Closed while the drain awaited (an unlink, a revoke): nothing more is owed.
-        if (!session.active) return;
+        await testPauseAsync("server:replay:start");
         await valid(session, true);
-        await drainBoards(session, hub, true);
-      } catch (error) { console.error("postcommit effect failed", error); }
+        if (session.readOnly || !session.push) return;
+        // Called after the hello's or bind's commit, outside any body, so the drain runs now; awaited, so the replay
+        // answers once it's delivered (#807 P3 A6a). A failure is logged, as a commit effect's is.
+        try {
+          await drainDirect(hub, session, addresses ?? session.addresses);
+          settle();
+          // Closed while the drain awaited (an unlink, a revoke): nothing more is owed.
+          if (!session.active) return;
+          await valid(session, true);
+          await drainBoards(session, hub, true);
+        } catch (error) { console.error("postcommit effect failed", error); }
+      } finally { settle(); }
     },
     async send(
       tx: Tx,
@@ -1370,7 +1473,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
       // Each item's post and the address it was read for: a service board's wake rule judges that address (#270 D6).
       const readers = new Map<number, string>();
       for (const a of session.addresses) {
-        for (const item of await pendingOf(repo, hub.access, r, a, true, lostAck(hub, r, a))) {
+        for (const item of await pendingOf(repo, hub.access, r, a, true, lostAck(hub, r, a, receiverOf(session)))) {
           const key = pendingKey(refOf(item));
           if (!seen.has(key)) { seen.add(key); all.push(item); readers.set((item.kind === "push" ? item.post : item.latest).id, a); }
         }
@@ -1426,11 +1529,13 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     },
     // A ref carries no handle: the item was sent for one of this session's
     // addresses, and acknowledging is a no-op on one with no such row, so
-    // each address acks it.
+    // each address acks it, as this session (receiverOf): an address it no
+    // longer holds in this transaction is left to its new holder (#1466).
     async receiptBoards(tx: Tx, session: ApplicationSession, refs: PendingRef[]) {
       await valid(session, false, tx);
+      const receiver = receiverOf(session);
       for (const r of refs) {
-        for (const a of session.addresses) await repo.boards.acknowledge(tx, a, r);
+        for (const a of session.addresses) await repo.boards.acknowledge(tx, a, r, receiver);
         tx.afterCommit(() => {
           session.inflight.delete(pendingKey(r));
           session.boardDrain?.acked.add(ackKey(r));
@@ -1463,10 +1568,11 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     // The server's one BoardAccess: HTTP's claim calls judge boards with it, as the hub's tools do (#807 P3 B5b3c).
     access: hub.access,
     // Trusted committed domain operations, not client-supplied invalidations; called after their commit, so effects run now.
-    boardsChanged: (boards: string[]) => boardsChanged(onCommit(repo.read), boards),
+    // Its fan-out is background work a server's stop waits for (#1493): the retention pass's posts step starts one.
+    boardsChanged: (boards: string[]) => boardsChanged(backgroundCommit("board change"), boards),
     wake(handles: string[]) {
       expiry.arm();
-      wake(hub, onCommit(repo.read), handles);
+      wake(hub, backgroundCommit("wake"), handles);
     },
     // An admin revoked or disabled a user: every session of theirs closes.
     // The hosted store ends them (disabled users) on its sweep.
@@ -1494,6 +1600,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
         return false;
       })));
       for (const [i, id] of ids.entries()) if (disabled[i]) application.disconnectUser(id);
+      await testPauseAsync("revalidate:between");
       return recheckAliases(null, null);
     },
     sweepHellos: () => {
@@ -1504,10 +1611,12 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     // Each tier's keys counted with its kind's (#270 D4): a service's bucket is a user's, sized apart.
     limiterSizes: () => ({ bind: hub.helloLimiter.size + hub.serviceHelloLimiter.size, hosted: hostedRequestLimiter.size + serviceRequestLimiter.size,
       subscriber: hostedSubscriberLimiter.size + serviceSubscriberLimiter.size, delegate: hub.delegateLimiter.size }),
-    stopExpiry() {
-      expiry.stop();
+    // Resolves once a claim expiry sweep or read already running has settled (#1489).
+    stopExpiry(): Promise<void> {
+      const running = expiry.stop();
       unsubscribeEnds();
       for (const observer of [...observers]) removeObserver(observer);
+      return running;
     },
   };
   // boardsVisible for addresses already snapshotted, with no session check: a stopped live's prune of its lost boards
@@ -1837,7 +1946,8 @@ async function writeOnce<W extends Written>(
       });
     }
   }, recheck);
-  if ("replay" in out && uploads.length > 0) tx.afterCommit(async () => { await sweepStoredBlobs(repo); });
+  // Tracked as background work a server's stop waits for, and skipped once stopping (#1496).
+  if ("replay" in out && uploads.length > 0) tx.afterCommit(() => hub.background("blob sweep", stopped => sweepStoredBlobs(repo, stopped)));
   return out;
 }
 
@@ -2042,7 +2152,7 @@ async function handleRetract(hub: Hub, tx: Tx, session: ApplicationSession, id: 
   }
   if (done === "read") return fail("bad_request", retractRefusal.reached(id, m.recipient));
   if (done === "replied") return fail("bad_request", retractRefusal.replied(id));
-  tx.afterCommit(async () => { await sweepStoredBlobs(repo); });
+  tx.afterCommit(() => hub.background("blob sweep", stopped => sweepStoredBlobs(repo, stopped)));
   return {};
 }
 
@@ -2083,7 +2193,8 @@ async function handleCall(hub: Hub, tx: Tx, session: ApplicationSession, tool: s
     if (a?.d.allow) recordDecision(repo, sp, sessionActor(session, as), a.req, a.d, { post_id: postId });
   };
   let outcome;
-  try { outcome = await callBoardTool(repo, hub.access, tx, actor, tool, rest, { ...ctx, ...(session.readOnly ? { principal: userOf(session) } : {}), announced }); }
+  const receiver = receiverOf(session);
+  try { outcome = await callBoardTool(repo, hub.access, tx, actor, tool, rest, { ...ctx, ...(session.readOnly ? { principal: userOf(session) } : {}), ...(receiver ? { receiver } : {}), announced }); }
   catch (e) {
     if (e instanceof CoreError) throw coreRefusal(e);
     console.error(`[grayboard] ${tool} failed:`, e);
@@ -2097,10 +2208,11 @@ async function handleCall(hub: Hub, tx: Tx, session: ApplicationSession, tool: s
   }
   // A hosted session with no name answers peer_list as its ID, but is nobody (#402).
   if (session.readOnly && tool === "peer_list" && outcome.result && typeof outcome.result === "object") delete (outcome.result as { you?: string }).you;
-  for (const board of new Set(outcome.boards ?? [])) hub.boardChanged(onCommit(tx), board);
+  // The fan-out and the wakes are background work a server's stop waits for (#1496).
+  for (const board of new Set(outcome.boards ?? [])) hub.boardChanged(trackedCommit(hub, tx, "call board change"), board);
   // The transitional adapter publishes its answer before the resulting deliveries.
   if (publish) tx.afterCommit(() => publish(outcome.result));
-  wake(hub, onCommit(tx), outcome.wake);
+  wake(hub, trackedCommit(hub, tx, "call wake"), outcome.wake);
   return outcome.result;
 }
 
@@ -2129,6 +2241,9 @@ async function handleBoardPost(hub: Hub, tx: Tx, session: ApplicationSession, me
     }
     // Its board is reused inside the savepoint: the same transaction, so the same row (b5b2 Decision 9).
     const { board, gate } = await postGateOn(repo, hub.access, tx, me, postArgs.board, parentId);
+    // Core's order (#1225): the gate, then the body and mode checks, then the uploads, so a call with several faults
+    // is refused for the same one in both modes. serverPost runs the same checks again; they hold, so they pass.
+    postPreChecks(board.name, postArgs.body, gate.announcement, { online: ctx.online, attachments: { ids, send: ctx.files } });
     const fp = { board: normalizeBoard(postArgs.board), body: postArgs.body, parent_id: parentId, attachments: await repo.attachments.unsentDigests(tx, ids, uploaderOf(session)) };
     out = await writeOnce(hub, tx, session, "board_post", me, fp, resend === true, ids, async sp => {
       const o = await serverPost(repo, hub.access, sp, me, board, gate, postArgs, ctx);
@@ -2149,9 +2264,9 @@ async function handleBoardPost(hub: Hub, tx: Tx, session: ApplicationSession, me
   }
   const r = out.fresh.payload;
   tx.afterCommit(() => testPause("write:after-commit"));
-  hub.boardChanged(onCommit(tx), r.board);
+  hub.boardChanged(trackedCommit(hub, tx, "post board change"), r.board);
   if (publish) tx.afterCommit(() => publish(r));
-  wake(hub, onCommit(tx), out.fresh.wake);
+  wake(hub, trackedCommit(hub, tx, "post wake"), out.fresh.wake);
   return r;
 }
 
@@ -2294,9 +2409,10 @@ async function handleThread(r: Read, session: ApplicationSession, messageId: num
 
 // A receipt: the harness was handed these ids. Each stamps its delivery time
 // once (unless `at` is null: given up, not handed) and moves its recipient
-// address's cursor; only your own direct messages count (S8).
+// address's cursor; only your own direct messages count (S8). In id order, whatever order the caller gave (#1510
+// scope pair 4): markDelivered's row locks then come in messages.prune's by-id order, so the two never deadlock.
 async function handleAck(tx: Tx, session: ApplicationSession, messageIds: number[], repo: Repo, at: number | null): Promise<void> {
-  for (const msgId of messageIds) {
+  for (const msgId of [...messageIds].sort((a, b) => a - b)) {
     const msg = await repo.messages.getById(tx, msgId);
     if (!msg || msg.recipient_type !== "user" || !session.addresses.includes(msg.recipient)) continue;
     if (at !== null) await repo.messages.markDelivered(tx, msgId, at);

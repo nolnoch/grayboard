@@ -17,6 +17,7 @@ import type { Config } from "./config.ts";
 import { handleHttp } from "./http.ts";
 import { scratchDbPath } from "../../tests/support/scratch_db.ts";
 import { seed } from "../../tests/support/seed.ts";
+import { until } from "../../tests/support/until.ts";
 
 let store: ReturnType<typeof openDatabase>;
 let application: ReturnType<typeof createApplication>;
@@ -63,9 +64,9 @@ beforeEach(async () => {
   alice = await user("alice@example.com");
   bob = await user("bob@example.com");
 });
-afterEach(() => {
+afterEach(async () => {
   resources.close();
-  application.stopExpiry();
+  await application.stopExpiry();
   store.db.close();
   rmSync(dir, { recursive: true, force: true });
 });
@@ -337,7 +338,7 @@ test("real bearer CLI claim route hints committed posts without attention subscr
       expect(await application.pending(store.repo.read, session)).toEqual([]);
       expect(await store.repo.cursors.directFor(store.repo.read, session.identityFull)).toBe(0);
     }
-  } finally { touches.cancelAll(); server.stop(true); }
+  } finally { touches.cancelAll(); void server.stop(true); }
 });
 
 test("timer expiry independently hints with no attention subscribers", async () => {
@@ -423,7 +424,7 @@ test("revocation, disabled users, application disconnect and stop close watchers
   const c = await select(alice, "fe");
   const stopped = hooks();
   resources.watch(c, boardResourceUri("e2e"), stopped, true);
-  application.stopExpiry();
+  await application.stopExpiry();
   expect(stopped.counts.closed).toBe(1);
   resources.close();
   expect(() => resources.watch(c, boardResourceUri("e2e"), hooks(), true)).toThrow("unauthorized");
@@ -544,7 +545,7 @@ test("per-session watch capacity counts only that session's watches and frees on
 // cap was a hard-coded 1024 that would bind first.
 test("configured watch caps admit past the defaults and refuse at the configured size", async () => {
   resources.close();
-  application.stopExpiry();
+  await application.stopExpiry();
   application = createApplication(store.repo, { observerCap: 1100 });
   resources = createResources(application, { isCurrent: () => true, isAuthorized: () => true, caps: { global: 1100, perSession: 1100 } });
   const a = await select(alice);
@@ -617,4 +618,51 @@ test("A7d2c/B5a2: a watch its caller didn't judge visible is refused", async () 
   expect(h.counts.closed).toBe(0);
   // The synchronous auth forms are gone (#807 P3 A7d2c): every token read is async.
   expect("authNow" in store.repo).toBe(false);
+});
+
+// #1504, #1506: a change hint's live check reads the store untracked by the commit that started it, so it runs as the
+// application's background work "resource watch check", which a server's stop() waits for: the pass settles only once
+// its check has. A check in flight when close() ran, or once the stop has begun, sends no hint.
+test("#1506: a change's live check runs as the background pass 'resource watch check'", async () => {
+  resources.close();
+  const passes: { what: string; done: Promise<unknown> }[] = [];
+  let stopping = false;
+  application = createApplication(store.repo, { runBackground: (what, run) => { passes.push({ what, done: run(() => stopping) }); } });
+  const a = await select(alice), b = await select(bob);
+  await call(a, "board_create", { name: "e2e", purpose: "tests" });
+  let release!: () => void, started = 0;
+  const gate = () => new Promise<void>(resolve => { release = resolve; });
+  let held = gate();
+  resources = createResources(application, { isCurrent: () => true, isAuthorized: async () => { started++; await held; return true; } });
+  const h = hooks();
+  resources.watch(b, boardResourceUri("e2e"), h, true);
+  const checks = () => passes.filter(p => p.what === "resource watch check");
+  // Released: the pass hints.
+  await call(a, "board_post", { board: "e2e", body: "first" });
+  await until(() => started === 1);
+  expect(checks()).toHaveLength(1);
+  release();
+  await checks()[0]!.done;
+  await until(() => h.counts.changed === 1);
+  // Held across the stop's start: the pass settles once its check has, and sends no hint.
+  held = gate();
+  await call(a, "board_post", { board: "e2e", body: "second" });
+  await until(() => started === 2);
+  let settled = false;
+  void checks()[1]!.done.then(() => { settled = true; });
+  stopping = true;
+  await flush();
+  expect(settled).toBe(false);
+  release();
+  await checks()[1]!.done;
+  expect(h.counts.changed).toBe(1);
+  // Held across close(): no hint after close. close() finishes the watch, so this pins the behaviour, not the `!stopped` guard.
+  stopping = false;
+  held = gate();
+  await call(a, "board_post", { board: "e2e", body: "third" });
+  await until(() => started === 3);
+  resources.close();
+  release();
+  await checks()[2]!.done;
+  expect(h.counts.changed).toBe(1);
 });

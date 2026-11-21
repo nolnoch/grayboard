@@ -207,7 +207,7 @@ export class AppSession {
   // session a writer, as a rebuilt hosted session is.
   async bind(alias: string, extra: { create?: boolean; meta?: unknown } = {}): Promise<BindResult> {
     const session = this.live();
-    const ok = await this.write(session, tx => this.application.bindNow(tx, session, { alias, ...extra } as Parameters<Application["bindNow"]>[2]));
+    const ok = await this.write(session, tx => this.application.bindNow(tx, session, { alias, ...extra } as Parameters<Application["bindNow"]>[2], true));
     if (session.readOnly) {
       session.readOnly = false;
       session.writerId = this.id;

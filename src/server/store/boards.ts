@@ -52,7 +52,11 @@ export interface BoardsStore {
   // Marks a pending item delivered to `handle` (core acknowledge). A push: its outbox row stamped delivered, and for
   // a subscription push a push-mode subscription's cursor and notified_id moved up to the post (never back); an
   // outbox row that isn't there is a no-op. A digest: the subscription's notified_id moved up to latest_id.
-  acknowledge(tx: Tx, handle: string, ref: PendingRef): Promise<void>;
+  // A push's first delivery credits a session (its outbox row's session_id, and a queue post's take while its claim
+  // names `handle`, #1461): `receiver` when given, else the session holding `handle`. With `receiver` (the session the
+  // item reached, #1466), nothing is marked unless `handle` is its ID or an alias it holds, judged in the statement that
+  // marks, so a hold that moved in a transaction committed first is never credited for this receipt.
+  acknowledge(tx: Tx, handle: string, ref: PendingRef, receiver?: string): Promise<void>;
 
   // ── a mode's bookkeeping (#807 P3 B5b1): the board writes outside the tools, unchecked ──
   // Creates the board (its name normalized) unless one has the name: no creator subscription, no kind (broadcast);
@@ -102,8 +106,9 @@ export interface BoardsStore {
   // Else the handle's unread (as views counts it) oldest first, up to limit, or when there is none the latest limit
   // (10 when limit is absent), oldest first. With a handle, its cursor moves up to the newest post returned (never
   // back) and its undelivered pushes of the returned posts are stamped delivered; unread_remaining is what's still
-  // unread. A null handle (a peek) changes nothing and reports 0.
-  read(tx: Tx, board: string, handle: string | null, opts: { limit?: number; before_id?: number; thread?: number }): Promise<ReadResult>;
+  // unread. A null handle (a peek) changes nothing and reports 0. The pushes it stamps are credited as acknowledge's
+  // are; with `receiver` (#1466) no longer holding `handle`, the read changes nothing either, as each write judges.
+  read(tx: Tx, board: string, handle: string | null, opts: { limit?: number; before_id?: number; thread?: number }, receiver?: string): Promise<ReadResult>;
   // The root of the thread postId is in; postId itself when it's a root or missing (core threadRoot).
   threadRoot(r: Read, postId: number): Promise<number>;
   // Mutes the thread at `root` for `handle` (a repeat is a no-op), or unmutes it (core setMute).

@@ -21,8 +21,9 @@ import { until } from "./until.ts";
 export const transactionScenarios = ["pending-gate", "bind-commit", "register-txn", "attach-revoke", "lease-expire"];
 
 // A plugin request host.ts's fetch shim forwarded: its JSON-RPC method (a new connection's `server/discover`
-// included; the HTTP method for one without a body), a tool call, or an inbox read with its answer.
-export type SeenMethod = { method: string; subscriber: boolean };
+// included; the HTTP method for one without a body) and the session its `_meta` names, a tool call, or an inbox read
+// with its answer.
+export type SeenMethod = { method: string; subscriber: boolean; session: string | null };
 export type SeenCall = { name: string; session: string; subscriber: boolean; args: Record<string, unknown>; cap: string | null };
 // A delivery lease the plugin opened, from delivery_open's answer.
 export type SeenOpen = { capability: string; ownership: number; bind_gen: number };
@@ -130,12 +131,18 @@ export async function transactionRace(f: TransactionRace) {
         // second waits at the gate (the bindgate:wait trace; every hosted request first snapshots its root as a
         // gate reader, so it waits there) and both land, in that order. The first is held at its async boundary
         // just inside the gate, so the server keeps serving and only the gate can make the second wait.
-        const child = await create("Transaction race child", root);
+        // Behind a held bind, what waits is the registration wire's connect (a reader); register's own writer wait
+        // behind a bind is src/server/hosted-persistence.test.ts's.
+        // The child is created only once the first is armed (#1208): the plugin registers a new child as soon as it
+        // sees it (the creation's instructions prefetch, which the child's call then shares, #567), so a child made
+        // earlier could register before the race began, and that registration, already committed or queued at the
+        // gate ahead of the bind, is not the race this proves.
         const body = "Transaction race child write";
-        let first: { hit(ms?: number): Promise<void>; release(): void }, binding: Promise<ToolResult>, childCall: Promise<void>;
+        let first: { hit(ms?: number): Promise<void>; release(): void }, binding: Promise<ToolResult>, childCall: Promise<void>, child: string;
         const { bind_gen: gen, ownership_id: ownership } = row(root)!;
         if (f.boundary === "before") {
           first = await server.pause("hosted:register:before-txn");
+          child = await create("Transaction race child", root);
           childCall = f.invoke(child, "dm_send", { to: "sender", body });
           await first.hit();
           const waiting = await server.trace("bindgate:wait");
@@ -151,15 +158,14 @@ export async function transactionRace(f: TransactionRace) {
           binding = oob.ok(root, "bind", { name: "be", create: true });
           await first.hit();
           assert(!f.calls.slice(mark).some(c => c.name === "delivery_open"), "The held owning call is the root's bind, not a plugin open");
-          const waiting = await server.trace("bindgate:wait"), armed = f.calls.length;
+          // Armed before the child exists, so every registration for it reaches the held gate traced. The registration
+          // runs over a temporary subscriber wire naming the root, whose connect is itself a hosted request and waits
+          // at the gate as a reader, so its session_register is sent only after the release.
+          const waiting = await server.trace("bindgate:wait"), armed = f.methods.length;
+          child = await create("Transaction race child", root);
           childCall = f.invoke(child, "dm_send", { to: "sender", body });
-          // The plugin registers a new child as soon as it sees it, so the registration may already be on its
-          // way when the child's call is made; either way it is sent after the held bind.
-          await until(() => f.calls.slice(mark).some(c => c.name === "session_register" && c.session === root), 20_000, "The child's registration is sent while the bind is held");
-          // One sent before the trace was armed (the creation's instructions prefetch) may already wait at the
-          // gate untraced, and the call shares it (#567). This branch then shows only that nothing committed
-          // while the bind was held; the traced branch and the "before" boundary prove the gate holds it.
-          if (!f.calls.slice(mark, armed).some(c => c.name === "session_register" && c.session === root)) await waiting.hit();
+          await until(() => f.methods.slice(armed).some(m => m.subscriber && m.session === root && m.method === "server/discover"), 20_000, "The child's registration wire connects while the bind is held");
+          await waiting.hit();
         }
         assert.equal(row(child), null, "Nothing registered while the first is held");
         first.release();
@@ -190,6 +196,8 @@ export async function transactionRace(f: TransactionRace) {
         const principal: OAuthPrincipal = { authed: { user_id: user, user_email: "you@example.com", kind: "user", session_id: 0 }, grantId: g1, clientId: OPENCODE_CLIENT, sourceKey: OPENCODE_SESSION_META, scopes: ["tools", "delivery"], accessHash: "", accessExpiry: 0 };
         const releaseFile = join(f.pauses, "revoke-release");
         const revoker = transactionProcess("tests/support/hosted-operation.ts", [f.dbPath, f.blobDir, JSON.stringify({ principal, operation: "revoke", refreshHash: refresh, now: Date.now() })], f.boundary === "before" ? "" : "hosted:revoke:in-txn", releaseFile, "REVOKER");
+        // The "after" branch's mark of the plugin's calls before its bind, so the outcome can count every bind it sent.
+        let mark = 0;
         try {
           await bounded(revoker.wait("READY"), 20_000, "Revoker ready");
           let binding: Promise<void>;
@@ -210,14 +218,15 @@ export async function transactionRace(f: TransactionRace) {
             // Armed before the revoke takes the lock (#1288): once it holds it, every hosted timer tick's sweep and
             // heartbeat write stalls the server's one thread in that busy handler, so a stdin command sent then could
             // go unread past its deadline, and the hit's deadline covers several such stalls before the bind's turn.
-            const mark = f.calls.length, marked = f.methods.length, waiting = await server.trace("hosted:gate:checked");
+            mark = f.calls.length;
+            const marked = f.methods.length, waiting = await server.trace("hosted:gate:checked");
             revoker.proc.stdin.end();
             await bounded(revoker.wait("test pause hit: hosted:revoke:in-txn"), 10_000, "Revoke held in its transaction");
             binding = f.invoke(root, "bind", { name: "final", create: true });
             await until(() => f.calls.slice(mark).some(c => c.name === "bind" && c.session === root), 20_000, "The G2 owning call is sent while the revoke is held");
             await waiting.hit(60_000);
             assert.deepEqual(f.calls.slice(mark).map(c => [c.name, c.session]), [["bind", root]], "The bind is the only call sent since arming");
-            assert.deepEqual(f.methods.slice(marked), [{ method: "tools/call", subscriber: false }], "The bind's is the only request sent since arming, so the gate traced is its");
+            assert.deepEqual(f.methods.slice(marked).map(({ method, subscriber }) => ({ method, subscriber })), [{ method: "tools/call", subscriber: false }], "The bind's is the only request sent since arming, so the gate traced is its");
             await Bun.write(releaseFile, "release");
           }
           assert.equal(await bounded(revoker.proc.exited, 20_000, "Revoker exits"), 0); await revoker.done;
@@ -237,8 +246,14 @@ export async function transactionRace(f: TransactionRace) {
         } else {
           assert.deepEqual(attached, [], "Released first: nothing attaches");
           assert.deepEqual(revoked, [{ session_id: before.session_id, name: RACE, reason: "revoked" }], "One released(revoked) per held name");
-          await until(() => { const r = row(root); return !!r && r.ownership_id !== before.ownership_id && r.held.includes("final"); }, 30_000, "The plugin's bind lands under a new ownership");
+          await until(() => { const r = row(root); return !!r && r.ownership_id !== before.ownership_id && r.held.includes("final"); }, 30_000, "The plugin's bind lands under a new ownership (a bind held past the 5 s busy_timeout fails SQLITE_BUSY and is not retried)");
           assert.notEqual(row(root)!.grant_id, g1, "The new ownership is G2's");
+          // The traced bind was still waiting when the revoke released (#1181): its BEGIN IMMEDIATE waits out the lock in
+          // SQLite's busy handler for 5 s, and a release later than that fails it with SQLITE_BUSY, which nothing on the
+          // server retries. So the bind that landed is that one only if the plugin sent no other: a retry after the
+          // commit (by the plugin or its transport, both under the fetch shim that records calls) would land the same.
+          // No other bind is legitimate here: the root is paused after G2's sign-in, so the subscriber's bindAll can't run.
+          assert.deepEqual(f.calls.slice(mark).filter(c => c.name === "bind").map(c => c.session), [root], "The bind that landed is the one traced at the gate: the plugin sent no other");
         }
         console.log("REAL_TXN_ATTACH_REVOKE_OK", JSON.stringify({ boundary: f.boundary, attached: attached.length, revoked: revoked.length }));
         break;

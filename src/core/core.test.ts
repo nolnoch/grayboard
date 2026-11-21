@@ -44,6 +44,7 @@ import { claim, claimExpiryTimer, expiryTimer, listClaims, release, sweepExpired
 import { initCoreSchema } from "./schema.ts";
 import { dropHold, holdAlias, logBinding } from "./bindings.ts";
 import { boardNotification } from "../shared/notifications.ts";
+import { until } from "../../tests/support/until.ts";
 
 let db: Database;
 
@@ -798,6 +799,52 @@ test("#807 P3 B2: an asynchronous expiry read arms when it resolves, and a stop 
     await Bun.sleep(50);
     expect(sweeps).toBe(1);
   } finally { timer.stop(); }
+});
+
+// #1489: a server closes its store once stop() settles, so stop() waits out a sweep or a read already running.
+test("#1489: the expiry timer's stop resolves only once its running sweep and read have settled", async () => {
+  let finishSweep!: () => void, finishRead!: (next: number | null) => void;
+  let sweeping = false;
+  const timer = expiryTimer({
+    next: () => new Promise<number | null>(resolve => { finishRead = resolve; }),
+    sweep: () => { sweeping = true; return new Promise(resolve => { finishSweep = () => resolve({ wake: [], boards: [] }); }); },
+  }, () => {});
+  // The first arm's read is running: stop waits for it.
+  let stopped = false;
+  void timer.stop().then(() => { stopped = true; });
+  await Bun.sleep(20);
+  expect(stopped).toBe(false);
+  finishRead(null);
+  await until(() => stopped, 1000, "stop settles once the read has");
+
+  // A sweep already running when stop lands: stop waits for it too.
+  const second = expiryTimer({
+    next: () => Date.now(),
+    sweep: () => { sweeping = true; return new Promise(resolve => { finishSweep = () => resolve({ wake: [], boards: [] }); }); },
+  }, () => {});
+  await until(() => sweeping, 1000, "the sweep starts");
+  let secondStopped = false;
+  void second.stop().then(() => { secondStopped = true; });
+  await Bun.sleep(20);
+  expect(secondStopped).toBe(false);
+  finishSweep();
+  await until(() => secondStopped, 1000, "stop settles once the sweep has");
+});
+
+// #1390: the timer measures its delay on the source's clock, the one its sweep reads: a server on a test clock behind
+// wall time would otherwise fire at once, find nothing lapsed at its own clock, and re-arm in a loop.
+test("#1390: the expiry timer's delay is measured on the source's clock", () => {
+  const T0 = 1_000_000;
+  const delays: number[] = [];
+  const real = globalThis.setTimeout;
+  const spied = spyOn(globalThis, "setTimeout").mockImplementation(((fn: () => void, ms?: number) => {
+    delays.push(ms ?? 0);
+    return real(fn, 3_600_000);
+  }) as typeof setTimeout);
+  const timer = expiryTimer({ next: () => T0 + 600_000, sweep: () => ({ wake: [], boards: [] }), now: () => T0 }, () => {});
+  try {
+    expect(delays).toEqual([600_000]);
+  } finally { timer.stop(); spied.mockRestore(); }
 });
 
 test("#807 P3 B2: a failed asynchronous expiry read is logged", async () => {

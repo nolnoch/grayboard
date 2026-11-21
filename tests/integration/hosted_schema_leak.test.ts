@@ -11,7 +11,9 @@ afterAll(() => srv.stop());
 const liveHeapMB = () => { Bun.gc(true); Bun.gc(true); return process.memoryUsage().heapUsed / 1048576; };
 
 test("live heap stays flat across 1,000 native tool calls", async () => {
-  const s = await srv.hosted("alice@example.com", "alpha");
+  // No delivery lease: the driver renews one only in inbox(), and this loop outlasts its TTL on a slow store, where
+  // the expired lease would refuse every later call.
+  const s = await srv.hosted("alice@example.com", "alpha", { delivery: false });
   // Warm every lazy path (SDK, zod, statement caches) before the baseline: growth settles within
   // about 1,000 calls (+1.1, +0.2, +0.03, +0.02 MB per 1,000 after it).
   for (let i = 0; i < 1000; i++) await s.call(i % 2 ? "whoami" : "board_list");

@@ -20,7 +20,7 @@ import { endSession, type EndedSession } from "../core/session_end.ts";
 import { HUMAN_NAME } from "../shared/addressing.ts";
 import { describeLocation } from "../shared/identity.ts";
 import { testPause } from "../shared/testpause.ts";
-import { aliveRows, ancestors, commandName, harnessAncestor, isAlive, procStart } from "../shared/proc.ts";
+import { aliveRows, ancestors, commandName, harnessAncestor, isAlive, parentsOf, procStart } from "../shared/proc.ts";
 import { localMail } from "./mailbox.ts";
 import { deliverEnded, poke } from "./wakeup.ts";
 
@@ -624,6 +624,9 @@ export async function acquireName(
   testPause("bind:before-poke");
   const sockLive = before && isAlive(before.pid, before.proc_start) ? false : await poke(name);
 
+  // The holder's parent, read here rather than under the lock (ChildReads, #1463).
+  const pre = opts.displace === undefined ? new Map<string, boolean>() : displacePreRead(db, name, sessionId, opts.displace);
+
   testPause("bind:before-txn");
   return db.transaction((): AcquireResult => {
     const now = Date.now();
@@ -644,7 +647,7 @@ export async function acquireName(
     }
     const holder = holdingSession(db, name, sessionId);
     const live = holder !== null && isAlive(holder.pid, holder.proc_start);
-    if (live && (opts.displace === undefined || !displaceableRow(db, holder, opts.displace))) {
+    if (live && (opts.displace === undefined || !displaceableRow(db, holder, opts.displace, pre))) {
       const who = describeHolder(holder);
       return refuse(aliasHeldText(name, who, "bind another name"), { holder: who });
     }
@@ -717,7 +720,16 @@ export function setHeldMeta(db: Database, sessionId: string, name: string, meta:
 // root under the same harness pid with no harness session, which receives.
 // An adapter's own child always has a harness session, so a restart's
 // predecessor is never displaced: it is waited for (siblingGone).
-function displaceableRow(db: Database, r: SessionRow, harnessPid: number): boolean {
+// The recorded harness pid alone could be a dead harness's, reused by this
+// one while the holder outlived it (#1401): the holder must still be that
+// pid's child now (an unkeyed root's harness pid is its parent at start, and
+// an orphan is reparented). An unreadable parent displaces nothing.
+function displaceableRow(db: Database, r: SessionRow, harnessPid: number, pre: ChildReads = new Map()): boolean {
+  return displaceableShape(db, r, harnessPid) && liveChildren([r], harnessPid, pre).length > 0;
+}
+
+// displaceableRow less the process read: the row's facts alone.
+function displaceableShape(db: Database, r: SessionRow, harnessPid: number): boolean {
   return r.harness_pid === harnessPid && r.harness_rule === null && db.prepare(
     `SELECT 1 FROM ids WHERE id = ? AND harness_session IS NULL AND keyed = 0 AND viewer = 0 AND delivery = 'push' AND ended_at IS NULL`,
   ).get(r.session_id) !== null;
@@ -727,6 +739,100 @@ function displaceableRow(db: Database, r: SessionRow, harnessPid: number): boole
 export function displaceableHolder(db: Database, name: string, harnessPid: number): boolean {
   const r = holdingSession(db, name);
   return r !== null && isAlive(r.pid, r.proc_start) && displaceableRow(db, r, harnessPid);
+}
+
+/**
+ * Candidates' process reads taken before a write lock (#1463): for each row,
+ * keyed by its process (session, pid, recorded start time), whether it was
+ * live and `harnessPid`'s child. macOS forks ps for these, so acquireName and
+ * writeNames (mcp.ts) read them first and their transactions only look them
+ * up (liveChildren). A row the lock finds that the read didn't (one that
+ * registered or bound in between) is read inside it, as before: rare, and
+ * the in-lock read keeps that race's answer what it was (#1381's audit).
+ *
+ * Trusting a read taken before the lock: a row with the same process key is
+ * the same process (a dead pid's process can't come back under its recorded
+ * start). Read "live and the harness's child", it stays so unless the harness
+ * itself died between (its children are reparented), and the taker or writer
+ * is that harness's child too, so this answers as an in-lock read would have
+ * an instant earlier; a holder that died between is still caught by
+ * acquireName's in-lock isAlive, and a writer that yields to a child that
+ * died between yields as it would to one that died just after the commit.
+ * Read "not", it was dead (and stays so), unreadable (displaces nothing, as
+ * ever), or another process's child, which becomes the harness's only if the
+ * harness is a subreaper adopting it: no displacement and no yield, the
+ * conservative side.
+ */
+export type ChildReads = Map<string, boolean>;
+
+const procKey = (r: { session_id: string; pid: number; proc_start: string | null }) => `${r.session_id}\0${r.pid}\0${r.proc_start ?? ""}`;
+
+/** ChildReads for `rows`: one start-time read and one parent read for all of them. */
+export function readChildren<T extends { session_id: string; pid: number; proc_start: string | null }>(rows: T[], harnessPid: number): ChildReads {
+  const { alive } = aliveRows(rows);
+  const parents = parentsOf(alive.map((r) => r.pid));
+  return new Map(rows.map((r) => [procKey(r), alive.includes(r) && parents.get(r.pid) === harnessPid]));
+}
+
+// The rows of `rows` that are live and `harnessPid`'s child: `pre`'s answer
+// for a row it read, a read now for the rest (ChildReads).
+function liveChildren<T extends { session_id: string; pid: number; proc_start: string | null }>(rows: T[], harnessPid: number, pre: ChildReads): T[] {
+  const missing = rows.filter((r) => !pre.has(procKey(r)));
+  const now = missing.length ? readChildren(missing, harnessPid) : new Map<string, boolean>();
+  return rows.filter((r) => (pre.get(procKey(r)) ?? now.get(procKey(r))) === true);
+}
+
+/** acquireName's pre-lock read: `name`'s holder's, when its row is one `displace` could take it from. */
+function displacePreRead(db: Database, name: string, sessionId: string, harnessPid: number): ChildReads {
+  const r = holdingSession(db, name, sessionId);
+  return r !== null && displaceableShape(db, r, harnessPid) ? readChildren([r], harnessPid) : new Map();
+}
+
+/**
+ * Whether `sessionId` leaves the name record for `harnessPid` alone (#1404):
+ * it has no harness session, and a live root that may be an adapter's child
+ * (unkeyed, receiving, with a harness session) runs under the same pid. The
+ * record is keyed by harness pid, so the two share it; the adapter's child,
+ * its harness session's delivery owner, keeps it. The caller writes records
+ * only for an unkeyed, receiving root (mcp.ts RECORDS), so a missing harness
+ * session is all that's left of displaceableRow's test on this side. Run in
+ * the caller's write transaction with the record write, so such a sibling
+ * can't register between the check and the write (its own record write
+ * follows its register). `pre` is recordYieldReads' answer from before the
+ * lock: the transaction reads processes only for a row registered since.
+ */
+export function recordYields(db: Database, sessionId: string, harnessPid: number, pre: ChildReads = new Map()): boolean {
+  // Still that pid's child, as displaceableRow requires: an orphan under a reused pid isn't (#1401).
+  return liveChildren(yieldCandidates(db, sessionId, harnessPid), harnessPid, pre).length > 0;
+}
+
+/** recordYields' process reads, for its caller to take before the lock (ChildReads, #1463). */
+export function recordYieldReads(db: Database, sessionId: string, harnessPid: number): ChildReads {
+  return readChildren(yieldCandidates(db, sessionId, harnessPid), harnessPid);
+}
+
+// The rows recordYields judges: none when `sessionId` has a harness session.
+function yieldCandidates(db: Database, sessionId: string, harnessPid: number): RawSessionRow[] {
+  if (db.prepare(`SELECT 1 FROM ids WHERE id = ? AND harness_session IS NULL`).get(sessionId) === null) return [];
+  return db.prepare(
+    `${SESSION_SQL} AND b.harness_pid = ? AND b.session_id <> ? AND b.harness_rule IS NULL
+      AND i.harness_session IS NOT NULL AND i.keyed = 0 AND i.viewer = 0 AND i.delivery = 'push' AND i.ended_at IS NULL`,
+  ).all(harnessPid, sessionId) as RawSessionRow[];
+}
+
+/**
+ * Whether `writer`, the session that wrote the name record a restarting
+ * session found, can be its predecessor (#1457). The record is keyed by
+ * harness pid, so an adapter's child and a sibling grayboard under it share
+ * one (recordYields), and an adapter's child that exited bound leaves its
+ * names there: a session with no harness session never restarts one that has
+ * one, so it doesn't restore that record as its restart (nor inherit that
+ * session's status). A writer whose row retention pruned is taken at its word.
+ */
+export function recordPredecessor(db: Database, writer: string, harnessSession: string | undefined): boolean {
+  if (harnessSession !== undefined) return true;
+  const row = db.prepare(`SELECT harness_session FROM ids WHERE id = ?`).get(writer) as { harness_session: string | null } | null;
+  return row === null || row.harness_session === null;
 }
 
 // The displaced session's hold goes as an unbind's does (releaseName), logged

@@ -29,7 +29,12 @@ export type StartOptions = ApplicationOptions & {
   // The opened store to serve (openRepo in open_repo.ts, or a test's own makePgRepo); stop() closes it. Without one, startServer opens
   // config.store's SQLite file itself, which only tests rely on: they read the raw handle it exposes as `db`.
   repo?: Repo;
+  // How long stop() waits for the requests in flight to finish before it closes the store anyway (#218).
+  stopDrainMs?: number;
 };
+
+// stop()'s default drain deadline: inside a supervisor's usual stop grace (systemd's 90 s, Kubernetes' 30 s).
+export const STOP_DRAIN_MS = 10_000;
 
 // A start option overrides the config's limit; an explicit undefined one doesn't wipe it (#385 item 14).
 export function startLimits(config: Pick<Config, "helloLimit" | "hostedRequestLimit" | "hostedSubscriberLimit" | "delegateLimit" | "delegateOpenCap" | "hostedCaps" | "aliasScopeCap" | "serviceLimits">, opts: StartOptions) {
@@ -44,9 +49,11 @@ export function startLimits(config: Pick<Config, "helloLimit" | "hostedRequestLi
   };
 }
 
-function sqlitePath(store: Config["store"]): string {
-  if (store.kind !== "sqlite") throw new Error("startServer: a Postgres store is opened with openRepo, then passed as `repo`");
-  return store.path;
+function sqlitePath(config: Config): string {
+  if (config.store.kind !== "sqlite") throw new Error("startServer: a Postgres store is opened with openRepo, then passed as `repo`");
+  // The S3 store's module stays off app.ts's import graph (open_repo.ts says why), and its startup check is async.
+  if (config.blobS3) throw new Error("startServer: an S3 attachment store is opened with openRepo, then passed as `repo`");
+  return config.store.path;
 }
 
 export function startServer(config: Config, opts: StartOptions = {}) {
@@ -56,7 +63,7 @@ export function startServer(config: Config, opts: StartOptions = {}) {
     // move the tests that read it onto the Repo. The injected Repo's own attachment limits and session-end reach apply,
     // not config's: openRepo sets them from the same config.
     ? { db: undefined as unknown as ReturnType<typeof openDatabase>["db"], repo: opts.repo }
-    : openDatabase(sqlitePath(config.store), { blobDir: config.blobDir, sessionEnd: sessionEndPort(humanReach), attachmentLimits: config.attachmentLimits, attachmentUserQuota: config.attachmentUserQuota, ...(opts.now ? { now: opts.now } : {}) });
+    : openDatabase(sqlitePath(config), { blobDir: config.blobDir, sessionEnd: sessionEndPort(humanReach), attachmentLimits: config.attachmentLimits, attachmentUserQuota: config.attachmentUserQuota, ...(opts.now ? { now: opts.now } : {}) });
   let slack: SlackBridge | undefined;
   // Dev sign-in mints tokens for any email; they must not outlive it (#805 F-04). A
   // server started without dev auth revokes them, so a re-enable doesn't revive them.
@@ -65,7 +72,26 @@ export function startServer(config: Config, opts: StartOptions = {}) {
     const revoked = await repo.sessions.revokeDev(tx);
     if (revoked > 0) writeAudit(repo, tx, "auth.dev_sessions_revoked", null, null, { count: revoked });
   });
-  const application = createApplication(repo, { humanReach, slackRunning: () => slack?.running ?? false, ...startLimits(config, opts) });
+  // The background passes running when stop() began (a revalidate tick, the retention pass, a claim expiry sweep), by
+  // name: stop() waits for them too, or one resumes from an await onto a closed database (#1489). None starts once
+  // `stopping` is set. Declared before the application, whose startup ends may start background work.
+  const passes = new Map<Promise<void>, string>();
+  let stopping = false;
+  const pass = (what: string, running: Promise<unknown>) => {
+    const settled = running.then(() => {}, () => {});
+    passes.set(settled, what);
+    void settled.then(() => passes.delete(settled));
+  };
+  // The work a commit or a pass starts and nobody awaits (a wake's drains, a board change's fan-out, a blob sweep),
+  // tracked as a pass (#1493). Once stopping it doesn't start: a fan-out then has nobody to reach, and the next start's
+  // sweep finishes a skipped blob sweep. `run` logs its own failure; one that escapes is logged here.
+  const background = (what: string, run: (stopped: () => boolean) => Promise<unknown>) => {
+    if (stopping) return;
+    let running: Promise<unknown>;
+    try { running = run(() => stopping); } catch (e) { running = Promise.reject(e); }
+    pass(what, running.catch(e => console.error(`[grayboard] ${what} failed:`, e)));
+  };
+  const application = createApplication(repo, { humanReach, slackRunning: () => slack?.running ?? false, ...startLimits(config, opts), runBackground: background });
   const { revalidate, disconnectUser, accessChanged, stopExpiry, wake } = application;
 
   const authGate = new AuthGate(repo, {
@@ -103,6 +129,53 @@ export function startServer(config: Config, opts: StartOptions = {}) {
   const ready: Promise<void> = settleAll([devRevoked, application.ready, oauth.ready, mcp.sessions.ready]).then(() => testPauseAsync("server:ready"));
   let started = false;
   ready.then(() => { started = true; }, () => {});
+
+  // Every request the listener has taken and not yet answered, by its method and path (never the query: it can
+  // carry a token). server.stop(true) closes their connections, but their handlers run on; stop() waits for them
+  // before it closes the store, or one resumes from an await onto a closed database (#218).
+  const inFlight = new Map<Promise<Response>, string>();
+  const track = (what: string, response: Promise<Response>): Promise<Response> => {
+    inFlight.set(response, what);
+    void response.then(() => inFlight.delete(response), () => inFlight.delete(response));
+    return response;
+  };
+  // The revalidate tick, and the one tests call by hand; its promise is revalidate's own.
+  const runRevalidate = (): Promise<void> => {
+    if (stopping) return Promise.resolve();
+    let running: Promise<void>;
+    try { running = revalidate(); } catch (e) { running = Promise.reject(e); }
+    pass("revalidate pass", running);
+    return running;
+  };
+  // One deadline for all of it: the requests and passes, then the writes they (and the touch queue, the OAuth sweep)
+  // posted and nobody awaits, which a final write queued behind them outlasts (the queue is FIFO).
+  async function drain(ms: number): Promise<void> {
+    const count = (suffix: string) => [
+      inFlight.size ? `${inFlight.size} request${inFlight.size === 1 ? "" : "s"}${suffix}` : "",
+      passes.size ? `${passes.size} background pass${passes.size === 1 ? "" : "es"}` : "",
+    ].filter(Boolean).join(" and ");
+    // Bounded: unauthenticated requests are tracked too, so the list and each path are capped.
+    const named = () => { const all = [...inFlight.values(), ...passes.values()].map(w => w.length > 120 ? `${w.slice(0, 120)}…` : w); return all.length > 10 ? `${all.slice(0, 10).join(", ")} +${all.length - 10} more` : all.join(", "); };
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const expired = new Promise<"expired">(resolve => { timer = setTimeout(() => resolve("expired"), ms); });
+    const fail = (what: string): never => {
+      // Said here as well: main.ts redacts a failed stop's error, and a method and path or a pass's name carry no secret.
+      const message = `stop: ${what}`;
+      console.error(`[grayboard] ${message}`);
+      throw new Error(message);
+    };
+    try {
+      if (inFlight.size || passes.size) {
+        console.error(`[grayboard] stopping: waiting for ${count(" in flight")}: ${named()}`);
+        while (inFlight.size || passes.size) {
+          if (await Promise.race([Promise.allSettled([...inFlight.keys(), ...passes.keys()]), expired]) === "expired") {
+            fail(`${count("")} never finished within ${ms} ms: ${named()}`);
+          }
+        }
+      }
+      if (await Promise.race([repo.write(() => {}).then(() => {}, () => {}), expired]) === "expired") fail(`the queued writes never finished within ${ms} ms`);
+    } finally { clearTimeout(timer); }
+  }
 
   async function route(req: Request, caller: Caller): Promise<Response> {
     const url = new URL(req.url);
@@ -156,11 +229,13 @@ export function startServer(config: Config, opts: StartOptions = {}) {
     maxRequestBodySize: repo.attachmentLimits.file + MAX_BODY_BYTES,
 
     async fetch(req, server) {
-      if (!started) await ready;
-      // First, before anything reads the database (#240).
-      const caller = authGate.caller(req, server.requestIP(req)?.address);
-      // Every audit row this request writes carries where it came from (security audit F-19).
-      return inRequest({ ip: caller.ip, ua: userAgent(req) }, () => route(req, caller));
+      return track(`${req.method} ${new URL(req.url).pathname}`, (async () => {
+        if (!started) await ready;
+        // First, before anything reads the database (#240).
+        const caller = authGate.caller(req, server.requestIP(req)?.address);
+        // Every audit row this request writes carries where it came from (security audit F-19).
+        return inRequest({ ip: caller.ip, ua: userAgent(req) }, () => route(req, caller));
+      })());
     },
 
     // A route that throws something other than a refusal it maps itself. Bun's
@@ -175,17 +250,17 @@ export function startServer(config: Config, opts: StartOptions = {}) {
   // Before the timers and the lag sampler: a metrics port in use fails startup with only the main listener to unwind.
   let metrics: ReturnType<typeof serveMetrics> | undefined;
   try { metrics = config.metricsAddr ? serveMetrics(config.metricsAddr, gauges) : undefined; }
-  catch (e) { server.stop(true); throw e; }
+  catch (e) { void server.stop(true); throw e; }
 
   const timers: ReturnType<typeof setInterval>[] = [];
-  let stopRetention: (() => void) | undefined;
+  let stopRetention: (() => Promise<void>) | undefined;
   let stopPromise: Promise<void> | undefined;
   if (opts.background !== false) {
     timers.push(setInterval(sweepLimits, 30_000), setInterval(() => {
       // A throw here would surface as an unhandled error every 30 s with no context; log it and let the next tick retry.
       // Async since #807 P3 A7u2: a rejection is logged the same way, never left unhandled (Bun exits on one).
       const failed = (e: unknown) => console.error(`[grayboard] revalidate failed: ${(e as Error).stack ?? e}`);
-      try { revalidate().catch(failed); } catch (e) { failed(e); }
+      runRevalidate().catch(failed);
     }, 30_000));
     stopRetention = startRetentionJobs(repo, config, opts.retentionFirstDelayMs !== undefined ? { firstDelayMs: opts.retentionFirstDelayMs } : undefined, application.boardsChanged);
   }
@@ -202,8 +277,8 @@ export function startServer(config: Config, opts: StartOptions = {}) {
     db: testDb,
     // Exposed for tests: the bridge instance, to drive fatal stops directly.
     slack,
-    // The auth re-check and limiter sweep, for tests that run without it.
-    revalidate,
+    // The auth re-check and limiter sweep, for tests that run without it. Tracked as the timer's is: stop() waits for it.
+    revalidate: runRevalidate,
     sweepLimits,
     authGate,
     // Settles once the startup writes have committed (the listener waits for it); rejects when one failed.
@@ -215,18 +290,23 @@ export function startServer(config: Config, opts: StartOptions = {}) {
     metrics,
     stop() {
       if (stopPromise) return stopPromise;
+      stopping = true;
       slack?.stop();
       for (const t of timers) clearInterval(t);
-      stopRetention?.();
+      if (stopRetention) pass("retention pass", stopRetention());
       stopLag?.();
-      metrics?.stop(true);
-      stopExpiry();
+      void metrics?.stop(true);
+      pass("claim expiry pass", stopExpiry());
       touches.cancelAll();
-      server.stop(true);
-      // After the startup writes settle: closing the database under a queued one would fail it mid-flight.
-      stopPromise = ready.catch(() => {}).then(() => Promise.allSettled([mcp.close(), attachments.close()])).then(outcomes => {
+      void server.stop(true);
+      // After the startup writes settle: closing the database under a queued one would fail it mid-flight. Then the
+      // requests still in flight, once hosted MCP and the attachment routes have refused theirs (#218), and the
+      // background passes already running (#1489).
+      stopPromise = ready.catch(() => {}).then(() => Promise.allSettled([mcp.close(), attachments.close()])).then(async outcomes => {
+        const drained = await drain(opts.stopDrainMs ?? STOP_DRAIN_MS).then(() => undefined, (error: unknown) => error);
         const failure = outcomes.find(outcome => outcome.status === "rejected");
         if (failure?.status === "rejected") throw failure.reason;
+        if (drained) throw drained;
       }).finally(async () => {
         // Awaited (#807 P3 C11a): a Postgres Repo's pool and LISTEN connection close over the network, and a caller
         // that exits once stop() settles would otherwise cut them off and leave its database in use. The Repo closes

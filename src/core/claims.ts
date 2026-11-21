@@ -1,10 +1,10 @@
 import type { Database } from "bun:sqlite";
 
-import { REDELIVERED_NOTE, canSeeBoard, getBoard, isHuman, normalizeBoard, post, redeliverQueuePost, seenHandles, systemBody, userViewer, type BoardPredicate, type PostOpts, type PostResult, type Viewer } from "./boards.ts";
+import { REDELIVERED_NOTE, canSeeBoard, getBoard, holdingSessionSql, isHuman, normalizeBoard, post, redeliverQueuePost, seenHandles, systemBody, userViewer, type BoardPredicate, type PostOpts, type PostResult, type Viewer } from "./boards.ts";
 import { holderUserRule } from "./claim_holder.ts";
 import { idRow } from "./bindings.ts";
 import { CoreError } from "./errors.ts";
-import { immediateTx, type WriteTx } from "./write_tx.ts";
+import { immediateTx } from "./write_tx.ts";
 
 export type Claim = {
   key: string;
@@ -122,8 +122,7 @@ export type ClaimEventRow = { handle: string; event: ClaimEvent; note: string | 
 export function logEvent(db: Database, event: ClaimEvent, handle: string, c: Partial<Claim> & { key: string }, at: number, heldBy?: string): void {
   db.prepare(
     `INSERT INTO claim_events (key, handle, event, note, board, expires_at, held_by, at, session_id)
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
-       COALESCE((SELECT id FROM alias_holds WHERE address = ?2), (SELECT id FROM ids WHERE id = ?2)))`,
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ${holdingSessionSql("?2")})`,
   ).run(c.key, handle, event, c.note ?? null, c.board ?? null, c.expires_at ?? null, heldBy ?? null, at);
 }
 
@@ -140,7 +139,7 @@ export type TakeOpts = { ttl_minutes?: number; until?: string; note?: string; bo
 
 /** claim_take's argument checks, in order: the key, the note, the reserved queue: keyspace, the ttl or stop time,
  * the board name. Throws CoreError; reads nothing. */
-export function checkTake(keyInput: string, opts: TakeOpts): { key: string; board: string | null } {
+export function checkTake(keyInput: string, opts: TakeOpts, now = Date.now()): { key: string; board: string | null } {
   const key = validKey(keyInput);
   validNote(opts.note);
   // The queue: keyspace is the delivery machinery's: only claimQueuePost
@@ -152,7 +151,7 @@ export function checkTake(keyInput: string, opts: TakeOpts): { key: string; boar
     throw new CoreError(
       `claim keys starting "queue:" are reserved for queue-board delivery; pick up queued work through the board flow instead`,
     );
-  expiresAt(Date.now(), opts.ttl_minutes, opts.until); // validate before taking the lock
+  expiresAt(now, opts.ttl_minutes, opts.until); // validate before taking the lock
   return { key, board: opts.board ? normalizeBoard(opts.board) : null };
 }
 
@@ -512,15 +511,16 @@ export function watch(db: Database, handle: string, keyInput: string, off = fals
 
 // Claims are visible to everyone on the bus. The announcing board's name is
 // hidden from handles that can't see that board; with `seer` (a session ID or
-// handle), a holder it may not see is withheld with its note (#871).
-export function listClaims(db: Database, prefix?: string): Claim[];
-export function listClaims(db: Database, prefix: string | undefined, viewer: Viewer, seer?: string): ClaimView[];
-export function listClaims(db: Database, prefix?: string, viewer?: Viewer, seer?: string): ClaimView[] {
+// handle), a holder it may not see is withheld with its note (#871). `now`: the clock live claims are judged at, the
+// server's store clock there (#1390).
+export function listClaims(db: Database, prefix?: string, viewer?: undefined, seer?: undefined, now?: number): Claim[];
+export function listClaims(db: Database, prefix: string | undefined, viewer: Viewer, seer?: string, now?: number): ClaimView[];
+export function listClaims(db: Database, prefix?: string, viewer?: Viewer, seer?: string, now = Date.now()): ClaimView[] {
   const rows = db
     .prepare(
       `SELECT ${CLAIM_COLS} FROM claims WHERE expires_at > ? AND key LIKE ? ESCAPE '\\' ORDER BY key`,
     )
-    .all(Date.now(), `${(prefix ?? "").replace(/[\\%_]/g, "\\$&")}%`) as Claim[];
+    .all(now, `${(prefix ?? "").replace(/[\\%_]/g, "\\$&")}%`) as Claim[];
   if (viewer === undefined) return rows;
   return rows
     .filter((c) => !isQueueKey(c.key) || (!!c.board && canSeeBoard(db, viewer, c.board)))
@@ -600,6 +600,8 @@ export function sweepExpired(db: Database, now = Date.now()): ClaimChanges {
 export type ExpirySource = {
   next(): number | null | Promise<number | null>;
   sweep(): ClaimChanges | Promise<ClaimChanges>;
+  // The clock next() and the sweep read, which the timer's delay is measured against; Date.now when absent.
+  now?(): number;
 };
 
 // One timer, armed for the next expiry of a claim with a board, so a lapse is
@@ -609,33 +611,38 @@ export function claimExpiryTimer(
   db: Database,
   onWake: (handles: string[]) => void,
   onBoardsChanged?: (boards: string[]) => void | Promise<void>,
-  tx: WriteTx = immediateTx(db),
 ): { arm(): void; stop(): void } {
   return expiryTimer({
     next: () => (db.prepare(`SELECT MIN(expires_at) AS next FROM claims WHERE board IS NOT NULL`).get() as { next: number | null }).next,
-    // A queued `tx` may make the sweep wait (#807 D4): the clock is read inside it.
-    sweep: () => tx((w) => sweepChanges(w, Date.now())),
+    sweep: () => immediateTx(db)((w) => sweepChanges(w, Date.now())),
   }, onWake, onBoardsChanged);
 }
 
 // claimExpiryTimer over any source. An asynchronous next() resolves after the arm that asked: a read that started
 // before a commit may miss that commit's claim, but the commit's own arm reads after it; a stale earlier time only
 // fires an empty sweep, which re-arms. A failed sweep or read retries after `retryMs`: a transient store error
-// mustn't leave live claims' lapses unannounced until the next arm.
+// mustn't leave live claims' lapses unannounced until the next arm. stop() resolves once a sweep or read already
+// running has settled (#1489): a server awaits it before it closes the store.
 export function expiryTimer(
   source: ExpirySource,
   onWake: (handles: string[]) => void,
   onBoardsChanged?: (boards: string[]) => void | Promise<void>,
   retryMs = 5_000,
-): { arm(): void; stop(): void } {
+): { arm(): void; stop(): Promise<void> } {
   let timer: ReturnType<typeof setTimeout> | undefined;
   let at = Infinity;
   let stopped = false;
+  const running = new Set<Promise<unknown>>();
+  const track = (p: Promise<unknown>) => {
+    const settled = p.then(() => {}, () => {}).finally(() => running.delete(settled));
+    running.add(settled);
+  };
+  const clock = () => (source.now ? source.now() : Date.now());
   const set = (when: number) => {
     if (stopped) return;
     clearTimeout(timer);
     at = when;
-    timer = setTimeout(() => void fire().catch(e => console.error("[grayboard] claim expiry timer failed:", e)), Math.max(0, when - Date.now()));
+    timer = setTimeout(() => track(fire().catch(e => console.error("[grayboard] claim expiry timer failed:", e))), Math.max(0, when - clock()));
     timer.unref?.();
   };
   const fire = async () => {
@@ -652,7 +659,7 @@ export function expiryTimer(
       if (!stopped && wake.length) onWake(wake);
     } catch (e) {
       console.error("[grayboard] claim expiry sweep failed:", e);
-      return set(Date.now() + retryMs);
+      return set(clock() + retryMs);
     }
     arm();
   };
@@ -664,7 +671,7 @@ export function expiryTimer(
     const next = source.next();
     if (!(next instanceof Promise)) return moveTo(next);
     // set() checks stopped, so a stop while the read waited arms nothing.
-    next.then(moveTo, e => { console.error("[grayboard] claim expiry arm failed:", e); moveTo(Date.now() + retryMs); });
+    track(next.then(moveTo, e => { console.error("[grayboard] claim expiry arm failed:", e); moveTo(clock() + retryMs); }));
   };
   arm();
   return {
@@ -674,6 +681,7 @@ export function expiryTimer(
       clearTimeout(timer);
       timer = undefined;
       at = Infinity;
+      return Promise.all([...running]).then(() => {});
     },
   };
 }

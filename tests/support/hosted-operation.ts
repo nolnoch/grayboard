@@ -30,7 +30,8 @@ try {
   else { now = input.sweepAt!; await hosted.sweep(); result = { swept: true }; }
   console.log(JSON.stringify({ ok: true, result }));
 } catch (error) {
-  console.log(JSON.stringify({ ok: false, code: (error as { code?: string }).code }));
+  // The message too: a failure the test didn't expect (#1134) must say what it was.
+  console.log(JSON.stringify({ ok: false, code: (error as { code?: string }).code, message: String((error as { message?: unknown }).message ?? error) }));
 } finally {
   delivery.close(); await hosted.close(); application.stopExpiry(); db.close();
 }

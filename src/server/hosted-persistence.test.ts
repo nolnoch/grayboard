@@ -31,7 +31,7 @@ async function open() {
   hosted = createHostedSessions(application, { now: () => now, isAuthorized }); await hosted.ready;
   delivery = createDelivery(hosted, { isAuthorized });
 }
-async function close() { delivery.close(); await hosted.close(); application.stopExpiry(); database.db.close(); }
+async function close() { delivery.close(); await hosted.close(); await application.stopExpiry(); database.db.close(); }
 async function issue(email = "you@example.com") {
   const issued = await issueOAuth(database.repo, resource, email, ["grayboard:tools", "grayboard:delivery"], now, OPENCODE_CLIENT);
   const principal: OAuthPrincipal = { authed: issued.authed, clientId: OPENCODE_CLIENT, sourceKey: OPENCODE_SESSION_META, grantId: issued.grantId, accessHash: hashToken(issued.token), accessExpiry: issued.tokens.accessExpiresAt, scopes: ["tools", "delivery"] };
@@ -42,15 +42,15 @@ afterEach(async () => { await close(); rmSync(dir, { recursive: true, force: tru
 const releases = () => database.db.query<{ detail: string }, []>("SELECT detail FROM binding_events WHERE event='released'").all();
 
 async function overlap(first: Record<string, unknown>, second: Record<string, unknown>, pause: string) {
-  delivery.close(); await hosted.close(); application.stopExpiry();
+  delivery.close(); await hosted.close(); await application.stopExpiry();
   const release = join(dir, "release-transaction");
   const start = (operation: Record<string, unknown>, point: string) => transactionProcess("tests/support/hosted-operation.ts", [join(dir, "bus.db"), join(dir, "blobs"), JSON.stringify({ now, ...operation })], point, release);
   const workers = [start(first, pause), start(second, "")];
   try {
     await Promise.all(workers.map(w => w.wait("READY")));
-    workers[0]!.proc.stdin.end();
+    void workers[0]!.proc.stdin.end();
     await workers[0]!.wait(`test pause hit: ${pause}`);
-    workers[1]!.proc.stdin.end();
+    void workers[1]!.proc.stdin.end();
     await workers[1]!.wait("OPERATING");
     await Bun.write(release, "release");
     await Promise.all(workers.map(async w => { expect(await w.proc.exited).toBe(0); await w.done; }));
@@ -73,7 +73,7 @@ for (const revokeFirst of [false, true]) test(`forced attachment/revoke transact
     expect((await database.repo.hosted.all(database.repo.read)).every(row => row.grant_id === first.grantId)).toBe(true);
     expect(releases()).toEqual([]);
   } else {
-    expect(results.every(result => result.ok)).toBe(true);
+    expect(results).toMatchObject([{ ok: true }, { ok: true }]);   // on a failure, prints both workers' results (#1134)
     expect(hostedRowCount(database.db)).toBe(0);
     expect(releases()).toEqual([{ detail: "revoked" }]);
   }
@@ -95,7 +95,7 @@ test("forced release/bind overlap hands the name to the contender only after the
   const { principal } = await issue();
   await hosted.bind(principal, context(principal), { name: "fe", create: true });
   const results = await overlap({ operation: "end", principal, rawSession: "root" }, { operation: "bind", principal, rawSession: "other" }, "hosted:release:in-txn");
-  expect(results.every(result => result.ok)).toBe(true);
+  expect(results).toMatchObject([{ ok: true }, { ok: true }]);
   const rows = await database.repo.hosted.all(database.repo.read);
   expect(rows.map(row => row.source_session_id)).toEqual(["other"]);
   expect((await application.hostedHolds(application.repo.read, rows[0]!.session_id)).map(short)).toEqual(["fe"]);
@@ -106,7 +106,7 @@ test("forced root registration/end overlap cannot leave an orphan child", async 
   const { principal } = await issue();
   await hosted.bind(principal, context(principal), { name: "fe", create: true });
   const results = await overlap({ operation: "register", principal, child: "child" }, { operation: "end", principal }, "hosted:register:in-txn");
-  expect(results.every(result => result.ok)).toBe(true);
+  expect(results).toMatchObject([{ ok: true }, { ok: true }]);
   expect(hostedRowCount(database.db)).toBe(0);
   expect(releases()).toHaveLength(1);
 }, 15_000);
@@ -116,7 +116,7 @@ test("forced expiry/rebind overlap releases only the expired ownership", async (
   await hosted.bind(principal, context(principal), { name: "fe", create: true });
   const lease = await delivery.open(principal, context(principal));
   const results = await overlap({ operation: "sweep", principal, sweepAt: now + 30_001 }, { operation: "bind", principal }, "hosted:lease-expire:in-txn");
-  expect(results.every(result => result.ok)).toBe(true);
+  expect(results).toMatchObject([{ ok: true }, { ok: true }]);
   const rows = await database.repo.hosted.all(database.repo.read);
   expect(rows).toHaveLength(1);
   expect(rows[0]?.ownership_id).not.toBe(lease.ownership);
@@ -239,7 +239,7 @@ for (const operation of ["revoke", "bind"] as const) {
     await hosted.bind(principal, context(principal), { name: "fe", create: true });
     const message = await seed(database.repo, tx => database.repo.messages.insert(tx, "sender@example.com/be", "user", "you@example.com/fe", "admitted", null, false));
     const results = await overlap({ operation: "receipt", principal }, { operation, principal, name: "be", refreshHash: hashToken(issued.refreshToken) }, "hosted:receipt:in-txn");
-    expect(results.every(result => result.ok)).toBe(true);
+    expect(results).toMatchObject([{ ok: true }, { ok: true }]);
     expect(await database.repo.cursors.directFor(database.repo.read, "you@example.com/fe")).toBe(message.id);
   }, 15_000);
 }

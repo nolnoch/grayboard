@@ -1,4 +1,5 @@
 // repo_sql.ts, audit.ts and hosted_rows.ts on each backend (#807 P3 C11c): the same SQL, the same rows.
+import { until } from "./until.ts";
 import { describe, expect, test } from "bun:test";
 import { writeAudit } from "../../src/server/audit.ts";
 import { accessAudits, auditOrigins } from "./audit.ts";
@@ -59,5 +60,31 @@ describe.each(backends)("on %s", (backend) => {
     spy.restore();
     expect(seen).toEqual([false, true, true, true, true, false]);
     expect([repo.write, repo.post, repo.hosted.write]).toEqual([write, post, hostedWrite]);
+  });
+
+  // #1510: the caller's own body, not any open one: a request's pool read beside another task's touch is outside.
+  test("txSpy is false in a task outside the open body, and in a continuation the body leaves past its settle", async () => {
+    await using srv = await TestServer.open({}, { backend });
+    await srv.app.ready;
+    const repo = srv.app.repo;
+    const spy = txSpy(srv);
+    let release!: () => void, resume!: () => void;
+    const entered = new Promise<void>(r => { release = r; });
+    const later = new Promise<void>(r => { resume = r; });
+    let hold!: () => void;
+    let late: boolean | undefined;
+    const body = repo.write(async () => {
+      void later.then(() => { late = spy.open; });
+      release();
+      await new Promise<void>(r => { hold = r; });
+    });
+    await entered;
+    const outside = spy.open;
+    hold();
+    await body;
+    resume();
+    await until(() => late !== undefined, 5000, "the body's left-over continuation to run");
+    spy.restore();
+    expect({ outside, late }).toEqual({ outside: false, late: false });
   });
 });

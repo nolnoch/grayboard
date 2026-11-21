@@ -20,7 +20,8 @@
 //     the key's holder. The post lock keeps a sweep's order posts, then outbox, as a prune's is: a push reset (an
 //     outbox UPDATE, no FK check) would otherwise hold the row a prune's outbox delete waits on while the sweep's next
 //     post write waits on the prune's batch, a deadlock (c10e2 audit 1).
-//   - Lock order across tables: posts, then outbox, then subscriptions. forget, read and acknowledge each write a
+//   - Lock order across tables: posts, then outbox, then claim_events (a delivered queue push's take, #1461), then
+//     subscriptions. forget, read and acknowledge each write a
 //     handle's outbox rows before its subscriptions, so a handle's forget racing its read waits rather than deadlocks
 //     (c10e2 audit 2); prunePosts locks posts first and touches no subscription.
 //   - acknowledge's and read's GREATEST is re-evaluated on the newest row version after the row lock, so a cursor or
@@ -54,6 +55,7 @@
 // is restated, and so are normalizeBoard and the catalog page size (pinned to core's by the contract runner).
 import { CoreError } from "../../../core/errors.ts";
 import type { Post } from "../../../shared/notifications.ts";
+import { testPauseAsync } from "../../../shared/testpause.ts";
 import type { Board, BoardSummary, BoardsStore, DigestRow, PushRow, SubMode, ThreadFacts, WhoRow } from "../boards.ts";
 import { MissingPost } from "../errors.ts";
 import type { Read } from "../tx_base.ts";
@@ -61,7 +63,7 @@ import { bindLocked, dropAttachments, lockUnsent, withAttachments } from "./atta
 import { foreignKeyViolation } from "./errors.ts";
 import { int8, int8OrNull } from "./sql.ts";
 import { insertClaimEvent } from "./claims.ts";
-import { pgOf, type PgFragment, type PgSql } from "./tx.ts";
+import { pgOf, refuseKeyed, type PgFragment, type PgSql } from "./tx.ts";
 
 type Row = Record<string, unknown>;
 
@@ -106,10 +108,10 @@ const flag = (v: unknown): number | null => (v === null || v === undefined ? nul
 
 // ── core's shared fragments, over a handle expression (a parameter, or a column in views) ──
 // NOT_OWN: not written by the reader's session, as its address, its session (or the session holding it) or a child
-// of that session.
+// of that session, the child's root as recorded when written (author_root, #540; a row without one reads it now).
 const notOwn = (sql: PgSql, h: PgFragment) => sql.fragment`NOT (p.author = ${h} OR p.author_id IS NOT NULL
   AND COALESCE((SELECT ah.id FROM alias_holds ah WHERE ah.address = ${h}), ${h})
-    IN (p.author_id, COALESCE((SELECT ri.root_id FROM ids ri WHERE ri.id = p.author_id), p.author_id)))`;
+    IN (p.author_id, COALESCE(p.author_root, (SELECT ri.root_id FROM ids ri WHERE ri.id = p.author_id), p.author_id)))`;
 // NOT_PUSHED: no outbox row for the reader (digests). NOT_PUSHED_YET: none that woke or was delivered (views' counts).
 const notPushed = (sql: PgSql, h: PgFragment) => sql.fragment`NOT EXISTS (SELECT 1 FROM outbox o WHERE o.handle = ${h} AND o.post_id = p.id)`;
 const notPushedYet = (sql: PgSql, h: PgFragment) => sql.fragment`NOT EXISTS (SELECT 1 FROM outbox o WHERE o.handle = ${h} AND o.post_id = p.id
@@ -120,8 +122,27 @@ const laneSession = (sql: PgSql, h: PgFragment) => sql.fragment`COALESCE((SELECT
 // core laneAddressesSql: `lane`'s session's ID and every alias it holds, as a one-column subquery.
 const laneAddresses = (sql: PgSql, lane: PgFragment) =>
   sql.fragment`(SELECT ${laneSession(sql, lane)} AS address UNION ALL SELECT la.address FROM alias_holds la WHERE la.id = ${laneSession(sql, lane)})`;
-// core liveSessionSql (#1351): `sid` names a live session, so a claim_events row with it is session-keyed.
+// core liveSessionSql (#1351): `sid` names a live session, so a claim_events or outbox (#1370) row with it is session-keyed.
 const liveSession = (sql: PgSql, sid: PgFragment) => sql.fragment`EXISTS (SELECT 1 FROM ids x WHERE x.id = ${sid} AND x.ended_at IS NULL)`;
+// core holdingSessionSql (#1351, #1370): the session holding `h` as a row is written, the alias's holder, else `h` when
+// it is a session ID, else NULL.
+const holdingSession = (sql: PgSql, h: PgFragment) =>
+  sql.fragment`COALESCE((SELECT hs.id FROM alias_holds hs WHERE hs.address = ${h}), (SELECT hi.id FROM ids hi WHERE hi.id = ${h}))`;
+// The session a delivery to `handle` credits (#1461, #1466): `receiver` when the caller names it, else `handle`'s holder.
+const credited = (sql: PgSql, handle: string, receiver?: string) =>
+  receiver === undefined ? holdingSession(sql, sql.fragment`${handle}::text`) : sql.fragment`${receiver}::text`;
+// core heldBy (#1466), in the statement that marks: `handle` is `receiver`'s ID or an alias it holds; TRUE with none.
+// Judged in that statement's snapshot, so a hold that moved in a transaction committed before it is seen.
+const heldBy = (sql: PgSql, handle: string, receiver?: string) => receiver === undefined ? sql.fragment`TRUE`
+  : sql.fragment`(${handle}::text = ${receiver}::text OR EXISTS (SELECT 1 FROM alias_holds hb WHERE hb.address = ${handle}::text AND hb.id = ${receiver}::text))`;
+// core creditQueueTakes (#1461): each post's newest take under `handle` re-records the session credited (`receiver`,
+// else the one holding `handle` now), while the post's claim still names `handle`.
+async function creditQueueTakes(sql: PgSql, handle: string, board: string, postIds: number[], receiver?: string): Promise<void> {
+  await sql`UPDATE claim_events SET session_id = ${credited(sql, handle, receiver)}
+    WHERE id IN (SELECT MAX(ce.id) FROM claim_events ce WHERE ce.key = ANY(${postIds.map(id => `queue:${board}:${id}`)}::text[])
+      AND ce.handle = ${handle} AND ce.event = 'take'
+      AND EXISTS (SELECT 1 FROM claims c WHERE c.key = ce.key AND c.holder = ${handle}) GROUP BY ce.key)`;
+}
 // core primaryHoldSql: session `id`'s oldest hold (HOLD_ORDER), or NULL.
 const primaryHold = (sql: PgSql, id: PgFragment) =>
   sql.fragment`(SELECT ph.address FROM alias_holds ph WHERE ph.id = ${id} ORDER BY ph.bound_at, ph.address COLLATE "C" LIMIT 1)`;
@@ -133,9 +154,10 @@ const aliasSession = (sql: PgSql) => sql.fragment`COALESCE(
 
 // queueLaneRows' statement ($board, $poster), exported for its plan test (#1174 audit H1: it runs inside every queue
 // post's and requeue's write transaction). A lane's takes are two subqueries, as core's (#1351): `es`, its session's
-// session-keyed takes, and `e`, the address-keyed takes under its addresses now. No planner pins: Postgres picks
-// idx_claim_events_take_sid (board, session_id, at) and idx_claim_events_take (board, handle, at) on its own; the plan
-// test asserts it does.
+// session-keyed takes, and `e`, the address-keyed takes under its addresses now; its pushes the same (#1370): `os`, its
+// session's session-keyed outbox rows, and `o2`, the address-keyed ones. No planner pins: Postgres picks
+// idx_claim_events_take_sid (board, session_id, at), idx_claim_events_take (board, handle, at) and idx_outbox_session
+// (session_id, post_id) on its own; the plan test asserts it does.
 export function laneRowsStatement(sql: PgSql, board: string, poster: string[]): PgFragment {
   const lane = sql.fragment`l.lane`;
   return sql.fragment`WITH lanes AS (
@@ -154,8 +176,12 @@ export function laneRowsStatement(sql: PgSql, board: string, poster: string[]): 
         COALESCE((SELECT MAX(e.at) FROM claim_events e
                   WHERE e.board = ${board} AND e.handle IN ${laneAddresses(sql, lane)} AND e.event = 'take' AND e.key LIKE 'queue:%'
                     AND NOT ${liveSession(sql, sql.fragment`e.session_id`)}), 0),
+        COALESCE((SELECT MAX(ps.created_at) FROM outbox os JOIN posts ps ON ps.id = os.post_id
+                  WHERE os.session_id = ${laneSession(sql, lane)} AND ps.board = ${board}
+                    AND ${liveSession(sql, sql.fragment`os.session_id`)}), 0),
         COALESCE((SELECT MAX(p2.created_at) FROM outbox o2 JOIN posts p2 ON p2.id = o2.post_id
-                  WHERE o2.handle IN ${laneAddresses(sql, lane)} AND p2.board = ${board}), 0)), 0) ASC NULLS FIRST,
+                  WHERE o2.handle IN ${laneAddresses(sql, lane)} AND p2.board = ${board}
+                    AND NOT ${liveSession(sql, sql.fragment`o2.session_id`)}), 0)), 0) ASC NULLS FIRST,
       l.lane COLLATE "C" ASC`;
 }
 
@@ -246,19 +272,41 @@ export function makePgBoards({ clock }: { clock: () => number }): BoardsStore {
       return rows.map((x): DigestRow => ({ board: x.digest_board as string, unread: int8(x.unread), latest: toPost(x) }));
     },
     // Core acknowledge; each GREATEST re-evaluates after the row lock (header).
-    async acknowledge(tx, handle, ref) {
+    async acknowledge(tx, handle, ref, receiver) {
       const sql = pgOf(tx);
+      // core: with `receiver`, only while `handle` is still its address (#1466). Each marking statement carries the
+      // check in its WHERE, so it is judged with the mark, not by a read before it.
+      const held = heldBy(sql, handle, receiver);
       if (ref.kind === "digest") {
-        await sql`UPDATE subscriptions SET notified_id = GREATEST(notified_id, ${ref.latest_id}::int8) WHERE board = ${ref.board} AND handle = ${handle}`;
+        await sql`UPDATE subscriptions SET notified_id = GREATEST(notified_id, ${ref.latest_id}::int8) WHERE board = ${ref.board} AND handle = ${handle} AND ${held}`;
         return;
       }
-      const [row] = await sql`SELECT o.reason, p.board FROM outbox o JOIN posts p ON p.id = o.post_id WHERE o.handle = ${handle} AND o.post_id = ${ref.post_id}`;
+      const [row] = await sql`SELECT o.reason, p.board, b.kind FROM outbox o JOIN posts p ON p.id = o.post_id
+        JOIN boards b ON b.name = p.board WHERE o.handle = ${handle} AND o.post_id = ${ref.post_id}`;
       if (!row) return;
-      await sql`UPDATE outbox SET delivered_at = ${clock()} WHERE handle = ${handle} AND post_id = ${ref.post_id}`;
+      // core: credited to `receiver`, else the session holding `handle` now, on its first delivery (#1461). The update
+      // itself decides "first": its WHERE is re-checked on the newest row version after the row lock, so of two
+      // concurrent acks only one matches (the SELECT above is unlocked and would let both credit). The repeat stamp
+      // touches only a row already delivered, so a hold that moves back between the two never marks without crediting.
+      const now = clock();
+      const first: Row[] = await sql`UPDATE outbox SET delivered_at = ${now}, session_id = ${credited(sql, handle, receiver)}
+        WHERE handle = ${handle} AND post_id = ${ref.post_id} AND delivered_at IS NULL AND ${held} RETURNING post_id`;
+      if (first.length === 0) {
+        // A test forces a hold moving back here (#1472): the repeat's `delivered_at IS NOT NULL` then keeps it unmarked.
+        await testPauseAsync("boards:acknowledge:repeat");
+        const again: Row[] = await sql`UPDATE outbox SET delivered_at = ${now}
+          WHERE handle = ${handle} AND post_id = ${ref.post_id} AND delivered_at IS NOT NULL AND ${held} RETURNING post_id`;
+        if (again.length === 0 && receiver !== undefined) return;
+      } else if (row.kind === "queue") {
+        // A claim_events write: exclusive bodies only (D4, #1510 chunk 4). Keyed receipt misses on a queue board before
+        // it gets here; this is the backstop.
+        refuseKeyed(tx, "boards.acknowledge's queue take credit (a claim_events write)");
+        await creditQueueTakes(sql, handle, row.board as string, [ref.post_id], receiver);
+      }
       // Push-mode subscribers have now seen it in full: count it as read.
       if (row.reason === "subscription") {
         await sql`UPDATE subscriptions SET cursor = GREATEST(cursor, ${ref.post_id}::int8), notified_id = GREATEST(notified_id, ${ref.post_id}::int8)
-          WHERE board = ${row.board as string} AND handle = ${handle} AND mode = 'push'`;
+          WHERE board = ${row.board as string} AND handle = ${handle} AND mode = 'push' AND ${held}`;
       }
     },
 
@@ -387,7 +435,7 @@ export function makePgBoards({ clock }: { clock: () => number }): BoardsStore {
       return row ? toBoard(row) : null;
     },
     // Core readRows; the cursor's GREATEST re-evaluates after the row lock (header).
-    async read(tx, board, handle, opts) {
+    async read(tx, board, handle, opts, receiver) {
       const sql = pgOf(tx);
       const limit = Math.min(Math.max(opts.limit ?? 20, 1), 200);
       let posts: Post[];
@@ -415,9 +463,15 @@ export function makePgBoards({ clock }: { clock: () => number }): BoardsStore {
       if (maxId > 0) {
         // What this read showed no longer needs pushing; what it skipped (a pending push it filters out, a post
         // outside the thread) still does. Outbox before the cursor: the header's lock order (core runs the reverse).
-        await sql`UPDATE outbox SET delivered_at = ${clock()} WHERE handle = ${handle} AND delivered_at IS NULL
-          AND post_id = ANY(${posts.map(p => p.id)}::int8[])`;
-        await sql`UPDATE subscriptions SET cursor = GREATEST(cursor, ${maxId}::int8) WHERE board = ${board} AND handle = ${handle}`;
+        // core: what it delivers is credited to `receiver`, else the session holding `handle` now (#1461); a read by a
+        // `receiver` that no longer holds `handle` changes nothing (#1466), each write judging it in its own WHERE.
+        const held = heldBy(sql, handle, receiver);
+        const fresh: Row[] = await sql`UPDATE outbox SET delivered_at = ${clock()}, session_id = ${credited(sql, handle, receiver)}
+          WHERE handle = ${handle} AND delivered_at IS NULL AND post_id = ANY(${posts.map(p => p.id)}::int8[]) AND ${held} RETURNING post_id`;
+        if (fresh.length > 0 && (await sql`SELECT 1 FROM boards WHERE name = ${board} AND kind = 'queue'`).length > 0) {
+          await creditQueueTakes(sql, handle, board, fresh.map(x => int8(x.post_id)), receiver);
+        }
+        await sql`UPDATE subscriptions SET cursor = GREATEST(cursor, ${maxId}::int8) WHERE board = ${board} AND handle = ${handle} AND ${held}`;
       }
       const [n] = await sql`SELECT COUNT(*) AS n FROM posts p JOIN subscriptions s ON s.board = p.board AND s.handle = ${handle}
         WHERE p.board = ${board} AND p.id > s.cursor AND ${notOwn(sql, h)} AND ${notPushedYet(sql, h)}`;
@@ -437,14 +491,17 @@ export function makePgBoards({ clock }: { clock: () => number }): BoardsStore {
     // Core insertPost, the parent locked by id first (header, P1); human is bound on every insert (#1355/#1366): marked
     // only when given true.
     async insertPost(tx, p) {
+      // Ids commit in allocation order only among bodies that exclude each other on the board (G1, D4).
+      refuseKeyed(tx, "boards.insertPost", `board:${p.board}`);
       const sql = pgOf(tx);
       if (p.parentId !== null && (await sql`SELECT 1 FROM posts WHERE id = ${p.parentId} FOR KEY SHARE`).length === 0) {
         throw new MissingPost(p.parentId, p.board);
       }
       try {
-        const [row] = await sql`INSERT INTO posts AS p (board, author, body, parent_id, created_at, expires_at, author_id, via, author_user, human)
+        const [row] = await sql`INSERT INTO posts AS p (board, author, body, parent_id, created_at, expires_at, author_id, via, author_user, human, author_root)
           VALUES (${p.board}, ${p.author}, ${p.body}, ${p.parentId}::int8, ${p.now}, ${p.expiresAt}::int8, ${p.authorId}::text, ${p.via}::text,
-            ${p.authorUser}::text, ${p.human === true}) RETURNING ${postCols(sql)}`;
+            ${p.authorUser}::text, ${p.human === true},
+            COALESCE((SELECT ri.root_id FROM ids ri WHERE ri.id = ${p.authorId}::text), ${p.authorId}::text)) RETURNING ${postCols(sql)}`;
         return toPost(row);
       } catch (e) {
         if (p.parentId !== null && foreignKeyViolation(e) === POST_PARENT_CONSTRAINT) throw new MissingPost(p.parentId, p.board);
@@ -501,12 +558,14 @@ export function makePgBoards({ clock }: { clock: () => number }): BoardsStore {
           (SELECT i.principal FROM alias_holds h JOIN ids i ON i.id = h.id WHERE h.address = ${lane})))
         ON CONFLICT (key) DO NOTHING RETURNING key`;
       if (push) {
-        await sql`INSERT INTO outbox (handle, post_id, reason, wake)
-          SELECT ${lane}::text, ${postId}::int8, 'subscription', true WHERE EXISTS (SELECT 1 FROM claims WHERE key = ${key} AND holder = ${lane})
-          ON CONFLICT (handle, post_id) DO UPDATE SET delivered_at = NULL, wake = true`;
+        // core's reset re-records the receiving session (#1370).
+        await sql`INSERT INTO outbox (handle, post_id, reason, wake, session_id)
+          SELECT ${lane}::text, ${postId}::int8, 'subscription', true, ${holdingSession(sql, sql.fragment`${lane}::text`)}
+          WHERE EXISTS (SELECT 1 FROM claims WHERE key = ${key} AND holder = ${lane})
+          ON CONFLICT (handle, post_id) DO UPDATE SET delivered_at = NULL, wake = true, session_id = excluded.session_id`;
       }
       if (took.length === 0) return false;
-      await insertClaimEvent(sql, "take", lane, { key, note, board, expires_at: expires }, now);
+      await insertClaimEvent(tx, "take", lane, { key, note, board, expires_at: expires }, now);
       return true;
     },
     // core insertOutbox as one statement; a handle given twice keeps its first target, as core's row-by-row insert does.
@@ -515,8 +574,8 @@ export function makePgBoards({ clock }: { clock: () => number }): BoardsStore {
       const seen = new Set<string>();
       const first = targets.filter(([h]) => !seen.has(h) && (seen.add(h), true));
       if (first.length === 0) return;
-      await sql`INSERT INTO outbox (handle, post_id, reason, wake)
-        SELECT t.handle, ${postId}::int8, t.reason, t.wake
+      await sql`INSERT INTO outbox (handle, post_id, reason, wake, session_id)
+        SELECT t.handle, ${postId}::int8, t.reason, t.wake, ${holdingSession(sql, sql.fragment`t.handle`)}
           FROM unnest(${first.map(([h]) => h)}::text[], ${first.map(([, t]) => t.reason)}::text[], ${first.map(([, t]) => t.wake)}::boolean[]) AS t(handle, reason, wake)
         ON CONFLICT DO NOTHING`;
     },

@@ -129,13 +129,21 @@ export function aliveRows<T extends { pid: number; proc_start: string | null }>(
   return { alive, dead: rows.filter((r) => !alive.includes(r)) };
 }
 
-function parentOf(pid: number): number | null {
-  if (process.platform === "linux") {
-    const ppid = Number(statFields(pid)?.[1]);
-    return ppid > 0 ? ppid : null;
-  }
-  const ppid = Number(ps("ppid", [pid])?.get(pid));
-  return ppid > 0 ? ppid : null;
+/**
+ * Each pid's parent pid now, or null when it can't be read (gone, or the
+ * process table unreadable). macOS: one ps fork for the whole list.
+ */
+export function parentsOf(pids: number[]): Map<number, number | null> {
+  const lines = process.platform === "linux" ? null : ps("ppid", pids);
+  return new Map(pids.map((pid) => {
+    const ppid = Number(process.platform === "linux" ? statFields(pid)?.[1] : lines?.get(pid));
+    return [pid, ppid > 0 ? ppid : null];
+  }));
+}
+
+/** `pid`'s parent pid now, or null when it can't be read (parentsOf). */
+export function parentOf(pid: number): number | null {
+  return parentsOf([pid]).get(pid)!;
 }
 
 /** This process's ancestors, nearest first, up to (not including) pid 1. */

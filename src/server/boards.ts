@@ -23,7 +23,8 @@ import type { Read, Tx } from "./store/tx.ts";
 
 // core's ToolContext (its `reader` unset on the server), plus `principal`: an addressless
 // caller's user (an unbound hosted session, #410), whose sight judges board_list, peer_list and the boards it reads.
-export type ServerToolContext = ToolContext & { principal?: Principal; announced?: Announced };
+// receiver: the session a board_read's delivery credits, and must still hold the handle it marks (#1466).
+export type ServerToolContext = ToolContext & { principal?: Principal; announced?: Announced; receiver?: string };
 
 /**
  * core's boardActor over the store: `as`, else the first of `addresses` a board use acts as (#284 S3, S14), else the
@@ -74,7 +75,7 @@ export async function callBoardTool(
       const c = createArgs(str(a, "name"), str(a, "purpose"), kind);
       const denied = await access.checkCreate(tx, actor, scope);
       if (denied) throw new CoreError(denied);
-      const b = await repo.boards.create(tx, { name: c.board, purpose: c.purpose, scope, kind: c.kind, createdBy: actor, now: Date.now() });
+      const b = await repo.boards.create(tx, { name: c.board, purpose: c.purpose, scope, kind: c.kind, createdBy: actor, now: repo.now() });
       if (!b) {
         // Taken. On Postgres a concurrent first create of this repeat commits between the read above and the insert,
         // which waits for it: answered as the repeat it is (C1). On SQLite the read above already saw it.
@@ -103,7 +104,7 @@ export async function callBoardTool(
       // A concurrent archive or reopen committed first (A1, Postgres): answered as the repeat this now is. A third
       // write may flip it back before the re-read, so the update is tried again, a bounded number of times.
       for (let tries = 0; tries < 3; tries++) {
-        const after = await repo.boards.setArchived(tx, b.name, archived ? actor : null, Date.now());
+        const after = await repo.boards.setArchived(tx, b.name, archived ? actor : null, repo.now());
         if (after) return { result: after, wake: [], boards: [b.name] };
         const now = (await repo.boards.get(tx, b.name))!;
         const repeat = archiveRepeat(now, archived);
@@ -118,7 +119,7 @@ export async function callBoardTool(
       const viewer = ctx.principal ?? actor;
       const b = await readableBoard(repo, access, tx, viewer, input);
       // A principal has no cursor, and a child's read (via) peeks: its root's read state stays as it was (#523).
-      const r = await repo.boards.read(tx, b.name, ctx.principal || ctx.via !== undefined ? null : actor, opts);
+      const r = await repo.boards.read(tx, b.name, ctx.principal || ctx.via !== undefined ? null : actor, opts, ctx.receiver);
       // Claims announced here stay in front of anyone reading the board.
       const held = (await claimViews(repo, access, tx, undefined, viewer, ctx.session ?? actor)).filter((c) => c.board === r.board);
       return { result: held.length ? { ...r, active_claims: held } : r, wake: [] };
@@ -148,7 +149,7 @@ export async function callBoardTool(
     case "peer_status": {
       const { text, queue } = peerStatusArgs(a, actor);
       const t = statusText(text);
-      if (!(await repo.bindings.setStatus(tx, actor, t, Date.now()))) throw new CoreError(noStatusText(actor));
+      if (!(await repo.bindings.setStatus(tx, actor, t, repo.now()))) throw new CoreError(noStatusText(actor));
       if (queue !== undefined) await repo.bindings.setQueueParticipation(tx, actor, queue === "on");
       return { result: "ok", wake: [] };
     }
@@ -258,7 +259,7 @@ async function who(
     seesMeta: lookup(metas, "seesAliasMeta"),
     online: ctx.online!,
     own: new Set(ctx.addresses ?? [actor]),
-    now: Date.now(),
+    now: repo.now(),
     principalScope,
   });
   // A board's roster lists its unbound subscribers by ID among its peers.

@@ -9,7 +9,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ApplicationError, createApplication } from "./application.ts";
 import { createHostedMcp } from "./mcp.ts";
-import { openDatabase } from "./db.ts";
+import { openDatabase, type Repo } from "./db.ts";
+import { openRepo } from "./open_repo.ts";
+import type { Config } from "./config.ts";
 import type { AuthedUser } from "./auth.ts";
 import { createOAuthServer, type OAuthPrincipal } from "./oauth.ts";
 import { issueOAuth, rotateOAuth } from "../../tests/helpers/oauth.ts";
@@ -19,14 +21,23 @@ import { sessionContext } from "./hosted.ts";
 import { OPENCODE_CLIENT } from "./oauth-config.ts";
 import { DEFAULT_MCP_LIMITS, type McpLimits } from "./config.ts";
 import { stubAuthRead } from "../../tests/support/auth_stub.ts";
-import type { Read } from "./store/tx.ts";
+import { isTx, type Read } from "./store/tx.ts";
 import { sessionEndPort } from "./session_end.ts";
 import { scratchDbPath } from "../../tests/support/scratch_db.ts";
-import { seed, seedSync } from "../../tests/support/seed.ts";
+import { seed } from "../../tests/support/seed.ts";
+import { until } from "../../tests/support/until.ts";
+import { TEST_BACKEND } from "../../tests/support/server.ts";
+import { drained, execOn, pgText, row, rows } from "../../tests/support/repo_sql.ts";
 const meta = { "ai.opencode/sessionID": "test-root" };
 const issuedOAuth = (repo: Parameters<typeof issueOAuth>[0], resource: string, email = "alice@example.com", scopes = ["grayboard:tools"]) => issueOAuth(repo, resource, email, scopes, Date.now(), OPENCODE_CLIENT);
 
-let store: ReturnType<typeof openDatabase>;
+// The fixture's store, on GRAYBOARD_TEST_BACKEND's backend (#1491): SQLite by default, a Postgres database of its own
+// (cloned from the test template, dropped by close) under pg. `db` is the SQLite connection, for the tests that are
+// SQLite by nature (testSqlite); every other raw read goes through repo_sql's row/rows, which take either backend.
+type Database = ReturnType<typeof openDatabase>["db"];
+// `otherCommit`: a write committed on a connection of its own, outside the Repo (another process's, or another pod's).
+type Store = { repo: Repo; readonly db: Database; config: Config; otherCommit(sql: string, ...params: unknown[]): Promise<void>; close(): Promise<void> };
+let store: Store;
 let application: ReturnType<typeof createApplication>;
 let hosted: ReturnType<typeof createHostedMcp>;
 let user: AuthedUser;
@@ -36,9 +47,9 @@ let blobDir: string;
 const clients: Client[] = [];
 beforeEach(async () => {
   blobDir = mkdtempSync(join(tmpdir(), "gb-mcp-"));
-  store = openDatabase(scratchDbPath(), { blobDir , sessionEnd: sessionEndPort("team") });
+  store = await openStore(TEST_BACKEND === "pg" ? undefined : scratchDbPath());
   application = createApplication(store.repo, { helloLimit: { burst: 10000, perSec: 10000 }, hostedRequestLimit: { burst: 10000, perSec: 10000 }, hostedSubscriberLimit: { burst: 10000, perSec: 10000 } });
-  oauth = createOAuthServer(store.repo, { store: { kind: "sqlite" as const, path: scratchDbPath() }, blobDir, httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl: "https://grayboard.example.com:443", messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES });
+  oauth = createOAuthServer(store.repo, store.config);
   hosted = createHostedMcp(application, oauth, { trustedOrigin: "https://grayboard.example.com:443" });
   const issued = await issuedOAuth(store.repo, oauth.resource);
   token = issued.token;
@@ -59,10 +70,47 @@ afterEach(async () => {
   expect(hosted.dormantLegacySessions).toBe(0);
   expect(hosted.activePosts).toBe(0);
   oauth.close();
-  application.stopExpiry();
+  await application.stopExpiry();
   await Bun.sleep(0);
-  store.db.close();
+  await store.close();
   rmSync(blobDir, { recursive: true, force: true });
+});
+
+const fixtureConfig = (dbStore: Config["store"]): Config => ({ store: dbStore, blobDir, httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl: "https://grayboard.example.com:443", messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES });
+
+// The fixture's store: SQLite on `path`, or (no path) a fresh Postgres database through openRepo, as the server opens it.
+async function openStore(path: string | undefined): Promise<Store> {
+  if (path !== undefined) {
+    const { db, repo } = openDatabase(path, { blobDir, sessionEnd: sessionEndPort("team") });
+    return {
+      repo, db, config: fixtureConfig({ kind: "sqlite", path }),
+      async otherCommit(sql, ...params) {
+        const { Database } = await import("bun:sqlite");
+        const other = new Database(path);
+        try { other.run(sql, params as never[]); } finally { other.close(); }
+      },
+      async close() { db.close(); },
+    };
+  }
+  const { pgDatabase } = await import("../../tests/support/pg.ts");
+  const pg = await pgDatabase({ max: 1 });
+  const config = fixtureConfig({ kind: "postgres", url: pg.url });
+  let repo: Repo;
+  try { repo = await openRepo(config, { pool: { applicationName: "gb-test", max: 4 } }); }
+  catch (error) { await pg[Symbol.asyncDispose](); throw error; }
+  return {
+    repo, config,
+    async otherCommit(sql, ...params) { await pg.sql.unsafe(pgText(sql), params); },
+    get db(): Database { throw new Error("store.db: the fixture is on Postgres; the test is SQLite only (testSqlite)"); },
+    async close() { try { await repo.close(); } finally { await pg[Symbol.asyncDispose](); } },
+  };
+}
+
+// #1491: CI's test-pg job lists this file; the fixture must follow GRAYBOARD_TEST_BACKEND, or that run is SQLite again.
+test("the fixture's store is GRAYBOARD_TEST_BACKEND's", async () => {
+  expect(store.config.store.kind).toBe(TEST_BACKEND === "pg" ? "postgres" : "sqlite");
+  const version = TEST_BACKEND === "pg" ? "SELECT version() AS v" : "SELECT 'SQLite ' || sqlite_version() AS v";
+  expect((await row<{ v: string }>(store.repo, version))!.v).toStartWith(TEST_BACKEND === "pg" ? "PostgreSQL" : "SQLite");
 });
 
 test("resource authorization does not sweep unrelated hosted roots", async () => {
@@ -87,7 +135,7 @@ test("legacy identity headers cannot select or create names; explicit bind retai
   expect(hosted.activeContexts).toBe(0);
 });
 
-async function connect(version = "2026-07-28", intercept?: (response: Response, request: Request) => Promise<void>, headers?: Headers, observeRequest?: (request: Request) => void) {
+async function connect(version = "2026-07-28", intercept?: (response: Response, request: Request) => Promise<void>, headers?: Headers, observeRequest?: (request: Request) => void, routing: Record<string, unknown> = meta) {
   const client = new Client({ name: "unit", version: "1" }, {
     supportedProtocolVersions: [version], versionNegotiation: { mode: version === "2026-07-28" ? { pin: version } : "legacy" },
   });
@@ -98,7 +146,7 @@ async function connect(version = "2026-07-28", intercept?: (response: Response, 
       let request = new Request(input, init);
       if (request.method === "POST" && request.body) {
         const body = await request.json() as { params?: Record<string, unknown> };
-        body.params = { ...body.params, _meta: { ...((body.params?._meta ?? {}) as object), ...meta } };
+        body.params = { ...body.params, _meta: { ...((body.params?._meta ?? {}) as object), ...routing } };
         request = new Request(request, { body: JSON.stringify(body) });
       }
       headers?.forEach((value, key) => request.headers.set(key, value));
@@ -112,7 +160,17 @@ async function connect(version = "2026-07-28", intercept?: (response: Response, 
 }
 
 // Subscriptions and outbox rows: what a consuming read would change.
-const deliveryState = () => store.db.prepare(`SELECT (SELECT json_group_array(json_array(board, handle, mode, cursor)) FROM subscriptions) AS subs, (SELECT json_group_array(json_array(handle, post_id, delivered_at)) FROM outbox) AS outbox`).get();
+const deliveryState = async () => ({
+  subs: await rows(store.repo, "SELECT board, handle, mode, cursor FROM subscriptions ORDER BY board, handle"),
+  outbox: await rows(store.repo, "SELECT handle, post_id, delivered_at FROM outbox ORDER BY handle, post_id"),
+});
+// access_log rows of `action` in write order, once every write queued before the read has committed: a posted audit
+// row runs at once on SQLite's idle queue but is always queued on Postgres (repo_sql.ts drained).
+async function auditRows(action: string): Promise<{ actor: string | null; target: string | null; detail: string }[]> {
+  await drained(store.repo);
+  return rows(store.repo, "SELECT actor, target, detail FROM access_log WHERE action = ? ORDER BY id", action);
+}
+const closedReasons = async () => (await auditRows("hosted.stream_closed")).map(r => JSON.parse(r.detail).reason as string);
 
 // An owner's general and team-only boards, each with a post and a board
 // claim, and an unbound reader: the owner's own principal when mapped, an
@@ -140,18 +198,18 @@ async function unboundReader(mapped: boolean) {
 
 for (const mapped of [true, false]) test(`unbound native resource catalog lists and reads a visible board, mapped=${mapped}`, async () => {
   const client = await unboundReader(mapped);
-  const before = deliveryState();
+  const before = (await deliveryState());
   const resources = await client.listResources();
   expect(resources.resources.some(resource => resource.uri === "grayboard://boards/general")).toBe(true);
   expect((await client.readResource({ uri: "grayboard://boards/general" })).contents.length).toBeGreaterThan(0);
-  expect(deliveryState()).toEqual(before);
+  expect((await deliveryState())).toEqual(before);
 });
 
 // #410: tool reads with no session key judge visibility by the user's
 // principal (own and team boards, never another team's) and change nothing.
 for (const mapped of [true, false]) test(`#410: unbound tool reads judge visibility by principal and change nothing, mapped=${mapped}`, async () => {
   const client = await unboundReader(mapped);
-  const before = deliveryState();
+  const before = (await deliveryState());
   const text = (r: { isError?: boolean; content: unknown }) => {
     expect(r.isError).not.toBe(true);
     return JSON.parse((r.content as { text: string }[])[0]!.text);
@@ -169,7 +227,7 @@ for (const mapped of [true, false]) test(`#410: unbound tool reads judge visibil
   const claims = text(await client.callTool({ name: "claim_list", arguments: { prefix: "lane:" } })) as { key: string; board: string | null }[];
   expect(claims.map(c => [c.key, c.board])).toEqual([["lane:general", "general"], ["lane:secret", mapped ? "secret" : null]]);
   expect(text(await client.callTool({ name: "peer_list", arguments: { board: "general" } }))).toHaveProperty("peers");
-  expect(deliveryState()).toEqual(before);
+  expect((await deliveryState())).toEqual(before);
   expect((await client.callTool({ name: "board_create", arguments: { name: "refused", purpose: "unbound" } })).isError).toBe(true);
   expect((await client.callTool({ name: "bind", arguments: { name: "refused", create: true } })).isError).toBe(true);
 });
@@ -327,7 +385,7 @@ for (const version of ["2026-07-28", "2025-11-25", "2025-06-18"]) test(`${versio
     expect(messages).toHaveLength(1);
     expect(messages[0]!.sender).toBe("alice@example.com/be");
     expect(messages[0]!.body).toContain('"persona": "researcher"');
-    expect(store.db.query("SELECT COUNT(*) AS n FROM access_log WHERE action = 'delegation.requested'").get()).toEqual({ n: 1 });
+    expect(await auditRows("delegation.requested")).toHaveLength(1);
   } finally { owner.close(); other.close(); }
 });
 
@@ -339,8 +397,8 @@ test("hosted bind does not inherit a previous application-level launcher's opt-i
   prior.close();
   const client = await connect();
   expect((await client.callTool({ name: "bind", arguments: { name: "launcher" } })).isError).not.toBe(true);
-  expect(store.db.query("SELECT i.launcher FROM ids i JOIN alias_holds h ON h.id = i.id WHERE h.address = ?").get("alice@example.com/launcher")).toEqual({ launcher: 0 });
-  expect(store.db.query("SELECT launcher FROM ids WHERE id = ?").get(prior.id)).toEqual({ launcher: 1 });
+  expect(await row(store.repo, "SELECT i.launcher FROM ids i JOIN alias_holds h ON h.id = i.id WHERE h.address = ?", "alice@example.com/launcher")).toEqual({ launcher: 0 });
+  expect(await row(store.repo, "SELECT launcher FROM ids WHERE id = ?", prior.id)).toEqual({ launcher: 1 });
 });
 
 test("internal operation failures are redacted, including paths and SQL", async () => {
@@ -507,7 +565,7 @@ for (const version of ["2026-07-28", "2025-11-25", "2025-06-18"]) for (const sta
     expect(response!.headers.get("WWW-Authenticate")).toContain(`scope="${status === 401 ? "grayboard:delivery grayboard:tools" : "grayboard:tools"}", error="${status === 401 ? "invalid_token" : "insufficient_scope"}"`);
     expect(response!.headers.get("WWW-Authenticate")).toContain(oauth.resourceMetadata);
     expect(checks).toBe(2);
-    expect(store.db.query("SELECT name FROM boards WHERE name = 'blocked'").get()).toBeNull();
+    expect(await row(store.repo, "SELECT name FROM boards WHERE name = 'blocked'")).toBeNull();
     expect(hosted.activeContexts).toBe(hosted.activeGetStreams);
   } finally { oauth.authenticate = original; }
 });
@@ -515,6 +573,9 @@ for (const version of ["2026-07-28", "2025-11-25", "2025-06-18"]) for (const sta
 for (const version of ["2026-07-28", "2025-11-25", "2025-06-18"]) test(`${version}: revocation during identity selection preserves the precommit OAuth challenge`, async () => {
   let response: Response | undefined;
   const client = await connect(version, async r => { response = r; });
+  // The legacy client opens its GET stream after initialize; it must select before the held snapshot goes in, or its
+  // selection, not the POST's, can be the one held (#807 P3 A7c; seen on Postgres, #1491).
+  if (version !== "2026-07-28") await untilHosted(() => hosted.activeGetStreams === 1);
   const original = hosted.sessions.snapshot;
   let selected!: () => void, release!: () => void;
   const selection = new Promise<void>(resolve => { selected = resolve; });
@@ -533,7 +594,7 @@ for (const version of ["2026-07-28", "2025-11-25", "2025-06-18"]) test(`${versio
     await pending;
     expect(response!.status).toBe(401);
     expect(response!.headers.get("WWW-Authenticate")).toBe(`Bearer resource_metadata="${oauth.resourceMetadata}", scope="grayboard:delivery grayboard:tools", error="invalid_token"`);
-    expect(store.db.query("SELECT name FROM boards WHERE name = 'blocked'").get()).toBeNull();
+    expect(await row(store.repo, "SELECT name FROM boards WHERE name = 'blocked'")).toBeNull();
     expect(hosted.activeContexts).toBe(hosted.activeGetStreams);
   } finally { release(); hosted.sessions.snapshot = original; }
 });
@@ -562,7 +623,7 @@ for (const version of ["2026-07-28", "2025-11-25", "2025-06-18"]) for (const sto
     expect(response.status).not.toBe(403);
     expect(response.headers.has("WWW-Authenticate")).toBe(false);
     await response.arrayBuffer();
-    expect(store.db.query("SELECT name FROM boards WHERE name = 'blocked'").get()).toBeNull();
+    expect(await row(store.repo, "SELECT name FROM boards WHERE name = 'blocked'")).toBeNull();
     expect(hosted.activeContexts).toBe(hosted.activeGetStreams);
   } finally { release(); hosted.sessions.snapshot = original; }
 });
@@ -581,7 +642,7 @@ test("actual access revocation between factory and dispatch prevents mutation", 
   try {
     await expect(client.callTool({ name: "board_create", arguments: { name: "blocked", purpose: "must not mutate" } })).rejects.toThrow("invalid_token");
     expect(checks).toBeGreaterThanOrEqual(2);
-    expect(store.db.query("SELECT name FROM boards WHERE name = 'blocked'").get()).toBeNull();
+    expect(await row(store.repo, "SELECT name FROM boards WHERE name = 'blocked'")).toBeNull();
   } finally { oauth.isAuthorized = original; }
   expect(hosted.activeContexts).toBe(hosted.activeGetStreams);
 });
@@ -604,7 +665,7 @@ for (const version of ["2026-07-28", "2025-11-25", "2025-06-18"]) test(`${versio
       expect(encoded).not.toMatch(/SELECT|private|sqlite|secret/);
       expect(encoded).toMatch(/internal|Internal/);
       expect(checks).toBe(stage);
-      expect(store.db.query("SELECT name FROM boards WHERE name = 'blocked'").get()).toBeNull();
+      expect(await row(store.repo, "SELECT name FROM boards WHERE name = 'blocked'")).toBeNull();
       expect(hosted.activeContexts).toBe(hosted.activeGetStreams);
     } finally { restoreAccess(); }
   }
@@ -699,8 +760,8 @@ async function otherClient(version = "2026-07-28") {
   token = (await issuedOAuth(store.repo, oauth.resource, "bob@example.com")).token;
   try { return await connect(version); } finally { token = original; }
 }
-function capacityRows() {
-  return store.db.query<{ actor: string; detail: string }, []>("SELECT actor,detail FROM access_log WHERE action='hosted.capacity_refused'").all();
+async function capacityRows() {
+  return (await auditRows("hosted.capacity_refused")).map(({ actor, detail }) => ({ actor, detail }));
 }
 
 test("one authenticated user cannot consume another user's modern listen share", async () => {
@@ -715,8 +776,8 @@ test("one authenticated user cannot consume another user's modern listen share",
   expect((await second.callTool({ name: "board_create", arguments: { name: "other", purpose: "other user's share" } })).isError).not.toBe(true);
   const other = await second.listen({ resourceSubscriptions: ["grayboard://boards/other"] });
   expect(hosted.activeListens).toBe(2);
-  expect(capacityRows()).toEqual([{ actor: "alice@example.com", detail: expect.any(String) }]);
-  expect(JSON.parse(capacityRows()[0]!.detail)).toEqual({ kind: "listen", scope: "user", client_id: OPENCODE_CLIENT });
+  expect((await capacityRows())).toEqual([{ actor: "alice@example.com", detail: expect.any(String) }]);
+  expect(JSON.parse((await capacityRows())[0]!.detail)).toEqual({ kind: "listen", scope: "user", client_id: OPENCODE_CLIENT });
   await held.close();
   const replacement = await first.listen(filter);
   await replacement.close(); await other.close();
@@ -730,7 +791,7 @@ test("legacy admission is fair and releases its reservation on protocol session 
   await expect(connect("2025-11-25")).rejects.toThrow();
   const other = await otherClient("2025-11-25");
   expect(hosted.activeLegacySessions).toBe(2);
-  expect(JSON.parse(capacityRows()[0]!.detail)).toMatchObject({ kind: "legacy", scope: "user" });
+  expect(JSON.parse((await capacityRows())[0]!.detail)).toMatchObject({ kind: "legacy", scope: "user" });
   const deleted = await hosted.fetch(new Request("http://localhost/mcp", { method: "DELETE", headers: { Authorization: `Bearer ${token}`, "Mcp-Session-Id": sid, "Mcp-Protocol-Version": "2025-11-25" } }));
   expect(deleted.status).toBe(200);
   await first.close();
@@ -749,10 +810,13 @@ for (const ending of ["end", "error", "cancel", "shutdown"] as const) test(`POST
   const abort = new AbortController();
   const pending = hosted.fetch(new Request("http://localhost/mcp", { method: "POST", body, signal: abort.signal, headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" } }));
   await reading;
+  // The body's first pull can precede the share: the POST reserves it after authentication, which awaits a pool read on
+  // Postgres (#1491).
+  await untilHosted(() => hosted.activePosts === 1);
   await expect(first.listResources()).rejects.toThrow();
   await other.listResources();
-  expect(JSON.parse(capacityRows()[0]!.detail)).toMatchObject({ kind: "post", scope: "user" });
-  expect(capacityRows()[0]!.actor).toBe("alice@example.com");
+  expect(JSON.parse((await capacityRows())[0]!.detail)).toMatchObject({ kind: "post", scope: "user" });
+  expect((await capacityRows())[0]!.actor).toBe("alice@example.com");
   if (ending === "end") { controller.enqueue(new TextEncoder().encode("{}")); controller.close(); }
   else if (ending === "error") controller.error(new Error("fixture body error"));
   else if (ending === "cancel") abort.abort();
@@ -774,8 +838,8 @@ test("global POST admission remains bounded across distinct authenticated users"
     const refused = await hosted.fetch(new Request("http://localhost/mcp", { method: "POST", body: "{}", headers: { Authorization: `Bearer ${access}` } }));
     expect(refused.status).toBe(429);
     expect(hosted.activePosts).toBe(2);
-    expect(capacityRows()).toEqual([{ actor: "third@example.com", detail: expect.any(String) }]);
-    expect(JSON.parse(capacityRows()[0]!.detail)).toEqual({ kind: "post", scope: "global", client_id: OPENCODE_CLIENT });
+    expect((await capacityRows())).toEqual([{ actor: "third@example.com", detail: expect.any(String) }]);
+    expect(JSON.parse((await capacityRows())[0]!.detail)).toEqual({ kind: "post", scope: "global", client_id: OPENCODE_CLIENT });
   } finally {
     held.forEach(request => request.abort.abort());
     await Promise.all(held.map(request => request.response));
@@ -787,7 +851,8 @@ test("global POST admission remains bounded across distinct authenticated users"
 // Rebuilds OAuth and hosted MCP on a fake clock and captures the 1 s timers for explicit ticks: `tick` runs every one,
 // `tickStream` only the stream timer, which createHostedMcp starts last.
 // `manual`: the 1 s timers run only when the test calls tick or tickStream, never on real time.
-async function clocked(limits?: McpLimits, streamRecheckMs?: number, manual = false) {
+// `holdSweep`: the hosted 250 ms sweep timer never runs, for an oracle that counts every Repo call in a window (#1497).
+async function clocked(limits?: McpLimits, streamRecheckMs?: number, manual = false, holdSweep = false) {
   await hosted.close(); oauth.close();
   const time = { now: Date.now() };
   oauth = createOAuthServer(store.repo, { store: { kind: "sqlite" as const, path: scratchDbPath() }, blobDir, httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl: "https://grayboard.example.com", messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES }, { now: () => time.now });
@@ -795,7 +860,7 @@ async function clocked(limits?: McpLimits, streamRecheckMs?: number, manual = fa
   const interval = globalThis.setInterval;
   const spy = spyOn(globalThis, "setInterval").mockImplementation(((fn: () => void, ms: number, ...args: unknown[]) => {
     if (ms === 1000) intervals.push(fn);
-    return manual && ms === 1000 ? interval(() => {}, 3_600_000) : interval(fn, ms, ...args);
+    return (manual && ms === 1000) || (holdSweep && ms === 250) ? interval(() => {}, 3_600_000) : interval(fn, ms, ...args);
   }) as typeof setInterval);
   try { hosted = createHostedMcp(application, oauth, { trustedOrigin: oauth.issuer, now: () => time.now, ...(limits ? { limits } : {}), ...(streamRecheckMs ? { streamRecheckMs } : {}) }); }
   finally { spy.mockRestore(); }
@@ -855,7 +920,7 @@ async function dormantFixture(limits?: McpLimits) {
     },
   };
 }
-const legacyRows = () => store.db.query<{ action: string; target: string | null; detail: string }, []>("SELECT action, target, detail FROM access_log WHERE action LIKE 'hosted.legacy%' ORDER BY rowid").all()
+const legacyRows = async () => (await (drained(store.repo).then(() => rows<{ action: string; target: string | null; detail: string }>(store.repo, "SELECT action, target, detail FROM access_log WHERE action LIKE 'hosted.legacy%' ORDER BY id"))))
   .map((row): Record<string, unknown> => ({ action: row.action, target: row.target, ...JSON.parse(row.detail) as Record<string, unknown> }));
 const rawLegacy = (method: string, sid: string, access: string) => hosted.fetch(new Request("http://localhost/mcp", { method, headers: {
   Authorization: `Bearer ${access}`, "Mcp-Session-Id": sid, "Mcp-Protocol-Version": "2025-11-25", Accept: "application/json, text/event-stream",
@@ -879,7 +944,7 @@ test("a legacy session idle past access expiry sleeps without admission and resu
   await untilHosted(() => f.hints.length === 1, 5000);
   expect(f.hints).toEqual([f.uri]);
   expect([...f.sids]).toEqual([f.sid]);
-  const rows = legacyRows();
+  const rows = await legacyRows();
   const target = "id" in hostedId ? hostedId.id : null;
   expect(rows).toEqual([
     { action: "hosted.legacy_dormant", target, subscriptions: 1, ref: expect.any(String), grant: f.grant.grantId, client_id: OPENCODE_CLIENT },
@@ -887,9 +952,8 @@ test("a legacy session idle past access expiry sleeps without admission and resu
   ]);
   expect(JSON.stringify(rows)).not.toContain(f.sid);
   // The close row is a posted write, which may wait behind a body phase B started (#807 P3 A7d).
-  const closedReasons = () => store.db.query<{ detail: string }, []>("SELECT detail FROM access_log WHERE action = 'hosted.stream_closed'").all().map(row => JSON.parse(row.detail).reason);
-  await untilHosted(() => closedReasons().length >= 1);
-  expect(closedReasons()).toEqual(["access_expired"]);
+  await until(async () => (await closedReasons()).length >= 1, 1000, "a stream_closed row");
+  expect(await closedReasons()).toEqual(["access_expired"]);
   // The expected close is audited above, not logged as a stream failure (#494 item 10).
   expect(logged.mock.calls.filter(args => String(args[0]).includes("mcp.stream"))).toEqual([]);
   logged.mockRestore();
@@ -906,9 +970,9 @@ test("a dormant sid answers 404 to another binding and only its own user's new g
   const regranted = await issueOAuth(store.repo, oauth.resource, "alice@example.com", ["grayboard:tools"], f.time.now, OPENCODE_CLIENT);
   expect((await rawLegacy("GET", f.sid, regranted.token)).status).toBe(404);
   expect(hosted.dormantLegacySessions).toBe(0);
-  expect(legacyRows().map(row => [row.action, row.reason])).toEqual([["hosted.legacy_dormant", undefined], ["hosted.legacy_dropped", "grant_changed"]]);
+  expect((await legacyRows()).map(row => [row.action, row.reason])).toEqual([["hosted.legacy_dormant", undefined], ["hosted.legacy_dropped", "grant_changed"]]);
   // The drop row names both grants: the one the session had and the one that dropped it (#494 item 9).
-  expect(legacyRows()[1]).toMatchObject({ grant: f.grant.grantId, new_grant: regranted.grantId });
+  expect((await legacyRows())[1]).toMatchObject({ grant: f.grant.grantId, new_grant: regranted.grantId });
   // Dropped is never resurrected, even for the original grant.
   expect((await rawLegacy("GET", f.sid, (await f.refresh()))).status).toBe(404);
 });
@@ -933,7 +997,7 @@ for (const ending of ["idle", "grant_ended", "deleted", "shutdown"] as const) te
   }
   expect(hosted.dormantLegacySessions).toBe(0);
   expect(hosted.activeLegacySessions).toBe(0);
-  expect(legacyRows().map(row => [row.action, row.reason])).toEqual([["hosted.legacy_dormant", undefined], ["hosted.legacy_dropped", ending]]);
+  expect((await legacyRows()).map(row => [row.action, row.reason])).toEqual([["hosted.legacy_dormant", undefined], ["hosted.legacy_dropped", ending]]);
   if (ending !== "grant_ended" && ending !== "shutdown") expect((await rawLegacy("GET", f.sid, (await f.refresh()))).status).toBe(404);
 });
 
@@ -949,13 +1013,13 @@ test("a full legacy limit refuses rehydration with the session's ref, keeps it d
   const access = await f.refresh();
   expect((await rawLegacy("GET", f.sid, access)).status).toBe(429);
   expect(hosted.dormantLegacySessions).toBe(1);
-  const refused = store.db.query<{ detail: string }, []>("SELECT detail FROM access_log WHERE action = 'hosted.capacity_refused'").all().map(row => JSON.parse(row.detail));
-  expect(refused).toEqual([expect.objectContaining({ kind: "legacy", ref: legacyRows()[0]!.ref })]);
+  const refused = (await auditRows("hosted.capacity_refused")).map(r => JSON.parse(r.detail));
+  expect(refused).toEqual([expect.objectContaining({ kind: "legacy", ref: (await legacyRows())[0]!.ref })]);
   // Teardown needs no admission, even with the limit full.
   expect((await rawLegacy("DELETE", f.sid, access)).status).toBe(200);
   expect(hosted.dormantLegacySessions).toBe(0);
   expect(hosted.activeLegacySessions).toBe(1);
-  expect(legacyRows().map(row => [row.action, row.reason])).toEqual([["hosted.legacy_dormant", undefined], ["hosted.legacy_dropped", "deleted"]]);
+  expect((await legacyRows()).map(row => [row.action, row.reason])).toEqual([["hosted.legacy_dormant", undefined], ["hosted.legacy_dropped", "deleted"]]);
 });
 
 test("the dormant registry is bounded by the legacy limits", async () => {
@@ -972,14 +1036,13 @@ test("the dormant registry is bounded by the legacy limits", async () => {
   await f.tick();
   expect(hosted.activeLegacySessions).toBe(0);
   expect(hosted.dormantLegacySessions).toBe(1);
-  expect(legacyRows().map(row => [row.action, row.reason])).toEqual([["hosted.legacy_dormant", undefined], ["hosted.legacy_dropped", "capacity"]]);
-  const refused = store.db.query<{ detail: string }, []>("SELECT detail FROM access_log WHERE action = 'hosted.capacity_refused'").all();
+  expect((await legacyRows()).map(row => [row.action, row.reason])).toEqual([["hosted.legacy_dormant", undefined], ["hosted.legacy_dropped", "capacity"]]);
+  const refused = await auditRows("hosted.capacity_refused");
   expect(refused.map(row => JSON.parse(row.detail).kind)).toEqual(["dormant"]);
   // The dropped session's GET still gets its close row.
   // The close row is a posted write, which may wait behind a body phase B started (#807 P3 A7d).
-  const closedReasons = () => store.db.query<{ detail: string }, []>("SELECT detail FROM access_log WHERE action = 'hosted.stream_closed'").all().map(row => JSON.parse(row.detail).reason);
-  await untilHosted(() => closedReasons().length >= 2);
-  expect(closedReasons()).toEqual(["access_expired", "access_expired"]);
+  await until(async () => (await closedReasons()).length >= 2, 1000, "two stream_closed rows");
+  expect(await closedReasons()).toEqual(["access_expired", "access_expired"]);
 });
 
 test("modern listen capacity is reserved and reusable after cancellation", async () => {
@@ -1328,7 +1391,8 @@ test("concurrent legacy subscribes from two session contexts register only one",
     expect((await raw.call("bind", { name: "conc-b", create: true }, b)).text).not.toContain("isError\":true");
     expect((await raw.call("board_create", { name: "attach", purpose: "legacy attach" }, a)).text).not.toContain("isError\":true");
     const results = await Promise.all([raw.subscribe("grayboard://boards/attach", a), raw.subscribe("grayboard://boards/attach", b)]);
-    expect(results.map(r => r.text.includes("\"error\""))).toEqual([false, true]);
+    // Either may win: on Postgres the two race through pool reads before the write queue orders them (#1491).
+    expect(results.map(r => r.text.includes("\"error\"")).sort()).toEqual([false, true]);
     expect(hosted.activeWatches).toBe(1);
   } finally { await raw.close(); }
 });
@@ -1383,10 +1447,44 @@ test("an unbind stops only its own session's listen, through the per-row notice 
   await kept.close();
 });
 
+// Every call to a Repo group's method (repo.hosted.get, repo.bindings.holdsOf, …) until restore(), with whether its
+// handle was a body's Tx (#1497): the backend-agnostic oracle for which rows a path reads, and on what. Callers reach
+// the groups through the Repo's own objects (hosted.ts's `store` is repo.hosted), so a replaced method sees each call.
+function repoCalls(repo: Repo): { readonly list: { method: string; tx: boolean }[]; restore(): void } {
+  const list: { method: string; tx: boolean }[] = [], restores: (() => void)[] = [];
+  for (const [group, value] of Object.entries(repo)) {
+    if (value === null || typeof value !== "object" || Array.isArray(value)) continue;
+    const g = value as Record<string, unknown>;
+    for (const [name, fn] of Object.entries(g)) {
+      if (typeof fn !== "function") continue;
+      g[name] = function (this: unknown, ...args: unknown[]) {
+        list.push({ method: `${group}.${name}`, tx: isTx(args[0] as Read) });
+        return (fn as (...a: unknown[]) => unknown).apply(this, args);
+      };
+      restores.push(() => { g[name] = fn; });
+    }
+  }
+  return { list, restore() { for (const r of restores.reverse()) r(); } };
+}
+// Allowlists, not lists of the methods that read a table: many Repo methods read alias_holds or hosted_sessions inside
+// their SQL (aliases.seen, claims, boards' delivery reads, the session end…), and a denylist misses the one it forgets.
+// B1b: the calls the notice may make outside a body's Tx. hosted.takeEnded takes no handle and reads no row;
+// hosted.write is any handle-less queued hosted write (the test holds the sweep timer that makes one): the calls its
+// body makes are still recorded on its Tx, so a read there is still judged.
+const NOTICE_OFF_TX = new Set(["hosted.takeEnded", "hosted.write"]);
+// #899: the methods quiet ticks may call, on either backend: board visibility and the auth cache's refills, none of
+// which reads hosted_sessions or alias_holds (pg/boards.ts get, pg/identity.ts principals.of, pg/oauth.ts).
+const QUIET_TICK = new Set(["boards.get", "oauth.findActiveAccess", "users.active", "principals.of"]);
+
 // #807 P3 B1b: a commit's notice judges a live synchronously, so whether its root holds a name comes from the stamp
 // its authorize read with the generation, never from a holds read outside a transaction.
+// The oracle (#1497): every Repo call during the commit and its notice, each with whether its handle was a body's Tx;
+// none but NOTICE_OFF_TX may run outside one, so no holds read (nor any other) is made on a pool Read. The handle, not
+// txSpy's open count: a judge in the commit's afterCommit runs while its body still counts open.
 test("#807 P3 B1b: a notice that keeps a bound root's generation keeps its listen, judged with no holds read", async () => {
-  const { Database } = await import("bun:sqlite");
+  // Both timers held (#1497): a real-time stream or sweep tick inside the window would make pool calls of its own.
+  const { time } = await clocked(undefined, undefined, true, true);
+  token = (await issueOAuth(store.repo, oauth.resource, "alice@example.com", ["grayboard:tools"], time.now, OPENCODE_CLIENT)).token;
   const client = await connect();
   expect((await client.callTool({ name: "bind", arguments: { name: "fe", create: true } })).isError).not.toBe(true);
   expect((await client.callTool({ name: "board_create", arguments: { name: "held", purpose: "B1b" } })).isError).not.toBe(true);
@@ -1394,26 +1492,23 @@ test("#807 P3 B1b: a notice that keeps a bound root's generation keeps its liste
   expect(hosted.activeListens).toBe(1);
   const root = async (r: Read) => (await store.repo.hosted.all(r)).find(row => !row.root_session_id && row.user_id === user.user_id)!;
   // Holds reads outside any transaction: the pool's, as bindingLive's was before B1b.
-  const pooled: string[] = [];
-  const query = Database.prototype.query;
-  const spy = spyOn(Database.prototype, "query").mockImplementation(function (this: InstanceType<typeof Database>, sql: string) {
-    if (sql.includes("alias_holds") && !this.inTransaction) pooled.push(sql);
-    return query.call(this, sql);
-  } as typeof query);
+  const calls = repoCalls(store.repo);
   try {
     // A commit to the root's row that leaves its generation: its notice carries the row, and the judge keeps the live.
     await seed(store.repo, async tx => { const r = await root(tx); return store.repo.hosted.update(tx, r.session_id, { last_seen_at: r.last_seen_at + 1 }); });
     expect(hosted.activeListens).toBe(1);
-    expect(pooled).toEqual([]);
-  } finally { spy.mockRestore(); }
+    expect(calls.list.filter(c => !c.tx && !NOTICE_OFF_TX.has(c.method))).toEqual([]);
+    expect(calls.list.some(c => c.method === "hosted.update" && c.tx)).toBe(true); // the oracle sees the commit's calls
+  } finally { calls.restore(); }
   // The same path still stops it once the generation moves.
   await seed(store.repo, async tx => { const r = await root(tx); return store.repo.hosted.update(tx, r.session_id, { bind_gen: r.bind_gen + 1 }); });
   await untilHosted(() => hosted.activeListens === 0);
   await listen.close();
 });
 
+// The row reads are the Repo's by-ID reads of a hosted row, hosted.get and hosted.lock (#1497): on SQLite, the only
+// two that run `SELECT * FROM hosted_sessions WHERE session_id = ?`, the statement this counted before.
 test("#902: a native tool call authorizes under one auth-generation read and leaves its row to the hosted gate", async () => {
-  const { Database } = await import("bun:sqlite");
   const client = await connect();
   await client.callTool({ name: "board_list", arguments: {} });
   // The exchange's authorization check reads through the async form since #807 P3 A7d.
@@ -1421,11 +1516,11 @@ test("#902: a native tool call authorizes under one auth-generation read and lea
   let depth = 0, pinned = 0, unpinned = 0;
   store.repo.authRead = async fn => { depth++; try { return await authRead(fn); } finally { depth--; } };
   application.revalidateSession = (session, allowUnbound) => { if (depth) pinned++; else unpinned++; return validate(session, allowUnbound); };
-  const query = spyOn(Database.prototype, "query");
+  const calls = repoCalls(store.repo);
   try {
     const listed = await client.callTool({ name: "board_list", arguments: {} });
     expect(listed.isError).not.toBe(true);
-    const rowReads = query.mock.calls.filter(([s]) => String(s) === "SELECT * FROM hosted_sessions WHERE session_id = ?").length;
+    const rowReads = calls.list.filter(c => c.method === "hosted.get" || c.method === "hosted.lock").length;
     // Before #902: nine row reads (authorize's own, besides the exchange's and the tool's hosted gates), and the
     // user check outside the grant check's generation read. Before #907: eight; before #998: five. Now four: the
     // exchange's gate reads the row and settles it; the tool's gate checks the exchange's verdict still holds and
@@ -1433,13 +1528,13 @@ test("#902: a native tool call authorizes under one auth-generation read and lea
     // and the call ends inside the touch window, so its end touch reads nothing.
     expect(rowReads).toBe(4);
     expect({ pinned, unpinned }).toEqual({ pinned: 1, unpinned: 0 });
-  } finally { query.mockRestore(); store.repo.authRead = authRead; application.revalidateSession = validate; }
+  } finally { calls.restore(); store.repo.authRead = authRead; application.revalidateSession = validate; }
 });
 
 // #899: the stream timer re-reads a live's hosted rows only when they could have changed. A listen checked once
 // (stamped), then each way it can end, within a tick of the write or deadline that ends it.
-async function stampedListen(recheckMs = 3_600_000, manual = false) {
-  const { time, tick, tickStream } = await clocked(undefined, recheckMs, manual);
+async function stampedListen(recheckMs = 3_600_000, manual = false, holdSweep = false) {
+  const { time, tick, tickStream } = await clocked(undefined, recheckMs, manual, holdSweep);
   const grant = await issueOAuth(store.repo, oauth.resource, "alice@example.com", ["grayboard:tools"], time.now, OPENCODE_CLIENT);
   token = grant.token;
   const client = await connect();
@@ -1486,7 +1581,7 @@ test("#899: a failed generation read in phase A leaves every stream to phase B's
   await peekFailing();
   expect(hosted.activeListens).toBe(0);
   await store.repo.write(() => {});
-  expect(streamClosedReasons()).toEqual(["unauthenticated"]);
+  expect((await streamClosedReasons())).toEqual(["unauthenticated"]);
   await f.listen.close();
 });
 
@@ -1504,7 +1599,7 @@ test("#807 P3 A7d: a failed generation read in phase B's check closes the stream
   expect(failures.length).toBe(1);
   expect(hosted.activeListens).toBe(0);
   await store.repo.write(() => {});
-  expect(streamClosedReasons()).toEqual(["failed"]);
+  expect((await streamClosedReasons())).toEqual(["failed"]);
   await f.listen.close();
 });
 
@@ -1551,7 +1646,7 @@ test("a lapsed root's settle from a board commit's hint, inside the write queue'
 test("#899: a write no notice or generation sees reaches a stamped listen at the recheck backstop", async () => {
   const f = await stampedListen(10_000);
   // Raw SQL on the repo's own connection: no hosted notice, no generation move.
-  await seed(store.repo, async tx => store.db.run("UPDATE hosted_sessions SET bind_gen = bind_gen + 1 WHERE session_id = ?", [(await aliceRoot(tx)).session_id]));
+  await seed(store.repo, async tx => execOn(tx, "UPDATE hosted_sessions SET bind_gen = bind_gen + 1 WHERE session_id = ?", (await aliceRoot(tx)).session_id));
   f.time.now += 9_999; await f.tick();
   expect(hosted.activeListens).toBe(1);
   f.time.now += 1; await f.tick();
@@ -1564,7 +1659,7 @@ test("#899: a write no notice or generation sees reaches a stamped listen at the
 test("#807 P3 A7h2: a null notice's full pass stops a live whose binding moved, after the pass's read", async () => {
   const f = await stampedListen(3_600_000, true);
   // Raw SQL: the commit sends no notice, so only the pass below can see it.
-  await seed(store.repo, async tx => store.db.run("UPDATE hosted_sessions SET bind_gen = bind_gen + 1 WHERE session_id = ?", [(await aliceRoot(tx)).session_id]));
+  await seed(store.repo, async tx => execOn(tx, "UPDATE hosted_sessions SET bind_gen = bind_gen + 1 WHERE session_id = ?", (await aliceRoot(tx)).session_id));
   let during = -1;
   await held("hosted:reconcile:read", () => hosted.sessions.reconcile(), async () => { during = hosted.activeListens; });
   expect(during).toBe(1);
@@ -1576,7 +1671,7 @@ test("#807 P3 A7h2: a null notice's full pass stops a live whose binding moved, 
 // that throws still lets the pass's apply stop a live whose binding moved.
 test("#807 P3 A7h2: a full pass whose rebuild throws still stops a live whose binding moved", async () => {
   const f = await stampedListen(3_600_000, true);
-  await seed(store.repo, async tx => store.db.run("UPDATE hosted_sessions SET bind_gen = bind_gen + 1 WHERE session_id = ?", [(await aliceRoot(tx)).session_id]));
+  await seed(store.repo, async tx => execOn(tx, "UPDATE hosted_sessions SET bind_gen = bind_gen + 1 WHERE session_id = ?", (await aliceRoot(tx)).session_id));
   const builds = spyOn(application, "hostedBuildFacts").mockRejectedValue(new Error("build failed"));
   try {
     await hosted.sessions.reconcile();
@@ -1586,23 +1681,17 @@ test("#807 P3 A7h2: a full pass whose rebuild throws still stops a live whose bi
   await f.listen.close();
 });
 
-test("#899: another connection's commit reaches a stamped listen within a tick", async () => {
-  const { Database } = await import("bun:sqlite");
-  // Reopen the fixture on a file, so a second connection can commit to it.
-  await hosted.close(); oauth.close(); application.stopExpiry(); store.db.close();
-  const path = join(blobDir, "gb.db");
-  store = openDatabase(path, { blobDir , sessionEnd: sessionEndPort("team") });
-  application = createApplication(store.repo, { helloLimit: { burst: 10000, perSec: 10000 }, hostedRequestLimit: { burst: 10000, perSec: 10000 }, hostedSubscriberLimit: { burst: 10000, perSec: 10000 } });
-  oauth = createOAuthServer(store.repo, { store: { kind: "sqlite" as const, path: path }, blobDir, httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl: "https://grayboard.example.com:443", messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES });
-  hosted = createHostedMcp(application, oauth, { trustedOrigin: "https://grayboard.example.com:443" });
-  const issued = await issuedOAuth(store.repo, oauth.resource);
-  user = issued.authed;
-  const principal = await oauth.authenticate(new Request("http://localhost/mcp", { headers: { Authorization: `Bearer ${issued.token}` } }));
-  if (principal instanceof Response) throw new Error("fixture authorization failed");
-  await hosted.sessions.bind(principal, sessionContext(principal, meta), { name: "be", create: true, where: "tools" });
-  const f = await stampedListen();
-  const other = new Database(path);
-  try { other.run("UPDATE hosted_sessions SET bind_gen = bind_gen + 1 WHERE session_id = ?", [(await aliceRoot()).session_id]); } finally { other.close(); }
+// SQLite: another connection's commit moves data_version, so the auth generation, and the next tick re-reads the row.
+// Postgres: the generation moves only on gb_auth, and another pod's hosted_sessions commit sends no in-process notice,
+// so it reaches the listen at the recheck backstop, no sooner (docs/architecture.md, docs/server-hosted-mcp.md §1).
+test("#899: another connection's commit reaches a stamped listen within a tick (SQLite) or at the recheck backstop (Postgres)", async () => {
+  const f = await stampedListen(10_000);
+  await store.otherCommit("UPDATE hosted_sessions SET bind_gen = bind_gen + 1 WHERE session_id = ?", (await aliceRoot()).session_id);
+  if (TEST_BACKEND === "pg") {
+    f.time.now += 9_999; await f.tick();
+    expect(hosted.activeListens).toBe(1);
+    f.time.now += 1;
+  }
   await f.tick();
   await untilHosted(() => hosted.activeListens === 0);
   await f.listen.close();
@@ -1612,10 +1701,11 @@ test("#899: another connection's commit reaches a stamped listen within a tick",
 // runs, then the pause releases. Resolves with `start`'s value once it settles.
 async function held<T>(point: string, start: () => Promise<T>, during: () => Promise<void>, hits = 1) {
   const dir = mkdtempSync(join(tmpdir(), "gb-mcp-pause-")), file = join(dir, "release");
-  let seen = 0;
+  let seen = 0, released = 0;
   const reached = Promise.withResolvers<void>();
   const log = spyOn(console, "error").mockImplementation((message: unknown) => {
     if (message === `[grayboard] test pause hit: ${point}` && ++seen === hits) reached.resolve();
+    if (message === `[grayboard] test pause released: ${point}`) released++;
   });
   process.env.BUS_TEST_PAUSE = point; process.env.BUS_TEST_PAUSE_FILE = file;
   const deadline = setTimeout(() => reached.reject(new Error(`pause point ${point} hit ${seen} of ${hits} times in 5 s`)), 5_000);
@@ -1627,6 +1717,8 @@ async function held<T>(point: string, start: () => Promise<T>, during: () => Pro
     await during();
     writeFileSync(file, "release");
     const value = await result;
+    // A hold off `start`'s own path (a live's re-read) may still be polling: the dir stays until it has passed.
+    await until(() => released === seen, 5_000, `every hold at ${point} released`);
     expect(seen).toBe(hits);
     return { value, failures: () => log.mock.calls.filter(args => String(args[0]).includes("mcp.stream")) };
   } finally {
@@ -1640,7 +1732,7 @@ async function held<T>(point: string, start: () => Promise<T>, during: () => Pro
 // overlaps it (skipping it), then `during`.
 const heldCheck = (tickStream: () => Promise<void>, during: () => Promise<void>) =>
   held("mcp:stream:check", tickStream, async () => { await tickStream(); await during(); });
-const streamClosedReasons = () => store.db.query<{ detail: string }, []>("SELECT detail FROM access_log WHERE action = 'hosted.stream_closed'").all().map(row => JSON.parse(row.detail).reason);
+const streamClosedReasons = closedReasons;
 const revokeAccess = (access: string, at: number) => seed(store.repo, tx => store.repo.oauth.revokeToken(tx, hashToken(access), OPENCODE_CLIENT, at));
 
 test("#807 P3 A7d: a revoke during a held phase-B check stales its stamp: the next tick closes the listen once", async () => {
@@ -1653,7 +1745,7 @@ test("#807 P3 A7d: a revoke during a held phase-B check stales its stamp: the ne
   await f.tickStream();
   expect(hosted.activeListens).toBe(0);
   await store.repo.write(() => {});
-  expect(streamClosedReasons()).toEqual(["unauthenticated"]);
+  expect((await streamClosedReasons())).toEqual(["unauthenticated"]);
   expect(failures()).toEqual([]);
   await f.listen.close();
 });
@@ -1668,7 +1760,7 @@ test("#807 P3 A7d: a held phase-B check whose live stopped meanwhile acts on not
     await revokeAccess(token, f.time.now);
   });
   await store.repo.write(() => {});
-  expect(streamClosedReasons()).toEqual([]);
+  expect((await streamClosedReasons())).toEqual([]);
   expect(failures()).toEqual([]);
   await f.listen.close();
 });
@@ -1696,7 +1788,7 @@ test("#807 P3 A7d: a held phase-B check of an idle legacy GET that an attach re-
   // The released check, refused under the old token, is about a context the GET no longer has.
   expect(hosted.activeGetStreams).toBe(1);
   await store.repo.write(() => {});
-  expect(streamClosedReasons()).toEqual([]);
+  expect((await streamClosedReasons())).toEqual([]);
   expect(failures()).toEqual([]);
   await tickStream();
   expect(hosted.activeGetStreams).toBe(1);
@@ -1755,6 +1847,142 @@ test("#807 P3 A7h2: a legacy GET whose binding moves while its check awaits re-r
   await raw.delete();
 });
 
+// #1196: a moved read whose notice the prune dropped is still re-read: `prunedThrough` past the read's start stands in
+// for the notice, so the GET re-reads its rows once it opens and stops, with no check of its own.
+test("#1196: a legacy GET whose binding moves, and whose notice the prune drops, while its check awaits re-reads its rows and stops", async () => {
+  const { time, tickStream } = await clocked(undefined, undefined, true);
+  const access = (await issueOAuth(store.repo, oauth.resource, "alice@example.com", ["grayboard:tools"], time.now, OPENCODE_CLIENT)).token;
+  const raw = await rawLegacySession(access, meta);
+  expect((await raw.post("tools/call", { name: "board_create", arguments: { name: "pruned", purpose: "#1196" }, _meta: meta })).text).not.toContain("isError\":true");
+  expect((await raw.post("resources/subscribe", { uri: "grayboard://boards/pruned", _meta: meta })).text).not.toContain("\"error\"");
+  const abort = new AbortController();
+  const { value: get } = await held("mcp:legacy:get-checked", () => raw.get(abort.signal), async () => {
+    await seed(store.repo, async tx => { const r = await aliceRoot(tx); return store.repo.hosted.update(tx, r.session_id, { bind_gen: r.bind_gen + 1 }); });
+    // Past the prune interval with no live stamped: the prune drops the root's notice.
+    time.now += 30_000; await tickStream();
+  });
+  expect(get.status).toBe(200);
+  await untilHosted(() => hosted.activeGetStreams === 0);
+  abort.abort(); await get.body?.cancel().catch(() => {});
+  await raw.delete();
+});
+
+// #1196: a live's bound starts from its creator's rows, so a root notice during the re-read its moved read queued
+// notes into a real pair: a child's live, whose own row the notice leaves, keeps streaming.
+test("#1196: a child's legacy GET whose read moved keeps streaming through a root notice during its re-read", async () => {
+  const principal = await oauth.authenticate(new Request("http://localhost/mcp", { headers: { Authorization: `Bearer ${token}` } }));
+  if (principal instanceof Response) throw new Error("fixture authorization failed");
+  await hosted.sessions.register(principal, sessionContext(principal, meta), "test-child");
+  const childMeta = { "ai.opencode/sessionID": "test-child" };
+  const root = await rawLegacySession(token, meta);
+  expect((await root.post("tools/call", { name: "board_create", arguments: { name: "child", purpose: "#1196" }, _meta: meta })).text).not.toContain("isError\":true");
+  const raw = await rawLegacySession(token, childMeta);
+  expect((await raw.post("resources/subscribe", { uri: "grayboard://boards/child", _meta: childMeta })).text).not.toContain("\"error\"");
+  const child = (await store.repo.hosted.all(store.repo.read)).find(r => r.root_session_id)!;
+  const touch = (id: string) => seed(store.repo, tx => store.repo.hosted.update(tx, id, { last_seen_at: Date.now() }));
+  // The GET's own read is followed by a notice for the child's row: its live re-reads.
+  const readRoot = hosted.sessions.readRoot;
+  let inject = true, reads = 0;
+  const roots = spyOn(hosted.sessions, "readRoot").mockImplementation(async row => {
+    const read = await readRoot(row);
+    reads++;
+    if (inject) { inject = false; await touch(child.session_id); }
+    return read;
+  });
+  const abort = new AbortController();
+  try {
+    const { value: get } = await held("mcp:live:recheck", () => raw.get(abort.signal), async () => {
+      expect(hosted.activeGetStreams).toBe(1);
+      await touch(child.root_session_id!);
+    });
+    expect(get.status).toBe(200);
+    await untilHosted(() => reads >= 2);
+    await store.repo.write(() => {});
+    expect(hosted.activeGetStreams).toBe(1);
+    abort.abort(); await get.body?.cancel().catch(() => {});
+  } finally { roots.mockRestore(); }
+  await raw.delete(); await root.delete();
+});
+
+// #1486: a re-read a root notice raced is merged per row: the child's own row, which no notice followed, takes the
+// re-read's half (ended), so the child's listen stops on its first re-read, though a root notice races every re-read.
+// The stream timer runs only by hand and never does here: the stop is the re-read's own.
+test("#1486: a child's listen whose row ended during its read stops on its re-read though root notices race each one", async () => {
+  const { time } = await clocked(undefined, undefined, true);
+  token = (await issueOAuth(store.repo, oauth.resource, "alice@example.com", ["grayboard:tools"], time.now, OPENCODE_CLIENT)).token;
+  const principal = await oauth.authenticate(new Request("http://localhost/mcp", { headers: { Authorization: `Bearer ${token}` } }));
+  if (principal instanceof Response) throw new Error("fixture authorization failed");
+  await hosted.sessions.register(principal, sessionContext(principal, meta), "test-child");
+  expect((await (await connect()).callTool({ name: "board_create", arguments: { name: "churn", purpose: "#1486" } })).isError).not.toBe(true);
+  const child = (await store.repo.hosted.all(store.repo.read)).find(r => r.root_session_id)!;
+  const client = await connect(undefined, undefined, undefined, undefined, { "ai.opencode/sessionID": "test-child" });
+  const readRow = hosted.sessions.readRow;
+  let armed = false, reads = 0;
+  // The child's reads once armed: the first (the listen's own) is followed by the row's end, each later one (a
+  // re-read) by a root notice, up to a bound a re-read loop that never merges reaches.
+  const rows = spyOn(hosted.sessions, "readRow").mockImplementation(async id => {
+    const read = await readRow(id);
+    if (!armed || id !== child.session_id) return read;
+    reads++;
+    if (reads === 1) await seed(store.repo, tx => store.repo.hosted.childEnd(tx, child.session_id, Date.now(), "closed"));
+    else if (reads < 20) await seed(store.repo, tx => store.repo.hosted.update(tx, child.root_session_id!, { last_seen_at: Date.now() }));
+    return read;
+  });
+  try {
+    const { value: listen } = await held("mcp:authorize:facts", () => client.listen({ resourceSubscriptions: ["grayboard://boards/churn"] }), async () => { armed = true; });
+    await untilHosted(() => hosted.activeListens === 0, 5_000);
+    expect(reads).toBeGreaterThanOrEqual(2);
+    expect(reads).toBeLessThan(5);
+    await listen.close();
+  } finally { rows.mockRestore(); }
+});
+
+// #1196: an idle GET a subscription attaches adopts its re-selection's rows only when no notice for them followed
+// the selection's start; a notice after its read makes the live re-read them.
+test("#1196: an idle legacy GET whose re-selection a notice raced re-reads its rows when a subscription attaches it", async () => {
+  const raw = await rawLegacySession(token, meta);
+  expect((await raw.post("tools/call", { name: "board_create", arguments: { name: "attached", purpose: "#1196" }, _meta: meta })).text).not.toContain("isError\":true");
+  const abort = new AbortController();
+  const get = await raw.get(abort.signal);
+  expect(get.status).toBe(200);
+  expect(hosted.activeGetStreams).toBe(1);
+  // Every selection from here is followed by a notice for the root's row: the attach's re-selection among them.
+  const snapshot = hosted.sessions.snapshot;
+  const snapshots = spyOn(hosted.sessions, "snapshot").mockImplementation(async (...args) => {
+    const selected = await snapshot(...args);
+    await seed(store.repo, async tx => { const r = await aliceRoot(tx); return store.repo.hosted.update(tx, r.session_id, { last_seen_at: Date.now() }); });
+    return selected;
+  });
+  try {
+    const { value: subscribed } = await held("mcp:live:recheck", () => raw.post("resources/subscribe", { uri: "grayboard://boards/attached", _meta: meta }), async () => {});
+    expect(subscribed.text).not.toContain("\"error\"");
+  } finally { snapshots.mockRestore(); }
+  await store.repo.write(() => {});
+  expect(hosted.activeGetStreams).toBe(1);
+  expect(hosted.activeWatches).toBe(1);
+  abort.abort(); await get.body?.cancel().catch(() => {});
+  await raw.delete();
+});
+
+// #1196: the bound text's facts are read only for a selection a server is built for: a legacy session's creating POST,
+// not its later requests or the re-selection an attach makes.
+test("#1196: a legacy session reads the bound text's facts for its creating POST alone", async () => {
+  const launcher = spyOn(application, "hostedLauncher");
+  try {
+    const raw = await rawLegacySession(token, meta);
+    expect(launcher).toHaveBeenCalledTimes(1);
+    expect((await raw.post("tools/call", { name: "board_create", arguments: { name: "facts", purpose: "#1196" }, _meta: meta })).text).not.toContain("isError\":true");
+    const abort = new AbortController();
+    const get = await raw.get(abort.signal);
+    expect(get.status).toBe(200);
+    expect((await raw.post("resources/subscribe", { uri: "grayboard://boards/facts", _meta: meta })).text).not.toContain("\"error\"");
+    expect(hosted.activeWatches).toBe(1);
+    expect(launcher).toHaveBeenCalledTimes(1);
+    abort.abort(); await get.body?.cancel().catch(() => {});
+    await raw.delete();
+  } finally { launcher.mockRestore(); }
+});
+
 // #807 P3 A7d: a revoke reaches a legacy GET through two phase-B tasks, its own check and its session's sweep; the
 // sweep writes the close row when it retires the session, so the GET gets one whichever settles first.
 test("#807 P3 A7d: a revoked legacy GET whose session the sweep retires before its own check settles gets one close row", async () => {
@@ -1767,7 +1995,7 @@ test("#807 P3 A7d: a revoked legacy GET whose session the sweep retires before i
   await held("mcp:stream:check", tickStream, () => untilHosted(() => hosted.activeLegacySessions === 0));
   expect(hosted.activeGetStreams).toBe(0);
   await store.repo.write(() => {});
-  expect(streamClosedReasons()).toEqual(["unauthenticated"]);
+  expect((await streamClosedReasons())).toEqual(["unauthenticated"]);
   await legacy.close();
 });
 
@@ -1789,22 +2017,23 @@ test("#807 P3 A7d: a legacy session a POST re-authorizes while the sweep's reads
   await raw.delete();
 });
 
+// The oracle (#1497): every Repo method the quiet ticks call must be in QUIET_TICK, so none reads a hosted row or an
+// alias hold, and none writes.
 test("#899: a quiet tick reads no hosted row or alias hold for a stamped listen or legacy GET", async () => {
-  const { Database } = await import("bun:sqlite");
-  const f = await stampedListen();
+  const f = await stampedListen(3_600_000, false, true); // the sweep timer held: its ticks read hosted rows
   const legacy = await connect("2025-11-25");
   expect(await legacy.subscribeResource({ uri: "grayboard://boards/stamped" })).toEqual({});
   await untilHosted(() => hosted.activeGetStreams === 1);
   await f.tick();
-  const query = spyOn(Database.prototype, "query"), prepare = spyOn(Database.prototype, "prepare");
+  const calls = repoCalls(store.repo);
   try {
     for (let i = 0; i < 5; i++) { f.time.now += 1000; await f.tick(); }
-    const reads = [...query.mock.calls, ...prepare.mock.calls].map(([sql]) => String(sql)).filter(sql => /hosted_sessions|alias_holds/.test(sql));
     // Before #899: every tick read each live's row and root and, for its binding, the root's holds.
-    expect(reads).toEqual([]);
+    expect(calls.list.length).toBeGreaterThan(0); // the recorder is live: the ticks' auth and board checks call through it
+    expect([...new Set(calls.list.map(c => c.method))].filter(m => !QUIET_TICK.has(m))).toEqual([]);
     expect(hosted.activeListens).toBe(1);
     expect(hosted.activeGetStreams).toBe(1);
-  } finally { query.mockRestore(); prepare.mockRestore(); }
+  } finally { calls.restore(); }
   await f.listen.close();
   await legacy.close();
 });
@@ -1824,7 +2053,8 @@ async function teamFixture() {
     return t;
   });
   const remove = () => seed(store.repo, tx => store.repo.teams.removeMember(tx, team.id, grant.authed.user_id));
-  return { ...clock, grant, bob, remove };
+  const readd = () => seed(store.repo, tx => store.repo.teams.addMember(tx, team.id, grant.authed.user_id));
+  return { ...clock, grant, bob, remove, readd };
 }
 const boardChecked = "mcp:board:checked";
 
@@ -1839,7 +2069,7 @@ test("#807 P3 B5a2: a team removal reaches a stamped native listen within a stre
   await f.tickStream();
   expect(hosted.activeListens).toBe(0);
   await store.repo.write(() => {});
-  expect(streamClosedReasons()).toEqual(["not_found"]);
+  expect((await streamClosedReasons())).toEqual(["not_found"]);
   await listen.close();
 });
 
@@ -1922,5 +2152,89 @@ for (const stop of ["the stream tick", "the watch's close", "the stream tick (pr
   await untilHosted(() => hosted.activeGetStreams === 1);
   expect(hosted.activeWatches).toBe(1);
   second.abort(); await again.body?.cancel().catch(() => {});
+  await raw.delete();
+});
+
+// #1216: forcing tests for B5a2's board-check windows.
+// `authorizeFor` reads a legacy GET's registrations after its awaits: a subscribe that lands while the GET's board
+// read holds adds a board that read missed, so the GET reads again rather than refusing it.
+test("#1216: a board a legacy subscribe registers while a GET's board read holds is read again, and the GET opens with it", async () => {
+  await teamFixture();
+  const raw = await rawLegacySession(token, meta);
+  for (const name of ["first", "second"]) expect((await raw.post("tools/call", { name: "board_create", arguments: { name, purpose: "#1216" }, _meta: meta })).text).not.toContain("isError\":true");
+  expect((await raw.post("resources/subscribe", { uri: "grayboard://boards/first", _meta: meta })).text).not.toContain("\"error\"");
+  const abort = new AbortController();
+  const { value: get } = await held("mcp:authorize:facts", () => raw.get(abort.signal), async () => {
+    // The GET's read covered `first` alone. The subscribe's own checks pass through the same point: unpaused.
+    delete process.env.BUS_TEST_PAUSE;
+    expect((await raw.post("resources/subscribe", { uri: "grayboard://boards/second", _meta: meta })).text).not.toContain("\"error\"");
+  });
+  // Read once, the GET would judge `second` unread and refuse it.
+  expect(get.status).toBe(200);
+  await untilHosted(() => hosted.activeGetStreams === 1 && hosted.activeWatches === 2);
+  abort.abort(); await get.body?.cancel().catch(() => {});
+  await raw.delete();
+});
+
+// A stopped stream's prune judged its boards before a subscribe that lands after the board came back: the subscribe
+// waits out the prune, so the prune can't delete the registration it makes.
+test("#1216: a subscribe after a lost board comes back, while the stopped stream's prune holds, survives the prune", async () => {
+  const f = await teamFixture();
+  const raw = await rawLegacySession(token, meta);
+  for (const args of [{ name: "open" }, { name: "private", team: "private" }]) expect((await raw.post("tools/call", { name: "board_create", arguments: { ...args, purpose: "#1216" }, _meta: meta })).text).not.toContain("isError\":true");
+  for (const uri of ["grayboard://boards/private", "grayboard://boards/open"]) expect((await raw.post("resources/subscribe", { uri, _meta: meta })).text).not.toContain("\"error\"");
+  const first = new AbortController();
+  const get = await raw.get(first.signal);
+  expect(get.status).toBe(200);
+  await untilHosted(() => hosted.activeGetStreams === 1 && hosted.activeWatches === 2);
+  await f.tickStream(); await f.tickStream();
+  await f.remove();
+  const subscribed = Promise.withResolvers<string>();
+  subscribed.promise.catch(() => {});
+  const second = new AbortController();
+  // `start` settles with the subscribe and then the next GET, which waits out the prune: the pause (in the prune,
+  // which no caller awaits) stays until the prune has run, whether or not the subscribe waited for it.
+  const { value: reopened } = await held("mcp:legacy:pruned", () => f.tickStream().then(() => subscribed.promise).then(() => raw.get(second.signal)), async () => {
+    // The prune read `private` as lost; alice rejoins the team and subscribes to it again.
+    await untilHosted(() => hosted.activeGetStreams === 0);
+    first.abort(); await get.body?.cancel().catch(() => {});
+    await f.readd();
+    const again = raw.post("resources/subscribe", { uri: "grayboard://boards/private", _meta: meta }).then(r => r.text);
+    again.then(subscribed.resolve, subscribed.reject);
+    // The pause forces the overlap; this window only gives a subscribe that didn't wait the time to register.
+    expect(await Promise.race([again.then(() => "answered", () => "answered"), Bun.sleep(200).then(() => "waiting")])).toBe("waiting");
+  });
+  expect(await subscribed.promise).not.toContain("\"error\"");
+  // The next GET carries both registrations.
+  expect(reopened.status).toBe(200);
+  await untilHosted(() => hosted.activeGetStreams === 1 && hosted.activeWatches === 2);
+  second.abort(); await reopened.body?.cancel().catch(() => {});
+  await raw.delete();
+});
+
+// `checkBoards` judges each uri whose board it read: a subscribe adding an unread board while the check holds leaves
+// the read ones judged, so a team removal the read saw stops the stream on that tick.
+test("#1216: a team removal stops a legacy stream on the tick whose board check a subscribe to another board overlaps", async () => {
+  const f = await teamFixture();
+  const raw = await rawLegacySession(token, meta);
+  for (const args of [{ name: "open" }, { name: "private", team: "private" }]) expect((await raw.post("tools/call", { name: "board_create", arguments: { ...args, purpose: "#1216" }, _meta: meta })).text).not.toContain("isError\":true");
+  expect((await raw.post("resources/subscribe", { uri: "grayboard://boards/private", _meta: meta })).text).not.toContain("\"error\"");
+  const abort = new AbortController();
+  const get = await raw.get(abort.signal);
+  expect(get.status).toBe(200);
+  await untilHosted(() => hosted.activeGetStreams === 1 && hosted.activeWatches === 1);
+  await f.tickStream(); await f.tickStream();
+  // Committed before the tick's read, which sees `private` lost; `open` joins the stream while the check holds.
+  await f.remove();
+  const { failures } = await held(boardChecked, f.tickStream, async () => {
+    expect((await raw.post("resources/subscribe", { uri: "grayboard://boards/open", _meta: meta })).text).not.toContain("\"error\"");
+    expect(hosted.activeWatches).toBe(2);
+  });
+  // Skipping the whole judgement once the uri set changed would leave the stream to the next tick.
+  expect(hosted.activeGetStreams).toBe(0);
+  await store.repo.write(() => {});
+  expect((await streamClosedReasons())).toEqual(["not_found"]);
+  expect(failures()).toEqual([]);
+  abort.abort(); await get.body?.cancel().catch(() => {});
   await raw.delete();
 });

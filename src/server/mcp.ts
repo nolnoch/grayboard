@@ -22,6 +22,7 @@ import { forwardMcpStream, readMcpBody, type OwnedStream } from "./mcp-streams.t
 import { AsyncLocalStorage } from "node:async_hooks";
 import { hostedFailure } from "./hosted-diagnostics.ts";
 import { diagnosticOrigin, failureDiagnostic, type FailureSource } from "./diagnostics.ts";
+import { RequestAbortedError } from "./store/queue.ts";
 import { permitsOrigin } from "./origin.ts";
 import { RateLimiter } from "./rate_limit.ts";
 import { DEFAULT_HOSTED_CAPS, DEFAULT_MCP_LIMITS, type HostedCaps, type McpLimits } from "./config.ts";
@@ -68,8 +69,9 @@ type Legacy = { ref: string; meta?: unknown; server: McpServer; transport: WebSt
 type Checked = { row: HostedSession | undefined; root?: HostedSession; seq: number; boards?: Map<string, boolean> };
 type Bound = { row: HostedSession | undefined; root?: HostedSession };
 // `bound`: the binding's row and root as the last read or commit notice left them, which a notice judges (#807 P3
-// A7h2). `rechecking`: the context a re-read of them is in flight for.
-type Live = { context: Context; rows: Set<string>; bound: Bound; rechecking?: Context; uris: Map<string, string | null>; watches: string[]; stream?: OwnedStream; handler?: McpHttpHandler; legacy?: Legacy; stopped: boolean; hint(uri: string): void; stop(): void };
+// A7h2). `rechecking`: the context a re-read of them is in flight for. `noted`: per bound row, the seq of the last
+// notice that carried its facts into `bound`, so a raced re-read keeps those halves and takes its own for the rest (#1486).
+type Live = { context: Context; rows: Set<string>; bound: Bound; rechecking?: Context; noted?: Map<string, number>; uris: Map<string, string | null>; watches: string[]; stream?: OwnedStream; handler?: McpHttpHandler; legacy?: Legacy; stopped: boolean; hint(uri: string): void; stop(): void };
 
 export function createHostedMcp(application: Application, oauth: Pick<ReturnType<typeof createOAuthServer>, "authenticate" | "isAuthorized" | "peekAuthorized" | "isGrantActive" | "issuer" | "resource">, opts: { trustedOrigin: string; now?: () => number; limits?: McpLimits; caps?: HostedCaps; idleSeconds?: number; streamRecheckMs?: number }) {
   const now = opts.now ?? Date.now;
@@ -161,9 +163,15 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
   type Exchange = { request: Request; address: string; protocol: string; principal?: number; identity?: string; session?: string; tool?: string; logged?: boolean; failure?: ApplicationError; meta?: unknown; id?: string | number | null; method?: unknown; call?: unknown; refusal?: Response; context?: Context; legacy?: Legacy; lost?: boolean; closedAtFactory?: boolean };
   const exchanges = new AsyncLocalStorage<Exchange>();
   const refusalLogs = new RateLimiter({ burst: 1, perSec: 0.1 }, { start() {}, end() {} }, now, 4096);
+  // A request its client abandoned (#1535: it aborted while the request waited, in the write queue or in `select`) is
+  // the client's timeout, i.e. server latency, not a server failure: its own line and category, at warn.
   const report = (error: unknown, source: FailureSource = "hosted-sdk", exchange = exchanges.getStore()) => {
     if (error instanceof ApplicationError || error instanceof CoreError || exchange?.failure || exchange?.refusal || exchange?.logged) return;
     if (exchange) exchange.logged = true;
+    if (error instanceof RequestAbortedError) {
+      console.warn(`[grayboard] hosted MCP client aborted: ${JSON.stringify({ principal: exchange?.principal, identity: exchange?.identity, session: exchange?.session, tool: exchange?.tool, protocol: exchange?.protocol, ...failureDiagnostic(source, error, "client_aborted") })}`);
+      return;
+    }
     console.error(`[grayboard] hosted MCP failed: ${JSON.stringify({ principal: exchange?.principal, identity: exchange?.identity, session: exchange?.session, tool: exchange?.tool, protocol: exchange?.protocol, ...failureDiagnostic(source, error) })}`);
   };
   const logRefusal = (reason: string, exchange: Exchange, detail: Record<string, unknown> = {}) => {
@@ -215,6 +223,9 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     await authCheck(context, signal);
     if (!withRow) return;
     const boards = await boardFacts(context, uris);
+    // Holds any row check past its board read (a subscribe's too), where a control may add a uri the read missed and
+    // `authorizeFor` must read again (#1216).
+    await testPauseAsync("mcp:authorize:facts");
     if (cancelled(context, signal)) throw new ApplicationError("unauthenticated", "request cancelled");
     const checked = await rowCheck(context);
     if (cancelled(context, signal)) throw new ApplicationError("unauthenticated", "request cancelled");
@@ -281,7 +292,8 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     return true;
   }
   // `admit: false` skips hosted admission, for a re-selection the prompting request already paid for (#431).
-  async function select(request: Request, admit = true): Promise<Context> {
+  // `instruct: false` skips the bound text's facts, for a selection no makeServer is built for (#1196).
+  async function select(request: Request, admit = true, instruct = true): Promise<Context> {
     const role = hostedRole(request);
     const principal = await oauth.authenticate(request, roleScopes(role));
     if (principal instanceof Response) {
@@ -315,7 +327,8 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
       // A native tool call's end is touched by its tool's gate, which also reuses this selection's verdict (#907). A
       // subscriber's ending call admits no unknown ID (#1097): ending must never start a session.
       const exchange = exchanges.getStore();
-      selected = await hosted.snapshot(principal, routing, !(role === "native" && exchange?.method === "tools/call"), !(role === "subscriber" && ENDING_CALLS.has(exchange?.call)));
+      // An ending call's selection always runs (#1535): a client that ends and exits may not wait for the answer.
+      selected = await hosted.snapshot(principal, routing, !(role === "native" && exchange?.method === "tools/call"), !(role === "subscriber" && ENDING_CALLS.has(exchange?.call)), ENDING_CALLS.has(exchange?.call) ? undefined : request.signal);
     } catch (error) {
       const exchange = exchanges.getStore();
       if (exchange && error instanceof ApplicationError && error.code === "rate_limited" && typeof error.extra.retry_after_ms === "number" && Number.isFinite(error.extra.retry_after_ms) && error.extra.retry_after_ms > 0) {
@@ -343,10 +356,10 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     const exchange = exchanges.getStore();
     if (exchange) { exchange.principal = principal.authed.user_id; exchange.identity = context.session.identityName; exchange.session = context.session.sessionId; }
     try {
-      if (closed || request.signal.aborted) throw new Error("MCP request is closed");
+      if (closed || request.signal.aborted) throw closedError(request);
       // The bound text's facts, for a context makeServer would give it (boundInstruction): read here, since the
       // server's instructions are built synchronously. The selection read the root moments ago (#907).
-      if (role !== "subscriber" && !context.session.via && !context.session.readOnly && "id" in routing) {
+      if (instruct && role !== "subscriber" && !context.session.via && !context.session.readOnly && "id" in routing) {
         const row = context.verdict ? undefined : await hosted.readRow(routing.id);
         const root = context.verdict?.root ?? (row && await hosted.readRoot(row));
         context.instruction = { launcher: await application.hostedLauncher(routing.id), leased: root?.lease_deadline != null };
@@ -357,10 +370,12 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
         throw new Error("unauthenticated");
       }
       // Closed or cancelled while the check awaited: the context is finished below, never handed out.
-      if (closed || request.signal.aborted) throw new Error("MCP request is closed");
+      if (closed || request.signal.aborted) throw closedError(request);
       return context;
     } catch (error) { context.finish(); throw error; }
   }
+  // A closing endpoint's error, else the client's abort (#1535), logged as client_aborted rather than unexpected.
+  const closedError = (request: Request) => closed || !request.signal.aborted ? new Error("MCP request is closed") : new RequestAbortedError();
   function binding(context: Context): Binding {
     return { user: context.principal.authed.user_id, email: context.principal.authed.user_email, grant: context.principal.grantId, role: context.role, identity: context.session.identityFull };
   }
@@ -412,20 +427,37 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     return false;
   }
   // Every commit to a hosted row notifies, so a read no notice for its rows followed is the committed state: the live
-  // keeps it. One a notice raced is read again, as is a re-read a notice raced in turn.
-  function adopt(live: Live, checked: Checked) {
+  // keeps it. One a notice raced is read again; a re-read a notice raced in turn is merged when it can be (`merged`).
+  function adopt(live: Live, checked: Checked, merge = false) {
     if (live.stopped) return;
-    if (moved(live.rows, checked.seq)) return recheck(live);
-    live.bound = { row: checked.row, root: checked.root };
+    if (!moved(live.rows, checked.seq)) { live.bound = { row: checked.row, root: checked.root }; return; }
+    if (!merge || !merged(live, checked)) recheck(live);
   }
+  // A re-read a notice raced, merged into the bound per row, so each half is its row's newest committed state (#1486):
+  // a row no notice followed since the read began takes the read's half; one whose latest notice since carried its
+  // row (`noted`) keeps the noted half. A notice for every row, a pruned one, or a latest one that carried no row
+  // (its full pass notes later) leaves the bound as notices left it, for another re-read.
+  function merged(live: Live, checked: Checked): boolean {
+    if (allAt > checked.seq || prunedThrough > checked.seq) return false;
+    const after = (id: string) => (changedAt.get(id) ?? 0) > checked.seq;
+    for (const id of live.rows) if (after(id) && live.noted?.get(id) !== changedAt.get(id)) return false;
+    const own = "id" in live.context.sessionContext ? live.context.sessionContext.id : undefined;
+    const rootId = [...live.rows].find(r => r !== own) ?? own;
+    if (own !== undefined && !after(own)) live.bound.row = checked.row;
+    if (rootId !== undefined && !after(rootId)) live.bound.root = checked.root;
+    return true;
+  }
+  // A re-read is merged (`merged`) and judged; one it couldn't merge queues another and is judged on the bound as
+  // notices left it, a real pair since the live's creation (#1196). Tests hold a re-read before its read at
+  // `mcp:live:recheck`.
   function recheck(live: Live) {
     const context = live.context;
     if (live.rechecking === context) return;
     live.rechecking = context;
-    track(rowCheck(context).then(checked => {
+    track(testPauseAsync("mcp:live:recheck").then(() => rowCheck(context)).then(checked => {
       if (live.rechecking === context) live.rechecking = undefined;
       if (live.stopped || live.context !== context) return;
-      adopt(live, checked);
+      adopt(live, checked, true);
       judge(live);
     }, e => {
       if (live.rechecking === context) live.rechecking = undefined;
@@ -456,7 +488,9 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     if (changed === null) allAt = seq; else changedAt.set(changed, seq);
     // A snapshot: stop() unindexes as it goes.
     const affected = [...rowless];
-    if (changed !== null && row !== undefined) for (const live of byRow.get(changed) ?? []) { note(live, changed, row ?? undefined); affected.push(live); }
+    if (changed !== null && row !== undefined) for (const live of byRow.get(changed) ?? []) {
+      note(live, changed, row ?? undefined); (live.noted ??= new Map()).set(changed, seq); affected.push(live);
+    }
     for (const live of affected) judge(live);
   });
   const unwatchHosted = hosted.watchRows({
@@ -490,13 +524,16 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
   }
   // One authorize for the live's every uri: watchable and describe reuse its row (#853). The uris are read after
   // the awaits, as they stand then (#807 P3 A7d).
+  // The rows are adopted only while the live keeps the context they were read for: an attach meanwhile replaced it
+  // and adopted its own selection's (#1196).
   async function valid(live: Live): Promise<Checked> {
-    const checked = validChecked(live, await authorizeFor(live.context, () => live.uris.keys()));
-    adopt(live, checked);
+    const context = live.context;
+    const checked = validChecked(live, await authorizeFor(context, () => live.uris.keys()), context);
+    if (live.context === context) adopt(live, checked);
     return checked;
   }
-  function validChecked(live: Live, checked: Checked): Checked {
-    for (const [uri, cap] of live.uris) if (watchable(live.context, uri, checked) !== cap) throw new ApplicationError("not_found", "resource not found");
+  function validChecked(live: Live, checked: Checked, context = live.context): Checked {
+    for (const [uri, cap] of live.uris) if (watchable(context, uri, checked) !== cap) throw new ApplicationError("not_found", "resource not found");
     return checked;
   }
   // valid for a live whose stamp is fresh (#899), from the auth cache (phase A): every check but the binding's row,
@@ -530,7 +567,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     const request = new Request(via.url, { method: "GET", headers: via.headers, signal: live.context.request.signal });
     const exchange: Exchange = { ...exchanges.getStore()!, request, refusal: undefined, context: undefined, failure: undefined, logged: false };
     let next: Context;
-    try { next = await exchanges.run(exchange, () => select(request, false)); }
+    try { next = await exchanges.run(exchange, () => select(request, false, false)); }
     catch (error) {
       if (error instanceof ApplicationError) throw error;
       if (exchange.refusal || closed || request.signal.aborted) throw new ApplicationError("unauthenticated", "unauthenticated");
@@ -541,14 +578,17 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     unindexRows(live);
     live.context = next; live.rows = bindingRows(next, next.verdict?.row);
     indexRows(live);
-    // The selection's rows, read after `start`.
-    adopt(live, { row: next.verdict?.row, root: next.verdict?.root, seq: start });
+    // The selection's rows, read after `start`, replace the previous context's pair at once, as a new live's do (#1196).
+    live.bound = { row: next.verdict?.row, root: next.verdict?.root }; live.noted = undefined;
+    adopt(live, { ...live.bound, seq: start });
     if (live.stream) streamContexts.set(live.stream, next);
     previous.finish();
   }
   // `checked`: the authorize its caller judged the uris with.
   function makeLive(context: Context, checked: Checked, uris: Map<string, string | null>, handler?: McpHttpHandler, legacy?: Legacy): Live {
-    const live: Live = { context, rows: bindingRows(context, checked.row), bound: { row: undefined }, uris, watches: [], handler, legacy, stopped: false,
+    // `bound` starts from the creator's read, never a placeholder: a moved one is re-read (`adopt`), and a notice
+    // meanwhile notes into a real pair, half of which may be older than the read (#1196).
+    const live: Live = { context, rows: bindingRows(context, checked.row), bound: { row: checked.row, root: checked.root }, uris, watches: [], handler, legacy, stopped: false,
       // A hint arrives from a commit's afterCommit, inside the queue's holder: nothing waits for its check, and a
       // live stopped, or a uri dropped, while the check awaited gets no notification (#807 P3 A7d).
       hint(uri) {
@@ -660,6 +700,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
               }
             }
             const stream = legacy.stream, streamContext = stream?.context;
+            await testPauseAsync("mcp:legacy:control-stream");
             // The checks this registration is judged by, both in one last await (#807 P3 A7d, B5a2): this POST's
             // context again (an attach may have awaited since the first), and the stream's, whose answer decides
             // whether this uri joins it. Each is judged below with no await since.
@@ -680,8 +721,15 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
                 if (!expected(error)) throw error;
               }
             }
-            // A stream stopped or replaced while the check awaited is left alone: nothing to join or stop.
-            if (!stream || legacy.stream !== stream || stream.stopped) {}
+            const attached = legacy.stream;
+            if (attached !== stream) {
+              // A GET attached, or replaced the stream, while the checks awaited (#1408): it built its uris from the
+              // registrations before this one, so it lacks this uri, and wasn't judged for it here. It stops; the
+              // client reconnects it with every registration, this one included (set below, before any await).
+              if (attached && !attached.stopped && attached.uris.get(uri) !== cap) attached.stop();
+            }
+            // A stream stopped while the check awaited is left alone: nothing to join or stop.
+            else if (!stream || stream.stopped) {}
             else if (compatible) {
               // Publish registration only after observer installation succeeds.
               if (!stream.uris.has(uri)) { addWatch(stream, uri, streamChecked!); stream.uris.set(uri, cap); indexInbox(stream); }
@@ -723,9 +771,9 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     try {
     const exchange = exchanges.getStore()!;
     if (exchange.context) {
-      if (closed || exchange.request.signal.aborted) { exchange.closedAtFactory = closed; throw new Error("MCP request is closed"); }
+      if (closed || exchange.request.signal.aborted) { exchange.closedAtFactory = closed; throw closedError(exchange.request); }
       const principal = await oauth.authenticate(exchange.request, roleScopes(exchange.context.role));
-      if (closed || exchange.request.signal.aborted) { exchange.closedAtFactory = closed; throw new Error("MCP request is closed"); }
+      if (closed || exchange.request.signal.aborted) { exchange.closedAtFactory = closed; throw closedError(exchange.request); }
       if (principal instanceof Response) refuse(principal);
     }
     const context = exchange.context ??= await select(exchange.request);
@@ -832,7 +880,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
   // `context`: the live's as the tick queued it; an attach that re-selected it since leaves the answer unused.
   async function checkLive(live: Live, context: Context, t: number) {
     try {
-      const { gen, start, checked } = await fullCheck(context, checked => validChecked(live, checked), () => live.uris.keys());
+      const { gen, start, checked } = await fullCheck(context, checked => validChecked(live, checked, context), () => live.uris.keys());
       // Stopped, or re-selected by an attach, while the check awaited: its answer is about a context the live no
       // longer has.
       if (closed || live.stopped || live.context !== context) return;
@@ -1067,7 +1115,8 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
               if (sid && !legacy) { releasePost(); return new Response("unknown MCP session", { status: 404 }); }
               // A GET or DELETE replays the creating POST's `_meta` for routing; its model and effort are stale by then (#364).
               if (req.method !== "POST" && legacy) exchange.meta = withoutFacts(legacy.meta);
-              const context = exchange.context = await select(req);
+              // Only a session's creating POST builds a server (makeServer): the rest skip the bound text's facts.
+              const context = exchange.context = await select(req, true, !legacy);
               // The timer may have dropped this sid while identity selection awaited.
               if (legacy?.stopped) { context.finish(); releasePost(); return new Response("unknown MCP session", { status: 404 }); }
               if (legacy?.dormant) {
@@ -1181,7 +1230,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
       // A failed drain or lease detach mustn't skip the final heartbeat or leave
       // the hosted timer running against a closed database (#423).
       try { await Promise.all([...forwarding].map(stream => stream.stop())); }
-      finally { try { unlistenHosted(); unwatchHosted(); resources.close(); delivery.close(); } finally { await hosted.close(); } }
+      finally { try { try { resources.close(); } finally { unlistenHosted(); unwatchHosted(); delivery.close(); } } finally { await hosted.close(); } }
       await modern.close();
       await Promise.allSettled([...bodyReads]);
       while (closing.size) await Promise.all([...closing]);
@@ -1268,7 +1317,7 @@ function registerNativeTools(server: McpServer, application: Application, hosted
   const run = async (ctx: ServerContext, tool: string, call: (session: ApplicationSession, tx: Tx) => unknown): Promise<CallToolResult> => {
     let notice: string | undefined;
     try {
-      return said(text(await timeTool(tool, async () => { const context = await current(ctx); return hosted.run(context.principal, context.sessionContext, tool, call, n => { notice = n; }, context.verdict); }) ?? "ok"), notice);
+      return said(text(await timeTool(tool, async () => { const context = await current(ctx); return hosted.run(context.principal, context.sessionContext, tool, call, n => { notice = n; }, context.verdict, context.request.signal); }) ?? "ok"), notice);
     }
     catch (e) {
       report(e, tool);
@@ -1291,11 +1340,11 @@ function registerNativeTools(server: McpServer, application: Application, hosted
   // The shared bind/unbind definitions (BIND_TOOL, UNBIND_TOOL), with the hosted input both roles take.
   server.registerTool(BIND_TOOL.name, { description: BIND_TOOL.description, _meta: BIND_TOOL._meta,
     inputSchema: HOSTED_BIND_INPUT }, async (args, ctx) => {
-    try { return await timeTool("bind", async () => { const context = await current(ctx); return hosted.bind(context.principal, context.sessionContext, args, context.declared); }); }
+    try { return await timeTool("bind", async () => { const context = await current(ctx); return hosted.bind(context.principal, context.sessionContext, args, context.declared, context.request.signal); }); }
     catch (e) { return bindRefusal(e, "bind"); }
   });
   server.registerTool(UNBIND_TOOL.name, { description: UNBIND_TOOL.description, inputSchema: HOSTED_UNBIND_INPUT }, async (args, ctx) => {
-    try { return await timeTool("unbind", async () => { const context = await current(ctx); return hosted.unbind(context.principal, context.sessionContext, args, context.declared); }); }
+    try { return await timeTool("unbind", async () => { const context = await current(ctx); return hosted.unbind(context.principal, context.sessionContext, args, context.declared, context.request.signal); }); }
     catch (e) { return bindRefusal(e, "unbind"); }
   });
   // The definitions local serves too (src/core/tools.ts), with files named by uploaded IDs (#385).

@@ -41,8 +41,8 @@ beforeEach(async () => {
   };
   [alice, bob] = await seed(store.repo, async tx => [await user(tx, "alice@example.com"), await user(tx, "bob@example.com")]);
 });
-afterEach(() => {
-  application.stopExpiry();
+afterEach(async () => {
+  await application.stopExpiry();
   store.db.close();
   rmSync(blobDir, { recursive: true, force: true });
 });
@@ -111,14 +111,19 @@ test("board observers are independent hints with concealed access and explicit l
   let changed = 0, closed = 0;
   const unsubscribe = application.observeBoard(a, "#E2E", { changed: () => { changed++; }, closed: () => { closed++; } });
   application.observeBoard(a, "e2e", { changed: () => { throw new Error("ignored hint"); } });
+  // #1500: commit effects aren't awaited, so wait for the hint; a witness that stays subscribed proves a later post
+  // was delivered before the unsubscribed observer's count is read.
+  let witnessed = 0;
+  application.observeBoard(a, "e2e", { changed: () => { witnessed++; } });
   await seed(store.repo, tx => application.call(tx, a, "board_post", { board: "e2e", body: "hello" }));
-  expect(changed).toBe(1);
+  await until(() => changed === 1 && witnessed === 1);
   expect((await application.boardSnapshot(store.repo.read, a, "e2e")).posts[0]!.body).toBe("hello");
   expect((await application.boardCatalog(store.repo.read, a)).boards.map(b => b.name)).toContain("e2e");
   unsubscribe();
   unsubscribe();
   expect(closed).toBe(1);
   await seed(store.repo, tx => application.call(tx, a, "board_post", { board: "e2e", body: "later" }));
+  await until(() => witnessed === 2);
   expect(changed).toBe(1);
   application.close(a);
   expect(() => application.observeBoard(a, "e2e", { changed: () => {} })).toThrow("session is closed");
@@ -188,6 +193,81 @@ test("#831: board and session observer indexes: a post tells its board's observe
   expect(application.observerIndexKeys).toEqual({ boards: 0, sessions: 0 });
 });
 
+// liveObservers (#807 P3 B5a1, H3; #1214 item 3): a post's observer check reads the board's visibility once, on the
+// pool. Held there, an observer that closes meanwhile isn't told of the change; one that stays is.
+test("#1214: an observer closed while a change's visibility read awaits isn't told; the board's other observer is", async () => {
+  const a = (await connect(alice, "be", { push: false })).session;
+  await seed(store.repo, tx => application.call(tx, a, "board_create", { name: "one", purpose: "tests" }));
+  const seen: string[] = [];
+  const watch = (tag: string) =>
+    application.observeBoard(a, "one", { changed: () => { seen.push(`${tag}+`); }, closed: () => { seen.push(`${tag}-`); } });
+  const leaving = watch("x");
+  watch("y");
+  const access = application.access;
+  const check = access.canSeeMany;
+  let held = false;
+  let release!: () => void;
+  const released = new Promise<void>(r => { release = r; });
+  access.canSeeMany = async (r, handles, b) => {
+    const seeing = await check.call(access, r, handles, b);
+    if (r === store.repo.read && b.name === "one" && !held) { held = true; await released; }
+    return seeing;
+  };
+  try {
+    await seed(store.repo, tx => application.call(tx, a, "board_post", { board: "one", body: "x" }));
+    await until(() => held, 5000, "the observer check held after its read");
+    leaving();
+    expect(seen).toEqual(["x-"]);
+    release();
+    await until(() => seen.includes("y+"), 5000, "the staying observer was told");
+    expect(seen).toEqual(["x-", "y+"]);
+  } finally { access.canSeeMany = check; release(); }
+});
+
+// A failed visibility read removes every observer it was checking, as a refused check would, and tells none of the change.
+test("#1214: a failed observer visibility read removes the board's observers and tells them nothing changed", async () => {
+  const a = (await connect(alice, "be", { push: false })).session;
+  await seed(store.repo, tx => application.call(tx, a, "board_create", { name: "one", purpose: "tests" }));
+  const seen: string[] = [];
+  for (const tag of ["x", "y"]) application.observeBoard(a, "one", { changed: () => { seen.push(`${tag}+`); }, closed: () => { seen.push(`${tag}-`); } });
+  expect(application.observerCount).toBe(2);
+  const access = application.access;
+  const check = access.canSeeMany;
+  access.canSeeMany = async (r, handles, b) => {
+    if (r === store.repo.read && b.name === "one") throw new Error("injected visibility read failure");
+    return check.call(access, r, handles, b);
+  };
+  const logged = spyOn(console, "error").mockImplementation(() => {});
+  try {
+    await seed(store.repo, tx => application.call(tx, a, "board_post", { board: "one", body: "x" }));
+    await until(() => application.observerCount === 0, 5000, "the failed check removed the observers");
+    expect(seen.sort()).toEqual(["x-", "y-"]);
+    expect(application.observerIndexKeys).toEqual({ boards: 0, sessions: 0 });
+    expect(logged.mock.calls.some(c => String(c[0]).includes("observer check failed"))).toBe(true);
+  } finally { access.canSeeMany = check; logged.mockRestore(); }
+});
+
+// The server's catalog walks the async branch of core's catalogWalk (board_reads.ts boardCatalog; #1214 item 5): past a
+// page of 100 rows, filtered by the access read, a board the viewer can't see left out on every page.
+test("#1214: the server's board catalog pages past one store page and conceals a hidden board across pages", async () => {
+  const a = (await connect(alice, "be", { push: false })).session;
+  const names = Array.from({ length: 105 }, (_, i) => `b${String(i).padStart(3, "0")}`);
+  await seed(store.repo, async tx => {
+    for (const name of names) await store.repo.boards.ensure(tx, name, "catalog", null, "be");
+    // Sorts among them: the first store page's 100 rows hold it, so only 99 of them are visible.
+    await store.repo.boards.ensure(tx, "b050x", "hidden", "team:nobody", "someone");
+  });
+  const first = await application.boardCatalog(store.repo.read, a);
+  expect(first.boards).toHaveLength(100);
+  expect(first.next_after).toBe(first.boards[99]!.name);
+  const last = await application.boardCatalog(store.repo.read, a, first.next_after!);
+  expect(last.next_after).toBeNull();
+  const all = [...first.boards, ...last.boards].map(b => b.name);
+  expect(all).not.toContain("b050x");
+  expect(all.filter(n => n.startsWith("b"))).toEqual(names);
+  expect(new Set(all).size).toBe(all.length);
+});
+
 test("tools-only calls neither own nor drain deliveries nor reset the owner's status", async () => {
   const owner = await connect(alice, "be");
   await owner.call("peer_status", { text: "working" });
@@ -204,7 +284,7 @@ test("tools-only calls neither own nor drain deliveries nor reset the owner's st
 });
 
 test("bind budget is per user and spent before an alias is created or a hold taken", async () => {
-  application.stopExpiry();
+  await application.stopExpiry();
   application = createApplication(store.repo, { helloLimit: { burst: 1, perSec: 0.01 } });
   const a = await connect(alice, "be");
   await expect(a.bind("refused")).rejects.toMatchObject({ code: "rate_limited", extra: { retry_after_ms: expect.any(Number) } });
@@ -678,6 +758,18 @@ test("#807 P3 B1c: close's touch commits or rolls back with its body, and from a
     await until(() => seen(late.id) > 0, 2000, "the queued close touch");
     expect(errors.mock.calls.filter(c => String(c[0]).includes("last-seen touch"))).toEqual([]);
   } finally { errors.mockRestore(); }
+});
+
+// #1527 L1: a queued close touch carries its writer's ID key beside its root's, so two sessions of one writer ID under
+// different roots (or none) touch its row in arrival order. Mutation: the touch's keys without `id:<writer>`.
+test("#1510: a queued close touch is keyed by its writer's root and its writer ID", async () => {
+  const keyed = spyOn(store.repo, "writeKeyed");
+  try {
+    const conn = await connect(alice, "keyed-close", { key: "alice-keyed-close" });
+    application.close(conn.session);
+    await until(() => keyed.mock.calls.length > 0, 2000, "the queued close touch");
+    expect(keyed.mock.calls.map(c => c[0])).toEqual([[`root:${conn.id}`, `id:${conn.id}`]]);
+  } finally { keyed.mockRestore(); }
 });
 
 test("#807: a rolled-back attachHuman leaves the earlier bridge connection in place", async () => {

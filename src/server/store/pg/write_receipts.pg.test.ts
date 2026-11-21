@@ -30,6 +30,7 @@ const receipts = makePgWriteReceipts();
 const repoOf = (writeReceipts: WriteReceiptsStore = receipts) => ({
   writeReceipts, audit: makePgAudit(), now: () => T0,
   post: () => { throw new Error("writeAudit posted: the row left the body's transaction"); },
+  postKeyed: () => { throw new Error("writeAudit posted: the row left the body's transaction"); },
 }) as unknown as Repo;
 
 type Sent = Written<{ message_id: number }>;

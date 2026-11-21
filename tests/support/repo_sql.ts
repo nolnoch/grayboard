@@ -106,61 +106,66 @@ function isRepoLike(on: RepoLike | Tx): on is RepoLike {
   return !isTx(on as Read);
 }
 
-// Whether a write transaction is open, on either backend (#807 P3 C11c): what a spy read from SQLite's
-// `db.inTransaction`. It counts the bodies passed to the Repo's write, post and hosted.write while each runs, which
-// is every top-level transaction the server opens (each goes through one of them). `restore()` puts them back.
+// Whether the caller's own write transaction is open, on either backend (#807 P3 C11c): what a spy read from SQLite's
+// `db.inTransaction` when one body ran at a time. True from a body's start until it settles, in the body and the tasks
+// it started; false in any other task, though another body is open (a fire-and-forget touch beside a route's pool read,
+// #1510), and false in a continuation the body left running past its settle. It wraps the bodies passed to the Repo's
+// write, writeKeyed, post and hosted.write/writeKeyed, which is every top-level transaction the server opens.
+// `restore()` puts them back.
 export function txSpy(on: RepoLike): { readonly open: boolean; restore(): void } {
   const repo = repoOf(on);
-  let depth = 0;
-  const counted = <F extends (tx: Tx) => unknown>(fn: F) => ((tx: Tx) => {
-    depth++;
-    let out: unknown;
-    try {
-      out = fn(tx);
-    } catch (error) {
-      depth--;
-      throw error;
-    }
-    if (out !== null && typeof out === "object" && typeof (out as PromiseLike<unknown>).then === "function") {
-      return Promise.resolve(out).finally(() => { depth--; });
-    }
-    depth--;
-    return out;
-  }) as F;
-  const write = repo.write, post = repo.post, hostedWrite = repo.hosted.write;
-  const wrapped = repo as unknown as Record<"write" | "post", unknown>;
-  wrapped.write = (fn: (tx: Tx) => unknown, ...rest: unknown[]) => (write as (...a: unknown[]) => unknown).call(repo, counted(fn), ...rest);
-  wrapped.post = (fn: (tx: Tx) => unknown, ...rest: unknown[]) => (post as (...a: unknown[]) => unknown).call(repo, counted(fn), ...rest);
-  (repo.hosted as unknown as Record<"write", unknown>).write = (fn: (tx: Tx) => unknown, ...rest: unknown[]) =>
-    (hostedWrite as (...a: unknown[]) => unknown).call(repo.hosted, counted(fn), ...rest);
+  const als = new AsyncLocalStorage<{ live: boolean }>();
+  const counted = (fn: (tx: Tx) => unknown) => (tx: Tx) => {
+    const body = { live: true };
+    return als.run(body, () => {
+      let out: unknown;
+      try {
+        out = fn(tx);
+      } catch (error) {
+        body.live = false;
+        throw error;
+      }
+      if (out !== null && typeof out === "object" && typeof (out as PromiseLike<unknown>).then === "function") {
+        return Promise.resolve(out).finally(() => { body.live = false; });
+      }
+      body.live = false;
+      return out;
+    });
+  };
+  const restore = wrapBodies(repo, counted);
   return {
-    get open() { return depth > 0; },
-    restore() {
-      wrapped.write = write;
-      wrapped.post = post;
-      (repo.hosted as unknown as Record<"write", unknown>).write = hostedWrite;
-    },
+    get open() { return als.getStore()?.live === true; },
+    restore,
   };
 }
 
-// Whether the calling code runs inside a body the server's write queue runs (repo.write, repo.post or
-// repo.hosted.write: every top-level transaction the server opens goes through one), on either backend (#807 P3 C11d):
+// Wraps every body the Repo's write paths take (write, writeKeyed, post, hosted.write, hosted.writeKeyed: every
+// top-level transaction the server opens goes through one) in `wrap`; returns what puts them back.
+function wrapBodies(repo: Repo, wrap: (fn: (tx: Tx) => unknown) => (tx: Tx) => unknown): () => void {
+  const r = repo as unknown as Record<"write" | "writeKeyed" | "post", (...a: unknown[]) => unknown>;
+  const h = repo.hosted as unknown as Record<"write" | "writeKeyed", (...a: unknown[]) => unknown>;
+  const { write, writeKeyed, post } = r, { write: hostedWrite, writeKeyed: hostedKeyed } = h;
+  r.write = (fn, ...rest) => write.call(repo, wrap(fn as (tx: Tx) => unknown), ...rest);
+  r.post = (fn, ...rest) => post.call(repo, wrap(fn as (tx: Tx) => unknown), ...rest);
+  r.writeKeyed = (keys, fn, ...rest) => writeKeyed.call(repo, keys, wrap(fn as (tx: Tx) => unknown), ...rest);
+  h.write = (fn, ...rest) => hostedWrite.call(repo.hosted, wrap(fn as (tx: Tx) => unknown), ...rest);
+  h.writeKeyed = (keys, fn, ...rest) => hostedKeyed.call(repo.hosted, keys, wrap(fn as (tx: Tx) => unknown), ...rest);
+  return () => { r.write = write; r.writeKeyed = writeKeyed; r.post = post; h.write = hostedWrite; h.writeKeyed = hostedKeyed; };
+}
+
+// Whether the calling code runs inside a body the server's write scheduler runs (repo.write, repo.writeKeyed,
+// repo.post or repo.hosted's: every top-level transaction the server opens goes through one), on either backend (#807 P3 C11d):
 // what SQLite's `db.inTransaction && queueFor(db).mine` said. Each body runs in an async context of its own, so a call
 // made outside any body (while another body holds the queue) reads false. Looser than that check in one way: async
 // work a body started carries its context on, so a call from it (an afterCommit effect, an un-awaited promise) reads
-// true even after the body has committed. Stricter than txSpy, which is true while any body is open. `restore()` puts
+// true even after the body has committed, where txSpy reads false. `restore()` puts
 // the Repo's methods back.
 export function queuedBodies(on: RepoLike): { readonly inside: boolean; restore(): void } {
   const repo = repoOf(on);
   const als = new AsyncLocalStorage<true>();
-  const wrap = (fn: (tx: Tx) => unknown) => (tx: Tx) => als.run(true, () => fn(tx));
-  const write = repo.write, post = repo.post, hostedWrite = repo.hosted.write;
-  const r = repo as unknown as Record<"write" | "post", unknown>, h = repo.hosted as unknown as Record<"write", unknown>;
-  r.write = (fn: (tx: Tx) => unknown, ...rest: unknown[]) => (write as (...a: unknown[]) => unknown).call(repo, wrap(fn), ...rest);
-  r.post = (fn: (tx: Tx) => unknown, ...rest: unknown[]) => (post as (...a: unknown[]) => unknown).call(repo, wrap(fn), ...rest);
-  h.write = (fn: (tx: Tx) => unknown, ...rest: unknown[]) => (hostedWrite as (...a: unknown[]) => unknown).call(repo.hosted, wrap(fn), ...rest);
+  const restore = wrapBodies(repo, fn => tx => als.run(true, () => fn(tx)));
   return {
     get inside() { return als.getStore() === true; },
-    restore() { r.write = write; r.post = post; h.write = hostedWrite; },
+    restore,
   };
 }

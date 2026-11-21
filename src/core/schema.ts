@@ -322,6 +322,11 @@ export function initCoreSchema(db: Database): void {
   // for every other post (a system post written as a human's handle among them); null for posts from before it, which
   // fall back to whether the author is the declared human at delivery (postHuman). Never shown on reads (POST_COLS).
   if (!postCols.some((c) => c.name === "human")) db.exec(`ALTER TABLE posts ADD COLUMN human INTEGER`);
+  // The root of the session that wrote it (#540), judged when it's written: author_id's ids.root_id, or author_id
+  // itself for a root's post; null with no author_id and for posts from before it, which fall back to the author's
+  // root as it is now. NOT_OWN reads it, so a raw ID's later change of role (a former child starting as a root clears
+  // its root_id; a root registered as a child gains one) never moves its earlier posts. Never shown on reads.
+  if (!postCols.some((c) => c.name === "author_root")) db.exec(`ALTER TABLE posts ADD COLUMN author_root TEXT`);
 
   // The principal an upload counts against (#284 decision 13): a server
   // user's email, null in local mode. Backfilled from the uploader's "email/"
@@ -336,6 +341,12 @@ export function initCoreSchema(db: Database): void {
   // next push that does (0): a thread reply to a bystander.
   const outboxCols = db.prepare(`PRAGMA table_info(outbox)`).all() as { name: string }[];
   if (!outboxCols.some((c) => c.name === "wake")) db.exec(`ALTER TABLE outbox ADD COLUMN wake INTEGER NOT NULL DEFAULT 1`);
+  // The session holding the row's handle when the push was written (#1370), by claim_events.session_id's rule (#1351):
+  // the alias's holder, else the handle when it is a session ID; null for an alias no session held, and for rows from
+  // before it. A queue lane's push history follows it while that session is live (queueLaneRowsSql). The index after
+  // the ALTER, as claim_events'.
+  if (!outboxCols.some((c) => c.name === "session_id")) db.exec(`ALTER TABLE outbox ADD COLUMN session_id TEXT`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_outbox_session ON outbox(session_id, post_id) WHERE session_id IS NOT NULL`);
 
   // A refused binding event's repeats (#210): NULL count means 1, NULL
   // last_at means at.

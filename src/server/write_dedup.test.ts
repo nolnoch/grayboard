@@ -108,8 +108,8 @@ describe("dedupWrite", () => {
   });
 
   test("a write that throws leaves no receipt, so the retry writes", async () => {
-    await expect(dedup(1_000, call(), tx => {
-      send()(tx);
+    await expect(dedup(1_000, call(), async tx => {
+      await send()(tx);
       throw new Error("bound attachment refused");
     })).rejects.toThrow("bound attachment refused");
     expect(count("SELECT COUNT(*) AS n FROM write_receipts")).toBe(0);

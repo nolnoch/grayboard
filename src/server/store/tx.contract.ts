@@ -16,10 +16,13 @@
 import { expect, test } from "bun:test";
 import { until } from "../../../tests/support/until.ts";
 import { afterCommitOf, isTx, type Read, type Tx } from "./tx_base.ts";
+import { abandonable, RequestAbortedError } from "./queue.ts";
 
 // One store, fresh per test, over a table of text values in insertion order.
 export type TxStore = {
   write<T, R = T>(fn: (tx: Tx) => T | Promise<T>, committed?: (value: T) => R): Promise<Awaited<R>>;
+  // Repo.writeKeyed (#1510): write, overlapping only keyed bodies that share none of `keys` where the backend can.
+  writeKeyed<T, R = T>(keys: readonly string[], fn: (tx: Tx) => T | Promise<T>, committed?: (value: T) => R): Promise<Awaited<R>>;
   post<T>(fn: (tx: Tx) => T | Promise<T>, committed?: (value: T) => unknown, what?: string): boolean;
   read: Read;
   // The store's write queue (store/queue.ts).
@@ -350,6 +353,38 @@ function handles(backend: TxBackend, it: It): void {
     expect(await h.rows(h.read)).toEqual(["a", "b", "c", "d"]);
   });
 
+  // D4 (#1054): a timer a suspended body starts inherits the body's queue ownership, so every ambient way to the
+  // writer refuses it: a write, a post and the store's Read. The only way in is the body's Tx, captured by name: its
+  // row is the body's, committed with it or rolled back with it.
+  it("D4: a timer a suspended body starts reaches the writer only through the Tx it captured (#1054)", async h => {
+    const fromTimer = (tx: Tx) => new Promise<{ write: string; post: string; read: string }>(resolve => setTimeout(() => {
+      void (async () => {
+        const write = await failure(() => h.write(t => h.put(t, "ambient write")));
+        const post = await failure(() => h.post(t => h.put(t, "ambient post"), undefined, "timer write"));
+        const read = await failure(() => h.rows(h.read));
+        await h.put(tx, "captured");
+        resolve({ write, post, read });
+      })();
+    }, 0));
+    let seen!: { write: string; post: string; read: string };
+    await h.write(async tx => {
+      await h.put(tx, "body");
+      seen = await fromTimer(tx);
+    });
+    expect(seen.write).toContain("write() inside an open transaction");
+    expect(seen.post).toContain("post inside an open transaction (timer write)");
+    expect(seen.read).toContain("repo.read inside the caller's own transaction");
+    await h.drain();
+    expect(await h.rows(h.read)).toEqual(["body", "captured"]);
+    // The captured Tx's row rolls back with the body that owns it.
+    await expect(h.write(async tx => {
+      await fromTimer(tx);
+      throw new Error("boom");
+    })).rejects.toThrow("boom");
+    await h.drain();
+    expect(await h.rows(h.read)).toEqual(["body", "captured"]);
+  });
+
   // #807 P3 A7g: Tx.beforeCommit.
   it("beforeCommit runs once per key after the body, before COMMIT, on the root Tx with the queue held", async h => {
     const seen: string[] = [];
@@ -580,6 +615,94 @@ function writePath(backend: TxBackend, it: It): void {
     expect(h.queue.held).toBe(false);
     await h.write(tx => h.put(tx, "next"));
     expect(await h.rows(h.read)).toEqual(["next"]);
+  });
+
+  // #1510: a keyed body keeps write's whole contract; what may overlap it is the backend's (one connection: nothing).
+  it("writeKeyed commits like write: rows, effects then committed, a rollback on throw, the nested refusal", async h => {
+    const seen: string[] = [];
+    expect(await h.writeKeyed(["root:a"], async tx => {
+      await h.put(tx, "keyed");
+      tx.afterCommit(() => { seen.push(`effect (${h.inTransaction() ? "in" : "after"} txn)`); });
+      return 1;
+    }, v => { seen.push(`committed ${v}`); return v + 1; })).toBe(2);
+    expect(seen).toEqual(["effect (after txn)", "committed 1"]);
+    await expect(h.writeKeyed(["root:a"], async tx => { await h.put(tx, "gone"); throw new Error("keyed boom"); })).rejects.toThrow("keyed boom");
+    let nested: Promise<unknown> | undefined;
+    await h.writeKeyed(["root:a"], async () => { nested = h.writeKeyed(["root:b"], () => 1).catch(e => e); });
+    expect(String(await nested)).toContain("nested code calls its Tx's savepoint");
+    await h.write(async () => { nested = h.writeKeyed(["root:b"], () => 1).catch(e => e); });
+    expect(String(await nested)).toContain("nested code calls its Tx's savepoint");
+    expect(await h.rows(h.read)).toEqual(["keyed"]);
+    expect(h.queue.held).toBe(false);
+  });
+
+  it("writeKeyed refuses an empty key list or an empty key, and writes nothing", async h => {
+    await expect(h.writeKeyed([], tx => h.put(tx, "none"))).rejects.toThrow("at least one key");
+    await expect(h.writeKeyed(["root:a", ""], tx => h.put(tx, "empty"))).rejects.toThrow("each a non-empty string");
+    expect(await h.rows(h.read)).toEqual([]);
+  });
+
+  it("an exclusive write waits for a keyed body, and keyed bodies of one key run in arrival order, each after the last one's effects", async h => {
+    const seen: string[] = [];
+    const hold = gate(), entered = gate();
+    const first = h.writeKeyed(["root:a"], async tx => {
+      seen.push("1");
+      entered.open();
+      await hold.wait;
+      await h.put(tx, "1");
+      tx.afterCommit(() => { seen.push("1:effect"); });
+    }, () => { seen.push("1:committed"); });
+    await entered.wait;
+    const exclusive = h.write(async tx => { seen.push("x"); await h.put(tx, "x"); });
+    const second = h.writeKeyed(["root:a"], async tx => { seen.push("2"); await h.put(tx, "2"); });
+    expect(seen).toEqual(["1"]);
+    hold.open();
+    await Promise.all([first, exclusive, second]);
+    expect(seen).toEqual(["1", "1:effect", "1:committed", "x", "2"]);
+    expect(await h.rows(h.read)).toEqual(["1", "x", "2"]);
+  });
+
+  // #1535 (D4): a request-entry write whose request aborts while it waits is skipped. It never begins: no row, no
+  // effect, no committed; its caller rejects RequestAbortedError before the holder releases. A body that started runs
+  // to its commit, and a write the aborted request (or a marked body) queues without the mark runs.
+  it("an abandonable write or keyed write whose signal fires while it waits is skipped: nothing written, committed never runs", async h => {
+    const seen: string[] = [];
+    const hold = gate();
+    const holder = h.write(async tx => { await hold.wait; await h.put(tx, "held"); });
+    const ac = new AbortController();
+    const skipped = abandonable(ac.signal, () => h.write(async tx => { seen.push("body"); await h.put(tx, "skipped"); tx.afterCommit(() => { seen.push("effect"); }); }, () => { seen.push("committed"); }));
+    const keyed = abandonable(ac.signal, () => h.writeKeyed(["root:a"], async tx => { seen.push("keyed body"); await h.put(tx, "keyed"); }));
+    // Both reject at the abort: caught now, so neither is reported unhandled while the other is awaited.
+    const failed = Promise.all([skipped.catch(e => e), keyed.catch(e => e)]);
+    ac.abort();
+    for (const e of await failed) expect(e).toBeInstanceOf(RequestAbortedError);
+    // The same request's cleanup, queued after its abort without the mark, runs.
+    const cleanup = h.write(tx => h.put(tx, "cleanup"));
+    hold.open();
+    await Promise.all([holder, cleanup]);
+    await h.drain();
+    expect(seen).toEqual([]);
+    expect(await h.rows(h.read)).toEqual(["held", "cleanup"]);
+    expect(h.queue.held).toBe(false);
+  });
+
+  it("an abandonable body that started commits normally when its signal fires mid-body; a write it queues is unmarked", async h => {
+    const seen: string[] = [];
+    const hold = gate(), entered = gate();
+    const ac = new AbortController();
+    let inner: Promise<unknown> | undefined;
+    const started = abandonable(ac.signal, () => h.write(async tx => {
+      entered.open();
+      await hold.wait;
+      await h.put(tx, "started");
+    }, () => { seen.push("committed"); inner = h.write(tx => h.put(tx, "queued by committed")); }));
+    await entered.wait;
+    ac.abort();
+    hold.open();
+    await started;
+    await inner;
+    expect(seen).toEqual(["committed"]);
+    expect(await h.rows(h.read)).toEqual(["started", "queued by committed"]);
   });
 
   // post (#807 P1b-4b): a write no caller awaits.

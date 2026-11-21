@@ -21,7 +21,8 @@
 import { holderUserRule } from "../../../core/claim_holder.ts";
 import type { Claim, ClaimEvent, ClaimEventRow, ClaimRow, ClaimsStore } from "../claims.ts";
 import { int8, int8OrNull } from "./sql.ts";
-import { pgOf, type PgSql } from "./tx.ts";
+import type { Tx } from "../tx_base.ts";
+import { pgOf, refuseKeyed, type PgSql } from "./tx.ts";
 
 type Row = Record<string, unknown>;
 const toClaim = (r: Row): Claim => ({
@@ -38,10 +39,13 @@ const lapseOrder = (a: ClaimRow, b: ClaimRow) => a.expires_at - b.expires_at || 
 
 // One claim_events row on the caller's handle (core logEvent); pg/boards.ts's claimQueuePost writes its take event
 // through it too. session_id: core logEvent's rule (#1351), the alias's holder, else the handle when it is a session
-// ID, else null.
+// ID, else null. Refused in a keyed body (#1510, D4): recentEvents reads claim_events newest by id, so their ids must
+// commit in allocation order, which only exclusive bodies give.
 export async function insertClaimEvent(
-  sql: PgSql, event: ClaimEvent, handle: string, c: Partial<Claim> & { key: string }, at: number, heldBy?: string,
+  tx: Tx, event: ClaimEvent, handle: string, c: Partial<Claim> & { key: string }, at: number, heldBy?: string,
 ): Promise<void> {
+  refuseKeyed(tx, "claim_events insert");
+  const sql = pgOf(tx);
   await sql`INSERT INTO claim_events (key, handle, event, note, board, expires_at, held_by, at, session_id)
     VALUES (${c.key}, ${handle}, ${event}, ${c.note ?? null}, ${c.board ?? null}, ${c.expires_at ?? null}::int8, ${heldBy ?? null}, ${at},
       COALESCE((SELECT id FROM alias_holds WHERE address = ${handle}), (SELECT id FROM ids WHERE id = ${handle})))`;
@@ -115,7 +119,7 @@ export function makePgClaims({ clock }: { clock: () => number }): ClaimsStore {
       const rows: Row[] = await sql`DELETE FROM claims WHERE expires_at <= ${now} RETURNING ${rowCols(sql)}`;
       return rows.map(toRow).sort(lapseOrder);
     },
-    logEvent: (tx, event, handle, c, at, heldBy) => insertClaimEvent(pgOf(tx), event, handle, c, at, heldBy),
+    logEvent: (tx, event, handle, c, at, heldBy) => insertClaimEvent(tx, event, handle, c, at, heldBy),
     takeWatchers,
     // core holderUser: the row's own user, else holderPrincipals' two facts read in one statement, then the rule.
     async holderUser(r, c) {
@@ -132,7 +136,7 @@ export function makePgClaims({ clock }: { clock: () => number }): ClaimsStore {
       if (!row) return false;
       const gone = toRow(row);
       await takeWatchers(tx, key);
-      await insertClaimEvent(pgOf(tx), "release", gone.holder, { ...gone, note: gone.expires_at <= now ? "ack (late)" : "ack" }, now);
+      await insertClaimEvent(tx, "release", gone.holder, { ...gone, note: gone.expires_at <= now ? "ack (late)" : "ack" }, now);
       return true;
     },
     // A session end's (#807 P3 C10d2-a): by key bytewise, as SQLite's BINARY orders it (C11a).

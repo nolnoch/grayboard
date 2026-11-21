@@ -7,6 +7,7 @@ import { sha256Hex } from "../shared/hash.ts";
 import { participant, type Repo } from "./db.ts";
 import type { Read } from "./store/tx.ts";
 import { boardAccess } from "./access.ts";
+import { testPauseAsync } from "../shared/testpause.ts";
 import { visibleBoards } from "./board_reads.ts";
 import { decidePure, recordDecision, type Actor, type PureRequest } from "./policy.ts";
 
@@ -151,8 +152,9 @@ async function releaseFile(repo: Repo, id: number, from: Uploader, guard?: Guard
 }
 
 // Deletes the bytes, then the catalog entry, of every blob no attachment names. Never throws: a failure is logged and
-// left for the next sweep. Returns how many went.
-export async function sweepStoredBlobs(repo: Repo): Promise<number> {
+// left for the next sweep. Returns how many went. `stopped`: the server's stop has begun (#1489), so the blobs not yet
+// started are left; each blob's work is resumable, and the next sweep redoes it.
+export async function sweepStoredBlobs(repo: Repo, stopped: () => boolean = () => false): Promise<number> {
   let shas: string[];
   try {
     shas = await repo.attachments.unnamedBlobs(repo.read);
@@ -160,8 +162,10 @@ export async function sweepStoredBlobs(repo: Repo): Promise<number> {
     console.error(`[grayboard] blob sweep: ${(e as Error).message}`);
     return 0;
   }
+  await testPauseAsync("blobs:listed");
   let swept = 0;
   for (const sha256 of shas) {
+    if (stopped()) break;
     try {
       await withBlob(sha256, async () => {
         if (await repo.attachments.named(repo.read, sha256)) return;

@@ -515,7 +515,7 @@ export class SlackBridge implements SlackLinker {
         const now = await repo.slack.linkFor(tx, link.user_id);
         if (this.stopped) return "the Slack bridge stopped";
         return now && now.slack_user === link.slack_user && now.dm_channel === link.dm_channel ? null : "the Slack link changed";
-      }));
+      }, true));
       this.linked.set(link.user_id, { link, session, relay });
       await application.replay(session);
     } catch (e) {

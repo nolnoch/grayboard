@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
-import type { Tx } from "./store/tx.ts";
-import { refusalCount } from "./metrics.ts";
+import { isTx, type Tx } from "./store/tx.ts";
+import { gateCount, refusalCount } from "./metrics.ts";
+import { hostedPause } from "../../tests/support/hosted-pause.ts";
 import { until } from "../../tests/support/until.ts";
 import { AppSession } from "../../tests/support/app_session.ts";
 import { hostedRowCount } from "../../tests/support/hosted_rows.ts";
@@ -23,7 +24,7 @@ import { issueOAuth } from "../../tests/helpers/oauth.ts";
 import { createDelivery } from "./delivery.ts";
 import { claim, listClaims } from "../core/claims.ts";
 import { scratchDbPath } from "../../tests/support/scratch_db.ts";
-import { queueFor } from "./store/queue.ts";
+import { queueFor, RequestAbortedError } from "./store/queue.ts";
 import { sessionEndPort } from "./session_end.ts";
 import { seed } from "../../tests/support/seed.ts";
 import { liveGrants } from "../../tests/support/grants.ts";
@@ -48,7 +49,7 @@ beforeEach(async () => {
   hosted = createHostedSessions(application, { now: () => now, isAuthorized: () => authorized }); await hosted.ready;
   delivery = createDelivery(hosted, { isAuthorized: () => authorized });
 });
-afterEach(async () => { delivery.close(); await hosted.close(); application.stopExpiry(); database.db.close(); rmSync(blobDir, { recursive: true, force: true }); });
+afterEach(async () => { delivery.close(); await hosted.close(); await application.stopExpiry(); database.db.close(); rmSync(blobDir, { recursive: true, force: true }); });
 
 test("#807: behind a write backlog longer than a tick, the timer keeps one sweep queued, not one per tick", async () => {
   // The service's timer, driven by hand: each call is one tick, so the test needs no wall clock (#961).
@@ -316,6 +317,17 @@ test("#807 P1c-15b: core helpers inside hosted bodies run on that body's Tx, out
     expect(pulled.some(c => c.op === "boards.get" && c.handle === "tx" && c.inTxn)).toBe(true);
     expect(pulled.some(c => c.op === "boards.pendingPushes" && c.handle === "pool" && !c.inTxn)).toBe(true);
     expect(pulled.some(c => c.op === "boards.acknowledge" && c.handle === "tx" && c.inTxn)).toBe(true);
+    // #1214 item 4: the catalog and a snapshot (resources list/read) read boards through repo.boards alone, on the
+    // handle they're given (here a body's Tx), and reach coreOn zero times.
+    const resources = checks.length;
+    await hosted.run(principal, b, "resources_read", async (session, tx) => {
+      expect((await application.boardCatalog(tx, session)).boards.map(x => x.name)).toContain("p15");
+      expect((await application.boardSnapshot(tx, session, "p15")).posts.map(p => p.body)).toEqual(["x"]);
+    });
+    const read = checks.slice(resources);
+    expect(read.filter(c => c.op === "coreOn")).toEqual([]);
+    expect(read.some(c => c.op === "boards.catalogPage" && c.handle === "tx" && c.inTxn)).toBe(true);
+    expect(read.some(c => c.op === "boards.snapshotPage" && c.handle === "tx" && c.inTxn)).toBe(true);
     await hosted.whoami(principal, a);
     expect(checks.filter(c => c.inTxn !== (c.handle === "tx"))).toEqual([]);
   } finally { spy.mockRestore(); for (const s of boardSpies) s.mockRestore(); }
@@ -476,6 +488,15 @@ test("#807 P1c-15b-2: refusal rows, place, unbind, facts and board checks run on
     logs.push({ inTxn: database.db.inTransaction, handle: h === database.repo.read ? "pool" : "tx" });
     return (log as (...a: unknown[]) => Promise<void>)(h, ...rest);
   }) as never);
+  // Place, unbind and facts went to `repo.bindings` with B1c (#1205): the coreOn spy no longer sees them, so these do.
+  const binds: { method: string; inTxn: boolean; handle: "pool" | "tx" }[] = [];
+  const bindSpies = (["setPlace", "release", "setIdFacts"] as const).map(method => {
+    const fn = (database.repo.bindings[method] as (...a: unknown[]) => unknown).bind(database.repo.bindings);
+    return spyOn(database.repo.bindings, method).mockImplementation(((h: unknown, ...rest: unknown[]) => {
+      binds.push({ method, inTxn: database.db.inTransaction, handle: h === database.repo.read ? "pool" : "tx" });
+      return fn(h, ...rest);
+    }) as never);
+  });
   const holder = ctx("p15b2-holder"), other = ctx("p15b2-other");
   const refused = () => database.db.prepare("SELECT name FROM binding_events WHERE session_id = ? AND event = 'refused'").all((other as { id: string }).id);
   try {
@@ -499,7 +520,9 @@ test("#807 P1c-15b-2: refusal rows, place, unbind, facts and board checks run on
     await delivery.receipt(generic, holder, lease.capability, items.map(i => i.id));
     expect(await hosted.unbind(generic, other, { name: "p15b2-other" })).toMatchObject({ structuredContent: { name: null } });
     expect(checks.filter(c => c.inTxn !== (c.handle === "tx"))).toEqual([]);
-  } finally { spy.mockRestore(); logSpy.mockRestore(); }
+    expect([...new Set(binds.map(b => b.method))].sort()).toEqual(["release", "setIdFacts", "setPlace"]);
+    expect(binds.filter(b => !b.inTxn || b.handle !== "tx")).toEqual([]);
+  } finally { spy.mockRestore(); logSpy.mockRestore(); for (const s of bindSpies) s.mockRestore(); }
 });
 
 // #807 P3 A2: an audit row written inside a hosted body goes on that body's Tx, never through `repo.post` (which ran it
@@ -981,12 +1004,132 @@ test("pending holds the reader gate while rebind waits; stale receipt cannot mov
   await expect(delivery.release(principal, context("root"), lease.capability)).rejects.toHaveProperty("code", "not_found");
 });
 
+// #1473: a lease that pulled an item before its root unbound the item's name can neither pull again nor receipt it, so
+// a stale lease never credits or repushes a name it lost; the item stays undelivered for whoever holds the name next.
+test("after an unbind, the old lease's pull and its receipt of the pulled item are both refused; the cursor stays (#1473)", async () => {
+  await hosted.bind(principal, context("root"), { name: "fe", create: true });
+  await hosted.bind(principal, context("root"), { name: "be", create: true });
+  const lease = await delivery.open(principal, context("root"));
+  const sender = new AppSession(application, database.repo, principal.authed, "sender", { push: false });
+  await sender.connect();
+  await sender.send("you@example.com/fe", "to fe");
+  const issued = await delivery.pending(principal, context("root"), lease.capability);
+  expect(issued).toHaveLength(1);
+  await hosted.unbind(principal, context("root"), { name: "fe" });
+  await expect(delivery.pending(principal, context("root"), lease.capability)).rejects.toHaveProperty("code", "not_found");
+  await expect(delivery.receipt(principal, context("root"), lease.capability, issued.map(item => item.id))).rejects.toHaveProperty("code", "not_found");
+  expect(await database.repo.cursors.directFor(database.repo.read, "you@example.com/fe")).toBe(0);
+});
+
 test("tool reader gate excludes rebind and revoke during its pause prevents the write", async () => {
   await hosted.bind(principal, context("root"), { name: "fe", create: true });
   let wrote = false;
   const operation = paused("hosted:tool:in-gate", () => hosted.run(principal, context("root"), "dm_send", () => { wrote = true; }), async () => { authorized = false; });
   await expect(operation).rejects.toHaveProperty("code", "unauthenticated");
   expect(wrote).toBe(false);
+});
+
+// #1535: a request-entry body whose request aborts while it waits in the write queue is skipped. The tool call is held
+// past its gate (`hosted:tool:in-gate`), the queue is then held, and the request aborts once the tool body queues:
+// the call rejects RequestAbortedError before the holder releases, the tool never ran and wrote no `hosted.write` row,
+// and the end-of-call touch, which the aborted request queues after, still commits.
+test("an aborted tool call's queued body is skipped; its end-of-call touch still runs (#1535)", async () => {
+  await hosted.bind(principal, context("root"), { name: "fe", create: true });
+  const id = (context("root") as { id: string }).id;
+  const q = queueFor(database.db);
+  const writes = () => (database.db.query("SELECT count(*) AS n FROM access_log WHERE action = 'hosted.write'").get() as { n: number }).n;
+  const before = writes();
+  const ac = new AbortController();
+  let wrote = false, release!: () => void, holder!: Promise<void>, rejectedWhileHeld = false;
+  const call = paused("hosted:tool:in-gate", () => hosted.run(principal, context("root"), "dm_send", () => { wrote = true; }, undefined, undefined, ac.signal), async () => {
+    holder = q.run(() => new Promise<void>(r => { release = r; }));
+    // Past the touch window, so the end-of-call touch writes.
+    now += 10_000;
+    void until(() => q.waitingAt("tool") === 1, 5000, "the tool body to queue behind the holder").then(async () => {
+      ac.abort();
+      // The tool body's caller rejects on the abort, while the holder still holds: the gate's finally then queues the
+      // end-of-call touch behind the holder, and the skipped body leaves the queue.
+      await until(() => q.waitingAt("touch") > 0, 5000, "the end-of-call touch to queue behind the holder");
+      rejectedWhileHeld = q.held && q.waitingAt("tool") === 0;
+      release();
+    });
+  });
+  await expect(call).rejects.toBeInstanceOf(RequestAbortedError);
+  await holder;
+  expect(rejectedWhileHeld).toBe(true);
+  expect(wrote).toBe(false);
+  expect(writes()).toBe(before);
+  await until(async () => (await database.repo.hosted.get(database.repo.read, id))?.last_seen_at === now, 5000, "the end-of-call touch to commit");
+});
+
+// The gate's own body, behind a held queue: skipped, so a new session's row is never created.
+test("an aborted request's queued gate body is skipped and creates no row (#1535)", async () => {
+  const q = queueFor(database.db);
+  let release!: () => void;
+  const holder = q.run(() => new Promise<void>(r => { release = r; }));
+  const rows = hostedRowCount(database.db);
+  const ac = new AbortController();
+  const call = hosted.run(principal, context("fresh"), "whoami", () => "ok", undefined, undefined, ac.signal);
+  const failed = call.catch(e => e);
+  await until(() => q.waitingAt("gate") === 1, 5000, "the gate body to queue behind the holder");
+  ac.abort();
+  expect(await failed).toBeInstanceOf(RequestAbortedError);
+  release();
+  await holder;
+  await database.repo.write(() => {});
+  expect(hostedRowCount(database.db)).toBe(rows);
+  // Without a signal the same call creates its row.
+  await hosted.run(principal, context("fresh"), "whoami", () => "ok");
+  expect(hostedRowCount(database.db)).toBe(rows + 1);
+});
+
+// Bind and unbind (`owning`'s body, site "other"), held past their gate at `hosted:owning:before-txn`, then queued
+// behind a holder and aborted: each rejects RequestAbortedError and leaves the holds as they were. Mutation: owning's
+// write without its signal (the bind holds, the unbind releases).
+for (const op of ["bind", "unbind"] as const) test(`an aborted ${op}'s queued body is skipped and leaves the holds as they were (#1535)`, async () => {
+  await hosted.bind(principal, context("root"), { name: "fe", create: true });
+  const q = queueFor(database.db);
+  const ac = new AbortController();
+  let release!: () => void, holder!: Promise<void>;
+  const start = () => op === "bind"
+    ? hosted.bind(principal, context("root"), { name: "skipme", create: true }, undefined, ac.signal)
+    : hosted.unbind(principal, context("root"), { name: "fe" }, undefined, ac.signal);
+  const call = paused("hosted:owning:before-txn", start, async () => {
+    holder = q.run(() => new Promise<void>(r => { release = r; }));
+    void until(() => q.waitingAt("other") === 1, 5000, `the ${op} body to queue behind the holder`).then(() => ac.abort());
+  });
+  const failed = await call.then(() => undefined, (e: unknown) => e);
+  release();
+  await holder;
+  expect(failed).toBeInstanceOf(RequestAbortedError);
+  await database.repo.write(() => {});
+  expect(await application.aliasHolderId(application.repo.read, "you@example.com/skipme")).toBeNull();
+  expect(await application.aliasHolderId(application.repo.read, "you@example.com/fe")).not.toBeNull();
+});
+
+// A tool call reusing its exchange's verdict (`prior`): its keyed touch queued behind a holder and aborted rejects
+// RequestAbortedError, without falling back to the full gate, and the tool never runs. Mutation: withPrior's write
+// without its signal (the touch runs and the tool after it).
+test("an aborted call's queued prior touch is skipped, with no fallback to the gate (#1535)", async () => {
+  await hosted.bind(principal, context("root"), { name: "fe", create: true });
+  const verdict = (await hosted.snapshot(principal, context("root"), false)).verdict;
+  expect(verdict).toBeDefined();
+  now += 10_000;
+  const q = queueFor(database.db);
+  let release!: () => void;
+  const holder = q.run(() => new Promise<void>(r => { release = r; }));
+  const ac = new AbortController();
+  let ran = false;
+  const call = hosted.run(principal, context("root"), "whoami", () => { ran = true; }, undefined, verdict, ac.signal).then(() => undefined, (e: unknown) => e);
+  try {
+    await until(() => q.waitingAt("prior") === 1, 5000, "the prior touch to queue behind the holder");
+    ac.abort();
+    expect(await call).toBeInstanceOf(RequestAbortedError);
+    expect(q.waitingAt("gate")).toBe(0);
+  } finally { release(); }
+  await holder;
+  await database.repo.write(() => {});
+  expect(ran).toBe(false);
 });
 
 test("bind publishes its new hold before the after-commit pause and the first hold's mail still reaches the root", async () => {
@@ -1083,7 +1226,7 @@ test("a rate-limited hosted bind keeps its bind.rate_limited row after the trans
     await service.bind(principal, context("other"), { name: "ops", create: true });
     expect(rows("bind.rate_limit_ended")).toBe(1);
     expect(service.refusalRowsLost).toBe(0);
-  } finally { await service.close(); limited.stopExpiry(); }
+  } finally { await service.close(); await limited.stopExpiry(); }
 });
 
 test("a refusal row whose write after the rollback fails is counted, and the refusal is still what the caller sees (#467)", async () => {
@@ -1841,7 +1984,7 @@ test("a released child's ID ends with the release's reason, not at the next star
   expect(endedWhy(hostedId("kept"))).toEqual(["closed"]);
   expect(idEnd(hostedId("root"))).toBeNull();
   // Nothing is left for the startup sweep to label a WSS leftover.
-  await hosted.close(); application.stopExpiry();
+  await hosted.close(); await application.stopExpiry();
   application = createApplication(database.repo);
   hosted = createHostedSessions(application, { now: () => now, isAuthorized: () => authorized }); await hosted.ready;
   expect(childAudits("id.ended").filter(a => a.why === "wss_removed")).toEqual([]);
@@ -2329,6 +2472,36 @@ test("#807 P3 C8a: a same-ID row committed while a creating request waited for t
   try { await hosted.whoami(principal, context("seam-racer")); } finally { spy.mockRestore(); }
   expect(database.db.query("SELECT count(*) AS n FROM hosted_ownerships WHERE session_id = ?").get(id)).toEqual({ n: 1 });
   expect(await store.get(database.repo.read, id)).toBeDefined();
+});
+
+// #1537a: the second wire's wait is Postgres only (hosted.ts `creating`, keyedFast). On SQLite, where every gate body
+// is exclusive, a second first contact of an ID being created reads the row once and runs its own exclusive body,
+// which finds the row under the capacity lock: one row, one ownership. The first is held at its gate's
+// `hosted:gate:checked` pause until the second has read no row. Mutation: the wait without its keyedFast condition (the
+// second reads the row twice).
+test("#1537a: on SQLite a second first contact of an ID being created runs its own exclusive gate body, with no wait", async () => {
+  const id = hostedId("storm-a");
+  const store = database.repo.hosted, get = store.get.bind(store);
+  let reads = 0, absent = 0;
+  const spy = spyOn(store, "get").mockImplementation(async (r, key) => {
+    const row = await get(r, key);
+    if (key === id && !isTx(r)) { reads++; if (!row) absent++; }
+    return row;
+  });
+  const skipped = gateCount("gate", "skipped"), keyed = gateCount("gate", "keyed");
+  try {
+    // The pause's file outlives both requests: the second also stops at the pause, and leaves it after the first.
+    let second!: Promise<unknown>, started!: () => void;
+    const ready = new Promise<void>(resolve => { started = resolve; });
+    await hostedPause("hosted:gate:checked", () => Promise.all([hosted.whoami(principal, context("storm-a")), ready.then(() => second)]), async () => {
+      second = hosted.whoami(principal, context("storm-a"));
+      started();
+      await until(() => absent === 2, 10_000, "the second request read no row while the first was held");
+    });
+  } finally { spy.mockRestore(); }
+  expect({ reads, skipped: gateCount("gate", "skipped") - skipped, keyed: gateCount("gate", "keyed") - keyed }).toEqual({ reads: 2, skipped: 2, keyed: 0 });
+  expect(database.db.query("SELECT count(*) AS n FROM hosted_ownerships WHERE session_id = ?").get(id)).toEqual({ n: 1 });
+  expect(database.db.query("SELECT count(*) AS n FROM hosted_sessions WHERE session_id = ?").get(id)).toEqual({ n: 1 });
 });
 
 test("#807 P3 C8a: a call on a live root reads its grant first and locks the row before settle writes it", async () => {

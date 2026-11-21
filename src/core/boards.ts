@@ -599,9 +599,12 @@ const NOT_PUSHED_YET = `NOT EXISTS (SELECT 1 FROM outbox o WHERE o.handle = ? AN
 // reader's address nor by the session that is it or holds it, nor by a child
 // of that session (#523: a subagent writing under its addresses, whose posts
 // are its root's own), whichever of its addresses it wrote as. Binds the
-// reader's address three times.
+// reader's address three times. The child's root is the one recorded when
+// the post was written (author_root, #540); only a row from before that
+// column reads the author's root as it is now (COALESCE stops at the first
+// non-null, so a newer row runs no subquery).
 const NOT_OWN = `NOT (p.author = ? OR p.author_id IS NOT NULL AND COALESCE((SELECT id FROM alias_holds WHERE address = ?), ?)
-  IN (p.author_id, COALESCE((SELECT root_id FROM ids WHERE id = p.author_id), p.author_id)))`;
+  IN (p.author_id, COALESCE(p.author_root, (SELECT root_id FROM ids WHERE id = p.author_id), p.author_id)))`;
 
 export type BoardSummary = Board & { mode: SubMode | null; unread: number; posts: number };
 
@@ -830,10 +833,10 @@ export type PostOpts = {
 // (never-woken first, then by handle). A lane was last woken at its latest
 // queue take on the board (a delivery or redelivery, #221: an old post's
 // redelivery counts when it was handed over, not when it was written), or at
-// the newest board post in its outbox (a mention or a thread reply), whichever is later. A take counts for the lane of
-// the session that made it while that session is live (#1351); any other take, and every push (an outbox row has no
-// session), counts under any address of its session now (its ID or an alias it holds, #1174: a take as its ID before
-// it bound counts). A lane is a push subscriber who isn't
+// the newest board post in its outbox (a mention or a thread reply), whichever is later. A take or push counts for the
+// lane of the session it went to while that session is live (#1351, #1370); any other counts under any address of its
+// session now (its ID or an alias it holds, #1174: a take as its ID before it bound counts). A lane is a push
+// subscriber who isn't
 // one of the poster's addresses (its address set: a session's own lane never
 // takes its own post, whichever alias it posted as), hasn't opted out (peer_status queue:"off"), isn't a
 // declared human (#1175: a human isn't a work lane, so no queue claim, and no system text written as its holder,
@@ -885,11 +888,47 @@ export function laneSessionSql(h: string): string {
 }
 
 /**
- * SQL that is true when `sid` (an SQL expression) names a live session (#1351). A claim_events row whose session_id
- * passes is session-keyed: it belongs to that session whatever its handle names now. NULL, or a session that has
- * ended (a restart mints a new ID and rebinds the name), makes the row address-keyed: it maps through who holds its
- * handle now (laneSessionSql), so a name's successor inherits its history and a restart can't re-open #220's
- * ping-pong.
+ * SQL for the session holding address `h` (an SQL expression) as a row is written (#1351, #1370): the alias's holder,
+ * else `h` when it is a session ID (live or ended), else NULL (an alias no session holds). claim_events.session_id
+ * (logEvent) and outbox.session_id record it, so a take or push can follow its session across an alias move; a push's
+ * delivery re-records it on both (#1461), for the reader holds the address then.
+ */
+export function holdingSessionSql(h: string): string {
+  return `COALESCE((SELECT id FROM alias_holds WHERE address = ${h}), (SELECT id FROM ids WHERE id = ${h}))`;
+}
+
+/**
+ * A queue post's push to `handle` just delivered (#1461): its take, the newest one under `handle` (claimQueuePost
+ * logged it when the post was written, for whoever held `handle` then), re-records the session holding `handle` now,
+ * as the push's outbox row does. A push read after its alias moved is the new holder's turn, not the old one's. Only
+ * while the post's claim still names `handle`: once it lapsed or was released (and maybe redelivered to another lane),
+ * that turn is over, and a stale push read later by whoever holds `handle` then must not take it from the old session.
+ */
+export function creditQueueTakes(db: Database, handle: string, board: string, postIds: number[], receiver?: string): void {
+  const take = db.prepare(
+    `UPDATE claim_events SET session_id = ${receiver === undefined ? holdingSessionSql("?1") : "?3"}
+      WHERE id = (SELECT MAX(id) FROM claim_events WHERE key = ?2 AND handle = ?1 AND event = 'take')
+        AND EXISTS (SELECT 1 FROM claims WHERE key = ?2 AND holder = ?1)`,
+  );
+  for (const id of postIds) receiver === undefined ? take.run(handle, `queue:${board}:${id}`) : take.run(handle, `queue:${board}:${id}`, receiver);
+}
+
+/**
+ * Whether address `handle` is session `receiver`'s now: its ID, or an alias it holds (#1466). A server's receipt or
+ * read names the session the item reached (`receiver`); its in-memory addresses can trail a hold that moved in a
+ * transaction that committed first, so the mark checks the holds it writes beside, and credits `receiver`, not
+ * whoever holds `handle` by then. Local mode's drain checks in its own transaction (markIfMine) and names none.
+ */
+export function heldBy(db: Database, handle: string, receiver: string): boolean {
+  return handle === receiver || !!db.prepare(`SELECT 1 FROM alias_holds WHERE address = ? AND id = ?`).get(handle, receiver);
+}
+
+/**
+ * SQL that is true when `sid` (an SQL expression) names a live session (#1351). A claim_events or outbox (#1370) row
+ * whose session_id passes is session-keyed: it belongs to that session whatever its handle names now. NULL, or a
+ * session that has ended (a restart mints a new ID and rebinds the name), makes the row address-keyed: it maps through
+ * who holds its handle now (laneSessionSql), so a name's successor inherits its history and a restart can't re-open
+ * #220's ping-pong.
  */
 function liveSessionSql(sid: string): string {
   return `EXISTS (SELECT 1 FROM ids x WHERE x.id = ${sid} AND x.ended_at IS NULL)`;
@@ -911,14 +950,15 @@ export function queueLaneRows(db: Database, board: string, poster: string[]): st
 /**
  * queueLaneRows' query (?1 board, ?2 JSON array of poster handles), exported for its plan test. A lane's takes are two
  * subqueries, never one OR (#1351): `es`, its session's session-keyed takes by idx_claim_events_take_sid (board,
- * session_id), and `e`, the address-keyed takes under its addresses now by idx_claim_events_take (board, handle). The
- * outbox half (`o2`) is address-mapped only: an outbox row records no session (#1370). It runs inside every
+ * session_id), and `e`, the address-keyed takes under its addresses now by idx_claim_events_take (board, handle). Its
+ * pushes split the same way (#1370): `os`, its session's session-keyed outbox rows by idx_outbox_session (session_id),
+ * and `o2`, the address-keyed ones under its addresses now by the outbox key (handle). It runs inside every
  * queue post's and requeue's write transaction, so its plan must stay indexed as history grows (#1174 audit H1); two
  * planner pins keep it there, with or without ANALYZE stats:
  * - `+e.key`, `+es.key`: the unary plus keeps idx_claim_events_key out. With stats the planner otherwise ranges that
  *   index on the GLOB prefix and reads every queue take on every board per lane, instead of the take indexes.
- * - `outbox o2 CROSS JOIN posts p2`: pins outbox as the outer loop, searched by handle. Without stats the planner
- *   otherwise drives from every post on the board and probes outbox per post.
+ * - `outbox o2 CROSS JOIN posts p2` (and `os`, `ps`): pins outbox as the outer loop, searched by handle or session.
+ *   Without stats the planner otherwise drives from every post on the board and probes outbox per post.
  */
 export function queueLaneRowsSql(): string {
   return `WITH lanes AS (
@@ -937,8 +977,12 @@ export function queueLaneRowsSql(): string {
              COALESCE((SELECT MAX(e.at) FROM claim_events e
                        WHERE e.board = ?1 AND e.handle IN ${laneAddressesSql("l.lane")} AND e.event = 'take' AND +e.key GLOB 'queue:*'
                          AND NOT ${liveSessionSql("e.session_id")}), 0),
+             COALESCE((SELECT MAX(ps.created_at) FROM outbox os CROSS JOIN posts ps ON ps.id = os.post_id
+                       WHERE os.session_id = ${laneSessionSql("l.lane")} AND ps.board = ?1
+                         AND ${liveSessionSql("os.session_id")}), 0),
              COALESCE((SELECT MAX(p2.created_at) FROM outbox o2 CROSS JOIN posts p2 ON p2.id = o2.post_id
-                       WHERE o2.handle IN ${laneAddressesSql("l.lane")} AND p2.board = ?1), 0)), 0) ASC NULLS FIRST, l.lane ASC`;
+                       WHERE o2.handle IN ${laneAddressesSql("l.lane")} AND p2.board = ?1
+                         AND NOT ${liveSessionSql("o2.session_id")}), 0)), 0) ASC NULLS FIRST, l.lane ASC`;
 }
 
 // The claim IS the delivery: the picked lane holds the post until it acks (a
@@ -966,11 +1010,12 @@ export function claimQueuePost(
     .run(key, lane, note, board, now, expires);
   // Redelivery to a lane that already had this post resets its push, so the
   // re-offer actually reaches it (at-least-once): when this run took the key,
-  // or the lane already holds it.
+  // or the lane already holds it. A reset re-records the receiving session (#1370): the re-offer is a push to whoever
+  // holds the lane now.
   if (push) db.prepare(
-    `INSERT INTO outbox (handle, post_id, reason, wake)
-     SELECT ?1, ?2, 'subscription', 1 WHERE EXISTS (SELECT 1 FROM claims WHERE key = ?3 AND holder = ?1)
-     ON CONFLICT(handle, post_id) DO UPDATE SET delivered_at = NULL, wake = 1`,
+    `INSERT INTO outbox (handle, post_id, reason, wake, session_id)
+     SELECT ?1, ?2, 'subscription', 1, ${holdingSessionSql("?1")} WHERE EXISTS (SELECT 1 FROM claims WHERE key = ?3 AND holder = ?1)
+     ON CONFLICT(handle, post_id) DO UPDATE SET delivered_at = NULL, wake = 1, session_id = excluded.session_id`,
   ).run(lane, postId, key);
   // The claim is the idempotency token: when a row already holds the key,
   // this run isn't the lane's delivery and must not read as one in the
@@ -1406,12 +1451,12 @@ export type NewPost = {
   authorId: string | null; via: string | null; authorUser: string | null; human: boolean;
 };
 
-/** Writes a post's row. */
+/** Writes a post's row, with its author's root as of now (author_root, #540). */
 export function insertPost(db: Database, p: NewPost): Post {
   return showPost(db
     .prepare(
-      `INSERT INTO posts (board, author, body, parent_id, created_at, expires_at, author_id, via, author_user, human)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING ${POST_COLS}`,
+      `INSERT INTO posts (board, author, body, parent_id, created_at, expires_at, author_id, via, author_user, human, author_root)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, COALESCE((SELECT root_id FROM ids WHERE id = ?7), ?7)) RETURNING ${POST_COLS}`,
     )
     .get(p.board, p.author, p.body, p.parentId, p.now, p.expiresAt, p.authorId, p.via, p.authorUser, p.human ? 1 : 0) as PostRow);
 }
@@ -1458,10 +1503,11 @@ export function threadFacts(db: Database, parentId: number): ThreadFacts {
   };
 }
 
-/** A plan's outbox rows, in its order; a row already there stays as it is. */
+/** A plan's outbox rows, in its order; a row already there stays as it is. Each records its handle's session (#1370):
+ * any board push counts toward a queue lane's rotation place, a mention or thread reply as much as a delivery. */
 export function insertOutbox(db: Database, postId: number, targets: [string, PostTarget][]): void {
   const ins = db.prepare(
-    `INSERT INTO outbox (handle, post_id, reason, wake) VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING`,
+    `INSERT INTO outbox (handle, post_id, reason, wake, session_id) VALUES (?1, ?2, ?3, ?4, ${holdingSessionSql("?1")}) ON CONFLICT DO NOTHING`,
   );
   for (const [h, t] of targets) ins.run(h, postId, t.reason, t.wake ? 1 : 0);
 }
@@ -2013,7 +2059,7 @@ export function read(
  * read on a board already judged visible: `handle` is whose cursor and pushes the read uses and advances, or null
  * for a read that changes nothing (a predicate viewer, a peek).
  */
-export function readRows(db: Database, board: string, handle: string | null, opts: { limit?: number; before_id?: number; thread?: number } = {}): ReadResult {
+export function readRows(db: Database, board: string, handle: string | null, opts: { limit?: number; before_id?: number; thread?: number } = {}, receiver?: string): ReadResult {
   const limit = Math.min(Math.max(opts.limit ?? 20, 1), 200);
   let posts: PostRow[];
 
@@ -2057,16 +2103,21 @@ export function readRows(db: Database, board: string, handle: string | null, opt
 
   if (handle === null) return { board, posts: withAttachments(db, "post", posts.map(showPost)), unread_remaining: 0 };
   const maxId = posts.reduce((m, p) => Math.max(m, p.id), 0);
-  if (maxId > 0) {
+  // A server read by a session that no longer holds `handle` (#1466) shows the posts and changes nothing: the read
+  // state is the new holder's.
+  if (maxId > 0 && (receiver === undefined || heldBy(db, handle, receiver))) {
     db.prepare(
       `UPDATE subscriptions SET cursor = MAX(cursor, ?) WHERE board = ? AND handle = ?`,
     ).run(maxId, board, handle);
     // What you've now read no longer needs pushing; what this read skipped
     // (a pending push it filters out, a post outside the thread) still does.
-    db.prepare(
-      `UPDATE outbox SET delivered_at = ? WHERE handle = ? AND delivered_at IS NULL
-         AND post_id IN (SELECT value FROM json_each(?))`,
-    ).run(Date.now(), handle, JSON.stringify(posts.map((p) => p.id)));
+    // The pushes it delivers are credited to the session reading them: `receiver`, else the one holding `handle` now
+    // (#1461).
+    const fresh = db.prepare(
+      `UPDATE outbox SET delivered_at = ?1, session_id = ${receiver === undefined ? holdingSessionSql("?2") : "?4"} WHERE handle = ?2 AND delivered_at IS NULL
+         AND post_id IN (SELECT value FROM json_each(?3)) RETURNING post_id`,
+    ).all(Date.now(), handle, JSON.stringify(posts.map((p) => p.id)), ...(receiver === undefined ? [] : [receiver])) as { post_id: number }[];
+    if (fresh.length > 0 && getBoard(db, board)?.kind === "queue") creditQueueTakes(db, handle, board, fresh.map((r) => r.post_id), receiver);
   }
 
   const remaining = db
@@ -2186,20 +2237,25 @@ export function markDelivered(db: Database, handle: string, item: Pending): void
   acknowledge(db, handle, refOf(item));
 }
 
-export function acknowledge(db: Database, handle: string, ref: PendingRef): void {
+// `receiver`: the session the item reached (a server's receipt, #1466). Given, nothing is marked unless `handle` is still
+// its address (heldBy), and a first delivery credits it.
+export function acknowledge(db: Database, handle: string, ref: PendingRef, receiver?: string): void {
+  if (receiver !== undefined && !heldBy(db, handle, receiver)) return;
   if (ref.kind === "push") {
     const row = db
       .prepare(
-        `SELECT o.reason, p.board FROM outbox o JOIN posts p ON p.id = o.post_id
-          WHERE o.handle = ? AND o.post_id = ?`,
+        `SELECT o.reason, o.delivered_at, p.board, b.kind FROM outbox o JOIN posts p ON p.id = o.post_id
+          JOIN boards b ON b.name = p.board WHERE o.handle = ? AND o.post_id = ?`,
       )
-      .get(handle, ref.post_id) as { reason: string; board: string } | undefined;
+      .get(handle, ref.post_id) as { reason: string; delivered_at: number | null; board: string; kind: string } | undefined;
     if (!row) return;
-    db.prepare(`UPDATE outbox SET delivered_at = ? WHERE handle = ? AND post_id = ?`).run(
-      Date.now(),
-      handle,
-      ref.post_id,
-    );
+    // Delivered now: credited to the session it reached, `receiver`, else the one holding `handle` now (#1461); a
+    // repeat ack keeps the first delivery's session.
+    db.prepare(
+      `UPDATE outbox SET delivered_at = ?1, session_id = CASE WHEN delivered_at IS NULL THEN ${receiver === undefined ? holdingSessionSql("?2") : "?4"} ELSE session_id END
+        WHERE handle = ?2 AND post_id = ?3`,
+    ).run(Date.now(), handle, ref.post_id, ...(receiver === undefined ? [] : [receiver]));
+    if (row.delivered_at === null && row.kind === "queue") creditQueueTakes(db, handle, row.board, [ref.post_id], receiver);
     // Push-mode subscribers have now seen it in full: count it as read.
     if (row.reason === "subscription") {
       db.prepare(
