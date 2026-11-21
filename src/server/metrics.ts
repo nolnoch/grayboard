@@ -52,8 +52,14 @@ export const QUEUE_BUCKETS = [0.00002, 0.00005, 0.0001, 0.00025, 0.0005, 0.001, 
 // Waiters ahead of a body that queues (an idle queue's body isn't counted: it never waits).
 export const QUEUE_DEPTH_BUCKETS = [0, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000];
 // Who queued a body: a literal its caller sets (store/queue.ts `atSite`), never a request's value or a stack frame.
-// The hot callers have their own; every other body is `other`.
-export const QUEUE_SITES = ["gate", "prior", "tool", "renew", "receipt", "touch", "audit", "other"] as const;
+// The hot callers have their own, and so does every other server writer (#1537 PR 6): the hosted timer's sweep, full
+// reconcile and heartbeat; a refusal's rows written after its rollback; mcp.ts's lapsed-lease settle; owning bodies
+// (bind, unbind, delivery open); register; session ends and releases; a tool's lost-hold take; the claim expiry
+// sweep; a lost-visibility push ack; alias rechecks and ends; the Slack bridge's human; startup and shutdown;
+// retention; uploads; the HTTP API (`admin`); OAuth; Slack; the IdP recheck; the CLI session touch; limiter rows. A
+// body queued with none (core's queuedTx, tests) is `other`.
+export const QUEUE_SITES = ["gate", "prior", "tool", "renew", "receipt", "touch", "audit", "sweep", "reconcile", "heartbeat", "refusal", "settle", "owning", "register", "end", "lost",
+  "claims", "boards", "alias", "human", "startup", "retention", "attachments", "admin", "oauth", "slack", "idp", "session", "limiter", "other"] as const;
 export type QueueSite = typeof QUEUE_SITES[number];
 
 // Per-bucket counts, not cumulative (the last slot is +Inf): an observation is one increment; the scrape sums them.
@@ -123,25 +129,27 @@ export function statementTotals(site: QueueSite): { bodies: number; statements: 
 // open, bind and unbind, and the rest by name); for the `prior` site the call that reused its exchange's verdict in
 // place of that gate body (withPrior: a native tool call's `tool`, and since #1537 C5/C7 the subscriber's renew,
 // receipt, pending, open and bind); renew and receipt have one each, their own. The `tool` site is a keyed tool body
-// (#1537 PR 5, hosted.ts dmSend), its method the tool (dm_send, the one so far): `skipped` there is SQLite, the keyed
-// path turned off, or a send whose plan says exclusive (application.sendPlan).
+// (#1537 PR 5 hosted.ts dmSend, PR 6 boardPost), its method the tool (dm_send, board_post): `skipped` there is SQLite,
+// the keyed path turned off, or a call whose plan says exclusive (application.sendPlan, postPlan).
 export const GATE_SITES = ["gate", "prior", "renew", "receipt", "tool"] as const;
 export const GATE_OUTCOMES = ["keyed", "miss", "skipped"] as const;
-export const GATE_METHODS = ["selection", "tool", "transfer", "whoami", "end", "open", "bind", "unbind", "owning", "renew", "receipt", "pending", "release", "control", "dm_send"] as const;
+export const GATE_METHODS = ["selection", "tool", "transfer", "whoami", "end", "open", "bind", "unbind", "owning", "renew", "receipt", "pending", "release", "control", "dm_send", "board_post"] as const;
 export type GateSite = typeof GATE_SITES[number];
 export type GateOutcome = typeof GATE_OUTCOMES[number];
 export type GateMethod = typeof GATE_METHODS[number];
 export const PRIOR_METHODS = ["tool", "renew", "receipt", "pending", "open", "bind"] as const satisfies readonly GateMethod[];
-const SITE_METHOD: Record<"renew" | "receipt" | "tool", GateMethod> = { renew: "renew", receipt: "receipt", tool: "dm_send" };
+const SITE_METHOD: Record<"renew" | "receipt", GateMethod> = { renew: "renew", receipt: "receipt" };
+export const TOOL_METHODS = ["dm_send", "board_post"] as const satisfies readonly GateMethod[];
 const gateKey = (site: GateSite, method: GateMethod, outcome: GateOutcome) => `${site}:${method}:${outcome}`;
 // Every series present from the start, so a rate() over a fresh process starts at zero.
 const gateFast = new Map<string, number>([
   ...GATE_METHODS.flatMap(m => GATE_OUTCOMES.map(o => [gateKey("gate", m, o), 0] as const)),
   ...PRIOR_METHODS.flatMap(m => GATE_OUTCOMES.map(o => [gateKey("prior", m, o), 0] as const)),
   ...(Object.entries(SITE_METHOD) as [GateSite, GateMethod][]).flatMap(([s, m]) => GATE_OUTCOMES.map(o => [gateKey(s, m, o), 0] as const)),
+  ...TOOL_METHODS.flatMap(m => GATE_OUTCOMES.map(o => [gateKey("tool", m, o), 0] as const)),
 ]);
 export function countGate(site: GateSite, outcome: GateOutcome, method: GateMethod = "tool") {
-  const k = gateKey(site, site === "gate" || site === "prior" ? method : SITE_METHOD[site], outcome);
+  const k = gateKey(site, site === "renew" || site === "receipt" ? SITE_METHOD[site] : method, outcome);
   gateFast.set(k, (gateFast.get(k) ?? 0) + 1);
 }
 // One site's count for `outcome`, of one method or (none given) summed over them.

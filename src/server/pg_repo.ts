@@ -108,6 +108,14 @@ export async function makePgRepo(url: string, opts: PgRepoOptions): Promise<PgRe
     }
     return t.writeKeyed(keys, fn, undefined, { effects: true });
   }) as NonNullable<Repo["writeKeyedSend"]>;
+  // board_post's keyed body (#1537 PR 6, D4): writeKeyedSend's terms, one root and one board, and no other key.
+  const writeKeyedPost = (<T>(keys: readonly string[], fn: (tx: Tx) => Promise<T>): Promise<T> => {
+    const roots = keys.filter(k => k.startsWith("root:") && k.length > 5), boards = keys.filter(k => k.startsWith("board:") && k.length > 6);
+    if (roots.length !== 1 || boards.length !== 1 || keys.length !== 2) {
+      return Promise.reject(new Error(`writeKeyedPost: a keyed post names one root and one board (board:<name>); got ${keys.join(", ")} (docs/future/postgres-server.md D4)`));
+    }
+    return t.writeKeyed(keys, fn, undefined, { effects: true });
+  }) as NonNullable<Repo["writeKeyedPost"]>;
   // The end a released hosted child's ID ends through, made from the finished Repo on first use, as db.ts openDatabase does.
   let port: SessionEndPort | undefined;
   const hosted = makePgHosted({ sessionEnd: deferredSessionEnd(() => port ??= sessionEndPort(opts.humanReach ?? "team")(repo)) });
@@ -137,6 +145,7 @@ export async function makePgRepo(url: string, opts: PgRepoOptions): Promise<PgRe
     readsOnly: t.readsOnly,
     writeKeyedEffects,
     writeKeyedSend,
+    writeKeyedPost,
     writeQueue: t.queue,
     read: t.read,
     authRead: auth.authRead,

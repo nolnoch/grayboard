@@ -29,7 +29,9 @@
 //     it lands either side of the cursor, as on SQLite); bindAttachments locks its uploads first (attachment_rows.ts);
 //     forget is five deletes keyed by the handle, none read first.
 //   Accepted (PS D4): two posts picking the same lane, a subscribe's tip missing an uncommitted post, and ids that
-//   commit out of order behind a reader's cursor; the one write queue rules them out until Stage 4 (#808).
+//   commit out of order behind a reader's cursor; the write queue rules them out until Stage 4 (#808): posts are
+//   exclusive bodies or keyed ones holding `board:<name>` (insertPost refuses a keyed body without it), so a board's
+//   ids commit in allocation order, and a subscriber's cursor is per board.
 // - A Read is the autocommit pool: each statement is its own snapshot. So a read whose parts must agree is one
 //   statement (§7 Q10): pendingDigests joins each digest's latest post where core reads it after with getPost(...)!,
 //   which a prune committing between the two would turn into a crash; threadFacts reads root, authors, the parent's

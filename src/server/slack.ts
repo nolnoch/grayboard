@@ -26,6 +26,7 @@ import { failureDiagnostic } from "./diagnostics.ts";
 import { detached } from "./request_context.ts";
 import { jsonSafe } from "./store/json_safe.ts";
 import type { Tx } from "./store/tx.ts";
+import { atSite } from "./store/queue.ts";
 
 /** users.info errors that mean Slack won't give this account's email, as opposed to Slack being unreachable. */
 const NO_EMAIL = new Set(["missing_scope", "user_not_found", "user_not_visible"]);
@@ -130,7 +131,7 @@ export class SlackBridge implements SlackLinker {
     // and the insert share its transaction. Its body awaits the links read (#807 P3 A6b), so it commits after stop()
     // returns, even on an idle queue; a write queued after it (a session's bind draining the notice) waits for it.
     const { repo } = this.o;
-    repo.post(async tx => {
+    atSite("slack", () => repo.post(async tx => {
       for (const link of await repo.slack.links(tx)) {
         const user = await repo.users.findById(tx, link.user_id);
         if (!user || user.disabled_at !== null) continue;
@@ -150,7 +151,7 @@ export class SlackBridge implements SlackLinker {
           ...(prior ? { suppressed: true } : {}),
         });
       }
-    }, undefined, "bridge.stopped audit");
+    }, undefined, "bridge.stopped audit"));
   }
 
   // ── linking ────────────────────────────────────────────────────────────────
@@ -171,7 +172,7 @@ export class SlackBridge implements SlackLinker {
   // relink to another account may have committed while it waited.
   unlink(userId: number, slackUser?: string): Promise<boolean> {
     const { repo } = this.o;
-    return repo.write(async (tx: Tx): Promise<boolean> => {
+    return atSite("slack", () => repo.write(async (tx: Tx): Promise<boolean> => {
       // Every link write's lock, before the read it decides on (#807 P3 C7 decision 4).
       await repo.slack.lock(tx);
       const link = await repo.slack.linkFor(tx, userId);
@@ -185,7 +186,7 @@ export class SlackBridge implements SlackLinker {
       await repo.boards.forget(tx, handle);
       writeAudit(repo, tx, "slack.unlinked", link.email, link.slack_user);
       return true;
-    }, unlinked => { if (unlinked) this.detach(userId); return unlinked; });
+    }, unlinked => { if (unlinked) this.detach(userId); return unlinked; }));
   }
 
   async userChanged(userId: number): Promise<void> {
@@ -218,15 +219,15 @@ export class SlackBridge implements SlackLinker {
     // with the user's own email may redeem it (#805 F-05).
     const email = await this.slackEmail(slackUser);
     if (email === "unavailable") {
-      await repo.write(tx => writeAudit(repo, tx, "slack.link_refused", user.email, slackUser, { reason: "slack_unavailable" }));
+      await atSite("slack", () => repo.write(tx => writeAudit(repo, tx, "slack.link_refused", user.email, slackUser, { reason: "slack_unavailable" })));
       return this.say(channel, ts, "grayboard couldn't reach Slack to check this account's email, and the code is used up. Run `grayboard slack link` for a new one and try again.");
     }
     if (email === null) {
-      await repo.write(tx => writeAudit(repo, tx, "slack.link_refused", user.email, slackUser, { reason: "no_email" }));
+      await atSite("slack", () => repo.write(tx => writeAudit(repo, tx, "slack.link_refused", user.email, slackUser, { reason: "no_email" })));
       return this.say(channel, ts, "grayboard can't read your Slack account's email, so it can't check this link. Ask the server's admin to add the users:read and users:read.email scopes to the Slack app and reinstall it.");
     }
     if (email !== user.email) {
-      await repo.write(tx => writeAudit(repo, tx, "slack.link_refused", user.email, slackUser, { reason: "email_mismatch" }));
+      await atSite("slack", () => repo.write(tx => writeAudit(repo, tx, "slack.link_refused", user.email, slackUser, { reason: "email_mismatch" })));
       return this.say(channel, ts, `This Slack account's email isn't \`${user.email}\`; link from that account. The code is used up.`);
     }
 
@@ -236,7 +237,7 @@ export class SlackBridge implements SlackLinker {
     // #807 P3 A7u2, and attachHuman's queued write) are covered by the link check inside attachHuman's write, so a
     // concurrent unlink can't leave it attached without its link.
     type Linked = { taken: SlackLink } | { moved: SlackLink | undefined; link: SlackLink };
-    const done = await repo.write(async (tx: Tx): Promise<Linked> => {
+    const done = await atSite("slack", () => repo.write(async (tx: Tx): Promise<Linked> => {
       // Every link write's lock, before its reads (#807 P3 C7 decision 4): of two links of one Slack account, the
       // second reads the first's row and answers taken.
       await repo.slack.lock(tx);
@@ -263,7 +264,7 @@ export class SlackBridge implements SlackLinker {
       if ("taken" in r) return r;
       this.detach(user.id);
       return { ...r, attached: this.attach(r.link) };
-    });
+    }));
     if ("taken" in done) {
       return this.say(channel, ts, `This Slack account is linked to \`${done.taken.email}\`. Send \`unlink\` first.`);
     }
@@ -321,7 +322,7 @@ export class SlackBridge implements SlackLinker {
           // A queued write, not a post (#807 P3 A7u1): receiptBoards is async, and this sink also runs from the write
           // queue's holder (a commit's wake drains the human's digests), where an async post throws. A refusal (the
           // human detached meanwhile) is expected; anything else is logged.
-          void repo.write(tx => application.receiptBoards(tx, session, [refOf(m.item)])).catch(error => {
+          void atSite("slack", () => repo.write(tx => application.receiptBoards(tx, session, [refOf(m.item)]))).catch(error => {
             if (!(error instanceof ApplicationError)) console.error("[grayboard] Slack digest receipt failed:", error);
           });
         }
@@ -359,7 +360,7 @@ export class SlackBridge implements SlackLinker {
     const postThread = (row: SlackThread, write: (tx: Tx) => Promise<void>, what: string) => {
       const mine = ++seq;
       pendingThreads.set(row.thread_ts, { row, seq: mine });
-      repo.post(write, () => { if (pendingThreads.get(row.thread_ts)?.seq === mine) pendingThreads.delete(row.thread_ts); }, what);
+      atSite("slack", () => repo.post(write, () => { if (pendingThreads.get(row.thread_ts)?.seq === mine) pendingThreads.delete(row.thread_ts); }, what));
     };
     const store: RelayStore = {
       thread: (kind, board, root) => {
@@ -370,7 +371,7 @@ export class SlackBridge implements SlackLinker {
       // INSERT OR IGNORE: a row already there stays as it is.
       addThread: async (row) => {
         const committed = await committedThread(row.thread_ts);
-        if (current(row.thread_ts, committed)) { repo.post(tx => repo.slack.addThread(tx, link.user_id, row), undefined, "Slack thread row"); return; }
+        if (current(row.thread_ts, committed)) { atSite("slack", () => repo.post(tx => repo.slack.addThread(tx, link.user_id, row), undefined, "Slack thread row")); return; }
         postThread({ ...row, board: row.board ?? null }, tx => repo.slack.addThread(tx, link.user_id, row), "Slack thread row");
       },
       // As advanceThread's UPDATE: last_id only moves forward, and peer follows only a newer id.
@@ -378,7 +379,7 @@ export class SlackBridge implements SlackLinker {
         const write = (tx: Tx) => repo.slack.advanceThread(tx, link.user_id, ts, id, peer);
         const committed = await committedThread(ts);
         const row = current(ts, committed);
-        if (!row) { repo.post(write, undefined, "Slack thread advance"); return; }
+        if (!row) { atSite("slack", () => repo.post(write, undefined, "Slack thread advance")); return; }
         postThread({ ...row, peer: peer != null && id > row.last_id ? peer : row.peer, last_id: Math.max(row.last_id, id) }, write, "Slack thread advance");
       },
       enqueue: (params) => {
@@ -395,7 +396,7 @@ export class SlackBridge implements SlackLinker {
         // safe as the store stores it (#807 P3 C7 decision 3), so a read before the write lands answers the same.
         const r = ref(id), mine = ++seq, value = jsonSafe(structuredClone(progress));
         pendingProgress.set(r, { value, seq: mine });
-        repo.post(tx => repo.slack.setProgress(tx, link.user_id, r, value), () => { if (pendingProgress.get(r)?.seq === mine) pendingProgress.delete(r); }, "Slack progress");
+        atSite("slack", () => repo.post(tx => repo.slack.setProgress(tx, link.user_id, r, value), () => { if (pendingProgress.get(r)?.seq === mine) pendingProgress.delete(r); }, "Slack progress"));
       },
       done: (id) => {
         const p = outbox.get(id);
@@ -406,14 +407,14 @@ export class SlackBridge implements SlackLinker {
         // leaves the outbox now so the drain doesn't post it again; a refusal then rolls both back and is logged, and
         // the unacked item is resent at the next start.
         const r = ref(id);
-        const now = repo.post(async tx => {
+        const now = atSite("slack", () => repo.post(async tx => {
           // A message Slack refused (msg_too_long) is given up, never posted: its cursor moves but it isn't stamped
           // delivered (#470). Read in the body, after the progress writes queued before it.
           const posted = (await repo.slack.progress(tx, link.user_id, r) as { posted?: boolean } | undefined)?.posted === true;
           if (m.board && m.post_id) await application.receiptBoards(tx, session, [{ kind: "push", post_id: Number(m.post_id) }]);
           else if (m.message_id) await application.receiptDirect(tx, session, [Number(m.message_id)], { handed: posted });
           await repo.slack.clearProgress(tx, link.user_id, r);
-        }, () => { outbox.delete(id); pendingProgress.delete(r); }, "Slack receipt");
+        }, () => { outbox.delete(id); pendingProgress.delete(r); }, "Slack receipt"));
         if (!now) outbox.delete(id);
       },
     };
@@ -425,18 +426,18 @@ export class SlackBridge implements SlackLinker {
     const inWrite = async <T>(fn: (tx: Tx) => Promise<T>): Promise<T> => {
       const rows: RefusalRow[] = [];
       try {
-        return await repo.write(async tx => {
+        return await atSite("slack", () => repo.write(async tx => {
           rows.length = 0;
           session.afterRollback = write => { rows.push(write); };
           try { return await fn(tx); } finally { session.afterRollback = undefined; }
-        }) as T;
+        })) as T;
       } catch (error) {
         if (rows.length) {
-          await repo.write(async tx => {
+          await atSite("slack", () => repo.write(async tx => {
             for (const write of rows) {
               try { await tx.savepoint(write); } catch (failure) { console.error("[grayboard slack] refusal row failed:", failure); }
             }
-          }).catch(failure => console.error("[grayboard slack] refusal rows failed:", failure));
+          })).catch(failure => console.error("[grayboard slack] refusal rows failed:", failure));
         }
         throw error;
       }
@@ -498,14 +499,14 @@ export class SlackBridge implements SlackLinker {
       retryMs: this.o.retryMs,
       label: (h) => (h.startsWith(prefix) ? h.slice(prefix.length) : h),
       attachmentLimits: repo.attachmentLimits,
-      onFileSent: (f) => void repo.post(tx =>
+      onFileSent: (f) => void atSite("slack", () => repo.post(tx =>
         writeAudit(repo, tx, "attachment.sent_to_slack", link.email, `attachment:${f.attachment}`, {
           identity: handle, channel: link.dm_channel, thread_ts: f.thread_ts, slack_file: f.slack_file, sha256: f.sha256,
-        }), undefined, "Slack file audit"),
-      onFileRefused: (f) => void repo.post(tx =>
+        }), undefined, "Slack file audit")),
+      onFileRefused: (f) => void atSite("slack", () => repo.post(tx =>
         writeAudit(repo, tx, "attachment.slack_refused", link.email, f.attachment === null ? null : `attachment:${f.attachment}`, {
           identity: handle, channel: link.dm_channel, filename: f.name, reason: f.why, ...(f.sha256 ? { sha256: f.sha256 } : {}),
-        }), undefined, "Slack file audit"),
+        }), undefined, "Slack file audit")),
     });
     try {
       // Checked again inside attachHuman's write: an unlink, relink, disable or stop may have committed while it

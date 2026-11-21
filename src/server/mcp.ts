@@ -22,7 +22,7 @@ import { forwardMcpStream, readMcpBody, type OwnedStream } from "./mcp-streams.t
 import { AsyncLocalStorage } from "node:async_hooks";
 import { hostedFailure } from "./hosted-diagnostics.ts";
 import { diagnosticOrigin, failureDiagnostic, type FailureSource } from "./diagnostics.ts";
-import { RequestAbortedError } from "./store/queue.ts";
+import { atSite, RequestAbortedError } from "./store/queue.ts";
 import { permitsOrigin } from "./origin.ts";
 import { RateLimiter } from "./rate_limit.ts";
 import { DEFAULT_HOSTED_CAPS, DEFAULT_MCP_LIMITS, type HostedCaps, type McpLimits } from "./config.ts";
@@ -276,7 +276,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     // closed. It goes through the write queue, not post: authorize also runs from the queue's holder (a board
     // commit's afterCommit hint), where an async post throws; a write queues behind the holder. The settle judges
     // the root when it runs, which may find a body it waited behind renewed the lease.
-    void application.repo.write(tx => hosted.settle(tx, root.session_id)).catch(e => hostedFailure("hosted.settle", e));
+    void atSite("settle", () => application.repo.write(tx => hosted.settle(tx, root.session_id))).catch(e => hostedFailure("hosted.settle", e));
     return { row: undefined, seq: start };
   }
   // authorize's checks that read no hosted row: the request, the token and grant, the session and its user. The
@@ -1362,7 +1362,10 @@ function registerNativeTools(server: McpServer, application: Application, hosted
   });
   // The definitions local serves too (src/core/tools.ts), with files named by uploaded IDs (#385).
   for (const { name, config } of NATIVE_BOARD_TOOLS) {
-    server.registerTool(name, config, (args, ctx) => run(ctx, name, (session, tx) => application.call(tx, session, name, args)));
+    server.registerTool(name, config, name === "board_post"
+      // board_post's keyed path (#1537 PR 6): hosted.boardPost.
+      ? (args, ctx) => runAs(ctx, name, (context, told) => hosted.boardPost(context.principal, context.sessionContext, args, told, context.verdict, context.request.signal))
+      : (args, ctx) => run(ctx, name, (session, tx) => application.call(tx, session, name, args)));
   }
   const dm = NATIVE_DM_TOOLS;
   server.registerTool("dm_send", dm.dm_send,

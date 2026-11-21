@@ -9,6 +9,7 @@ import { reauthDue } from "./auth.ts";
 import { writeAudit } from "./audit.ts";
 import type { Repo, User } from "./db.ts";
 import type { IdentityProvider } from "./idp.ts";
+import { atSite } from "./store/queue.ts";
 
 // A status call that hasn't answered by then is transient. Well inside hosted-core's 10 s refresh abort
 // (adapters/hosted-core/src/login.ts), which a slow IdP plus a busy write queue must not reach.
@@ -83,7 +84,7 @@ export function createIdpRecheck(
   // meanwhile restamped the clock (the IdP vouched again), or someone else disabled or unlinked them. The re-read
   // locks the row, so on a multi-writer store a sign-in's restamp can't commit between it and the disable.
   async function disable(u: Checked, p: IdentityProvider): Promise<boolean> {
-    const done = await repo.write(async tx => {
+    const done = await atSite("idp", () => repo.write(async tx => {
       const cur = await repo.users.lockById(tx, u.id);
       if (!cur || cur.disabled_at !== null || cur.idp_checked_at !== u.idp_checked_at || cur.idp_issuer !== u.idp_issuer || cur.idp_subject !== u.idp_subject) return null;
       await repo.users.setDisabled(tx, cur.id, true);
@@ -91,7 +92,7 @@ export function createIdpRecheck(
       writeAudit(repo, tx, "auth.idp_disabled", null, cur.email,
         { provider: p.id, issuer: p.issuer, reason: "inactive", ...(orphaned.length ? { orphaned_services: orphaned } : {}) });
       return cur;
-    }, cur => { if (cur) hooks.disconnectUser(cur.id); return cur; });
+    }, cur => { if (cur) hooks.disconnectUser(cur.id); return cur; }));
     if (!done) return false;
     try { await hooks.userChanged(done.id); } catch (e) { console.error("[grayboard] IdP disable: Slack user update failed:", e); }
     return true;
@@ -111,7 +112,7 @@ export function createIdpRecheck(
     }
     if (answer === "active") {
       confirmed.add(p);
-      await repo.write(tx => repo.users.stampIdpChecked(tx, u.id));
+      await atSite("idp", () => repo.write(tx => repo.users.stampIdpChecked(tx, u.id)));
       return "active";
     }
     if (!confirmed.has(p)) { failed(p, u, "unconfirmed_inactive"); return "transient"; }
