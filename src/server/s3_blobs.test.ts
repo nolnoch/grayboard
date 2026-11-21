@@ -215,11 +215,12 @@ test("the deadline's timer is cleared when the operation settles", async () => {
 });
 
 test("the wait on an abandoned request clears its timer once the request settles", async () => {
-  const blobs = store({ timeoutMs: 300 });
+  // A wide deadline: the released delete must come back inside settled()'s wait, even on a loaded runner.
+  const blobs = store({ timeoutMs: 1000 });
   const sha = sha256Hex(bytes("settled"));
   await blobs.put(sha, bytes("settled"));
   const release = s3.hang("DELETE");
-  await expect(blobs.delete(sha)).rejects.toThrow("no answer in 300 ms");
+  await expect(blobs.delete(sha)).rejects.toThrow("no answer in 1000 ms");
   const set = spyOn(globalThis, "setTimeout");
   const cleared = spyOn(globalThis, "clearTimeout");
   try {
@@ -228,7 +229,7 @@ test("the wait on an abandoned request clears its timer once the request settles
     release();
     await put;
     // The store's own timers (settled()'s wait and the put's deadline) are the ones armed for timeoutMs.
-    const timers = set.mock.calls.flatMap((c, i) => c[1] === 300 ? [set.mock.results[i]!.value] : []);
+    const timers = set.mock.calls.flatMap((c, i) => c[1] === 1000 ? [set.mock.results[i]!.value] : []);
     expect(timers.length).toBe(2);
     const clearedTimers = new Set(cleared.mock.calls.map(c => c[0]));
     expect(timers.filter(t => !clearedTimers.has(t as ReturnType<typeof setTimeout>))).toEqual([]);

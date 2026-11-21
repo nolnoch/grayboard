@@ -120,7 +120,7 @@ export class S3Blobs implements BlobStore {
   // Waits, under the deadline, for a put or delete of `sha256` abandoned earlier; throws if it's still pending. A request
   // Bun never settles keeps its entry until the process restarts, so every later put, get or delete of that sha256 fails
   // at this deadline. That's deliberate: letting the operation through would reopen the race the entry exists to close
-  // (a late delete taking a newer upload's bytes).
+  // (e.g. a late delete taking a newer upload's bytes).
   private async settled(what: string, sha256: string): Promise<void> {
     const pending = this.abandoned.get(sha256);
     if (!pending) return;
