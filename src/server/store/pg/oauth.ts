@@ -61,6 +61,13 @@ const ok = <T>(value: T) => ({ status: "ok" as const, value });
 
 const grantOf = (r: Row): OAuthGrant => ({ ...(r.data as OAuthGrant), revokedAt: int8OrNull(r.revoked_at) });
 
+// What a per-grant revoke (#930) ends beside the grant or CLI token, as db.ts endSignIns: the user's browser sessions
+// (a live one consents without the IdP, #1552) and their unspent codes. The caller already holds the users row.
+export async function endSignIns(sql: PgSql, userId: number): Promise<void> {
+  await sql`DELETE FROM oauth_browsers WHERE user_id = ${userId}`;
+  await sql`DELETE FROM oauth_codes WHERE user_id = ${userId} AND grant_id IS NULL AND session_id IS NULL`;
+}
+
 export function makePgOAuth({ hosted }: { hosted: PgHostedEnds }): OAuthStore {
   const lock = async (sql: PgSql, cls: number, key: string | null = null) => {
     await (key === null ? sql`SELECT pg_advisory_xact_lock(${cls}::int4, 0)` : sql`SELECT pg_advisory_xact_lock(${cls}::int4, hashtext(${key}))`);
@@ -120,9 +127,12 @@ export function makePgOAuth({ hosted }: { hosted: PgHostedEnds }): OAuthStore {
     const [r] = await sql`SELECT kind, grant_id, spent_at, revoked_at, expires_at FROM oauth_tokens WHERE hash = ${h}`;
     return r ? { kind: r.kind as string, grant_id: r.grant_id as string, spent_at: int8OrNull(r.spent_at), revoked_at: int8OrNull(r.revoked_at), expires_at: int8(r.expires_at) } : undefined;
   };
+  // Locked, the session is read again after the user's FOR SHARE: a per-grant revoke holding the users row deletes it
+  // (endSignIns), and the first read's snapshot predates that commit (#1552).
   const browser = async (sql: PgSql, h: string, now: number, lock: boolean) => {
     const b = await read<OAuthBrowserSession>(sql, "oauth_browsers", h, now);
-    return b && await activeUser(sql, b.userId, lock) ? b : undefined;
+    if (!b || !await activeUser(sql, b.userId, lock)) return undefined;
+    return lock ? read<OAuthBrowserSession>(sql, "oauth_browsers", h, now) : b;
   };
   // A code row and the checks both redeemers share (#928 D8), as db.ts.
   type CodeRow = { c: OAuthCode; expires_at: number; grant_id: string | null; session_id: number | null };
@@ -366,6 +376,10 @@ export function makePgOAuth({ hosted }: { hosted: PgHostedEnds }): OAuthStore {
     async revokeUserGrant(tx, userId, grantId, now) {
       if (!userGrantLookup(userId, grantId, now)) return invalid;
       const sql = pgOf(tx);
+      // The users row first, as revoke-all takes it (pg/identity.ts): a consent's mint holds FOR SHARE on it, so it either
+      // commits first and its code dies in endSignIns, or waits and then re-reads its browser session gone (browser()).
+      // User before grant, the order a disable's revoke takes them in.
+      await sql`SELECT 1 FROM users WHERE id = ${userId} FOR NO KEY UPDATE`;
       // FOR NO KEY UPDATE on the grant, as a credential's revoke: a second revoke waits, re-checks after this one commits
       // and answers missing (one revoke, one audit row); a rotation holds the same lock (#1066), so it either commits
       // first, its pair then dying with the grant, or reads the revoked row after this commits.
@@ -374,6 +388,7 @@ export function makePgOAuth({ hosted }: { hosted: PgHostedEnds }): OAuthStore {
       if (!g) return missing;
       if (g.credential) return invalid;
       await revokeGrant(tx, grantId, now);
+      await endSignIns(sql, userId);
       return ok({ clientId: (g.data as OAuthGrant).clientId });
     },
     async revokePreBuiltinGrants(tx, clientIds, now, key = "builtin_clients") {

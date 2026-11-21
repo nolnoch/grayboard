@@ -1,12 +1,15 @@
 // The per-grant list and revoke (#930): a user lists and revokes their own OAuth grants and CLI tokens one at a time,
 // an org admin another user's; revoking one leaves the rest serving.
 import { afterEach, beforeEach, expect, test } from "bun:test";
+import { createHash, randomBytes } from "node:crypto";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runCli } from "../support/cli.ts";
 import { cleanEnv } from "../support/env.ts";
 import { issueOAuth, rotateOAuth } from "../helpers/oauth.ts";
+import { hostedServer, upstreamLeg } from "../support/hosted_oauth.ts";
+import { Browser, consentForm, submitConsent } from "../support/oauth_browser.ts";
 import { drained, rows } from "../support/repo_sql.ts";
 import { TestServer } from "../support/server.ts";
 
@@ -138,4 +141,41 @@ test("the CLI lists and revokes, its own and (--user) another user's", async () 
     expect(refused.code).toBe(1);
     expect(refused.err).toContain("no live grant nope");
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+// #1552: a live AS browser session consents without the IdP, so a revoke that left it would let the lost device
+// mint a replacement grant. A per-grant revoke ends the user's browser sessions: the next authorize goes upstream.
+test("after a per-grant revoke, the same browser's next authorize goes to the IdP, not straight to consent", async () => {
+  const hs = await hostedServer({}, A);
+  try {
+    const browser = new Browser();
+    const authorize = () => {
+      const verifier = randomBytes(32).toString("base64url");
+      const redirectUri = "http://127.0.0.1:49152/callback";
+      const url = `${hs.issuer}/oauth/authorize?` + new URLSearchParams({ response_type: "code", client_id: "grayboard-pi", redirect_uri: redirectUri,
+        scope: "grayboard:delivery grayboard:tools", state: randomBytes(16).toString("base64url"),
+        code_challenge: createHash("sha256").update(verifier).digest("base64url"), code_challenge_method: "S256" });
+      return { url, verifier, redirectUri };
+    };
+    // Signed in upstream once, consented, the code redeemed: one grant.
+    const first = authorize();
+    const callback = await upstreamLeg(browser, hs.issuer, await browser.request(first.url));
+    expect(callback.status).toBe(303);
+    const page = await (await browser.request(callback.headers.get("Location")!)).text();
+    const decided = await submitConsent(browser, `${hs.issuer}/oauth/consent`, consentForm(page));
+    const code = new URL(decided.headers.get("Location")!).searchParams.get("code")!;
+    const redeemed = await fetch(`${hs.issuer}/oauth/token`, { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ grant_type: "authorization_code", client_id: "grayboard-pi", code, redirect_uri: first.redirectUri, code_verifier: first.verifier }) });
+    expect(redeemed.status).toBe(200);
+    const next = async () => new URL((await browser.request(authorize().url)).headers.get("Location")!);
+    // The browser session alone reaches consent.
+    expect((await next()).pathname).toBe("/oauth/consent");
+
+    const token = await hs.login(A);
+    const [grant] = ((await hs.api(token, "GET", "/api/grants")).body.grants as { id: string; kind: string }[]).filter(g => g.kind === "oauth");
+    expect((await hs.api(token, "POST", "/api/grants/revoke", { id: grant!.id })).status).toBe(200);
+    expect((await next()).host).toBe("accounts.google.com");
+  } finally {
+    await hs.stop();
+  }
 });

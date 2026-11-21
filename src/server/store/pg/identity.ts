@@ -34,6 +34,7 @@ import type { Read, Tx } from "../tx_base.ts";
 import { insertAudit } from "./audit_row.ts";
 import { principalTaken, SERVICE_NAME_CONSTRAINTS, uniqueViolation } from "./errors.ts";
 import type { PgHostedEnds } from "./hosted_port.ts";
+import { endSignIns } from "./oauth.ts";
 import { int8, int8OrNull } from "./sql.ts";
 import { pgOf, type PgFragment, type PgSql } from "./tx.ts";
 
@@ -113,7 +114,7 @@ class LostLink extends Error {}
 
 export function makePgIdentity({ now, hosted }: { now: () => number; hosted: PgHostedEnds }): PgIdentity {
   // What a disable and a revoke-all both end (db.ts setDisabled, revokeAllForUser): the CLI sessions, the OAuth grants,
-  // then the hosted sessions, and the unredeemed codes; a disable also the browser sessions. The users row is already
+  // then the hosted sessions, the browser sessions (a live one consents without the IdP, #1552) and the unredeemed codes. The users row is already
   // locked (see the header), so each statement here sees every row a concurrent mint for the user committed.
   const revokeUser = async (tx: Tx, userId: number, reason: "revoked" | "disabled", at: number) => {
     const sql = pgOf(tx);
@@ -122,7 +123,7 @@ export function makePgIdentity({ now, hosted }: { now: () => number; hosted: PgH
     await sql`UPDATE oauth_grants SET revoked_at = ${at} WHERE user_id = ${userId} AND revoked_at IS NULL`;
     // After the grants' revoke, as revokeGrant orders its own end (hosted_port.ts: the lock order).
     await hosted.endForUser(tx, userId, reason, at);
-    if (reason === "disabled") await sql`DELETE FROM oauth_browsers WHERE user_id = ${userId}`;
+    await sql`DELETE FROM oauth_browsers WHERE user_id = ${userId}`;
     await sql`DELETE FROM oauth_codes WHERE user_id = ${userId} AND grant_id IS NULL`;
   };
 
@@ -262,8 +263,13 @@ export function makePgIdentity({ now, hosted }: { now: () => number; hosted: PgH
         return (await pgOf(r)`SELECT * FROM sessions WHERE user_id = ${userId} AND revoked_at IS NULL AND last_used_at > ${usedAfter}
           ORDER BY last_used_at DESC, id DESC LIMIT ${limit}`).map(toSession);
       },
+      // The users row first, as revokeUserGrant (pg/oauth.ts) and for the same consent race (#1552).
       async revokeOwn(tx, userId, sessionId) {
-        return (await pgOf(tx)`UPDATE sessions SET revoked_at = ${now()} WHERE id = ${sessionId} AND user_id = ${userId} AND revoked_at IS NULL RETURNING id`).length > 0;
+        const sql = pgOf(tx);
+        await sql`SELECT 1 FROM users WHERE id = ${userId} FOR NO KEY UPDATE`;
+        if (!(await sql`UPDATE sessions SET revoked_at = ${now()} WHERE id = ${sessionId} AND user_id = ${userId} AND revoked_at IS NULL RETURNING id`).length) return false;
+        await endSignIns(sql, userId);
+        return true;
       },
       // Writes no users row, so it locks it: FOR NO KEY UPDATE conflicts with a mint's FOR SHARE (a plain FK insert's
       // KEY SHARE would not), so a CLI session, grant or code minted concurrently is either committed and revoked here

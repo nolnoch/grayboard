@@ -31,7 +31,7 @@ export type Row = Record<string, unknown>;
 export type OAuthHarness = {
   oauth: OAuthStore;
   users: Pick<UsersStore, "upsertByEmail">;
-  sessions: Pick<SessionsStore, "create" | "revoke" | "findById" | "findByTokenHash">;
+  sessions: Pick<SessionsStore, "create" | "revoke" | "revokeOwn" | "findById" | "findByTokenHash">;
   services: Pick<ServicesStore, "create">;
   write<T>(fn: (tx: Tx) => Promise<T>): Promise<T>;
   read: Read;
@@ -515,16 +515,21 @@ function access(it: It): void {
     expect(await o.findBrowserSession(h.read, w.sessionHash, start)).toBeUndefined();
   });
 
-  it("revoke-all revokes OAuth grants; a single session revoke and browser logout don't", async h => {
+  it("revoke-all revokes OAuth grants and ends browser sessions; a single session revoke and browser logout don't revoke grants", async h => {
     const w = await world(h);
     const input = await w.issue();
+    // A second browser session, so the revoke-all below has one to end (#1552); the logout ends only its own.
+    const live = sha("live-browser");
+    expect(await status(h.write(tx => h.oauth.createBrowserSession(tx, { sessionHash: live, userId: w.userId, createdAt: start, expiresAt: start + 1000 }, start)))).toBe("ok");
     const s = await h.write(tx => h.sessions.create(tx, w.userId, sha("old-token"), null));
     await h.write(tx => h.sessions.revoke(tx, s.id));
     await h.write(tx => h.oauth.revokeBrowserSession(tx, w.sessionHash));
     expect(await h.oauth.findBrowserSession(h.read, w.sessionHash, start)).toBeUndefined();
     expect(await h.oauth.isGrantActive(h.read, input.grantId, start)).toBe(true);
+    expect(await h.oauth.findBrowserSession(h.read, live, start)).toBeDefined();
     await h.revokeAllForUser(w.userId);
     expect(await h.oauth.isGrantActive(h.read, input.grantId, start)).toBe(false);
+    expect(await h.oauth.findBrowserSession(h.read, live, start)).toBeUndefined();
   });
 
   // The serial half of the disable race (postgres-server.md D3; C4b's T-C4-8 is the concurrent half): each write that
@@ -911,5 +916,37 @@ function userGrants(it: It): void {
     expect(await status(revoke(userId, b.grantId, start + OAUTH_TTL.grant))).toBe("not_found");
     // The caller audits: the store writes no row of its own.
     expect(await h.audits("auth.grant_revoked")).toEqual([]);
+  });
+
+  // A live browser session consents without the IdP, so the lost device could mint a replacement (#1552).
+  it("revokeUserGrant and sessions.revokeOwn end the user's browser sessions and unspent codes, not another user's or a spent code", async h => {
+    const a = await world(h, "a");
+    const issued = await a.issue();
+    const pending = await world(h, "p");
+    await pending.issueCode();
+    // A consent bound before the revoke and decided after it.
+    const late = await world(h, "l");
+    await h.write(async tx => {
+      expect(await status(h.oauth.createRequest(tx, late.request, start))).toBe("ok");
+      expect(await status(h.oauth.bindRequestSession(tx, late.request.requestHash, late.request.browserHash, late.sessionHash, start))).toBe("ok");
+    });
+    const other = (await h.write(tx => h.users.upsertByEmail(tx, "other@example.com", null))).id;
+    expect(await status(h.write(tx => h.oauth.createBrowserSession(tx, { sessionHash: sha("other-browser"), userId: other, createdAt: start, expiresAt: start + 1000 }, start)))).toBe("ok");
+    expect(await h.rows("oauth_browsers")).toHaveLength(4);
+
+    expect(await status(h.write(tx => h.oauth.revokeUserGrant(tx, a.userId, issued.grantId, start + 1)))).toBe("ok");
+    expect((await h.rows("oauth_browsers")).map(r => r.user_id)).toEqual([other]);
+    // The spent code stays, so a replay still reaches its grant; the unspent one is gone.
+    expect((await h.rows("oauth_codes")).map(r => r.hash)).toEqual([a.code.codeHash]);
+    expect(await status(h.write(tx => h.oauth.redeemCode(tx, pending.redemption(), start + 1)))).not.toBe("ok");
+    expect(await status(h.write(tx => h.oauth.decideRequest(tx, late.decision(), start + 1)))).not.toBe("ok");
+
+    // A CLI token's revoke does the same; a refused one ends nothing.
+    const cli = await h.write(tx => h.sessions.create(tx, a.userId, sha("cli-token"), "laptop"));
+    expect(await status(h.write(tx => h.oauth.createBrowserSession(tx, { sessionHash: sha("again"), userId: a.userId, createdAt: start + 2, expiresAt: start + 1000 }, start + 2)))).toBe("ok");
+    expect(await h.write(tx => h.sessions.revokeOwn(tx, other, cli.id))).toBe(false);
+    expect(await h.rows("oauth_browsers")).toHaveLength(2);
+    expect(await h.write(tx => h.sessions.revokeOwn(tx, a.userId, cli.id))).toBe(true);
+    expect((await h.rows("oauth_browsers")).map(r => r.user_id)).toEqual([other]);
   });
 }
