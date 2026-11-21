@@ -667,8 +667,8 @@ export function recheckConfig(config: Pick<Config, "idpRecheck" | "idpReauthDays
   };
 }
 
-// The startup line for #930's fallback: which sign-in providers the server can't ask about a user's status, so their
-// users re-authenticate every GRAYBOARD_IDP_REAUTH_DAYS instead. No provider has a directory check yet.
+// The startup line for #930: which sign-in providers have a directory check (only Google, with a directory key), and
+// which the server can't ask about a user's status, so their users re-authenticate every GRAYBOARD_IDP_REAUTH_DAYS.
 export function describeReauth(config: Pick<Config, "idps" | "idpReauthDays" | "idpRecheck" | "googleDirectory">): string {
   const days = config.idpReauthDays ?? DEFAULT_IDP_REAUTH_DAYS;
   const idps = config.idps ?? ["google"];

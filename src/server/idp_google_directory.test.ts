@@ -1,5 +1,6 @@
 // #930 A2b: Google's directory check against a scripted token endpoint and users.get, with a key made per run.
 import { beforeAll, expect, test } from "bun:test";
+import { createPrivateKey } from "node:crypto";
 import { exportPKCS8, generateKeyPair, jwtVerify, type KeyLike } from "jose";
 import { DIRECTORY_SCOPE, GOOGLE_TOKEN_URL, googleDirectoryStatus, parseDirectoryKey } from "./idp_google_directory.ts";
 
@@ -73,7 +74,10 @@ test("every other answer throws, named for what an operator fixes", async () => 
     [{ user: () => ({ status: 500 }) }, "google_directory_error"],
     [{ user: () => ({ status: 200, body: {} }) }, "google_directory_error"],
     [{ user: () => ({ status: 200, body: { suspended: "no" } }) }, "google_directory_error"],
-    [{ user: () => ({ status: 200, body: "not json" }) }, "SyntaxError"],
+    [{ user: () => ({ status: 200, body: "not json" }) }, "google_directory_error"],
+    [{ user: () => ({ status: 200, body: null }) }, "google_directory_error"],
+    [{ token: () => ({ status: 200, body: "<html>" }) }, "google_directory_error"],
+    [{ token: () => ({ status: 200, body: null }) }, "google_directory_error"],
   ];
   for (const [script, name] of cases) {
     const g = google(script);
@@ -85,33 +89,80 @@ test("a token is minted again near its expiry and after a 401; concurrent first 
   let refuse = false;
   const g = google({ user: () => refuse ? { status: 401 } : { status: 200, body: { suspended: false } } });
   const status = googleDirectoryStatus(parseDirectoryKey(keyJson(), undefined), g.options);
-  await Promise.all([status("a", signal()), status("b", signal()), status("c", signal())]);
+  await Promise.all([status("1", signal()), status("2", signal()), status("3", signal())]);
   expect(g.tokens()).toHaveLength(1);
   g.advance(3600_000 - 60_000);
-  await status("a", signal());
+  await status("1", signal());
   expect(g.tokens()).toHaveLength(2);
   refuse = true;
-  await failure(status("a", signal()));
+  await failure(status("1", signal()));
   refuse = false;
-  await status("a", signal());
+  await status("1", signal());
   expect(g.tokens()).toHaveLength(3);
 });
 
-test("the subject is one path segment, however it's spelled", async () => {
+test("a subject that isn't a Google user id throws without a request", async () => {
   const g = google();
-  await googleDirectoryStatus(parseDirectoryKey(keyJson(), undefined), g.options)("../x?y", signal());
-  expect(g.seen.at(-1)!.url).toBe("https://api.test/admin/directory/v1/users/..%2Fx%3Fy?fields=suspended,archived");
+  const status = googleDirectoryStatus(parseDirectoryKey(keyJson(), undefined), g.options);
+  for (const subject of ["..", ".", "../x?y", "", "12a"]) expect((await failure(status(subject, signal()))).name).toBe("google_directory_error");
+  expect(g.seen).toEqual([]);
+});
+
+test("a caller's abort stops its own wait, not the shared token request; users.get gets the caller's signal", async () => {
+  let release!: () => void;
+  const gate = new Promise<void>(r => { release = r; });
+  const signals: (AbortSignal | undefined)[] = [];
+  const g = google();
+  const fetchFn = (async (input: string | URL | Request, init?: RequestInit) => {
+    signals.push(init?.signal ?? undefined);
+    if (String(input) === "https://token.test") await gate;
+    return g.options.fetch(input, init);
+  }) as typeof fetch;
+  const status = googleDirectoryStatus(parseDirectoryKey(keyJson(), undefined), { ...g.options, fetch: fetchFn });
+  const quitter = new AbortController(), stayer = new AbortController();
+  const first = failure(status("1", quitter.signal));
+  const second = status("2", stayer.signal);
+  quitter.abort(new Error("timeout"));
+  expect((await first).message).toBe("timeout");
+  release();
+  expect(await second).toBe("active");
+  expect(g.tokens()).toHaveLength(1);
+  expect(signals[0]).not.toBe(quitter.signal);
+  expect(signals.at(-1)).toBe(stayer.signal);
+});
+
+test("a refused credential logs Google's error text once per window; the class goes to the audit", async () => {
+  const warned: string[] = [];
+  const warn = console.warn;
+  console.warn = (m: string) => { warned.push(m); };
+  try {
+    const g = google({ token: () => ({ status: 400, body: { error: "unauthorized_client" } }) });
+    const status = googleDirectoryStatus(parseDirectoryKey(keyJson(), undefined), g.options);
+    expect((await failure(status("1", signal()))).name).toBe("google_token_refused");
+    await failure(status("1", signal()));
+    expect(warned).toHaveLength(1);
+    expect(warned[0]).toContain("unauthorized_client");
+    g.advance(10 * 60_000);
+    await failure(status("1", signal()));
+    expect(warned).toHaveLength(2);
+    const d = google({ user: () => ({ status: 403, body: { error: { message: "Not Authorized to access this resource/api" } } }) });
+    expect((await failure(googleDirectoryStatus(parseDirectoryKey(keyJson(), undefined), d.options)("1", signal()))).name).toBe("google_directory_refused");
+    expect(warned.at(-1)).toContain("Not Authorized");
+  } finally { console.warn = warn; }
 });
 
 test("a key that isn't a service account's RSA key, or an admin that isn't an email, is refused at startup", async () => {
+  const pkcs1 = createPrivateKey(pem).export({ type: "pkcs1", format: "pem" }) as string;
   const ec = await exportPKCS8((await generateKeyPair("ES256", { extractable: true })).privateKey);
   for (const [raw, admin, msg] of [
     ["{", undefined, /is not JSON/],
     [keyJson({ type: "authorized_user" }), undefined, /must be a service account key/],
     [keyJson({ client_email: undefined }), undefined, /has no client_email/],
     [keyJson({ private_key: undefined }), undefined, /has no private_key/],
-    [keyJson({ private_key: "garbage" }), undefined, /not an RSA private key/],
-    [keyJson({ private_key: ec }), undefined, /not an RSA private key/],
+    [keyJson({ private_key: "garbage" }), undefined, /not a PKCS#8 RSA private key/],
+    [keyJson({ private_key: ec }), undefined, /not a PKCS#8 RSA private key/],
+    [keyJson({ private_key: pkcs1 }), undefined, /not a PKCS#8 RSA private key/],
+    [keyJson({ private_key: `\n${pem}` }), undefined, /not a PKCS#8 RSA private key/],
     [keyJson(), "admin", /must be an admin's email/],
     [keyJson(), "", /must be an admin's email/],
   ] as const) expect(() => parseDirectoryKey(raw, admin)).toThrow(msg);
