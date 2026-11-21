@@ -126,6 +126,7 @@ test("every other answer throws, named for what an operator fixes", async () => 
     [{ token: () => ({ status: 401, body: { error: "invalid_client", error_description: "The client_assertion signature is invalid." } }) }, "okta_token_refused"],
     [{ token: () => ({ status: 400, body: { error: "invalid_scope", error_description: "The following scopes are not allowed: okta.users.read" } }) }, "okta_token_refused"],
     [{ token: () => ({ status: 400, body: { error: "invalid_dpop_proof" } }) }, "okta_token_refused"],
+    [{ token: () => ({ status: 403, body: { error: "access_denied" } }) }, "okta_token_refused"],
     // A second use_dpop_nonce after the retry is a refusal, not a loop.
     [{ token: () => ({ status: 400, body: { error: "use_dpop_nonce" }, headers: { "DPoP-Nonce": "n" } }) }, "okta_token_refused"],
     [{ token: () => ({ status: 429, body: { errorCode: "E0000047" } }) }, "okta_directory_error"],
@@ -144,6 +145,27 @@ test("every other answer throws, named for what an operator fixes", async () => 
   ];
   for (const [script, name] of cases)
     expect([script, (await failure(oktaDirectoryStatus(config, okta(script).options)(ID, signal()))).name]).toEqual([script, name]);
+});
+
+test("use_dpop_nonce without a DPoP-Nonce header is refused without a retry", async () => {
+  const o = okta({ token: () => ({ status: 400, body: { error: "use_dpop_nonce" } }) });
+  expect((await failure(oktaDirectoryStatus(config, o.options)(ID, signal()))).name).toBe("okta_token_refused");
+  expect(o.tokens()).toHaveLength(1);
+});
+
+test("an EC key signs the assertion with its curve's alg (P-256, P-384, P-521)", async () => {
+  const saved = { config, pub };
+  try {
+    for (const [curve, alg] of [["P-256", "ES256"], ["P-384", "ES384"], ["P-521", "ES512"]] as const) {
+      const ec = generateKeyPairSync("ec", { namedCurve: curve });
+      config = { orgUrl: ORG, clientId: CLIENT, ...parseOktaDirectoryKey(ec.privateKey.export({ type: "sec1", format: "pem" }) as string, "kid-ec") };
+      pub = ec.publicKey as unknown as KeyLike;
+      const o = okta({ dpop: "off" });
+      expect(await oktaDirectoryStatus(config, o.options)(ID, signal())).toBe("active");
+      expect(decodeProtectedHeader(o.tokens()[0]!.form!.get("client_assertion")!).alg).toBe(alg);
+      expect(o.problems).toEqual([]);
+    }
+  } finally { ({ config, pub } = saved); }
 });
 
 test("a subject that isn't an Okta user id throws without a request: the path would take a login", async () => {
@@ -232,6 +254,7 @@ test("parseOktaDirectoryKey takes a JWK or a PEM (PKCS#8, PKCS#1, SEC1), as PKCS
     [JSON.stringify(await exportJWK((await generateKeyPair("RS256", { extractable: true })).publicKey)), undefined, /without its private part/],
     ["-----BEGIN PRIVATE KEY-----\nnope\n-----END PRIVATE KEY-----", undefined, /is not a valid private key/],
     [generateKeyPairSync("ed25519").privateKey.export({ type: "pkcs8", format: "pem" }) as string, undefined, /must be an RSA or EC/],
+    [generateKeyPairSync("rsa", { modulusLength: 1024 }).privateKey.export({ type: "pkcs8", format: "pem" }) as string, undefined, /at least 2048 bits/],
     [pkcs8, "", /KEY_ID must be the key's id/],
     [pkcs8, "a b", /KEY_ID must be the key's id/],
     [JSON.stringify(jwk), "other", /differs from GRAYBOARD_OKTA_DIRECTORY_KEY's kid/],

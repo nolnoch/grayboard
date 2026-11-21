@@ -61,9 +61,11 @@ export function parseOktaDirectoryKey(raw: string, keyIdVar: string | undefined)
   }
   let alg: string;
   let pkcs8: string;
+  let modulus: number | undefined;
   try {
     const key = jwk ? createPrivateKey({ key: jwk as never, format: "jwk" }) : createPrivateKey(trimmed);
     const curve = key.asymmetricKeyDetails?.namedCurve;
+    modulus = key.asymmetricKeyDetails?.modulusLength;
     alg = key.asymmetricKeyType === "rsa" ? "RS256"
       : key.asymmetricKeyType === "ec" && curve === "prime256v1" ? "ES256"
       : key.asymmetricKeyType === "ec" && curve === "secp384r1" ? "ES384"
@@ -72,6 +74,8 @@ export function parseOktaDirectoryKey(raw: string, keyIdVar: string | undefined)
     pkcs8 = key.export({ type: "pkcs8", format: "pem" }) as string;
   } catch { throw new Error(`${name} is not a valid private key`); }
   if (!alg) throw new Error(`${name} must be an RSA or EC (P-256, P-384, P-521) private key`);
+  // jose refuses to sign RS256 with a modulus under 2048 bits, which would otherwise surface only as every check failing.
+  if (alg === "RS256" && (modulus ?? 0) < 2048) throw new Error(`${name} must be an RSA key of at least 2048 bits`);
   const fromJwk = typeof jwk?.kid === "string" && jwk.kid ? jwk.kid : undefined;
   if (keyIdVar !== undefined && (keyIdVar === "" || /\s/.test(keyIdVar))) throw new Error("GRAYBOARD_OKTA_DIRECTORY_KEY_ID must be the key's id, without whitespace");
   if (keyIdVar !== undefined && fromJwk !== undefined && keyIdVar !== fromJwk) throw new Error("GRAYBOARD_OKTA_DIRECTORY_KEY_ID differs from GRAYBOARD_OKTA_DIRECTORY_KEY's kid");
