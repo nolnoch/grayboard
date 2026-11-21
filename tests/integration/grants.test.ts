@@ -173,6 +173,16 @@ test("the CLI revokes a grant whose id starts with '-', and still refuses an unk
       expect(await live()).not.toContain(id);
     }
 
+    // A dash id and a plain id together: refused, and neither grant is revoked (the rewrite moves the dash id behind
+    // `--`, so a dropped extra operand would have revoked the plain one).
+    const [dash, plain] = [dashId("-z"), "y".repeat(43)];
+    await issue(A, "grayboard-pi", dash);
+    await issue(A, "grayboard-pi", plain);
+    const two = await cli(A, "grants", "revoke", dash, plain);
+    expect(two.code).toBe(1);
+    expect(two.err).toContain("too many arguments");
+    expect(await live()).toEqual(expect.arrayContaining([dash, plain]));
+
     const unknown = await cli(A, "grants", "revoke", "--bogus");
     expect(unknown.code).toBe(1);
     expect(unknown.err).toContain("unknown option '--bogus'");

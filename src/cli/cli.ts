@@ -1140,6 +1140,9 @@ grantsCmd
   .command("revoke <id>")
   .description("Revoke one sign-in by its id from `grants list`; that harness or CLI must sign in again, the others keep working")
   .option("--user <email>", "Another user's (org admins)")
+  // One id per call: a second operand is refused, not dropped, so `revoke <dash-id> <id>`, whose dash id the argv
+  // rewrite moves behind `--`, can't revoke the other grant (#1583).
+  .allowExcessArguments(false)
   .action(async (id: string, opts: { user?: string }) => {
     try {
       output(await makeClient().post(opts.user ? "/api/admin/grants/revoke" : "/api/grants/revoke", opts.user ? { email: opts.user, id } : { id }), globalJson());
