@@ -27,8 +27,9 @@
 // svc_reply, peer_list); every invocation must come back as a reply its invoker read. At --read-share a user's op reads
 // the service's board through R5's other canSee sites (#1511), in turn: board_list, board_read (a thread of its own
 // answered invocations), the snapshot (resources/read) and the catalog (resources/list, also read by every session as
-// it connects, reported as catalog_connect and not gated). Each is its own op, and each result must show the board
-// (and the reads of its posts, posts), or the run fails.
+// it connects, timed as catalog_connect and not latency-gated, though its result counts toward the catalog's proof).
+// Each is its own op, and each result must show the board (every board_read thread its invocation and reply, some
+// snapshot a post), or the run fails.
 //
 // The server runs with GRAYBOARD_DEV_AUTH=1 (tests/support/server.ts) on every interface, for as
 // long as the run: anyone who can reach this host's port can sign in to the scratch database.
@@ -581,7 +582,7 @@ async function main() {
       if (audit!.boardScope !== `service:${SERVICE}` || audit!.boardKind !== "queue") failures.push(`${SVC_BOARD} is scope ${audit!.boardScope}, kind ${audit!.boardKind}; want service:${SERVICE}, queue`);
     }
     // Proof the reads saw the service's board (#1511): every result named it, and the reads of its posts returned some (a
-    // board_read's thread, every time: the invocation and its reply).
+    // board_read's thread, every time: the invocation and its reply; a snapshot, once invocations have put posts there).
     const svcReads: Record<string, ReadProof> = Object.fromEntries(SVC_READS.map(op => [op, drivers.reduce((a, d) => {
       const p = d.final!.svcReads[op] ?? { ok: 0, named: 0, content: 0 };
       return { ok: a.ok + p.ok, named: a.named + p.named, content: a.content + p.content };
@@ -592,7 +593,7 @@ async function main() {
       if (!p.ok) failures.push(`no ${op} of ${SVC_BOARD} returned`);
       if (p.named < p.ok) failures.push(`${p.ok - p.named} of ${p.ok} ${op} results didn't show ${SVC_BOARD}`);
       if (op === "board_read" && p.content < p.ok) failures.push(`${p.ok - p.content} of ${p.ok} board_read threads of ${SVC_BOARD} lacked the invocation or its reply`);
-      if (op === "snapshot" && p.ok && !p.content) failures.push(`no snapshot of ${SVC_BOARD} carried a post`);
+      if (op === "snapshot" && o.svcShare > 0 && p.ok && !p.content) failures.push(`no snapshot of ${SVC_BOARD} carried a post`);
     }
     const laneEchoes = drivers.reduce((a, d) => a + d.final!.laneEcho, 0);
     if (laneEchoes) failures.push(`${laneEchoes} replies reached a service lane; want 0 (a reply goes to its invoker)`);

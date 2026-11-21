@@ -122,6 +122,8 @@ type Live = {
   reads: number;
   invoked: Map<number, number>;
   doneThread?: number;
+  // A board_read whose turn came before the session had a thread to read: it runs once one exists.
+  owedRead?: boolean;
 };
 
 const sentDm = new Set<string>();
@@ -270,12 +272,17 @@ async function catalog(l: Live, board: string) {
 }
 
 // One read of the service's board, the next of SVC_READS in this session's turn. board_read waits for a thread to read:
-// until the session's first answered invocation, the next read stands in and board_read keeps its turn.
+// a turn that comes before the session's first answered invocation passes to the next read, and board_read is owed
+// until the session has a thread. The rotation always advances, so the other reads stay in turn (with no invocations
+// at all, as at --svc-share 0, they rotate among themselves).
 function svcRead(l: Live, board: string) {
   const counted = proving;
-  let op = SVC_READS[l.reads % SVC_READS.length]!;
-  if (op === "board_read" && l.doneThread === undefined) op = SVC_READS[(l.reads + 1) % SVC_READS.length]!;
-  else l.reads++;
+  let op: typeof SVC_READS[number];
+  if (l.owedRead && l.doneThread !== undefined) { op = "board_read"; l.owedRead = false; }
+  else {
+    op = SVC_READS[l.reads++ % SVC_READS.length]!;
+    if (op === "board_read" && l.doneThread === undefined) { l.owedRead = true; op = SVC_READS[l.reads++ % SVC_READS.length]!; }
+  }
   if (op === "board_list") {
     void timed(op, async () => {
       const v = await l.s.call<unknown>("board_list", {});
@@ -397,7 +404,7 @@ async function main() {
         live.delete(l.spec.index);
         await timed("close", () => close(l));
         const fresh = await timed("connect", () => open(l.spec, config.url));
-        if (fresh) { fresh.nextSend = l.nextSend; fresh.seq = l.seq; fresh.reads = l.reads; fresh.invoked = l.invoked; fresh.doneThread = l.doneThread; live.set(l.spec.index, fresh); }
+        if (fresh) { fresh.nextSend = l.nextSend; fresh.seq = l.seq; fresh.reads = l.reads; fresh.invoked = l.invoked; fresh.doneThread = l.doneThread; fresh.owedRead = l.owedRead; live.set(l.spec.index, fresh); }
       }));
     }
     emit({ type: "churned", driver: config.driver, count: picked.length, live: live.size });
