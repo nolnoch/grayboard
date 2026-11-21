@@ -262,3 +262,85 @@ for (const { point, name } of [
     await srv.stop();
   });
 }
+
+// #1496: the effects a request's own transaction schedules for after its commit (a post's or a call's board change and
+// wakes, the blob sweep after a retract or a replay that released uploads) are background work stop() waits for as it
+// does a pass's, and skips once stopping. Each is held at a testPause point inside it.
+for (const { point, name } of [
+  { point: "board-change:observers-read", name: "post board change" },
+  // Held inside the drain of the subscriber the post wakes, before its read.
+  { point: "server:drain-boards:before-read", name: "post wake" },
+]) {
+  const boards = name.endsWith("board change");
+  test(`stop() waits for the ${name} a board_post's commit starts${boards ? ", and starts no other once stopping" : ""}`, async () => {
+    const srv = await TestServer.open();
+    const token = await srv.login(A);
+    const be = await srv.connected(token, "be");
+    await be.call("board_create", { name: "lobby", purpose: "general" });
+    const qa = await srv.connected(token, "qa");
+    await qa.call("board_subscribe", { board: "lobby", mode: "push" });
+    const closed = await closeSpy(srv);
+    hold(point);
+    await be.call("board_post", { board: "lobby", body: "first" });
+    // A post that commits once stop has begun: its effect is skipped, so it never reaches the same pause.
+    let late: Promise<unknown> = Promise.resolve();
+    await stopAround(srv, closed, point, name, () => { late = be.call("board_post", { board: "lobby", body: "second" }); });
+    await late;
+    // The drain reads once per address of the subscriber's, each read held at the pause.
+    if (boards) expect(pauseHits(point)).toBe(1);
+    await srv.stop();
+  });
+}
+
+for (const { point, name } of [
+  { point: "board-change:observers-read", name: "call board change" },
+  { point: "server:drain-boards:before-read", name: "call wake" },
+]) {
+  test(`stop() waits for the ${name} a board tool call's commit starts`, async () => {
+    const srv = await TestServer.open();
+    const token = await srv.login(A);
+    const be = await srv.connected(token, "be");
+    await be.call("board_create", { name: "lobby", purpose: "general" });
+    const qa = await srv.connected(token, "qa");
+    await qa.call("board_subscribe", { board: "lobby", mode: "push" });
+    const closed = await closeSpy(srv);
+    hold(point);
+    // A claim take announces on the board: a board change, and a wake for its subscriber.
+    await be.call("claim_take", { key: "work", board: "lobby", ttl_minutes: 60 });
+    await stopAround(srv, closed, point, name);
+    await srv.stop();
+  });
+}
+
+test("stop() waits for the blob sweep a dm_retract's commit starts", async () => {
+  const srv = await TestServer.open({ hostedRequestLimit: { burst: 10_000, perSec: 10_000 } });
+  const B = "bob@example.com";
+  const fe = await srv.hosted(B, "fe");
+  await fe.close();
+  const be = await srv.hosted(A, "be");
+  const first = await be.call<{ message_id: number }>("dm_send", { to: `${B}/fe`, body: "first" });
+  const closed = await closeSpy(srv);
+  hold("blobs:listed");
+  await be.call("dm_retract", { message_id: first.message_id });
+  // Closed first: stop() shuts the HTTP listener, and a hosted session's own requests would then fail.
+  await be.close();
+  await stopAround(srv, closed, "blobs:listed", "blob sweep");
+  await srv.stop();
+});
+
+test("stop() waits for the blob sweep a replayed board_post's commit starts", async () => {
+  const srv = await TestServer.open({ hostedRequestLimit: { burst: 10_000, perSec: 10_000 } });
+  const be = await srv.hosted(A, "be");
+  await be.call("board_create", { name: "lobby", purpose: "general" });
+  const one = await be.upload("a.txt", "same bytes");
+  await be.call("board_post", { board: "lobby", body: "with a file", attachment_ids: [one] });
+  // The retry uploaded its file afresh: the replay releases it, and the sweep follows the commit.
+  const two = await be.upload("a.txt", "same bytes");
+  const closed = await closeSpy(srv);
+  hold("blobs:listed");
+  const retry = await be.call<{ replayed?: unknown }>("board_post", { board: "lobby", body: "with a file", attachment_ids: [two] });
+  expect(retry.replayed).toBeDefined();
+  await be.close();
+  await stopAround(srv, closed, "blobs:listed", "blob sweep");
+  await srv.stop();
+});
