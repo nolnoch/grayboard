@@ -236,7 +236,8 @@ async function openOnce(spec: DriverSession, url: string): Promise<Live> {
   l.stopWatch = () => subscription.close();
   l.loop = deliveryLoop(l);
   // A harness host lists the resources at its start: the catalog, judged per board (a service board's binding read).
-  if (svcBoard) await timed("catalog", () => catalog(l, svcBoard!));
+  // Timed as its own op, reported but not gated: churn reconnects land it in the steady windows.
+  if (svcBoard) await timed("catalog_connect", () => catalog(l, svcBoard!));
   return l;
 }
 
@@ -257,20 +258,24 @@ const postsOf = (v: unknown): { id?: unknown; body?: unknown }[] => {
 async function catalog(l: Live, board: string) {
   const counted = proving, uris: string[] = [];
   let cursor: string | undefined;
+  const seen = new Set<string>();
   do {
     const page = await l.s.native.client.listResources(cursor === undefined ? {} : { cursor }, { ...l.s.native.options(), cacheMode: "bypass" });
     uris.push(...page.resources.map(r => r.uri));
     cursor = page.nextCursor;
+    if (cursor !== undefined && seen.has(cursor)) throw new Error(`catalog: cursor ${cursor} repeated`);
+    if (cursor !== undefined) seen.add(cursor);
   } while (cursor);
   proved(counted, "catalog", uris.includes(`grayboard://boards/${board}`), true);
 }
 
 // One read of the service's board, the next of SVC_READS in this session's turn. board_read waits for a thread to read:
-// until the session's first answered invocation, its turn passes to the next read.
+// until the session's first answered invocation, the next read stands in and board_read keeps its turn.
 function svcRead(l: Live, board: string) {
   const counted = proving;
-  let op = SVC_READS[l.reads++ % SVC_READS.length]!;
-  if (op === "board_read" && l.doneThread === undefined) op = SVC_READS[l.reads++ % SVC_READS.length]!;
+  let op = SVC_READS[l.reads % SVC_READS.length]!;
+  if (op === "board_read" && l.doneThread === undefined) op = SVC_READS[(l.reads + 1) % SVC_READS.length]!;
+  else l.reads++;
   if (op === "board_list") {
     void timed(op, async () => {
       const v = await l.s.call<unknown>("board_list", {});

@@ -102,8 +102,8 @@ async function run(extra: string[]): Promise<{ code: number; out: string; summar
   try {
     // runCli kills the whole process group on timeout: the coordinator, its drivers and the server.
     const { code, out, err } = await runCli([join(ROOT, "scripts/loadtest.ts"),
-      "--sessions", "8", "--service-workers", "2", "--svc-share", "0.2", "--peer-share", "0.1", "--read-share", "0.4", "--users", "2", "--drivers", "2", "--duration", "10", "--warmup", "2", "--window", "2",
-      "--period", "1", "--boards", "2", "--post-share", "0.15", "--churn", "0.5", "--churn-every", "5", "--grace", "1",
+      "--sessions", "8", "--service-workers", "2", "--svc-share", "0.2", "--peer-share", "0.1", "--read-share", "0.3", "--users", "2", "--drivers", "2", "--duration", "14", "--warmup", "2", "--window", "2",
+      "--period", "1", "--boards", "2", "--post-share", "0.2", "--churn", "0.5", "--churn-every", "5", "--grace", "1",
       "--out", dir, ...extra], { bin: process.execPath, cwd: ROOT, env: { PATH: process.env.PATH ?? "" }, timeoutMs: 60_000 });
     let summary: any;
     try { summary = JSON.parse(readFileSync(join(dir, "summary.json"), "utf8")); } catch { summary = undefined; }
@@ -117,8 +117,8 @@ describe("loadtest run", () => {
   test("a small fleet with churn passes every gate and drains to zero", async () => {
     const r = await run([]);
     expect({ code: r.code, failures: r.summary?.failures }, r.out).toEqual({ code: 0, failures: [] });
-    // Five windows; the first spans the warm-up, so four are steady (#1038).
-    expect({ windows: r.summary.windows, steady: r.summary.steadyWindows }).toEqual({ windows: 5, steady: 4 });
+    // Seven windows; the first spans the warm-up, so six are steady (#1038).
+    expect({ windows: r.summary.windows, steady: r.summary.steadyWindows }).toEqual({ windows: 7, steady: 6 });
     expect(r.summary.dms.sent).toBeGreaterThan(0);
     expect(r.summary.dms.lost).toBe(0);
     expect(r.summary.misdelivered).toBe(0);

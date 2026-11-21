@@ -27,7 +27,8 @@
 // svc_reply, peer_list); every invocation must come back as a reply its invoker read. At --read-share a user's op reads
 // the service's board through R5's other canSee sites (#1511), in turn: board_list, board_read (a thread of its own
 // answered invocations), the snapshot (resources/read) and the catalog (resources/list, also read by every session as
-// it connects). Each is its own op, and each result must show the board (and the reads its posts), or the run fails.
+// it connects, reported as catalog_connect and not gated). Each is its own op, and each result must show the board
+// (and the reads of its posts, posts), or the run fails.
 //
 // The server runs with GRAYBOARD_DEV_AUTH=1 (tests/support/server.ts) on every interface, for as
 // long as the run: anyone who can reach this host's port can sign in to the scratch database.
