@@ -18,6 +18,9 @@ export const TRANSIENT_BACKOFF_MS = 5 * 60_000;
 // Past this many backed-off users, expired entries are swept on the next insert.
 const BACKOFF_SWEEP_AT = 1_000;
 const HOUR = 3_600_000;
+// At most one auth.reauth_required row per user and credential kind in this long (#1558): a client that retries a clock-refused refresh, or
+// a CLI loop, writes one row, not one per attempt. Per process, as the other guards are.
+export const REAUTH_ROW_MS = HOUR;
 
 export type RecheckConfig = { recheckHours: number; maxStaleHours: number; disableLimit: number; reauthDays: number };
 export type RecheckHooks = {
@@ -48,6 +51,9 @@ export type IdpRecheck = {
   cliVerdict(user: Checked): Promise<CliVerdict>;
   // Inside a refresh's rotation: the fallback, for a user no status provider covers.
   fallbackDue(user: Checked): boolean;
+  // After the fallback refused a credential (cliVerdict calls it itself; the refresh path once its rotation has rolled
+  // back): audits auth.reauth_required with the user as target, at most once per user and credential per REAUTH_ROW_MS.
+  reauthRefused(user: Pick<User, "id" | "email">, credential: "refresh" | "cli", clientId?: string): void;
 };
 
 // now: the clock the refresh path reads (OAuthOptions.now), so the fallback and the rotation agree on the time.
@@ -63,6 +69,8 @@ export function createIdpRecheck(
   const backoff = new Map<number, number>();
   const disables: number[] = [];
   let tripped = false;
+  // "<userId>:<credential>" → when its last auth.reauth_required row was written.
+  const reauthRows = new Map<string, number>();
 
   const providerFor = (u: Checked) => u.kind === "user" && u.idp_issuer !== null && u.idp_subject !== null
     ? providers.find(p => p.status && p.issuer === u.idp_issuer) : undefined;
@@ -147,7 +155,19 @@ export function createIdpRecheck(
     return next;
   }
 
+  function reauthRefused(u: Pick<User, "id" | "email">, credential: "refresh" | "cli", clientId?: string): void {
+    const t = now(), key = `${u.id}:${credential}`, last = reauthRows.get(key);
+    if (last !== undefined && t - last < REAUTH_ROW_MS) return;
+    // Re-inserted, so the map stays in write order and the expired entries are a prefix: a re-auth wave (every clock
+    // started on one day) sweeps in amortized constant time, not a scan of the map per refusal.
+    reauthRows.delete(key);
+    for (const [k, at] of reauthRows) { if (t - at < REAUTH_ROW_MS) break; reauthRows.delete(k); }
+    reauthRows.set(key, t);
+    writeAudit(repo, repo.read, "auth.reauth_required", null, u.email, { credential, ...(clientId ? { client_id: clientId } : {}) });
+  }
+
   return {
+    reauthRefused,
     async beforeRefresh(userId) {
       const u = await repo.users.findById(repo.read, userId);
       if (!u) return "ok";
@@ -160,7 +180,11 @@ export function createIdpRecheck(
     },
     async cliVerdict(u) {
       const p = providerFor(u);
-      if (!p) return reauthDue(u, now(), config.reauthDays) ? "refuse" : "ok";
+      if (!p) {
+        if (!reauthDue(u, now(), config.reauthDays)) return "ok";
+        reauthRefused(u, "cli");
+        return "refuse";
+      }
       if (olderThan(u, config.maxStaleHours)) {
         const out = await check(u, p);
         return out === "active" ? "ok" : out === "inactive" ? "refuse" : "unavailable";
