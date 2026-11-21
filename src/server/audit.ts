@@ -24,6 +24,7 @@ export type AuditAction =
   | "auth.rate_limit_ended"
   | "auth.rate_limit_full"
   | "auth.rate_limited"
+  | "auth.reauth_required"
   | "auth.session_revoked"
   | "auth.subject_cleared"
   | "auth.subject_linked"
