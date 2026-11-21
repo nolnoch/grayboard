@@ -1034,7 +1034,54 @@ test("live disable/admin revoke, expiry, and database failures are not credentia
   storage.db.exec("DROP TRIGGER reject_token"); expect((await post("/oauth/token", tokenParams(d))).status).toBe(200);
 });
 
+// #930: a provider with no directory check sends its users back through the IdP every GRAYBOARD_IDP_REAUTH_DAYS. The
+// refusal rolls back the rotation, so the refused token still works once a fresh sign-in restarts the clock, and a
+// replay of a spent token still revokes the family.
+test("refresh is refused once the IdP re-auth window passes, unspent, and works again after a fresh sign-in", async () => {
+  const day = 86_400_000;
+  const refresh = (token: string) => post("/oauth/token", { client_id: "native", grant_type: "refresh_token", refresh_token: token, resource: service.resource });
+  const checkedAt = async () => (await storage.repo.users.findByEmail(storage.repo.read, "you@example.com"))!.idp_checked_at!;
+  const first = await redeem(await issue());
+  const signedIn = await checkedAt();
+  clock = signedIn + 29 * day;
+  const r1 = await refresh(first.refresh_token); expect(r1.status).toBe(200);
+  const current = await r1.json() as Tokens;
+  clock = signedIn + 30 * day + 1;
+  const refused = await refresh(current.refresh_token);
+  expect(refused.status).toBe(400); expect(await refused.json()).toEqual({ error: "invalid_grant" });
+  expect(storage.db.query("SELECT COUNT(*) AS n FROM oauth_grants WHERE revoked_at IS NULL").get()).toEqual({ n: 1 });
+  // A fresh sign-in (the store's clock stamps it) restarts the user's clock; the refused token was never spent.
+  await issue();
+  expect(await checkedAt()).toBeGreaterThan(signedIn);
+  clock = Math.max(clock, await checkedAt());
+  const again = await refresh(current.refresh_token); expect(again.status).toBe(200);
+  // The spent token's replay still revokes its family, past the window as inside it.
+  clock = (await checkedAt()) + 31 * day;
+  expect((await refresh(first.refresh_token)).status).toBe(400);
+  expect(storage.db.query("SELECT revoked_at FROM oauth_grants WHERE id = (SELECT grant_id FROM oauth_tokens WHERE hash = ?)").get(hashToken((await again.json() as Tokens).refresh_token))).not.toEqual({ revoked_at: null });
+});
+
+test("refresh ignores the re-auth window when GRAYBOARD_IDP_REAUTH_DAYS is 0, and for a user with no IdP clock or issuer", async () => {
+  const refresh = (token: string) => post("/oauth/token", { client_id: "native", grant_type: "refresh_token", refresh_token: token, resource: service.resource });
+  service.close(); config = { ...config, idpReauthDays: 0 }; service = makeService();
+  // In steps inside the refresh token's own lifetime, to well past the 30-day window and short of the grant's deadline.
+  const walk = async (token: string, steps: number) => {
+    for (let i = 0; i < steps; i++) {
+      clock += 29 * 86_400_000;
+      const r = await refresh(token); expect(r.status).toBe(200); token = (await r.json() as Tokens).refresh_token;
+    }
+    return token;
+  };
+  const token = await walk((await redeem(await issue())).refresh_token, 2);
+  // A dev-login row: no issuer, no clock. Nothing to send it back to, so the default window leaves it alone.
+  service.close(); config = { ...config, idpReauthDays: undefined }; service = makeService();
+  await seed(storage.repo, () => storage.db.run("UPDATE users SET idp_issuer = NULL, idp_subject = NULL, idp_checked_at = NULL"));
+  await walk(token, 1);
+});
+
 test("hash-only browser/code/token persistence and HTTP expiry clamps use actual absolute grant deadline", async () => {
+  // The walk to the grant's deadline outlasts the IdP re-auth window (#930), which has its own tests.
+  service.close(); config = { ...config, idpReauthDays: 0 }; service = makeService();
   const a = await issue(), tokens = await redeem(a), p = await principal(tokens);
   const persisted = () => JSON.stringify(["oauth_requests", "oauth_browsers", "oauth_codes", "oauth_grants", "oauth_tokens"].map(table => storage.db.query(`SELECT * FROM ${table}`).all()));
   const records = persisted();
@@ -1507,7 +1554,7 @@ test("a login code redeems once for a CLI session token: no refresh, no expiry, 
   expect(body).toMatchObject({ token_type: "Bearer", scope: LOGIN_SCOPE });
   const token = body.access_token as string;
   expect(token).toStartWith("gbrd_v1_");
-  const authed = await verifySessionToken(token, storage.repo, touches, 30);
+  const authed = await verifySessionToken(token, storage.repo, touches, 30, 0);
   expect(authed).toMatchObject({ user_email: "you@example.com" });
   expect(await storage.repo.sessions.findById(storage.repo.read, authed!.session_id)).toMatchObject({ label: "grayboard-test", revoked_at: null });
   // Not an OAuth access token.
@@ -1524,7 +1571,7 @@ test("a replayed login code revokes its session and audits oauth.code_replay_rev
     const a = await cliCode();
     const first = await post("/oauth/token", cliTokenParams(a));
     const token = (await first.json() as { access_token: string }).access_token;
-    const authed = (await verifySessionToken(token, storage.repo, touches, 30))!;
+    const authed = (await verifySessionToken(token, storage.repo, touches, 30, 0))!;
     expect(authed).not.toBeNull();
     // Kept past its expiry while the session lives, so a late replay is still caught.
     clock += OAUTH_TTL.code + 1;
@@ -1532,7 +1579,7 @@ test("a replayed login code revokes its session and audits oauth.code_replay_rev
     const again = await post("/oauth/token", cliTokenParams(a));
     expect(again.status).toBe(400);
     expect(await again.json()).toEqual({ error: "invalid_grant" });
-    expect(await verifySessionToken(token, storage.repo, touches, 30)).toBeNull();
+    expect(await verifySessionToken(token, storage.repo, touches, 30, 0)).toBeNull();
     expect((await storage.repo.sessions.findById(storage.repo.read, authed.session_id))!.revoked_at).not.toBeNull();
     expect(accessAudits(storage.db, "oauth.code_replay_revoked")).toEqual([expect.objectContaining({ actor: "you@example.com", detail: { client_id: CLI_CLIENT_ID, token_session: authed.session_id, level: "warning" } })]);
     // With its session revoked the spent code goes at the next sweep.

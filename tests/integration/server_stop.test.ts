@@ -43,7 +43,7 @@ testSqlite("stop() cancels a session's deferred last-used touch instead of crash
   const srv = await TestServer.open();
   const token = await srv.login("alice@example.com");
   // Schedules the touch; stopped in the same turn, so it is still pending.
-  expect(await verifySessionToken(token, srv.app.repo, srv.app.touches, 0)).toMatchObject({ user_email: "alice@example.com" });
+  expect(await verifySessionToken(token, srv.app.repo, srv.app.touches, 0, 0)).toMatchObject({ user_email: "alice@example.com" });
   await srv.stop();
   // The pending immediate would fire here and throw "Database has closed"
   // unhandled (the CI failure on PR #197). A settle gives it the chance.
@@ -54,7 +54,7 @@ testSqlite("stop() cancels a session's deferred last-used touch instead of crash
 test("a session's deferred last-used touch lands when the server keeps running", async () => {
   const srv = await TestServer.open();
   const token = await srv.login("alice@example.com");
-  const authed = await verifySessionToken(token, srv.app.repo, srv.app.touches, 0);
+  const authed = await verifySessionToken(token, srv.app.repo, srv.app.touches, 0, 0);
   expect(authed).not.toBeNull();
   // Pin a known-past stamp after scheduling; the deferred touch overwrites it
   // with the fire-time now. (A before/after pair around the fire collides:
@@ -73,7 +73,7 @@ test("stopping one server leaves another live server's pending touch alone", asy
   const a = await TestServer.open();
   const b = await TestServer.open();
   const tokenA = await a.login("alice@example.com");
-  const authedA = (await verifySessionToken(tokenA, a.app.repo, a.app.touches, 0))!;
+  const authedA = (await verifySessionToken(tokenA, a.app.repo, a.app.touches, 0, 0))!;
   // Pin a known-past stamp after scheduling; the deferred touch overwrites it
   // with the fire-time now (the immediate cannot run mid-sync-block).
   await seed(a.app.repo, tx => a.app.repo.sessions.touch(tx, authedA.session_id, 1));

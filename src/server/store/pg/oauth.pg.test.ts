@@ -316,6 +316,48 @@ describePg("OAuth races (Postgres)", () => {
     expect(r.waited).toBe(true);
   });
 
+  // #1552: a per-grant revoke ends the user's browser sessions and unspent codes. It holds the users row, so a consent's
+  // mint either commits first and its code is deleted after, or waits and re-reads its browser session gone.
+  const perGrant: [string, (p: Pair, userId: number) => Promise<(tx: Tx) => Promise<unknown>>][] = [
+    ["revokeUserGrant", async (p, userId) => {
+      const g = await world(p, "g");
+      await g.until("code");
+      expect((await p.a.write(tx => p.o.redeemCode(tx, g.redemption(), start))).status).toBe("ok");
+      return tx => p.o.revokeUserGrant(tx, userId, g.redemption().grantId, start);
+    }],
+    ["sessions.revokeOwn", async (p, userId) => {
+      const s = await p.a.write(tx => p.g.sessions.create(tx, userId, sha("cli-token"), null));
+      return async tx => ({ status: await p.g.sessions.revokeOwn(tx, userId, s.id) ? "ok" : "not_found" });
+    }],
+  ];
+  const unspent = (p: Pair, userId: number) => count(p, "oauth_codes", p.db.sql`user_id = ${userId} AND grant_id IS NULL AND session_id IS NULL`);
+  for (const [name, setup] of perGrant) {
+    test(`${name} first: a consent decided behind it waits, then finds its browser session gone and issues no code (#1552)`, async () => {
+      await using p = await pair();
+      const w = await world(p);
+      await w.until("bound");
+      const revoke = await setup(p, w.userId);
+      const r = await race(p, revoke, tx => p.o.decideRequest(tx, w.decision(), start));
+      expect(st(r.a)).toBe("ok");
+      expect(st(r.b)).toBe("not_found");
+      expect(await unspent(p, w.userId)).toBe(0);
+      expect(await count(p, "oauth_browsers")).toBe(0);
+      expect(r.waited).toBe(true);
+    });
+    test(`consent first: ${name} waits for the code, then deletes it with the browser sessions (#1552)`, async () => {
+      await using p = await pair();
+      const w = await world(p);
+      await w.until("bound");
+      const revoke = await setup(p, w.userId);
+      const r = await race(p, tx => p.o.decideRequest(tx, w.decision(), start), revoke);
+      expect(st(r.a)).toBe("ok");
+      expect(st(r.b)).toBe("ok");
+      expect(await unspent(p, w.userId)).toBe(0);
+      expect(await count(p, "oauth_browsers")).toBe(0);
+      expect(r.waited).toBe(true);
+    });
+  }
+
   test("T-C4-10 cutover: two boots claim the key; one revokes and audits, the other returns 0 without error", async () => {
     await using p = await pair();
     const w = await world(p);

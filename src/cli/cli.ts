@@ -1112,6 +1112,39 @@ teamCmd
     catch (e) { handleApiError(e); }
   });
 
+// ── grants ────────────────────────────────────────────────────────────────────
+
+// The per-grant list and revoke (#930): each harness sign-in (an OAuth grant) and each CLI token, so one lost device
+// is revoked alone. --user acts on another user's, as an org admin.
+type GrantRow = { id: string; kind: "oauth" | "credential" | "cli"; client_id?: string; label?: string | null; created_at: number; last_used_at: number; expires_at: number | null; current?: boolean };
+const day = (ms: number) => new Date(ms).toISOString().slice(0, 10);
+const grantLine = (g: GrantRow) => [g.id, g.kind === "cli" ? `cli${g.label ? ` (${g.label})` : ""}` : g.kind === "credential" ? `service credential ${g.client_id}` : g.client_id,
+  `created ${day(g.created_at)}`, `last used ${day(g.last_used_at)}`, ...(g.expires_at ? [`expires ${day(g.expires_at)}`] : []), ...(g.current ? ["(this CLI)"] : [])].join("  ");
+const grantsCmd = program.command("grants").description("List and revoke your sign-ins one at a time: each harness's OAuth grant and each CLI token (server mode)");
+
+grantsCmd
+  .command("list")
+  .description("List your live sign-ins, newest use first")
+  .option("--user <email>", "Another user's (org admins)")
+  .action(async (opts: { user?: string }) => {
+    try {
+      const res = await makeClient().get(opts.user ? `/api/admin/grants?email=${encodeURIComponent(opts.user)}` : "/api/grants") as { grants: GrantRow[] };
+      if (globalJson()) { output(res, true); return; }
+      if (res.grants.length === 0) { console.log("No live sign-ins."); return; }
+      for (const g of res.grants) console.log(grantLine(g));
+    } catch (e) { handleApiError(e); }
+  });
+
+grantsCmd
+  .command("revoke <id>")
+  .description("Revoke one sign-in by its id from `grants list`; that harness or CLI must sign in again, the others keep working")
+  .option("--user <email>", "Another user's (org admins)")
+  .action(async (id: string, opts: { user?: string }) => {
+    try {
+      output(await makeClient().post(opts.user ? "/api/admin/grants/revoke" : "/api/grants/revoke", opts.user ? { email: opts.user, id } : { id }), globalJson());
+    } catch (e) { handleApiError(e); }
+  });
+
 // ── admin ─────────────────────────────────────────────────────────────────────
 
 const adminCmd = program

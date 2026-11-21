@@ -1,7 +1,9 @@
 import { createHash, randomBytes } from "node:crypto";
 import type { Principal } from "../core/resolver.ts";
 import type { Repo } from "./db.ts";
+import type { User } from "./store/identity.ts";
 import type { SignedIn } from "./policy.ts";
+import type { IdpRecheck } from "./idp_recheck.ts";
 
 // The signed-in principal: its users row's id and name (an email, or a service's name), and its kind, read with the
 // row (#270 D1). Every check that keys on "a user is a person" reads `kind`.
@@ -57,15 +59,38 @@ export function createTouchQueue(): TouchQueue {
   };
 }
 
+// reauthDue (#930): the IdP last vouched for the user more than `days` ago, so their grants and CLI tokens stop
+// working until they sign in again. A service principal never signs in, so it's exempt. A null clock is due with an
+// issuer (a row a release without the column linked); with neither, no token can exist (the upgrade stamps every row,
+// sign-in and dev login stamp, unlink-idp keeps or zeroes the clock), so only a test fixture's row reads that way.
+export function reauthDue(user: Pick<User, "kind" | "idp_issuer" | "idp_checked_at">, now: number, days: number): boolean {
+  if (user.kind !== "user" || days <= 0) return false;
+  return user.idp_checked_at !== null ? user.idp_checked_at < now - days * 86_400_000 : user.idp_issuer !== null;
+}
+
+// Thrown by verifySessionToken when the IdP re-check couldn't get an answer past its stale bound (#930): the caller
+// answers 503 temporarily_unavailable, not 401, since the token isn't revoked and its user isn't disabled.
+export class IdpUnavailable extends Error {
+  constructor() { super("identity provider unreachable"); this.name = "IdpUnavailable"; }
+}
+
 // idleDays: a token unused that long is refused (security audit F-14); 0 never
 // expires one. Use, not age, so an agent that keeps working never loses its token.
-export async function verifySessionToken(raw: string, repo: Repo, touches: TouchQueue, idleDays: number): Promise<AuthedUser | null> {
+// reauth: the server's IdP re-check (#930 A2: the fallback clock, or a background directory check), or a bare
+// GRAYBOARD_IDP_REAUTH_DAYS (see reauthDue) where no provider has a directory check. Throws IdpUnavailable when the
+// re-check answers "unavailable".
+export async function verifySessionToken(
+  raw: string, repo: Repo, touches: TouchQueue, idleDays: number, reauth: number | Pick<IdpRecheck, "cliVerdict">,
+): Promise<AuthedUser | null> {
   const hash = hashToken(raw);
   const session = await repo.sessions.findByTokenHash(repo.read, hash);
   if (!session) return null;
   const user = await repo.users.findById(repo.read, session.user_id);
   if (session.revoked_at !== null || !user || user.disabled_at !== null) return null;
   if (idleDays > 0 && repo.now() - session.last_used_at > idleDays * 86_400_000) return null;
+  const verdict = typeof reauth === "number" ? (reauthDue(user, repo.now(), reauth) ? "refuse" : "ok") : await reauth.cliVerdict(user);
+  if (verdict === "refuse") return null;
+  if (verdict === "unavailable") throw new IdpUnavailable();
   // Off the request path: last-used is a stamp, not a result the caller waits on. Posted, so a touch that fires
   // while another body holds the write queue waits behind it (#807).
   touches.schedule(() => { repo.post(tx => repo.sessions.touch(tx, session.id, repo.now()), undefined, "session touch"); });

@@ -166,6 +166,35 @@ function users(it: It, sqliteOnly: (name: string, why: string, fn: (h: IdentityS
     await expect(h.setIdp(c.id, G, "same")).rejects.toThrow(/unique/i);
   });
 
+  // #930: every verified sign-in stamps the user's IdP clock (create, link and by-subject paths), and the returned user
+  // carries the stored stamp; a refusal leaves it; an upsert (dev login) has none; unlinking keeps it.
+  it("users.signIn stamps idp_checked_at on every ok path, never on a refusal; clearSubject keeps it, or zeroes a missing one; stampIdpChecked stamps", async h => {
+    const stamp = async (id: number) => (await h.users.findById(h.read, id))!.idp_checked_at;
+    const created = await signIn(h, G, "s-1", A, null);
+    expect(typeof created.user.idp_checked_at).toBe("number");
+    expect(await stamp(created.user.id)).toBe(created.user.idp_checked_at);
+    const again = await signIn(h, G, "s-1", A, null);
+    expect(again.user.idp_checked_at!).toBeGreaterThanOrEqual(created.user.idp_checked_at!);
+    expect(await stamp(created.user.id)).toBe(again.user.idp_checked_at);
+    const dev = await upsert(h, B);
+    expect(dev.idp_checked_at).toBeNull();
+    const linked = await signIn(h, G, "s-2", B, null);
+    expect(linked).toMatchObject({ status: "ok", linked: true });
+    expect(await stamp(dev.id)).toBe(linked.user.idp_checked_at);
+    expect(typeof linked.user.idp_checked_at).toBe("number");
+    const before = await stamp(created.user.id);
+    for (const r of [await signIn(h, G, "s-intruder", A, null), await signIn(h, OKTA, "o-1", A, null), await signIn(h, G, "s-1", "renamed@example.com", null)]) expect(r.status).not.toBe("ok");
+    expect(await stamp(created.user.id)).toBe(before);
+    await h.write(tx => h.users.clearSubject(tx, created.user.id));
+    expect(await stamp(created.user.id)).toBe(before);
+    // A row with no clock that loses its issuer would read as exempt (#930): it starts at 0, due at once.
+    const bare = await upsert(h, "bare@example.com");
+    await h.write(tx => h.users.clearSubject(tx, bare.id));
+    expect(await stamp(bare.id)).toBe(0);
+    await h.write(tx => h.users.stampIdpChecked(tx, bare.id));
+    expect(await stamp(bare.id)).toBeGreaterThan(0);
+  });
+
   it("users.clearSubject clears issuer and subject, so the next sign-in from any issuer takes the email", async h => {
     const u = (await signIn(h, G, "s-1", A, null)).user;
     await h.write(tx => h.users.clearSubject(tx, u.id));
@@ -214,6 +243,29 @@ function sessionsAndPrincipals(it: It): void {
     // By row, a revoked one still reads, with its revoked_at.
     expect((await h.sessions.findById(h.read, s.id))?.revoked_at).not.toBeNull();
     expect(await h.sessions.findById(h.read, s.id + 100)).toBeUndefined();
+  });
+
+  it("sessions.listLive lists one user's unrevoked sessions used after the cutoff, newest use first; revokeOwn revokes only the user's live one", async h => {
+    const { a, b, s1, s2, s3, other } = await h.write(async tx => {
+      const a = await h.users.upsertByEmail(tx, A, null), b = await h.users.upsertByEmail(tx, B, null);
+      return { a, b, s1: await h.sessions.create(tx, a.id, "h1", "laptop"), s2: await h.sessions.create(tx, a.id, "h2", null),
+        s3: await h.sessions.create(tx, a.id, "h3", "old"), other: await h.sessions.create(tx, b.id, "h4", null) };
+    });
+    const t = s1.last_used_at;
+    await h.write(async tx => { await h.sessions.touch(tx, s1.id, t + 2000); await h.sessions.touch(tx, s2.id, t + 3000); await h.sessions.touch(tx, s3.id, t + 10); });
+    const ids = async (after: number, limit = 10) => (await h.sessions.listLive(h.read, a.id, after, limit)).map(s => s.id);
+    expect(await ids(0)).toEqual([s2.id, s1.id, s3.id]);
+    expect((await h.sessions.listLive(h.read, a.id, 0, 10))[0]).toMatchObject({ user_id: a.id, token_hash: "h2", label: null, last_used_at: t + 3000 });
+    // The cutoff is exclusive: a session last used at it is idle.
+    expect(await ids(t + 10)).toEqual([s2.id, s1.id]);
+    expect(await ids(0, 1)).toEqual([s2.id]);
+    expect(await h.write(tx => h.sessions.revokeOwn(tx, b.id, s1.id))).toBe(false);
+    expect(await h.write(tx => h.sessions.revokeOwn(tx, a.id, other.id))).toBe(false);
+    expect(await h.write(tx => h.sessions.revokeOwn(tx, a.id, s1.id))).toBe(true);
+    expect(await h.write(tx => h.sessions.revokeOwn(tx, a.id, s1.id))).toBe(false);
+    expect(await h.sessions.findByTokenHash(h.read, "h1")).toBeUndefined();
+    expect(await ids(0)).toEqual([s2.id, s3.id]);
+    expect((await h.sessions.listLive(h.read, b.id, 0, 10)).map(s => s.id)).toEqual([other.id]);
   });
 
   it("sessions.revokeDev revokes only live dev-labelled sessions and counts them", async h => {
