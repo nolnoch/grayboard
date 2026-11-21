@@ -1465,15 +1465,19 @@ function repoCalls(repo: Repo): { readonly list: { method: string; tx: boolean }
   }
   return { list, restore() { for (const r of restores.reverse()) r(); } };
 }
-// The Repo reads of a hosted_sessions row (any filter), and of alias_holds: what the SQL spies these replaced matched
-// by table name. hosted.idle reads both.
-const HOSTED_READS = new Set(["hosted.get", "hosted.lock", "hosted.owned", "hosted.all", "hosted.counts", "hosted.ofOwnership", "hosted.children", "hosted.roots", "hosted.expired", "hosted.idle", "hosted.disabled"]);
-const HOLDS_READS = new Set(["bindings.holdsOf", "bindings.holdsOfMany", "bindings.holderOf", "bindings.holdersOf", "bindings.userOf", "bindings.addressSet", "bindings.aliasUses", "hosted.holds", "hosted.idle"]);
+// Allowlists, not lists of the methods that read a table: many Repo methods read alias_holds or hosted_sessions inside
+// their SQL (aliases.seen, claims, boards' delivery reads, the session end…), and a denylist misses the one it forgets.
+// B1b: the calls the notice may make outside a body's Tx. hosted.takeEnded takes no handle and reads no row.
+const NOTICE_OFF_TX = new Set(["hosted.takeEnded"]);
+// #899: the methods quiet ticks may call, on either backend: board visibility and the auth cache's refills, none of
+// which reads hosted_sessions or alias_holds (pg/boards.ts get, pg/identity.ts principals.of, pg/oauth.ts).
+const QUIET_TICK = new Set(["boards.get", "oauth.findActiveAccess", "users.active", "principals.of"]);
 
 // #807 P3 B1b: a commit's notice judges a live synchronously, so whether its root holds a name comes from the stamp
 // its authorize read with the generation, never from a holds read outside a transaction.
-// The oracle (#1497): the Repo's holds reads during the notice, each with its handle; one on a pool Read is outside
-// any transaction. The handle, not txSpy's open count: a judge in the commit's afterCommit runs while its body counts open.
+// The oracle (#1497): every Repo call during the commit and its notice, each with whether its handle was a body's Tx;
+// none but NOTICE_OFF_TX may run outside one, so no holds read (nor any other) is made on a pool Read. The handle, not
+// txSpy's open count: a judge in the commit's afterCommit runs while its body still counts open.
 test("#807 P3 B1b: a notice that keeps a bound root's generation keeps its listen, judged with no holds read", async () => {
   const client = await connect();
   expect((await client.callTool({ name: "bind", arguments: { name: "fe", create: true } })).isError).not.toBe(true);
@@ -1487,7 +1491,7 @@ test("#807 P3 B1b: a notice that keeps a bound root's generation keeps its liste
     // A commit to the root's row that leaves its generation: its notice carries the row, and the judge keeps the live.
     await seed(store.repo, async tx => { const r = await root(tx); return store.repo.hosted.update(tx, r.session_id, { last_seen_at: r.last_seen_at + 1 }); });
     expect(hosted.activeListens).toBe(1);
-    expect(calls.list.filter(c => HOLDS_READS.has(c.method) && !c.tx)).toEqual([]);
+    expect(calls.list.filter(c => !c.tx && !NOTICE_OFF_TX.has(c.method))).toEqual([]);
     expect(calls.list.some(c => c.method === "hosted.update" && c.tx)).toBe(true); // the oracle sees the commit's calls
   } finally { calls.restore(); }
   // The same path still stops it once the generation moves.
@@ -2007,7 +2011,8 @@ test("#807 P3 A7d: a legacy session a POST re-authorizes while the sweep's reads
   await raw.delete();
 });
 
-// The oracle (#1497): every Repo method the quiet ticks call; none may read a hosted row or an alias hold.
+// The oracle (#1497): every Repo method the quiet ticks call must be in QUIET_TICK, so none reads a hosted row or an
+// alias hold, and none writes.
 test("#899: a quiet tick reads no hosted row or alias hold for a stamped listen or legacy GET", async () => {
   const f = await stampedListen();
   const legacy = await connect("2025-11-25");
@@ -2018,7 +2023,8 @@ test("#899: a quiet tick reads no hosted row or alias hold for a stamped listen 
   try {
     for (let i = 0; i < 5; i++) { f.time.now += 1000; await f.tick(); }
     // Before #899: every tick read each live's row and root and, for its binding, the root's holds.
-    expect(calls.list.filter(c => HOSTED_READS.has(c.method) || HOLDS_READS.has(c.method))).toEqual([]);
+    expect(calls.list.length).toBeGreaterThan(0); // the recorder is live: the ticks' auth and board checks call through it
+    expect([...new Set(calls.list.map(c => c.method))].filter(m => !QUIET_TICK.has(m))).toEqual([]);
     expect(hosted.activeListens).toBe(1);
     expect(hosted.activeGetStreams).toBe(1);
   } finally { calls.restore(); }
