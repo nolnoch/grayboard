@@ -1482,6 +1482,9 @@ const QUIET_TICK = new Set(["boards.get", "oauth.findActiveAccess", "users.activ
 // none but NOTICE_OFF_TX may run outside one, so no holds read (nor any other) is made on a pool Read. The handle, not
 // txSpy's open count: a judge in the commit's afterCommit runs while its body still counts open.
 test("#807 P3 B1b: a notice that keeps a bound root's generation keeps its listen, judged with no holds read", async () => {
+  // Both timers held (#1497): a real-time stream or sweep tick inside the window would make pool calls of its own.
+  const { time } = await clocked(undefined, undefined, true, true);
+  token = (await issueOAuth(store.repo, oauth.resource, "alice@example.com", ["grayboard:tools"], time.now, OPENCODE_CLIENT)).token;
   const client = await connect();
   expect((await client.callTool({ name: "bind", arguments: { name: "fe", create: true } })).isError).not.toBe(true);
   expect((await client.callTool({ name: "board_create", arguments: { name: "held", purpose: "B1b" } })).isError).not.toBe(true);
