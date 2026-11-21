@@ -1,4 +1,5 @@
 import { AsyncLocalStorage } from "node:async_hooks";
+import { queueBody, queueWaiting, type QueueSite } from "../metrics.ts";
 
 // The server's one write queue (docs/future/postgres-server.md D4): every top-level write transaction runs
 // through it, so in-memory state a transaction reads changes only inside a queued transaction or its
@@ -21,9 +22,15 @@ import { AsyncLocalStorage } from "node:async_hooks";
 // hosted exchange, its auth pin, its request origin) and judges its work as that request's.
 const holder = new AsyncLocalStorage<object>();
 
+// The site a body is counted under in the queue's metrics (metrics.ts): the innermost `atSite` around the run() call,
+// else `other`. A literal from code, so the label set stays fixed. A body runs inside its enqueuer's context, so a write
+// it starts without a site of its own counts under the body's.
+const sites = new AsyncLocalStorage<QueueSite>();
+export function atSite<T>(site: QueueSite, fn: () => T): T { return sites.run(site, fn); }
+
 // `enter`: the queuing task's context, for a body that waits (AsyncLocalStorage.snapshot); an idle queue's body
-// already runs in it.
-type Waiter = { fn: () => unknown; resolve: (value: unknown) => void; reject: (error: unknown) => void; enter?: <R>(fn: () => R) => R };
+// already runs in it. `at`: performance.now() at run(), the start of its wait; `began`, at its start.
+type Waiter = { fn: () => unknown; resolve: (value: unknown) => void; reject: (error: unknown) => void; at: number; began: number; site: QueueSite; enter?: <R>(fn: () => R) => R };
 
 export class WriteQueue {
   private busy = false;
@@ -32,8 +39,8 @@ export class WriteQueue {
 
   run<T>(fn: () => T | PromiseLike<T>): Promise<T> {
     return new Promise<T>((resolve, reject) => {
-      const w = { fn, resolve, reject } as Waiter;
-      if (this.busy) { w.enter = AsyncLocalStorage.snapshot(); this.waiters.push(w); return; }
+      const w = { fn, resolve, reject, at: performance.now(), began: 0, site: sites.getStore() ?? "other" } as Waiter;
+      if (this.busy) { w.enter = AsyncLocalStorage.snapshot(); queueWaiting(this.waiters.length); this.waiters.push(w); return; }
       this.busy = true;
       if (!this.start(w)) this.release();
     });
@@ -59,8 +66,10 @@ export class WriteQueue {
   // that settles, and its settling releases it. False when it finished synchronously, returning or throwing. `then` is
   // read once and called here, inside the body's context and try: a lazy thenable's work runs as the holder, and a
   // throwing `then` getter rejects this caller rather than escaping with the queue held.
+  // Timed into the queue's metrics: a waiter's start is a clock read, an idle queue's is run()'s; the release is one more.
   private start(w: Waiter): boolean {
     const token = this.current = {};
+    w.began = w.enter ? performance.now() : w.at;
     let held: Promise<unknown> | undefined, out: unknown;
     const body = () => holder.run(token, () => {
       out = w.fn();
@@ -69,10 +78,14 @@ export class WriteQueue {
     });
     try {
       if (w.enter) w.enter(body); else body();
-    } catch (error) { w.reject(error); return false; }
-    if (!held) { w.resolve(out); return false; }
-    held.finally(() => this.release()).then(w.resolve, w.reject);
+    } catch (error) { WriteQueue.timed(w); w.reject(error); return false; }
+    if (!held) { WriteQueue.timed(w); w.resolve(out); return false; }
+    held.finally(() => { WriteQueue.timed(w); this.release(); }).then(w.resolve, w.reject);
     return true;
+  }
+
+  private static timed(w: Waiter): void {
+    queueBody(w.site, w.enter !== undefined, (w.began - w.at) / 1000, (performance.now() - w.began) / 1000);
   }
 
   // Hands the queue on. Synchronous bodies drain in this loop, so a backlog of N costs one stack frame, not N (#925);

@@ -20,6 +20,7 @@ import {
 import { participant, type MessageRow, type Repo } from "./db.ts";
 import { sweepStoredBlobs } from "./attachments.ts";
 import { afterCommitOf, isTx, type Read, type Tx } from "./store/tx.ts";
+import { atSite } from "./store/queue.ts";
 import { MissingParent } from "./store/errors.ts";
 import { HUMAN_NAME, HUMAN_RESERVED, formatTeamAddress } from "../shared/addressing.ts";
 import { describeLocation } from "../shared/identity.ts";
@@ -786,9 +787,9 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     return true;
   }
   function close(session: ApplicationSession, h: Read = repo.read) {
-    const write = (row: (tx: Tx) => Promise<void>, what: string) => {
+    const write = (row: (tx: Tx) => Promise<void>, what: string, site: "touch" | "other" = "other") => {
       if (isTx(h)) h.beforeCommit({}, row);
-      else void repo.write(row).catch(e => console.error(`[grayboard] ${what} failed:`, e));
+      else void atSite(site, () => repo.write(row)).catch(e => console.error(`[grayboard] ${what} failed:`, e));
     };
     if (!session.active) return;
     session.active = false;
@@ -809,7 +810,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     // Close runs from sync finally blocks and commit callbacks: the touch is written at `h`'s commit or queued, not
     // awaited (#807 P1b-4b, P3 B1c).
     const writer = session.writerId;
-    if (writer && touchDue(writer)) write(tx => repo.bindings.touchId(tx, writer), "last-seen touch");
+    if (writer && touchDue(writer)) write(tx => repo.bindings.touchId(tx, writer), "last-seen touch", "touch");
   }
   // The server closes the session: it leaves the hub, and its transport is
   // told why and closes. `h`: the body it runs in, whose `Tx` takes close's rows (#807 P3 A3).
