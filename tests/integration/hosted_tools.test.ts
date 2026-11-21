@@ -656,7 +656,7 @@ test("attachments on a DM: uploaded as your identity, bound by the send, pushed 
 });
 
 test("attachments: a failed blob read or write is audited; a swept blob is a 404, a fault a bare 500", async () => {
-  const { blobDir } = srv.config;
+  const blobDir = srv.config.blobDir!;
   const a = await srv.hosted(A, "be");
   const b = await srv.hosted(B, "fe");
 

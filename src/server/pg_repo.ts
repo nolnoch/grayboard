@@ -8,7 +8,8 @@
 // then the auth generation's LISTEN (gen.start). The Repo comes back only after both, so nothing reads the pool
 // before the schema is there. Close: the generation (its heartbeat, retry and LISTEN connection), then the pool.
 import type { Repo, RepoHosted } from "./db.ts";
-import { DiskBlobs } from "./blobs.ts";
+import { blobStore } from "./blobs.ts";
+import type { BlobStore } from "../core/attachments.ts";
 import type { HumanReach } from "./policy.ts";
 import { sessionEndPort } from "./session_end.ts";
 import { makeNotices } from "./store/notices.ts";
@@ -36,8 +37,10 @@ import { makePgWriteReceipts } from "./store/pg/write_receipts.ts";
 import { DEFAULT_ATTACHMENT_LIMITS, DEFAULT_ATTACHMENT_USER_QUOTA, type AttachmentLimits } from "../shared/attachments.ts";
 
 export type PgRepoOptions = {
-  // Where attachment bytes live (no database directory to derive it from).
-  blobDir: string;
+  // Where attachment bytes live (no database directory to derive it from): `blobs` when given (an S3 store, #1509),
+  // else a directory store at `blobDir`.
+  blobDir?: string;
+  blobs?: BlobStore;
   attachmentLimits?: AttachmentLimits;
   attachmentUserQuota?: number;
   // The hub's clock (db.ts OpenOptions): every group's rows read it.
@@ -133,7 +136,7 @@ export async function makePgRepo(url: string, opts: PgRepoOptions): Promise<Repo
     writeReceipts: makePgWriteReceipts(),
     // Autovacuum returns Postgres's free space; logReclaimed stays silent on nothing reclaimed.
     storage: { async reclaimFreePages() { return { reclaimed: 0, remaining: 0, incremental: true }; } },
-    blobs: new DiskBlobs(opts.blobDir),
+    blobs: blobStore(opts),
     attachmentLimits,
     attachmentUserQuota: opts.attachmentUserQuota ?? DEFAULT_ATTACHMENT_USER_QUOTA,
   };

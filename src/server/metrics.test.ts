@@ -1,7 +1,7 @@
 import { afterEach, expect, test } from "bun:test";
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { countRefusal, lagSamplerUsers, lagWindow, LATENCY_BUCKETS, observeTool, render, startLagSampler } from "./metrics.ts";
+import { countRefusal, forgetToolSeries, lagSamplerUsers, lagWindow, LATENCY_BUCKETS, observeTool, render, startLagSampler } from "./metrics.ts";
 import { DEFAULT_MCP_LIMITS, parseMetricsAddr } from "./config.ts";
 import { TestServer } from "../../tests/support/server.ts";
 import { until } from "../../tests/support/until.ts";
@@ -148,12 +148,18 @@ test("a hosted tool call lands in the latency histogram under its own name", asy
   } finally { await srv.stop(); }
 });
 
-// Last in the file: it fills the process-wide registry's series guard, so a test after it that
-// names a new tool would read `other`.
+// It fills the process-wide registry's series guard, then frees it: a later test, in this file or another file
+// bun runs in the same process, that names a new tool must read its own series, not `other` (#1515).
 test("tool series past the guard fold into other", () => {
-  for (let i = 0; i < 80; i++) observeTool(`guard_probe_${i}`, 0.001);
-  const text = render();
-  const tools = new Set([...text.matchAll(/^grayboard_tool_call_duration_seconds_count\{tool="([^"]+)"\}/gm)].map(m => m[1]));
-  expect(tools.size).toBeLessThanOrEqual(65);
-  expect(tools.has("other")).toBe(true);
+  const series = () => new Set([...render().matchAll(/^grayboard_tool_call_duration_seconds_count\{tool="([^"]+)"\}/gm)].map(m => m[1]));
+  try {
+    for (let i = 0; i < 80; i++) observeTool(`guard_probe_${i}`, 0.001);
+    const tools = series();
+    expect(tools.size).toBeLessThanOrEqual(65);
+    expect(tools.has("other")).toBe(true);
+  } finally { forgetToolSeries("guard_probe_"); }
+  try {
+    observeTool("guard_after_probe", 0.001);
+    expect(series().has("guard_after_probe")).toBe(true);
+  } finally { forgetToolSeries("guard_after_probe"); }
 });

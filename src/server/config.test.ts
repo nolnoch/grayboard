@@ -2,7 +2,7 @@ import { describe, test, expect, beforeEach, afterEach } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { checkIdpConfig, describeStore, FILE_SECRETS, loadConfig } from "./config.ts";
+import { checkIdpConfig, describeBlobs, describeStore, FILE_SECRETS, loadConfig } from "./config.ts";
 
 const KEYS = [
   "GRAYBOARD_DEV_AUTH", "GRAYBOARD_DB_PATH", "GRAYBOARD_DATABASE_URL", "GRAYBOARD_UNRELEASED_POSTGRES", "GRAYBOARD_PUBLIC_URL", "GRAYBOARD_ORG_DOMAIN",
@@ -24,6 +24,9 @@ const KEYS = [
   "GRAYBOARD_HOSTED_SESSIONS_PER_SERVICE", "GRAYBOARD_DELIVERY_LEASES_PER_SERVICE",
   ...["HOSTED_REQUEST_SERVICE", "HOSTED_SUBSCRIBER_SERVICE", "HELLO_SERVICE"].flatMap(p => [`GRAYBOARD_${p}_BURST`, `GRAYBOARD_${p}_PER_SEC`]),
   "GRAYBOARD_SERVICE_TOKEN_MAX_SECONDS", "GRAYBOARD_SERVICE_TOKEN_MINTS_PER_MINUTE", "GRAYBOARD_SERVICE_TOKENS_UNEXPIRED",
+  "GRAYBOARD_BLOB_S3_BUCKET", "GRAYBOARD_BLOB_S3_REGION", "GRAYBOARD_BLOB_S3_PREFIX", "GRAYBOARD_BLOB_S3_ENDPOINT",
+  "AWS_REGION", "AWS_ROLE_ARN", "AWS_WEB_IDENTITY_TOKEN_FILE", "AWS_ROLE_SESSION_NAME", "AWS_ENDPOINT_URL_STS",
+  "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "S3_SESSION_TOKEN",
   "GRAYBOARD_DATABASE_CONNECT_SECONDS", "GRAYBOARD_DATABASE_WRITERS", "SLACK_APP_TOKEN", "SLACK_BOT_TOKEN", ...FILE_SECRETS.map(name => `${name}_FILE`),
 ];
 
@@ -538,6 +541,113 @@ describe("loadConfig", () => {
     expect(loadConfig().blobDir).toBe("/var/lib/grayboard/blobs");
     process.env.GRAYBOARD_BLOB_DIR = "/srv/blobs";
     expect(loadConfig().blobDir).toBe("/srv/blobs");
+  });
+
+  // #1509: an S3 bucket in place of a blob directory, on either store.
+  test("GRAYBOARD_BLOB_S3_BUCKET keeps attachments in S3 instead of a directory, with its region, prefix and endpoint", () => {
+    process.env.GRAYBOARD_DEV_AUTH = "1";
+    process.env.GRAYBOARD_BLOB_S3_BUCKET = "example-bucket";
+    process.env.AWS_ACCESS_KEY_ID = "AKIAEXAMPLE";
+    process.env.AWS_SECRET_ACCESS_KEY = "example-secret";
+    expect(() => loadConfig()).toThrow("GRAYBOARD_BLOB_S3_BUCKET needs a region: set GRAYBOARD_BLOB_S3_REGION (or AWS_REGION)");
+    process.env.AWS_REGION = "us-west-2";
+    let config = loadConfig();
+    expect(config.blobDir).toBeUndefined();
+    expect(config.blobS3).toEqual({ bucket: "example-bucket", region: "us-west-2", prefix: "", credentials: { kind: "static", accessKeyId: "AKIAEXAMPLE", secretAccessKey: "example-secret" } });
+    process.env.GRAYBOARD_BLOB_S3_REGION = "eu-central-1";
+    process.env.GRAYBOARD_BLOB_S3_PREFIX = "grayboard/blobs";
+    process.env.GRAYBOARD_BLOB_S3_ENDPOINT = "http://127.0.0.1:9000";
+    process.env.AWS_SESSION_TOKEN = "example-session";
+    config = loadConfig();
+    expect(config.blobS3).toEqual({ bucket: "example-bucket", region: "eu-central-1", prefix: "grayboard/blobs/", endpoint: "http://127.0.0.1:9000", credentials: { kind: "static", accessKeyId: "AKIAEXAMPLE", secretAccessKey: "example-secret", sessionToken: "example-session" } });
+    // The startup line names where and how, never a key.
+    const line = describeBlobs(config);
+    expect(line).toBe("s3://example-bucket/grayboard/blobs/ (eu-central-1, endpoint http://127.0.0.1:9000; static keys)");
+    for (const secret of ["AKIAEXAMPLE", "example-secret", "example-session"]) expect(line).not.toContain(secret);
+    expect(describeBlobs({ blobDir: "/srv/blobs" })).toBe("directory /srv/blobs");
+    // Prefixes S3 takes as written: dots inside a segment, its other safe characters, a trailing "/".
+    for (const [ok, normalized] of [["a.b/c-d_e/", "a.b/c-d_e/"], ["x!*'()", "x!*'()/"], ["..a/b..", "..a/b../"]]) {
+      process.env.GRAYBOARD_BLOB_S3_PREFIX = ok;
+      expect(loadConfig().blobS3?.prefix).toBe(normalized);
+    }
+    process.env.GRAYBOARD_BLOB_S3_PREFIX = "grayboard/blobs";
+    // One place for attachments.
+    process.env.GRAYBOARD_BLOB_DIR = "/srv/blobs";
+    expect(() => loadConfig()).toThrow("Set one of GRAYBOARD_BLOB_S3_BUCKET, GRAYBOARD_BLOB_DIR, not both");
+    delete process.env.GRAYBOARD_BLOB_DIR;
+    for (const [name, bad, refusal] of [
+      ["GRAYBOARD_BLOB_S3_BUCKET", "Example_Bucket", "GRAYBOARD_BLOB_S3_BUCKET must be an S3 bucket name"],
+      ["GRAYBOARD_BLOB_S3_PREFIX", "/blobs", "GRAYBOARD_BLOB_S3_PREFIX must not start with \"/\""],
+      ...["../other-bucket/x", "a/../b", "a/./b", "a/..", ".", "a//b", "a b", "a\\b", "a?b", "a#b", "a%2e%2e/b", "ü/x"].map(bad =>
+        ["GRAYBOARD_BLOB_S3_PREFIX", bad, "GRAYBOARD_BLOB_S3_PREFIX must be \"/\"-separated segments"] as const),
+      ["GRAYBOARD_BLOB_S3_ENDPOINT", "https://user:pass@s3.example.com", "GRAYBOARD_BLOB_S3_ENDPOINT must not carry credentials"],
+      ["GRAYBOARD_BLOB_S3_ENDPOINT", "https://user@s3.example.com", "GRAYBOARD_BLOB_S3_ENDPOINT must not carry credentials"],
+      ["GRAYBOARD_BLOB_S3_ENDPOINT", "ftp://example.com", "GRAYBOARD_BLOB_S3_ENDPOINT must be an http(s) URL"],
+      ["GRAYBOARD_BLOB_S3_ENDPOINT", "not a url", "GRAYBOARD_BLOB_S3_ENDPOINT must be an http(s) URL"],
+      ["GRAYBOARD_BLOB_S3_REGION", "us-east-1.evil", "the S3 region must be an AWS region name"],
+    ] as const) {
+      const was = process.env[name];
+      process.env[name] = bad;
+      expect(() => loadConfig()).toThrow(refusal);
+      process.env[name] = was;
+    }
+  });
+
+  test("an empty GRAYBOARD_BLOB_S3_BUCKET is unset, but the store's other S3 variables without it are refused", () => {
+    process.env.GRAYBOARD_DEV_AUTH = "1";
+    process.env.GRAYBOARD_DB_PATH = "/var/lib/grayboard/bus.db";
+    process.env.GRAYBOARD_BLOB_S3_BUCKET = "";
+    expect(loadConfig()).toMatchObject({ blobDir: "/var/lib/grayboard/blobs" });
+    expect(loadConfig().blobS3).toBeUndefined();
+    for (const name of ["GRAYBOARD_BLOB_S3_REGION", "GRAYBOARD_BLOB_S3_PREFIX", "GRAYBOARD_BLOB_S3_ENDPOINT"]) {
+      process.env[name] = "x";
+      expect(() => loadConfig()).toThrow(`${name} is set without GRAYBOARD_BLOB_S3_BUCKET`);
+      delete process.env[name];
+    }
+  });
+
+  test("a Postgres store with an S3 bucket needs no blob directory", () => {
+    process.env.GRAYBOARD_DEV_AUTH = "1";
+    delete process.env.GRAYBOARD_DB_PATH;
+    process.env.GRAYBOARD_DATABASE_URL = "postgres://gb@db.example.com/grayboard";
+    process.env.GRAYBOARD_UNRELEASED_POSTGRES = "1";
+    expect(() => loadConfig()).toThrow("GRAYBOARD_DATABASE_URL needs GRAYBOARD_BLOB_DIR or GRAYBOARD_BLOB_S3_BUCKET");
+    process.env.GRAYBOARD_BLOB_S3_BUCKET = "example-bucket";
+    process.env.AWS_REGION = "us-east-1";
+    process.env.AWS_ACCESS_KEY_ID = "AKIAEXAMPLE";
+    process.env.AWS_SECRET_ACCESS_KEY = "example-secret";
+    const config = loadConfig();
+    expect(config.store).toEqual({ kind: "postgres", url: "postgres://gb@db.example.com/grayboard" });
+    expect(config.blobDir).toBeUndefined();
+    expect(config.blobS3?.bucket).toBe("example-bucket");
+  });
+
+  test("S3 credentials: the pod's web identity before static keys; half a pair, or none, is refused", () => {
+    process.env.GRAYBOARD_DEV_AUTH = "1";
+    process.env.GRAYBOARD_BLOB_S3_BUCKET = "example-bucket";
+    process.env.GRAYBOARD_BLOB_S3_REGION = "us-east-1";
+    expect(() => loadConfig()).toThrow("GRAYBOARD_BLOB_S3_BUCKET needs AWS credentials: AWS_WEB_IDENTITY_TOKEN_FILE and AWS_ROLE_ARN");
+    process.env.AWS_ACCESS_KEY_ID = "AKIAEXAMPLE";
+    expect(() => loadConfig()).toThrow("set both AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY");
+    process.env.AWS_SECRET_ACCESS_KEY = "example-secret";
+    expect(loadConfig().blobS3?.credentials.kind).toBe("static");
+    process.env.AWS_ROLE_ARN = "arn:aws:iam::123456789012:role/grayboard";
+    expect(() => loadConfig()).toThrow("set both AWS_WEB_IDENTITY_TOKEN_FILE and AWS_ROLE_ARN");
+    process.env.AWS_WEB_IDENTITY_TOKEN_FILE = "/var/run/secrets/eks.amazonaws.com/serviceaccount/token";
+    // STS in the pod's region (EKS injects AWS_REGION), else the bucket's; a fresh session name per process.
+    let creds = loadConfig().blobS3!.credentials;
+    expect(creds).toMatchObject({ kind: "web-identity", roleArn: "arn:aws:iam::123456789012:role/grayboard", tokenFile: "/var/run/secrets/eks.amazonaws.com/serviceaccount/token", stsEndpoint: "https://sts.us-east-1.amazonaws.com/" });
+    expect(creds.kind === "web-identity" && creds.sessionName).toMatch(/^grayboard-[0-9a-f]{12}$/);
+    process.env.AWS_REGION = "us-west-2";
+    process.env.AWS_ROLE_SESSION_NAME = "gb-pod-1";
+    creds = loadConfig().blobS3!.credentials;
+    expect(creds).toMatchObject({ stsEndpoint: "https://sts.us-west-2.amazonaws.com/", sessionName: "gb-pod-1" });
+    process.env.AWS_ENDPOINT_URL_STS = "http://127.0.0.1:4566/";
+    expect(loadConfig().blobS3!.credentials).toMatchObject({ stsEndpoint: "http://127.0.0.1:4566/" });
+    expect(describeBlobs(loadConfig())).toBe("s3://example-bucket/ (us-east-1; web identity, role arn:aws:iam::123456789012:role/grayboard)");
+    // Bun's client would sign with S3_SESSION_TOKEN where it's handed no token, read as the process started.
+    process.env.S3_SESSION_TOKEN = "stray";
+    expect(() => loadConfig()).toThrow("S3_SESSION_TOKEN is set");
   });
 
   test("attachment limits default to local mode's; set, they must be byte counts with the file cap within the total", () => {

@@ -6,21 +6,30 @@
 // (emit window n: everything since the last report, so driver and coordinator windows cover the
 // same span), "churn <f>", "quiesce" (stop sending, keep draining), "close" (release every
 // session, report, exit).
+// Service traffic (#1258, #270 R5): a few sessions are a service's workers on its run token, the lanes of its queue
+// board; every user session holds service_invoke through a team. A user's op is sometimes an invocation (a post on
+// that board: service.invoke, then queueLanes to pick its lane) or a peer_list (alias.see_service per service scope);
+// the lane answers each with a reply under the post, which wakes the invoker (principalCanSee on its delivery).
 // Reports are JSON lines on stdout. Bun runs this on one thread, like a C program with one event
 // loop: the driver's own loop lag is reported so a saturated driver's window is discarded, not
 // blamed on the server.
 import { monitorEventLoopDelay } from "node:perf_hooks";
 import { HostedSession, HostedToolError } from "../tests/support/hosted_session.ts";
 
-export type DriverSession = { index: number; email: string; token: string; name: string; address: string; board: string };
+// service: one of the service's workers (its run token, its queue board as `board`), which sends no scheduled traffic.
+export type DriverSession = { index: number; email: string; token: string; name: string; address: string; board: string; service?: true };
 export type DriverConfig = {
   driver: number;
   url: string;
   sessions: DriverSession[];
-  // Every session's DM address, by index: the DM targets.
+  // Every user session's DM address, by index (the service's workers come after them): the DM targets.
   addresses: string[];
   periodMs: number;
   postShare: number;
+  // The service's queue board, and the shares of a user's ops that invoke it and that list peers; null: no service.
+  svcBoard: string | null;
+  svcShare: number;
+  peerShare: number;
   burst: number;
 };
 // Client-side latency buckets, seconds: the server's (src/server/metrics.ts LATENCY_BUCKETS).
@@ -30,12 +39,20 @@ export type DriverWindow = {
   type: "window"; driver: number; seq: number; at: number; live: number; inflight: number; inflightMax: number;
   lagP99: number; ops: Record<string, Hist>; errors: Record<string, number>; firstErrors: string[];
 };
-// misdelivered: a DM read by a session it wasn't sent to, or a post by one off its board.
-export type DriverFinal = { type: "final"; driver: number; sentDm: string[]; recvDm: string[]; posts: number; boardRecv: number; misdelivered: number; misdeliveredFirst: string[]; errors: Record<string, number> };
+// misdelivered: a DM read by a session it wasn't sent to, a post by one off its board, an invocation by a session
+// that isn't a lane of the service's board, or a reply by a user who didn't invoke. Invocation ids ("invoker:seq"):
+// svcSent, those whose post returned; svcGot, those a lane read; svcDone, those whose reply its invoker read.
+// svcPosts: the invocations' post ids, which the coordinator matches to the server's authz.decision rows.
+// laneEcho: replies a lane read (it subscribes the board it answers on).
+export type DriverFinal = {
+  type: "final"; driver: number; sentDm: string[]; recvDm: string[]; posts: number; boardRecv: number; misdelivered: number; misdeliveredFirst: string[];
+  svcSent: string[]; svcGot: string[]; svcDone: string[]; svcPosts: number[]; laneEcho: number; errors: Record<string, number>;
+};
 
 const RENEW_MS = 10_000;
-// Body marker: lt|<kind>|<sender index>|<seq>|<to: the target index, or the board>|<sent at ms>.
-const MARK = /lt\|(dm|post)\|(\d+)\|(\d+)\|([\w-]+)\|(\d+)/g;
+// Body marker: lt|<kind>|<sender index>|<seq>|<to: the target index, or the board>|<sent at ms>. An invocation (svc)
+// goes to the service's board; its reply (done) carries the invocation's sender, seq and sent-at, to the invoker.
+const MARK = /lt\|(dm|post|svc|done)\|(\d+)\|(\d+)\|([\w-]+)\|(\d+)/g;
 
 const newHist = (): Hist => ({ buckets: BUCKETS.map(() => 0), count: 0, sum: 0, errors: 0 });
 let ops: Record<string, Hist> = {};
@@ -93,16 +110,27 @@ type Live = {
 
 const sentDm = new Set<string>();
 const recvDm = new Set<string>();
-let posts = 0, boardRecv = 0, misdelivered = 0;
+const svcSent = new Set<string>(), svcGot = new Set<string>(), svcDone = new Set<string>();
+const svcPosts: number[] = [];
+let posts = 0, boardRecv = 0, misdelivered = 0, laneEcho = 0;
 const misdeliveredFirst: string[] = [];
 let sending = true;
+
+let svcBoard: string | null = null;
 
 function itemsOf(read: unknown): { id: string; event: unknown }[] {
   if (!read || typeof read !== "object" || !("items" in read) || !Array.isArray(read.items)) throw new Error(`the inbox read answered ${JSON.stringify(read)?.slice(0, 200)}`);
   return read.items;
 }
 
-// One inbox pass, as the controller makes it: read, then per item a renew and its receipt.
+// The pushed post's id in a board delivery ({ kind: "board", item: { kind: "push", post } }).
+function postIdOf(event: unknown): number | undefined {
+  const e = event as { kind?: string; item?: { kind?: string; post?: { id?: unknown } } } | null;
+  return e?.kind === "board" && e.item?.kind === "push" && typeof e.item.post?.id === "number" ? e.item.post.id : undefined;
+}
+
+// One inbox pass, as the controller makes it: read, then per item a renew and its receipt. A lane answers an
+// invocation before its receipt, as a worker finishes the job before it acks the delivery.
 async function drain(l: Live) {
   const read = await timed("inbox", () => l.s.subscriber.read("grayboard://inbox"));
   // A failed read leaves the items on the server: try again shortly rather than at the next renewal.
@@ -112,7 +140,8 @@ async function drain(l: Live) {
   for (const item of items) {
     const text = JSON.stringify(item.event);
     for (const m of text.matchAll(MARK)) {
-      const meant = m[1] === "dm" ? m[4] === String(l.spec.index) : m[4] === l.spec.board;
+      if (m[1] === "done" && l.spec.service) { laneEcho++; continue; }
+      const meant = m[1] === "dm" || m[1] === "done" ? m[4] === String(l.spec.index) : m[1] === "svc" ? l.spec.service === true && m[4] === l.spec.board : m[4] === l.spec.board;
       if (!meant) {
         misdelivered++;
         if (misdeliveredFirst.length < 5) misdeliveredFirst.push(`${m[0]} read by session ${l.spec.index} (${l.spec.board})`);
@@ -121,6 +150,16 @@ async function drain(l: Live) {
       if (m[1] === "dm") {
         recvDm.add(`${m[2]}:${m[3]}`);
         observe("dm_e2e", (Date.now() - Number(m[5])) / 1000, false);
+      } else if (m[1] === "svc") {
+        svcGot.add(`${m[2]}:${m[3]}`);
+        observe("svc_e2e", (Date.now() - Number(m[5])) / 1000, false);
+        const parent = postIdOf(item.event);
+        if (parent === undefined) { noteError("svc_reply", new Error(`an invocation's delivery has no post id: ${text.slice(0, 200)}`)); continue; }
+        await timed("svc_reply", () => l.s.call("board_post", { board: l.spec.board, body: `lt|done|${m[2]}|${m[3]}|${m[2]}|${m[5]}`, parent_id: parent }));
+      } else if (m[1] === "done") {
+        svcDone.add(`${m[2]}:${m[3]}`);
+        // From the invocation's send to its reply's read: the round trip through the service.
+        observe("svc_rtt", (Date.now() - Number(m[5])) / 1000, false);
       } else {
         boardRecv++;
         observe("post_e2e", (Date.now() - Number(m[5])) / 1000, false);
@@ -163,8 +202,8 @@ async function openOnce(spec: DriverSession, url: string): Promise<Live> {
   const s = new HostedSession(url, spec.token, spec.name, { receipt: "manual" });
   const l: Live = { spec, s, dirty: true, stop: false, nextSend: 0, seq: 0 };
   try { await s.connect(); } catch (e) { await s.drop(); throw e; }
-  // board_create subscribes its creator; whoever loses the race subscribes.
-  try { await s.call("board_create", { name: spec.board, purpose: "load test" }); }
+  // board_create subscribes its creator; whoever loses the race subscribes. A worker's board is the service's queue.
+  try { await s.call("board_create", { name: spec.board, purpose: "load test", ...(spec.service ? { kind: "queue" } : {}) }); }
   catch (e) {
     if (!(e instanceof HostedToolError)) throw e;
     await s.call("board_subscribe", { board: spec.board, mode: "push" });
@@ -203,6 +242,7 @@ async function main() {
   const first = await lines.next();
   if (first.done) throw new Error("no config on stdin");
   const config: DriverConfig = JSON.parse(first.value);
+  svcBoard = config.svcBoard;
   const emit = (o: unknown) => process.stdout.write(JSON.stringify(o) + "\n");
 
   const lag = monitorEventLoopDelay({ resolution: 10 });
@@ -229,13 +269,23 @@ async function main() {
     if (!sending) return;
     const now = Date.now();
     for (const l of live.values()) {
-      if (l.stop || now < l.nextSend) continue;
+      if (l.stop || l.spec.service || now < l.nextSend) continue;
       l.nextSend += config.periodMs * (0.5 + Math.random());
       if (l.nextSend < now) l.nextSend = now + config.periodMs * Math.random();
-      const seq = ++l.seq;
-      if (Math.random() < config.postShare) {
+      const seq = ++l.seq, r = Math.random();
+      if (r < config.postShare) {
         posts++;
         void timed("board_post", () => l.s.call("board_post", { board: l.spec.board, body: `lt|post|${l.spec.index}|${seq}|${l.spec.board}|${Date.now()}` }));
+      } else if (svcBoard && r < config.postShare + config.svcShare) {
+        const id = `${l.spec.index}:${seq}`, board = svcBoard;
+        void timed("svc_invoke", async () => {
+          const res = await l.s.call<{ post_id: number }>("board_post", { board, body: `lt|svc|${l.spec.index}|${seq}|${board}|${Date.now()}` });
+          svcSent.add(id);
+          svcPosts.push(res.post_id);
+          return res;
+        });
+      } else if (svcBoard && r < config.postShare + config.svcShare + config.peerShare) {
+        void timed("peer_list", () => l.s.call("peer_list", {}));
       } else {
         let to = Math.floor(Math.random() * (config.addresses.length - 1));
         if (to >= l.spec.index) to++;
@@ -280,7 +330,10 @@ async function main() {
       await churning;
       await Promise.all([...live.values()].map(l => timed("close", () => close(l))));
       live.clear();
-      const f: DriverFinal = { type: "final", driver: config.driver, sentDm: [...sentDm], recvDm: [...recvDm], posts, boardRecv, misdelivered, misdeliveredFirst, errors: totalErrors };
+      const f: DriverFinal = {
+        type: "final", driver: config.driver, sentDm: [...sentDm], recvDm: [...recvDm], posts, boardRecv, misdelivered, misdeliveredFirst,
+        svcSent: [...svcSent], svcGot: [...svcGot], svcDone: [...svcDone], svcPosts, laneEcho, errors: totalErrors,
+      };
       // The final line holds every DM id: tens of KB a pipe takes in several writes. process.exit
       // drops a write still queued, so exit only once this one has reached the pipe.
       await new Promise<void>((done, fail) => process.stdout.write(JSON.stringify(f) + "\n", e => e ? fail(e) : done()));

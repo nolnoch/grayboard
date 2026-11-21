@@ -1,6 +1,6 @@
 import "./zod_config.ts";
 import pkg from "../../package.json" with { type: "json" };
-import { describeStore, loadConfig } from "./config.ts";
+import { describeBlobs, describeStore, loadConfig } from "./config.ts";
 import { startServer } from "./app.ts";
 import { openRepo } from "./open_repo.ts";
 import { BUILTIN_CLIENT_IDS } from "./oauth-config.ts";
@@ -49,6 +49,7 @@ try {
 }
 console.log(`grayboard server ${pkg.version} listening on port ${server.port}`);
 console.log(`grayboard server: store ${describeStore(config.store, { writers: config.databaseWriters })}`);
+console.log(`grayboard server: attachments ${describeBlobs(config)}`);
 // An unauthenticated listener: say where it bound, every start.
 console.log(`grayboard server: metrics ${metrics ? `on ${metrics.hostname}:${metrics.port}` : "off"}`);
 // Write-capable hosted clients are a trust decision (#414, #429); say which at every start.
