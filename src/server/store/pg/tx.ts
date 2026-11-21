@@ -226,6 +226,14 @@ class PgTx extends BaseTx {
     return { frame, tx: new PgTx(this.store, this.txn, root) };
   }
 
+  // A keyed body's beforeCommit hooks refuse as its effects do (D4, #1510 chunk 3 audit L6): a hook runs other code at
+  // the commit, in this body's context, while other keyed bodies run, and one registered in a readsOnly probe would
+  // run after the probe ends, unchecked. In a probe the refusal is its ProbeWrite (refuseKeyed).
+  override beforeCommit(key: object, hook: (tx: Tx) => Promise<void>): void {
+    if (!this.txn.effects) refuseKeyed(this as unknown as Read, "a beforeCommit hook");
+    super.beforeCommit(key, hook);
+  }
+
   // A keyed body's effects refuse unless its caller opted in (D4): an effect runs other code at the commit, in this
   // body's context, while other keyed bodies run.
   protected deferEffect(effect: Effect): void {

@@ -746,6 +746,21 @@ describePg("keyed write bodies (Postgres store guard)", () => {
     expect(await rows(x.s.read)).toEqual(["kept"]);
   });
 
+  // #1510 chunk 3 audit L6: a beforeCommit hook runs at the commit, in the body's context, as an effect does; one
+  // registered in a probe would run after it ends. Mutation: PgTx.beforeCommit without its refuseKeyed (the keyed body
+  // commits and its hook writes; the probe resolves).
+  test("a keyed body's beforeCommit hook refuses, naming the keys, and in a probe is its ProbeWrite; opted in, it runs", async () => {
+    await using x = await scratch();
+    const e = await rejection(x.s.writeKeyed(["root:a"], async tx => { await put(tx, "gone"); tx.beforeCommit({}, root => put(root, "hook")); }));
+    expect(e.message).toBe("a beforeCommit hook refused in a keyed write body (keys root:a): it runs in an exclusive body (write) (docs/future/postgres-server.md D4)");
+    const probed = await x.s.writeKeyed(["root:b"], tx => rejection(x.s.readsOnly(tx, async () => { tx.beforeCommit({}, root => put(root, "probed hook")); })));
+    expect(probed).toBeInstanceOf(ProbeWrite);
+    expect(probed.message).toBe("a beforeCommit hook refused in a read-only probe (keys root:b): the probed code would write (docs/future/postgres-server.md D4)");
+    await x.s.writeKeyed(["root:a"], async tx => { tx.beforeCommit({}, root => put(root, "kept")); }, undefined, { effects: true });
+    await x.s.write(async tx => { tx.beforeCommit({}, root => put(root, "exclusive")); });
+    expect(await rows(x.s.read)).toEqual(["kept", "exclusive"]);
+  });
+
   // Mutations: drop run's committed refusal (the keyed body commits and `committed` runs); drop post's (postKeyed
   // queues the body).
   test("a keyed body's committed callback refuses before the body runs, for writeKeyed and postKeyed; opted in, it runs", async () => {

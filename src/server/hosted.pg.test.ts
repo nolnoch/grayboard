@@ -741,6 +741,23 @@ describePg("hosted gate keyed fast path (Postgres)", () => {
     expect((await db.sql`SELECT disabled_at FROM users WHERE id = ${p.authed.user_id}`)[0].disabled_at).toBeNull();
   });
 
+  // The Repo's writeKeyed passes no options through (audit L7): `{ effects: true }` exists only on PgTransactions, so a
+  // caller that slips it past the types still has its effect refused. Mutation: the Repo's writeKeyed as t.writeKeyed.
+  test("the Repo's writeKeyed drops an effects opt-in a caller passes past its types", async () => {
+    await using db = await pgDatabase({ max: 2 });
+    const blobDir = mkdtempSync(join(tmpdir(), "gb-pg-blobs-"));
+    const repo = await makePgRepo(db.url, { blobDir, applicationName: "gb-test-l7", max: 2 });
+    try {
+      let ran = 0;
+      type Loose = (keys: string[], fn: (tx: Tx) => Promise<void>, committed: undefined, opts: { effects: true }) => Promise<void>;
+      for (const loose of [repo.writeKeyed as unknown as Loose, repo.hosted.writeKeyed as unknown as Loose]) {
+        await expect(atSite("other", () => loose(["k"], async tx => { tx.afterCommit(() => { ran++; }); }, undefined, { effects: true })))
+          .rejects.toThrow("afterCommit effect refused in a keyed write body (keys k)");
+      }
+      expect(ran).toBe(0);
+    } finally { await repo.close(); rmSync(blobDir, { recursive: true, force: true }); }
+  });
+
   test("miss-then-exclusive writes the same rows as the exclusive body alone", async () => {
     const script = async (x: GateInstance, sql: Awaited<ReturnType<typeof pgDatabase>>["sql"]) => {
       const user = await seed(x.repo, tx => x.repo.users.upsertByEmail(tx, ME, null));
