@@ -656,7 +656,7 @@ test("#1506: a change's live check runs as the background pass 'resource watch c
   release();
   await checks()[1]!.done;
   expect(h.counts.changed).toBe(1);
-  // Held across close(): no hint after close.
+  // Held across close(): no hint after close. close() finishes the watch, so this pins the behaviour, not the `!stopped` guard.
   stopping = false;
   held = gate();
   await call(a, "board_post", { board: "e2e", body: "third" });

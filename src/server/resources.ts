@@ -95,9 +95,9 @@ export function createResources(application: Application, options: ResourceOptio
   async function requireSession(session: ApplicationSession, allowUnbound = false, r?: Read) {
     if (!await authorized(session, allowUnbound, r)) refuse(session);
   }
-  // Runs from a board change (the watch's `changed`, as the background pass "resource watch check") and from the revalidate
-  // pass, so a server's stop() waits for its reads before it closes the store (#1504, #1506). A watch finished while the
-  // check awaited stays finished, and gets no notification (#807 P3 A7d2c).
+  // Runs from a board change (the watch's `changed`, as the background pass "resource watch check"), so a server's stop()
+  // waits for its reads before it closes the store (#1504, #1506). revalidate() runs it too, untracked: only tests call
+  // that. A watch finished while the check awaited stays finished, and gets no notification (#807 P3 A7d2c).
   async function live(watch: Watch): Promise<boolean> {
     if (!watches.has(watch.id)) return false;
     // Background faults close the watch without failing a committed mutation.
