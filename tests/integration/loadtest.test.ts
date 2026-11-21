@@ -162,7 +162,8 @@ describe("loadtest write-queue report (#1510)", () => {
   });
 
   // #1537 PR 0. Mutations: the gate line summing replaced by a set (gate.keyed reads one method's); statements per body
-  // over the window's bodies dropped for the cumulative (reads 9, not 10).
+  // over the window's bodies dropped for the cumulative (reads 9, not 10); the tool site left out of gateMethod (#1573: no
+  // tool.<method> entries).
   test("statements and round trips per body per site, and the gate's bodies by method, come from the window's deltas", () => {
     const expo2 = (holdCount: number, st: [number, number], rt: number, sel: number, renew: number) => [
       `grayboard_write_queue_hold_seconds_bucket{site="gate",le="+Inf"} ${holdCount}`, `grayboard_write_queue_hold_seconds_sum{site="gate"} 0.1`, `grayboard_write_queue_hold_seconds_count{site="gate"} ${holdCount}`,
@@ -172,6 +173,9 @@ describe("loadtest write-queue report (#1510)", () => {
       `grayboard_hosted_gate_bodies_total{site="gate",method="renew",outcome="keyed"} ${renew}`,
       `grayboard_hosted_gate_bodies_total{site="gate",method="pending",outcome="miss"} 0`,
       `grayboard_hosted_gate_bodies_total{site="prior",method="receipt",outcome="keyed"} ${renew}`,
+      `grayboard_hosted_gate_bodies_total{site="tool",method="dm_send",outcome="keyed"} ${renew}`,
+      `grayboard_hosted_gate_bodies_total{site="tool",method="board_post",outcome="keyed"} ${sel}`,
+      `grayboard_hosted_gate_bodies_total{site="tool",method="board_post",outcome="miss"} ${sel - 3}`,
     ].join("\n");
     const a = queueCumulative(parseMetrics(expo2(10, [90, 10], 80, 4, 2)));
     const b = queueCumulative(parseMetrics(expo2(30, [290, 30], 260, 14, 12)));
@@ -180,8 +184,13 @@ describe("loadtest write-queue report (#1510)", () => {
     expect(q.sites.gate!.statements).toBe(10);
     expect(q.sites.gate!.roundTrips).toBe(9);
     expect(q.gate.gate).toMatchObject({ keyed: 20, miss: 0 });
-    // The prior site's by method as `prior.<method>` (#1537 C5/C7).
-    expect(q.gateMethods).toEqual({ selection: { keyed: 10, miss: 0, skipped: 0 }, renew: { keyed: 10, miss: 0, skipped: 0 }, "prior.receipt": { keyed: 10, miss: 0, skipped: 0 } });
+    // The prior site's by method as `prior.<method>` (#1537 C5/C7), the tool site's as `tool.<method>` (#1573); its
+    // `tool` line sums them.
+    expect(q.gateMethods).toEqual({
+      selection: { keyed: 10, miss: 0, skipped: 0 }, renew: { keyed: 10, miss: 0, skipped: 0 }, "prior.receipt": { keyed: 10, miss: 0, skipped: 0 },
+      "tool.dm_send": { keyed: 10, miss: 0, skipped: 0 }, "tool.board_post": { keyed: 10, miss: 10, skipped: 0 },
+    });
+    expect(q.gate.tool).toMatchObject({ keyed: 20, miss: 10 });
     // A site with no statement series (SQLite) reads null.
     expect(queueStats(queueCumulative(parseMetrics(expo([10, 10, 10, 10], 0.005, [3, 3, 3, 3]))), 1).sites.gate!.statements).toBeNull();
   });
