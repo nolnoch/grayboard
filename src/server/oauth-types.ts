@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import type { Read, Tx } from "./store/tx.ts";
 
 // All times are epoch milliseconds; capability inputs are SHA-256 hex digests, never secrets.
@@ -14,6 +15,14 @@ export type OAuthRequest = OAuthAuthorization & {
 };
 export type OAuthBrowserSession = { sessionHash: string; userId: number; createdAt: number; expiresAt: number };
 export type OAuthCode = OAuthAuthorization & { codeHash: string; userId: number; createdAt: number; expiresAt: number };
+// A new grant's id: 32 random bytes as base64url (43 characters), redrawn while it starts with '-', which a command
+// line reads as an option (#1583). Ids already issued keep that shape and may start with '-'; the CLI accepts them.
+export function newGrantId(draw: () => Buffer = () => randomBytes(32)): string {
+  for (;;) {
+    const id = draw().toString("base64url");
+    if (id[0] !== "-") return id;
+  }
+}
 export type OAuthGrant = OAuthBinding & {
   id: string; userId: number; createdAt: number; expiresAt: number; revokedAt: number | null;
 };

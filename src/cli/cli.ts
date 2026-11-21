@@ -20,6 +20,7 @@ import { canonicalEndpoint } from "../shared/endpoint.ts";
 import { ompAgentDir, ompSetupRefusal, piSetupAgentDir } from "../shared/pi.ts";
 import { Login } from "../../adapters/hosted-core/src/login.ts";
 import { hostedConfigPath, type HostedConfig } from "../../adapters/hosted-core/src/config.ts";
+import { protectGrantIds } from "./argv.ts";
 
 function writeCredentials(creds: Credentials): void {
   const file = credentialsPath();
@@ -1323,4 +1324,4 @@ credentialCmd
     } catch (e) { handleApiError(e); }
   });
 
-program.parseAsync(process.argv);
+program.parseAsync(protectGrantIds(process.argv));

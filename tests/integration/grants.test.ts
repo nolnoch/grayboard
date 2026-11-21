@@ -22,7 +22,7 @@ beforeEach(async () => {
 afterEach(() => srv.stop());
 
 const api = (token: string, method: string, path: string, body?: unknown) => srv.api(token, method, path, body);
-const issue = (email: string, clientId: string) => issueOAuth(srv.app.repo, srv.app.oauth.resource, email, ["grayboard:tools"], Date.now(), clientId);
+const issue = (email: string, clientId: string, grantId?: string) => issueOAuth(srv.app.repo, srv.app.oauth.resource, email, ["grayboard:tools"], Date.now(), clientId, grantId);
 const audits = async (action: string) => {
   await drained(srv);
   return (await rows<{ actor: string; target: string | null; detail: string }>(srv, `SELECT actor, target, detail FROM access_log WHERE action = ? ORDER BY id`, action))
@@ -140,6 +140,42 @@ test("the CLI lists and revokes, its own and (--user) another user's", async () 
     const refused = await cli(ROOT, "grants", "revoke", "nope", "--user", A);
     expect(refused.code).toBe(1);
     expect(refused.err).toContain("no live grant nope");
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+// #1583: a grant issued before ids stopped starting with '-' revokes from the CLI as listed, bare or after `--`, its
+// own and (--user) another user's; -h and -V prefixes would otherwise print help or the version and exit 0. A
+// genuinely unknown flag is still refused.
+test("the CLI revokes a grant whose id starts with '-', and still refuses an unknown flag", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "gb-grants-dash-"));
+  try {
+    const creds = async (email: string) => {
+      const path = join(dir, `${email}.credentials`);
+      writeFileSync(path, JSON.stringify({ session_token: await login(email), server: srv.base, user_email: email }), { mode: 0o600 });
+      return path;
+    };
+    const as: Record<string, string> = { [A]: await creds(A), [ROOT]: await creds(ROOT) };
+    const cli = (email: string, ...args: string[]) => runCli(args, { cwd: dir, env: cleanEnv({ GRAYBOARD_CREDENTIALS: as[email]! }) });
+    const root = await login(ROOT);
+    const dashId = (prefix: string) => (prefix + "x".repeat(43)).slice(0, 43);
+    const live = async () => ((await api(root, "GET", `/api/admin/grants?email=${encodeURIComponent(A)}`)).body.grants as { id: string }[]).map(g => g.id);
+    // [id, global options, arguments before the id, arguments after it]
+    const cases: [string, string[], string[], string[]][] = [
+      [dashId("-nPDrs"), [], [], []], [dashId("-h"), [], [], []], [dashId("-V"), ["--json"], [], []], [dashId("--"), [], [], []],
+      [dashId("-k"), [], ["--"], []], [dashId("-u"), [], ["--user", A, "--"], []], [dashId("-q"), [], [], ["--user", A]],
+    ];
+    for (const [id, global, before, after] of cases) {
+      await issue(A, "grayboard-pi", id);
+      expect(await live()).toContain(id);
+      const r = await cli([...before, ...after].includes("--user") ? ROOT : A, ...global, "grants", "revoke", ...before, id, ...after);
+      expect(r.code, `${id}: ${r.out} ${r.err}`).toBe(0);
+      if (global.includes("--json")) expect(JSON.parse(r.out)).toEqual({ ok: true, id });
+      expect(await live()).not.toContain(id);
+    }
+
+    const unknown = await cli(A, "grants", "revoke", "--bogus");
+    expect(unknown.code).toBe(1);
+    expect(unknown.err).toContain("unknown option '--bogus'");
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
