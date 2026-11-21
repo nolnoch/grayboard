@@ -19,7 +19,7 @@ import type { HostedEnd, HostedLost, HostedSession, LostReader } from "./hosted-
 import { writeAudit, type AuditAction } from "./audit.ts";
 import { hostedFailure } from "./hosted-diagnostics.ts";
 import { decidePure, recordDecision, type PureRequest } from "./policy.ts";
-import { countGate, countRefusal } from "./metrics.ts";
+import { countGate, countRefusal, type GateMethod } from "./metrics.ts";
 import { isTx, ProbeWrite, type Read, type Tx } from "./store/tx.ts";
 import { abandonable, atSite } from "./store/queue.ts";
 
@@ -727,8 +727,9 @@ export function createHostedSessions(application: Application, options: { now?: 
   // skipped, rejecting RequestAbortedError, if the signal fires while the body waits in the write queue (store/queue.ts
   // abandonable); undefined (an ending call, a caller with no request) always runs. Nothing the gate body writes is
   // owed to anyone but this request: settle's ends and parks are the sweep's, which the timer and the next request
-  // apply anyway, and its refusal rows exist only once it runs.
-  async function withGate<T>(p: OAuthPrincipal, context: SessionContext, writer: boolean, fn: (row: HostedSession | undefined) => Promise<T>, wake = true, declare = true, endTouch = true, create = true, signal?: AbortSignal): Promise<T> {
+  // apply anyway, and its refusal rows exist only once it runs. `method`: the call this gate serves, for the gate
+  // counter's label (metrics.ts countGate, #1537 PR 0).
+  async function withGate<T>(p: OAuthPrincipal, context: SessionContext, writer: boolean, fn: (row: HostedSession | undefined) => Promise<T>, wake = true, declare = true, endTouch = true, create = true, signal?: AbortSignal, method: GateMethod = "tool"): Promise<T> {
     await authorized(p);
     if (!("id" in context)) return fn(undefined);
     const retry = Symbol("root changed");
@@ -755,7 +756,7 @@ export function createHostedSessions(application: Application, options: { now?: 
         // The keyed fast path first, where it can run (keyedBody); a miss wrote nothing and runs the exclusive body
         // below, which checks authorization in its transaction again.
         const keyed = keyedFast && before !== undefined && before.parked_at === null ? await keyedBody(p, context, id, create, wake, declare, signal) : undefined;
-        countGate("gate", keyed === undefined ? "skipped" : keyed === MISS ? "miss" : "keyed");
+        countGate("gate", keyed === undefined ? "skipped" : keyed === MISS ? "miss" : "keyed", method);
         if (keyed === MISS) waited = true;
         // One queued body: settle commits whether or not rowFor refuses (rowFor's savepoint rolls back alone, and its
         // refusal rows are written after it, in the same commit), and nothing runs between them, so `settled` is
@@ -956,7 +957,7 @@ export function createHostedSessions(application: Application, options: { now?: 
       return withGate(p, context, false, async row => {
         const root = row ? await rootOf(repo.read, row) : undefined;
         return { ...await snapshot(p, row, undefined, root), verdict: row && root ? { row, root } as Verdict : undefined };
-      }, false, true, endTouch, create, signal);
+      }, false, true, endTouch, create, signal, "selection");
     },
     // `told` (a native tool call): gets the alias_lost notice, if any, for the result. `prior`: its exchange's
     // verdict (#907). `signal`: the request's (withGate): the gate, the prior and the tool body are each skipped if it
@@ -1009,11 +1010,12 @@ export function createHostedSessions(application: Application, options: { now?: 
           await late.flushQueued();
           throw error;
         } finally { application.close(selected.session); }
-      });
+      }, true, true, true, true, undefined, "transfer");
     },
     // `defer`: for a session `fn` opens, its `afterRollback`. `tx`: the body's. `signal`: the request's (withGate), for
-    // bind and unbind: the gate and the body are each skipped, with `committed`, if it fires while they wait.
-    async owning<T, R = T>(p: OAuthPrincipal, context: SessionContext, fn: (row: HostedSession, defer: (write: RefusalRow) => void, tx: Tx) => T | Promise<T>, committed?: (value: T) => R | Promise<R>, signal?: AbortSignal): Promise<R> {
+    // bind and unbind: the gate and the body are each skipped, with `committed`, if it fires while they wait. `method`:
+    // the call, for the gate counter (withGate).
+    async owning<T, R = T>(p: OAuthPrincipal, context: SessionContext, fn: (row: HostedSession, defer: (write: RefusalRow) => void, tx: Tx) => T | Promise<T>, committed?: (value: T) => R | Promise<R>, signal?: AbortSignal, method: GateMethod = "owning"): Promise<R> {
       return withGate(p, context, true, async row => {
         if (!row) throw new ApplicationError("unbound", `this request carries no session context (${("missing" in context ? context.missing : "missing")}), so it can only read.`);
         rootOnly(row);
@@ -1025,16 +1027,17 @@ export function createHostedSessions(application: Application, options: { now?: 
         try {
           return await abandonable(signal, () => store.write(async tx => { await grantLive(tx, p); return fn(await attach(tx, p, row), late.defer, tx); }, (result: T) => { done = true; return committed ? committed(result) : result as unknown as R; }));
         } catch (error) { if (!done) await late.flushQueued(); throw error; }
-      }, true, true, true, true, signal);
+      }, true, true, true, true, signal, method);
     },
     // `absent`: an ending call's answer for an ID the server doesn't hold, which it then doesn't admit (#1097).
-    async control<T>(p: OAuthPrincipal, context: SessionContext, writer: boolean, fn: (row: HostedSession) => Promise<T> | T, absent?: () => T): Promise<T> {
+    // `method`: the call, for the gate counter (withGate).
+    async control<T>(p: OAuthPrincipal, context: SessionContext, writer: boolean, fn: (row: HostedSession) => Promise<T> | T, absent?: () => T, method: GateMethod = "control"): Promise<T> {
       return withGate(p, context, writer, async row => {
         if (!row && absent) return absent();
         if (!row) throw new ApplicationError("unbound", "unbound; bind a name first");
         rootOnly(row);
         return fn(row);
-      }, true, true, true, !absent);
+      }, true, true, true, !absent, undefined, method);
     },
     // `held`: every hold, oldest first, and `primary` the one it sends as (#451): the client's
     // hold list, which the Controller restarts on when it changes (a bind, an unbind, a revocation).
@@ -1056,7 +1059,7 @@ export function createHostedSessions(application: Application, options: { now?: 
           ...(row?.root_session_id ? { root: root?.session_id, child: true } : {}),
           // A child binds nothing, so it isn't offered names to bind (#523).
           ...(!(root && named(root, held)) ? { unbound: true, ...(offered ? { candidates: offered } : {}) } : {}) };
-      });
+      }, true, true, true, true, undefined, "whoami");
     },
     // `declared`: the native request's declaration (deliveryDeclaration); text only.
     async bind(p: OAuthPrincipal, context: SessionContext, args: { name: string; create?: boolean; meta?: Record<string, unknown>; where?: string }, declared?: DeclaredDelivery, signal?: AbortSignal) {
@@ -1092,7 +1095,7 @@ export function createHostedSessions(application: Application, options: { now?: 
         await testPauseAsync("hosted:bind:after-commit");
         await authorized(p);
         return result;
-      }, signal);
+      }, signal, "bind");
       // A push client opens delivery right after bind and reports it itself if it can't. A
       // poll session gets no channel lines, as in its `initialize` text.
       const short = shortOf(p.authed.user_email), held = result.ok.held.map(short), name = short(result.ok.alias);
@@ -1127,7 +1130,7 @@ export function createHostedSessions(application: Application, options: { now?: 
         await testPauseAsync("hosted:unbind:after-commit");
         await authorized(p);
         return result;
-      }, signal);
+      }, signal, "unbind");
       const short = shortOf(p.authed.user_email), held = result.ok.held.map(short), alias = short(result.ok.alias);
       if (!result.ok.released) return { content: [{ type: "text" as const, text: notHolding(alias) }], structuredContent: { name: held[0] ?? null, instructions: [], ownership: result.ownership } };
       const source = declared?.mode === "poll" ? null : declared?.source ?? DEFAULT_CHANNEL_SOURCE;
@@ -1214,7 +1217,7 @@ export function createHostedSessions(application: Application, options: { now?: 
           await (candidate.root_session_id ? store.childEnd(tx, target, now(), "closed") : store.end(tx, target, "closed", now()));
         }); } catch (e) { await later.flushQueued(); throw e; }
         return { ended: true };
-      }, false, false, true, false);
+      }, false, false, true, false, undefined, "end");
     },
     release(id: string, reason: HostedEnd, deadline?: number): Promise<void> {
       return store.write(tx => store.end(tx, id, reason, now(), deadline));

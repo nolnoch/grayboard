@@ -181,11 +181,17 @@ function refusalsTotal(s: Sample[]): Record<string, number> {
 // `cum[i]` counts observations at or under `le[i]`; the last edge is +Inf.
 export type CumHist = { le: number[]; cum: number[]; sum: number; count: number };
 // `keyed`: bodies that ran keyed, per site; `worldStop`: seconds in which an exclusive body waited or ran (chunk 2);
-// `gate`: keyed requests by `<site>:<outcome>` (grayboard_hosted_gate_bodies_total; gate and prior, chunk 3; renew
-// and receipt, chunk 4).
-export type QueueCum = { wait: Map<string, CumHist>; hold: Map<string, CumHist>; depth?: CumHist; keyed: Map<string, number>; worldStop: number; gate: Map<string, number> };
+// `gate`: keyed requests by `<site>:<outcome>` (grayboard_hosted_gate_bodies_total, summed over its methods; gate and
+// prior, chunk 3; renew and receipt, chunk 4); `gateMethod`: the gate site's by `<method>:<outcome>` (#1537 PR 0).
+// `statements`, `roundTrips`: per site, Postgres statements and round trips summed over the bodies counted
+// (grayboard_write_queue_statements and _round_trips, #1537 PR 0); `count` is the bodies.
+export type StmtCum = { sum: number; count: number };
+export type QueueCum = {
+  wait: Map<string, CumHist>; hold: Map<string, CumHist>; depth?: CumHist; keyed: Map<string, number>; worldStop: number; gate: Map<string, number>;
+  gateMethod: Map<string, number>; statements: Map<string, StmtCum>; roundTrips: Map<string, StmtCum>;
+};
 export function queueCumulative(s: Sample[]): QueueCum {
-  const q: QueueCum = { wait: new Map(), hold: new Map(), keyed: new Map(), worldStop: 0, gate: new Map() };
+  const q: QueueCum = { wait: new Map(), hold: new Map(), keyed: new Map(), worldStop: 0, gate: new Map(), gateMethod: new Map(), statements: new Map(), roundTrips: new Map() };
   const slot = (name: string, labels: Record<string, string>): CumHist | undefined => {
     const m = /^grayboard_write_queue_(wait|hold)_seconds_/.exec(name);
     if (m) { const map = q[m[1] as "wait" | "hold"]; return map.get(labels.site!) ?? map.set(labels.site!, { le: [], cum: [], sum: 0, count: 0 }).get(labels.site!)!; }
@@ -195,7 +201,19 @@ export function queueCumulative(s: Sample[]): QueueCum {
   for (const x of s) {
     if (x.name === "grayboard_write_queue_keyed_bodies_total") { q.keyed.set(x.labels.site!, x.value); continue; }
     if (x.name === "grayboard_write_queue_world_stop_seconds_total") { q.worldStop = x.value; continue; }
-    if (x.name === "grayboard_hosted_gate_bodies_total") { q.gate.set(`${x.labels.site}:${x.labels.outcome}`, x.value); continue; }
+    if (x.name === "grayboard_hosted_gate_bodies_total") {
+      const k = `${x.labels.site}:${x.labels.outcome}`;
+      q.gate.set(k, (q.gate.get(k) ?? 0) + x.value);
+      if (x.labels.site === "gate" && x.labels.method) q.gateMethod.set(`${x.labels.method}:${x.labels.outcome}`, x.value);
+      continue;
+    }
+    const st = /^grayboard_write_queue_(statements|round_trips)_(sum|count)$/.exec(x.name);
+    if (st) {
+      const map = st[1] === "statements" ? q.statements : q.roundTrips;
+      const c = map.get(x.labels.site!) ?? map.set(x.labels.site!, { sum: 0, count: 0 }).get(x.labels.site!)!;
+      c[st[2] as "sum" | "count"] = x.value;
+      continue;
+    }
     const h = slot(x.name, x.labels);
     if (!h) continue;
     if (x.name.endsWith("_bucket")) { h.le.push(x.labels.le === "+Inf" ? Infinity : Number(x.labels.le)); h.cum.push(x.value); }
@@ -221,8 +239,14 @@ export function combineQueue(a: QueueCum, b: QueueCum, sign: 1 | -1): QueueCum {
     for (const [k, n] of y) out.set(k, (out.get(k) ?? 0) + sign * n);
     return out;
   };
+  const stmts = (x: Map<string, StmtCum>, y: Map<string, StmtCum>) => {
+    const out = new Map<string, StmtCum>([...x].map(([k, c]) => [k, { ...c }]));
+    for (const [k, c] of y) { const o = out.get(k) ?? out.set(k, { sum: 0, count: 0 }).get(k)!; o.sum += sign * c.sum; o.count += sign * c.count; }
+    return out;
+  };
   return { wait: maps(a.wait, b.wait), hold: maps(a.hold, b.hold), ...(a.depth ? { depth: combine(a.depth, b.depth, sign) } : b.depth && sign === 1 ? { depth: b.depth } : {}),
-    keyed: counts(a.keyed, b.keyed), worldStop: a.worldStop + sign * b.worldStop, gate: counts(a.gate, b.gate) };
+    keyed: counts(a.keyed, b.keyed), worldStop: a.worldStop + sign * b.worldStop, gate: counts(a.gate, b.gate),
+    gateMethod: counts(a.gateMethod, b.gateMethod), statements: stmts(a.statements, b.statements), roundTrips: stmts(a.roundTrips, b.roundTrips) };
 }
 // The q-quantile, interpolated linearly within its bucket (histogram_quantile's rule); one in the +Inf bucket reads as
 // the last finite edge. Null with no observations.
@@ -246,11 +270,16 @@ export type QueueStats = {
   worldStop: number; keyed: number;
   // The highest depth bucket edge any body that queued met (null: none queued; past the last edge reads as it + 1).
   maxDepth: number | null;
-  sites: Record<string, { bodies: number; bodiesPerS: number; busy: number; wait: Dist; hold: Dist; keyed: number }>;
+  // `statements`, `roundTrips`: Postgres statements and round trips per body at the site (#1537 PR 0), null with none
+  // counted (SQLite).
+  sites: Record<string, { bodies: number; bodiesPerS: number; busy: number; wait: Dist; hold: Dist; keyed: number; statements: number | null; roundTrips: number | null }>;
   // The keyed fast path per site (the hosted gate's gate and prior, delivery's renew and receipt): requests whose body
   // ran keyed, missed (a keyed attempt, then the exclusive body), or skipped it; `missRate`: misses over attempts
   // (keyed + miss), null with none.
   gate: Record<string, { keyed: number; miss: number; skipped: number; missRate: number | null }>;
+  // The gate site's requests by the call it served (selection, tool, renew, receipt, pending, …; #1537 PR 0), only
+  // methods with any.
+  gateMethods: Record<string, { keyed: number; miss: number; skipped: number }>;
 };
 // A span's queue numbers from its histogram deltas over `wallS` seconds.
 export function queueStats(d: QueueCum, wallS: number): QueueStats {
@@ -262,7 +291,9 @@ export function queueStats(d: QueueCum, wallS: number): QueueStats {
   for (const [site, h] of d.hold) if (h.count) {
     const k = d.keyed.get(site) ?? 0;
     keyed += k;
-    sites[site] = { bodies: h.count, bodiesPerS: h.count / wallS, busy: h.sum / wallS, wait: dist(d.wait.get(site)), hold: dist(h), keyed: k / h.count };
+    const st = d.statements.get(site), rt = d.roundTrips.get(site);
+    sites[site] = { bodies: h.count, bodiesPerS: h.count / wallS, busy: h.sum / wallS, wait: dist(d.wait.get(site)), hold: dist(h), keyed: k / h.count,
+      statements: st?.count ? st.sum / st.count : null, roundTrips: rt?.count ? rt.sum / rt.count : null };
   }
   const bodies = hold?.count ?? 0;
   const gate: QueueStats["gate"] = {};
@@ -272,7 +303,13 @@ export function queueStats(d: QueueCum, wallS: number): QueueStats {
     g[outcome] = n;
   }
   for (const g of Object.values(gate)) g.missRate = g.keyed + g.miss ? g.miss / (g.keyed + g.miss) : null;
-  return { bodies, bodiesPerS: bodies / wallS, busy: (hold?.sum ?? 0) / wallS, wait: dist(wait), hold: dist(hold), worldStop: d.worldStop / wallS, keyed: bodies ? keyed / bodies : 0, maxDepth, sites, gate };
+  const gateMethods: QueueStats["gateMethods"] = {};
+  for (const [k, n] of d.gateMethod) {
+    if (!n) continue;
+    const [method, outcome] = k.split(":") as [string, "keyed" | "miss" | "skipped"];
+    (gateMethods[method] ??= { keyed: 0, miss: 0, skipped: 0 })[outcome] = n;
+  }
+  return { bodies, bodiesPerS: bodies / wallS, busy: (hold?.sum ?? 0) / wallS, wait: dist(wait), hold: dist(hold), worldStop: d.worldStop / wallS, keyed: bodies ? keyed / bodies : 0, maxDepth, sites, gate, gateMethods };
 }
 const ms = (x: number | null) => x === null ? "-" : (x * 1000).toFixed(2);
 
@@ -452,7 +489,7 @@ async function main() {
   let srv: ServerProcess | undefined;
   let proxy: DelayProxy | undefined;
   // The steady period's write-queue deltas, kept outside the try so an aborted run still reports them.
-  let steadyQueue: QueueCum = { wait: new Map(), hold: new Map(), keyed: new Map(), worldStop: 0, gate: new Map() }, steadyQueueS = 0;
+  let steadyQueue: QueueCum = { wait: new Map(), hold: new Map(), keyed: new Map(), worldStop: 0, gate: new Map(), gateMethod: new Map(), statements: new Map(), roundTrips: new Map() }, steadyQueueS = 0;
   // A driver killed by a signal (the scope's OOM killer) keeps a null exitCode.
   const exited = (d: Driver) => d.proc.exitCode !== null || d.proc.signalCode !== null;
   try {
@@ -763,8 +800,9 @@ async function main() {
     if (queueSteady) {
       const q = queueSteady;
       log(`write queue, steady: ${q.bodiesPerS.toFixed(0)} bodies/s, busy ${(100 * q.busy).toFixed(1)}%, wait p50/p99 ${ms(q.wait.p50)}/${ms(q.wait.p99)} ms, hold p50/p99 ${ms(q.hold.p50)}/${ms(q.hold.p99)} ms, depth ≤ ${q.maxDepth ?? 0}, world stop ${(100 * q.worldStop).toFixed(1)}%, keyed ${(100 * q.keyed).toFixed(1)}%`);
-      for (const [site, x] of Object.entries(q.sites).sort((a, b) => b[1].busy - a[1].busy)) log(`  ${site}: ${x.bodiesPerS.toFixed(1)}/s, busy ${(100 * x.busy).toFixed(1)}%, hold p50/p99 ${ms(x.hold.p50)}/${ms(x.hold.p99)} ms, wait p50/p99 ${ms(x.wait.p50)}/${ms(x.wait.p99)} ms, keyed ${(100 * x.keyed).toFixed(0)}%`);
+      for (const [site, x] of Object.entries(q.sites).sort((a, b) => b[1].busy - a[1].busy)) log(`  ${site}: ${x.bodiesPerS.toFixed(1)}/s, busy ${(100 * x.busy).toFixed(1)}%, hold p50/p99 ${ms(x.hold.p50)}/${ms(x.hold.p99)} ms, wait p50/p99 ${ms(x.wait.p50)}/${ms(x.wait.p99)} ms, keyed ${(100 * x.keyed).toFixed(0)}%${x.statements === null ? "" : `, statements/body ${x.statements.toFixed(2)}, round trips/body ${x.roundTrips?.toFixed(2) ?? "-"}`}`);
       for (const [site, g] of Object.entries(q.gate)) log(`  gate fast path ${site}: keyed ${g.keyed}, miss ${g.miss}, skipped ${g.skipped}, miss rate ${g.missRate === null ? "-" : (100 * g.missRate).toFixed(2) + "%"}`);
+      for (const [method, g] of Object.entries(q.gateMethods).sort((a, b) => (b[1].keyed + b[1].miss + b[1].skipped) - (a[1].keyed + a[1].miss + a[1].skipped))) log(`  gate bodies for ${method}: ${((g.keyed + g.miss + g.skipped) / steadyQueueS).toFixed(1)}/s (keyed ${g.keyed}, miss ${g.miss}, skipped ${g.skipped})`);
     }
     if (failures.length) { log(`FAIL (${failures.length}):`); for (const f of failures.slice(0, 50)) log(`  ${f}`); exitCode = 1; }
     else log("PASS");

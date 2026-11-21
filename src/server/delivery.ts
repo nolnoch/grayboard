@@ -226,7 +226,7 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
           context: openOptions.context ?? true, row };
         track(lease);
         return opened(lease, true, hooks);
-      });
+      }, undefined, "open");
     },
     accept(result: DeliveryLease) {
       const attempt = attempts.get(result);
@@ -275,7 +275,7 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
           return { lease, deadline };
         }, renewed)));
         return describe(lease);
-      }).catch(error => refused(p, context, error));
+      }, undefined, "renew").catch(error => refused(p, context, error));
     },
     async pending(p: DeliveryPrincipal, context: SessionContext, capability: string, limit = 100): Promise<PendingDelivery[]> {
       return hosted.control(p, context, false, async row => {
@@ -294,7 +294,7 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
         for (const item of unseen) lease.issued.set(item.id, { item: structuredClone(item), ...(item.event.kind === "board" ? { ref: refOf(item.event.item) } : {}) });
         if (!items.length) drained.add(drainKey(lease));
         return items;
-      }).catch(error => refused(p, context, error));
+      }, undefined, "pending").catch(error => refused(p, context, error));
     },
     async receipt(p: DeliveryPrincipal, context: SessionContext, capability: string, ids: string[]): Promise<void> {
       return hosted.control(p, context, false, async root => {
@@ -363,7 +363,7 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
           const row = "id" in context ? await store.lock(tx, context.id) : undefined;
           return writes(tx, await reads(tx, row));
         }, committed)));
-      }).catch(error => refused(p, context, error));
+      }, undefined, "receipt").catch(error => refused(p, context, error));
     },
     async release(p: DeliveryPrincipal, context: SessionContext, capability: string) {
       return hosted.control(p, context, true, async row => {
@@ -371,7 +371,7 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
           await get(p, context, capability, await store.lock(tx, row.session_id), tx);
           await store.end(tx, row.session_id, "closed", now());
         });
-      }, () => undefined).catch(error => refused(p, context, error));
+      }, () => undefined, "release").catch(error => refused(p, context, error));
     },
     async cancel(result: DeliveryLease) {
       const attempt = attempts.get(result);

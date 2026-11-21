@@ -26,7 +26,8 @@
 // nothing that reaches it.
 import { SQL } from "bun";
 import { errorDiagnostic } from "../../diagnostics.ts";
-import { DEFAULT_DATABASE_WRITERS, WriteQueue } from "../queue.ts";
+import { queueStatementsBody } from "../../metrics.ts";
+import { currentSite, DEFAULT_DATABASE_WRITERS, WriteQueue } from "../queue.ts";
 import { BaseRead, BaseTx, flushEffect, isThenable, ProbeWrite, type Read, type SavepointFrame, type Tx } from "../tx_base.ts";
 import { pgFailure } from "./errors.ts";
 import { openPg, type PgOptions } from "./sql.ts";
@@ -52,12 +53,27 @@ function openOf(store: Store): PgTx | undefined {
 // undefined for an exclusive body. `effects`: a keyed body whose caller opted in to afterCommit effects and `committed`
 // (writeKeyed's `effects`); without it they refuse. `notices`: the change notices (store/notices.ts, by op name) an
 // opted-in body may queue; every other refuses. `probe`: set while readsOnly runs on the transaction, with the first
-// statement it refused.
+// statement it refused. `sent`, `flights`, `inflight`: the statements sent on `conn` (counted), the round trips among
+// them, and how many are in flight now (#1537 PR 0).
 type Txn = {
   readonly conn: SQL; readonly stack: object[]; n: number; ended: boolean; readonly keys?: ReadonlySet<string>; readonly effects?: boolean;
   readonly notices?: ReadonlySet<string>;
   failed?: { error: unknown; frames: object[] }; probe?: { refused?: ProbeWrite };
+  sent: number; flights: number; inflight: number;
 };
+
+// A statement sent on `txn`'s connection, counted into its body's metrics (#1537 PR 0): one more statement, and one
+// more round trip when none of the transaction's statements was in flight, so one sent behind an un-awaited statement
+// (a SAVEPOINT, pg/audit.ts's eager insert) rides that statement's flight. The settle handler is attached here, before
+// any caller's, so the count drops before an awaiting caller resumes and sends its next statement. It also marks the
+// query's rejection handled; every statement here is awaited or caught by its sender anyway.
+function counted<Q extends PromiseLike<unknown>>(txn: Txn, q: Q): Q {
+  txn.sent++;
+  if (txn.inflight++ === 0) txn.flights++;
+  const settled = () => { txn.inflight--; };
+  q.then(settled, settled);
+  return q;
+}
 
 const READ_REFUSAL = "repo.read inside the caller's own transaction: pass the body's Tx (#807 D2)";
 
@@ -186,7 +202,7 @@ class PgTx extends BaseTx {
     const txn = this.txn, { conn, stack } = txn;
     const name = `gb_sp_${++txn.n}`;
     const marker = {};
-    const opened = conn.unsafe(`SAVEPOINT ${name}`).execute();
+    const opened = counted(txn, conn.unsafe(`SAVEPOINT ${name}`).execute());
     // Awaited by commit() or rollback(); a failure also fails every statement after it, so nothing is lost here.
     opened.catch(() => {});
     stack.push(marker);
@@ -203,7 +219,7 @@ class PgTx extends BaseTx {
         if (stack.at(-1) !== marker) { await frame.rollback(); throw new Error("savepoint commit out of order: an inner one is still open"); }
         open = false;
         end();
-        const released = conn.unsafe(`RELEASE ${name}`).execute();
+        const released = counted(txn, conn.unsafe(`RELEASE ${name}`).execute());
         try {
           await Promise.all([opened, released]);
         } catch (error) {
@@ -212,9 +228,9 @@ class PgTx extends BaseTx {
           // undo, which clears a failure it undid.
           const aborted = TxAborted.wrap(error, txn);
           if (!txn.ended) {
-            await conn.unsafe(`ROLLBACK TO ${name}`).then(() => {
+            await counted(txn, conn.unsafe(`ROLLBACK TO ${name}`).execute()).then(() => {
               undone(txn, marker);
-              return conn.unsafe(`RELEASE ${name}`);
+              return counted(txn, conn.unsafe(`RELEASE ${name}`).execute());
             }).catch(() => {});
           }
           throw aborted;
@@ -227,8 +243,8 @@ class PgTx extends BaseTx {
         if (!open) return;
         open = false;
         if (!end()) return;
-        const back = conn.unsafe(`ROLLBACK TO ${name}`).execute();
-        const released = conn.unsafe(`RELEASE ${name}`).execute();
+        const back = counted(txn, conn.unsafe(`ROLLBACK TO ${name}`).execute());
+        const released = counted(txn, conn.unsafe(`RELEASE ${name}`).execute());
         // A SAVEPOINT that failed (25P02: the transaction was already aborted) fails the two after it: the cause is
         // the aborted transaction, named as TxAborted, as the write's own rejection would be.
         const [o, b, ...rest] = await Promise.allSettled([opened, back, released]);
@@ -299,14 +315,16 @@ function fragment(q: SQL.Query<unknown>): PgFragment {
   return Object.defineProperty(q, "then", { value() { throw new Error("a PgSql fragment awaited: it goes inside a statement (pgOf)"); } }) as unknown as PgFragment;
 }
 
-// `check` gets the statement's text (a template's literal pieces), before it's sent.
-function statements(conn: SQL, check: (text: string) => void): PgSql {
+// `check` gets the statement's text (a template's literal pieces), before it's sent. `txn`: a body's transaction, whose
+// statements are counted (counted); none for the read pool.
+function statements(conn: SQL, check: (text: string) => void, txn?: Txn): PgSql {
+  const send = <Q extends PromiseLike<unknown>>(q: Q): Q => txn ? counted(txn, q) : q;
   const sql = ((first: unknown, ...rest: unknown[]) => {
-    if (isTemplate(first)) { check(statementText(first, rest)); return conn(first, ...rest).execute(); }
+    if (isTemplate(first)) { check(statementText(first, rest)); return send(conn(first, ...rest).execute()); }
     if (typeof first === "string") return fragment(conn(first));
     return (conn as unknown as (...a: unknown[]) => unknown)(first, ...rest);
   }) as PgSql;
-  sql.unsafe = (text, values) => { check(text); return conn.unsafe(text, values).execute(); };
+  sql.unsafe = (text, values) => { check(text); return send(conn.unsafe(text, values).execute()); };
   sql.fragment = (strings, ...values) => {
     const f = fragment(conn(strings, ...values));
     fragmentText.set(f, statementText(strings, values));
@@ -321,7 +339,7 @@ function statements(conn: SQL, check: (text: string) => void): PgSql {
 // per body (openOf): another body's open transaction doesn't refuse this caller's read. Checked here and again as each
 // statement is sent. The refusals read as SQLite's. A Tx's statement in a readsOnly probe is checked too (probeCheck).
 export function pgOf(r: Read): PgSql {
-  if (r instanceof PgTx) { r.assertLive(); return statements(r.txn.conn, text => { r.assertLive(); probeCheck(r.txn, text); }); }
+  if (r instanceof PgTx) { r.assertLive(); return statements(r.txn.conn, text => { r.assertLive(); probeCheck(r.txn, text); }, r.txn); }
   if (!(r instanceof PgRead)) throw new Error("not a Postgres store handle");
   const { store } = r;
   const check = () => { if (openOf(store)) throw new Error(READ_REFUSAL); };
@@ -411,12 +429,12 @@ export function makePgTransactions(url: string, { ownAuthCommit, writers = DEFAU
     async function body(): Promise<{ out: R }> {
       // This body's identity for its own open transaction (openOf): the scheduler sets it before calling here.
       const token = queue.token!;
-      let root: PgTx | undefined;
+      let root: PgTx | undefined, txn: Txn | undefined;
       let fulfilled = false, touched = false;
       let box: { v: T };
       try {
         box = await writePool.begin("isolation level read committed, read write", async conn => {
-          const txn: Txn = { conn, stack: [], n: 0, ended: false, ...(held ? { keys: held, effects, ...(notices ? { notices } : {}) } : {}) };
+          txn = { conn, stack: [], n: 0, ended: false, sent: 0, flights: 0, inflight: 0, ...(held ? { keys: held, effects, ...(notices ? { notices } : {}) } : {}) };
           root = new PgTx(store, txn);
           store.open.set(token, root);
           try {
@@ -427,7 +445,7 @@ export function makePgTransactions(url: string, { ownAuthCommit, writers = DEFAU
             // (G5: the generation bumps before the next body), so a keyed body that set it throws here, before COMMIT,
             // and rolls back.
             if (ownAuthCommit || held) {
-              const marked = (await conn`SELECT current_setting('gb.auth_touched', true) = '1' AS t`)[0].t === true;
+              const marked = (await counted(txn, conn`SELECT current_setting('gb.auth_touched', true) = '1' AS t`.execute()))[0].t === true;
               if (marked && held) throw new Error(`a keyed write body (keys ${[...held].join(", ")}) wrote an auth table (gb.auth_touched): auth-table writers run in an exclusive body (write); rolled back (docs/future/postgres-server.md D4, D5)`);
               touched = marked;
             }
@@ -442,6 +460,7 @@ export function makePgTransactions(url: string, { ownAuthCommit, writers = DEFAU
           }
         });
       } catch (error) {
+        counts(txn);
         root?.close();
         store.open.delete(token);
         // The body fulfilled and COMMIT failed without a SQLSTATE (the connection lost): the server may have
@@ -453,11 +472,19 @@ export function makePgTransactions(url: string, { ownAuthCommit, writers = DEFAU
         if (touched) ownAuthCommit!();
         throw TxAborted.wrap(error, root?.txn);
       }
+      counts(txn);
       if (touched) ownAuthCommit!();
       store.open.delete(token);
       for (const effect of root!.effects) flushEffect(effect);
       return { out: committed ? committed(box.v) : box.v as unknown as R };
     }
+  }
+
+  // The body's statement counts into the queue's metrics under its site (#1537 PR 0): what its transaction sent, plus
+  // Bun's BEGIN and its COMMIT or ROLLBACK, each awaited on its own (a round trip each). Nothing when BEGIN never ran
+  // the callback (no transaction to count).
+  function counts(txn: Txn | undefined): void {
+    if (txn) queueStatementsBody(currentSite() ?? "other", txn.sent + 2, txn.flights + 2);
   }
 
   function post<T>(fn: (tx: Tx) => T | PromiseLike<T>, given?: (value: T) => unknown, what = "write", keys?: readonly string[]): boolean {
