@@ -484,6 +484,8 @@ function storeConfig(env: Record<string, string | undefined>): { store: Store; b
   if (blobS3 && blobDir) throw new Error("Set one of GRAYBOARD_BLOB_S3_BUCKET, GRAYBOARD_BLOB_DIR, not both: attachments live in one place");
   if (path) return blobS3 ? { store: { kind: "sqlite", path }, blobS3 } : { store: { kind: "sqlite", path }, blobDir: blobDir || join(dirname(path), "blobs") };
   if (!url) throw new Error("Required env var GRAYBOARD_DB_PATH (or GRAYBOARD_DATABASE_URL) is not set");
+  // Bun.SQL picks its adapter from the scheme (mysql://, sqlite:// …): anything but Postgres is a misconfiguration.
+  if (!/^postgres(ql)?:\/\//i.test(url)) throw new Error("GRAYBOARD_DATABASE_URL must start with postgres:// or postgresql://");
   if (blobS3) return { store: { kind: "postgres", url }, blobS3 };
   if (!blobDir) throw new Error("GRAYBOARD_DATABASE_URL needs GRAYBOARD_BLOB_DIR or GRAYBOARD_BLOB_S3_BUCKET: there's no database directory to keep attachments beside");
   return { store: { kind: "postgres", url }, blobDir };
@@ -548,13 +550,16 @@ export function describeBlobs(config: Pick<Config, "blobDir" | "blobS3">): strin
 }
 
 // What the startup line names: the backend and where, never a URL's credentials. Given `writers` (the config's
-// databaseWriters), a Postgres store's line says how many write connections it opens, so a run's W is on record.
+// databaseWriters), a Postgres store's line says how many write connections it opens and its sslmode, so a run's W and TLS are on record.
 export function describeStore(store: Store, opts?: { writers: number | undefined }): string {
   if (store.kind === "sqlite") return `sqlite ${store.path}`;
   const writers = opts ? `, ${opts.writers ?? DEFAULT_DATABASE_WRITERS} writers` : "";
   try {
     const u = new URL(store.url);
-    return `postgres ${u.host}${u.pathname}${writers}`;
+    // On the startup line, the TLS mode too: no sslmode means no TLS at all under Bun.SQL, so say so where the operator looks.
+    const mode = u.searchParams.get("sslmode");
+    const tls = opts ? `, ${mode ? `sslmode=${mode}` : "no TLS (no sslmode)"}` : "";
+    return `postgres ${u.host}${u.pathname}${writers}${tls}`;
   } catch {
     return `postgres (unparsable URL)${writers}`;
   }

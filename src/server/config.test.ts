@@ -144,10 +144,16 @@ describe("loadConfig", () => {
     expect(config.blobDir).toBe("/var/lib/grayboard/blobs");
     // The startup line's description carries no credentials.
     expect(describeStore(config.store)).toBe("postgres db.example.com:5432/grayboard");
-    expect(describeStore(config.store, { writers: undefined })).toBe("postgres db.example.com:5432/grayboard, 8 writers");
-    expect(describeStore(config.store, { writers: 8 })).toBe("postgres db.example.com:5432/grayboard, 8 writers");
+    expect(describeStore(config.store, { writers: undefined })).toBe("postgres db.example.com:5432/grayboard, 8 writers, no TLS (no sslmode)");
+    expect(describeStore(config.store, { writers: 8 })).toBe("postgres db.example.com:5432/grayboard, 8 writers, no TLS (no sslmode)");
+    expect(describeStore({ kind: "postgres", url: `${url}?sslmode=verify-full&sslrootcert=/ca.pem` }, { writers: 4 })).toBe("postgres db.example.com:5432/grayboard, 4 writers, sslmode=verify-full");
     expect(describeStore({ kind: "sqlite", path: "/x.db" }, { writers: 8 })).toBe("sqlite /x.db");
     expect(describeStore({ kind: "postgres", url: "not a url s3cret" })).not.toContain("s3cret");
+    // Bun.SQL would pick another adapter from another scheme.
+    process.env.GRAYBOARD_DATABASE_URL = "mysql://gb:s3cret@db.example.com/grayboard";
+    expect(() => loadConfig()).toThrow("must start with postgres:// or postgresql://");
+    process.env.GRAYBOARD_DATABASE_URL = "postgresql://gb@db.example.com/grayboard";
+    expect(loadConfig().store.kind).toBe("postgres");
     delete process.env.GRAYBOARD_DATABASE_URL;
     expect(() => loadConfig()).toThrow("Required env var GRAYBOARD_DB_PATH (or GRAYBOARD_DATABASE_URL) is not set");
   });

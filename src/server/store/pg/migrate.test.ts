@@ -7,7 +7,7 @@ import { describePg, pgEmptyDatabase } from "../../../../tests/support/pg.ts";
 import { FIXTURES } from "../../../../tests/support/pg_migrate_child.ts";
 import { transactionProcess } from "../../../../tests/support/transaction-process.ts";
 import { until } from "../../../../tests/support/until.ts";
-import { checksum, migrate, validateMigrations, type Migration } from "./migrate.ts";
+import { checksum, migrate, MIGRATIONS, validateMigrations, type Migration } from "./migrate.ts";
 import { openPg } from "./sql.ts";
 
 const recorded = async (sql: Bun.SQL) =>
@@ -20,6 +20,16 @@ test("a migration list must run 1, 2, 3… with names starting with their versio
   expect(() => validateMigrations([FIXTURES[1]!, FIXTURES[0]!])).toThrow("version 2 at position 1");
   expect(() => validateMigrations([FIXTURES[0]!, FIXTURES[2]!])).toThrow("version 3 at position 2");
   expect(() => validateMigrations([{ ...FIXTURES[0]!, name: "0002_one" }])).toThrow('name "0002_one"');
+});
+
+// Shipped migrations are append-only (D7): a kept database records each file's checksum, and a boot refuses an edited
+// file, so an in-place edit (a comment counts) would stop every pilot server's boot. Pinned here so CI fails first. A new
+// migration adds its line; an existing line never changes.
+test("shipped migrations keep their checksums", () => {
+  expect(MIGRATIONS.map(m => [m.name, checksum(m)])).toEqual([
+    ["0001_init", "0608ca7efd3ccc27a69189776a99aeb9de5ba20ebf410c79c7b08a3a2b840fa1"],
+    ["0002_posts_author_root", "9659b2bf7ee83ee72f81db01951b90cc660644283dff75d580f73b4e9cdee9e4"],
+  ]);
 });
 
 describePg("migrate", () => {

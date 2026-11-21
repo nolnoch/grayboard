@@ -251,8 +251,8 @@ export class TestServer {
 // A grayboard server as its own process: a compiled binary (a release, or the
 // build under test), or a command line (this tree's src/server/main.ts under
 // bun, so a sync testPause blocks only the server). Dev auth, port 0, its DB
-// at `dbPath` and its blobs beside it, or on a Postgres `url` (behind the
-// unreleased gate) with `blobDir`, or a temp dir it removes on stop. Ready
+// at `dbPath` and its blobs beside it, or on a Postgres `url` with
+// `blobDir`, or a temp dir it removes on stop. Ready
 // once it prints the port it listens on. Its stdout and stderr are drained
 // into one log as they arrive, so it never blocks on a full pipe and log()
 // mid-run has both.
