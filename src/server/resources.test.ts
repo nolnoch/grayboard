@@ -620,26 +620,49 @@ test("A7d2c/B5a2: a watch its caller didn't judge visible is refused", async () 
   expect("authNow" in store.repo).toBe(false);
 });
 
-// #1504: a change hint's live check reads the store untracked by the hint; close() stops new ones, and idle() settles
-// only once one already in flight has, so a closing server can wait for its read before it closes the store.
-test("#1504: idle() waits for a live check in flight when close() ran", async () => {
+// #1504, #1506: a change hint's live check reads the store untracked by the commit that started it, so it runs as the
+// application's background work "resource watch check", which a server's stop() waits for: the pass settles only once
+// its check has. A check in flight when close() ran, or once the stop has begun, sends no hint.
+test("#1506: a change's live check runs as the background pass 'resource watch check'", async () => {
+  resources.close();
+  const passes: { what: string; done: Promise<unknown> }[] = [];
+  let stopping = false;
+  application = createApplication(store.repo, { runBackground: (what, run) => { passes.push({ what, done: run(() => stopping) }); } });
   const a = await select(alice), b = await select(bob);
   await call(a, "board_create", { name: "e2e", purpose: "tests" });
-  resources.close();
   let release!: () => void, started = 0;
-  const gate = new Promise<void>(resolve => { release = resolve; });
-  resources = createResources(application, { isCurrent: () => true, isAuthorized: async () => { started++; await gate; return true; } });
+  const gate = () => new Promise<void>(resolve => { release = resolve; });
+  let held = gate();
+  resources = createResources(application, { isCurrent: () => true, isAuthorized: async () => { started++; await held; return true; } });
   const h = hooks();
   resources.watch(b, boardResourceUri("e2e"), h, true);
-  await call(a, "board_post", { board: "e2e", body: "hint" });
+  const checks = () => passes.filter(p => p.what === "resource watch check");
+  // Released: the pass hints.
+  await call(a, "board_post", { board: "e2e", body: "first" });
   await until(() => started === 1);
-  resources.close();
-  let idle = false;
-  const waiting = resources.idle().then(() => { idle = true; });
-  await flush();
-  expect(idle).toBe(false);
+  expect(checks()).toHaveLength(1);
   release();
-  await waiting;
-  expect(h.counts.changed).toBe(0); // closed before its check finished: no hint after close
-  await resources.idle(); // nothing in flight: settles at once
+  await checks()[0]!.done;
+  await until(() => h.counts.changed === 1);
+  // Held across the stop's start: the pass settles once its check has, and sends no hint.
+  held = gate();
+  await call(a, "board_post", { board: "e2e", body: "second" });
+  await until(() => started === 2);
+  let settled = false;
+  void checks()[1]!.done.then(() => { settled = true; });
+  stopping = true;
+  await flush();
+  expect(settled).toBe(false);
+  release();
+  await checks()[1]!.done;
+  expect(h.counts.changed).toBe(1);
+  // Held across close(): no hint after close. close() finishes the watch, so this pins the behaviour, not the `!stopped` guard.
+  stopping = false;
+  held = gate();
+  await call(a, "board_post", { board: "e2e", body: "third" });
+  await until(() => started === 3);
+  resources.close();
+  release();
+  await checks()[2]!.done;
+  expect(h.counts.changed).toBe(1);
 });

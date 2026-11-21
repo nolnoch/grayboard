@@ -48,8 +48,6 @@ export function createResources(application: Application, options: ResourceOptio
   // Each session's watches, so a session's close and its capacity check don't scan every watch (#805).
   const bySession = new Map<ApplicationSession, Set<Watch>>();
   let stopped = false;
-  // Checks in flight, so a closing server can wait for their reads before it closes the store (#1504).
-  const checking = new Set<Promise<boolean>>();
   function drop(watch: Watch): boolean {
     if (!watches.delete(watch.id)) return false;
     const own = bySession.get(watch.session);
@@ -97,16 +95,11 @@ export function createResources(application: Application, options: ResourceOptio
   async function requireSession(session: ApplicationSession, allowUnbound = false, r?: Read) {
     if (!await authorized(session, allowUnbound, r)) refuse(session);
   }
-  // Runs from a commit's afterCommit (the board observer's `changed`, which doesn't wait for it) and from revalidate. A
-  // watch finished while the check awaited stays finished, and gets no notification (#807 P3 A7d2c).
-  function live(watch: Watch): Promise<boolean> {
-    if (!watches.has(watch.id)) return Promise.resolve(false);
-    const check = liveCheck(watch);
-    checking.add(check);
-    void check.finally(() => checking.delete(check));
-    return check;
-  }
-  async function liveCheck(watch: Watch): Promise<boolean> {
+  // Runs from a board change (the watch's `changed`, as the background pass "resource watch check"), so a server's stop()
+  // waits for its reads before it closes the store (#1504, #1506). revalidate() runs it too, untracked: only tests call
+  // that. A watch finished while the check awaited stays finished, and gets no notification (#807 P3 A7d2c).
+  async function live(watch: Watch): Promise<boolean> {
+    if (!watches.has(watch.id)) return false;
     // Background faults close the watch without failing a committed mutation.
     try {
       const ok = await authorized(watch.session);
@@ -150,7 +143,11 @@ export function createResources(application: Application, options: ResourceOptio
       own.add(watch);
       try {
         watch.unsubscribe = application.observeBoard(session, board, {
-          changed: () => { void live(watch).then(ok => { if (ok && watches.has(watch.id) && !stopped) notify("resources.changed", () => hooks.changed()); }); },
+          // Called from a commit's afterCommit, which doesn't wait for it: the check and its hint are background work
+          // a server's stop() tracks, bounds by its drain deadline, and skips once stopping (#1506).
+          changed: () => application.runBackground("resource watch check", async halted => {
+            if (await live(watch) && watches.has(watch.id) && !stopped && !halted()) notify("resources.changed", () => hooks.changed());
+          }),
           closed: () => finishQuietly(watch),
         });
       } catch (error) { drop(watch); throw error; }
@@ -167,13 +164,11 @@ export function createResources(application: Application, options: ResourceOptio
     // hosted MCP live (mcp.ts addWatch), whose stream timer rechecks the same token and board access each second and
     // stops the live, which ends its session and with it the watch (#807 P3 A7d2c).
     async revalidate(): Promise<void> { await Promise.all([...watches.values()].map(live)); },
+    // A check already running is the server's background work: its stop() waits for it (#1506).
     close(): void {
       stopped = true;
       for (const watch of [...watches.values()]) finishQuietly(watch);
     },
-    // Settles once every check started before it has (none rejects): once close() has run, nothing starts another, so
-    // mcp.close() runs close() first and awaits this before a server's stop closes the store (#1504).
-    async idle(): Promise<void> { await Promise.allSettled([...checking]); },
   };
   return service;
 }
