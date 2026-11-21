@@ -414,7 +414,9 @@ function migrateHostedHolds(db: Database): void {
 // hosted.child_registered audit rows (target: the root, detail.child: the
 // child) name its root. Each child takes its latest registration's, unless its
 // ID started as a root since (an ownership of its own begun after that
-// registration, when hostedRoot cleared root_id on purpose). The audit rows
+// registration, when hostedRoot cleared root_id on purpose), and unless it has
+// a live hosted row (a live child got its root above; a live root has none,
+// whatever a stepped-back clock says of its ownership's start). The audit rows
 // are read once each: server_state's CHILD_ROOTS_AUDIT_KEY holds the last
 // access_log id read, so an open reads only rows written since the last one
 // (normally none: a registration by this code already set root_id), and never
@@ -428,19 +430,25 @@ function recordChildRoots(db: Database): void {
   const from = db.query<{ value: number }, [string]>(`SELECT value FROM server_state WHERE key = ?`).get(CHILD_ROOTS_AUDIT_KEY)?.value ?? 0;
   const to = db.query<{ id: number | null }, []>(`SELECT MAX(id) AS id FROM access_log`).get()?.id ?? 0;
   if (to <= from) return;
-  // Materialized, so each statement below reads the window's rows once (inlined, the latest-per-child pick and the
-  // ownership probe were correlated rescans of it): latest is each child's last registration in the window, reborn
-  // the children whose ID began an ownership of its own after it.
-  db.run(`
-    WITH latest AS MATERIALIZED (
-           SELECT child, root, at FROM (
-             SELECT json_extract(detail, '$.child') AS child, target AS root, at,
-                    ROW_NUMBER() OVER (PARTITION BY json_extract(detail, '$.child') ORDER BY id DESC) AS n
-               FROM access_log WHERE id > ?1 AND id <= ?2 AND action = 'hosted.child_registered' AND target IS NOT NULL AND json_valid(detail))
-            WHERE n = 1 AND child IS NOT NULL),
-         reborn AS MATERIALIZED (SELECT DISTINCT l.child FROM latest l JOIN hosted_ownerships o ON o.session_id = l.child AND o.started_at > l.at)
-    UPDATE ids SET root_id = l.root FROM latest l
-      WHERE l.child = ids.id AND ids.root_id IS NULL AND l.child NOT IN (SELECT child FROM reborn)`, [from, to]);
+  // `+action` keeps the action index out of both statements: the rowid range drives them, so an open reads only the
+  // rows written since the last one, not every retained registration. A window with none writes only the watermark.
+  const any = db.query(`SELECT 1 FROM access_log WHERE id > ?1 AND id <= ?2 AND +action = 'hosted.child_registered' LIMIT 1`).get(from, to);
+  if (any) {
+    // Materialized, so each statement below reads the window's rows once (inlined, the latest-per-child pick and the
+    // ownership probe were correlated rescans of it): latest is each child's last registration in the window, reborn
+    // the children whose ID began an ownership of its own after it.
+    db.run(`
+      WITH latest AS MATERIALIZED (
+             SELECT child, root, at FROM (
+               SELECT json_extract(detail, '$.child') AS child, target AS root, at,
+                      ROW_NUMBER() OVER (PARTITION BY json_extract(detail, '$.child') ORDER BY id DESC) AS n
+                 FROM access_log WHERE id > ?1 AND id <= ?2 AND +action = 'hosted.child_registered' AND target IS NOT NULL AND json_valid(detail))
+              WHERE n = 1 AND child IS NOT NULL),
+           reborn AS MATERIALIZED (SELECT DISTINCT l.child FROM latest l JOIN hosted_ownerships o ON o.session_id = l.child AND o.started_at > l.at)
+      UPDATE ids SET root_id = l.root FROM latest l
+        WHERE l.child = ids.id AND ids.root_id IS NULL AND l.child NOT IN (SELECT child FROM reborn)
+          AND ids.id NOT IN (SELECT session_id FROM hosted_sessions)`, [from, to]);
+  }
   db.run(`INSERT INTO server_state (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`, [CHILD_ROOTS_AUDIT_KEY, to]);
 }
 

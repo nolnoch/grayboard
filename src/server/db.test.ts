@@ -156,37 +156,42 @@ test("opening a database from before ids.root_id backfills each live hosted chil
 
 // #540 2: a hosted child that ended before the upgrade has no source row to read its root from; its
 // hosted.child_registered audit rows name it. Each child takes its latest registration's root, unless its ID started
-// as a root since (an ownership of its own begun after that registration: hostedRoot cleared it on purpose). A
-// second open reads only audit rows written since the first, so a row cleared later is never refilled.
+// as a root since (an ownership of its own begun after that registration: hostedRoot cleared it on purpose), or it's a
+// live hosted root now, whatever its ownership's start says (a clock stepped back). A second open reads only audit rows written since the first, so a row cleared later is never refilled.
 test("opening a database backfills an ended hosted child's root from its registration audit rows", async () => {
   const dir = mkdtempSync(join(tmpdir(), "gb-root-audit-"));
   const path = join(dir, "db.sqlite");
   const opts = { blobDir: join(dir, "blobs") };
   const old = openDatabase(path, opts);
   const now = Date.now();
-  const [r1, r2, ended, moved, reborn, never] = ["id:r100000000000", "id:r200000000000", "id:e000000000000", "id:m000000000000", "id:b000000000000", "id:n000000000000"];
+  const [r1, r2, ended, moved, reborn, never, live] = ["id:r100000000000", "id:r200000000000", "id:e000000000000", "id:m000000000000", "id:b000000000000", "id:n000000000000", "id:l000000000000"];
   await seed(old.repo, async tx => {
     const user = await old.repo.users.upsertByEmail(tx, "you@example.com", null);
-    for (const id of [r1, r2, ended, moved, reborn, never]) old.db.prepare(`INSERT INTO ids (id, principal, started_at, last_seen) VALUES (?, ?, ?, ?)`).run(id, user.email, now, now);
+    for (const id of [r1, r2, ended, moved, reborn, never, live]) old.db.prepare(`INSERT INTO ids (id, principal, started_at, last_seen) VALUES (?, ?, ?, ?)`).run(id, user.email, now, now);
     const own = old.db.prepare(`INSERT INTO hosted_ownerships (session_id, user_id, client_id, started_at) VALUES (?, ?, 'grayboard-pi', ?)`);
     own.run(r1, user.id, now);
     own.run(r2, user.id, now);
     own.run(reborn, user.id, now + 5);
+    // A live root whose ownership's start reads earlier than its registration as a child (the clock stepped back).
+    const liveOwn = old.db.prepare(`INSERT INTO hosted_ownerships (session_id, user_id, client_id, started_at) VALUES (?, ?, 'grayboard-pi', ?) RETURNING id`).get(live, user.id, now - 100) as { id: number };
+    old.db.prepare(`INSERT INTO hosted_sessions (session_id, ownership_id, user_id, client_id, grant_id, source_session_id, root_session_id, created_at, last_seen_at) VALUES (?, ?, ?, 'grayboard-pi', 'G1', 'l-run', NULL, ?, ?)`).run(live, liveOwn.id, user.id, now, now);
     const reg = old.db.prepare(`INSERT INTO access_log (at, actor, action, target, detail) VALUES (?, 'you@example.com', 'hosted.child_registered', ?, ?)`);
     reg.run(now + 1, r1, JSON.stringify({ child: ended, ownership: 1, source_session_id: "e-run", via: "tool" }));
     reg.run(now + 2, r1, JSON.stringify({ child: moved, ownership: 1, source_session_id: "m-run", via: "tool" }));
     reg.run(now + 3, r2, JSON.stringify({ child: moved, ownership: 2, source_session_id: "m-run", via: "tool" }));
     reg.run(now + 4, r1, JSON.stringify({ child: reborn, ownership: 1, source_session_id: "b-run", via: "tool" }));
+    reg.run(now + 6, r1, JSON.stringify({ child: live, ownership: 1, source_session_id: "l-run", via: "tool" }));
     old.db.exec(`DROP INDEX idx_ids_root; ALTER TABLE ids DROP COLUMN root_id`);
   });
   old.db.close();
   const roots = (db: { query: typeof old.db.query }) =>
-    db.query(`SELECT id, root_id FROM ids WHERE id IN (?, ?, ?, ?) ORDER BY id`).all(ended, moved, reborn, never);
+    db.query(`SELECT id, root_id FROM ids WHERE id IN (?, ?, ?, ?, ?) ORDER BY id`).all(ended, moved, reborn, never, live);
   const reopened = openDatabase(path, opts);
   try {
     expect(roots(reopened.db)).toEqual([
       { id: reborn, root_id: null },
       { id: ended, root_id: r1 },
+      { id: live, root_id: null },
       { id: moved, root_id: r2 },
       { id: never, root_id: null },
     ]);
@@ -200,6 +205,7 @@ test("opening a database backfills an ended hosted child's root from its registr
     expect(roots(third.db)).toEqual([
       { id: reborn, root_id: null },
       { id: ended, root_id: null },
+      { id: live, root_id: null },
       { id: moved, root_id: r2 },
       { id: never, root_id: null },
     ]);
