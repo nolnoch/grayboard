@@ -114,7 +114,7 @@ class LostLink extends Error {}
 
 export function makePgIdentity({ now, hosted }: { now: () => number; hosted: PgHostedEnds }): PgIdentity {
   // What a disable and a revoke-all both end (db.ts setDisabled, revokeAllForUser): the CLI sessions, the OAuth grants,
-  // then the hosted sessions, and the unredeemed codes; a disable also the browser sessions. The users row is already
+  // then the hosted sessions, the browser sessions (a live one consents without the IdP, #1552) and the unredeemed codes. The users row is already
   // locked (see the header), so each statement here sees every row a concurrent mint for the user committed.
   const revokeUser = async (tx: Tx, userId: number, reason: "revoked" | "disabled", at: number) => {
     const sql = pgOf(tx);
@@ -123,7 +123,7 @@ export function makePgIdentity({ now, hosted }: { now: () => number; hosted: PgH
     await sql`UPDATE oauth_grants SET revoked_at = ${at} WHERE user_id = ${userId} AND revoked_at IS NULL`;
     // After the grants' revoke, as revokeGrant orders its own end (hosted_port.ts: the lock order).
     await hosted.endForUser(tx, userId, reason, at);
-    if (reason === "disabled") await sql`DELETE FROM oauth_browsers WHERE user_id = ${userId}`;
+    await sql`DELETE FROM oauth_browsers WHERE user_id = ${userId}`;
     await sql`DELETE FROM oauth_codes WHERE user_id = ${userId} AND grant_id IS NULL`;
   };
 

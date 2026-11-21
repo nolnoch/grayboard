@@ -515,16 +515,21 @@ function access(it: It): void {
     expect(await o.findBrowserSession(h.read, w.sessionHash, start)).toBeUndefined();
   });
 
-  it("revoke-all revokes OAuth grants; a single session revoke and browser logout don't", async h => {
+  it("revoke-all revokes OAuth grants and ends browser sessions; a single session revoke and browser logout don't revoke grants", async h => {
     const w = await world(h);
     const input = await w.issue();
+    // A second browser session, so the revoke-all below has one to end (#1552); the logout ends only its own.
+    const live = sha("live-browser");
+    expect(await status(h.write(tx => h.oauth.createBrowserSession(tx, { sessionHash: live, userId: w.userId, createdAt: start, expiresAt: start + 1000 }, start)))).toBe("ok");
     const s = await h.write(tx => h.sessions.create(tx, w.userId, sha("old-token"), null));
     await h.write(tx => h.sessions.revoke(tx, s.id));
     await h.write(tx => h.oauth.revokeBrowserSession(tx, w.sessionHash));
     expect(await h.oauth.findBrowserSession(h.read, w.sessionHash, start)).toBeUndefined();
     expect(await h.oauth.isGrantActive(h.read, input.grantId, start)).toBe(true);
+    expect(await h.oauth.findBrowserSession(h.read, live, start)).toBeDefined();
     await h.revokeAllForUser(w.userId);
     expect(await h.oauth.isGrantActive(h.read, input.grantId, start)).toBe(false);
+    expect(await h.oauth.findBrowserSession(h.read, live, start)).toBeUndefined();
   });
 
   // The serial half of the disable race (postgres-server.md D3; C4b's T-C4-8 is the concurrent half): each write that

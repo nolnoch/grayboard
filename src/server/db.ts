@@ -1205,6 +1205,8 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
           await endHostedWhere(hosted, sp, "revoked", now, row => row.user_id === userId);
           db.run("UPDATE oauth_grants SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL", [now, userId]);
           db.run("DELETE FROM oauth_codes WHERE user_id = ? AND grant_id IS NULL", [userId]);
+          // A live browser session consents without the IdP, so revoke-all ends them as a per-grant revoke does (#1552).
+          db.run("DELETE FROM oauth_browsers WHERE user_id = ?", [userId]);
         });
         notices.changed(tx, null);
       },
