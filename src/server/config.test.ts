@@ -18,6 +18,7 @@ const KEYS = [
   "GRAYBOARD_OAUTH_BURST", "GRAYBOARD_OAUTH_PER_SEC", "GRAYBOARD_OAUTH_GLOBAL_BURST", "GRAYBOARD_OAUTH_GLOBAL_PER_SEC",
   "GRAYBOARD_AUTH_FAIL_BURST", "GRAYBOARD_AUTH_FAIL_PER_SEC", "GRAYBOARD_TRUSTED_PROXIES", "GRAYBOARD_HOSTED_IDLE_SECONDS", "GRAYBOARD_CLI_TOKEN_IDLE_DAYS", "GRAYBOARD_IDP_REAUTH_DAYS", "GRAYBOARD_IDP_RECHECK_HOURS", "GRAYBOARD_IDP_RECHECK_MAX_STALE_HOURS", "GRAYBOARD_IDP_DISABLE_LIMIT", "GRAYBOARD_GOOGLE_DIRECTORY_KEY", "GRAYBOARD_GOOGLE_DIRECTORY_ADMIN",
   "GRAYBOARD_KEYCLOAK_DIRECTORY_CLIENT_ID", "GRAYBOARD_KEYCLOAK_DIRECTORY_CLIENT_SECRET", "GRAYBOARD_KEYCLOAK_DIRECTORY_URL",
+  "GRAYBOARD_OKTA_DIRECTORY_CLIENT_ID", "GRAYBOARD_OKTA_DIRECTORY_KEY", "GRAYBOARD_OKTA_DIRECTORY_KEY_ID", "GRAYBOARD_OKTA_DIRECTORY_URL",
   "GRAYBOARD_DELEGATE_BURST", "GRAYBOARD_DELEGATE_PER_SEC", "GRAYBOARD_DELEGATE_OPEN_CAP", "GRAYBOARD_ALIAS_SCOPE_CAP",
   ...["LISTEN", "LEGACY", "POST"].flatMap(kind => [`GRAYBOARD_MCP_${kind}_GLOBAL`, `GRAYBOARD_MCP_${kind}_PER_USER`]),
   "GRAYBOARD_HOSTED_SESSIONS_GLOBAL", "GRAYBOARD_HOSTED_SESSIONS_PER_USER", "GRAYBOARD_DELIVERY_LEASES_GLOBAL", "GRAYBOARD_DELIVERY_LEASES_PER_USER",
@@ -757,6 +758,9 @@ describe("loadConfig", () => {
     expect(describeReauth({ idps: ["oidc", "google"], keycloakDirectory: kc }))
       .toBe("directory check every 24 h (oidc); sign-in every 30 days (no directory check: google)");
     expect(describeReauth({ idps: ["google", "oidc"], googleDirectory: dir, keycloakDirectory: kc })).toBe("directory check every 24 h (google, oidc)");
+    const ok = { orgUrl: "https://example.okta.com", clientId: "0oa1", privateKey: "k", alg: "RS256" };
+    expect(describeReauth({ idps: ["okta", "google"], oktaDirectory: ok })).toBe("directory check every 24 h (okta); sign-in every 30 days (no directory check: google)");
+    expect(describeReauth({ idps: ["okta", "oidc"], oktaDirectory: ok, keycloakDirectory: kc })).toBe("directory check every 24 h (okta, oidc)");
   });
 
   test("GRAYBOARD_GOOGLE_DIRECTORY_KEY turns on Google's directory check; half a configuration refuses to start (#930 A2b)", () => {
@@ -837,6 +841,65 @@ describe("loadConfig", () => {
     process.env.GRAYBOARD_IDPS = "okta";
     okta();
     expect(message()).toMatch(/set but GRAYBOARD_IDPS doesn't list oidc/);
+  });
+
+  test("the Okta directory pair turns on okta's directory check against the issuer's org, or the URL named (#1563)", () => {
+    process.env.GRAYBOARD_IDPS = "okta";
+    okta();
+    const rsa = generateKeyPairSync("rsa", { modulusLength: 2048 }).privateKey;
+    const pem = rsa.export({ type: "pkcs8", format: "pem" }) as string;
+    expect(loadConfig().oktaDirectory).toBeUndefined();
+    process.env.GRAYBOARD_OKTA_DIRECTORY_CLIENT_ID = "0oa1checker";
+    process.env.GRAYBOARD_OKTA_DIRECTORY_KEY = JSON.stringify({ ...rsa.export({ format: "jwk" }), kid: "kid-1" });
+    expect(loadConfig().oktaDirectory).toEqual({ orgUrl: "https://example.okta.com", clientId: "0oa1checker", privateKey: pem, alg: "RS256", keyId: "kid-1" });
+    // A custom authorization server's issuer: the org is its origin.
+    process.env.GRAYBOARD_OKTA_ISSUER = "https://example.okta.com/oauth2/default";
+    expect(loadConfig().oktaDirectory?.orgUrl).toBe("https://example.okta.com");
+    // An issuer on a custom domain names the okta.com domain for the API.
+    process.env.GRAYBOARD_OKTA_ISSUER = "https://login.example.com/oauth2/default";
+    process.env.GRAYBOARD_OKTA_DIRECTORY_URL = "https://example.okta.com";
+    expect(loadConfig().oktaDirectory?.orgUrl).toBe("https://example.okta.com");
+    for (const url of ["http://example.okta.com", "https://example.okta.com/", "https://example.okta.com/oauth2/default", "example.okta.com", ""]) {
+      process.env.GRAYBOARD_OKTA_DIRECTORY_URL = url;
+      expect(message()).toMatch(/^GRAYBOARD_OKTA_DIRECTORY_URL must be the org's https origin/);
+    }
+    delete process.env.GRAYBOARD_OKTA_DIRECTORY_URL;
+    // The key from a file, as every secret can be, with its id named.
+    const d = mkdtempSync(join(tmpdir(), "gb-secrets-"));
+    try {
+      writeFileSync(join(d, "key.pem"), pem);
+      delete process.env.GRAYBOARD_OKTA_DIRECTORY_KEY;
+      process.env.GRAYBOARD_OKTA_DIRECTORY_KEY_FILE = join(d, "key.pem");
+      process.env.GRAYBOARD_OKTA_DIRECTORY_KEY_ID = "kid-2";
+      expect(loadConfig().oktaDirectory).toMatchObject({ privateKey: pem, keyId: "kid-2" });
+    } finally { rmSync(d, { recursive: true, force: true }); }
+  });
+
+  test("half an Okta directory configuration, or one with nothing to check, refuses to start (#1563)", () => {
+    process.env.GRAYBOARD_IDPS = "okta";
+    okta();
+    const pem = generateKeyPairSync("rsa", { modulusLength: 2048 }).privateKey.export({ type: "pkcs8", format: "pem" }) as string;
+    process.env.GRAYBOARD_OKTA_DIRECTORY_CLIENT_ID = "0oa1checker";
+    expect(message()).toBe("GRAYBOARD_OKTA_DIRECTORY_CLIENT_ID set, so GRAYBOARD_OKTA_DIRECTORY_KEY is required too");
+    delete process.env.GRAYBOARD_OKTA_DIRECTORY_CLIENT_ID;
+    process.env.GRAYBOARD_OKTA_DIRECTORY_KEY_ID = "kid";
+    expect(message()).toMatch(/^GRAYBOARD_OKTA_DIRECTORY_KEY_ID set, so GRAYBOARD_OKTA_DIRECTORY_CLIENT_ID is required too/);
+    delete process.env.GRAYBOARD_OKTA_DIRECTORY_KEY_ID;
+    process.env.GRAYBOARD_OKTA_DIRECTORY_CLIENT_ID = "has space";
+    process.env.GRAYBOARD_OKTA_DIRECTORY_KEY = pem;
+    expect(message()).toMatch(/^GRAYBOARD_OKTA_DIRECTORY_CLIENT_ID must be a nonempty client id/);
+    process.env.GRAYBOARD_OKTA_DIRECTORY_CLIENT_ID = "0oa1checker";
+    process.env.GRAYBOARD_OKTA_DIRECTORY_KEY = "-----BEGIN RSA PUBLIC KEY-----";
+    expect(message()).toMatch(/^GRAYBOARD_OKTA_DIRECTORY_KEY is not a JSON Web Key or a PEM private key/);
+    process.env.GRAYBOARD_OKTA_DIRECTORY_KEY = pem;
+    // An issuer that isn't an Okta authorization server.
+    process.env.GRAYBOARD_OKTA_ISSUER = "https://example.okta.com/realms/eng";
+    expect(message()).toMatch(/^GRAYBOARD_OKTA_ISSUER is not an Okta authorization server URL/);
+    // No okta provider to check.
+    for (const k of ["GRAYBOARD_OKTA_ISSUER", "GRAYBOARD_OKTA_CLIENT_ID", "GRAYBOARD_OKTA_CLIENT_SECRET", "GRAYBOARD_OKTA_ALLOWED_DOMAINS"]) delete process.env[k];
+    process.env.GRAYBOARD_IDPS = "google";
+    primary();
+    expect(message()).toMatch(/set but GRAYBOARD_IDPS doesn't list okta$/);
   });
 
   test("the hello limit defaults to 60 and 1/s; set, the burst is a whole number up to 10000 and the rate at least 0.1/s", () => {

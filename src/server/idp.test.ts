@@ -83,6 +83,13 @@ test("defaultProviders gives oidc a status check only with Keycloak's directory 
   expect(providers.map(p => [p.id, p.issuer, typeof p.status])).toEqual([["oidc", oidc.issuer, "function"], ["okta", OKTA_ISSUER, "undefined"]]);
 });
 
+// #1563: okta has a status check exactly when the server has Okta's directory pair.
+test("defaultProviders gives okta a status check only with Okta's directory configuration", () => {
+  const oktaDirectory = { orgUrl: "https://example.okta.com", clientId: "0oa1", privateKey: "unused until the first check", alg: "RS256" };
+  const providers = defaultProviders({ ...base, idps: ["okta", "google"], oktaDirectory } as Config);
+  expect(providers.map(p => [p.id, p.issuer, typeof p.status])).toEqual([["okta", OKTA_ISSUER, "function"], ["google", expect.any(String), "undefined"]]);
+});
+
 test("defaultProviders builds Okta from Config in the listed order, fetching nothing until first use, with its own client", async () => {
   const fetched: string[] = [];
   let tokenAuthorization: string | null = null;

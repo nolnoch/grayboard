@@ -17,6 +17,7 @@ import { ALIAS_SCOPE_CAP } from "./alias_cap.ts";
 import { GOOGLE_ISSUER } from "./idp_google.ts";
 import { parseDirectoryKey, type GoogleDirectoryConfig } from "./idp_google_directory.ts";
 import { keycloakRealm, type KeycloakDirectoryConfig } from "./idp_keycloak_directory.ts";
+import { oktaOrgUrl, parseOktaDirectoryKey, type OktaDirectoryConfig } from "./idp_okta_directory.ts";
 import { describeCredentials, type AwsCredentialSpec } from "./aws_credentials.ts";
 import type { RecheckConfig } from "./idp_recheck.ts";
 
@@ -90,6 +91,9 @@ export type Config = {
   // realm: a confidential client whose service account reads users through the admin REST API. Unset, oidc users stay
   // on the GRAYBOARD_IDP_REAUTH_DAYS clock.
   keycloakDirectory?: KeycloakDirectoryConfig;
+  // Okta's directory check (#1563, idp_okta_directory.ts): an API service app's client id and private key. Unset, Okta
+  // users stay on the GRAYBOARD_IDP_REAUTH_DAYS clock.
+  oktaDirectory?: OktaDirectoryConfig;
   // Emails allowed to run admin commands. Empty means nobody can.
   admins: string[];
   oauthClients?: OAuthClient[];
@@ -138,7 +142,7 @@ export type Config = {
 export const FILE_SECRETS = [
   "GRAYBOARD_DATABASE_URL", "GOOGLE_OAUTH_CLIENT_SECRET", "GRAYBOARD_MCP_GOOGLE_CLIENT_SECRET",
   "GRAYBOARD_OKTA_CLIENT_SECRET", "GRAYBOARD_OIDC_CLIENT_SECRET", "SLACK_APP_TOKEN", "SLACK_BOT_TOKEN", "GRAYBOARD_GOOGLE_DIRECTORY_KEY",
-  "GRAYBOARD_KEYCLOAK_DIRECTORY_CLIENT_SECRET",
+  "GRAYBOARD_KEYCLOAK_DIRECTORY_CLIENT_SECRET", "GRAYBOARD_OKTA_DIRECTORY_KEY",
 ] as const;
 
 // Resolves each NAME_FILE into env.NAME before anything reads it. Both set (to different values) is refused: which
@@ -215,6 +219,7 @@ export function loadConfig(): Config {
     ...(oidc ? { oidc } : {}),
     ...googleDirectoryConfig(google),
     ...keycloakDirectoryConfig(oidc),
+    ...oktaDirectoryConfig(okta),
     publicUrl: publicUrl.replace(/\/$/, ""),
     messageRetentionDays: retentionDays("GRAYBOARD_MESSAGE_RETENTION_DAYS", process.env.GRAYBOARD_MESSAGE_RETENTION_DAYS, DEFAULT_RETENTION_DAYS),
     auditRetentionDays:   retentionDays("GRAYBOARD_AUDIT_RETENTION_DAYS",   process.env.GRAYBOARD_AUDIT_RETENTION_DAYS,   90),
@@ -675,12 +680,12 @@ export function recheckConfig(config: Pick<Config, "idpRecheck" | "idpReauthDays
 }
 
 // The startup line for #930: which sign-in providers have a directory check (Google with a directory key, oidc with
-// Keycloak's), and which the server can't ask about a user's status, so their users re-authenticate every
+// Keycloak's, Okta with a service app), and which the server can't ask about a user's status, so their users re-authenticate every
 // GRAYBOARD_IDP_REAUTH_DAYS.
-export function describeReauth(config: Pick<Config, "idps" | "idpReauthDays" | "idpRecheck" | "googleDirectory" | "keycloakDirectory">): string {
+export function describeReauth(config: Pick<Config, "idps" | "idpReauthDays" | "idpRecheck" | "googleDirectory" | "keycloakDirectory" | "oktaDirectory">): string {
   const days = config.idpReauthDays ?? DEFAULT_IDP_REAUTH_DAYS;
   const idps = config.idps ?? ["google"];
-  const checked = idps.filter(id => (id === "google" && config.googleDirectory) || (id === "oidc" && config.keycloakDirectory));
+  const checked = idps.filter(id => (id === "google" && config.googleDirectory) || (id === "oidc" && config.keycloakDirectory) || (id === "okta" && config.oktaDirectory));
   const unchecked = idps.filter(id => !checked.includes(id));
   const recheck = checked.length ? `directory check every ${recheckConfig(config).recheckHours} h (${checked.join(", ")})` : "";
   if (!unchecked.length) return recheck;
@@ -724,6 +729,32 @@ function keycloakDirectoryConfig(oidc: OidcConfig | undefined): { keycloakDirect
   if (!url || !(url.protocol === "https:" || url.protocol === "http:") || /[?#]/.test(raw) || raw.endsWith("/") || url.username || url.password || url.pathname.includes("/realms/"))
     throw new Error("GRAYBOARD_KEYCLOAK_DIRECTORY_URL must be an http(s) URL with no query, fragment, credentials or trailing slash: Keycloak's base, the part of a realm URL before /realms/");
   return { keycloakDirectory: { baseUrl: raw, realm: realm.realm, clientId, clientSecret } };
+}
+
+const OKTA_DIRECTORY_VARS = ["GRAYBOARD_OKTA_DIRECTORY_CLIENT_ID", "GRAYBOARD_OKTA_DIRECTORY_KEY"] as const;
+
+// Okta's directory check: the service app's id and key, both or neither, and only with okta listed. The org URL is
+// GRAYBOARD_OKTA_ISSUER's origin, or GRAYBOARD_OKTA_DIRECTORY_URL (an org whose issuer is on a custom domain names its
+// okta.com domain there); GRAYBOARD_OKTA_DIRECTORY_KEY_ID, optional, is the key's id for a PEM key.
+function oktaDirectoryConfig(okta: OktaConfig | undefined): { oktaDirectory?: OktaDirectoryConfig } {
+  const optional = ["GRAYBOARD_OKTA_DIRECTORY_KEY_ID", "GRAYBOARD_OKTA_DIRECTORY_URL"];
+  const set = [...OKTA_DIRECTORY_VARS, ...optional].filter(name => process.env[name] !== undefined);
+  if (!set.length) return {};
+  for (const name of OKTA_DIRECTORY_VARS) if (!process.env[name]) throw new Error(`${set.join(", ")} set, so ${name} is required too`);
+  if (!okta) throw new Error(`${set.join(", ")} set but GRAYBOARD_IDPS doesn't list okta`);
+  const clientId = process.env.GRAYBOARD_OKTA_DIRECTORY_CLIENT_ID!;
+  if (!CREDENTIAL.test(clientId)) throw new Error("GRAYBOARD_OKTA_DIRECTORY_CLIENT_ID must be a nonempty client id without whitespace");
+  const key = parseOktaDirectoryKey(process.env.GRAYBOARD_OKTA_DIRECTORY_KEY!, process.env.GRAYBOARD_OKTA_DIRECTORY_KEY_ID);
+  const raw = process.env.GRAYBOARD_OKTA_DIRECTORY_URL;
+  let orgUrl: string | null;
+  if (raw === undefined) {
+    orgUrl = oktaOrgUrl(okta.issuer);
+    if (!orgUrl) throw new Error("GRAYBOARD_OKTA_ISSUER is not an Okta authorization server URL (https://<org>, or https://<org>/oauth2/<id>), which the Okta directory check needs");
+  } else {
+    orgUrl = oktaOrgUrl(raw);
+    if (!orgUrl || orgUrl !== raw) throw new Error("GRAYBOARD_OKTA_DIRECTORY_URL must be the org's https origin, such as https://example.okta.com, with no path or trailing slash");
+  }
+  return { oktaDirectory: { orgUrl, clientId, ...key } };
 }
 
 // Port 0 (an ephemeral port, what tests use) through 65535. Gated to plain digits so
