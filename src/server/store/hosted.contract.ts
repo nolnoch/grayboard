@@ -523,13 +523,15 @@ function seams(it: It): void {
       ["forgetLost", () => h.hosted.forgetLost(kept, "r", lost.alias)], ["heartbeat", () => h.hosted.heartbeat(kept, T0 + 9)],
       ["setRoot", () => h.hosted.setRoot(kept, "c", "r")], ["reopenId", () => h.hosted.reopenId(kept, "c")],
       ["restateWritesAs", () => h.hosted.restateWritesAs(kept, "r", lost.alias)], ["declareLauncher", () => h.hosted.declareLauncher(kept, "r")],
-      ["get", () => h.hosted.get(kept, "r")], ["owned", () => h.hosted.owned(kept, "r")], ["all", () => h.hosted.all(kept)],
+      ["get", () => h.hosted.get(kept, "r")], ["getMany", () => h.hosted.getMany(kept, ["r", "c"])], ["owned", () => h.hosted.owned(kept, "r")], ["all", () => h.hosted.all(kept)],
       ["counts", () => h.hosted.counts(kept, u)], ["ofOwnership", () => h.hosted.ofOwnership(kept, r.ownership_id)],
       ["children", () => h.hosted.children(kept, "r")], ["roots", () => h.hosted.roots(kept, u)], ["expired", () => h.hosted.expired(kept, T0 + 9)],
       ["idle", () => h.hosted.idle(kept, T0 + 9)], ["disabled", () => h.hosted.disabled(kept)], ["lost", () => h.hosted.lost(kept, "r", "agent")],
       ["aliveAt", () => h.hosted.aliveAt(kept)], ["launcher", () => h.hosted.launcher(kept, "r")], ["holds", () => h.hosted.holds(kept)],
     ];
     for (const [name, call] of calls) expect(`${name}: ${await failure(call)}`).toMatch(new RegExp(`^${name}: .*${settled.source}`));
+    // No IDs, no statement: an empty getMany answers even on the finished handle (#1572).
+    expect(await h.hosted.getMany(kept, [])).toEqual([]);
     expect(await get(h, "r")).toEqual(r);
     expect(await get(h, "c")).toEqual(c);
     expect(await get(h, "r2")).toBeUndefined();
