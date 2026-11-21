@@ -162,7 +162,8 @@ describe("Postgres TLS through the URL (#1525)", () => {
       expect(await attempt(url("localhost", q, plainFake.port))).toEqual({ handshake: false, code: "ERR_POSTGRES_TLS_NOT_AVAILABLE" });
       expect(bytesAfterN).toBe(0);
     }
-  });
+    // Above the pool's 5 s connectionTimeout, so a plaintext fallback fails on the code mismatch, not the test timeout.
+  }, 15_000);
 
   test("a certificate refusal fails the startup wait at once instead of retrying", async () => {
     let sleeps = 0;
