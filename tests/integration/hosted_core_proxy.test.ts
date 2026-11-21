@@ -731,6 +731,13 @@ test("a call cut off after its request left reports its outcome unknown and is s
     expect(await bodies()).toEqual(["landed"]);
     // A failed probe says nothing of the pooled socket, so the shared connection was kept: no new one was listed.
     expect(lists).toBe(4);
+    // A probe whose connect errors (refused here) doesn't decide: the request's own fetch does, and this one answers,
+    // as a test's stubbed fetch or a host's shim would where a direct connect can't reach.
+    probed = probes;
+    connectProbe.open = () => { probes++; return probe0.open("127.0.0.1", 1); };
+    expect(await bodies()).toEqual(["landed"]);
+    expect(probes).toBe(probed + 1);
+    connectProbe.open = (host, port) => { probes++; return probe0.open(host, port); };
     // One request per call: nothing resent any of them, and the blackholed one never left.
     expect(posts).toEqual(["503", "reset", "refused"]);
 

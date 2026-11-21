@@ -31734,7 +31734,7 @@ function probe(url, signal) {
     const onAbort = () => done(signal.reason);
     signal.addEventListener("abort", onAbort, { once: true });
     socket.once("connect", () => done());
-    socket.once("error", done);
+    socket.once("error", () => done());
   });
 }
 async function methodOf(request) {

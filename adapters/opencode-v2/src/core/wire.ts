@@ -178,8 +178,10 @@ const connectMethods = new Set(["server/discover", "initialize"]);
 // at 10 s, after the SDK's 10 s request timeout), so a blackholed endpoint would fail a call as a request timeout,
 // OutcomeUnknown, though nothing left. Before a tool call on a wire with no recent answer, a plain TCP connect to the
 // endpoint under a deadline shorter than the request's (the Rust SDK's CONNECT_TIMEOUT) proves the server reachable
-// or the call unsent. Skipped behind a proxy, where a direct connect proves nothing. Tests shorten the deadline, or
-// replace `open` with a socket that never connects.
+// or the call unsent. Only its own deadline fails the call: a connect error (refused, unresolvable) falls through to
+// the request, whose fetch classifies it as unsent itself, so a fetch that resolves or routes differently from a
+// direct connect (a test's stub, a host's shim) still decides. Skipped behind a proxy, where a direct connect proves
+// nothing. Tests shorten the deadline, or replace `open` with a socket that never connects.
 export const connectProbe = { deadlineMs: 5_000, coldMs: 30_000, open: (host: string, port: number): Socket => tcpConnect({ host, port }) };
 function proxied(url: URL): boolean {
   const env = typeof process === "undefined" ? {} : process.env;
@@ -203,7 +205,7 @@ function probe(url: URL, signal: AbortSignal): Promise<void> {
     const onAbort = () => done(signal.reason);
     signal.addEventListener("abort", onAbort, { once: true });
     socket.once("connect", () => done());
-    socket.once("error", done);
+    socket.once("error", () => done());
   });
 }
 async function methodOf(request: Request): Promise<string | undefined> {
@@ -237,7 +239,7 @@ abstract class Connection {
         const method = await methodOf(request);
         const connecting = method !== undefined && connectMethods.has(method);
         if (this.probes && method === "tools/call" && performance.now() - this.answeredAt >= connectProbe.coldMs && !proxied(endpoint)) {
-          // An abort stays itself (a stop, or the caller's); any other failure means the request never left.
+          // An abort stays itself (a stop, or the caller's); the deadline means the request never left.
           try { await probe(endpoint, signal); } catch (error) { throw signal.aborted ? error : new ConnectProbeFailed(error); }
         }
         for (let attempt = 0; ; attempt++) {
