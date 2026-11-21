@@ -51,6 +51,16 @@ class EndpointClosedError extends Error { override name = "EndpointClosedError";
 type CallToolResult = z.infer<typeof CallToolResultSchema>;
 const id = z.number().int().positive();
 const ids = z.array(id);
+// A request or exchange capacity refusal (#1536): the JSON-RPC `rate_limited` body admission's 429 uses, with a
+// jittered `retry_after_ms`, so hosted-core's wire retries it and a refused connect burst spreads out. A plain-text 429
+// on a connect's `server/discover` reads to the MCP SDK as a legacy server and fails as a causeless
+// ERA_NEGOTIATION_FAILED. The listen cap stays plain text: hosted-core's `listenCapacity` matches that body (#1394).
+// The caller counts the refusal. `id` is null: the body hasn't been read.
+function capacityRefused(message: string): Response {
+  const retryAfterMs = 500 + Math.floor(Math.random() * 1000);
+  return Response.json({ jsonrpc: "2.0", id: null, error: { code: -32000, message, data: { code: "rate_limited", retry_after_ms: retryAfterMs } } },
+    { status: 429, headers: { "Retry-After": String(Math.ceil(retryAfterMs / 1000)) } });
+}
 const text = (value: unknown): CallToolResult => ({ content: [{ type: "text", text: typeof value === "string" ? value : JSON.stringify(value, null, 2) }] });
 const LEGACY_GET_PRIME = ": keepalive\n\n";
 // `declared`: the native request's declared delivery (#429), for text only.
@@ -1063,14 +1073,14 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
         boundary.principal = principal.authed.user_id;
         postReservation = post ? reserve("post", principal) : undefined;
       } catch (error) { report(error, "hosted-fetch", boundary); return Response.json({ code: "internal", message: "internal error" }, { status: 500 }); }
-      if (post && !postReservation) return new Response("MCP request capacity reached", { status: 429 }); // counted in reserve()
+      if (post && !postReservation) return capacityRefused("MCP request capacity reached"); // counted in reserve()
       let released = false, legacyPost: Legacy | undefined;
       const releasePost = () => {
         if (post && !released) { released = true; posts--; postReservation!(); }
         if (legacyPost) { legacyPost.posts--; legacyPost.lastUsed = now(); legacyPost = undefined; }
       };
       if (post) posts++;
-      if (pendingRequests.size >= exchangeCap) { releasePost(); countRefusal("mcp_exchange"); return new Response("MCP exchange capacity reached", { status: 429 }); }
+      if (pendingRequests.size >= exchangeCap) { releasePost(); countRefusal("mcp_exchange"); return capacityRefused("MCP exchange capacity reached"); }
       let finishRequest!: () => void;
       const pendingRequest = new Promise<void>(resolve => { finishRequest = resolve; });
       pendingRequests.add(pendingRequest);

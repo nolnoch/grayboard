@@ -31621,6 +31621,14 @@ class ServerUnreachable extends Error {
   }
 }
 
+class ServerBusy extends ServerUnreachable {
+  retryAfterMs;
+  constructor(retryAfterMs) {
+    super(new Error(`server at capacity (rate_limited); retry after ${retryAfterMs} ms`));
+    this.retryAfterMs = retryAfterMs;
+  }
+}
+
 class OutcomeUnknown extends ServerUnreachable {
   constructor(cause) {
     super(cause);
@@ -31707,6 +31715,7 @@ class Connection {
   admissionRetryAfterMs;
   connect;
   refusal;
+  busy;
   constructor(wireOptions, authProvider, signal, beforeRetry) {
     this.wireOptions = wireOptions;
     this.signal = signal;
@@ -31724,29 +31733,39 @@ class Connection {
         this.decorate(outgoing);
         const signal = AbortSignal.any([request.signal, this.signal]);
         const method = await methodOf(request);
+        const connecting = method !== undefined && connectMethods.has(method);
         for (let attempt = 0;; attempt++) {
           if (attempt) {
-            await beforeRetry?.();
-            const token = await authProvider.token();
-            if (token)
-              outgoing.set("Authorization", `Bearer ${token}`);
-            else
-              outgoing.delete("Authorization");
+            try {
+              await beforeRetry?.();
+              const token = await authProvider.token();
+              if (token)
+                outgoing.set("Authorization", `Bearer ${token}`);
+              else
+                outgoing.delete("Authorization");
+            } catch (error) {
+              if (connecting)
+                this.busy = undefined;
+              throw error;
+            }
           }
           signal.throwIfAborted();
           const response = await fetch(request.clone(), { headers: outgoing, redirect: "error", signal });
-          if (method && connectMethods.has(method) && !response.ok && ![401, 403, 429].includes(response.status) && !gatewayStatuses.has(response.status)) {
+          if (connecting && !response.ok && ![401, 403, 429].includes(response.status) && !gatewayStatuses.has(response.status)) {
             this.refusal = new ConnectRefused(response.status, (await response.clone().text().catch(() => "")).slice(0, 4096));
           }
-          if (response.status !== 429)
-            return response;
-          const body = await response.clone().json().catch(() => {
+          const body = response.status === 429 ? await response.clone().json().catch(() => {
             return;
-          });
+          }) : undefined;
           const data = body?.error?.data;
-          if (data?.code !== "rate_limited" || typeof data.retry_after_ms !== "number" || !Number.isFinite(data.retry_after_ms) || data.retry_after_ms <= 0)
+          if (data?.code !== "rate_limited" || typeof data.retry_after_ms !== "number" || !Number.isFinite(data.retry_after_ms) || data.retry_after_ms <= 0) {
+            if (connecting)
+              this.busy = undefined;
             return response;
+          }
           this.admissionRetryAfterMs = data.retry_after_ms;
+          if (connecting)
+            this.busy = new ServerBusy(data.retry_after_ms);
           if (attempt === 7)
             return response;
           await response.body?.cancel().catch(() => {});
@@ -31764,7 +31783,7 @@ class Connection {
       try {
         await this.reachable(this.client.connect(transport, { signal, timeout: 1e4 }));
       } catch (error) {
-        throw this.refusal ?? error;
+        throw this.refusal ?? (!this.signal.aborted || this.signal.reason?.name === "TimeoutError" ? this.busy : undefined) ?? error;
       }
     };
   }

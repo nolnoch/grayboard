@@ -2,7 +2,8 @@
 // (SdkError {cause}) and hosted-core's wire wraps an outage (ServerUnreachable {cause}), so the outer class alone
 // ("connect/SdkError") hides what failed: a request timeout, a capacity 429, a reset. This walks the cause chain and
 // names each link: its class, an SdkError's code, an HTTP status and, for a plain-text 429 or 503, the server's body
-// (its capacity refusals differ only there: "MCP request capacity reached", "MCP listen capacity reached").
+// ("MCP listen capacity reached"). The request and exchange caps answer `rate_limited` JSON (#1536): a connect that
+// exhausts the wire's retries on one is a ServerBusy, and any other request's shows as a bare http_429.
 import { SdkError, SdkHttpError } from "@modelcontextprotocol/client";
 import { HostedToolError } from "../tests/support/hosted_session.ts";
 
