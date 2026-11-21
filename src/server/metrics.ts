@@ -89,6 +89,17 @@ export function queueWaitersNow(): number { return queueWaiters; }
 // so this is the scheduler's world-stop time, an exclusive body's drain of the keyed bodies ahead of it plus its hold.
 export function queueWorldStop(seconds: number) { queueWorldStopS += seconds; }
 
+// The hosted gate's keyed fast path (#1510 chunk 3, hosted.ts withGate/withPrior): per site, a request whose body ran
+// keyed (`keyed`), one whose keyed attempt missed and ran the exclusive body after it (`miss`), and one that ran
+// exclusive without an attempt (`skipped`: SQLite, no row yet, a parked row, a prior that differed outright).
+export const GATE_SITES = ["gate", "prior"] as const;
+export const GATE_OUTCOMES = ["keyed", "miss", "skipped"] as const;
+export type GateSite = typeof GATE_SITES[number];
+export type GateOutcome = typeof GATE_OUTCOMES[number];
+const gateFast = new Map<string, number>(GATE_SITES.flatMap(s => GATE_OUTCOMES.map(o => [`${s}:${o}`, 0] as const)));
+export function countGate(site: GateSite, outcome: GateOutcome) { const k = `${site}:${outcome}`; gateFast.set(k, gateFast.get(k)! + 1); }
+export function gateCount(site: GateSite, outcome: GateOutcome): number { return gateFast.get(`${site}:${outcome}`)!; }
+
 // Event-loop lag, in windows: each window's p50/p99/max of the loop's delay, then a reset. The
 // scrape reports the last finished window, so it costs nothing and doesn't depend on the scraper's
 // cadence. Shared by every server in the process: started and stopped by reference count; the
@@ -217,6 +228,8 @@ export function render(gauges: Gauges = {}): string {
   for (const [site, b] of queueHold) out.push(`grayboard_write_queue_bodies_total${labelText({ site })} ${b.count}`);
   family("grayboard_write_queue_keyed_bodies_total", "counter", "Write-queue bodies released that ran keyed (overlapping other keyed bodies), by calling site; the rest ran exclusive.");
   for (const [site, n] of queueKeyed) out.push(`grayboard_write_queue_keyed_bodies_total${labelText({ site })} ${n}`);
+  family("grayboard_hosted_gate_bodies_total", "counter", "Hosted gate requests by site and how the gate body ran: keyed (the fast path), miss (a keyed attempt, then the exclusive body), skipped (exclusive without an attempt).");
+  for (const [k, n] of gateFast) { const [site, outcome] = k.split(":"); out.push(`grayboard_hosted_gate_bodies_total${labelText({ site: site!, outcome: outcome! })} ${n}`); }
   family("grayboard_write_queue_world_stop_seconds_total", "counter", "Seconds in which an exclusive write-queue body waited or ran, so keyed bodies arriving meanwhile waited behind it: its drain of the keyed bodies ahead of it plus its hold.");
   out.push(`grayboard_write_queue_world_stop_seconds_total ${num(queueWorldStopS)}`);
   family("grayboard_write_queue_depth", "histogram", "Bodies already waiting when a body queues behind a held write queue.");

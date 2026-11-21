@@ -32,7 +32,8 @@ import { makePgOAuth } from "./store/pg/oauth.ts";
 import { makePgSessionEnd } from "./store/pg/session_end.ts";
 import { makePgSlack } from "./store/pg/slack.ts";
 import { openPg } from "./store/pg/sql.ts";
-import { makePgTransactions } from "./store/pg/tx.ts";
+import { makePgTransactions, refuseKeyed } from "./store/pg/tx.ts";
+import type { Tx } from "./store/tx.ts";
 import type { WriteQueue } from "./store/queue.ts";
 import { makePgWriteReceipts } from "./store/pg/write_receipts.ts";
 import { DEFAULT_ATTACHMENT_LIMITS, DEFAULT_ATTACHMENT_USER_QUOTA, type AttachmentLimits } from "../shared/attachments.ts";
@@ -81,8 +82,11 @@ export async function makePgRepo(url: string, opts: PgRepoOptions): Promise<PgRe
   }
 
   // Each notice waits on the Tx it's given (store/notices.ts).
-  const notices = makeNotices((tx, effect) => tx.afterCommit(effect));
+  // A keyed body queues none (refuseKeyed, D4).
+  const notices = makeNotices((tx, effect) => tx.afterCommit(effect), (tx, op) => refuseKeyed(tx, op));
   const { change, marks } = notices;
+  // The Repo's keyed write takes no options: `{ effects: true }` lives only on PgTransactions (D4, audit L7).
+  const writeKeyed = ((keys: readonly string[], fn: (tx: Tx) => Promise<unknown>, committed?: (value: unknown) => unknown) => t.writeKeyed(keys, fn, committed)) as Repo["writeKeyed"];
   // The end a released hosted child's ID ends through, made from the finished Repo on first use, as db.ts openDatabase does.
   let port: SessionEndPort | undefined;
   const hosted = makePgHosted({ sessionEnd: deferredSessionEnd(() => port ??= sessionEndPort(opts.humanReach ?? "team")(repo)) });
@@ -95,20 +99,21 @@ export async function makePgRepo(url: string, opts: PgRepoOptions): Promise<PgRe
 
   const repoHosted: RepoHosted = {
     ...hosted,
-    insert: marks(hosted.insert, (_tx, row) => row.session_id), update: marks(hosted.update, (_tx, id) => id),
-    end: marks(hosted.end, (_tx, session) => session), childEnd: marks(hosted.childEnd, (_tx, session) => session),
-    park: marks(hosted.park, (_tx, session) => session), unpark: marks(hosted.unpark, (_tx, session) => session),
+    insert: marks(hosted.insert, (_tx, row) => row.session_id, "hosted.insert"), update: marks(hosted.update, (_tx, id) => id, "hosted.update"),
+    end: marks(hosted.end, (_tx, session) => session, "hosted.end"), childEnd: marks(hosted.childEnd, (_tx, session) => session, "hosted.childEnd"),
+    park: marks(hosted.park, (_tx, session) => session, "hosted.park"), unpark: marks(hosted.unpark, (_tx, session) => session, "hosted.unpark"),
     write: t.write,
-    writeKeyed: t.writeKeyed,
+    writeKeyed,
     subscribe: notices.subscribe,
   };
 
   const repo: PgRepo = {
     now: clock,
     write: t.write,
-    writeKeyed: t.writeKeyed,
+    writeKeyed,
     post: t.post,
     postKeyed: t.postKeyed,
+    readsOnly: t.readsOnly,
     writeQueue: t.queue,
     read: t.read,
     authRead: auth.authRead,
@@ -116,11 +121,12 @@ export async function makePgRepo(url: string, opts: PgRepoOptions): Promise<PgRe
     authGeneration: auth.authGeneration,
     commitGeneration: auth.commitGeneration,
     // The revokes notify, as on SQLite (db.ts makeRepo): a credential's add, rotate and mint only add authority.
-    oauth: { ...oauth, findActiveAccess: auth.findActiveAccess, redeemCode: change(oauth.redeemCode), rotateRefresh: change(oauth.rotateRefresh),
-      revokeToken: change(oauth.revokeToken), revokeServiceCredential: change(oauth.revokeServiceCredential), revokeServiceSecret: change(oauth.revokeServiceSecret) },
+    oauth: { ...oauth, findActiveAccess: auth.findActiveAccess, redeemCode: change(oauth.redeemCode, "oauth.redeemCode"), rotateRefresh: change(oauth.rotateRefresh, "oauth.rotateRefresh"),
+      revokeToken: change(oauth.revokeToken, "oauth.revokeToken"), revokeServiceCredential: change(oauth.revokeServiceCredential, "oauth.revokeServiceCredential"),
+      revokeServiceSecret: change(oauth.revokeServiceSecret, "oauth.revokeServiceSecret") },
     hosted: repoHosted,
-    users: { ...identity.users, isDisabled: auth.isDisabled, active: auth.active, setDisabled: change(identity.users.setDisabled) },
-    sessions: { ...identity.sessions, revokeAllForUser: change(identity.sessions.revokeAllForUser) },
+    users: { ...identity.users, isDisabled: auth.isDisabled, active: auth.active, setDisabled: change(identity.users.setDisabled, "users.setDisabled") },
+    sessions: { ...identity.sessions, revokeAllForUser: change(identity.sessions.revokeAllForUser, "sessions.revokeAllForUser") },
     principals: identity.principals,
     teams: identity.teams,
     roles: identity.roles,

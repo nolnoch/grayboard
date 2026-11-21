@@ -35,6 +35,9 @@ const holder = new AsyncLocalStorage<Token>();
 // it starts without a site of its own counts under the body's.
 const sites = new AsyncLocalStorage<QueueSite>();
 export function atSite<T>(site: QueueSite, fn: () => T): T { return sites.run(site, fn); }
+// The site the calling code runs under (a body's, inside one), undefined outside every `atSite`. For tests that hold
+// one site's bodies.
+export function currentSite(): QueueSite | undefined { return sites.getStore(); }
 
 // `keys`: a keyed body's, undefined for an exclusive one. `enter`: the queuing task's context, for a body that waits
 // (AsyncLocalStorage.snapshot); one that starts at once already runs in it. `at`: performance.now() at run(), the

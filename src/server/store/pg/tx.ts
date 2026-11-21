@@ -27,7 +27,7 @@
 import { SQL } from "bun";
 import { errorDiagnostic } from "../../diagnostics.ts";
 import { DEFAULT_DATABASE_WRITERS, WriteQueue } from "../queue.ts";
-import { BaseRead, BaseTx, flushEffect, isThenable, type Read, type SavepointFrame, type Tx } from "../tx_base.ts";
+import { BaseRead, BaseTx, flushEffect, isThenable, ProbeWrite, type Read, type SavepointFrame, type Tx } from "../tx_base.ts";
 import { pgFailure } from "./errors.ts";
 import { openPg, type PgOptions } from "./sql.ts";
 
@@ -49,8 +49,13 @@ function openOf(store: Store): PgTx | undefined {
 // `failed`: the first eager statement's failure that aborted it (eagerFailure), with the frames open when that statement
 // was sent; a ROLLBACK TO of one of those frames undid the failure and clears it.
 // `keys`: a keyed body's (writeKeyed), on the transaction rather than a Tx handle so its savepoints carry them too;
-// undefined for an exclusive body.
-type Txn = { readonly conn: SQL; readonly stack: object[]; n: number; ended: boolean; readonly keys?: ReadonlySet<string>; failed?: { error: unknown; frames: object[] } };
+// undefined for an exclusive body. `effects`: a keyed body whose caller opted in to afterCommit effects and `committed`
+// (writeKeyed's `effects`); without it they refuse. `probe`: set while readsOnly runs on the transaction, with the first
+// statement it refused.
+type Txn = {
+  readonly conn: SQL; readonly stack: object[]; n: number; ended: boolean; readonly keys?: ReadonlySet<string>; readonly effects?: boolean;
+  failed?: { error: unknown; frames: object[] }; probe?: { refused?: ProbeWrite };
+};
 
 const READ_REFUSAL = "repo.read inside the caller's own transaction: pass the body's Tx (#807 D2)";
 
@@ -89,11 +94,52 @@ export class TxAborted extends Error {
 // keyed fails in the first test that reaches the call, instead of reordering ids or racing a lock in production:
 // messages.insert needs `dm:<recipient>` and boards.insertPost `board:<name>` (id commit order, G1), and
 // hosted.lockCapacity is refused outright (the capacity paths stay exclusive).
+// Inside a readsOnly probe the refusal is the probe's (a ProbeWrite, a miss for its caller), since what it refuses is a
+// write or a lock only an exclusive body takes.
 export function refuseKeyed(h: Read, op: string, needs?: string): void {
   if (!(h instanceof PgTx)) return;
   const keys = h.txn.keys;
   if (keys === undefined || (needs !== undefined && keys.has(needs))) return;
-  throw new Error(`${op} refused in a keyed write body (keys ${[...keys].join(", ")})${needs === undefined ? "" : ` without the key ${needs}`}: it runs in an exclusive body (write) (docs/future/postgres-server.md D4)`);
+  if (h.txn.probe) probeRefusal(h.txn, op);
+  throw new Error(keyedRefusal(op, keys, needs));
+}
+const keyedRefusal = (op: string, keys: ReadonlySet<string>, needs?: string) =>
+  `${op} refused in a keyed write body (keys ${[...keys].join(", ")})${needs === undefined ? "" : ` without the key ${needs}`}: it runs in an exclusive body (write) (docs/future/postgres-server.md D4)`;
+
+// A read-only probe's refusal: noted on the transaction (so a caller that swallows it still misses) and thrown.
+function probeRefusal(txn: Txn, op: string): never {
+  const refused = new ProbeWrite(`${op} refused in a read-only probe${txn.keys ? ` (keys ${[...txn.keys].join(", ")})` : ""}: the probed code would write (docs/future/postgres-server.md D4)`);
+  txn.probe!.refused ??= refused;
+  throw refused;
+}
+
+// What a probe lets through: a statement whose first word is SELECT and that names no advisory lock. Every write
+// (INSERT, UPDATE, DELETE, a data-modifying WITH, DDL) and every statement whose text starts with an interpolation
+// refuses. Row locks (FOR UPDATE, FOR SHARE) pass: the probed code takes the rows it reads.
+const PROBE_READ = /^\s*select\b/i;
+const PROBE_ADVISORY = /pg_advisory/i;
+function probeCheck(txn: Txn, text: string): void {
+  if (!txn.probe) return;
+  if (!PROBE_READ.test(text) || PROBE_ADVISORY.test(text)) probeRefusal(txn, `the statement "${text.trim().split(/\s+/).slice(0, 3).join(" ")} …"`);
+}
+
+// Runs fn with `tx`'s transaction in a read-only probe (#1510, docs/future/postgres-server.md D4): every statement it
+// sends on that transaction is checked as it's built (probeCheck), and refuseKeyed's refusals become the probe's. The
+// first refusal rejects the probe, ProbeWrite, before anything it refused was sent, even if fn caught it and went on.
+// Not nested; the probe ends when fn settles, so the caller's later statements write.
+export async function readsOnly<T>(tx: Tx, fn: () => Promise<T>): Promise<T> {
+  if (!(tx instanceof PgTx)) throw new Error("readsOnly needs a Postgres body's Tx");
+  tx.assertLive();
+  const txn = tx.txn;
+  if (txn.probe) throw new Error("readsOnly nested in a probe");
+  const probe: { refused?: ProbeWrite } = {};
+  txn.probe = probe;
+  let out: T;
+  try { out = await fn(); }
+  catch (error) { if (probe.refused) throw probe.refused; throw error; }
+  finally { txn.probe = undefined; }
+  if (probe.refused) throw probe.refused;
+  return out;
 }
 
 // For a statement a store function sends on `tx` without awaiting it (pg/audit.ts write): call at send time, and pass
@@ -180,7 +226,20 @@ class PgTx extends BaseTx {
     return { frame, tx: new PgTx(this.store, this.txn, root) };
   }
 
-  protected deferEffect(effect: Effect): void { this.effects.push(effect); }
+  // A keyed body's beforeCommit hooks refuse as its effects do (D4, #1510 chunk 3 audit L6): a hook runs other code at
+  // the commit, in this body's context, while other keyed bodies run, and one registered in a readsOnly probe would
+  // run after the probe ends, unchecked. In a probe the refusal is its ProbeWrite (refuseKeyed).
+  override beforeCommit(key: object, hook: (tx: Tx) => Promise<void>): void {
+    if (!this.txn.effects) refuseKeyed(this as unknown as Read, "a beforeCommit hook");
+    super.beforeCommit(key, hook);
+  }
+
+  // A keyed body's effects refuse unless its caller opted in (D4): an effect runs other code at the commit, in this
+  // body's context, while other keyed bodies run.
+  protected deferEffect(effect: Effect): void {
+    if (!this.txn.effects) refuseKeyed(this as unknown as Read, "afterCommit effect");
+    this.effects.push(effect);
+  }
 
   protected override settled(inner: BaseTx, kept: boolean): void {
     const t = inner as PgTx;
@@ -217,13 +276,14 @@ function fragment(q: SQL.Query<unknown>): PgFragment {
   return Object.defineProperty(q, "then", { value() { throw new Error("a PgSql fragment awaited: it goes inside a statement (pgOf)"); } }) as unknown as PgFragment;
 }
 
-function statements(conn: SQL, check: () => void): PgSql {
+// `check` gets the statement's text (a template's literal pieces), before it's sent.
+function statements(conn: SQL, check: (text: string) => void): PgSql {
   const sql = ((first: unknown, ...rest: unknown[]) => {
-    if (isTemplate(first)) { check(); return conn(first, ...rest).execute(); }
+    if (isTemplate(first)) { check(first.join(" ")); return conn(first, ...rest).execute(); }
     if (typeof first === "string") return fragment(conn(first));
     return (conn as unknown as (...a: unknown[]) => unknown)(first, ...rest);
   }) as PgSql;
-  sql.unsafe = (text, values) => { check(); return conn.unsafe(text, values).execute(); };
+  sql.unsafe = (text, values) => { check(text); return conn.unsafe(text, values).execute(); };
   sql.fragment = (strings, ...values) => fragment(conn(strings, ...values));
   return sql;
 }
@@ -232,9 +292,9 @@ function statements(conn: SQL, check: () => void): PgSql {
 // whose savepoint is open), a handle from another backend, and the store's Read from a body whose transaction is open
 // (or a task it started): a pool read there sees none of the body's rows. Such a caller passes its body's Tx. Judged
 // per body (openOf): another body's open transaction doesn't refuse this caller's read. Checked here and again as each
-// statement is sent. The refusals read as SQLite's.
+// statement is sent. The refusals read as SQLite's. A Tx's statement in a readsOnly probe is checked too (probeCheck).
 export function pgOf(r: Read): PgSql {
-  if (r instanceof PgTx) { r.assertLive(); return statements(r.txn.conn, () => r.assertLive()); }
+  if (r instanceof PgTx) { r.assertLive(); return statements(r.txn.conn, text => { r.assertLive(); probeCheck(r.txn, text); }); }
   if (!(r instanceof PgRead)) throw new Error("not a Postgres store handle");
   const { store } = r;
   const check = () => { if (openOf(store)) throw new Error(READ_REFUSAL); };
@@ -249,6 +309,9 @@ function loggable(error: unknown): unknown {
   return error instanceof SQL.SQLError || error instanceof TxAborted ? errorDiagnostic(error) : error;
 }
 
+// `effects`: the keyed body may register afterCommit effects and pass `committed` (D4: a reviewed opt-in).
+export type KeyedOptions = { effects?: true };
+
 export type PgTransactions = {
   // A top-level write transaction through the store's scheduler, exclusive: SQLite's Repo.write contract (db.ts
   // `queued`). fn's Tx is live until fn settles; the beforeCommit hooks run after it fulfils; COMMIT, then the
@@ -256,13 +319,16 @@ export type PgTransactions = {
   // commits async too.
   write<T, R = T>(fn: (tx: Tx) => T | PromiseLike<T>, committed?: (value: T) => R): Promise<Awaited<R>>;
   // write, keyed (store/queue.ts runKeyed, #1510): it overlaps running keyed bodies that share none of `keys`, on a
-  // connection of its own; its effects and `committed` still run before any body that conflicts with it starts.
-  writeKeyed<T, R = T>(keys: readonly string[], fn: (tx: Tx) => T | PromiseLike<T>, committed?: (value: T) => R): Promise<Awaited<R>>;
+  // connection of its own. Its afterCommit effects and `committed` refuse (D4) unless `effects` opts in (no Repo caller
+  // does yet); opted in, they still run before any body that conflicts with it starts.
+  writeKeyed<T, R = T>(keys: readonly string[], fn: (tx: Tx) => T | PromiseLike<T>, committed?: (value: T) => R, opts?: KeyedOptions): Promise<Awaited<R>>;
   // A write no caller awaits: always queued, so always false. Refuses inside the caller's open transaction; a
   // failure, or a rejection of a promise `committed` returns, is logged as `what` failed.
   post<T>(fn: (tx: Tx) => T | PromiseLike<T>, committed?: (value: T) => unknown, what?: string): boolean;
-  // post, keyed: its body runs as writeKeyed's.
+  // post, keyed: its body runs as writeKeyed's, without `effects`.
   postKeyed<T>(keys: readonly string[], fn: (tx: Tx) => T | PromiseLike<T>, committed?: (value: T) => unknown, what?: string): boolean;
+  // Repo.readsOnly: readsOnly above.
+  readsOnly<T>(tx: Tx, fn: () => Promise<T>): Promise<T>;
   read: Read;
   queue: WriteQueue;
   // Whether the calling body's root transaction is open (from BEGIN until `begin` settles): false outside any body,
@@ -303,12 +369,14 @@ export function makePgTransactions(url: string, { ownAuthCommit, writers = DEFAU
   const store: Store = { sql, queue, open: new WeakMap() };
 
   const write = <T, R = T>(fn: (tx: Tx) => T | PromiseLike<T>, committed?: (value: T) => R) => run(undefined, fn, committed);
-  const writeKeyed = <T, R = T>(keys: readonly string[], fn: (tx: Tx) => T | PromiseLike<T>, committed?: (value: T) => R) => run(keys, fn, committed);
+  const writeKeyed = <T, R = T>(keys: readonly string[], fn: (tx: Tx) => T | PromiseLike<T>, committed?: (value: T) => R, opts?: KeyedOptions) => run(keys, fn, committed, opts?.effects === true);
 
-  function run<T, R = T>(keys: readonly string[] | undefined, fn: (tx: Tx) => T | PromiseLike<T>, committed?: (value: T) => R): Promise<Awaited<R>> {
+  function run<T, R = T>(keys: readonly string[] | undefined, fn: (tx: Tx) => T | PromiseLike<T>, committed?: (value: T) => R, effects = false): Promise<Awaited<R>> {
     if (openOf(store)) return Promise.reject(new Error("write() inside an open transaction: nested code calls its Tx's savepoint"));
     // A keyed body's keys, which its transaction carries (refuseKeyed); also the auth mark's refusal below.
     const held = keys === undefined ? undefined : new Set(keys);
+    // `committed` runs other code at the release, in this body's context, while other keyed bodies run (D4).
+    if (held && committed && !effects && Array.isArray(keys) && keys.length) return Promise.reject(new Error(keyedRefusal("a committed callback", held)));
     // fn and committed run as the work of the request that called write(), or of none (db.ts queued, #1042, #1408).
     return (keys === undefined ? queue.run(body) : queue.runKeyed(keys, body)).then(box => box.out) as Promise<Awaited<R>>;
 
@@ -320,7 +388,7 @@ export function makePgTransactions(url: string, { ownAuthCommit, writers = DEFAU
       let box: { v: T };
       try {
         box = await writePool.begin("isolation level read committed, read write", async conn => {
-          const txn: Txn = { conn, stack: [], n: 0, ended: false, ...(held ? { keys: held } : {}) };
+          const txn: Txn = { conn, stack: [], n: 0, ended: false, ...(held ? { keys: held, effects } : {}) };
           root = new PgTx(store, txn);
           store.open.set(token, root);
           try {
@@ -366,6 +434,8 @@ export function makePgTransactions(url: string, { ownAuthCommit, writers = DEFAU
 
   function post<T>(fn: (tx: Tx) => T | PromiseLike<T>, given?: (value: T) => unknown, what = "write", keys?: readonly string[]): boolean {
     if (openOf(store)) throw new Error(`post inside an open transaction (${what}): a body's write goes on its Tx`);
+    // A keyed post takes no `committed` (writeKeyed's refusal, thrown to the caller, since nobody awaits a post).
+    if (keys && given && Array.isArray(keys) && keys.length) throw new Error(keyedRefusal("a committed callback", new Set(keys)));
     // No caller awaits a post: a promise committed returns is caught and logged here (#1051), its throw by the
     // write's own catch, once either way.
     const committed = given && ((value: T) => {
@@ -377,7 +447,7 @@ export function makePgTransactions(url: string, { ownAuthCommit, writers = DEFAU
   }
 
   return {
-    write, writeKeyed,
+    write, writeKeyed, readsOnly,
     post: (fn, committed, what) => post(fn, committed, what),
     postKeyed: (keys, fn, committed, what) => post(fn, committed, what, keys),
     read: new PgRead(store) as unknown as Read,

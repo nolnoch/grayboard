@@ -10,7 +10,7 @@ import { afterCommit, openSavepoint, ownsTx } from "../../core/sqlite.ts";
 import { BaseRead, BaseTx, type Read, type RootTx, type SavepointFrame } from "./tx_base.ts";
 
 // The neutral names, re-exported so a store module keeps importing its handles from here.
-export { afterCommitOf, isTx, type Read, type RootTx, type Tx } from "./tx_base.ts";
+export { afterCommitOf, isTx, ProbeWrite, type Read, type RootTx, type Tx } from "./tx_base.ts";
 
 // The connection, opaque here so this file stays off bun:sqlite (db.test.ts: the Repo facade is the Postgres seam).
 type Database = Parameters<typeof openSavepoint>[0];

@@ -7,6 +7,7 @@ import { DEFAULT_IDLE_SECONDS, MAX_CHILDREN, aliasLostNotice, childCapacity, asS
 import { launcherInstruction } from "../core/delegation.ts";
 import { channelInstructions, COORDINATION_INSTRUCTIONS, DEFAULT_CHANNEL_SOURCE, ownHumanInstruction } from "../core/tools.ts";
 import { normalizeAliasName } from "../core/addresses.ts";
+import { cleanFact } from "../core/text.ts";
 import { HUMAN_NAME, normalizeIdentityName } from "../shared/addressing.ts";
 import { ApplicationError, UNBOUND_READS, type Application, type ApplicationSession, type BuildFacts, type DeliverySink, type IdentityInfo, type RefusalRow } from "./application.ts";
 import type { AuthedUser } from "./auth.ts";
@@ -18,8 +19,8 @@ import type { HostedEnd, HostedLost, HostedSession, LostReader } from "./hosted-
 import { writeAudit, type AuditAction } from "./audit.ts";
 import { hostedFailure } from "./hosted-diagnostics.ts";
 import { decidePure, recordDecision, type PureRequest } from "./policy.ts";
-import { countRefusal } from "./metrics.ts";
-import { isTx, type Read, type Tx } from "./store/tx.ts";
+import { countGate, countRefusal } from "./metrics.ts";
+import { isTx, ProbeWrite, type Read, type Tx } from "./store/tx.ts";
 import { atSite } from "./store/queue.ts";
 
 // `facts`: the model and effort the request reports (#364); a key the request leaves out keeps the stored value, and
@@ -206,7 +207,8 @@ const RECONCILE_EVERY = 120;
 // Activity writes coalesce (#912): a touch skips a row whose last_seen_at is within this of now, at most a tenth
 // of the idle window, so the idle sweep sees a row at most that much older than its last call.
 const TOUCH_EVERY_MS = 5_000;
-export function createHostedSessions(application: Application, options: { now?: () => number; idleSeconds?: number; caps?: HostedCaps["sessions"]; isAuthorized(principal: OAuthPrincipal, r?: Read): boolean | Promise<boolean> }) {
+// `keyedGate: false` turns the gate's keyed fast path off (#1510): tests' reference for what the exclusive body writes.
+export function createHostedSessions(application: Application, options: { now?: () => number; idleSeconds?: number; caps?: HostedCaps["sessions"]; keyedGate?: false; isAuthorized(principal: OAuthPrincipal, r?: Read): boolean | Promise<boolean> }) {
   const repo = application.repo, store = repo.hosted;
   const now = options.now ?? Date.now;
   // GRAYBOARD_HOSTED_IDLE_SECONDS is parsed strictly in config.ts and arrives here as options.idleSeconds.
@@ -675,6 +677,48 @@ export function createHostedSessions(application: Application, options: { now?: 
       },
     };
   }
+  // The gate's keyed fast path (#1510 chunk 3, docs/future/postgres-server.md D4), Postgres only (Repo.readsOnly).
+  const keyedFast = options.keyedGate !== false && repo.readsOnly !== undefined;
+  // A keyed attempt that would have written more than the touch, or refused: it wrote nothing, and its caller runs the
+  // exclusive body, which writes (or refuses) as it would have without the attempt.
+  const MISS = Symbol("keyed gate miss");
+  // The gate body keyed by its root, `root:<id>`, for a request whose row exists, isn't parked and lives under `id`, and
+  // whose settle and rowFor write nothing: the common call of a live session. In lock order (D4): the access and user
+  // reads (authorized, uncached in a body: auth_cache ownsTx), the grant FOR SHARE (grantLive), then settle's root and
+  // row FOR UPDATE (store.lock), then rowFor's ids row FOR NO KEY UPDATE (setIdFacts), all reads; the touch's UPDATEs
+  // write the locked rows. settle and rowFor run in a read-only probe (readsOnly): any write they reach (an end, a
+  // park, an eviction, an unpark, a creation, a facts or launcher change, an audit or refusal row) refuses before its
+  // statement is sent, and so does the capacity lock; the body then returns MISS with nothing written, its refusal rows
+  // (`later`) dropped. An ApplicationError there (another user's row, a changed shape, an unbound child) is a MISS
+  // too, so the exclusive body writes its refusal rows. A refusal of the authorization or the grant, before the probe,
+  // is the request's, as the exclusive body's would be: neither writes. Any other failure is the request's.
+  // Sound against the exclusive writers of these rows (revoke, disable, bind, end, park, sweep): on one process the
+  // scheduler never runs them beside a keyed body, and the body's authorized and grantLive read what committed before
+  // it began; across processes a revoke waits on the grant's share lock, and the others on the rows' locks.
+  async function keyedBody(p: OAuthPrincipal, context: SessionContext & { id: string }, id: string, create: boolean, wake: boolean, declare: boolean): Promise<{ r: HostedSession; seen: number } | typeof MISS> {
+    const readsOnly = repo.readsOnly!;
+    return atSite("gate", () => store.writeKeyed([`root:${id}`], async tx => {
+      await authorized(p, tx);
+      await grantLive(tx, p);
+      let found: { row: HostedSession; root: HostedSession } | typeof MISS;
+      try {
+        found = await readsOnly(tx, async () => {
+          const settled = await settle(tx, context.id, p.authed.user_id);
+          if (!settled?.row || settled.row.parked_at !== null) return MISS;
+          const row = await rowFor(tx, p, context, () => {}, create, wake, declare, settled);
+          if (!row || (row.root_session_id ?? row.session_id) !== id) return MISS;
+          return { row, root: await rootOf(tx, row) };
+        });
+      } catch (error) {
+        if (error instanceof ProbeWrite || error instanceof ApplicationError) return MISS;
+        throw error;
+      }
+      if (found === MISS) return MISS;
+      const { row, root } = found, t = now();
+      const seen = await touchRow(tx, root, t);
+      return { r: row, seen: row.session_id === root.session_id ? seen : Math.min(seen, await touchRow(tx, row, t)) };
+    }));
+  }
   // `endTouch`: whether the call's end is touched (`touchAfter`); an exchange's selection for a tool call leaves it
   // to the tool's own gate, which ends later (#907). `create`: false admits no unknown ID (#1097): `fn` then gets no
   // row, and the gate writes nothing but settle's.
@@ -702,19 +746,28 @@ export function createHostedSessions(application: Application, options: { now?: 
         await testPauseAsync("hosted:gate:checked");
         let waited = false, stale = true;
         try { stale = g === undefined || repo.commitGeneration() !== g; } catch { stale = true; }
+        // The keyed fast path first, where it can run (keyedBody); a miss wrote nothing and runs the exclusive body
+        // below, which checks authorization in its transaction again.
+        const keyed = keyedFast && before !== undefined && before.parked_at === null ? await keyedBody(p, context, id, create, wake, declare) : undefined;
+        countGate("gate", keyed === undefined ? "skipped" : keyed === MISS ? "miss" : "keyed");
+        if (keyed === MISS) waited = true;
         // One queued body: settle commits whether or not rowFor refuses (rowFor's savepoint rolls back alone, and its
         // refusal rows are written after it, in the same commit), and nothing runs between them, so `settled` is
         // current when rowFor reads it.
-        const pending = atSite("gate", () => store.write(async tx => {
-          if (waited || stale) await authorized(p, tx);
-          await grantLive(tx, p);
-          // authorized(p) passed with no commit to the auth tables since: settle skips p's own disabled read (#881).
-          const settled = await settle(tx, context.id, p.authed.user_id);
-          try { return { row: await tx.savepoint(async sp => { const r = await rowFor(sp, p, context, later.defer, create, wake, declare, settled); return r && { r, seen: await touch(sp, r) }; }) }; }
-          catch (error) { await later.flush(tx); return { error }; }
-        }));
-        waited = true;
-        const selected = await pending;
+        let selected: { row?: { r: HostedSession; seen: number } } | { error: unknown };
+        if (keyed !== undefined && keyed !== MISS) selected = { row: keyed };
+        else {
+          const pending = atSite("gate", () => store.write(async tx => {
+            if (waited || stale) await authorized(p, tx);
+            await grantLive(tx, p);
+            // authorized(p) passed with no commit to the auth tables since: settle skips p's own disabled read (#881).
+            const settled = await settle(tx, context.id, p.authed.user_id);
+            try { return { row: await tx.savepoint(async sp => { const r = await rowFor(sp, p, context, later.defer, create, wake, declare, settled); return r && { r, seen: await touch(sp, r) }; }) }; }
+            catch (error) { await later.flush(tx); return { error }; }
+          }));
+          waited = true;
+          selected = await pending;
+        }
         if ("error" in selected) throw selected.error;
         if (!selected.row) return fn(undefined);
         const { r: row, seen } = selected.row;
@@ -736,24 +789,51 @@ export function createHostedSessions(application: Application, options: { now?: 
   // park, a lapsed lease, a new ownership, root or generation, an idle window passed) runs the full gate instead, so
   // every refusal and recovery stays on its one path. `rowFor`'s writes are a selection's, already made: a request's
   // facts and launcher declaration are written only on a change, and its writes_as is fixed for the ownership.
-  const MISS = Symbol("prior stale");
+  // Whether rowFor would write this request's change-only facts on `row` (#364): its model and effort (setIdFacts,
+  // compared as stored, cleanFact) and its launcher declaration (declareLauncher, under rowFor's conditions). The prior
+  // stands in for rowFor only while the selection's writes still read as made: a request built before a switch and
+  // committed after it (a lease op carrying the old facts) reverts them, and this request must then write its own.
+  async function priorWouldWrite(tx: Tx, context: SessionContext, row: HostedSession): Promise<boolean> {
+    if (!("id" in context)) return false;
+    const launcher = context.launcher === true && !row.root_session_id && row.writes_as === null;
+    if (!context.facts && !launcher) return false;
+    const stored = (await repo.bindings.idFacts(tx, [row.session_id])).get(row.session_id);
+    if (!stored) return false;
+    const f = context.facts;
+    if (f?.model !== undefined && cleanFact(f.model) !== stored.model) return true;
+    if (f?.effort !== undefined && cleanFact(f.effort) !== stored.effort) return true;
+    return launcher && stored.launcher !== 1;
+  }
   async function withPrior<T>(p: OAuthPrincipal, context: SessionContext, prior: Verdict, fn: (row: HostedSession | undefined) => Promise<T>): Promise<T> {
     await authorized(p);
-    if (!("id" in context) || context.id !== prior.row.session_id || prior.row.parked_at !== null) return withGate(p, context, false, fn);
+    if (!("id" in context) || context.id !== prior.row.session_id || prior.row.parked_at !== null) { countGate("prior", "skipped"); return withGate(p, context, false, fn); }
     const id = prior.root.session_id;
     const result = await gate(id).call(async () => {
       await authorized(p);
       if (stopped) return MISS;
-      const touched = await atSite("prior", () => store.write(async tx => {
+      // Keyed by the root (#1510 chunk 3, D4), as the gate's fast path: authorization read in the body, the grant FOR
+      // SHARE, plain reads, then the touch's UPDATEs, root first. No row lock before the touch: a row an exclusive
+      // body changes waits for this body, or this body for it, and its reads see the change only after it commits;
+      // either way an end or park this body missed lands before (it refused) or after the call it lets through, as on
+      // the exclusive path. Without the fast path (SQLite, keyedGate: false) the body is exclusive, as before chunk 3:
+      // the queue's one writer leaves nothing to re-read in the body.
+      const body = async (tx: Tx) => {
+        if (keyedFast) {
+          await authorized(p, tx);
+          await grantLive(tx, p);
+        }
         const fresh = await store.get(tx, prior.row.session_id);
         const root = !fresh ? undefined : fresh.root_session_id ? await store.get(tx, fresh.root_session_id) : fresh;
         const t = now();
         if (!fresh || !root || fresh.ownership_id !== prior.row.ownership_id || fresh.root_session_id !== prior.row.root_session_id || fresh.parked_at !== null
           || root.session_id !== id || root.ownership_id !== prior.root.ownership_id || root.bind_gen !== prior.root.bind_gen || root.root_session_id
           || (root.lease_deadline !== null && root.lease_deadline <= t) || idleAt(fresh) || idleAt(root)) return undefined;
+        if (await priorWouldWrite(tx, context, fresh)) return undefined;
         const seen = await touchRow(tx, root, t);
         return { row: fresh, seen: fresh === root ? seen : Math.min(seen, await touchRow(tx, fresh, t)) };
-      }));
+      };
+      const touched = await atSite("prior", () => keyedFast ? store.writeKeyed([`root:${id}`], body) : store.write(body));
+      countGate("prior", !keyedFast ? "skipped" : touched ? "keyed" : "miss");
       if (!touched) return MISS;
       const { row, seen } = touched;
       const ids = [...new Set([row.session_id, id])];

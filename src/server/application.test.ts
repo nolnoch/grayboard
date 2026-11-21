@@ -760,6 +760,18 @@ test("#807 P3 B1c: close's touch commits or rolls back with its body, and from a
   } finally { errors.mockRestore(); }
 });
 
+// #1527 L1: a queued close touch carries its writer's ID key beside its root's, so two sessions of one writer ID under
+// different roots (or none) touch its row in arrival order. Mutation: the touch's keys without `id:<writer>`.
+test("#1510: a queued close touch is keyed by its writer's root and its writer ID", async () => {
+  const keyed = spyOn(store.repo, "writeKeyed");
+  try {
+    const conn = await connect(alice, "keyed-close", { key: "alice-keyed-close" });
+    application.close(conn.session);
+    await until(() => keyed.mock.calls.length > 0, 2000, "the queued close touch");
+    expect(keyed.mock.calls.map(c => c[0])).toEqual([[`root:${conn.id}`, `id:${conn.id}`]]);
+  } finally { keyed.mockRestore(); }
+});
+
 test("#807: a rolled-back attachHuman leaves the earlier bridge connection in place", async () => {
   const first = (await application.attachHuman(alice, delivery())).session;
   store.db.run(`CREATE TRIGGER fail_bind BEFORE INSERT ON binding_events BEGIN SELECT RAISE(ABORT, 'binding refused'); END`);

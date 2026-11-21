@@ -790,8 +790,13 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
   }
   // The last-seen touch outside a body is keyed by the writer's hosted root (#1510, docs/future/postgres-server.md D4): one
   // UPDATE of ids.last_seen on the writer's row (the root's or a child's), a column no key or foreign key covers and no
-  // trigger watches. Every other body that writes that row is exclusive, or keyed by the same root; a touch of another
-  // root writes another row. Close's other write, the human release row, stays exclusive.
+  // trigger watches. The root alone doesn't exclude every other writer of the row (#1527 L1): `hostedRoot` is fixed
+  // when the session is built, so two sessions of one writer ID (a child re-registered under a new root, a hosted and
+  // a non-hosted one) can carry different roots; their touches would commit out of order and move last_seen back. So
+  // the touch carries `id:<writer>` too: touches of one writer start in arrival order, each stamping the clock when it
+  // runs. A keyed gate body of the writer's root may hold the row FOR NO KEY UPDATE (its facts read) and writes no
+  // last_seen; the one-statement touch waits on it and on nothing after, so no cycle forms. Close's other write, the
+  // human release row, stays exclusive.
   function close(session: ApplicationSession, h: Read = repo.read) {
     const write = (row: (tx: Tx) => Promise<void>, what: string, site: "touch" | "other" = "other", keys?: string[]) => {
       if (isTx(h)) h.beforeCommit({}, row);
@@ -816,7 +821,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     // Close runs from sync finally blocks and commit callbacks: the touch is written at `h`'s commit or queued, not
     // awaited (#807 P1b-4b, P3 B1c).
     const writer = session.writerId;
-    if (writer && touchDue(writer)) write(tx => repo.bindings.touchId(tx, writer), "last-seen touch", "touch", [`root:${session.hostedRoot || writer}`]);
+    if (writer && touchDue(writer)) write(tx => repo.bindings.touchId(tx, writer), "last-seen touch", "touch", [`root:${session.hostedRoot || writer}`, `id:${writer}`]);
   }
   // The server closes the session: it leaves the hub, and its transport is
   // told why and closes. `h`: the body it runs in, whose `Tx` takes close's rows (#807 P3 A3).

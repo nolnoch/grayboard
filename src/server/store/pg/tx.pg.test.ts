@@ -11,13 +11,14 @@ import { MESSAGE_LIMITS } from "../messages.contract.ts";
 import { DEFAULT_DATABASE_WRITERS } from "../queue.ts";
 import { txContract, type TxBackend } from "../tx.contract.ts";
 import { sqliteOf, sqliteRead } from "../tx.ts";
-import type { Read, Tx } from "../tx_base.ts";
+import { ProbeWrite, type Read, type Tx } from "../tx_base.ts";
 import { makeNotices } from "../notices.ts";
 import { makePgAuthGeneration } from "./auth_generation.ts";
 import { makePgBoards } from "./boards.ts";
 import { makePgHosted } from "./hosted.ts";
 import { makePgMessages } from "./messages.ts";
-import { makePgTransactions, pgOf, TxAborted, type PgTransactions } from "./tx.ts";
+import { makePgClaims } from "./claims.ts";
+import { makePgTransactions, pgOf, refuseKeyed, TxAborted, type PgTransactions } from "./tx.ts";
 
 // Written as a store function will be: a plain `await` on pgOf's statement, which pgOf sends as it's built.
 const put = async (tx: Tx, v: string) => { await pgOf(tx)`INSERT INTO t (v) VALUES (${v})`; };
@@ -58,7 +59,8 @@ const pgBackend: TxBackend = {
     const { db, s, [Symbol.asyncDispose]: dispose } = await scratch();
     void db;
     return {
-      write: s.write, writeKeyed: s.writeKeyed, post: s.post, read: s.read, queue: s.queue,
+      // The contract's keyed bodies register effects and pass `committed`: the store's opt-in (D4) lets them.
+      write: s.write, writeKeyed: (keys, fn, committed) => s.writeKeyed(keys, fn, committed, { effects: true }), post: s.post, read: s.read, queue: s.queue,
       put, rows,
       inTransaction: s.inTransaction,
       drain: () => s.write(() => {}),
@@ -529,7 +531,7 @@ describePg("Postgres write scheduler", () => {
       });
       aIn.open();
       await within(aGo.wait, "the test to let A commit");
-    });
+    }, undefined, { effects: true });
     const b = x.s.writeKeyed(["root:b"], async tx => {
       await put(tx, "b");
       bIn.open();
@@ -585,7 +587,7 @@ describePg("Postgres write scheduler", () => {
     }, async () => {
       seen.bMine = x.s.queue.mine;
       seen.bCommitted = await state();
-    });
+    }, { effects: true });
     await b;
     await flushed;
     seen.outside = { inTx: x.s.inTransaction(), ownsTx: gen.ownsTx() };
@@ -609,19 +611,20 @@ describePg("Postgres write scheduler", () => {
       async (tx, id) => (await pgOf(tx)`SELECT count(*)::int AS n FROM t WHERE v = ${id}`)[0].n);
     const marked = notices.marks((tx: Tx, v: string) => put(tx, v), (_tx, v) => v);
     const aMarked = gate(), bMarked = gate();
+    // Opted in to effects (KeyedOptions): a notice is an afterCommit effect, which a keyed body otherwise refuses.
     const a = x.s.writeKeyed(["root:a"], async tx => {
       await marked(tx, "a");
       aMarked.open();
       // B marks its row before A commits: A's hook must not read B's (on A's transaction, B's row isn't there).
       await within(bMarked.wait, "B to mark its row");
-    });
+    }, undefined, { effects: true });
     const b = x.s.writeKeyed(["root:b"], async tx => {
       await within(aMarked.wait, "A to mark its row");
       await marked(tx, "b");
       await marked(tx, "b");
       bMarked.open();
       await a;
-    });
+    }, undefined, { effects: true });
     await Promise.all([a, b]);
     expect(seen).toEqual([["a", 1], ["b", 2], ["b", 2]]);
   });
@@ -724,5 +727,123 @@ describePg("keyed write bodies (Postgres store guard)", () => {
     await x.s.write(user("exclusive@example.com"));
     expect(bumps).toBe(1);
     expect((await x.sql`SELECT email FROM users ORDER BY email`).map((r: { email: string }) => r.email)).toEqual(["exclusive@example.com"]);
+  });
+
+  // #1510 chunk 3 (#1527 L2): what D4 promised and chunk 2 didn't enforce. A keyed body's afterCommit effect and its
+  // `committed` refuse unless the caller opted in; so does every change notice (pg_repo's marks/change, through
+  // makeNotices' refuse) and every claim_events insert.
+  // Mutation: drop PgTx.deferEffect's refuseKeyed (the keyed effect is queued, the body commits and the effect runs).
+  test("a keyed body's afterCommit effect refuses, naming the keys, through a savepoint too, and the body rolls back; opted in, it runs", async () => {
+    await using x = await scratch();
+    let ran = 0;
+    const e = await rejection(x.s.writeKeyed(["root:a"], async tx => { await put(tx, "gone"); tx.afterCommit(() => { ran++; }); }));
+    expect(e.message).toBe("afterCommit effect refused in a keyed write body (keys root:a): it runs in an exclusive body (write) (docs/future/postgres-server.md D4)");
+    const sp = await rejection(x.s.writeKeyed(["root:b"], tx => tx.savepoint(async inner => { inner.afterCommit(() => { ran++; }); })));
+    expect(sp.message).toContain("afterCommit effect refused in a keyed write body (keys root:b)");
+    await x.s.writeKeyed(["root:a"], async tx => { await put(tx, "kept"); tx.afterCommit(() => { ran++; }); }, undefined, { effects: true });
+    await x.s.write(async tx => { tx.afterCommit(() => { ran++; }); });
+    expect(ran).toBe(2);
+    expect(await rows(x.s.read)).toEqual(["kept"]);
+  });
+
+  // #1510 chunk 3 audit L6: a beforeCommit hook runs at the commit, in the body's context, as an effect does; one
+  // registered in a probe would run after it ends. Mutation: PgTx.beforeCommit without its refuseKeyed (the keyed body
+  // commits and its hook writes; the probe resolves).
+  test("a keyed body's beforeCommit hook refuses, naming the keys, and in a probe is its ProbeWrite; opted in, it runs", async () => {
+    await using x = await scratch();
+    const e = await rejection(x.s.writeKeyed(["root:a"], async tx => { await put(tx, "gone"); tx.beforeCommit({}, root => put(root, "hook")); }));
+    expect(e.message).toBe("a beforeCommit hook refused in a keyed write body (keys root:a): it runs in an exclusive body (write) (docs/future/postgres-server.md D4)");
+    const probed = await x.s.writeKeyed(["root:b"], tx => rejection(x.s.readsOnly(tx, async () => { tx.beforeCommit({}, root => put(root, "probed hook")); })));
+    expect(probed).toBeInstanceOf(ProbeWrite);
+    expect(probed.message).toBe("a beforeCommit hook refused in a read-only probe (keys root:b): the probed code would write (docs/future/postgres-server.md D4)");
+    await x.s.writeKeyed(["root:a"], async tx => { tx.beforeCommit({}, root => put(root, "kept")); }, undefined, { effects: true });
+    await x.s.write(async tx => { tx.beforeCommit({}, root => put(root, "exclusive")); });
+    expect(await rows(x.s.read)).toEqual(["kept", "exclusive"]);
+  });
+
+  // Mutations: drop run's committed refusal (the keyed body commits and `committed` runs); drop post's (postKeyed
+  // queues the body).
+  test("a keyed body's committed callback refuses before the body runs, for writeKeyed and postKeyed; opted in, it runs", async () => {
+    await using x = await scratch();
+    let body = 0, after = 0;
+    const e = await rejection(x.s.writeKeyed(["root:a", "root:b"], async tx => { body++; await put(tx, "gone"); }, () => { after++; }));
+    expect(e.message).toBe("a committed callback refused in a keyed write body (keys root:a, root:b): it runs in an exclusive body (write) (docs/future/postgres-server.md D4)");
+    expect(() => x.s.postKeyed(["root:c"], async tx => { body++; await put(tx, "posted"); }, () => { after++; })).toThrow("a committed callback refused in a keyed write body (keys root:c)");
+    expect(await x.s.writeKeyed(["root:a"], async tx => { body++; await put(tx, "kept"); return 2; }, v => { after++; return v * 2; }, { effects: true })).toBe(4);
+    await x.s.write(() => {});
+    expect([body, after]).toEqual([1, 1]);
+    expect(await rows(x.s.read)).toEqual(["kept"]);
+  });
+
+  // Mutation: makeNotices' marks/change without the refuse call (the keyed mark's write is sent; the notice's
+  // afterCommit refusal still fires, but only after its statement ran, so the op's name is missing from the error).
+  test("a change notice's op refuses in a keyed body before its statement is sent, naming the op and the keys; an exclusive body marks", async () => {
+    await using x = await scratch();
+    const notices = makeNotices((tx, effect) => tx.afterCommit(effect), (tx, op) => refuseKeyed(tx, op));
+    const seen: Array<string | null> = [];
+    notices.subscribe<null>(id => { seen.push(id); }, async () => null);
+    let sent = 0;
+    const marked = notices.marks(async (tx: Tx, v: string) => { sent++; await put(tx, v); }, (_tx, v) => v, "t.put");
+    const changed = notices.change(async (tx: Tx) => { sent++; await put(tx, "c"); }, "t.change");
+    const e = await rejection(x.s.writeKeyed(["root:a"], tx => marked(tx, "m")));
+    expect(e.message).toBe("t.put (it queues a change notice) refused in a keyed write body (keys root:a): it runs in an exclusive body (write) (docs/future/postgres-server.md D4)");
+    expect((await rejection(x.s.writeKeyed(["root:a"], tx => tx.savepoint(inner => changed(inner))))).message).toContain("t.change (it queues a change notice) refused in a keyed write body (keys root:a)");
+    expect(sent).toBe(0);
+    await x.s.write(async tx => { await marked(tx, "m"); await changed(tx); });
+    expect(seen).toEqual(["m", null]);
+  });
+
+  // Mutation: drop insertClaimEvent's refuseKeyed (the keyed event commits).
+  test("a claim_events insert refuses in a keyed body, naming the keys; an exclusive body logs it", async () => {
+    await using x = await store();
+    const claims = makePgClaims({ clock: () => KT0 });
+    const e = await rejection(x.s.writeKeyed(["root:a"], tx => claims.logEvent(tx, "take", "a@example.com/fe", { key: "ticket:1" }, KT0)));
+    expect(e.message).toBe("claim_events insert refused in a keyed write body (keys root:a): it runs in an exclusive body (write) (docs/future/postgres-server.md D4)");
+    await x.s.write(tx => claims.logEvent(tx, "take", "a@example.com/fe", { key: "ticket:1" }, KT0));
+    expect((await x.sql`SELECT count(*)::int AS n FROM claim_events`)[0].n).toBe(1);
+  });
+});
+
+// #1510 chunk 3: readsOnly, the read-only probe the hosted gate's keyed fast path runs settle and rowFor under. A
+// statement that isn't a SELECT, or names an advisory lock, refuses ProbeWrite before it's sent; refuseKeyed's
+// refusals become the probe's; a refusal the probed code swallowed still rejects the probe; the probe ends with fn.
+describePg("readsOnly (Postgres read-only probe)", () => {
+  // Mutations: probeCheck returning at once (the INSERT is sent and the probe resolves); readsOnly without its
+  // after-fn `probe.refused` rethrow (the swallowed refusal resolves the probe).
+  test("a write refuses ProbeWrite before it's sent, even when the probed code swallows it; reads and row locks pass; the probe ends with fn", async () => {
+    await using x = await scratch();
+    await x.s.write(tx => put(tx, "a"));
+    const out = await x.s.writeKeyed(["root:a"], async tx => {
+      const read = await x.s.readsOnly(tx, async () => (await pgOf(tx)`SELECT v FROM t WHERE v = 'a' FOR UPDATE`).length);
+      const e = await rejection(x.s.readsOnly(tx, () => put(tx, "probed")));
+      const swallowed = await rejection(x.s.readsOnly(tx, async () => { await put(tx, "swallowed").catch(() => {}); return "went on"; }));
+      const advisory = await rejection(x.s.readsOnly(tx, async () => { await pgOf(tx)`SELECT pg_advisory_xact_lock(1)`; }));
+      const data = await rejection(x.s.readsOnly(tx, async () => { await pgOf(tx)`WITH d AS (DELETE FROM t RETURNING 1) SELECT 1`; }));
+      // After the probe the body writes.
+      await put(tx, "after");
+      return { read, e, swallowed, advisory, data };
+    });
+    expect(out.read).toBe(1);
+    for (const e of [out.e, out.swallowed, out.advisory, out.data]) expect(e).toBeInstanceOf(ProbeWrite);
+    expect(out.e.message).toBe(`the statement "INSERT INTO t …" refused in a read-only probe (keys root:a): the probed code would write (docs/future/postgres-server.md D4)`);
+    expect(out.advisory.message).toContain(`the statement "SELECT pg_advisory_xact_lock(1) …" refused in a read-only probe`);
+    expect(await rows(x.s.read)).toEqual(["a", "after"]);
+  });
+
+  // Mutation: refuseKeyed without its probe branch (the store's refusal is a plain Error, which the gate counts as a
+  // failure, not a miss).
+  test("a store's keyed refusal inside the probe is the probe's ProbeWrite, before anything is sent", async () => {
+    await using x = await store();
+    const e = await x.s.writeKeyed(["root:a"], tx => rejection(x.s.readsOnly(tx, () => hosted.lockCapacity(tx))));
+    expect(e).toBeInstanceOf(ProbeWrite);
+    expect(e.message).toBe("hosted.lockCapacity refused in a read-only probe (keys root:a): the probed code would write (docs/future/postgres-server.md D4)");
+  });
+
+  test("readsOnly refuses a nested probe and a Tx that isn't Postgres's", async () => {
+    await using x = await scratch();
+    await x.s.writeKeyed(["root:a"], async tx => {
+      expect((await rejection(x.s.readsOnly(tx, () => x.s.readsOnly(tx, async () => 1)))).message).toBe("readsOnly nested in a probe");
+    });
+    expect((await rejection(x.s.readsOnly({} as Tx, async () => 1))).message).toBe("readsOnly needs a Postgres body's Tx");
   });
 });
