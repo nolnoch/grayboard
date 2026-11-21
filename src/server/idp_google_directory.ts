@@ -5,6 +5,7 @@
 // impersonates GRAYBOARD_GOOGLE_DIRECTORY_ADMIN (the JWT's `sub`).
 import { createPrivateKey } from "node:crypto";
 import { importPKCS8, SignJWT, type KeyLike } from "jose";
+import { throttledWarn, tokenCache } from "./idp_directory.ts";
 
 export type GoogleDirectoryConfig = { clientEmail: string; privateKey: string; admin?: string };
 // Test seams: where the token request and users.get go, and the fetch that sends them.
@@ -13,15 +14,8 @@ export type GoogleDirectoryOptions = { tokenUrl?: string; apiBase?: string; fetc
 export const GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
 const GOOGLE_API_BASE = "https://admin.googleapis.com";
 export const DIRECTORY_SCOPE = "https://www.googleapis.com/auth/admin.directory.user.readonly";
-// An access token is reused until this long before Google's expires_in, so a call never carries one about to lapse.
-const TOKEN_MARGIN_MS = 60_000;
-// The token request is shared by every check waiting on it, so it runs on its own clock, never one caller's: a caller
-// that gives up stops waiting, and the mint goes on for the others.
-const MINT_TIMEOUT_MS = 10_000;
 // Google's error text (invalid_grant, unauthorized_client, "Not Authorized to access this resource") is what tells an
-// operator which of key, delegation or role to fix; the audit row carries only the class, so it's logged, each distinct
-// text at most once in this window.
-const LOG_EVERY_MS = 10 * 60_000;
+// operator which of key, delegation or role to fix; the audit row carries only the class, so it's logged (throttledWarn).
 
 // The re-check audits a failure by its error's name (auth.idp_check_failed's error_class), so each kind an operator
 // acts on differently has its own: the credential refused (fix the key, the role or the delegation), the directory
@@ -60,21 +54,9 @@ export function googleDirectoryStatus(config: GoogleDirectoryConfig, options: Go
   const tokenUrl = options.tokenUrl ?? GOOGLE_TOKEN_URL;
   const apiBase = options.apiBase ?? GOOGLE_API_BASE;
   let signingKey: Promise<KeyLike> | undefined;
-  let cached: { token: string; until: number } | undefined;
-  // One token request at a time: concurrent checks of different users share it.
-  let minting: Promise<string> | undefined;
-  const logged = new Map<string, number>();
-  function refused(error: DirectoryError): DirectoryError {
-    const last = logged.get(error.message);
-    if (last === undefined || now() - last >= LOG_EVERY_MS) {
-      logged.set(error.message, now());
-      console.warn(`[grayboard] Google directory check: ${error.name}: ${error.message}`);
-    }
-    return error;
-  }
+  const refused = throttledWarn("Google directory check", now);
 
-  async function mint(): Promise<string> {
-    const signal = AbortSignal.timeout(MINT_TIMEOUT_MS);
+  async function mint(signal: AbortSignal): Promise<{ token: string; expiresIn: number }> {
     signingKey ??= importPKCS8(config.privateKey, "RS256");
     const jwt = new SignJWT({ scope: DIRECTORY_SCOPE })
       .setProtectedHeader({ alg: "RS256", typ: "JWT" })
@@ -96,24 +78,19 @@ export function googleDirectoryStatus(config: GoogleDirectoryConfig, options: Go
     if (!res.ok) throw new DirectoryError("google_directory_error", `Google Directory token request failed (${res.status})`);
     const body = await jsonObject(res, "Google Directory token response");
     if (typeof body.access_token !== "string" || typeof body.expires_in !== "number") throw new DirectoryError("google_directory_error", "Google Directory token response is malformed");
-    cached = { token: body.access_token, until: now() + body.expires_in * 1000 - TOKEN_MARGIN_MS };
-    return body.access_token;
+    return { token: body.access_token, expiresIn: body.expires_in };
   }
-
-  function accessToken(signal: AbortSignal): Promise<string> {
-    if (cached && cached.until > now()) return Promise.resolve(cached.token);
-    minting ??= mint().finally(() => { minting = undefined; });
-    return abortable(minting, signal);
-  }
+  // One token request at a time: concurrent checks of different users share it.
+  const tokens = tokenCache(mint, now);
 
   return async function status(subject: string, signal: AbortSignal): Promise<"active" | "inactive"> {
     if (!/^\d+$/.test(subject)) throw new DirectoryError("google_directory_error", "subject is not a Google user id");
-    const token = await accessToken(signal);
+    const token = await tokens.get(signal);
     const res = await send(`${apiBase}/admin/directory/v1/users/${encodeURIComponent(subject)}?fields=suspended,archived`, {
       signal, headers: { Authorization: `Bearer ${token}` },
     });
     if (res.status === 404) return "inactive";
-    if (res.status === 401) cached = undefined;
+    if (res.status === 401) tokens.drop();
     if (res.status === 401 || res.status === 403) throw refused(new DirectoryError("google_directory_refused", `Google Directory users.get failed (${res.status}): ${(await res.text()).slice(0, 200)}`));
     if (!res.ok) throw new DirectoryError("google_directory_error", `Google Directory users.get failed (${res.status})`);
     const user = await jsonObject(res, "Google Directory user");
@@ -131,14 +108,4 @@ async function jsonObject(res: Response, what: string): Promise<Record<string, u
   }
   if (typeof body !== "object" || body === null) throw new DirectoryError("google_directory_error", `${what} is not a JSON object`);
   return body as Record<string, unknown>;
-}
-
-// p, given up on (with the signal's reason) when the signal aborts first; p itself runs on.
-function abortable<T>(p: Promise<T>, signal: AbortSignal): Promise<T> {
-  if (signal.aborted) return Promise.reject(signal.reason);
-  return new Promise<T>((resolve, reject) => {
-    const stop = () => reject(signal.reason);
-    signal.addEventListener("abort", stop, { once: true });
-    p.then(v => { signal.removeEventListener("abort", stop); resolve(v); }, e => { signal.removeEventListener("abort", stop); reject(e); });
-  });
 }
