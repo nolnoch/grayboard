@@ -17,6 +17,7 @@ import type { Config } from "./config.ts";
 import { handleHttp } from "./http.ts";
 import { scratchDbPath } from "../../tests/support/scratch_db.ts";
 import { seed } from "../../tests/support/seed.ts";
+import { until } from "../../tests/support/until.ts";
 
 let store: ReturnType<typeof openDatabase>;
 let application: ReturnType<typeof createApplication>;
@@ -617,4 +618,28 @@ test("A7d2c/B5a2: a watch its caller didn't judge visible is refused", async () 
   expect(h.counts.closed).toBe(0);
   // The synchronous auth forms are gone (#807 P3 A7d2c): every token read is async.
   expect("authNow" in store.repo).toBe(false);
+});
+
+// #1504: a change hint's live check reads the store untracked by the hint; close() stops new ones, and idle() settles
+// only once one already in flight has, so a closing server can wait for its read before it closes the store.
+test("#1504: idle() waits for a live check in flight when close() ran", async () => {
+  const a = await select(alice), b = await select(bob);
+  await call(a, "board_create", { name: "e2e", purpose: "tests" });
+  resources.close();
+  let release!: () => void, started = 0;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  resources = createResources(application, { isCurrent: () => true, isAuthorized: async () => { started++; await gate; return true; } });
+  const h = hooks();
+  resources.watch(b, boardResourceUri("e2e"), h, true);
+  await call(a, "board_post", { board: "e2e", body: "hint" });
+  await until(() => started === 1);
+  resources.close();
+  let idle = false;
+  const waiting = resources.idle().then(() => { idle = true; });
+  await flush();
+  expect(idle).toBe(false);
+  release();
+  await waiting;
+  expect(h.counts.changed).toBe(0); // closed before its check finished: no hint after close
+  await resources.idle(); // nothing in flight: settles at once
 });
