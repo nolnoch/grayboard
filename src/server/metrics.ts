@@ -97,17 +97,53 @@ export function queueWaitersNow(): number { return queueWaiters; }
 // so this is the scheduler's world-stop time, an exclusive body's drain of the keyed bodies ahead of it plus its hold.
 export function queueWorldStop(seconds: number) { queueWorldStopS += seconds; }
 
+// Postgres statements per write body (#1537 PR 0, store/pg/tx.ts), by calling site: every statement the body's
+// transaction sent, BEGIN and its COMMIT or ROLLBACK and the auth-mark read included; and its round trips, the flights
+// among them: a statement sent while none of the body's statements is in flight starts one, and one sent behind an
+// un-awaited statement (a SAVEPOINT, an in-body audit) rides its flight. SQLite bodies record nothing.
+export const STATEMENT_BUCKETS = [1, 2, 3, 4, 5, 6, 8, 10, 12, 15, 20, 25, 30, 40, 50, 75, 100];
+const queueStatements = new Map<QueueSite, Bins>(QUEUE_SITES.map(s => [s, bins(STATEMENT_BUCKETS)]));
+const queueRoundTrips = new Map<QueueSite, Bins>(QUEUE_SITES.map(s => [s, bins(STATEMENT_BUCKETS)]));
+export function queueStatementsBody(site: QueueSite, statements: number, roundTrips: number) {
+  bin(queueStatements.get(site)!, STATEMENT_BUCKETS, statements);
+  bin(queueRoundTrips.get(site)!, STATEMENT_BUCKETS, roundTrips);
+}
+// One site's totals so far: bodies recorded, statements and round trips summed over them.
+export function statementTotals(site: QueueSite): { bodies: number; statements: number; roundTrips: number } {
+  const s = queueStatements.get(site)!, r = queueRoundTrips.get(site)!;
+  return { bodies: s.count, statements: s.sum, roundTrips: r.sum };
+}
+
 // The hosted gate's keyed fast path (#1510 chunk 3, hosted.ts withGate/withPrior): per site, a request whose body ran
 // keyed (`keyed`), one whose keyed attempt missed and ran the exclusive body after it (`miss`), and one that ran
 // exclusive without an attempt (`skipped`: SQLite, no row yet, a parked row, a prior that differed outright). Delivery's
 // renew and receipt the same (#1510 chunk 4, delivery.ts): `skipped` there is SQLite, or the keyed path turned off.
+// `method`: the call the gate body served (#1537 PR 0): for the `gate` site the hosted call that ran withGate (an
+// exchange's `selection`, a tool call's own `tool` gate, `control`'s renew, receipt, pending and release, `owning`'s
+// open, bind and unbind, and the rest by name); the other sites have one each (prior: tool; renew and receipt: their own).
 export const GATE_SITES = ["gate", "prior", "renew", "receipt"] as const;
 export const GATE_OUTCOMES = ["keyed", "miss", "skipped"] as const;
+export const GATE_METHODS = ["selection", "tool", "transfer", "whoami", "end", "open", "bind", "unbind", "owning", "renew", "receipt", "pending", "release", "control"] as const;
 export type GateSite = typeof GATE_SITES[number];
 export type GateOutcome = typeof GATE_OUTCOMES[number];
-const gateFast = new Map<string, number>(GATE_SITES.flatMap(s => GATE_OUTCOMES.map(o => [`${s}:${o}`, 0] as const)));
-export function countGate(site: GateSite, outcome: GateOutcome) { const k = `${site}:${outcome}`; gateFast.set(k, gateFast.get(k)! + 1); }
-export function gateCount(site: GateSite, outcome: GateOutcome): number { return gateFast.get(`${site}:${outcome}`)!; }
+export type GateMethod = typeof GATE_METHODS[number];
+const SITE_METHOD: Record<Exclude<GateSite, "gate">, GateMethod> = { prior: "tool", renew: "renew", receipt: "receipt" };
+const gateKey = (site: GateSite, method: GateMethod, outcome: GateOutcome) => `${site}:${method}:${outcome}`;
+// Every series present from the start, so a rate() over a fresh process starts at zero.
+const gateFast = new Map<string, number>([
+  ...GATE_METHODS.flatMap(m => GATE_OUTCOMES.map(o => [gateKey("gate", m, o), 0] as const)),
+  ...(Object.entries(SITE_METHOD) as [GateSite, GateMethod][]).flatMap(([s, m]) => GATE_OUTCOMES.map(o => [gateKey(s, m, o), 0] as const)),
+]);
+export function countGate(site: GateSite, outcome: GateOutcome, method: GateMethod = site === "gate" ? "tool" : SITE_METHOD[site]) {
+  const k = gateKey(site, site === "gate" ? method : SITE_METHOD[site], outcome);
+  gateFast.set(k, gateFast.get(k)! + 1);
+}
+// One site's count for `outcome`, of one method or (none given) summed over them.
+export function gateCount(site: GateSite, outcome: GateOutcome, method?: GateMethod): number {
+  let n = 0;
+  for (const [k, v] of gateFast) { const [s, m, o] = k.split(":"); if (s === site && o === outcome && (method === undefined || m === method)) n += v; }
+  return n;
+}
 
 // Event-loop lag, in windows: each window's p50/p99/max of the loop's delay, then a reset. The
 // scrape reports the last finished window, so it costs nothing and doesn't depend on the scraper's
@@ -239,8 +275,12 @@ export function render(gauges: Gauges = {}): string {
   for (const [site, n] of queueSkips) out.push(`grayboard_write_queue_skipped_bodies_total${labelText({ site })} ${n}`);
   family("grayboard_write_queue_keyed_bodies_total", "counter", "Write-queue bodies released that ran keyed (overlapping other keyed bodies), by calling site; the rest ran exclusive.");
   for (const [site, n] of queueKeyed) out.push(`grayboard_write_queue_keyed_bodies_total${labelText({ site })} ${n}`);
-  family("grayboard_hosted_gate_bodies_total", "counter", "Hosted gate and delivery requests by site and how the write body ran: keyed (the fast path), miss (a keyed attempt, then the exclusive body), skipped (exclusive without an attempt).");
-  for (const [k, n] of gateFast) { const [site, outcome] = k.split(":"); out.push(`grayboard_hosted_gate_bodies_total${labelText({ site: site!, outcome: outcome! })} ${n}`); }
+  family("grayboard_hosted_gate_bodies_total", "counter", "Hosted gate and delivery requests by site, the call the gate served (method), and how the write body ran: keyed (the fast path), miss (a keyed attempt, then the exclusive body), skipped (exclusive without an attempt).");
+  for (const [k, n] of gateFast) { const [site, method, outcome] = k.split(":"); out.push(`grayboard_hosted_gate_bodies_total${labelText({ site: site!, method: method!, outcome: outcome! })} ${n}`); }
+  family("grayboard_write_queue_statements", "histogram", "Postgres statements per write body (BEGIN, COMMIT or ROLLBACK and the auth-mark read included), by calling site; SQLite bodies record none.");
+  for (const [site, b] of queueStatements) if (b.count) histogram(out, "grayboard_write_queue_statements", { site }, STATEMENT_BUCKETS, b);
+  family("grayboard_write_queue_round_trips", "histogram", "Postgres round trips per write body, by calling site: its statements less those sent while another of its statements was in flight.");
+  for (const [site, b] of queueRoundTrips) if (b.count) histogram(out, "grayboard_write_queue_round_trips", { site }, STATEMENT_BUCKETS, b);
   family("grayboard_write_queue_world_stop_seconds_total", "counter", "Seconds in which an exclusive write-queue body waited or ran, so keyed bodies arriving meanwhile waited behind it: its drain of the keyed bodies ahead of it plus its hold.");
   out.push(`grayboard_write_queue_world_stop_seconds_total ${num(queueWorldStopS)}`);
   family("grayboard_write_queue_depth", "histogram", "Bodies already waiting when a body queues behind a held write queue.");

@@ -8,7 +8,8 @@ import { describePg, pgDatabase, pgEmptyDatabase, type PgDatabase } from "../../
 import { commitCutProxy } from "../../../../tests/support/pg_proxy.ts";
 import { until } from "../../../../tests/support/until.ts";
 import { MESSAGE_LIMITS } from "../messages.contract.ts";
-import { DEFAULT_DATABASE_WRITERS } from "../queue.ts";
+import { statementTotals } from "../../metrics.ts";
+import { atSite, DEFAULT_DATABASE_WRITERS } from "../queue.ts";
 import { txContract, type TxBackend } from "../tx.contract.ts";
 import { sqliteOf, sqliteRead } from "../tx.ts";
 import { ProbeWrite, type Read, type Tx } from "../tx_base.ts";
@@ -647,6 +648,35 @@ async function store(opts: { ownAuthCommit?: () => void } = {}): Promise<{ s: Pg
   const s = makePgTransactions(db.url, { max: 2, writers: 2, applicationName: "gb-test-keyed", ...opts });
   return { s, sql: db.sql, async [Symbol.asyncDispose]() { await s.close(); await db[Symbol.asyncDispose](); } };
 }
+
+// #1537 PR 0: each body's statements and round trips, counted into the queue's metrics under its site. BEGIN and the
+// COMMIT or ROLLBACK are 1 each; a statement sent while another of the body's is in flight shares its round trip; a
+// keyed body reads the auth mark before COMMIT (1 more). The site is one no other body in this file uses.
+// Mutations: statements() without counted (every count drops its INSERTs); counted always starting a flight (the
+// pipelined and savepoint bodies read one more round trip); the auth read uncounted (the keyed body reads 3, 3).
+describePg("statement counts per body (Postgres, #1537 PR 0)", () => {
+  const SITE = "touch" as const;
+  const measured = async (fn: () => Promise<unknown>) => {
+    const at = statementTotals(SITE);
+    await atSite(SITE, fn);
+    const now = statementTotals(SITE);
+    return { bodies: now.bodies - at.bodies, statements: now.statements - at.statements, roundTrips: now.roundTrips - at.roundTrips };
+  };
+
+  test("awaited statements, a pipelined pair, a savepoint, a keyed body and a failed body each count exactly", async () => {
+    await using x = await scratch();
+    expect(await measured(() => x.s.write(async tx => { await put(tx, "a"); await put(tx, "b"); }))).toEqual({ bodies: 1, statements: 4, roundTrips: 4 });
+    // The first INSERT isn't awaited before the second is sent: one flight.
+    expect(await measured(() => x.s.write(async tx => { const first = put(tx, "c"); await put(tx, "d"); await first; }))).toEqual({ bodies: 1, statements: 4, roundTrips: 3 });
+    // SAVEPOINT rides the INSERT's flight; RELEASE is its own.
+    expect(await measured(() => x.s.write(tx => tx.savepoint(sp => put(sp, "e"))))).toEqual({ bodies: 1, statements: 5, roundTrips: 4 });
+    expect(await measured(() => x.s.writeKeyed(["root:a"], tx => put(tx, "f")))).toEqual({ bodies: 1, statements: 4, roundTrips: 4 });
+    // BEGIN, the INSERT, ROLLBACK.
+    expect(await measured(() => rejection(x.s.write(async tx => { await put(tx, "g"); throw new Error("no"); })))).toEqual({ bodies: 1, statements: 3, roundTrips: 3 });
+    // A pool read counts nothing.
+    expect(await measured(() => rows(x.s.read))).toEqual({ bodies: 0, statements: 0, roundTrips: 0 });
+  });
+});
 
 describePg("keyed write bodies (Postgres store guard)", () => {
   // #1520 L4: tests reach production's W through the default; W = 1 stays the explicit single-queue control.

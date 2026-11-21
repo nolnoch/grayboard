@@ -1,7 +1,7 @@
 import { afterEach, expect, test } from "bun:test";
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { countRefusal, forgetToolSeries, lagSamplerUsers, lagWindow, LATENCY_BUCKETS, observeTool, render, startLagSampler } from "./metrics.ts";
+import { countGate, countRefusal, forgetToolSeries, gateCount, lagSamplerUsers, lagWindow, LATENCY_BUCKETS, observeTool, queueStatementsBody, render, startLagSampler, statementTotals } from "./metrics.ts";
 import { DEFAULT_MCP_LIMITS, parseMetricsAddr } from "./config.ts";
 import { TestServer } from "../../tests/support/server.ts";
 import { until } from "../../tests/support/until.ts";
@@ -34,6 +34,34 @@ test("render writes the exposition format: types, cumulative buckets, escaped la
   expect(text).toMatch(/^grayboard_build_info\{version="[^"]+"\} 1$/m);
   expect(sample(text, "grayboard_process_resident_memory_bytes")).toBeGreaterThan(0);
   expect(LATENCY_BUCKETS).toEqual([...LATENCY_BUCKETS].sort((a, b) => a - b));
+});
+
+// #1537 PR 0. Mutations: queueStatementsBody binning round trips into the statements histogram (the round-trip
+// series reads 0, the statement sum 13 more); countGate ignoring `method` for the gate site (selection reads 0);
+// gateCount without a method not summing (reads one method's).
+test("statements and round trips per body render as per-site histograms; the gate counter carries its method", () => {
+  const at = statementTotals("renew");
+  queueStatementsBody("renew", 8, 8);
+  queueStatementsBody("renew", 14, 5);
+  expect(statementTotals("renew")).toEqual({ bodies: at.bodies + 2, statements: at.statements + 22, roundTrips: at.roundTrips + 13 });
+  const sel = gateCount("gate", "keyed", "selection"), ctl = gateCount("gate", "keyed", "renew"), all = gateCount("gate", "keyed"), prior = gateCount("prior", "miss");
+  countGate("gate", "keyed", "selection");
+  countGate("gate", "keyed", "renew");
+  countGate("prior", "miss");
+  expect([gateCount("gate", "keyed", "selection") - sel, gateCount("gate", "keyed", "renew") - ctl, gateCount("gate", "keyed") - all, gateCount("prior", "miss") - prior]).toEqual([1, 1, 2, 1]);
+  const text = render();
+  expect(text).toContain("# TYPE grayboard_write_queue_statements histogram");
+  expect(text).toContain("# TYPE grayboard_write_queue_round_trips histogram");
+  expect(sample(text, 'grayboard_write_queue_statements_count{site="renew"}')).toBe(at.bodies + 2);
+  expect(sample(text, 'grayboard_write_queue_statements_sum{site="renew"}')).toBe(at.statements + 22);
+  expect(sample(text, 'grayboard_write_queue_round_trips_sum{site="renew"}')).toBe(at.roundTrips + 13);
+  // 8 is at or under the le="8" bucket; 14 isn't (the next edge is 15).
+  expect(sample(text, 'grayboard_write_queue_statements_bucket{site="renew",le="8"}')! - sample(text, 'grayboard_write_queue_statements_bucket{site="renew",le="6"}')!).toBeGreaterThanOrEqual(1);
+  expect(sample(text, 'grayboard_hosted_gate_bodies_total{site="gate",method="selection",outcome="keyed"}')).toBe(sel + 1);
+  expect(sample(text, 'grayboard_hosted_gate_bodies_total{site="gate",method="renew",outcome="keyed"}')).toBe(ctl + 1);
+  expect(sample(text, 'grayboard_hosted_gate_bodies_total{site="prior",method="tool",outcome="miss"}')).toBe(prior + 1);
+  // Every method's series is present from the start.
+  expect(sample(text, 'grayboard_hosted_gate_bodies_total{site="gate",method="pending",outcome="miss"}')).toBeGreaterThanOrEqual(0);
 });
 
 // A capacity refusal that doesn't count itself reads zero on the dashboard while clients are refused.

@@ -24,7 +24,7 @@ import { DEFAULT_AUTH_FAIL_LIMIT, DEFAULT_HELLO_LIMIT } from "./rate_limit.ts";
 import { DEFAULT_TRUSTED_PROXIES } from "./client_addr.ts";
 import { createOAuthServer } from "./oauth.ts";
 import { hashToken } from "./auth.ts";
-import { gateCount } from "./metrics.ts";
+import { gateCount, statementTotals } from "./metrics.ts";
 import { GRAYBOARD_EFFORT_META, GRAYBOARD_LAUNCHER_META, GRAYBOARD_MODEL_META } from "../shared/session_meta.ts";
 import { issueOAuth } from "../../tests/helpers/oauth.ts";
 import { hostedPause } from "../../tests/support/hosted-pause.ts";
@@ -461,6 +461,29 @@ describePg("hosted gate keyed fast path (Postgres)", () => {
     } finally { x.state.hold.open(); }
     await Promise.all(same);
     expect(d()).toEqual({ keyed: 4, miss: 0, skipped: 0 });
+  });
+
+  // #1537 PR 0: the keyed gate body's statements, pinned so a later round-trip cut updates them on purpose. A live
+  // root, no facts, the touch window not passed: 8, BEGIN; authorized's findActiveAccess and users.active; grantLive's
+  // FOR SHARE; settle's store.lock (the root probe, then the row FOR UPDATE); the auth-mark read; COMMIT. rowFor and
+  // rootOf send nothing (they use settle's rows). With the clock past the touch window the root's touch adds its
+  // UPDATE: 9. Every statement is awaited, so each is its own round trip. The method label is the tool call's (`tool`).
+  // Mutation: tx.ts statements() without counted (the counts drop to the framing's 3).
+  test("a keyed gate body sends a pinned number of statements, one round trip each (#1537 PR 0)", async () => {
+    await using db = await pgDatabase({ max: 2 });
+    await using x = await gateInstance(db.url, { oauth: true });
+    const { p } = await issued(x);
+    await whoami(x, p, "root-a");
+    await whoami(x, p, "root-a");
+    const measured = async (fn: () => Promise<unknown>) => {
+      const at = statementTotals("gate"), tool = gateCount("gate", "keyed", "tool");
+      await fn();
+      const now = statementTotals("gate");
+      return { bodies: now.bodies - at.bodies, statements: now.statements - at.statements, roundTrips: now.roundTrips - at.roundTrips, keyedTool: gateCount("gate", "keyed", "tool") - tool };
+    };
+    expect(await measured(() => whoami(x, p, "root-a"))).toEqual({ bodies: 1, statements: 8, roundTrips: 8, keyedTool: 1 });
+    x.advance(LATER);
+    expect(await measured(() => whoami(x, p, "root-a"))).toEqual({ bodies: 1, statements: 9, roundTrips: 9, keyedTool: 1 });
   });
 
   // Each exclusive writer of the held root's rows queues behind the keyed gate body and starts only after it: a
