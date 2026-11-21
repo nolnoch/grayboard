@@ -18,6 +18,14 @@
 // server.log, drivers' stderr and summary.json to its run dir (.e2e-runs/loadtest-<time>/ unless
 // --out), exits 1 on any miss and 2 when the run itself broke.
 //
+// Service traffic (#1258), in every profile unless --service-workers 0: the last W sessions are a service's workers
+// (service loadsvc, one run token minted by client credentials as a launcher mints it), the lanes of its queue board
+// load-svc; every user holds service_invoke through a team (T teams, user u in team u % T). A user's op invokes the
+// service (a post on load-svc: service.invoke and queueLanes) at --svc-share, or lists peers (alias.see_service per
+// service scope) at --peer-share; the lane replies under each invocation, which wakes the invoker. Those calls are
+// native tool calls, so the latency gates cover them, and the client reports them as their own ops (svc_invoke,
+// svc_reply, peer_list); every invocation must come back as a reply its invoker read.
+//
 // The server runs with GRAYBOARD_DEV_AUTH=1 (tests/support/server.ts) on every interface, for as
 // long as the run: anyone who can reach this host's port can sign in to the scratch database.
 // Run it on a machine whose ports aren't reachable from untrusted networks.
@@ -35,10 +43,10 @@ import { openDatabase, type Repo } from "../src/server/db.ts";
 import { makePgRepo } from "../src/server/pg_repo.ts";
 import { openPg } from "../src/server/store/pg/sql.ts";
 import { sessionEndPort } from "../src/server/session_end.ts";
-import { OAUTH_TTL } from "../src/server/oauth-types.ts";
+import { DEFAULT_SERVICE_TOKEN_LIMITS, OAUTH_TTL, SERVICE_TOKEN_MIN_SECONDS } from "../src/server/oauth-types.ts";
 import { issueOAuth } from "../tests/helpers/oauth.ts";
 import { HOSTED_CLIENT, HOSTED_SCOPES } from "../tests/support/hosted_session.ts";
-import { ServerProcess } from "../tests/support/server.ts";
+import { devLogin, ServerProcess } from "../tests/support/server.ts";
 import { BUCKETS, type DriverConfig, type DriverFinal, type DriverSession, type DriverWindow, type Hist } from "./loadtest_driver.ts";
 
 const ROOT = resolve(import.meta.dir, "..");
@@ -47,6 +55,9 @@ export type Options = {
   sessions: number; users: number; drivers: number; durationS: number; warmupS: number; periodS: number;
   boards: number; postShare: number; burst: number; churn: number; churnEveryS: number; windowS: number;
   graceS: number; server: string[]; out: string; keepDb: boolean; rssGate: boolean; env: Record<string, string>;
+  // The service's workers (of `sessions`), the teams its invokers hold service_invoke through, and the shares of a
+  // user's ops that invoke it and list peers.
+  serviceWorkers: number; teams: number; svcShare: number; peerShare: number;
   // A Postgres cluster URL; absent runs the server on a SQLite file.
   pg?: string;
 };
@@ -57,6 +68,7 @@ export function options(argv: string[]): Options {
       quick: { type: "boolean" }, sessions: { type: "string" }, users: { type: "string" }, drivers: { type: "string" },
       duration: { type: "string" }, warmup: { type: "string" }, period: { type: "string" }, boards: { type: "string" },
       "post-share": { type: "string" }, burst: { type: "string" }, churn: { type: "string" }, "churn-every": { type: "string" },
+      "service-workers": { type: "string" }, teams: { type: "string" }, "svc-share": { type: "string" }, "peer-share": { type: "string" },
       window: { type: "string" }, grace: { type: "string" }, server: { type: "string" }, out: { type: "string" }, "keep-db": { type: "boolean" }, pg: { type: "string" },
       // Server env overrides, KEY=VALUE, applied after the caps the run computes.
       env: { type: "string", multiple: true },
@@ -77,6 +89,8 @@ export function options(argv: string[]): Options {
     durationS, warmupS: n("warmup", 600, 15), periodS: n("period", 30, 3), boards: n("boards", 20, 2),
     postShare: n("post-share", 0.05, 0.2), burst: n("burst", 100, 20), churn: n("churn", 0.1, 0.25),
     churnEveryS: n("churn-every", 900, 20), windowS: n("window", 10, 5), graceS: n("grace", 15, 5),
+    // Unset, the workers shrink to what a small fleet leaves after its users' sessions (defaultWorkers).
+    serviceWorkers: v["service-workers"] === undefined ? defaultWorkers(n("service-workers", 4, 2), n("sessions", 1000, 40), n("users", 100, 4)) : n("service-workers", 4, 2), teams: v.teams === undefined ? Math.min(n("teams", 10, 2), Math.max(1, n("users", 100, 4))) : n("teams", 10, 2), svcShare: n("svc-share", 0.05, 0.2), peerShare: n("peer-share", 0.02, 0.1),
     server: v.server ? [resolve(v.server)] : [process.execPath, join(ROOT, "src/server/main.ts")],
     out: v.out ? resolve(v.out) : join(ROOT, ".e2e-runs", `loadtest-${new Date().toISOString().replace(/[:.]/g, "-")}`),
     keepDb: v["keep-db"] === true,
@@ -91,8 +105,24 @@ export function options(argv: string[]): Options {
   };
   if (o.sessions < 2 || o.users < 1 || o.drivers < 1 || o.users > o.sessions || o.drivers > o.sessions) throw new Error("need sessions ≥ 2, 1 ≤ users ≤ sessions, 1 ≤ drivers ≤ sessions");
   if (o.warmupS >= o.durationS) throw new Error("--warmup must be shorter than --duration");
+  if (!Number.isInteger(o.serviceWorkers) || userSessions(o) < Math.max(2, o.users)) throw new Error("--service-workers must be a whole number that leaves at least 2 sessions, and one per user, to the users");
+  if (o.serviceWorkers && (!Number.isInteger(o.teams) || o.teams < 1 || o.teams > o.users)) throw new Error("--teams must be a whole number from 1 to --users");
+  if (o.postShare + (o.serviceWorkers ? o.svcShare + o.peerShare : 0) > 1) throw new Error("--post-share, --svc-share and --peer-share must sum to at most 1");
   return o;
 }
+
+// Unset, the workers shrink to what a small fleet leaves after its users' sessions; a fleet that leaves none is
+// refused rather than run without the service: only an explicit --service-workers 0 turns it off.
+function defaultWorkers(want: number, sessions: number, users: number): number {
+  const room = sessions - Math.max(2, users);
+  // A fleet the sessions/users check refuses anyway gets that error, not this one.
+  if (users > sessions || sessions < 2) return 0;
+  if (room < 1) throw new Error(`${sessions} sessions leave no room for a service worker after ${users} users' sessions: raise --sessions, or pass --service-workers 0 to run without the service`);
+  return Math.min(want, room);
+}
+
+// The sessions that are users' (the rest are the service's workers).
+export const userSessions = (o: Options) => o.sessions - o.serviceWorkers;
 
 // Prometheus text, one sample per line: `name{k="v",…} value`.
 export type Sample = { name: string; labels: Record<string, string>; value: number };
@@ -129,6 +159,8 @@ function refusalsTotal(s: Sample[]): Record<string, number> {
 
 // The share of a client histogram at or under 0.1 s.
 const fastShare = (h: { buckets: number[]; count: number }) => h.count ? h.buckets[BUCKETS.indexOf(0.1)]! / h.count : 1;
+// The 99th percentile's bucket: the lowest edge at or under which 99% of calls fall (null: beyond the last, or none).
+const p99Edge = (h: Hist) => h.count ? BUCKETS.find((_, i) => h.buckets[i]! >= 0.99 * h.count) ?? null : null;
 const mergeHist = (into: Hist, h: Hist) => { h.buckets.forEach((b, i) => into.buckets[i]! += b); into.count += h.count; into.sum += h.sum; into.errors += h.errors; };
 const newHist = (): Hist => ({ buckets: BUCKETS.map(() => 0), count: 0, sum: 0, errors: 0 });
 // The 99% latency gate on a pool of any size: more slow calls than 1% of the pool, rounded up, so a pool under 100
@@ -154,7 +186,7 @@ export function slope(points: [number, number][]): number {
 // sessions per user. Never below a shipped default, and a per-user cap never above its global
 // (the server refuses to start on that).
 export function capsEnv(o: Options): Record<string, string> {
-  const n = Math.ceil(o.sessions * 1.25), perUser = Math.ceil(Math.ceil(o.sessions / o.users) * 1.25);
+  const n = Math.ceil(o.sessions * 1.25), perUser = Math.ceil(Math.ceil(userSessions(o) / o.users) * 1.25);
   const pair = (prefix: string, d: { global: number; perUser: number }, scoped = perUser) => {
     const global = Math.max(n, d.global);
     return { [`${prefix}_GLOBAL`]: String(global), [`${prefix}_PER_USER`]: String(Math.min(global, Math.max(scoped, d.perUser))) };
@@ -162,6 +194,8 @@ export function capsEnv(o: Options): Record<string, string> {
   return {
     ...pair("GRAYBOARD_HOSTED_SESSIONS", DEFAULT_HOSTED_CAPS.sessions), ...pair("GRAYBOARD_DELIVERY_LEASES", DEFAULT_HOSTED_CAPS.leases),
     ...pair("GRAYBOARD_MCP_LISTEN", DEFAULT_MCP_LIMITS.listen), ...pair("GRAYBOARD_MCP_POST", DEFAULT_MCP_LIMITS.post, perUser * 4),
+    // The service's workers: one lease each, under its own per-service cap (its buckets' defaults are far above them).
+    ...(Math.ceil(o.serviceWorkers * 1.25) > DEFAULT_HOSTED_CAPS.leases.perService! ? { GRAYBOARD_DELIVERY_LEASES_PER_SERVICE: String(Math.min(Math.max(n, DEFAULT_HOSTED_CAPS.leases.global), Math.ceil(o.serviceWorkers * 1.25))) } : {}),
     // Board watches: one per session at most here; the per-session default stands.
     GRAYBOARD_RESOURCE_WATCHES_GLOBAL: String(Math.max(n, DEFAULT_HOSTED_CAPS.watches.global)),
     // Each per-user request bucket (#845), raised only when its estimate needs it, at twice the estimate.
@@ -177,12 +211,13 @@ function bucket(prefix: string, d: RateLimit, rate: number): Record<string, stri
 // Hosted requests per second per user, per bucket, at hosted-core's cadence. Tool calls: the agent's
 // op every period. Delivery upkeep (role=subscriber): a renew and a read every 10 s, and up to three
 // requests per delivery (a read on its hint, a renew, a receipt; #845). A DM reaches one session; a
-// post reaches its board's other subscribers.
+// post reaches its board's other subscribers; an invocation's reply reaches its invoker; a peer_list reaches no one.
 export function perUserRate(o: Options): { tools: number; subscriber: number; total: number } {
-  const subscribers = Math.max(0, o.sessions / o.boards - 1);
-  const perUser = o.sessions / o.users;
+  const subscribers = Math.max(0, userSessions(o) / o.boards - 1);
+  const perUser = userSessions(o) / o.users;
   const tools = perUser / o.periodS;
-  const subscriber = perUser * (0.2 + (1 / o.periodS) * 3 * ((1 - o.postShare) + o.postShare * subscribers));
+  const peers = o.serviceWorkers ? o.peerShare : 0;
+  const subscriber = perUser * (0.2 + (1 / o.periodS) * 3 * ((1 - o.postShare - peers) + o.postShare * subscribers));
   return { tools, subscriber, total: tools + subscriber };
 }
 
@@ -193,6 +228,36 @@ type Window = {
   driverLagP99: number; ops: number; loadavg: number[];
 };
 
+// What the server recorded of the service's traffic: the post ids of the invocations it allowed through a team's
+// service_invoke binding (authz.decision rows, src/server/application.ts board_post), every service.invoke row by
+// rule, and the service board's scope. The run's proof that its invocations took the service path, not another one.
+type ServiceAudit = { teamAllowed: Set<number>; rules: Record<string, number>; boardScope: string | null; boardKind: string | null };
+async function serviceAudit(pgDbUrl: string | undefined, dbPath: string): Promise<ServiceAudit> {
+  let details: unknown[], board: { scope: string | null; kind: string | null } | undefined;
+  if (pgDbUrl) {
+    const sql = openPg(pgDbUrl, { max: 1, applicationName: "gb-loadtest-audit" });
+    try {
+      details = (await sql`SELECT detail FROM access_log WHERE action = 'authz.decision'`).map((r: { detail: unknown }) => r.detail);
+      board = (await sql`SELECT scope, kind FROM boards WHERE name = ${SVC_BOARD}`)[0];
+    } finally { await sql.close(); }
+  } else {
+    const ro = new Database(dbPath, { readonly: true });
+    try {
+      details = (ro.query("SELECT detail FROM access_log WHERE action = 'authz.decision'").all() as { detail: string }[]).map(r => r.detail);
+      board = ro.query("SELECT scope, kind FROM boards WHERE name = ?").get(SVC_BOARD) as typeof board ?? undefined;
+    } finally { ro.close(); }
+  }
+  const teamAllowed = new Set<number>(), rules: Record<string, number> = {};
+  for (const raw of details) {
+    const d = (typeof raw === "string" ? JSON.parse(raw) : raw) as Record<string, unknown> | null;
+    if (d?.verb !== "service.invoke") continue;
+    const key = `${d.rule}:${d.allow ? "allow" : "deny"}`;
+    rules[key] = (rules[key] ?? 0) + 1;
+    if (d.allow === true && d.rule === "role.service_invoke" && typeof d.team === "string" && d.board === SVC_BOARD && typeof d.post_id === "number") teamAllowed.add(d.post_id);
+  }
+  return { teamAllowed, rules, boardScope: board?.scope ?? null, boardKind: board?.kind ?? null };
+}
+
 // Every hosted_sessions row left once the fleet has closed, parked children included.
 async function hostedRows(pgDbUrl: string | undefined, dbPath: string): Promise<number> {
   if (pgDbUrl) {
@@ -201,6 +266,38 @@ async function hostedRows(pgDbUrl: string | undefined, dbPath: string): Promise<
   }
   const ro = new Database(dbPath, { readonly: true });
   try { return (ro.query("SELECT count(*) AS n FROM hosted_sessions").get() as { n: number }).n; } finally { ro.close(); }
+}
+
+const ADMIN = "load-admin@example.com", SERVICE = "loadsvc", SVC_BOARD = "load-svc";
+const SERVICE_OPS = { svc_invoke: 1, svc_reply: 1, peer_list: 1 };
+
+// The service, as an admin and a launcher set one up (tests/support/service_token.ts): the service (owned by the first
+// user), a credential whose run tokens outlast the run, one run token minted with client credentials, and T teams
+// (user u in team u % T), each granted service_invoke on it. Returns the run token every worker connects with.
+async function seedService(base: string, o: Options, emails: string[], runS: number): Promise<string> {
+  const admin = await devLogin(base, ADMIN);
+  const api = async (method: string, path: string, body: unknown, want: number) => {
+    const r = await fetch(`${base}${path}`, { method, headers: { Authorization: `Bearer ${admin}` }, body: JSON.stringify(body) });
+    const text = await r.text();
+    if (r.status !== want) throw new Error(`${method} ${path}: ${r.status} ${text}`);
+    return JSON.parse(text);
+  };
+  await api("POST", "/api/admin/services", { name: SERVICE, owners: [emails[0]] }, 201);
+  const c = await api("POST", "/api/admin/services/credentials", { service: SERVICE, token_seconds: Math.max(SERVICE_TOKEN_MIN_SECONDS, Math.min(runS, DEFAULT_SERVICE_TOKEN_LIMITS.maxSeconds)) }, 201);
+  const minted = await fetch(`${base}/oauth/token`, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded", Authorization: `Basic ${btoa(`${encodeURIComponent(c.client_id)}:${encodeURIComponent(c.client_secret)}`)}` },
+    body: new URLSearchParams({ grant_type: "client_credentials" }),
+  });
+  const token = ((await minted.json()) as { access_token?: string }).access_token;
+  if (minted.status !== 200 || !token) throw new Error(`minting the service's run token: ${minted.status}`);
+  for (let t = 0; t < o.teams; t++) {
+    const team = `loadteam-${t}`;
+    await api("POST", "/api/teams", { name: team }, 201);
+    for (let u = t; u < emails.length; u += o.teams) await api("POST", `/api/teams/${team}/add`, { email: emails[u] }, 200);
+    await api("POST", "/api/admin/roles/grant", { role: "service_invoke", principal: team, scope: SERVICE }, 201);
+  }
+  return token;
 }
 
 async function main() {
@@ -213,11 +310,12 @@ async function main() {
   const pgAdmin = o.pg ? openPg(o.pg, { max: 1, applicationName: "gb-loadtest-admin" }) : undefined;
   const pgDbUrl = o.pg ? (() => { const u = new URL(o.pg!); u.pathname = `/${pgName}`; return u.toString(); })() : undefined;
   const log = (s: string) => { console.log(s); appendFileSync(join(o.out, "run.log"), s + "\n"); };
-  log(`loadtest: ${o.sessions} sessions, ${o.users} users, ${o.drivers} drivers, ${o.durationS}s (${o.warmupS}s warm-up), op every ${o.periodS}s, ${o.boards} boards (~${Math.round(o.sessions / o.boards)} subscribers each), post share ${o.postShare}, burst ${o.burst}, churn ${o.churn} every ${o.churnEveryS}s; ${cpus().length} CPUs, load ${loadavg().map(x => x.toFixed(2)).join(" ")}`);
+  log(`loadtest: ${o.sessions} sessions, ${o.users} users, ${o.drivers} drivers, ${o.durationS}s (${o.warmupS}s warm-up), op every ${o.periodS}s, ${o.boards} boards (~${Math.round(o.sessions / o.boards)} subscribers each), post share ${o.postShare}, burst ${o.burst}, churn ${o.churn} every ${o.churnEveryS}s, ${o.serviceWorkers ? `${o.serviceWorkers} service workers, ${o.teams} invoker teams, svc share ${o.svcShare}, peer_list share ${o.peerShare}` : "no service"}; ${cpus().length} CPUs, load ${loadavg().map(x => x.toFixed(2)).join(" ")}`);
   log(`run dir: ${o.out}`);
 
   const caps = capsEnv(o);
-  const env = { ...caps, ...o.env, GRAYBOARD_METRICS_ADDR: "127.0.0.1:0", HOME: join(scratch, "home") };
+  // The admin creates the service, its credential, the teams and their grants through the admin routes.
+  const env = { ...caps, ...o.env, GRAYBOARD_METRICS_ADDR: "127.0.0.1:0", GRAYBOARD_ADMINS: ADMIN, HOME: join(scratch, "home") };
   mkdirSync(env.HOME, { recursive: true });
   log(`server env: ${Object.entries(env).filter(([k]) => k !== "HOME").map(([k, v]) => `${k}=${v}`).join(" ")} (about ${perUserRate(o).tools.toFixed(1)} tool and ${perUserRate(o).subscriber.toFixed(1)} delivery requests/s per user)`);
   type Driver = { proc: ReturnType<typeof Bun.spawn>; windows: DriverWindow[]; ready?: { live: number; want: number }; final?: DriverFinal; churned: number; quiesced: boolean; read: Promise<void> };
@@ -253,20 +351,25 @@ async function main() {
       return { email, token: (await issueOAuth(repo, resource, email, HOSTED_SCOPES, issuedAt, HOSTED_CLIENT)).token };
     }));
     await repo.close();
+    const svcToken = o.serviceWorkers ? await seedService(server.base, o, users.map(u => u.email), Math.ceil(runMs / 1000)) : undefined;
 
     const scrape = async () => parseMetrics(await (await fetch(metricsUrl!)).text());
 
-    // Sessions: index i belongs to user i % U and driver i % K, binds load-<i>, subscribes board i % B.
+    // Sessions: index i belongs to user i % U and driver i % K, binds load-<i>, subscribes board i % B; the last W are
+    // the service's workers, w-<j> on its run token, each a lane of its queue board.
+    const users_ = userSessions(o);
     const specs: DriverSession[] = Array.from({ length: o.sessions }, (_, i) => {
+      if (i >= users_) { const name = `w-${i - users_}`; return { index: i, email: SERVICE, token: svcToken!, name, address: `${SERVICE}/${name}`, board: SVC_BOARD, service: true }; }
       const u = users[i % o.users]!, name = `load-${i}`;
       return { index: i, email: u.email, token: u.token, name, address: `${u.email}/${name}`, board: `load-${i % o.boards}` };
     });
-    const addresses = specs.map(s => s.address);
+    const addresses = specs.filter(s => !s.service).map(s => s.address);
 
     for (let k = 0; k < o.drivers; k++) {
       const config: DriverConfig = {
         driver: k, url: `${server.base}/mcp`, sessions: specs.filter(s => s.index % o.drivers === k), addresses,
         periodMs: o.periodS * 1000, postShare: o.postShare, burst: Math.max(1, Math.ceil(o.burst / o.drivers)),
+        svcBoard: o.serviceWorkers ? SVC_BOARD : null, svcShare: o.svcShare, peerShare: o.peerShare,
       };
       const proc = Bun.spawn([process.execPath, join(ROOT, "scripts/loadtest_driver.ts")], {
         cwd: ROOT, stdin: "pipe", stdout: "pipe", stderr: Bun.file(join(o.out, `driver-${k}.stderr`)),
@@ -362,7 +465,7 @@ async function main() {
         ...(lagSamples.every(x => x !== undefined) ? { lag: { p50: lagSamples[0]!, p99: lagSamples[1]!, max: lagSamples[2]! } } : {}),
         leases: one(s, "grayboard_delivery_leases") ?? -1, listens: one(s, "grayboard_mcp_admissions", { kind: "listen" }) ?? -1,
         holding: one(s, "grayboard_hosted_sessions_holding") ?? -1, live, refusals, tools, client, clientErrors, driverLagP99,
-        ops: (client.dm_send?.count ?? 0) + (client.board_post?.count ?? 0), loadavg: loadavg(),
+        ops: ["dm_send", "board_post", "svc_invoke", "peer_list"].reduce((a, op) => a + (client[op]?.count ?? 0), 0), loadavg: loadavg(),
       };
       windows.push(w);
       appendFileSync(join(o.out, "windows.jsonl"), JSON.stringify(w) + "\n");
@@ -389,11 +492,13 @@ async function main() {
     const after = await scrape();
     const drained = { leases: one(after, "grayboard_delivery_leases"), listens: one(after, "grayboard_mcp_admissions", { kind: "listen" }), posts: one(after, "grayboard_mcp_admissions", { kind: "post" }), holding: one(after, "grayboard_hosted_sessions_holding"), watches: one(after, "grayboard_resource_watches"), exchanges: one(after, "grayboard_mcp_exchanges_in_flight") };
     const rows = await hostedRows(pgDbUrl, dbPath);
+    const audit = o.serviceWorkers ? await serviceAudit(pgDbUrl, dbPath) : undefined;
 
     // Gates.
     const steady = windows.filter(w => w.steady);
     if (!steady.length) failures.push("no steady window");
-    const target = o.sessions * o.windowS / o.periodS;
+    // Only users' sessions send on the schedule.
+    const target = userSessions(o) * o.windowS / o.periodS;
     for (const w of steady) {
       if (!w.churning && (w.leases !== o.sessions || w.listens !== o.sessions)) failures.push(`t=${w.t.toFixed(0)}s: ${w.leases} leases, ${w.listens} listens; want ${o.sessions} of each`);
       const all = Object.values(w.tools).reduce((a, x) => ({ count: a.count + x.count, fast: a.fast + x.fast }), { count: 0, fast: 0 });
@@ -423,10 +528,14 @@ async function main() {
     if (steady.length && clean.length < 0.9 * steady.length) failures.push(`${steady.length - clean.length} of ${steady.length} steady windows had a saturated driver (loop p99 ≥ 50 ms): add drivers`);
     const clientSteady: Record<string, Hist> = {};
     for (const w of clean) for (const [op, h] of Object.entries(w.client)) mergeHist(clientSteady[op] ??= newHist(), h);
-    for (const op of ["inbox", "renew", "receipt", "dm_send", "board_post"]) {
+    // The service's paths (#1258): each must have run, or a run without them would pass unmeasured.
+    const wanted: Record<string, boolean> = { board_post: o.postShare > 0, svc_invoke: o.serviceWorkers > 0 && o.svcShare > 0, svc_reply: o.serviceWorkers > 0 && o.svcShare > 0, peer_list: o.serviceWorkers > 0 && o.peerShare > 0 };
+    for (const op of ["inbox", "renew", "receipt", "dm_send", "board_post", "svc_invoke", "svc_reply", "peer_list"]) {
       const h = clientSteady[op];
-      if (!h && clean.length && (op !== "board_post" || o.postShare > 0)) failures.push(`client ${op}: no samples in the clean steady windows`);
+      if (!h && clean.length && (wanted[op] ?? true)) failures.push(`client ${op}: no samples in the clean steady windows`);
       if (h && h.count >= 100 && fastShare(h) < 0.99) failures.push(`client ${op}: ${(100 * fastShare(h)).toFixed(2)}% of ${h.count} at ≤ 100 ms (clean steady windows)`);
+      // The service's ops are rare (tens a run below the full profile): each is held to the pooled small-pool rule.
+      else if (h && op in SERVICE_OPS && tooSlow(h.count, h.buckets[BUCKETS.indexOf(0.1)]!)) failures.push(`client ${op}: ${(100 * fastShare(h)).toFixed(2)}% of ${h.count} at ≤ 100 ms (clean steady windows); want at most 1% slower, rounded up`);
     }
     // Refusals since the server started, connect and close included: the windows see only the load.
     const refusedAll = Object.fromEntries(Object.entries(refusalsTotal(after)).filter(([, v]) => v > 0));
@@ -447,6 +556,22 @@ async function main() {
     if (misdelivered) failures.push(`${misdelivered} deliveries reached the wrong session (e.g. ${drivers.flatMap(d => d.final!.misdeliveredFirst).slice(0, 5).join("; ")})`);
     const posts = drivers.reduce((a, d) => a + d.final!.posts, 0), boardRecv = drivers.reduce((a, d) => a + d.final!.boardRecv, 0);
     if (o.postShare > 0 && !boardRecv) failures.push(`${posts} board posts, none delivered`);
+    // Invocation accounting: every invocation whose post returned reached a lane, and its reply reached the invoker.
+    const svcSent = new Set(drivers.flatMap(d => d.final!.svcSent)), svcGot = new Set(drivers.flatMap(d => d.final!.svcGot)), svcDone = new Set(drivers.flatMap(d => d.final!.svcDone));
+    const svcLost = [...svcSent].filter(id => !svcDone.has(id)), svcUnread = [...svcSent].filter(id => !svcGot.has(id));
+    if (o.serviceWorkers && o.svcShare > 0) {
+      if (!svcSent.size) failures.push("no service invocation was sent");
+      if (svcUnread.length) failures.push(`${svcUnread.length} of ${svcSent.size} invocations never reached a service lane (e.g. ${svcUnread.slice(0, 5).join(", ")})`);
+      if (svcLost.length) failures.push(`${svcLost.length} of ${svcSent.size} invocations never came back as a reply their invoker read (e.g. ${svcLost.slice(0, 5).join(", ")})`);
+      // Proof the invocations took the service path: each allowed by a team's service_invoke binding, on a board in
+      // the service's scope, and no lane read a reply (a lane rotation would hand a lane its siblings' replies).
+      const svcPosts = drivers.flatMap(d => d.final!.svcPosts), unproven = svcPosts.filter(id => !audit!.teamAllowed.has(id));
+      if (svcPosts.length !== svcSent.size) failures.push(`${svcSent.size} invocations returned, ${svcPosts.length} with a post id`);
+      if (unproven.length) failures.push(`${unproven.length} of ${svcPosts.length} invocations have no authz.decision row allowing service.invoke through a team's binding (e.g. posts ${unproven.slice(0, 5).join(", ")}; service.invoke rows by rule ${JSON.stringify(audit!.rules)})`);
+      if (audit!.boardScope !== `service:${SERVICE}` || audit!.boardKind !== "queue") failures.push(`${SVC_BOARD} is scope ${audit!.boardScope}, kind ${audit!.boardKind}; want service:${SERVICE}, queue`);
+    }
+    const laneEchoes = drivers.reduce((a, d) => a + d.final!.laneEcho, 0);
+    if (laneEchoes) failures.push(`${laneEchoes} replies reached a service lane; want 0 (a reply goes to its invoker)`);
     // RSS and heap over the steady period.
     const rssSlope = slope(steady.map(w => [w.t, w.rss])), heapSlope = slope(steady.map(w => [w.t, w.heap]));
     const meanRss = steady.reduce((a, w) => a + w.rss, 0) / Math.max(1, steady.length);
@@ -459,14 +584,15 @@ async function main() {
     const summary = {
       options: { ...o, server: o.server.join(" ") }, env, connected, windows: windows.length, steadyWindows: steady.length, cleanWindows: clean.length,
       toolSteady: Object.fromEntries(Object.entries(toolSteady).map(([t, x]) => [t, { count: x.count, fastShare: x.fast / x.count }])),
-      clientSteady: Object.fromEntries(Object.entries(clientSteady).map(([op, h]) => [op, { count: h.count, fastShare: fastShare(h), mean: h.sum / Math.max(1, h.count), errors: h.errors }])),
+      clientSteady: Object.fromEntries(Object.entries(clientSteady).map(([op, h]) => [op, { count: h.count, fastShare: fastShare(h), p99Le: p99Edge(h), mean: h.sum / Math.max(1, h.count), errors: h.errors }])),
       dms: { sent: sent.size, received: recv.size, lost: lost.length }, misdelivered, posts, boardDeliveries: boardRecv,
+      service: o.serviceWorkers ? { name: SERVICE, board: SVC_BOARD, workers: o.serviceWorkers, teams: o.teams, invocations: svcSent.size, reachedLane: svcGot.size, replied: svcDone.size, lost: svcLost.length, laneEchoes, teamAllowed: audit!.teamAllowed.size, rules: audit!.rules, boardScope: audit!.boardScope } : null,
       rss: { meanMB: meanRss / 2 ** 20, growthMB: rssGrowth / 2 ** 20, gated: o.rssGate }, heapGrowthMB: heapSlope * steadyS / 2 ** 20,
       lag: { windows: lagP99.length, p99Max: Math.max(0, ...lagP99), p99Median: lagP99.sort((a, b) => a - b)[Math.floor(lagP99.length / 2)] ?? null },
       drained, hostedRowsAfter: rows, refusals: refusedAll, clientErrors: erroredAll, failures,
     };
     writeFileSync(join(o.out, "summary.json"), JSON.stringify(summary, null, 2) + "\n");
-    log(`summary: ${JSON.stringify({ connected, dms: summary.dms, posts, boardDeliveries: boardRecv, rss: summary.rss, heapGrowthMB: summary.heapGrowthMB.toFixed(1), lag: summary.lag, hostedRowsAfter: rows })}`);
+    log(`summary: ${JSON.stringify({ connected, dms: summary.dms, posts, boardDeliveries: boardRecv, service: summary.service, rss: summary.rss, heapGrowthMB: summary.heapGrowthMB.toFixed(1), lag: summary.lag, hostedRowsAfter: rows })}`);
     if (failures.length) { log(`FAIL (${failures.length}):`); for (const f of failures.slice(0, 50)) log(`  ${f}`); exitCode = 1; }
     else log("PASS");
   } catch (e) {
