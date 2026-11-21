@@ -850,11 +850,17 @@ export function createHostedSessions(application: Application, options: { now?: 
     return launcher && stored.launcher !== 1;
   }
   // `signal`: the request's, as withGate's: the touch is skipped if it fires while the body waits, rejecting the call.
-  async function withPrior<T>(p: OAuthPrincipal, context: SessionContext, prior: Verdict, fn: (row: HostedSession | undefined) => Promise<T>, signal?: AbortSignal): Promise<T> {
+  // `writer`: the call runs alone under the root's BindGate (gate(id).bind), as withGate's writer: `owning`'s bind and
+  // delivery open (#1537 C7). `method`: the call, for the counter (countGate). Every fallback (a prior that differs
+  // outright, a stopped server, a body that misses) is the caller's full gate: withGate with the same `writer`, `signal`
+  // and `method`, which admits (create) and wakes as `run`, `control` and `owning` ask. Called outside the BindGate's
+  // callback, so a writer's fallback never waits on its own gate.
+  async function withPrior<T>(p: OAuthPrincipal, context: SessionContext, prior: Verdict, fn: (row: HostedSession | undefined) => Promise<T>, signal?: AbortSignal, writer = false, method: GateMethod = "tool"): Promise<T> {
+    const full = () => withGate(p, context, writer, fn, true, true, true, true, signal, method);
     await authorized(p);
-    if (!("id" in context) || context.id !== prior.row.session_id || prior.row.parked_at !== null) { countGate("prior", "skipped"); return withGate(p, context, false, fn, true, true, true, true, signal); }
+    if (!("id" in context) || context.id !== prior.row.session_id || prior.row.parked_at !== null) { countGate("prior", "skipped", method); return full(); }
     const id = prior.root.session_id;
-    const result = await gate(id).call(async () => {
+    const result = await gate(id)[writer ? "bind" : "call"](async () => {
       await authorized(p);
       if (stopped) return MISS;
       // Keyed by the root (#1510 chunk 3, D4), as the gate's fast path: authorization read in the body, the grant FOR
@@ -879,7 +885,7 @@ export function createHostedSessions(application: Application, options: { now?: 
         return { row: fresh, seen: fresh === root ? seen : Math.min(seen, await touchRow(tx, fresh, t)) };
       };
       const touched = await abandonable(signal, () => atSite("prior", () => keyedFast ? store.writeKeyed([`root:${id}`], body) : store.write(body)));
-      countGate("prior", !keyedFast ? "skipped" : touched ? "keyed" : "miss");
+      countGate("prior", !keyedFast ? "skipped" : touched ? "keyed" : "miss", method);
       if (!touched) return MISS;
       const { row, seen } = touched;
       const ids = [...new Set([row.session_id, id])];
@@ -890,7 +896,7 @@ export function createHostedSessions(application: Application, options: { now?: 
         await touchAfter(row, seen);
       }
     });
-    return result === MISS ? withGate(p, context, false, fn, true, true, true, true, signal) : result as T;
+    return result === MISS ? full() : result as T;
   }
   async function attach(tx: Tx, p: OAuthPrincipal, row: HostedSession): Promise<HostedSession> {
     await authorized(p, tx);
@@ -1052,9 +1058,11 @@ export function createHostedSessions(application: Application, options: { now?: 
     },
     // `defer`: for a session `fn` opens, its `afterRollback`. `tx`: the body's. `signal`: the request's (withGate), for
     // bind and unbind: the gate and the body are each skipped, with `committed`, if it fires while they wait. `method`:
-    // the call, for the gate counter (withGate).
-    async owning<T, R = T>(p: OAuthPrincipal, context: SessionContext, fn: (row: HostedSession, defer: (write: RefusalRow) => void, tx: Tx) => T | Promise<T>, committed?: (value: T) => R | Promise<R>, signal?: AbortSignal, method: GateMethod = "owning"): Promise<R> {
-      return withGate(p, context, true, async row => {
+    // the call, for the gate counter (withGate). `prior`: the request's exchange's verdict (#1537 C7), which stands in
+    // for the gate's settle and rowFor as in `run` (withPrior, as a writer): attach then locks the root, authorizes on
+    // the body's Tx and fences the row against it, as after the full gate.
+    async owning<T, R = T>(p: OAuthPrincipal, context: SessionContext, fn: (row: HostedSession, defer: (write: RefusalRow) => void, tx: Tx) => T | Promise<T>, committed?: (value: T) => R | Promise<R>, signal?: AbortSignal, method: GateMethod = "owning", prior?: Verdict): Promise<R> {
+      const body = async (row: HostedSession | undefined) => {
         if (!row) throw new ApplicationError("unbound", `this request carries no session context (${("missing" in context ? context.missing : "missing")}), so it can only read.`);
         rootOnly(row);
         await testPauseAsync("hosted:owning:before-txn");
@@ -1065,17 +1073,20 @@ export function createHostedSessions(application: Application, options: { now?: 
         try {
           return await abandonable(signal, () => store.write(async tx => { await grantLive(tx, p); return fn(await attach(tx, p, row), late.defer, tx); }, (result: T) => { done = true; return committed ? committed(result) : result as unknown as R; }));
         } catch (error) { if (!done) await late.flushQueued(); throw error; }
-      }, true, true, true, true, signal, method);
+      };
+      return prior ? withPrior(p, context, prior, body, signal, true, method) : withGate(p, context, true, body, true, true, true, true, signal, method);
     },
     // `absent`: an ending call's answer for an ID the server doesn't hold, which it then doesn't admit (#1097).
-    // `method`: the call, for the gate counter (withGate).
-    async control<T>(p: OAuthPrincipal, context: SessionContext, writer: boolean, fn: (row: HostedSession) => Promise<T> | T, absent?: () => T, method: GateMethod = "control"): Promise<T> {
-      return withGate(p, context, writer, async row => {
+    // `method`: the call, for the gate counter (withGate). `prior`: the request's exchange's verdict (#1537 C5), for a
+    // call that admits (no `absent`): withPrior then stands in for the second gate body, as for `run`'s tool call.
+    async control<T>(p: OAuthPrincipal, context: SessionContext, writer: boolean, fn: (row: HostedSession) => Promise<T> | T, absent?: () => T, method: GateMethod = "control", prior?: Verdict): Promise<T> {
+      const body = async (row: HostedSession | undefined) => {
         if (!row && absent) return absent();
         if (!row) throw new ApplicationError("unbound", "unbound; bind a name first");
         rootOnly(row);
         return fn(row);
-      }, true, true, true, !absent, undefined, method);
+      };
+      return prior && !absent ? withPrior(p, context, prior, body, undefined, writer, method) : withGate(p, context, writer, body, true, true, true, !absent, undefined, method);
     },
     // `held`: every hold, oldest first, and `primary` the one it sends as (#451): the client's
     // hold list, which the Controller restarts on when it changes (a bind, an unbind, a revocation).
@@ -1099,8 +1110,9 @@ export function createHostedSessions(application: Application, options: { now?: 
           ...(!(root && named(root, held)) ? { unbound: true, ...(offered ? { candidates: offered } : {}) } : {}) };
       }, true, true, true, true, undefined, "whoami");
     },
-    // `declared`: the native request's declaration (deliveryDeclaration); text only.
-    async bind(p: OAuthPrincipal, context: SessionContext, args: { name: string; create?: boolean; meta?: Record<string, unknown>; where?: string }, declared?: DeclaredDelivery, signal?: AbortSignal) {
+    // `declared`: the native request's declaration (deliveryDeclaration); text only. `prior`: the request's exchange's
+    // verdict (owning).
+    async bind(p: OAuthPrincipal, context: SessionContext, args: { name: string; create?: boolean; meta?: Record<string, unknown>; where?: string }, declared?: DeclaredDelivery, signal?: AbortSignal, prior?: Verdict) {
       const normalized = normalizeAliasName(args.name);
       if (!normalized.ok) throw new ApplicationError("bad_request", normalized.error);
       const result = await service.owning(p, context, async (row, defer, tx) => {
@@ -1133,7 +1145,7 @@ export function createHostedSessions(application: Application, options: { now?: 
         await testPauseAsync("hosted:bind:after-commit");
         await authorized(p);
         return result;
-      }, signal, "bind");
+      }, signal, "bind", prior);
       // A push client opens delivery right after bind and reports it itself if it can't. A
       // poll session gets no channel lines, as in its `initialize` text.
       const short = shortOf(p.authed.user_email), held = result.ok.held.map(short), name = short(result.ok.alias);

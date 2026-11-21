@@ -403,8 +403,10 @@ async function gateInstance(url: string, opts: { oauth?: boolean; keyedGate?: fa
   await oauth?.ready;
   const hosted = createHostedSessions(application, { now: () => clock, isAuthorized: (p, r) => { if (state.denyNext) { state.denyNext = false; return false; } return oauth ? oauth.isAuthorized(p, r) : true; }, ...(opts.keyedGate === false ? { keyedGate: false as const } : {}), ...(opts.idleSeconds ? { idleSeconds: opts.idleSeconds } : {}), ...(opts.caps ? { caps: opts.caps } : {}) });
   await hosted.ready;
+  // Delivery on the same authorization, for the subscriber calls' verdict reuse (#1537 C5, C7).
+  const delivery = createDelivery(hosted, { isAuthorized: (p, r) => oauth ? oauth.isAuthorized(p, r) : true });
   return {
-    repo, hosted, state, oauth, q: repo.writeQueue,
+    repo, hosted, delivery, state, oauth, q: repo.writeQueue,
     advance(ms: number) { clock += ms; },
     get clock() { return clock; },
     // Every write queued so far committed (an exclusive body waits for the keyed ones ahead of it): the posted audits
@@ -412,7 +414,7 @@ async function gateInstance(url: string, opts: { oauth?: boolean; keyedGate?: fa
     drain: () => atSite("other", () => repo.write(() => {})),
     async [Symbol.asyncDispose]() {
       state.hold?.open(); state.defer?.open(); state.priorHold?.open();
-      try { await hosted.close(); await application.stopExpiry(); oauth?.close(); await repo.close(); }
+      try { delivery.close(); await hosted.close(); await application.stopExpiry(); oauth?.close(); await repo.close(); }
       finally { rmSync(blobDir, { recursive: true, force: true }); }
     },
   };
@@ -1611,4 +1613,124 @@ describePg("keyed renew and receipt rows (Postgres)", () => {
     expect(fastRows.messages!.every(r => !r.includes('"delivered_at":null'))).toBe(true);
     expect(fastRows.access_log!.filter(r => r.includes("hosted.stale_capability"))).toHaveLength(2);
   });
+});
+
+// #1537 C5, C7: the subscriber's renew, receipt and pending (hosted `control`) and its delivery open and bind (`owning`)
+// reuse the exchange's selection verdict (withPrior) in place of a second gate body. Each change between the selection
+// and the call ends as it does with no verdict (today's full gate): the same answer, the same leases tracked, and the
+// same rows, audits and refusal rows (every table but the OAuth ones, whose tokens are random, normalized). The change
+// commits in one of three windows: before the call; inside the prior, after its checks outside the body and before the
+// body (`beforePrior`; the full arm's reference is the change before the call, the same state when its gate starts);
+// and after the gate or prior, before the call's own body (its testPause point; none for renew, whose fn goes straight
+// to its keyed body, so the existing keyed renew tests cover that window against the gate's row). The changes: an end,
+// a rebind (the generation bump, by this process with its notice and by an outside writer without one), the grant
+// revoked (by this process and by an outside writer's UPDATE, whose NOTIFY this process may not have heard), the user
+// disabled, the access token (the request's secret) revoked. Mutations: withPrior's bind_gen comparison dropped; its
+// fallback on a miss replaced by the call (no full gate); the body's authorization read dropped (pinned by the
+// existing "committed between withPrior's checks" tests); renew's own ownership/generation check dropped. Results in
+// p1537/c4/result.md.
+type VerdictOp = "renew" | "receipt" | "pending" | "open" | "bind";
+const VERDICT_STALES = ["nothing", "end", "rebind", "rebind outside", "grant revoke", "grant revoke outside", "disable", "access revoke"] as const;
+type VerdictStale = typeof VERDICT_STALES[number];
+type VerdictWindow = "before" | "in prior" | "in call";
+const CALL_PAUSE: Partial<Record<VerdictOp, string>> = { open: "hosted:owning:before-txn", bind: "hosted:owning:before-txn", receipt: "hosted:receipt:before-txn", pending: "hosted:pending:in-gate" };
+const OAUTH_TABLES = /^(oauth_|auth_|gb_|schema_|hosted_meta$|sessions$|users$|login_)/;
+
+async function verdictRun(op: VerdictOp, stale: VerdictStale, window: VerdictWindow, arm: "prior" | "full") {
+  await using db = await pgDatabase({ max: 3 });
+  await using x = await gateInstance(db.url, { oauth: true });
+  const { p, token, access } = await issued(x);
+  const c = ctx(p, "root-a"), id = idOf(p, "root-a"), s = ctx(p, "root-s");
+  await x.hosted.bind(p, s, { name: "sender", create: true });
+  await x.hosted.bind(p, c, { name: "fe", create: true });
+  await x.hosted.bind(p, c, { name: "be", create: true });
+  const lease = await x.delivery.open(p, c);
+  x.delivery.accept(lease);
+  await x.hosted.run(p, s, "dm_send", (session, tx) => x.hosted.application.send(tx, session, "fe", "one"));
+  const items = await x.delivery.pending(p, c, lease.capability);
+  expect(items).toHaveLength(1);
+  const verdict = (await x.hosted.snapshot(p, c)).verdict!;
+  const prior = arm === "prior" ? verdict : undefined;
+  const write = (fn: (tx: Tx) => Promise<unknown>) => atSite("other", () => x.repo.write(fn));
+  const act = async () => {
+    switch (stale) {
+      case "nothing": return;
+      case "end": await write(tx => x.repo.hosted.end(tx, id, "closed", x.clock)); return;
+      case "rebind": await write(async tx => { const r = (await x.repo.hosted.get(tx, id))!; await x.repo.hosted.update(tx, id, { bind_gen: r.bind_gen + 1 }); }); return;
+      case "rebind outside": await db.sql`UPDATE hosted_sessions SET bind_gen = bind_gen + 1 WHERE session_id = ${id}`; return;
+      case "grant revoke": await write(tx => x.repo.oauth.revokeToken(tx, hashToken(token), OPENCODE_CLIENT, x.clock)); return;
+      case "grant revoke outside": await db.sql`UPDATE oauth_grants SET revoked_at = ${x.clock} WHERE id = ${p.grantId}`; return;
+      case "disable": await write(tx => x.repo.users.setDisabled(tx, p.authed.user_id, true)); return;
+      case "access revoke": await write(tx => x.repo.oauth.revokeToken(tx, hashToken(access), OPENCODE_CLIENT, x.clock)); return;
+    }
+  };
+  const call = (): Promise<unknown> => {
+    switch (op) {
+      case "renew": return x.delivery.renew(p, c, lease.capability, undefined, prior);
+      case "receipt": return x.delivery.receipt(p, c, lease.capability, items.map(i => i.id), prior);
+      case "pending": return x.delivery.pending(p, c, lease.capability, 100, prior);
+      case "open": return x.delivery.open(p, c, {}, {}, prior);
+      case "bind": return x.hosted.bind(p, c, { name: "qa", create: true }, undefined, undefined, prior);
+    }
+  };
+  const answer = (pr: Promise<unknown>) => pr.then(() => "ok", (e: { code?: string; message?: string }) => `${e.code ?? "error"}: ${e.message}`);
+  const method = op;
+  const at = { gate: ["keyed", "miss", "skipped"].map(o => gateCount("gate", o as "keyed", method)), prior: ["keyed", "miss", "skipped"].map(o => gateCount("prior", o as "keyed", method)) };
+  let outcome: string;
+  if (window === "before") { await act(); outcome = await answer(call()); }
+  else if (window === "in prior") {
+    let ran = false;
+    x.state.beforePrior = async () => { ran = true; await act(); };
+    outcome = await answer(call());
+    x.state.beforePrior = undefined;
+    expect([op, stale, "beforePrior ran", ran]).toEqual([op, stale, "beforePrior ran", true]);
+  } else outcome = await answer(hostedPause(CALL_PAUSE[op]!, call, act));
+  const counts = { gate: ["keyed", "miss", "skipped"].map((o, i) => gateCount("gate", o as "keyed", method) - at.gate[i]!), prior: ["keyed", "miss", "skipped"].map((o, i) => gateCount("prior", o as "keyed", method) - at.prior[i]!) };
+  // Posted audits (writeAudit) and end-of-call touches committed.
+  await x.drain(); await x.drain();
+  const secrets = [p.grantId, token, access, hashToken(token), hashToken(access)];
+  const rows: Record<string, string[]> = {};
+  const tables = (await db.sql`SELECT tablename FROM pg_tables WHERE schemaname = 'public' ORDER BY tablename`).map((r: { tablename: string }) => r.tablename).filter((t: string) => !OAUTH_TABLES.test(t));
+  for (const table of tables) {
+    const found: Array<Record<string, unknown>> = await db.sql.unsafe(`SELECT * FROM ${table}`);
+    rows[table] = found.map(r => {
+      // A column the application stamps with its wall clock (application.ts now: a hold's bound_at, a write receipt's
+      // at, a message's delivered_at), not the injected one: only that it was set is compared.
+      const wall = (v: unknown) => { const n = typeof v === "bigint" || typeof v === "string" && /^\d{13}$/.test(v) ? Number(v) : v; return typeof n === "number" && Math.abs(n - Date.now()) < 86_400_000 ? "wall" : v; };
+      let text = JSON.stringify(Object.fromEntries(Object.entries(r).filter(([k]) => k !== "id" || table !== "access_log").map(([k, v]) => [k, wall(v)]).sort(([a], [b]) => String(a) < String(b) ? -1 : 1)), (_k, v) => typeof v === "bigint" ? String(v) : v);
+      for (const secret of secrets) text = text.split(secret).join("<secret>");
+      return text;
+    }).sort();
+  }
+  return { outcome, leases: x.delivery.activeLeaseCount, lost: x.hosted.refusalRowsLost, rows, counts };
+}
+
+describePg("control and owning reuse the exchange's verdict (#1537 C5, C7) (Postgres)", () => {
+  // A normal exchange: the call's gate body is gone (0 at the gate site for its method), and its prior ran keyed.
+  test("with nothing changed, each call's second gate body is a keyed prior: renew, receipt, pending, open, bind", async () => {
+    for (const op of ["renew", "receipt", "pending", "open", "bind"] as const) {
+      const full = await verdictRun(op, "nothing", "before", "full"), got = await verdictRun(op, "nothing", "before", "prior");
+      expect([op, full.outcome, full.counts]).toEqual([op, "ok", { gate: [1, 0, 0], prior: [0, 0, 0] }]);
+      expect([op, got.outcome, got.counts]).toEqual([op, "ok", { gate: [0, 0, 0], prior: [1, 0, 0] }]);
+      expect([op, got.leases, got.lost, got.rows]).toEqual([op, full.leases, full.lost, full.rows]);
+    }
+  }, 120_000);
+
+  for (const op of ["renew", "receipt", "pending", "open", "bind"] as const) {
+    test(`${op}: each change between the selection and the call ends as it does with no verdict, in every window`, async () => {
+      const windows: VerdictWindow[] = CALL_PAUSE[op] ? ["before", "in prior", "in call"] : ["before", "in prior"];
+      const seen: string[] = [];
+      for (const stale of VERDICT_STALES.filter(s => s !== "nothing")) for (const window of windows) {
+        const ref = await verdictRun(op, stale, window === "in prior" ? "before" : window, "full");
+        const got = await verdictRun(op, stale, window, "prior");
+        expect([stale, window, got.outcome, got.leases, got.lost]).toEqual([stale, window, ref.outcome, ref.leases, ref.lost]);
+        expect([stale, window, got.rows]).toEqual([stale, window, ref.rows]);
+        // The prior site ran for every prior call (keyed or missed, or refused in its body).
+        expect([stale, window, got.counts.prior.reduce((a: number, b: number) => a + b, 0) <= 1]).toEqual([stale, window, true]);
+        seen.push(`${stale} / ${window}: ${got.outcome}`);
+      }
+      // A change that refuses refuses in both arms: the outcome list is what the reference gave.
+      expect(seen.length).toBeGreaterThan(0);
+    }, 600_000);
+  }
 });

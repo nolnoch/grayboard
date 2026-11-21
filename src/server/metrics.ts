@@ -120,23 +120,27 @@ export function statementTotals(site: QueueSite): { bodies: number; statements: 
 // renew and receipt the same (#1510 chunk 4, delivery.ts): `skipped` there is SQLite, or the keyed path turned off.
 // `method`: the call the gate body served (#1537 PR 0): for the `gate` site the hosted call that ran withGate (an
 // exchange's `selection`, a tool call's own `tool` gate, `control`'s renew, receipt, pending and release, `owning`'s
-// open, bind and unbind, and the rest by name); the other sites have one each (prior: tool; renew and receipt: their own).
+// open, bind and unbind, and the rest by name); for the `prior` site the call that reused its exchange's verdict in
+// place of that gate body (withPrior: a native tool call's `tool`, and since #1537 C5/C7 the subscriber's renew,
+// receipt, pending, open and bind); renew and receipt have one each, their own.
 export const GATE_SITES = ["gate", "prior", "renew", "receipt"] as const;
 export const GATE_OUTCOMES = ["keyed", "miss", "skipped"] as const;
 export const GATE_METHODS = ["selection", "tool", "transfer", "whoami", "end", "open", "bind", "unbind", "owning", "renew", "receipt", "pending", "release", "control"] as const;
 export type GateSite = typeof GATE_SITES[number];
 export type GateOutcome = typeof GATE_OUTCOMES[number];
 export type GateMethod = typeof GATE_METHODS[number];
-const SITE_METHOD: Record<Exclude<GateSite, "gate">, GateMethod> = { prior: "tool", renew: "renew", receipt: "receipt" };
+export const PRIOR_METHODS = ["tool", "renew", "receipt", "pending", "open", "bind"] as const satisfies readonly GateMethod[];
+const SITE_METHOD: Record<"renew" | "receipt", GateMethod> = { renew: "renew", receipt: "receipt" };
 const gateKey = (site: GateSite, method: GateMethod, outcome: GateOutcome) => `${site}:${method}:${outcome}`;
 // Every series present from the start, so a rate() over a fresh process starts at zero.
 const gateFast = new Map<string, number>([
   ...GATE_METHODS.flatMap(m => GATE_OUTCOMES.map(o => [gateKey("gate", m, o), 0] as const)),
+  ...PRIOR_METHODS.flatMap(m => GATE_OUTCOMES.map(o => [gateKey("prior", m, o), 0] as const)),
   ...(Object.entries(SITE_METHOD) as [GateSite, GateMethod][]).flatMap(([s, m]) => GATE_OUTCOMES.map(o => [gateKey(s, m, o), 0] as const)),
 ]);
-export function countGate(site: GateSite, outcome: GateOutcome, method: GateMethod = site === "gate" ? "tool" : SITE_METHOD[site]) {
-  const k = gateKey(site, site === "gate" ? method : SITE_METHOD[site], outcome);
-  gateFast.set(k, gateFast.get(k)! + 1);
+export function countGate(site: GateSite, outcome: GateOutcome, method: GateMethod = "tool") {
+  const k = gateKey(site, site === "gate" || site === "prior" ? method : SITE_METHOD[site], outcome);
+  gateFast.set(k, (gateFast.get(k) ?? 0) + 1);
 }
 // One site's count for `outcome`, of one method or (none given) summed over them.
 export function gateCount(site: GateSite, outcome: GateOutcome, method?: GateMethod): number {
@@ -275,7 +279,7 @@ export function render(gauges: Gauges = {}): string {
   for (const [site, n] of queueSkips) out.push(`grayboard_write_queue_skipped_bodies_total${labelText({ site })} ${n}`);
   family("grayboard_write_queue_keyed_bodies_total", "counter", "Write-queue bodies released that ran keyed (overlapping other keyed bodies), by calling site; the rest ran exclusive.");
   for (const [site, n] of queueKeyed) out.push(`grayboard_write_queue_keyed_bodies_total${labelText({ site })} ${n}`);
-  family("grayboard_hosted_gate_bodies_total", "counter", "Hosted gate and delivery requests by site, the call the gate served (method), and how the write body ran: keyed (the fast path), miss (a keyed attempt, then the exclusive body), skipped (exclusive without an attempt).");
+  family("grayboard_hosted_gate_bodies_total", "counter", "Hosted gate and delivery requests by site, the call the gate (or, for prior, the reused selection verdict) served (method), and how the write body ran: keyed (the fast path), miss (a keyed attempt, then the exclusive body), skipped (exclusive without an attempt).");
   for (const [k, n] of gateFast) { const [site, method, outcome] = k.split(":"); out.push(`grayboard_hosted_gate_bodies_total${labelText({ site: site!, method: method!, outcome: outcome! })} ${n}`); }
   family("grayboard_write_queue_statements", "histogram", "Postgres statements per write body (BEGIN, COMMIT or ROLLBACK and the auth-mark read included), by calling site; SQLite bodies record none.");
   for (const [site, b] of queueStatements) if (b.count) histogram(out, "grayboard_write_queue_statements", { site }, STATEMENT_BUCKETS, b);
