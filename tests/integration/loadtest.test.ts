@@ -9,6 +9,9 @@ import { capsEnv, options, parseMetrics, perUserRate, combineQueue, quantile, qu
 import { DEFAULT_HOSTED_CAPS, DEFAULT_MCP_LIMITS } from "../../src/server/config.ts";
 import { DEFAULT_HOSTED_REQUEST_LIMIT } from "../../src/server/rate_limit.ts";
 import { runCli } from "../support/cli.ts";
+import { SdkError, SdkErrorCode, SdkHttpError } from "@modelcontextprotocol/client";
+import { ServerUnreachable } from "../../adapters/hosted-core/src/wire.ts";
+import { errorClass } from "../../scripts/loadtest_errors.ts";
 
 const ROOT = resolve(import.meta.dir, "../..");
 
@@ -41,6 +44,24 @@ describe("loadtest sizing", () => {
           .toEqual({ argv, prefix, global: true, perUser: true, within: true });
       }
     }
+  });
+
+  test("the POST caps leave every listener its slot and a connect's two wires theirs (#1532)", () => {
+    for (const argv of [[], ["--quick"], ["--sessions", "300", "--service-workers", "0"], ["--users", "1", "--sessions", "400"]]) {
+      const o = options(argv), env = capsEnv(o);
+      // A listen holds a POST slot for its stream's life; a connect POSTs discover from both wires at once.
+      expect({ argv, fits: Number(env.GRAYBOARD_MCP_POST_GLOBAL) >= Number(env.GRAYBOARD_MCP_LISTEN_GLOBAL) + 2 * o.sessions }).toEqual({ argv, fits: true });
+    }
+  });
+
+  test("a client error is classed by its cause chain: the SDK's code, an HTTP status and a capacity 429's body (#1532)", () => {
+    const capacity = new SdkHttpError(SdkErrorCode.EraNegotiationFailed, "probe", { status: 429, statusText: "Too Many Requests", text: "MCP request capacity reached" });
+    expect(errorClass(new SdkError(SdkErrorCode.EraNegotiationFailed, "Version negotiation probe failed", undefined, { cause: capacity }))).toBe("SdkError(ERA_NEGOTIATION_FAILED)<http_429(MCP request capacity reached)");
+    expect(errorClass(new ServerUnreachable(new SdkError(SdkErrorCode.RequestTimeout, "Request timed out")))).toBe("ServerUnreachable<SdkError(REQUEST_TIMEOUT)");
+    // A JSON body is the server's structured refusal, not a capacity line: the status alone.
+    expect(errorClass(new SdkHttpError(SdkErrorCode.ClientHttpNotImplemented, "x", { status: 503, text: "{\"code\":\"internal\"}" }))).toBe("http_503");
+    expect(errorClass(Object.assign(new Error("reset"), { code: "ECONNRESET" }))).toBe("Error(ECONNRESET)");
+    expect(errorClass("boom")).toBe("string");
   });
 
   test("slope is least squares in units per second", () => {
