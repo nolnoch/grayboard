@@ -2513,6 +2513,40 @@ describePg("keyed board_post rows (Postgres)", () => {
   });
 });
 
+// A keyed tool body's user read awaits (application.ts sendKeyed, postKeyed): a close landing meanwhile changes the
+// session outside the write queue, so each checks stillOpen again after it (#1573, the #1537 PR 6 audit's L4). The
+// session is closed at the read's testPause point, which the keyed body reaches first (its user read on a keyed Tx at
+// the tool site); the recheck makes it a miss with nothing written, and the exclusive body refuses the closed session.
+// Mutation: either function's second stillOpen dropped (the keyed body commits the message or post for the closed
+// session, counted keyed).
+describePg("keyed tool bodies' session recheck (Postgres)", () => {
+  for (const tool of ["dm_send", "board_post"] as const) test(`a session closed during a keyed ${tool}'s user read misses, and the exclusive body refuses it with nothing written`, async () => {
+    await using db = await pgDatabase({ max: 2 });
+    await using x = await leaseInstance(db.url);
+    const p = await leasePrincipal(x, db.sql);
+    await bound(x, p, "root-s1", "s1"); await bound(x, p, "root-r1", "r1");
+    if (tool === "board_post") await boardTool(x, p, "root-r1", "board_create", { name: "b1", purpose: "one" });
+    // The keyed body's session (the call's own, from its gate), and whether its user read ran on a keyed Tx.
+    let session: Parameters<LeaseInstance["application"]["close"]>[0] | undefined;
+    let keyedRead = false;
+    const sendKeyed = x.application.sendKeyed, postKeyed = x.application.postKeyed;
+    x.application.sendKeyed = (tx, s, ...rest) => { session = s; return sendKeyed(tx, s, ...rest); };
+    x.application.postKeyed = (tx, s, ...rest) => { session = s; return postKeyed(tx, s, ...rest); };
+    const isDisabled = x.repo.users.isDisabled;
+    x.repo.users.isDisabled = async (r, id) => { if (keyedTx(r) && currentSite() === "tool") keyedRead = true; return isDisabled(r, id); };
+    const rowsBefore = { messages: (await db.sql`SELECT count(*)::int AS n FROM messages`)[0].n, posts: (await db.sql`SELECT count(*)::int AS n FROM posts`)[0].n };
+    const d = toolDelta();
+    const call = () => tool === "dm_send" ? dm(x, p, "root-s1", `${ME}/r1`, "while closing") : post(x, p, "root-s1", { board: "b1", body: "while closing" });
+    const out = await hostedPause("valid:user:read", call, async () => {
+      expect([keyedRead, session?.active]).toEqual([true, true]);
+      x.application.close(session!);
+    }).then(r => `sent ${JSON.stringify(r)}`, (e: { code?: string; message?: string }) => `refused ${e.code}: ${e.message}`);
+    expect(out).toBe("refused unauthenticated: session is closed");
+    expect(d()).toEqual({ keyed: 0, miss: 1, skipped: 0 });
+    expect({ messages: (await db.sql`SELECT count(*)::int AS n FROM messages`)[0].n, posts: (await db.sql`SELECT count(*)::int AS n FROM posts`)[0].n }).toEqual(rowsBefore);
+  });
+});
+
 describePg("timer bodies (Postgres)", () => {
   // The heartbeat is keyed on its one row (#1537 PR 6): it commits while a keyed post is held. Mutation: the heartbeat
   // back to an exclusive write (it waits for the held post, and the stamp never lands while it's held).
@@ -2533,6 +2567,71 @@ describePg("timer bodies (Postgres)", () => {
       expect(posts.held).toBe(1);
     } finally { posts.hold.open(); x.state.defer?.open(); }
     await held;
+  });
+
+  // Heartbeat stamps share one key (hosted.ts HEARTBEAT_KEY), so a later stamp waits for an earlier one and they commit
+  // in the order the timer queued them: alive_at ends at the later stamp (#1573, the #1537 PR 6 audit's L2). The first
+  // stamp is held in its body; the timer, its clock moved past a heartbeat again, queues the second. Mutation: a key per
+  // stamp (`server:alive_at:${t}`: the second stamp enters beside the held first, never waiting).
+  test("heartbeat stamps share their key: a later stamp waits for a held one, and alive_at ends at the later", async () => {
+    await using db = await pgDatabase({ max: 3 });
+    await using x = await leaseInstance(db.url);
+    const beats = { hold: gate() as Gate | undefined, held: 0, entered: [] as number[] };
+    const heartbeat = x.repo.hosted.heartbeat;
+    x.repo.hosted.heartbeat = async (tx, t) => {
+      beats.entered.push(t);
+      if (beats.hold) { beats.held++; try { await beats.hold.wait; } finally { beats.held--; } }
+      return heartbeat(tx, t);
+    };
+    let first = 0, second = 0;
+    try {
+      x.advance(5_000); first = x.clock;
+      await until(() => beats.held === 1, 10_000, "the first stamp held in its body");
+      x.advance(5_000); second = x.clock;
+      await until(() => x.q.waitingAt("heartbeat") === 1, 10_000, "the second stamp queued behind the held first");
+      expect([beats.entered, beats.held]).toEqual([[first], 1]);
+    } finally { beats.hold!.open(); beats.hold = undefined; }
+    const aliveAt = async () => Number((await db.sql`SELECT value FROM server_state WHERE key = 'alive_at'`)[0]?.value ?? 0);
+    await until(async () => beats.entered.length === 2 && x.q.waitingAt("heartbeat") === 0 && await aliveAt() === second, 10_000, "both stamps committed, the later last");
+    expect(beats.entered).toEqual([first, second]);
+  });
+
+  // A full pass the timer's pre-check skips counts as a sweep run now (hosted.ts timerSweep sets `sweptAt`), so a capacity
+  // refusal in the same tick runs no nested sweep (`full`: at most one per tick) (#1573, the #1537 PR 6 audit's L3). The
+  // clock is moved past startup's sweep first, and stays put until the full pass's pool check has run; the refusal
+  // after it then sweeps nothing. A refusal a tick later by the clock sweeps (the nested sweep's disabled read, on its
+  // Tx), so the check can see one. Mutation: timerSweep without `if (full) sweptAt = now()` (the first refusal sweeps).
+  test("a full pass the pre-check skips stamps the sweep: a capacity refusal in the same tick runs no nested sweep", async () => {
+    await using db = await pgDatabase({ max: 2 });
+    await using x = await leaseInstance(db.url);
+    const p = await leasePrincipal(x, db.sql);
+    x.advance(1_000);
+    // poolChecks: a full pass's pool check; ticks: every tick's (its expired read, called in the same task that stamps a
+    // full pass's sweptAt).
+    let poolChecks = 0, ticks = 0;
+    const nested: Array<string | undefined> = [];
+    const disabled = x.repo.hosted.disabled, expired = x.repo.hosted.expired;
+    x.repo.hosted.disabled = r => { if (isTx(r)) nested.push(currentSite()); else poolChecks++; return disabled(r); };
+    x.repo.hosted.expired = (r, t) => { if (!isTx(r)) ticks++; return expired(r, t); };
+    await until(() => poolChecks >= 1, 15_000, "a full pass's pool check (every IDLE_EVERY ticks)");
+    expect(nested).toEqual([]);
+    x.repo.hosted.counts = async () => ({ total: Number.MAX_SAFE_INTEGER, user: Number.MAX_SAFE_INTEGER });
+    const refused = (source: string) => x.hosted.run(p, ctx(p, source), "whoami", () => null).then(() => "ok", (e: { message?: string }) => e.message);
+    const CAPACITY = "hosted session capacity reached; end unused sessions first";
+    expect(await refused("root-new-1")).toBe(CAPACITY);
+    expect(nested).toEqual([]);
+    // The control: a tick later by the clock, the refusal sweeps once. A timer tick during the call could be a full pass
+    // that stamps the sweep at the new clock, so a run that saw a tick is retried.
+    let swept = false;
+    for (let i = 0; i < 20 && !swept; i++) {
+      const at = ticks, before = nested.length;
+      x.advance(1_000);
+      expect(await refused(`root-new-c${i}`)).toBe(CAPACITY);
+      if (ticks !== at) continue;
+      expect(nested.length - before).toBe(1);
+      swept = true;
+    }
+    expect(swept).toBe(true);
   });
 
   // The timer's sweep reads the pool first and queues no exclusive body while nothing is due. Mutation: timerSweep
