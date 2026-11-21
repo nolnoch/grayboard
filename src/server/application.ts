@@ -1220,6 +1220,9 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
   const application = {
     ready,
     repo,
+    // Runs `run` as background work `what` (#1506): the work a hook outside the hub starts and nobody awaits (a resource
+    // watch's check), so a server's stop() waits for it under its drain deadline and names it, or, once stopping, skips it.
+    runBackground(what: string, run: (stopped: () => boolean) => Promise<unknown>): void { background(what, run); },
     admitHosted,
     // `suggested`: the name the session's checkout suggested (#443), offered first while free.
     hostedCandidates(r: Read, authed: AuthedUser, suggested: string | null): Promise<Candidate[]> { return candidates(hub, r, authed, suggested); },

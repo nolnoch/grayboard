@@ -9,6 +9,11 @@ import { join } from "node:path";
 import { TestServer } from "../support/server.ts";
 import { until } from "../support/until.ts";
 import { exec, row } from "../support/repo_sql.ts";
+import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
+import { issueOAuth } from "../helpers/oauth.ts";
+import { OPENCODE_CLIENT, OPENCODE_SESSION_META } from "../../src/server/oauth-config.ts";
+import { bindFixture, withMeta } from "../helpers/hosted.ts";
+import { sessionContext } from "../../src/server/hosted.ts";
 
 const A = "alice@example.com";
 const POINT = "http:team-members:between";
@@ -343,4 +348,57 @@ test("stop() waits for the blob sweep a replayed board_post's commit starts", as
   await be.close();
   await stopAround(srv, closed, "blobs:listed", "blob sweep");
   await srv.stop();
+});
+
+// #1506: a native hosted session's board watch runs a live check on each change to the board, after the change's commit
+// and unawaited by it: background work "resource watch check" stop() waits for, under its drain deadline, as it does a
+// pass's. Held at "resources:live:checked", between the check's token read and its board read.
+async function heldWatchCheck(opts: { stopDrainMs?: number } = {}) {
+  const srv = await TestServer.open({ publicUrl: "https://grayboard.example.com" }, { hostname: "127.0.0.1", ...opts });
+  const base = `http://127.0.0.1:${srv.app.server.port}`;
+  const { token } = await issueOAuth(srv.app.repo, srv.app.oauth.resource, A, ["grayboard:tools", "grayboard:delivery"], Date.now(), OPENCODE_CLIENT);
+  const headers = new Headers({ Authorization: `Bearer ${token}` });
+  const principal = await srv.app.oauth.authenticate(new Request(base + "/mcp", { headers }));
+  if (principal instanceof Response) throw new Error("fixture authentication failed");
+  await srv.app.mcp.sessions.bind(principal, sessionContext(principal, { "ai.opencode/sessionID": "be" }), { name: "be", create: true });
+  const version = "2026-07-28";
+  const client = new Client({ name: "stop-quiesce", version: "1" }, { supportedProtocolVersions: [version], versionNegotiation: { mode: { pin: version } } });
+  const transport = new StreamableHTTPClientTransport(new URL(base + "/mcp"), {
+    async fetch(input, init) {
+      const request = new Request(input, init);
+      headers.forEach((v, k) => request.headers.set(k, v));
+      return fetch(await withMeta(request, OPENCODE_SESSION_META, "be"));
+    },
+    reconnectionOptions: { initialReconnectionDelay: 30, maxReconnectionDelay: 30, reconnectionDelayGrowFactor: 1, maxRetries: 1 },
+  });
+  await client.connect(transport);
+  await bindFixture(client, "be");
+  const post = (body: string) => client.callTool({ name: "board_post", arguments: { board: "lobby", body } });
+  expect((await client.callTool({ name: "board_create", arguments: { name: "lobby", purpose: "general" } })).isError).toBeFalsy();
+  const subscription = await client.listen({ resourceSubscriptions: ["grayboard://boards/lobby"] });
+  expect(srv.app.mcp.activeWatches).toBe(1);
+  const closed = await closeSpy(srv);
+  hold("resources:live:checked");
+  expect((await post("change")).isError).toBeFalsy();
+  await until(() => pauseHits("resources:live:checked") > 0, 5000, "the watch's check reached its pause");
+  // Closed before the stop: stop() shuts the HTTP listener, and the client's own requests would then fail.
+  await subscription.close().catch(() => {});
+  await client.close().catch(() => {});
+  return { srv, closed };
+}
+
+test("stop() waits for a resource watch's check before it closes the store", async () => {
+  const { srv, closed } = await heldWatchCheck();
+  await stopAround(srv, closed, "resources:live:checked", "resource watch check");
+  await srv.stop();
+});
+
+test("stop()'s drain deadline names a resource watch check that never finished, and the store still closes", async () => {
+  const { srv, closed } = await heldWatchCheck({ stopDrainMs: 50 });
+  await expect(srv.app.stop()).rejects.toThrow(/stop: 1 background pass never finished within 50 ms: resource watch check/);
+  expect(logs).toContain("[grayboard] stop: 1 background pass never finished within 50 ms: resource watch check");
+  expect(closed.at).toBeGreaterThan(0);
+  writeFileSync(release, "release");
+  await until(() => logs.includes("[grayboard] test pause released: resources:live:checked"), 5000, "the watch's check left its pause");
+  await srv.stop().catch(() => {});
 });
