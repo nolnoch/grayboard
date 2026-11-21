@@ -225,3 +225,29 @@ test("a listen past the per-user listen cap is the refusal listenCapacity matche
     return subscription;
   }, 5000, "the freed slot admits the second listen");
 });
+
+// #1536: a connect refused by the request cap retries and connects once a slot frees. The plain-text 429 it used to get
+// reached the SDK's `server/discover` probe as a legacy server, a causeless ERA_NEGOTIATION_FAILED nothing retried.
+test("a connect past the per-user request cap retries the server's rate_limited 429 and connects", async () => {
+  await srv.stop();
+  srv = await TestServer.open({ hostedRequestLimit: { burst: 10_000, perSec: 10_000 }, mcpLimits: { ...DEFAULT_MCP_LIMITS, post: { global: 256, perUser: 1 } } });
+  const token = await issue();
+  // Hold the user's one POST slot: the server reserves it once the headers authenticate, and keeps it while the body is unread.
+  const url = new URL(srv.base);
+  const held = await Bun.connect({ hostname: url.hostname, port: Number(url.port), socket: { data() {} } });
+  held.write(`POST /mcp HTTP/1.1\r\nHost: ${url.host}\r\nAuthorization: Bearer ${token}\r\nContent-Type: application/json\r\nContent-Length: 1000\r\n\r\n{`);
+  await until(() => srv.app.mcp.activePosts === 1, 5000, "the held POST takes the user's slot");
+  const refused = await fetch(`${srv.base}/mcp`, { method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: "{}" });
+  expect(refused.status).toBe(429);
+  const body = await refused.json() as { jsonrpc: string; id: null; error: { data: { code: string; retry_after_ms: number } } };
+  expect(body).toMatchObject({ jsonrpc: "2.0", id: null, error: { data: { code: "rate_limited" } } });
+  expect(body.error.data.retry_after_ms).toBeGreaterThanOrEqual(500);
+  expect(body.error.data.retry_after_ms).toBeLessThan(1500);
+  expect(refused.headers.get("Retry-After")).toMatch(/^[12]$/);
+  const wire = subscriber(token);
+  const connecting = wire.connect();
+  await until(() => wire.admissionRetryAfterMs !== undefined, 5000, "the wire is refused and waits to retry");
+  held.end();
+  await connecting;
+  expect(await wire.call("whoami")).toBeTruthy();
+});
