@@ -127,6 +127,14 @@ function basics(it: It): void {
     expect(sorted(await h.hosted.children(h.read, "r1"))).toEqual(["c1", "c2"]);
     expect((await h.hosted.children(h.read, "r1")).find(r => r.session_id === "c2")?.parked_at).toBe(T0 + 5);
     expect(await h.hosted.children(h.read, "c1")).toEqual([]);
+    // getMany (#1572): the rows that exist, parked ones too, each once however often its ID repeats; none for no IDs.
+    const many = async (ids: string[], r: Read = h.read) => (await h.hosted.getMany(r, ids)).map(cols).sort((x, y) => x!.session_id < y!.session_id ? -1 : 1);
+    expect(await many(["r1", "c2", "nope", "r1", "c2"])).toEqual([await get(h, "c2"), await get(h, "r1")]);
+    expect(await many(["nope"])).toEqual([]);
+    expect(await many([])).toEqual([]);
+    // On the body's Tx it sees the body's own write.
+    const before = (await get(h, "c1"))!;
+    expect(await h.write(async tx => { await h.hosted.update(tx, "c1", { bind_gen: 7 }); return many(["c1"], tx); })).toEqual([{ ...before, bind_gen: 7 }]);
   });
 }
 

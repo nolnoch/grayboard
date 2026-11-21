@@ -491,12 +491,12 @@ export function createHostedSessions(application: Application, options: { now?: 
     // The rows each watcher follows, parked ones too, read on this Tx (#807 P3 A7h2): `applyAll` hands them over
     // before the queue's next body, so no commit lands between this read and the watcher's check. Read first, and
     // each rebuild below in its own savepoint, so a rebuild that throws can't keep a revocation from its watchers.
+    // Every watcher's IDs in one statement (#1572), then each watcher gets its own: a watched ID with no row maps to
+    // undefined, as a per-ID read gave it.
+    const wanted = [...watchers].map(w => [w, [...w.ids()]] as const);
+    const found = new Map((await store.getMany(tx, wanted.flatMap(([, ids]) => ids))).map(r => [r.session_id, r]));
     const watched = new Map<RowWatcher, Map<string, HostedSession | undefined>>();
-    for (const w of watchers) {
-      const rows = new Map<string, HostedSession | undefined>();
-      for (const id of [...w.ids()]) rows.set(id, await store.get(tx, id));
-      watched.set(w, rows);
-    }
+    for (const [w, ids] of wanted) watched.set(w, new Map(ids.map(id => [id, found.get(id)])));
     const held = await application.holdsByOwner(tx);
     const rows = (await store.all(tx)).filter(r => !r.root_session_id && held.has(r.session_id));
     const builds = new Map<string, { authed: AuthedUser; facts: BuildFacts }>();

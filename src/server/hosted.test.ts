@@ -2474,6 +2474,35 @@ test("#807 P3 A7g1 audit: a full reconcile whose write is refused before its bod
   } finally { write.mockRestore(); all.mockRestore(); }
 });
 
+// #1572: the full pass reads every watched row in one statement, then hands each watcher its own IDs' rows, as the
+// per-ID reads did: a live row, undefined for an ended session and for an ID that never had a row, an ID two watchers
+// share in both, and an empty map for a watcher with none. hosted.pg.test.ts runs the same on Postgres. Mutations: the
+// fan-out handing every watcher every row read; missing IDs left out of a watcher's map; the per-ID loop back (the
+// getMany count).
+test("#1572: a full reconcile reads the watched rows in one call and hands each watcher its own: live, ended, missing, shared", async () => {
+  const idFor = (raw: string) => (context(raw) as { id: string }).id;
+  for (const raw of ["w-a", "w-b", "w-c"]) await hosted.run(principal, context(raw), "whoami", async () => null);
+  const [a, b, c] = ["w-a", "w-b", "w-c"].map(idFor) as [string, string, string];
+  await hosted.release(b, "closed");
+  const seen = new Map<string, Map<string, string | undefined>[]>();
+  const watcher = (name: string, ids: string[]) => hosted.watchRows({
+    ids: () => ids,
+    apply(rows) { seen.set(name, [...seen.get(name) ?? [], new Map([...rows].map(([id, row]) => [id, row?.session_id]))]); },
+  });
+  const off = [watcher("one", [a, b, "never-a-session"]), watcher("two", [b, c, a]), watcher("none", [])];
+  const getMany = spyOn(database.repo.hosted, "getMany"), get = spyOn(database.repo.hosted, "get");
+  try {
+    await hosted.reconcile();
+    expect(getMany).toHaveBeenCalledTimes(1);
+    expect(get.mock.calls.filter(([, id]) => [a, b, c, "never-a-session"].includes(id))).toEqual([]);
+    expect(Object.fromEntries(seen)).toEqual({
+      one: [new Map([[a, a], [b, undefined], ["never-a-session", undefined]])],
+      two: [new Map([[b, undefined], [c, c], [a, a]])],
+      none: [new Map()],
+    });
+  } finally { getMany.mockRestore(); get.mockRestore(); for (const f of off) f(); }
+});
+
 // #807 P3 C8a: the lock seams' call sites. On SQLite `lock`, `lockCapacity` and `grantLive` take no lock (the single
 // writer serializes every body), so what these rows pin is where each call sits: in the write body, before the read it
 // guards, with the guarded value read again after it. On Postgres those positions are what make the locks work.

@@ -131,6 +131,11 @@ export function makePgHosted({ sessionEnd }: { sessionEnd: PgSessionEndPort }): 
 
   return {
     get: (r, id) => { const sql = pgOf(r); return one(sql`SELECT ${cols(sql)} FROM hosted_sessions WHERE session_id = ${id}`); },
+    getMany: async (r, ids) => {
+      if (!ids.length) return [];
+      const sql = pgOf(r);
+      return sessions(sql`SELECT ${cols(sql)} FROM hosted_sessions WHERE session_id = ANY(${[...new Set(ids)]}::text[])`);
+    },
     // A child's root first, then the row (store/hosted.ts's order). A child's root never changes while its row exists
     // (a convert deletes and inserts), so the root read before the lock is the row's; the re-check covers a row
     // deleted and registered again under another root in between.
