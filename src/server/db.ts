@@ -26,7 +26,7 @@ import { afterCommit, type Boundary, onCommit, openBoundary, openReader, openSql
 import type { WriteTx } from "../core/write_tx.ts";
 import { isTx, type Read, type Tx, sqliteOf, sqliteRead, sqliteTx } from "./store/tx.ts";
 import { DEFAULT_ATTACHMENT_LIMITS, DEFAULT_ATTACHMENT_USER_QUOTA, type AttachmentLimits } from "../shared/attachments.ts";
-import { DiskBlobs } from "./blobs.ts";
+import { blobStore } from "./blobs.ts";
 import { requestOrigin } from "./request_context.ts";
 import { GOOGLE_ISSUER } from "./idp_google.ts";
 import { LOGIN_SCOPE, OAUTH_SCOPES } from "./oauth-config.ts";
@@ -294,7 +294,8 @@ export interface Repo {
 // `now` is the hub's clock (application.ts): rows, audit and write receipts read one clock, so a test clock moves them together (#297).
 // `sessionEnd`: the session end a released hosted child's ID ends through (session_end.ts sessionEndPort), made from
 // the Repo on first use; a child end without it throws.
-export type OpenOptions = { blobDir: string; attachmentLimits?: AttachmentLimits; attachmentUserQuota?: number; now?: () => number; sessionEnd?: (repo: Repo) => SessionEndPort };
+// The attachment bytes' store: `blobs` when given (an S3 store, #1509), else a directory store at `blobDir`.
+export type OpenOptions = { blobDir?: string; blobs?: BlobStore; attachmentLimits?: AttachmentLimits; attachmentUserQuota?: number; now?: () => number; sessionEnd?: (repo: Repo) => SessionEndPort };
 
 // undeliveredFrom: messages a sender has sent that the recipient's read point
 // hasn't reached. The read point is the last delivered-and-handled message id
@@ -361,7 +362,7 @@ export function openDatabase(path: string, opts: OpenOptions): { db: Database; r
   ownWriter(db, { holds: () => queue.mine, check: () => queue.assertMine() });
   let port: SessionEndPort | undefined;
   const sessionEnd = () => port ??= opts.sessionEnd?.(repo) ?? (() => { throw new Error("no session-end port: pass OpenOptions.sessionEnd to end a hosted child"); })();
-  const repo = makeRepo(db, new DiskBlobs(opts.blobDir), opts.attachmentLimits ?? DEFAULT_ATTACHMENT_LIMITS, opts.attachmentUserQuota ?? DEFAULT_ATTACHMENT_USER_QUOTA, sessionEnd, opts.now);
+  const repo = makeRepo(db, blobStore(opts), opts.attachmentLimits ?? DEFAULT_ATTACHMENT_LIMITS, opts.attachmentUserQuota ?? DEFAULT_ATTACHMENT_USER_QUOTA, sessionEnd, opts.now);
   return { db, repo };
 }
 

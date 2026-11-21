@@ -49,9 +49,11 @@ export function startLimits(config: Pick<Config, "helloLimit" | "hostedRequestLi
   };
 }
 
-function sqlitePath(store: Config["store"]): string {
-  if (store.kind !== "sqlite") throw new Error("startServer: a Postgres store is opened with openRepo, then passed as `repo`");
-  return store.path;
+function sqlitePath(config: Config): string {
+  if (config.store.kind !== "sqlite") throw new Error("startServer: a Postgres store is opened with openRepo, then passed as `repo`");
+  // The S3 store's module stays off app.ts's import graph (open_repo.ts says why), and its startup check is async.
+  if (config.blobS3) throw new Error("startServer: an S3 attachment store is opened with openRepo, then passed as `repo`");
+  return config.store.path;
 }
 
 export function startServer(config: Config, opts: StartOptions = {}) {
@@ -61,7 +63,7 @@ export function startServer(config: Config, opts: StartOptions = {}) {
     // move the tests that read it onto the Repo. The injected Repo's own attachment limits and session-end reach apply,
     // not config's: openRepo sets them from the same config.
     ? { db: undefined as unknown as ReturnType<typeof openDatabase>["db"], repo: opts.repo }
-    : openDatabase(sqlitePath(config.store), { blobDir: config.blobDir, sessionEnd: sessionEndPort(humanReach), attachmentLimits: config.attachmentLimits, attachmentUserQuota: config.attachmentUserQuota, ...(opts.now ? { now: opts.now } : {}) });
+    : openDatabase(sqlitePath(config), { blobDir: config.blobDir, sessionEnd: sessionEndPort(humanReach), attachmentLimits: config.attachmentLimits, attachmentUserQuota: config.attachmentUserQuota, ...(opts.now ? { now: opts.now } : {}) });
   let slack: SlackBridge | undefined;
   // Dev sign-in mints tokens for any email; they must not outlive it (#805 F-04). A
   // server started without dev auth revokes them, so a re-enable doesn't revive them.

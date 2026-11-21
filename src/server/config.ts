@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { isLoopback, parseOAuthClients, type OAuthClient } from "./oauth-config.ts";
@@ -13,6 +14,7 @@ import { DEFAULT_RETENTION_DAYS, parseRetentionDays } from "../core/boards.ts";
 import { DELEGATE_LIMIT, DELEGATE_OPEN_CAP } from "../core/delegation.ts";
 import { ALIAS_SCOPE_CAP } from "./alias_cap.ts";
 import { GOOGLE_ISSUER } from "./idp_google.ts";
+import { describeCredentials, type AwsCredentialSpec } from "./aws_credentials.ts";
 
 export type McpLimits = Record<"listen" | "legacy" | "post", { global: number; perUser: number }>;
 export const DEFAULT_MCP_LIMITS: McpLimits = { listen: { global: 128, perUser: 32 }, legacy: { global: 256, perUser: 32 }, post: { global: 256, perUser: 64 } };
@@ -41,10 +43,15 @@ export type OidcConfig = { issuer: string; clientId: string; clientSecret?: stri
 // the cutover (docs/future/postgres-server.md D8 P3, P5).
 export type Store = { kind: "sqlite"; path: string } | { kind: "postgres"; url: string };
 
+// An S3 attachment store (#1509), in place of a blob directory: GRAYBOARD_BLOB_S3_*. `prefix` is "" or ends in "/".
+export type S3BlobConfig = { bucket: string; region: string; prefix: string; endpoint?: string; credentials: AwsCredentialSpec };
+
 export type Config = {
   store: Store;
-  // Where attachment bytes are kept (src/server/blobs.ts); default blobs/ beside a SQLite database, required with a URL.
-  blobDir: string;
+  // Where attachment bytes are kept: exactly one of a directory (src/server/blobs.ts; default blobs/ beside a SQLite
+  // database, required with a URL unless S3 is set) and an S3 bucket (src/server/s3_blobs.ts, #1509).
+  blobDir?: string;
+  blobS3?: S3BlobConfig;
   // GRAYBOARD_DATABASE_CONNECT_SECONDS (#1418): how long a Postgres store's first connection retries; absent, the
   // default (store/pg/connect.ts).
   databaseConnectSeconds?: number;
@@ -147,7 +154,7 @@ export function loadConfig(): Config {
   if (devAuth && process.env.GRAYBOARD_OIDC_ISSUER !== undefined)
     throw new Error("GRAYBOARD_DEV_AUTH=1 must not be set alongside GRAYBOARD_OIDC_ISSUER (prevents prod misconfig)");
 
-  const { store, blobDir } = storeConfig(process.env);
+  const { store, blobDir, blobS3 } = storeConfig(process.env);
   const publicUrl = requireEnv("GRAYBOARD_PUBLIC_URL");
 
   // Dev sign-in lets anyone who reaches the server act as anyone (#805 F-04): a
@@ -174,7 +181,7 @@ export function loadConfig(): Config {
 
   return {
     store,
-    blobDir,
+    ...(blobS3 ? { blobS3 } : { blobDir }),
     ...connectSeconds(process.env.GRAYBOARD_DATABASE_CONNECT_SECONDS),
     httpPort: parsePort(process.env.GRAYBOARD_HTTP_PORT),
     googleClientId,
@@ -463,15 +470,72 @@ function urlHostname(raw: string): string {
 
 // One of GRAYBOARD_DATABASE_URL and GRAYBOARD_DB_PATH: both set would hide a misconfigured deploy behind a silent
 // precedence. The URL needs the unreleased gate (PS D8: the two stores never coexist in a release, so a release cut
-// before P5 must not honour it) and an explicit blob directory (no database directory to put it beside).
-function storeConfig(env: Record<string, string | undefined>): { store: Store; blobDir: string } {
+// before P5 must not honour it) and somewhere to keep attachments: an explicit blob directory (no database directory
+// to put it beside) or an S3 bucket. Either store may keep them in S3 (#1509), and then has no blob directory.
+function storeConfig(env: Record<string, string | undefined>): { store: Store; blobDir?: string; blobS3?: S3BlobConfig } {
   const url = env.GRAYBOARD_DATABASE_URL, path = env.GRAYBOARD_DB_PATH, blobDir = env.GRAYBOARD_BLOB_DIR;
   if (url && path) throw new Error("Set one of GRAYBOARD_DATABASE_URL, GRAYBOARD_DB_PATH, not both");
-  if (path) return { store: { kind: "sqlite", path }, blobDir: blobDir || join(dirname(path), "blobs") };
+  const blobS3 = s3BlobConfig(env);
+  if (blobS3 && blobDir) throw new Error("Set one of GRAYBOARD_BLOB_S3_BUCKET, GRAYBOARD_BLOB_DIR, not both: attachments live in one place");
+  if (path) return blobS3 ? { store: { kind: "sqlite", path }, blobS3 } : { store: { kind: "sqlite", path }, blobDir: blobDir || join(dirname(path), "blobs") };
   if (!url) throw new Error("Required env var GRAYBOARD_DB_PATH (or GRAYBOARD_DATABASE_URL) is not set");
   if (env.GRAYBOARD_UNRELEASED_POSTGRES !== "1") throw new Error("GRAYBOARD_DATABASE_URL needs GRAYBOARD_UNRELEASED_POSTGRES=1: the Postgres store is unreleased");
-  if (!blobDir) throw new Error("GRAYBOARD_DATABASE_URL needs GRAYBOARD_BLOB_DIR: there's no database directory to keep attachments beside");
+  if (blobS3) return { store: { kind: "postgres", url }, blobS3 };
+  if (!blobDir) throw new Error("GRAYBOARD_DATABASE_URL needs GRAYBOARD_BLOB_DIR or GRAYBOARD_BLOB_S3_BUCKET: there's no database directory to keep attachments beside");
   return { store: { kind: "postgres", url }, blobDir };
+}
+
+const S3_BUCKET_NAME = /^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/;
+const S3_VARS = ["GRAYBOARD_BLOB_S3_REGION", "GRAYBOARD_BLOB_S3_PREFIX", "GRAYBOARD_BLOB_S3_ENDPOINT"] as const;
+
+// GRAYBOARD_BLOB_S3_BUCKET (empty is unset) with its region (else AWS_REGION), optional key prefix and endpoint, and
+// the credentials: the pod's role by web identity (IRSA's AWS_WEB_IDENTITY_TOKEN_FILE and AWS_ROLE_ARN), else static
+// AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY (and AWS_SESSION_TOKEN). Half of either pair is refused, as is no source.
+function s3BlobConfig(env: Record<string, string | undefined>): S3BlobConfig | undefined {
+  const bucket = env.GRAYBOARD_BLOB_S3_BUCKET;
+  if (!bucket) {
+    const stray = S3_VARS.find(v => env[v]);
+    if (stray) throw new Error(`${stray} is set without GRAYBOARD_BLOB_S3_BUCKET`);
+    return undefined;
+  }
+  if (!S3_BUCKET_NAME.test(bucket)) throw new Error(`GRAYBOARD_BLOB_S3_BUCKET must be an S3 bucket name (3-63 lowercase letters, digits, dots and hyphens), not "${bucket}"`);
+  const region = env.GRAYBOARD_BLOB_S3_REGION || env.AWS_REGION;
+  if (!region) throw new Error("GRAYBOARD_BLOB_S3_BUCKET needs a region: set GRAYBOARD_BLOB_S3_REGION (or AWS_REGION)");
+  if (!/^[a-z0-9-]+$/.test(region)) throw new Error(`the S3 region must be an AWS region name like us-east-1, not "${region}"`);
+  let prefix = env.GRAYBOARD_BLOB_S3_PREFIX ?? "";
+  if (prefix.startsWith("/")) throw new Error(`GRAYBOARD_BLOB_S3_PREFIX must not start with "/": S3 keys have no root, not "${prefix}"`);
+  if (prefix && !prefix.endsWith("/")) prefix += "/";
+  const endpoint = env.GRAYBOARD_BLOB_S3_ENDPOINT || undefined;
+  if (endpoint) {
+    let u: URL | undefined;
+    try { u = new URL(endpoint); } catch { /* refused below */ }
+    if (!u || (u.protocol !== "https:" && u.protocol !== "http:")) throw new Error(`GRAYBOARD_BLOB_S3_ENDPOINT must be an http(s) URL, not "${endpoint}"`);
+  }
+  // Bun's S3 client signs with S3_SESSION_TOKEN when it's handed no session token (static keys without one), and reads
+  // it from the environment as the process started: unsetting it at runtime doesn't help.
+  if (env.S3_SESSION_TOKEN) throw new Error("S3_SESSION_TOKEN is set: Bun's S3 client would sign attachment requests with it; unset it (the S3 attachment store reads AWS_SESSION_TOKEN)");
+  return { bucket, region, prefix, ...(endpoint ? { endpoint } : {}), credentials: awsCredentialSpec(env, region) };
+}
+
+function awsCredentialSpec(env: Record<string, string | undefined>, region: string): AwsCredentialSpec {
+  const tokenFile = env.AWS_WEB_IDENTITY_TOKEN_FILE, roleArn = env.AWS_ROLE_ARN;
+  if (tokenFile || roleArn) {
+    if (!tokenFile || !roleArn) throw new Error("set both AWS_WEB_IDENTITY_TOKEN_FILE and AWS_ROLE_ARN for the S3 attachment store's web identity, or neither");
+    // The regional STS endpoint, in the pod's region (AWS_REGION, which EKS injects) or else the bucket's.
+    const stsEndpoint = env.AWS_ENDPOINT_URL_STS || `https://sts.${env.AWS_REGION || region}.amazonaws.com/`;
+    return { kind: "web-identity", tokenFile, roleArn, stsEndpoint, sessionName: env.AWS_ROLE_SESSION_NAME || `grayboard-${randomBytes(6).toString("hex")}` };
+  }
+  const accessKeyId = env.AWS_ACCESS_KEY_ID, secretAccessKey = env.AWS_SECRET_ACCESS_KEY;
+  if (accessKeyId && secretAccessKey) return { kind: "static", accessKeyId, secretAccessKey, ...(env.AWS_SESSION_TOKEN ? { sessionToken: env.AWS_SESSION_TOKEN } : {}) };
+  if (accessKeyId || secretAccessKey) throw new Error("set both AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY for the S3 attachment store, or neither");
+  throw new Error("GRAYBOARD_BLOB_S3_BUCKET needs AWS credentials: AWS_WEB_IDENTITY_TOKEN_FILE and AWS_ROLE_ARN (an IAM role for the pod's service account), or AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY");
+}
+
+// What the startup line says about attachments: where they live and, for S3, the credential source, never a key.
+export function describeBlobs(config: Pick<Config, "blobDir" | "blobS3">): string {
+  const s3 = config.blobS3;
+  if (!s3) return `directory ${config.blobDir}`;
+  return `s3://${s3.bucket}/${s3.prefix} (${s3.region}${s3.endpoint ? `, endpoint ${s3.endpoint}` : ""}; ${describeCredentials(s3.credentials)})`;
 }
 
 // What the startup line names: the backend and where, never a URL's credentials.
