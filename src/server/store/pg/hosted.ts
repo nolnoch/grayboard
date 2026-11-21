@@ -41,7 +41,7 @@ import { insertAudit } from "./audit_row.ts";
 import type { PgSessionEndPort } from "./hosted_port.ts";
 import type { AuditDetail } from "./sql.ts";
 import { int8, int8OrNull } from "./sql.ts";
-import { pgOf, type PgSql } from "./tx.ts";
+import { pgOf, refuseKeyed, type PgSql } from "./tx.ts";
 
 // pg_advisory_xact_lock(class, 0) for admission (`full()`): the two-int4 form beside ALIAS_CAP_LOCK and the OAuth
 // classes, one key for every user, since the global cap spans them.
@@ -143,6 +143,8 @@ export function makePgHosted({ sessionEnd }: { sessionEnd: PgSessionEndPort }): 
       return row;
     },
     async lockCapacity(tx) {
+      // The capacity paths (admission, its nested sweep) stay exclusive (D4).
+      refuseKeyed(tx, "hosted.lockCapacity");
       const sql = lockOn(tx);
       await sql`SELECT pg_advisory_xact_lock(${HOSTED_CAP_LOCK}::int4, 0)`;
       capped.add(tx);

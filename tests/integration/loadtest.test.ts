@@ -97,13 +97,14 @@ describe("loadtest sizing", () => {
 
 describe("loadtest write-queue report (#1510)", () => {
   // Two scrapes' worth of exposition, in the server's format: hold by site, wait by site, depth.
-  const expo = (holdCum: number[], holdSum: number, depthCum: number[]) => [
+  const expo = (holdCum: number[], holdSum: number, depthCum: number[], keyed = 0, stop = 0) => [
     ...["0.001", "0.002", "0.004", "+Inf"].map((le, i) => `grayboard_write_queue_hold_seconds_bucket{site="gate",le="${le}"} ${holdCum[i]}`),
     `grayboard_write_queue_hold_seconds_sum{site="gate"} ${holdSum}`, `grayboard_write_queue_hold_seconds_count{site="gate"} ${holdCum[3]}`,
     ...["0.001", "0.002", "0.004", "+Inf"].map((le, i) => `grayboard_write_queue_wait_seconds_bucket{site="gate",le="${le}"} ${holdCum[i]}`),
     `grayboard_write_queue_wait_seconds_sum{site="gate"} ${holdSum / 2}`, `grayboard_write_queue_wait_seconds_count{site="gate"} ${holdCum[3]}`,
     ...["0", "1", "2", "+Inf"].map((le, i) => `grayboard_write_queue_depth_bucket{le="${le}"} ${depthCum[i]}`),
     `grayboard_write_queue_depth_sum 0`, `grayboard_write_queue_depth_count ${depthCum[3]}`,
+    `grayboard_write_queue_keyed_bodies_total{site="gate"} ${keyed}`, `grayboard_write_queue_world_stop_seconds_total ${stop}`,
   ].join("\n");
 
   test("quantiles interpolate within a bucket, and one past the last edge reads as that edge", () => {
@@ -115,8 +116,8 @@ describe("loadtest write-queue report (#1510)", () => {
   });
 
   test("a window's numbers come from the deltas between two scrapes", () => {
-    const a = queueCumulative(parseMetrics(expo([10, 10, 10, 10], 0.005, [3, 3, 3, 3])));
-    const b = queueCumulative(parseMetrics(expo([10, 60, 110, 110], 0.205, [3, 5, 7, 7])));
+    const a = queueCumulative(parseMetrics(expo([10, 10, 10, 10], 0.005, [3, 3, 3, 3], 4, 0.5)));
+    const b = queueCumulative(parseMetrics(expo([10, 60, 110, 110], 0.205, [3, 5, 7, 7], 29, 1.3)));
     const q = queueStats(combineQueue(b, a, -1), 2);
     expect(q.bodies).toBe(100);
     expect(q.bodiesPerS).toBe(50);
@@ -125,6 +126,10 @@ describe("loadtest write-queue report (#1510)", () => {
     expect(q.hold.mean).toBeCloseTo(0.002, 9);
     expect(q.maxDepth).toBe(2);
     expect(Object.keys(q.sites)).toEqual(["gate"]);
+    // 25 of the window's 100 bodies ran keyed; 0.8 s of its 2 s were a world stop (#1510 chunk 2).
+    expect(q.keyed).toBeCloseTo(0.25, 9);
+    expect(q.sites.gate!.keyed).toBeCloseTo(0.25, 9);
+    expect(q.worldStop).toBeCloseTo(0.4, 9);
   });
 
   test("--pg-latency needs --pg", () => {

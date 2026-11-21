@@ -206,6 +206,7 @@ jobs:
             src/server/idp.test.ts
             src/server/idp_google.test.ts
             src/server/idp_oidc.test.ts
+            src/server/keyed_sites.pg.test.ts
             src/server/main.test.ts
             src/server/mcp-attachments.test.ts
             src/server/mcp-resources.test.ts
@@ -256,6 +257,7 @@ jobs:
             src/server/store/pg/identity.contract.pg.test.ts
             src/server/store/pg/identity.pg.test.ts
             src/server/store/pg/isolation.test.ts
+            src/server/store/pg/keyed.pg.test.ts
             src/server/store/pg/messages.contract.pg.test.ts
             src/server/store/pg/messages.pg.test.ts
             src/server/store/pg/migrate.test.ts

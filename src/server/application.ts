@@ -159,6 +159,8 @@ export class ApplicationSession {
   // The ID its writes carry as provenance; unset for a writer with no
   // session (the bridge's humans, a hosted request with no context).
   writerId?: string;
+  // A hosted session's root ID: its own for a root. Keys its keyed writes (`root:<id>`, #1510).
+  hostedRoot = "";
   // A hosted child's own ID (#523): it acts under its root's addresses, and
   // its writes store this as `via` so readers see which subagent wrote them.
   // The root's read state isn't its: its board_read peeks, and dm_inbox and
@@ -786,10 +788,14 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     touchedIds.set(id, t);
     return true;
   }
+  // The last-seen touch outside a body is keyed by the writer's hosted root (#1510, docs/future/postgres-server.md D4): one
+  // UPDATE of ids.last_seen on the writer's row (the root's or a child's), a column no key or foreign key covers and no
+  // trigger watches. Every other body that writes that row is exclusive, or keyed by the same root; a touch of another
+  // root writes another row. Close's other write, the human release row, stays exclusive.
   function close(session: ApplicationSession, h: Read = repo.read) {
-    const write = (row: (tx: Tx) => Promise<void>, what: string, site: "touch" | "other" = "other") => {
+    const write = (row: (tx: Tx) => Promise<void>, what: string, site: "touch" | "other" = "other", keys?: string[]) => {
       if (isTx(h)) h.beforeCommit({}, row);
-      else void atSite(site, () => repo.write(row)).catch(e => console.error(`[grayboard] ${what} failed:`, e));
+      else void atSite(site, () => keys ? repo.writeKeyed(keys, row) : repo.write(row)).catch(e => console.error(`[grayboard] ${what} failed:`, e));
     };
     if (!session.active) return;
     session.active = false;
@@ -810,7 +816,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     // Close runs from sync finally blocks and commit callbacks: the touch is written at `h`'s commit or queued, not
     // awaited (#807 P1b-4b, P3 B1c).
     const writer = session.writerId;
-    if (writer && touchDue(writer)) write(tx => repo.bindings.touchId(tx, writer), "last-seen touch", "touch");
+    if (writer && touchDue(writer)) write(tx => repo.bindings.touchId(tx, writer), "last-seen touch", "touch", [`root:${session.hostedRoot || writer}`]);
   }
   // The server closes the session: it leaves the hub, and its transport is
   // told why and closes. `h`: the body it runs in, whose `Tx` takes close's rows (#807 P3 A3).
@@ -1249,6 +1255,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
       const session = new ApplicationSession(authed, sink, false, push);
       session.transport = "hosted";
       session.sessionId = id;
+      session.hostedRoot = root ?? id;
       session.place = row?.place ?? null;
       session.readOnly = holds.length === 0 && writesAs === null;
       session.toolsOnly = writesAs !== null;

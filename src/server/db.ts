@@ -149,10 +149,10 @@ function queued<T, R>(db: Database, fn: (tx: Tx) => T | PromiseLike<T>, committe
 
 // Repo.writeKeyed on SQLite: write, once the keys pass the check Postgres's scheduler makes (store/queue.ts runKeyed),
 // so a caller's bad key fails on both stores.
+const BAD_KEYS = "runKeyed needs at least one key, each a non-empty string";
+const badKeys = (keys: readonly string[]) => !Array.isArray(keys) || keys.length === 0 || keys.some(k => typeof k !== "string" || k === "");
 function keyedOnSqlite<T, R>(db: Database, keys: readonly string[], fn: (tx: Tx) => T | PromiseLike<T>, committed?: (value: T) => R): Promise<Awaited<R>> {
-  if (!Array.isArray(keys) || keys.length === 0 || keys.some(k => typeof k !== "string" || k === "")) {
-    return Promise.reject(new Error("runKeyed needs at least one key, each a non-empty string"));
-  }
+  if (badKeys(keys)) return Promise.reject(new Error(BAD_KEYS));
   return queued(db, fn, committed);
 }
 
@@ -233,6 +233,10 @@ export interface Repo {
   // write goes on its Tx). A promise `committed` returns is caught and its rejection logged as `what` failed on every
   // branch (#1051). fn may be async (#807 P3 A3), except from the queue's holder; its Tx is live until fn settles.
   post<T>(fn: (tx: Tx) => T | Promise<T>, committed?: (value: T) => unknown, what?: string): boolean;
+  // post, keyed (#1510): on Postgres the body runs as writeKeyed's does, overlapping keyed bodies that share none of
+  // `keys`; on SQLite it is post, run-now branch and all. For a write that reads no in-memory state and writes rows no
+  // other body orders by (a posted audit row, audit.ts writeAudit).
+  postKeyed<T>(keys: readonly string[], fn: (tx: Tx) => T | Promise<T>, committed?: (value: T) => unknown, what?: string): boolean;
   // The store's read handle outside any transaction (#807 P1c): reads committed state. The task holding an open
   // transaction can't use it (sqliteOf refuses, #807 P3 A7e2): it passes its body's Tx. A Postgres Read is a pool
   // handle and must never resolve to a transaction's connection.
@@ -1075,6 +1079,10 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
     write: <T, R = T>(fn: (tx: Tx) => T | Promise<T>, committed?: (value: T) => R) => queued(db, fn, committed),
     writeKeyed: <T, R = T>(keys: readonly string[], fn: (tx: Tx) => T | Promise<T>, committed?: (value: T) => R) => keyedOnSqlite(db, keys, fn, committed),
     post: <T>(fn: (tx: Tx) => T | Promise<T>, committed?: (value: T) => unknown, what = "write") => posted(db, fn, committed, what),
+    postKeyed: <T>(keys: readonly string[], fn: (tx: Tx) => T | Promise<T>, committed?: (value: T) => unknown, what = "write") => {
+      if (badKeys(keys)) throw new Error(BAD_KEYS);
+      return posted(db, fn, committed, what);
+    },
     read: sqliteRead(db),
     authRead: auth.authRead,
     authPeek: auth.authPeek,

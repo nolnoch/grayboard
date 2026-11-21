@@ -26,7 +26,7 @@
 // nothing that reaches it.
 import { SQL } from "bun";
 import { errorDiagnostic } from "../../diagnostics.ts";
-import { WriteQueue } from "../queue.ts";
+import { DEFAULT_DATABASE_WRITERS, WriteQueue } from "../queue.ts";
 import { BaseRead, BaseTx, flushEffect, isThenable, type Read, type SavepointFrame, type Tx } from "../tx_base.ts";
 import { pgFailure } from "./errors.ts";
 import { openPg, type PgOptions } from "./sql.ts";
@@ -48,7 +48,9 @@ function openOf(store: Store): PgTx | undefined {
 // A frame missing from `stack` is dead: its transaction ended, or an enclosing ROLLBACK TO or RELEASE ended it.
 // `failed`: the first eager statement's failure that aborted it (eagerFailure), with the frames open when that statement
 // was sent; a ROLLBACK TO of one of those frames undid the failure and clears it.
-type Txn = { readonly conn: SQL; readonly stack: object[]; n: number; ended: boolean; failed?: { error: unknown; frames: object[] } };
+// `keys`: a keyed body's (writeKeyed), on the transaction rather than a Tx handle so its savepoints carry them too;
+// undefined for an exclusive body.
+type Txn = { readonly conn: SQL; readonly stack: object[]; n: number; ended: boolean; readonly keys?: ReadonlySet<string>; failed?: { error: unknown; frames: object[] } };
 
 const READ_REFUSAL = "repo.read inside the caller's own transaction: pass the body's Tx (#807 D2)";
 
@@ -79,6 +81,19 @@ export class TxAborted extends Error {
   static wrap(e: unknown, txn?: Txn): unknown {
     return pgFailure(e)?.kind === "aborted" ? new TxAborted(e as InstanceType<typeof SQL.PostgresError>, txn?.failed?.error) : e;
   }
+}
+
+// The keyed-body guard (#1510, docs/future/postgres-server.md D4): a store function whose work a keyed body must not do
+// calls it before its first statement. On a keyed body's Tx (or a savepoint of one) it throws unless the body holds
+// `needs`; with no `needs`, always. An exclusive body's Tx, a Read and a SQLite handle pass. So a body misclassified as
+// keyed fails in the first test that reaches the call, instead of reordering ids or racing a lock in production:
+// messages.insert needs `dm:<recipient>` and boards.insertPost `board:<name>` (id commit order, G1), and
+// hosted.lockCapacity is refused outright (the capacity paths stay exclusive).
+export function refuseKeyed(h: Read, op: string, needs?: string): void {
+  if (!(h instanceof PgTx)) return;
+  const keys = h.txn.keys;
+  if (keys === undefined || (needs !== undefined && keys.has(needs))) return;
+  throw new Error(`${op} refused in a keyed write body (keys ${[...keys].join(", ")})${needs === undefined ? "" : ` without the key ${needs}`}: it runs in an exclusive body (write) (docs/future/postgres-server.md D4)`);
 }
 
 // For a statement a store function sends on `tx` without awaiting it (pg/audit.ts write): call at send time, and pass
@@ -246,6 +261,8 @@ export type PgTransactions = {
   // A write no caller awaits: always queued, so always false. Refuses inside the caller's open transaction; a
   // failure, or a rejection of a promise `committed` returns, is logged as `what` failed.
   post<T>(fn: (tx: Tx) => T | PromiseLike<T>, committed?: (value: T) => unknown, what?: string): boolean;
+  // post, keyed: its body runs as writeKeyed's.
+  postKeyed<T>(keys: readonly string[], fn: (tx: Tx) => T | PromiseLike<T>, committed?: (value: T) => unknown, what?: string): boolean;
   read: Read;
   queue: WriteQueue;
   // Whether the calling body's root transaction is open (from BEGIN until `begin` settles): false outside any body,
@@ -275,9 +292,10 @@ export type PgTransactions = {
 // body; also when such a COMMIT's outcome is unknown, since a bump is always safe. Set, it costs each write one round
 // trip before COMMIT to read the mark.
 //
-// `writers` (W, default 1): the write pool's size and the scheduler's cap. With every body exclusive, any W runs them
-// one at a time, as the single queue did; W bounds only how many keyed bodies overlap.
-export function makePgTransactions(url: string, { ownAuthCommit, writers = 1, ...opts }: Omit<PgOptions, "connection"> & { ownAuthCommit?: () => void; writers?: number } = {}): PgTransactions {
+// `writers` (W, default DEFAULT_DATABASE_WRITERS, production's): the write pool's size and the scheduler's cap. With
+// every body exclusive, any W runs them one at a time, as the single queue did; W bounds only how many keyed bodies
+// overlap. 1 is the single queue, the A/B control.
+export function makePgTransactions(url: string, { ownAuthCommit, writers = DEFAULT_DATABASE_WRITERS, ...opts }: Omit<PgOptions, "connection"> & { ownAuthCommit?: () => void; writers?: number } = {}): PgTransactions {
   const connection = { default_transaction_read_only: "on", lock_timeout: "5000" };
   const queue = new WriteQueue(writers);
   const sql = openPg(url, { ...opts, connection });
@@ -289,6 +307,8 @@ export function makePgTransactions(url: string, { ownAuthCommit, writers = 1, ..
 
   function run<T, R = T>(keys: readonly string[] | undefined, fn: (tx: Tx) => T | PromiseLike<T>, committed?: (value: T) => R): Promise<Awaited<R>> {
     if (openOf(store)) return Promise.reject(new Error("write() inside an open transaction: nested code calls its Tx's savepoint"));
+    // A keyed body's keys, which its transaction carries (refuseKeyed); also the auth mark's refusal below.
+    const held = keys === undefined ? undefined : new Set(keys);
     // fn and committed run as the work of the request that called write(), or of none (db.ts queued, #1042, #1408).
     return (keys === undefined ? queue.run(body) : queue.runKeyed(keys, body)).then(box => box.out) as Promise<Awaited<R>>;
 
@@ -300,15 +320,21 @@ export function makePgTransactions(url: string, { ownAuthCommit, writers = 1, ..
       let box: { v: T };
       try {
         box = await writePool.begin("isolation level read committed, read write", async conn => {
-          const txn: Txn = { conn, stack: [], n: 0, ended: false };
+          const txn: Txn = { conn, stack: [], n: 0, ended: false, ...(held ? { keys: held } : {}) };
           root = new PgTx(store, txn);
           store.open.set(token, root);
           try {
             const v = await fn(root as unknown as Tx);
             if (root.hasBeforeCommit) await root.runBeforeCommit();
             // After the beforeCommit hooks, defensively: no hook writes an auth table today, but one that did would
-            // count.
-            if (ownAuthCommit) touched = (await conn`SELECT current_setting('gb.auth_touched', true) = '1' AS t`)[0].t === true;
+            // count. A keyed body reads the mark whether or not anyone listens for it: auth-table writers are exclusive
+            // (G5: the generation bumps before the next body), so a keyed body that set it throws here, before COMMIT,
+            // and rolls back.
+            if (ownAuthCommit || held) {
+              const marked = (await conn`SELECT current_setting('gb.auth_touched', true) = '1' AS t`)[0].t === true;
+              if (marked && held) throw new Error(`a keyed write body (keys ${[...held].join(", ")}) wrote an auth table (gb.auth_touched): auth-table writers run in an exclusive body (write); rolled back (docs/future/postgres-server.md D4, D5)`);
+              touched = marked;
+            }
             fulfilled = true;
             // Boxed: Bun's handling of a callback's array result can't touch the body's value.
             return { v };
@@ -338,7 +364,7 @@ export function makePgTransactions(url: string, { ownAuthCommit, writers = 1, ..
     }
   }
 
-  function post<T>(fn: (tx: Tx) => T | PromiseLike<T>, given?: (value: T) => unknown, what = "write"): boolean {
+  function post<T>(fn: (tx: Tx) => T | PromiseLike<T>, given?: (value: T) => unknown, what = "write", keys?: readonly string[]): boolean {
     if (openOf(store)) throw new Error(`post inside an open transaction (${what}): a body's write goes on its Tx`);
     // No caller awaits a post: a promise committed returns is caught and logged here (#1051), its throw by the
     // write's own catch, once either way.
@@ -346,12 +372,14 @@ export function makePgTransactions(url: string, { ownAuthCommit, writers = 1, ..
       const r = given(value);
       if (isThenable(r)) Promise.resolve(r).catch(error => console.error(`[grayboard] ${what} failed:`, loggable(error)));
     });
-    write(fn, committed).catch(error => console.error(`[grayboard] ${what} failed:`, loggable(error)));
+    run(keys, fn, committed).catch(error => console.error(`[grayboard] ${what} failed:`, loggable(error)));
     return false;
   }
 
   return {
-    write, writeKeyed, post,
+    write, writeKeyed,
+    post: (fn, committed, what) => post(fn, committed, what),
+    postKeyed: (keys, fn, committed, what) => post(fn, committed, what, keys),
     read: new PgRead(store) as unknown as Read,
     queue,
     inTransaction: () => openOf(store) !== undefined,

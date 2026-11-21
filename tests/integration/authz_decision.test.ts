@@ -124,13 +124,14 @@ describe("deny rows", () => {
     for (let i = 0; i < DENY_ROW_LIMIT.burst + 5; i++) await leave(a);
     for (let i = 0; i < DENY_ROW_LIMIT.burst + 2; i++) await leave(b);
     expect(await accessAudits(srv, "authz.suppressed")).toEqual([]);
-    const post = spyOn(srv.app.repo, "post");
+    // A posted audit is keyed (#1510): postKeyed(keys, fn, committed, what).
+    const post = spyOn(srv.app.repo, "postKeyed");
     try {
       // A full refill: alice's next deny ends her streak on her body; bob's is swept after her body commits, posted.
       clock += Math.ceil(DENY_ROW_LIMIT.burst / DENY_ROW_LIMIT.perSec) * 1000;
       await leave(a);
       await until(async () => (await accessAudits(srv, "authz.suppressed")).length === 2, 3000, "both suppressed rows");
-      expect(post.mock.calls.filter((c) => c[2] === "audit authz.suppressed").length).toBe(1);
+      expect(post.mock.calls.filter((c) => c[3] === "audit authz.suppressed").length).toBe(1);
     } finally { post.mockRestore(); }
     const suppressed = (await accessAudits(srv, "authz.suppressed")).map((r) => [r.actor, r.at, r.detail]);
     expect(suppressed).toContainEqual([A, clock, { refused: 5 }]);

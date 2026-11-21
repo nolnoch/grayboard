@@ -68,7 +68,7 @@ const queueWait = new Map<QueueSite, Bins>(QUEUE_SITES.map(s => [s, bins(QUEUE_B
 const queueHold = new Map<QueueSite, Bins>(QUEUE_SITES.map(s => [s, bins(QUEUE_BUCKETS)]));
 const queueDepth = bins(QUEUE_DEPTH_BUCKETS);
 const queueKeyed = new Map<QueueSite, number>(QUEUE_SITES.map(s => [s, 0]));
-let queueWaiters = 0, queueRunning = 0;
+let queueWaiters = 0, queueRunning = 0, queueWorldStopS = 0;
 
 // A body queued behind `ahead` others.
 export function queueWaiting(ahead: number) { queueWaiters++; bin(queueDepth, QUEUE_DEPTH_BUCKETS, ahead); }
@@ -85,6 +85,9 @@ export function queueBody(site: QueueSite, waited: boolean, keyed: boolean, wait
 }
 // Bodies waiting now, across every queue in the process.
 export function queueWaitersNow(): number { return queueWaiters; }
+// A span in which an exclusive body waited or ran (store/queue.ts): every keyed body arriving meanwhile waits behind it,
+// so this is the scheduler's world-stop time, an exclusive body's drain of the keyed bodies ahead of it plus its hold.
+export function queueWorldStop(seconds: number) { queueWorldStopS += seconds; }
 
 // Event-loop lag, in windows: each window's p50/p99/max of the loop's delay, then a reset. The
 // scrape reports the last finished window, so it costs nothing and doesn't depend on the scraper's
@@ -214,6 +217,8 @@ export function render(gauges: Gauges = {}): string {
   for (const [site, b] of queueHold) out.push(`grayboard_write_queue_bodies_total${labelText({ site })} ${b.count}`);
   family("grayboard_write_queue_keyed_bodies_total", "counter", "Write-queue bodies released that ran keyed (overlapping other keyed bodies), by calling site; the rest ran exclusive.");
   for (const [site, n] of queueKeyed) out.push(`grayboard_write_queue_keyed_bodies_total${labelText({ site })} ${n}`);
+  family("grayboard_write_queue_world_stop_seconds_total", "counter", "Seconds in which an exclusive write-queue body waited or ran, so keyed bodies arriving meanwhile waited behind it: its drain of the keyed bodies ahead of it plus its hold.");
+  out.push(`grayboard_write_queue_world_stop_seconds_total ${num(queueWorldStopS)}`);
   family("grayboard_write_queue_depth", "histogram", "Bodies already waiting when a body queues behind a held write queue.");
   histogram(out, "grayboard_write_queue_depth", {}, QUEUE_DEPTH_BUCKETS, queueDepth);
   family("grayboard_write_queue_waiters", "gauge", "Bodies waiting for the write queue now.");

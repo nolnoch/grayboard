@@ -33,6 +33,7 @@ import { makePgSessionEnd } from "./store/pg/session_end.ts";
 import { makePgSlack } from "./store/pg/slack.ts";
 import { openPg } from "./store/pg/sql.ts";
 import { makePgTransactions } from "./store/pg/tx.ts";
+import type { WriteQueue } from "./store/queue.ts";
 import { makePgWriteReceipts } from "./store/pg/write_receipts.ts";
 import { DEFAULT_ATTACHMENT_LIMITS, DEFAULT_ATTACHMENT_USER_QUOTA, type AttachmentLimits } from "../shared/attachments.ts";
 
@@ -52,11 +53,15 @@ export type PgRepoOptions = {
   applicationName?: string;
   // Read pool size (Bun's default is 10).
   max?: number;
-  // Write pool size and the write scheduler's cap (store/pg/tx.ts makePgTransactions; default 1).
+  // Write pool size and the write scheduler's cap (store/pg/tx.ts makePgTransactions; default DEFAULT_DATABASE_WRITERS).
   writers?: number;
 };
 
-export async function makePgRepo(url: string, opts: PgRepoOptions): Promise<Repo> {
+// `writeQueue`: the store's write scheduler, for a test's queue-state signals (store/queue.ts waitingAt); the server
+// reaches it only through the Repo's writes.
+export type PgRepo = Repo & { readonly writeQueue: WriteQueue };
+
+export async function makePgRepo(url: string, opts: PgRepoOptions): Promise<PgRepo> {
   const clock = opts.now ?? Date.now;
   const app = opts.applicationName ?? "grayboard";
   const attachmentLimits = opts.attachmentLimits ?? DEFAULT_ATTACHMENT_LIMITS;
@@ -98,11 +103,13 @@ export async function makePgRepo(url: string, opts: PgRepoOptions): Promise<Repo
     subscribe: notices.subscribe,
   };
 
-  const repo: Repo = {
+  const repo: PgRepo = {
     now: clock,
     write: t.write,
     writeKeyed: t.writeKeyed,
     post: t.post,
+    postKeyed: t.postKeyed,
+    writeQueue: t.queue,
     read: t.read,
     authRead: auth.authRead,
     authPeek: auth.authPeek,

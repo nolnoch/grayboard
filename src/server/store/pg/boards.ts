@@ -63,7 +63,7 @@ import { bindLocked, dropAttachments, lockUnsent, withAttachments } from "./atta
 import { foreignKeyViolation } from "./errors.ts";
 import { int8, int8OrNull } from "./sql.ts";
 import { insertClaimEvent } from "./claims.ts";
-import { pgOf, type PgFragment, type PgSql } from "./tx.ts";
+import { pgOf, refuseKeyed, type PgFragment, type PgSql } from "./tx.ts";
 
 type Row = Record<string, unknown>;
 
@@ -486,6 +486,8 @@ export function makePgBoards({ clock }: { clock: () => number }): BoardsStore {
     // Core insertPost, the parent locked by id first (header, P1); human is bound on every insert (#1355/#1366): marked
     // only when given true.
     async insertPost(tx, p) {
+      // Ids commit in allocation order only among bodies that exclude each other on the board (G1, D4).
+      refuseKeyed(tx, "boards.insertPost", `board:${p.board}`);
       const sql = pgOf(tx);
       if (p.parentId !== null && (await sql`SELECT 1 FROM posts WHERE id = ${p.parentId} FOR KEY SHARE`).length === 0) {
         throw new MissingPost(p.parentId, p.board);
