@@ -35,6 +35,10 @@ export function observeTool(tool: string, seconds: number) {
   h.sum += seconds; h.count++;
 }
 
+// Test seam (#1515): drops the series whose names start with `prefix`. The registry is process-wide, so a test
+// that fills the series guard frees it again, or every later file in the process folds its new tools into `other`.
+export function forgetToolSeries(prefix: string) { for (const t of [...tools.keys()]) if (t.startsWith(prefix)) tools.delete(t); }
+
 // Times `fn` into the tool histogram, success or throw.
 export async function timeTool<T>(tool: string, fn: () => Promise<T> | T): Promise<T> {
   const start = performance.now();
