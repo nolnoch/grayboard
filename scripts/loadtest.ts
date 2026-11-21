@@ -26,6 +26,16 @@
 // server.log, drivers' stderr and summary.json to its run dir (.e2e-runs/loadtest-<time>/ unless
 // --out), exits 1 on any miss and 2 when the run itself broke.
 //
+// Pilot gate (#1537, `--gate pilot`; the default `--gate latency` is the bar above): "doesn't fall over, with headroom" at
+// a realistic database round trip, run as `--sessions 300 --period 6 --pg … --pg-latency 0.25` at W = 8. Every check
+// above stays, except that each "≥ 99% at ≤ 100 ms" (per window, per tool, all tools pooled, each client op) becomes
+// p99 ≤ 1 s on the same histogram (≥ 99% at or under the 1 s bucket edge), and the steady world stop must be ≤ 70%. The
+// lapsed-leases item also fails on any lease the drivers saw lapse outside churn and close (a lease op answering
+// LeaseUnavailable), which the per-window lease gauge misses when a lease lapses and is replaced within a window; the
+// count is in summary.json (lapsedLeases) under either bar. The
+// run prints `PILOT GATE: PASS|FAIL` with a line per item (connect, lost DMs, lapsed leases, tool p99, world stop, the
+// other checks) above the FAIL list; summary.json carries it as `pilot`.
+//
 // Service traffic (#1258), in every profile unless --service-workers 0: the last W sessions are a service's workers
 // (service loadsvc, one run token minted by client credentials as a launcher mints it), the lanes of its queue board
 // load-svc; every user holds service_invoke through a team (T teams, user u in team u % T). A user's op invokes the
@@ -78,6 +88,8 @@ export type Options = {
   pg?: string;
   // Milliseconds added to each direction between the server and Postgres (a delay proxy); absent, none.
   pgLatencyMs?: number;
+  // The bar the run is judged by (judge): absent, the exit bar's latency target; "pilot", the pilot gate (#1537).
+  gate?: "pilot";
 };
 
 export function options(argv: string[]): Options {
@@ -88,6 +100,7 @@ export function options(argv: string[]): Options {
       "post-share": { type: "string" }, burst: { type: "string" }, churn: { type: "string" }, "churn-every": { type: "string" },
       "service-workers": { type: "string" }, teams: { type: "string" }, "svc-share": { type: "string" }, "peer-share": { type: "string" }, "read-share": { type: "string" },
       window: { type: "string" }, grace: { type: "string" }, server: { type: "string" }, out: { type: "string" }, "keep-db": { type: "boolean" }, pg: { type: "string" }, "pg-latency": { type: "string" },
+      gate: { type: "string" },
       // Server env overrides, KEY=VALUE, applied after the caps the run computes.
       env: { type: "string", multiple: true },
     },
@@ -114,6 +127,7 @@ export function options(argv: string[]): Options {
     keepDb: v["keep-db"] === true,
     ...(v.pg ? { pg: v.pg } : {}),
     ...(v["pg-latency"] !== undefined ? { pgLatencyMs: n("pg-latency", 0, 0) } : {}),
+    ...(v.gate === "pilot" ? { gate: "pilot" as const } : {}),
     env: Object.fromEntries((v.env ?? []).map((kv) => {
       const eq = kv.indexOf("=");
       if (eq < 1) throw new Error(`--env takes KEY=VALUE, not "${kv}"`);
@@ -128,6 +142,7 @@ export function options(argv: string[]): Options {
   if (o.serviceWorkers && (!Number.isInteger(o.teams) || o.teams < 1 || o.teams > o.users)) throw new Error("--teams must be a whole number from 1 to --users");
   if (o.postShare + (o.serviceWorkers ? o.svcShare + o.peerShare + o.readShare : 0) > 1) throw new Error("--post-share, --svc-share, --peer-share and --read-share must sum to at most 1");
   if (o.pgLatencyMs !== undefined && !o.pg) throw new Error("--pg-latency needs --pg");
+  if (v.gate !== undefined && v.gate !== "latency" && v.gate !== "pilot") throw new Error(`--gate is latency or pilot, not "${v.gate}"`);
   return o;
 }
 
@@ -161,15 +176,31 @@ export function parseMetrics(text: string): Sample[] {
 const one = (s: Sample[], name: string, labels: Record<string, string> = {}) =>
   s.find(x => x.name === name && Object.entries(labels).every(([k, v]) => x.labels[k] === v))?.value;
 
-// Per tool: cumulative count and count at or under 0.1 s.
-type ToolCum = Map<string, { count: number; fast: number }>;
-function toolCumulative(s: Sample[]): ToolCum {
+// Per tool: cumulative count, count at or under 0.1 s, and count at or under 1 s (the pilot gate's edge, a bucket edge
+// of the server's LATENCY_BUCKETS).
+type ToolCum = Map<string, { count: number; fast: number; le1: number }>;
+export function toolCumulative(s: Sample[]): ToolCum {
   const m: ToolCum = new Map();
+  const of = (tool: string) => m.get(tool) ?? m.set(tool, { count: 0, fast: 0, le1: 0 }).get(tool)!;
   for (const x of s) {
-    if (x.name === "grayboard_tool_call_duration_seconds_count") (m.get(x.labels.tool!) ?? m.set(x.labels.tool!, { count: 0, fast: 0 }).get(x.labels.tool!)!).count = x.value;
-    if (x.name === "grayboard_tool_call_duration_seconds_bucket" && x.labels.le === "0.1") (m.get(x.labels.tool!) ?? m.set(x.labels.tool!, { count: 0, fast: 0 }).get(x.labels.tool!)!).fast = x.value;
+    if (x.name === "grayboard_tool_call_duration_seconds_count") of(x.labels.tool!).count = x.value;
+    if (x.name === "grayboard_tool_call_duration_seconds_bucket" && x.labels.le === "0.1") of(x.labels.tool!).fast = x.value;
+    if (x.name === "grayboard_tool_call_duration_seconds_bucket" && x.labels.le === "1") of(x.labels.tool!).le1 = x.value;
   }
   return m;
+}
+// Every tool's calls as one cumulative histogram (the pilot verdict's measured p99); undefined with none.
+export function toolHist(s: Sample[]): CumHist | undefined {
+  const byLe = new Map<number, number>();
+  let sum = 0, count = 0;
+  for (const x of s) {
+    if (x.name === "grayboard_tool_call_duration_seconds_bucket") { const le = x.labels.le === "+Inf" ? Infinity : Number(x.labels.le); byLe.set(le, (byLe.get(le) ?? 0) + x.value); }
+    else if (x.name === "grayboard_tool_call_duration_seconds_sum") sum += x.value;
+    else if (x.name === "grayboard_tool_call_duration_seconds_count") count += x.value;
+  }
+  if (!byLe.size) return undefined;
+  const le = [...byLe.keys()].sort((a, b) => a - b);
+  return { le, cum: le.map(e => byLe.get(e)!), sum, count };
 }
 function refusalsTotal(s: Sample[]): Record<string, number> {
   const r: Record<string, number> = {};
@@ -384,10 +415,11 @@ export function perUserRate(o: Options): { tools: number; subscriber: number; to
   return { tools, subscriber, total: tools + subscriber };
 }
 
-type Window = {
+export type Window = {
   at: number; t: number; steady: boolean; churning: boolean; rss: number; heap: number; lag?: { p50: number; p99: number; max: number };
   leases: number; listens: number; holding: number; live: number; refusals: Record<string, number>;
-  tools: Record<string, { count: number; fast: number }>; client: Record<string, Hist>; clientErrors: Record<string, number>;
+  // `le1`: each tool's calls at or under 1 s, only under --gate pilot (so the latency bar's windows.jsonl is unchanged).
+  tools: Record<string, { count: number; fast: number; le1?: number }>; client: Record<string, Hist>; clientErrors: Record<string, number>;
   driverLagP99: number; ops: number; loadavg: number[];
   // The server's write queue over the window; absent when the server exports no queue metrics.
   queue?: QueueStats;
@@ -396,7 +428,7 @@ type Window = {
 // What the server recorded of the service's traffic: the post ids of the invocations it allowed through a team's
 // service_invoke binding (authz.decision rows, src/server/application.ts board_post), every service.invoke row by
 // rule, and the service board's scope. The run's proof that its invocations took the service path, not another one.
-type ServiceAudit = { teamAllowed: Set<number>; rules: Record<string, number>; boardScope: string | null; boardKind: string | null };
+export type ServiceAudit = { teamAllowed: Set<number>; rules: Record<string, number>; boardScope: string | null; boardKind: string | null };
 async function serviceAudit(pgDbUrl: string | undefined, dbPath: string): Promise<ServiceAudit> {
   let details: unknown[], board: { scope: string | null; kind: string | null } | undefined;
   if (pgDbUrl) {
@@ -465,6 +497,174 @@ async function seedService(base: string, o: Options, emails: string[], runS: num
   return token;
 }
 
+// The bars a run is judged by. The exit bar's latency target (#805): ≥ 99% of calls at or under the 0.1 s bucket edge.
+// The pilot gate (#1537, the maintainer's revision): the same checks with "p99 ≤ 1 s" (≥ 99% at or under the 1 s edge,
+// no interpolation), plus the steady world stop ≤ 70%. Both edges are bucket edges of the server's LATENCY_BUCKETS and
+// the driver's BUCKETS.
+export const GATE_EDGE = { latency: { le: 0.1, label: "≤ 100 ms" }, pilot: { le: 1, label: "≤ 1 s" } } as const;
+export const PILOT_WORLD_STOP = 0.7;
+// The pilot verdict's items; a failure tagged with none is one of the other checks both bars keep.
+export type PilotItem = "connect" | "dms" | "leases" | "p99" | "stop";
+export type Failure = { text: string; item?: PilotItem };
+export type JudgeInput = {
+  o: Options; windows: Window[]; connected: number; connectErrors: Record<string, number>; finals: DriverFinal[];
+  // Refusals since the server started, connect and close included: the windows see only the load.
+  refusedAll: Record<string, number>; drained: Record<string, number | undefined>; audit?: ServiceAudit;
+  // The steady period's write queue (the pilot gate's world stop).
+  queueSteady: QueueStats | null;
+};
+
+// Every gate, in the order the run reports them. Pure: the run's measurements in, its failures and the numbers its
+// summary reports out.
+export function judge(input: JudgeInput) {
+  const { o, windows, connected, connectErrors, finals, refusedAll, drained, audit, queueSteady } = input;
+  const pilot = o.gate === "pilot", edge = GATE_EDGE[pilot ? "pilot" : "latency"];
+  const tagged: Failure[] = [];
+  const fail = (text: string, item?: PilotItem) => { tagged.push(item ? { text, item } : { text }); };
+  // A tool's calls within the bar's edge: under pilot a window without the 1 s count reads as none, so a missing metric fails.
+  const within = (x: { fast: number; le1?: number }) => pilot ? x.le1 ?? 0 : x.fast;
+  const share = (h: { buckets: number[]; count: number }) => h.count ? h.buckets[BUCKETS.indexOf(edge.le)]! / h.count : 1;
+  if (connected !== o.sessions) fail(`only ${connected} of ${o.sessions} sessions connected${Object.keys(connectErrors).length ? `: ${JSON.stringify(connectErrors)}` : ""}`, "connect");
+  const steady = windows.filter(w => w.steady);
+  if (!steady.length) fail("no steady window");
+  // Only users' sessions send on the schedule.
+  const target = userSessions(o) * o.windowS / o.periodS;
+  for (const w of steady) {
+    if (!w.churning && (w.leases !== o.sessions || w.listens !== o.sessions)) fail(`t=${w.t.toFixed(0)}s: ${w.leases} leases, ${w.listens} listens; want ${o.sessions} of each`, "leases");
+    const all = Object.values(w.tools).reduce((a, x) => ({ count: a.count + x.count, fast: a.fast + within(x) }), { count: 0, fast: 0 });
+    // A missing metric must not read as a pass.
+    if (!all.count) fail(`t=${w.t.toFixed(0)}s: no server tool-call samples (is grayboard_tool_call_duration_seconds scraped?)`, "p99");
+    if (w.rss <= 0 || w.heap <= 0) fail(`t=${w.t.toFixed(0)}s: no RSS or heap sample`);
+    // Per window only with enough calls for a 1% tail to mean something; the steady pool below covers the rest.
+    if (all.count >= 100 && all.fast / all.count < 0.99) fail(`t=${w.t.toFixed(0)}s: ${(100 * all.fast / all.count).toFixed(2)}% of ${all.count} tool calls at ${edge.label}; want ≥ 99%`, "p99");
+    // Per window only at a size where 80% isn't inside the schedule's own noise; the pool below covers small runs.
+    if (!w.churning && target >= 100 && w.ops < 0.8 * target) fail(`t=${w.t.toFixed(0)}s: ${w.ops} ops; want ≥ 80% of ${target.toFixed(0)}`);
+  }
+  // The pool holds 80% once it's past the noise, as the per-window gate does. A smaller pool (a seconds-long run, #1027)
+  // wants 65%: the op schedule's jitter or a brief driver stall (a late session skips its missed sends) took 24 to 19,
+  // while a fleet with one of two drivers silent (~12) still fails.
+  const opsWindows = steady.filter(w => !w.churning), opsPool = opsWindows.reduce((a, w) => a + w.ops, 0);
+  const poolTarget = target * opsWindows.length, poolShare = poolTarget >= 100 ? 0.8 : 0.65;
+  if (opsWindows.length && opsPool < poolShare * poolTarget) fail(`${opsPool} ops over ${opsWindows.length} steady windows; want ≥ ${100 * poolShare}% of ${poolTarget.toFixed(0)}`);
+  // Per tool over the steady period: a rare tool's tail can hide in the per-window total. `fast`: at or under 0.1 s (the
+  // summary's share, whichever bar); `in`: within the bar's edge.
+  const toolSteady: Record<string, { count: number; fast: number; in: number }> = {};
+  for (const w of steady) for (const [t, x] of Object.entries(w.tools)) { const a = toolSteady[t] ??= { count: 0, fast: 0, in: 0 }; a.count += x.count; a.fast += x.fast; a.in += within(x); }
+  for (const [t, x] of Object.entries(toolSteady)) if (x.count >= 100 && x.in / x.count < 0.99) fail(`${t}: ${(100 * x.in / x.count).toFixed(2)}% of ${x.count} at ${edge.label} over the steady period`, "p99");
+  const toolPool = Object.values(toolSteady).reduce((a, x) => ({ count: a.count + x.count, fast: a.fast + x.fast, in: a.in + x.in }), { count: 0, fast: 0, in: 0 });
+  if (toolPool.count && tooSlow(toolPool.count, toolPool.in)) fail(`all tools: ${(100 * toolPool.in / toolPool.count).toFixed(2)}% of ${toolPool.count} at ${edge.label} over the steady period`, "p99");
+  // The client's view of the hot path the server histogram doesn't time (inbox reads, renews,
+  // receipts), only from windows where no driver was saturated.
+  const clean = steady.filter(w => w.driverLagP99 < 0.05);
+  if (steady.length && clean.length < 0.9 * steady.length) fail(`${steady.length - clean.length} of ${steady.length} steady windows had a saturated driver (loop p99 ≥ 50 ms): add drivers`);
+  const clientSteady: Record<string, Hist> = {};
+  for (const w of clean) for (const [op, h] of Object.entries(w.client)) mergeHist(clientSteady[op] ??= newHist(), h);
+  // The service's paths (#1258): each must have run, or a run without them would pass unmeasured.
+  const wanted: Record<string, boolean> = {
+    board_post: o.postShare > 0, svc_invoke: o.serviceWorkers > 0 && o.svcShare > 0, svc_reply: o.serviceWorkers > 0 && o.svcShare > 0, peer_list: o.serviceWorkers > 0 && o.peerShare > 0,
+    // board_read reads an answered invocation's thread, so it needs invocations too.
+    ...Object.fromEntries(SVC_READS.map(op => [op, o.serviceWorkers > 0 && o.readShare > 0 && (op !== "board_read" || o.svcShare > 0)])),
+  };
+  for (const op of ["inbox", "renew", "receipt", "dm_send", "board_post", "svc_invoke", "svc_reply", "peer_list", ...SVC_READS]) {
+    const h = clientSteady[op];
+    if (!h && clean.length && (wanted[op] ?? true)) fail(`client ${op}: no samples in the clean steady windows`);
+    if (h && h.count >= 100 && share(h) < 0.99) fail(`client ${op}: ${(100 * share(h)).toFixed(2)}% of ${h.count} at ${edge.label} (clean steady windows)`, "p99");
+    // The service's ops are rare (tens a run below the full profile): each is held to the pooled small-pool rule.
+    else if (h && SERVICE_OPS.has(op) && tooSlow(h.count, h.buckets[BUCKETS.indexOf(edge.le)]!)) fail(`client ${op}: ${(100 * share(h)).toFixed(2)}% of ${h.count} at ${edge.label} (clean steady windows); want at most 1% slower, rounded up`, "p99");
+  }
+  const erroredAll: Record<string, number> = {};
+  for (const w of windows) for (const [k, v] of Object.entries(w.clientErrors)) erroredAll[k] = (erroredAll[k] ?? 0) + v;
+  // Each driver's final counts are its whole run's, connect included; the windows' sums can miss what came after the
+  // last report. Summed over drivers, not the max of one (#1532: 20 of 51 connect failures were counted that way).
+  const finalErrors: Record<string, number> = {};
+  for (const f of finals) for (const [k, v] of Object.entries(f.errors)) finalErrors[k] = (finalErrors[k] ?? 0) + v;
+  for (const [k, v] of Object.entries(finalErrors)) erroredAll[k] = Math.max(erroredAll[k] ?? 0, v);
+  if (Object.keys(refusedAll).length) fail(`capacity refusals: ${JSON.stringify(refusedAll)}`);
+  if (Object.keys(erroredAll).length) fail(`client errors: ${JSON.stringify(erroredAll)}`);
+  // DM accounting: every DM a send call returned for reached its recipient's lease.
+  const sent = new Set(finals.flatMap(f => f.sentDm)), recv = new Set(finals.flatMap(f => f.recvDm));
+  const lost = [...sent].filter(id => !recv.has(id));
+  if (!sent.size) fail("no DM was sent", "dms");
+  if (lost.length) fail(`${lost.length} of ${sent.size} DMs never reached their recipient (e.g. ${lost.slice(0, 5).join(", ")})`, "dms");
+  // Leases lost outside churn and close, as the drivers saw them (#1537): exact where the per-window lease gauge misses a
+  // lease that lapses and is replaced within a window. Gated only under the pilot bar, so the latency bar's list is unchanged.
+  const lapsed = finals.reduce((a, f) => a + (f.lapsed ?? 0), 0), lapsedFirst = finals.flatMap(f => f.lapsedFirst ?? []).slice(0, 5);
+  if (pilot && lapsed) fail(`${lapsed} delivery leases lapsed outside churn and close (e.g. ${lapsedFirst.join("; ")})`, "leases");
+  const misdelivered = finals.reduce((a, f) => a + f.misdelivered, 0);
+  if (misdelivered) fail(`${misdelivered} deliveries reached the wrong session (e.g. ${finals.flatMap(f => f.misdeliveredFirst).slice(0, 5).join("; ")})`);
+  const posts = finals.reduce((a, f) => a + f.posts, 0), boardRecv = finals.reduce((a, f) => a + f.boardRecv, 0);
+  if (o.postShare > 0 && !boardRecv) fail(`${posts} board posts, none delivered`);
+  // Invocation accounting: every invocation whose post returned reached a lane, and its reply reached the invoker.
+  const svcSent = new Set(finals.flatMap(f => f.svcSent)), svcGot = new Set(finals.flatMap(f => f.svcGot)), svcDone = new Set(finals.flatMap(f => f.svcDone));
+  const svcLost = [...svcSent].filter(id => !svcDone.has(id)), svcUnread = [...svcSent].filter(id => !svcGot.has(id));
+  if (o.serviceWorkers && o.svcShare > 0) {
+    if (!svcSent.size) fail("no service invocation was sent");
+    if (svcUnread.length) fail(`${svcUnread.length} of ${svcSent.size} invocations never reached a service lane (e.g. ${svcUnread.slice(0, 5).join(", ")})`);
+    if (svcLost.length) fail(`${svcLost.length} of ${svcSent.size} invocations never came back as a reply their invoker read (e.g. ${svcLost.slice(0, 5).join(", ")})`);
+    // Proof the invocations took the service path: each allowed by a team's service_invoke binding, on a board in
+    // the service's scope, and no lane read a reply (a lane rotation would hand a lane its siblings' replies).
+    const svcPosts = finals.flatMap(f => f.svcPosts), unproven = svcPosts.filter(id => !audit!.teamAllowed.has(id));
+    if (svcPosts.length !== svcSent.size) fail(`${svcSent.size} invocations returned, ${svcPosts.length} with a post id`);
+    if (unproven.length) fail(`${unproven.length} of ${svcPosts.length} invocations have no authz.decision row allowing service.invoke through a team's binding (e.g. posts ${unproven.slice(0, 5).join(", ")}; service.invoke rows by rule ${JSON.stringify(audit!.rules)})`);
+    if (audit!.boardScope !== `service:${SERVICE}` || audit!.boardKind !== "queue") fail(`${SVC_BOARD} is scope ${audit!.boardScope}, kind ${audit!.boardKind}; want service:${SERVICE}, queue`);
+  }
+  // Proof the reads saw the service's board (#1511): every result named it, and the reads of its posts returned some (a
+  // board_read's thread, every time: the invocation and its reply; a snapshot, once invocations have put posts there).
+  const svcReads: Record<string, ReadProof> = Object.fromEntries(PROOF_OPS.map(op => [op, finals.reduce((a, f) => {
+    const p = f.svcReads[op] ?? { ok: 0, named: 0, content: 0 };
+    return { ok: a.ok + p.ok, named: a.named + p.named, content: a.content + p.content };
+  }, { ok: 0, named: 0, content: 0 })]));
+  for (const op of PROOF_OPS) {
+    const p = svcReads[op]!;
+    // The connect-time catalog is proved only on churn's reconnects, so it may have none; any it has must show the board.
+    if (op === "catalog_connect") { if (o.serviceWorkers && p.named < p.ok) fail(`${p.ok - p.named} of ${p.ok} ${op} results didn't show ${SVC_BOARD}`); continue; }
+    if (!wanted[op]) continue;
+    if (!p.ok) fail(`no ${op} of ${SVC_BOARD} returned`);
+    if (p.named < p.ok) fail(`${p.ok - p.named} of ${p.ok} ${op} results didn't show ${SVC_BOARD}`);
+    if (op === "board_read" && p.content < p.ok) fail(`${p.ok - p.content} of ${p.ok} board_read threads of ${SVC_BOARD} lacked the invocation or its reply`);
+    if (op === "snapshot" && o.svcShare > 0 && p.ok && !p.content) fail(`no snapshot of ${SVC_BOARD} carried a post`);
+  }
+  const laneEchoes = finals.reduce((a, f) => a + f.laneEcho, 0);
+  if (laneEchoes) fail(`${laneEchoes} replies reached a service lane; want 0 (a reply goes to its invoker)`);
+  // RSS and heap over the steady period.
+  const rssSlope = slope(steady.map(w => [w.t, w.rss])), heapSlope = slope(steady.map(w => [w.t, w.heap]));
+  const meanRss = steady.reduce((a, w) => a + w.rss, 0) / Math.max(1, steady.length);
+  const steadyS = o.durationS - o.warmupS;
+  const rssGrowth = rssSlope * steadyS;
+  if (o.rssGate && rssGrowth > Math.max(0.1 * meanRss, 64 * 2 ** 20)) fail(`RSS grew ${(rssGrowth / 2 ** 20).toFixed(0)} MB over the steady ${steadyS} s (mean ${(meanRss / 2 ** 20).toFixed(0)} MB); want flat (< 10% or 64 MB)`);
+  for (const [k, v] of Object.entries(drained)) if (v !== 0) fail(`after close, ${k} = ${v}; want 0`);
+  // The pilot gate's headroom: the share of the steady period in which writes were paused for an exclusive body. A run
+  // whose server exports no write queue has no number, and fails.
+  if (pilot) {
+    if (!queueSteady) fail("no steady write-queue sample: world stop unmeasured", "stop");
+    else if (queueSteady.worldStop > PILOT_WORLD_STOP) fail(`steady world stop ${(100 * queueSteady.worldStop).toFixed(1)}%; want ≤ ${(100 * PILOT_WORLD_STOP).toFixed(1)}%`, "stop");
+  }
+  return {
+    tagged, failures: tagged.map(f => f.text), steady, clean, toolSteady, toolPool, clientSteady, erroredAll, sent, recv, lost, lapsed, lapsedFirst, misdelivered, posts, boardRecv,
+    svcSent, svcGot, svcDone, svcLost, svcReads, laneEchoes, heapSlope, meanRss, steadyS, rssGrowth,
+  };
+}
+export type Verdict = ReturnType<typeof judge>;
+
+// The pilot gate's verdict block: PASS only when every check passed (so it agrees with the exit code), then one line per
+// item with what it measured, and a line for the other checks both bars keep. `toolSteadyHist`: every tool's calls over
+// the steady period, whose interpolated p99 the tool line reports.
+export function pilotBlock(o: Options, v: Verdict, connected: number, queueSteady: QueueStats | null, toolSteadyHist: CumHist | undefined): string[] {
+  const failed = (item: PilotItem) => v.tagged.filter(f => f.item === item).length;
+  const mark = (item: PilotItem) => failed(item) ? "FAIL" : "PASS";
+  const p99 = toolSteadyHist ? quantile(toolSteadyHist, 0.99) : null;
+  const others = v.tagged.filter(f => !f.item).length;
+  return [
+    `PILOT GATE: ${v.failures.length ? "FAIL" : "PASS"}`,
+    `  connect: ${mark("connect")} (${connected}/${o.sessions} sessions)`,
+    `  lost DMs: ${mark("dms")} (${v.lost.length} of ${v.sent.size})`,
+    `  lapsed leases: ${mark("leases")} (${v.lapsed} lapsed outside churn and close; ${v.tagged.filter(f => f.item === "leases" && f.text.startsWith("t=")).length} steady windows short of ${o.sessions} leases or listens)`,
+    `  tool p99 ${GATE_EDGE.pilot.label}: ${mark("p99")} (server tools p99 ${ms(p99)} ms over ${toolSteadyHist?.count ?? 0} steady calls; ${failed("p99")} checks over)`,
+    `  world stop ≤ ${(100 * PILOT_WORLD_STOP).toFixed(0)}%: ${mark("stop")} (${queueSteady ? `${(100 * queueSteady.worldStop).toFixed(1)}%` : "unmeasured"})`,
+    `  other checks: ${others ? `FAIL (${others}, below)` : "PASS"}`,
+  ];
+}
+
 async function main() {
   const o = options(process.argv.slice(2));
   mkdirSync(o.out, { recursive: true });
@@ -492,6 +692,8 @@ async function main() {
   let proxy: DelayProxy | undefined;
   // The steady period's write-queue deltas, kept outside the try so an aborted run still reports them.
   let steadyQueue: QueueCum = { wait: new Map(), hold: new Map(), keyed: new Map(), worldStop: 0, gate: new Map(), gateMethod: new Map(), statements: new Map(), roundTrips: new Map() }, steadyQueueS = 0;
+  // Every tool's calls over the steady period, one histogram (the pilot verdict's measured p99).
+  let steadyTools: CumHist | undefined;
   // A driver killed by a signal (the scope's OOM killer) keeps a null exitCode.
   const exited = (d: Driver) => d.proc.exitCode !== null || d.proc.signalCode !== null;
   try {
@@ -597,11 +799,10 @@ async function main() {
     const connectErrors: Record<string, number> = {};
     for (const d of drivers) for (const [k, v] of Object.entries(d.ready!.connectErrors ?? {})) connectErrors[k] = (connectErrors[k] ?? 0) + v;
     if (Object.keys(connectErrors).length) log(`connect failures by class: ${JSON.stringify(connectErrors)}`);
-    if (connected !== o.sessions) failures.push(`only ${connected} of ${o.sessions} sessions connected${Object.keys(connectErrors).length ? `: ${JSON.stringify(connectErrors)}` : ""}`);
 
     // The load: a scrape per window; a churn wave every churnEveryS.
     const start = Date.now(), end = start + o.durationS * 1000;
-    let prev = await scrape(), prevTools = toolCumulative(prev), prevRef = refusalsTotal(prev), prevQueue = queueCumulative(prev), prevAt = Date.now();
+    let prev = await scrape(), prevTools = toolCumulative(prev), prevToolHist = toolHist(prev), prevRef = refusalsTotal(prev), prevQueue = queueCumulative(prev), prevAt = Date.now();
     // The connect storm's write bodies (#1537a): the first scrape is cumulative since the server started.
     {
       const bodies = [...prevQueue.hold.values()].reduce((a, h) => a + h.count, 0), keyed = [...prevQueue.keyed.values()].reduce((a, n) => a + n, 0);
@@ -623,8 +824,8 @@ async function main() {
       await waitAll(`window ${seq}`, reported(seq), o.windowS * 1000);
       const tools: Window["tools"] = {};
       for (const [tool, c] of toolCumulative(s)) {
-        const p = prevTools.get(tool) ?? { count: 0, fast: 0 };
-        if (c.count > p.count) tools[tool] = { count: c.count - p.count, fast: c.fast - p.fast };
+        const p = prevTools.get(tool) ?? { count: 0, fast: 0, le1: 0 };
+        if (c.count > p.count) tools[tool] = { count: c.count - p.count, fast: c.fast - p.fast, ...(o.gate === "pilot" ? { le1: c.le1 - p.le1 } : {}) };
       }
       const ref = refusalsTotal(s), refusals: Record<string, number> = {};
       for (const [k, v] of Object.entries(ref)) if (v > (prevRef[k] ?? 0)) refusals[k] = v - (prevRef[k] ?? 0);
@@ -643,6 +844,8 @@ async function main() {
       const queueNow = queueCumulative(s), queueDelta = combineQueue(queueNow, prevQueue, -1), wallS = (now - prevAt) / 1000;
       const steadyWindow = next - o.windowS * 1000 - start >= o.warmupS * 1000;
       if (steadyWindow && queueNow.hold.size) { steadyQueue = combineQueue(steadyQueue, queueDelta, 1); steadyQueueS += wallS; }
+      const toolsNow = toolHist(s);
+      if (steadyWindow && toolsNow) { const d = combine(toolsNow, prevToolHist, -1); steadyTools = steadyTools ? combine(steadyTools, d, 1) : d; }
       const w: Window = {
         // Steady from the first window that starts after the warm-up (#1038), by schedule, so scrape jitter can't flip it.
         at: now, t: (now - start) / 1000, steady: steadyWindow, churning: now < churnUntil,
@@ -657,7 +860,7 @@ async function main() {
       appendFileSync(join(o.out, "windows.jsonl"), JSON.stringify(w) + "\n");
       const toolAll = Object.values(tools).reduce((a, x) => ({ count: a.count + x.count, fast: a.fast + x.fast }), { count: 0, fast: 0 });
       log(`t=${w.t.toFixed(0)}s${w.steady ? "" : " (warm-up)"}${w.churning ? " (churn)" : ""} leases=${w.leases} listens=${w.listens} live=${w.live} rss=${(w.rss / 2 ** 20).toFixed(0)}MB heap=${(w.heap / 2 ** 20).toFixed(0)}MB lag.p99=${w.lag ? (w.lag.p99 * 1000).toFixed(1) : "-"}ms tools=${toolAll.count} (${(100 * (toolAll.count ? toolAll.fast / toolAll.count : 1)).toFixed(2)}% ≤100ms) ops=${w.ops} inbox≤100ms=${client.inbox ? (100 * fastShare(client.inbox)).toFixed(2) : "-"}% drvlag=${(driverLagP99 * 1000).toFixed(0)}ms load=${w.loadavg[0]!.toFixed(1)}${w.queue ? ` queue: ${w.queue.bodiesPerS.toFixed(0)}/s busy=${(100 * w.queue.busy).toFixed(1)}% wait.p50/p99=${ms(w.queue.wait.p50)}/${ms(w.queue.wait.p99)}ms hold.p50/p99=${ms(w.queue.hold.p50)}/${ms(w.queue.hold.p99)}ms depth≤${w.queue.maxDepth ?? 0} stop=${(100 * w.queue.worldStop).toFixed(1)}% keyed=${(100 * w.queue.keyed).toFixed(1)}%` : ""}${Object.keys(refusals).length ? ` REFUSED ${JSON.stringify(refusals)}` : ""}${Object.keys(clientErrors).length ? ` ERRORS ${JSON.stringify(clientErrors)}` : ""}`);
-      prev = s; prevTools = toolCumulative(s); prevRef = ref; prevQueue = queueNow; prevAt = now;
+      prev = s; prevTools = toolCumulative(s); prevToolHist = toolsNow; prevRef = ref; prevQueue = queueNow; prevAt = now;
       if (o.churn > 0 && o.churnEveryS > 0 && now >= nextChurn && next + o.windowS * 1000 <= end) {
         send(`churn ${o.churn}`); churnsSent++;
         nextChurn += o.churnEveryS * 1000;
@@ -681,127 +884,28 @@ async function main() {
     const audit = o.serviceWorkers ? await serviceAudit(pgDbUrl, dbPath) : undefined;
 
     // Gates.
-    const steady = windows.filter(w => w.steady);
-    if (!steady.length) failures.push("no steady window");
-    // Only users' sessions send on the schedule.
-    const target = userSessions(o) * o.windowS / o.periodS;
-    for (const w of steady) {
-      if (!w.churning && (w.leases !== o.sessions || w.listens !== o.sessions)) failures.push(`t=${w.t.toFixed(0)}s: ${w.leases} leases, ${w.listens} listens; want ${o.sessions} of each`);
-      const all = Object.values(w.tools).reduce((a, x) => ({ count: a.count + x.count, fast: a.fast + x.fast }), { count: 0, fast: 0 });
-      // A missing metric must not read as a pass.
-      if (!all.count) failures.push(`t=${w.t.toFixed(0)}s: no server tool-call samples (is grayboard_tool_call_duration_seconds scraped?)`);
-      if (w.rss <= 0 || w.heap <= 0) failures.push(`t=${w.t.toFixed(0)}s: no RSS or heap sample`);
-      // Per window only with enough calls for a 1% tail to mean something; the steady pool below covers the rest.
-      if (all.count >= 100 && all.fast / all.count < 0.99) failures.push(`t=${w.t.toFixed(0)}s: ${(100 * all.fast / all.count).toFixed(2)}% of ${all.count} tool calls at ≤ 100 ms; want ≥ 99%`);
-      // Per window only at a size where 80% isn't inside the schedule's own noise; the pool below covers small runs.
-      if (!w.churning && target >= 100 && w.ops < 0.8 * target) failures.push(`t=${w.t.toFixed(0)}s: ${w.ops} ops; want ≥ 80% of ${target.toFixed(0)}`);
-    }
-    // The pool holds 80% once it's past the noise, as the per-window gate does. A smaller pool (a seconds-long run, #1027)
-    // wants 65%: the op schedule's jitter or a brief driver stall (a late session skips its missed sends) took 24 to 19,
-    // while a fleet with one of two drivers silent (~12) still fails.
-    const opsWindows = steady.filter(w => !w.churning), opsPool = opsWindows.reduce((a, w) => a + w.ops, 0);
-    const poolTarget = target * opsWindows.length, poolShare = poolTarget >= 100 ? 0.8 : 0.65;
-    if (opsWindows.length && opsPool < poolShare * poolTarget) failures.push(`${opsPool} ops over ${opsWindows.length} steady windows; want ≥ ${100 * poolShare}% of ${poolTarget.toFixed(0)}`);
-    // Per tool over the steady period: a rare tool's tail can hide in the per-window total.
-    const toolSteady: Record<string, { count: number; fast: number }> = {};
-    for (const w of steady) for (const [t, x] of Object.entries(w.tools)) { const a = toolSteady[t] ??= { count: 0, fast: 0 }; a.count += x.count; a.fast += x.fast; }
-    for (const [t, x] of Object.entries(toolSteady)) if (x.count >= 100 && x.fast / x.count < 0.99) failures.push(`${t}: ${(100 * x.fast / x.count).toFixed(2)}% of ${x.count} at ≤ 100 ms over the steady period`);
-    const toolPool = Object.values(toolSteady).reduce((a, x) => ({ count: a.count + x.count, fast: a.fast + x.fast }), { count: 0, fast: 0 });
-    if (toolPool.count && tooSlow(toolPool.count, toolPool.fast)) failures.push(`all tools: ${(100 * toolPool.fast / toolPool.count).toFixed(2)}% of ${toolPool.count} at ≤ 100 ms over the steady period`);
-    // The client's view of the hot path the server histogram doesn't time (inbox reads, renews,
-    // receipts), only from windows where no driver was saturated.
-    const clean = steady.filter(w => w.driverLagP99 < 0.05);
-    if (steady.length && clean.length < 0.9 * steady.length) failures.push(`${steady.length - clean.length} of ${steady.length} steady windows had a saturated driver (loop p99 ≥ 50 ms): add drivers`);
-    const clientSteady: Record<string, Hist> = {};
-    for (const w of clean) for (const [op, h] of Object.entries(w.client)) mergeHist(clientSteady[op] ??= newHist(), h);
-    // The service's paths (#1258): each must have run, or a run without them would pass unmeasured.
-    const wanted: Record<string, boolean> = {
-      board_post: o.postShare > 0, svc_invoke: o.serviceWorkers > 0 && o.svcShare > 0, svc_reply: o.serviceWorkers > 0 && o.svcShare > 0, peer_list: o.serviceWorkers > 0 && o.peerShare > 0,
-      // board_read reads an answered invocation's thread, so it needs invocations too.
-      ...Object.fromEntries(SVC_READS.map(op => [op, o.serviceWorkers > 0 && o.readShare > 0 && (op !== "board_read" || o.svcShare > 0)])),
-    };
-    for (const op of ["inbox", "renew", "receipt", "dm_send", "board_post", "svc_invoke", "svc_reply", "peer_list", ...SVC_READS]) {
-      const h = clientSteady[op];
-      if (!h && clean.length && (wanted[op] ?? true)) failures.push(`client ${op}: no samples in the clean steady windows`);
-      if (h && h.count >= 100 && fastShare(h) < 0.99) failures.push(`client ${op}: ${(100 * fastShare(h)).toFixed(2)}% of ${h.count} at ≤ 100 ms (clean steady windows)`);
-      // The service's ops are rare (tens a run below the full profile): each is held to the pooled small-pool rule.
-      else if (h && SERVICE_OPS.has(op) && tooSlow(h.count, h.buckets[BUCKETS.indexOf(0.1)]!)) failures.push(`client ${op}: ${(100 * fastShare(h)).toFixed(2)}% of ${h.count} at ≤ 100 ms (clean steady windows); want at most 1% slower, rounded up`);
-    }
-    // Refusals since the server started, connect and close included: the windows see only the load.
-    const refusedAll = Object.fromEntries(Object.entries(refusalsTotal(after)).filter(([, v]) => v > 0));
-    const erroredAll: Record<string, number> = {};
-    for (const w of windows) for (const [k, v] of Object.entries(w.clientErrors)) erroredAll[k] = (erroredAll[k] ?? 0) + v;
-    // Each driver's final counts are its whole run's, connect included; the windows' sums can miss what came after the
-    // last report. Summed over drivers, not the max of one (#1532: 20 of 51 connect failures were counted that way).
-    const finalErrors: Record<string, number> = {};
-    for (const d of drivers) for (const [k, v] of Object.entries(d.final!.errors)) finalErrors[k] = (finalErrors[k] ?? 0) + v;
-    for (const [k, v] of Object.entries(finalErrors)) erroredAll[k] = Math.max(erroredAll[k] ?? 0, v);
-    if (Object.keys(refusedAll).length) failures.push(`capacity refusals: ${JSON.stringify(refusedAll)}`);
-    if (Object.keys(erroredAll).length) failures.push(`client errors: ${JSON.stringify(erroredAll)}`);
-    // DM accounting: every DM a send call returned for reached its recipient's lease.
-    const sent = new Set(drivers.flatMap(d => d.final!.sentDm)), recv = new Set(drivers.flatMap(d => d.final!.recvDm));
-    const lost = [...sent].filter(id => !recv.has(id));
-    if (!sent.size) failures.push("no DM was sent");
-    if (lost.length) failures.push(`${lost.length} of ${sent.size} DMs never reached their recipient (e.g. ${lost.slice(0, 5).join(", ")})`);
+    const queueSteady = steadyQueueS > 0 ? queueStats(steadyQueue, steadyQueueS) : null;
+    const refusedAll = Object.fromEntries(Object.entries(refusalsTotal(after)).filter(([, n]) => n > 0));
+    const v = judge({ o, windows, connected, connectErrors, finals: drivers.map(d => d.final!), refusedAll, drained, audit, queueSteady });
+    failures.push(...v.failures);
+    const { steady, clean, toolSteady, toolPool, clientSteady, erroredAll, sent, recv, lost, misdelivered, posts, boardRecv, svcSent, svcGot, svcDone, svcLost, svcReads, laneEchoes, heapSlope, meanRss, steadyS, rssGrowth } = v;
     // Every undelivered id ("sender:seq", the body's `lt|dm|<sender>|<seq>|...`), for classifying against a --keep-db database (#942).
     // Written even when empty, so a reused --out dir never keeps an earlier run's list.
     writeFileSync(join(o.out, "lost-dms.json"), JSON.stringify(lost) + "\n");
-    const misdelivered = drivers.reduce((a, d) => a + d.final!.misdelivered, 0);
-    if (misdelivered) failures.push(`${misdelivered} deliveries reached the wrong session (e.g. ${drivers.flatMap(d => d.final!.misdeliveredFirst).slice(0, 5).join("; ")})`);
-    const posts = drivers.reduce((a, d) => a + d.final!.posts, 0), boardRecv = drivers.reduce((a, d) => a + d.final!.boardRecv, 0);
-    if (o.postShare > 0 && !boardRecv) failures.push(`${posts} board posts, none delivered`);
-    // Invocation accounting: every invocation whose post returned reached a lane, and its reply reached the invoker.
-    const svcSent = new Set(drivers.flatMap(d => d.final!.svcSent)), svcGot = new Set(drivers.flatMap(d => d.final!.svcGot)), svcDone = new Set(drivers.flatMap(d => d.final!.svcDone));
-    const svcLost = [...svcSent].filter(id => !svcDone.has(id)), svcUnread = [...svcSent].filter(id => !svcGot.has(id));
-    if (o.serviceWorkers && o.svcShare > 0) {
-      if (!svcSent.size) failures.push("no service invocation was sent");
-      if (svcUnread.length) failures.push(`${svcUnread.length} of ${svcSent.size} invocations never reached a service lane (e.g. ${svcUnread.slice(0, 5).join(", ")})`);
-      if (svcLost.length) failures.push(`${svcLost.length} of ${svcSent.size} invocations never came back as a reply their invoker read (e.g. ${svcLost.slice(0, 5).join(", ")})`);
-      // Proof the invocations took the service path: each allowed by a team's service_invoke binding, on a board in
-      // the service's scope, and no lane read a reply (a lane rotation would hand a lane its siblings' replies).
-      const svcPosts = drivers.flatMap(d => d.final!.svcPosts), unproven = svcPosts.filter(id => !audit!.teamAllowed.has(id));
-      if (svcPosts.length !== svcSent.size) failures.push(`${svcSent.size} invocations returned, ${svcPosts.length} with a post id`);
-      if (unproven.length) failures.push(`${unproven.length} of ${svcPosts.length} invocations have no authz.decision row allowing service.invoke through a team's binding (e.g. posts ${unproven.slice(0, 5).join(", ")}; service.invoke rows by rule ${JSON.stringify(audit!.rules)})`);
-      if (audit!.boardScope !== `service:${SERVICE}` || audit!.boardKind !== "queue") failures.push(`${SVC_BOARD} is scope ${audit!.boardScope}, kind ${audit!.boardKind}; want service:${SERVICE}, queue`);
-    }
-    // Proof the reads saw the service's board (#1511): every result named it, and the reads of its posts returned some (a
-    // board_read's thread, every time: the invocation and its reply; a snapshot, once invocations have put posts there).
-    const svcReads: Record<string, ReadProof> = Object.fromEntries(PROOF_OPS.map(op => [op, drivers.reduce((a, d) => {
-      const p = d.final!.svcReads[op] ?? { ok: 0, named: 0, content: 0 };
-      return { ok: a.ok + p.ok, named: a.named + p.named, content: a.content + p.content };
-    }, { ok: 0, named: 0, content: 0 })]));
-    for (const op of PROOF_OPS) {
-      const p = svcReads[op]!;
-      // The connect-time catalog is proved only on churn's reconnects, so it may have none; any it has must show the board.
-      if (op === "catalog_connect") { if (o.serviceWorkers && p.named < p.ok) failures.push(`${p.ok - p.named} of ${p.ok} ${op} results didn't show ${SVC_BOARD}`); continue; }
-      if (!wanted[op]) continue;
-      if (!p.ok) failures.push(`no ${op} of ${SVC_BOARD} returned`);
-      if (p.named < p.ok) failures.push(`${p.ok - p.named} of ${p.ok} ${op} results didn't show ${SVC_BOARD}`);
-      if (op === "board_read" && p.content < p.ok) failures.push(`${p.ok - p.content} of ${p.ok} board_read threads of ${SVC_BOARD} lacked the invocation or its reply`);
-      if (op === "snapshot" && o.svcShare > 0 && p.ok && !p.content) failures.push(`no snapshot of ${SVC_BOARD} carried a post`);
-    }
-    const laneEchoes = drivers.reduce((a, d) => a + d.final!.laneEcho, 0);
-    if (laneEchoes) failures.push(`${laneEchoes} replies reached a service lane; want 0 (a reply goes to its invoker)`);
-    // RSS and heap over the steady period.
-    const rssSlope = slope(steady.map(w => [w.t, w.rss])), heapSlope = slope(steady.map(w => [w.t, w.heap]));
-    const meanRss = steady.reduce((a, w) => a + w.rss, 0) / Math.max(1, steady.length);
-    const steadyS = o.durationS - o.warmupS;
-    const rssGrowth = rssSlope * steadyS;
-    if (o.rssGate && rssGrowth > Math.max(0.1 * meanRss, 64 * 2 ** 20)) failures.push(`RSS grew ${(rssGrowth / 2 ** 20).toFixed(0)} MB over the steady ${steadyS} s (mean ${(meanRss / 2 ** 20).toFixed(0)} MB); want flat (< 10% or 64 MB)`);
-    for (const [k, v] of Object.entries(drained)) if (v !== 0) failures.push(`after close, ${k} = ${v}; want 0`);
     const lagP99 = windows.filter(w => w.lag).map(w => w.lag!.p99);
-    const queueSteady = steadyQueueS > 0 ? queueStats(steadyQueue, steadyQueueS) : null;
 
     const summary = {
       options: { ...o, server: o.server.join(" ") }, env, connected, windows: windows.length, steadyWindows: steady.length, cleanWindows: clean.length,
       toolSteady: Object.fromEntries(Object.entries(toolSteady).map(([t, x]) => [t, { count: x.count, fastShare: x.fast / x.count }])),
       toolSteadyAll: toolPool.count ? { count: toolPool.count, fastShare: toolPool.fast / toolPool.count } : null,
       clientSteady: Object.fromEntries(Object.entries(clientSteady).map(([op, h]) => [op, { count: h.count, fastShare: fastShare(h), p99Le: p99Edge(h), mean: h.sum / Math.max(1, h.count), errors: h.errors }])),
-      dms: { sent: sent.size, received: recv.size, lost: lost.length }, misdelivered, posts, boardDeliveries: boardRecv,
+      dms: { sent: sent.size, received: recv.size, lost: lost.length }, lapsedLeases: { count: v.lapsed, first: v.lapsedFirst }, misdelivered, posts, boardDeliveries: boardRecv,
       service: o.serviceWorkers ? { name: SERVICE, board: SVC_BOARD, workers: o.serviceWorkers, teams: o.teams, invocations: svcSent.size, reachedLane: svcGot.size, replied: svcDone.size, lost: svcLost.length, laneEchoes, teamAllowed: audit!.teamAllowed.size, rules: audit!.rules, boardScope: audit!.boardScope, reads: svcReads } : null,
       rss: { meanMB: meanRss / 2 ** 20, growthMB: rssGrowth / 2 ** 20, gated: o.rssGate }, heapGrowthMB: heapSlope * steadyS / 2 ** 20,
       lag: { windows: lagP99.length, p99Max: Math.max(0, ...lagP99), p99Median: lagP99.sort((a, b) => a - b)[Math.floor(lagP99.length / 2)] ?? null },
       drained, hostedRowsAfter: rows, refusals: refusedAll, clientErrors: erroredAll, queueSteady, pgLatencyMs: o.pgLatencyMs ?? null, failures,
+      // The pilot verdict (only under --gate pilot): the block the log prints, and every tool's steady p99, interpolated.
+      ...(o.gate === "pilot" ? { pilot: { verdict: pilotBlock(o, v, connected, queueSteady, steadyTools), toolP99S: steadyTools ? quantile(steadyTools, 0.99) : null } } : {}),
     };
     writeFileSync(join(o.out, "summary.json"), JSON.stringify(summary, null, 2) + "\n");
     log(`summary: ${JSON.stringify({ connected, dms: summary.dms, posts, boardDeliveries: boardRecv, service: summary.service, rss: summary.rss, heapGrowthMB: summary.heapGrowthMB.toFixed(1), lag: summary.lag, hostedRowsAfter: rows })}`);
@@ -812,6 +916,7 @@ async function main() {
       for (const [site, g] of Object.entries(q.gate)) log(`  gate fast path ${site}: keyed ${g.keyed}, miss ${g.miss}, skipped ${g.skipped}, miss rate ${g.missRate === null ? "-" : (100 * g.missRate).toFixed(2) + "%"}`);
       for (const [method, g] of Object.entries(q.gateMethods).sort((a, b) => (b[1].keyed + b[1].miss + b[1].skipped) - (a[1].keyed + a[1].miss + a[1].skipped))) log(`  gate bodies for ${method}: ${((g.keyed + g.miss + g.skipped) / steadyQueueS).toFixed(1)}/s (keyed ${g.keyed}, miss ${g.miss}, skipped ${g.skipped})`);
     }
+    if (o.gate === "pilot") for (const line of summary.pilot!.verdict) log(line);
     if (failures.length) { log(`FAIL (${failures.length}):`); for (const f of failures.slice(0, 50)) log(`  ${f}`); exitCode = 1; }
     else log("PASS");
   } catch (e) {
