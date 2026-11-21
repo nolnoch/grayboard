@@ -861,19 +861,27 @@ export function createHostedSessions(application: Application, options: { now?: 
     if (!("id" in context) || context.id !== prior.row.session_id || prior.row.parked_at !== null) { countGate("prior", "skipped", method); return full(); }
     const id = prior.root.session_id;
     const result = await gate(id)[writer ? "bind" : "call"](async () => {
+      // The gate's stamp (withGate, #807 P3 A7d2): the generation read before the pool check, compared after it.
+      let g: string | undefined;
+      try { g = repo.commitGeneration(); } catch { g = undefined; }
       await authorized(p);
       if (stopped) return MISS;
+      let waited = false, stale = true;
+      try { stale = g === undefined || repo.commitGeneration() !== g; } catch { stale = true; }
       // Keyed by the root (#1510 chunk 3, D4), as the gate's fast path: authorization read in the body, the grant FOR
       // SHARE, plain reads, then the touch's UPDATEs, root first. No row lock before the touch: a row an exclusive
       // body changes waits for this body, or this body for it, and its reads see the change only after it commits;
       // either way an end or park this body missed lands before (it refused) or after the call it lets through, as on
-      // the exclusive path. Without the fast path (SQLite, keyedGate: false) the body is exclusive, as before chunk 3:
-      // the queue's one writer leaves nothing to re-read in the body.
+      // the exclusive path. Without the fast path (SQLite, keyedGate: false) the body is exclusive, as before chunk 3.
+      // There authorization is read in the body as the full gate's exclusive body reads it (#1537 C5): again in the
+      // transaction when the body waited in the queue or something committed since the pool check, so a body queued
+      // behind a revoke or disable refuses `unauthenticated` with no row, as the gate's does, never handing control's
+      // renew, receipt or pending a call whose lease check answers not_found and audits a stale capability. `waited`
+      // is set right after write() returns: a body that starts at once runs before that and sees false. The grant is
+      // read in every body, as the gate's.
       const body = async (tx: Tx) => {
-        if (keyedFast) {
-          await authorized(p, tx);
-          await grantLive(tx, p);
-        }
+        if (keyedFast || waited || stale) await authorized(p, tx);
+        await grantLive(tx, p);
         const fresh = await store.get(tx, prior.row.session_id);
         const root = !fresh ? undefined : fresh.root_session_id ? await store.get(tx, fresh.root_session_id) : fresh;
         const t = now();
@@ -884,7 +892,9 @@ export function createHostedSessions(application: Application, options: { now?: 
         const seen = await touchRow(tx, root, t);
         return { row: fresh, seen: fresh === root ? seen : Math.min(seen, await touchRow(tx, fresh, t)) };
       };
-      const touched = await abandonable(signal, () => atSite("prior", () => keyedFast ? store.writeKeyed([`root:${id}`], body) : store.write(body)));
+      const pending = abandonable(signal, () => atSite("prior", () => keyedFast ? store.writeKeyed([`root:${id}`], body) : store.write(body)));
+      waited = true;
+      const touched = await pending;
       countGate("prior", !keyedFast ? "skipped" : touched ? "keyed" : "miss", method);
       if (!touched) return MISS;
       const { row, seen } = touched;

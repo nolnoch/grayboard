@@ -3016,3 +3016,76 @@ for (const op of ["open", "bind"] as const) test(`#1537: a${op === "open" ? "n" 
     if (env.file === undefined) delete process.env.BUS_TEST_PAUSE_FILE; else process.env.BUS_TEST_PAUSE_FILE = env.file;
   }
 });
+
+// #1537 C5, C7: authorization lost while the call's body waits in the queue behind another body (a revoke or disable
+// committed meanwhile) ends as it does with no verdict: `unauthenticated` and no audit row, never the lease check's
+// not_found and stale-capability audit. Mutation: withPrior's in-body authorization kept to the keyed (Postgres) path.
+for (const op of ["renew", "receipt", "pending", "open", "bind"] as const) test(`#1537: ${op} with its exchange's verdict ends as one without it when authorization is lost while its body waits in the queue`, async () => {
+  const outcome = async (mode: "prior" | "full") => {
+    authorized = true;
+    const m = { root: `root-${mode}`, other: `other-${mode}`, name: `be-${mode}` };
+    await hosted.bind(principal, context(m.root), { name: m.name, create: true });
+    await hosted.bind(principal, context(m.other), { name: `${m.name}-other`, create: true });
+    const lease = await delivery.open(principal, context(m.root));
+    delivery.accept(lease);
+    await hosted.run(principal, context(m.other), "dm_send", (session, tx) => application.send(tx, session, m.name, `${mode}`));
+    const items = await delivery.pending(principal, context(m.root), lease.capability);
+    const { verdict } = await hosted.snapshot(principal, context(m.root));
+    const prior = mode === "prior" ? verdict : undefined;
+    const mark = database.db.query<{ n: number }, []>("SELECT coalesce(max(id), 0) AS n FROM access_log").get()!.n;
+    const q = queueFor(database.db);
+    let release!: () => void;
+    const holder = q.run(() => new Promise<void>(r => { release = r; }));
+    const c = context(m.root);
+    const call = op === "renew" ? delivery.renew(principal, c, lease.capability, undefined, prior)
+      : op === "receipt" ? delivery.receipt(principal, c, lease.capability, items.map(i => i.id), prior)
+      : op === "pending" ? delivery.pending(principal, c, lease.capability, 100, prior)
+      : op === "open" ? delivery.open(principal, c, {}, {}, prior)
+      : hosted.bind(principal, c, { name: `qa-${mode}`, create: true }, undefined, undefined, prior);
+    const site = mode === "prior" ? "prior" : "gate";
+    await until(() => q.waitingAt(site) === 1, 5000, `the ${site} body to queue`);
+    authorized = false;
+    release();
+    await holder;
+    const result = await call.then(() => "ok", (e: { code?: string }) => e.code ?? "error");
+    const audits = database.db.query<{ action: string }, [number]>("SELECT action FROM access_log WHERE id > ? ORDER BY id").all(mark).map(r => r.action);
+    authorized = true;
+    for (const r of [m.root, m.other]) await hosted.end(principal, context(r)).catch(() => {});
+    return { result, audits };
+  };
+  const full = await outcome("full"), got = await outcome("prior");
+  expect(got).toEqual(full);
+});
+
+// #1537 C7: a verdict the call can't use (here another session's) runs the caller's full gate, which keeps `owning`'s
+// writer: it waits for the root's calls in flight. Mutation: withPrior's fallback `full()` entering the gate as a reader.
+for (const op of ["open", "bind"] as const) test(`#1537: a${op === "open" ? "n" : ""} ${op} whose verdict falls back to the full gate still waits for the root's calls in flight, as a writer`, async () => {
+  await hosted.bind(principal, context("root"), { name: "be", create: true });
+  await hosted.bind(principal, context("other"), { name: "fe", create: true });
+  const { verdict } = await hosted.snapshot(principal, context("other"));
+  const lines: string[] = [];
+  const spy = spyOn(console, "error").mockImplementation((...args: unknown[]) => { lines.push(args.map(String).join(" ")); });
+  const released = join(blobDir, "released");
+  writeFileSync(released, "");
+  const env = { pause: process.env.BUS_TEST_PAUSE, file: process.env.BUS_TEST_PAUSE_FILE };
+  process.env.BUS_TEST_PAUSE = "bindgate:bind:drain";
+  process.env.BUS_TEST_PAUSE_FILE = released;
+  try {
+    let release!: () => void;
+    const held = hosted.gate(hostedId("root")).call(() => new Promise<void>(resolve => { release = resolve; }));
+    const at = { gate: gateCount("gate", "skipped", op), prior: gateCount("prior", "skipped", op) };
+    let done = false;
+    const call = (op === "open" ? delivery.open(principal, context("root"), {}, {}, verdict) : hosted.bind(principal, context("root"), { name: "qa", create: true }, undefined, undefined, verdict))
+      .finally(() => { done = true; });
+    await until(() => lines.some(l => l.includes("test pause hit: bindgate:bind:drain")), 5000, `the ${op}'s full gate to wait for the held call as a writer`);
+    expect(done).toBe(false);
+    release();
+    await held;
+    await call;
+    expect({ gate: gateCount("gate", "skipped", op) - at.gate, prior: gateCount("prior", "skipped", op) - at.prior }).toEqual({ gate: 1, prior: 1 });
+  } finally {
+    spy.mockRestore();
+    if (env.pause === undefined) delete process.env.BUS_TEST_PAUSE; else process.env.BUS_TEST_PAUSE = env.pause;
+    if (env.file === undefined) delete process.env.BUS_TEST_PAUSE_FILE; else process.env.BUS_TEST_PAUSE_FILE = env.file;
+  }
+});
