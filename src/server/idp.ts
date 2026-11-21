@@ -54,7 +54,7 @@ export function defaultProviders(config: Config): IdentityProvider[] {
       return oidcProvider({ id: "oidc", ...config.oidc });
     }
     const googleClient = config.mcpGoogle ?? { clientId: config.googleClientId, clientSecret: config.googleClientSecret };
-    return googleProvider({ ...googleClient, orgDomain: config.orgDomain });
+    return googleProvider({ ...googleClient, orgDomain: config.orgDomain }, config.googleDirectory);
   });
 }
 
