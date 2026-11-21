@@ -3,7 +3,7 @@
 // revision, the server's own status and body for a refusal at initialize, and
 // a scope refusal classified for a new sign-in.
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { abortOf, ConnectRefused, DELIVERY_META, EFFORT_META, InsufficientScope, LAUNCHER_META, LISTEN_CAPACITY, listenCapacity, MODEL_META, NativeWire, SERVER_TEXT_LIMIT, ServerBusy, ServerUnreachable, SUGGESTED_META, Wire, type WireOptions } from "../../adapters/hosted-core/src/wire.ts";
+import { abortOf, ConnectRefused, DELIVERY_META, EFFORT_META, InsufficientScope, LAUNCHER_META, LISTEN_CAPACITY, listenCapacity, MODEL_META, NativeWire, SERVER_TEXT_LIMIT, ServerBusy, SUGGESTED_META, Wire, type WireOptions } from "../../adapters/hosted-core/src/wire.ts";
 import { GRAYBOARD_DELIVERY_META, GRAYBOARD_EFFORT_META, GRAYBOARD_LAUNCHER_META, GRAYBOARD_MODEL_META, GRAYBOARD_SESSION_META, GRAYBOARD_SUGGESTED_META } from "../../src/shared/session_meta.ts";
 import { issueOAuth } from "../helpers/oauth.ts";
 import { DEFAULT_MCP_LIMITS } from "../../src/server/config.ts";
@@ -252,10 +252,10 @@ test("a connect past the per-user request cap retries the server's rate_limited 
   expect(await wire.call("whoami")).toBeTruthy();
 });
 
-// #1536: a cap that stays full past the wire's eight tries fails the connect as an outage the controller retries
-// (ServerBusy, or the SDK's own 10 s timeout as a ServerUnreachable when the jittered waits add up past it), never the
-// causeless ERA_NEGOTIATION_FAILED the last 429 would read as.
-test("a connect the request cap refuses on every try fails as ServerUnreachable", async () => {
+// #1536: a cap that stays full fails the connect as ServerBusy, an outage the controller retries, whether the wire's
+// eight tries run out or a timeout (the SDK's or the wire's own signal) ends the waits first; never the causeless
+// ERA_NEGOTIATION_FAILED the last 429 would read as.
+test("a connect the request cap refuses on every try fails as ServerBusy", async () => {
   await srv.stop();
   srv = await TestServer.open({ hostedRequestLimit: { burst: 10_000, perSec: 10_000 }, mcpLimits: { ...DEFAULT_MCP_LIMITS, post: { global: 256, perUser: 1 } } });
   const token = await issue();
@@ -265,7 +265,7 @@ test("a connect the request cap refuses on every try fails as ServerUnreachable"
     held.write(`POST /mcp HTTP/1.1\r\nHost: ${url.host}\r\nAuthorization: Bearer ${token}\r\nContent-Type: application/json\r\nContent-Length: 1000\r\n\r\n{`);
     await until(() => srv.app.mcp.activePosts === 1, 5000, "the held POST takes the user's slot");
     const error = await subscriber(token).connect().then(() => undefined, (e: unknown) => e);
-    expect(error).toBeInstanceOf(ServerUnreachable);
-    if (error instanceof ServerBusy) expect(error.retryAfterMs).toBeGreaterThanOrEqual(500);
+    expect(error).toBeInstanceOf(ServerBusy);
+    expect((error as ServerBusy).retryAfterMs).toBeGreaterThanOrEqual(500);
   } finally { held.end(); }
 }, 30_000);

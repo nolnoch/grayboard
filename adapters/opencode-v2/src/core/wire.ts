@@ -69,8 +69,8 @@ export class ConnectRefused extends SubscriberError {
 export class ServerUnreachable extends Error {
   constructor(cause: unknown) { super("Server unreachable", { cause }); }
 }
-// A connect (`server/discover`, `initialize`) still refused `rate_limited` after
-// its last retry (#1536): the server is up but at capacity. A ServerUnreachable,
+// A connect (`server/discover`, `initialize`) still refused `rate_limited` when
+// its retries or its timeout ran out (#1536): the server is up but at capacity. A ServerUnreachable,
 // so every outage path retries it rather than reading the SDK's causeless
 // version-negotiation failure the 429 would otherwise become.
 export class ServerBusy extends ServerUnreachable {
@@ -125,7 +125,7 @@ export function unreachable(error: unknown): boolean {
 
 // The server's listen cap refused a listen (`src/server/mcp.ts` `reserve`): a plain-text 429 with this exact body and
 // no `rate_limited` data, so the fetch wrapper hands it back unretried and the SDK raises it as an SdkHttpError. Only
-// this body: another plain 429 (request or exchange capacity) is no listen-slot race (#1394).
+// this body: another plain 429 is no listen-slot race (#1394).
 export const LISTEN_CAPACITY = "MCP listen capacity reached";
 export function listenCapacity(error: unknown): boolean {
   for (let e = error, depth = 0; e && depth < 8; e = (e as { cause?: unknown }).cause, depth++) {
@@ -197,15 +197,17 @@ abstract class Connection {
           if (method && connectMethods.has(method) && !response.ok && ![401, 403, 429].includes(response.status) && !gatewayStatuses.has(response.status)) {
             this.refusal = new ConnectRefused(response.status, (await response.clone().text().catch(() => "")).slice(0, 4096));
           }
-          if (response.status !== 429) return response;
-          const body = await response.clone().json().catch(() => undefined) as { error?: { data?: { code?: string; retry_after_ms?: number } } } | undefined;
+          const connecting = method !== undefined && connectMethods.has(method);
+          const body = response.status === 429 ? await response.clone().json().catch(() => undefined) as { error?: { data?: { code?: string; retry_after_ms?: number } } } | undefined : undefined;
           const data = body?.error?.data;
-          if (data?.code !== "rate_limited" || typeof data.retry_after_ms !== "number" || !Number.isFinite(data.retry_after_ms) || data.retry_after_ms <= 0) return response;
-          this.admissionRetryAfterMs = data.retry_after_ms;
-          if (attempt === 7) {
-            if (method && connectMethods.has(method)) this.busy = new ServerBusy(data.retry_after_ms);
+          if (data?.code !== "rate_limited" || typeof data.retry_after_ms !== "number" || !Number.isFinite(data.retry_after_ms) || data.retry_after_ms <= 0) {
+            if (connecting) this.busy = undefined;
             return response;
           }
+          this.admissionRetryAfterMs = data.retry_after_ms;
+          // Recorded on every refusal, not only the last: a wire whose own timeout fires mid-wait still fails as busy.
+          if (connecting) this.busy = new ServerBusy(data.retry_after_ms);
+          if (attempt === 7) return response;
           await response.body?.cancel().catch(() => {});
           await sleep(Math.ceil(data.retry_after_ms), undefined, { signal });
         }
@@ -218,7 +220,8 @@ abstract class Connection {
     };
     this.connect = async () => {
       try { await this.reachable(this.client.connect(transport, { signal, timeout: 10_000 })); }
-      catch (error) { throw this.refusal ?? (this.signal.aborted ? undefined : this.busy) ?? error; }
+      // This wire's own timeout (AbortSignal.timeout) aborting a capacity wait is still the server's capacity; a stop is not.
+      catch (error) { throw this.refusal ?? (!this.signal.aborted || (this.signal.reason as { name?: unknown } | undefined)?.name === "TimeoutError" ? this.busy : undefined) ?? error; }
     };
   }
   // Role headers and the `_meta` every request carries unless it names its own.
