@@ -2578,3 +2578,59 @@ describePg("timer bodies (Postgres)", () => {
     expect(x.state.exclusive.filter(b => b.site === "sweep").length).toBeGreaterThanOrEqual(1);
   });
 });
+
+describePg("the backstop reconcile (Postgres)", () => {
+  // #1572: the full pass reads every watched row in one statement on its Tx, so its body's statements don't grow with
+  // the watched sessions. Pinned at 6: BEGIN; the watched rows (getMany); holdsByOwner; store.all; the auth-mark read;
+  // COMMIT. The roots are unbound (no holds), so no build runs. Mutation: readAll back to one store.get per ID (2
+  // watched: 7; 6 watched: 11).
+  test("a full reconcile body's statements don't grow with the watched sessions (#1572)", async () => {
+    await using db = await pgDatabase({ max: 2 });
+    await using x = await gateInstance(db.url, { oauth: true });
+    const { p } = await issued(x);
+    const watched = new Set<string>();
+    const unwatch = x.hosted.watchRows({ ids: () => watched, apply() {} });
+    const measured = async () => {
+      const at = statementTotals("reconcile");
+      await x.hosted.reconcile();
+      const now = statementTotals("reconcile");
+      return { bodies: now.bodies - at.bodies, statements: now.statements - at.statements, roundTrips: now.roundTrips - at.roundTrips };
+    };
+    try {
+      for (const s of ["r-1", "r-2"]) { await whoami(x, p, s); watched.add(idOf(p, s)); }
+      await x.hosted.reconcile();
+      const two = await measured();
+      for (const s of ["r-3", "r-4", "r-5", "r-6"]) { await whoami(x, p, s); watched.add(idOf(p, s)); }
+      await x.hosted.reconcile();
+      expect(await measured()).toEqual(two);
+      expect(two).toEqual({ bodies: 1, statements: 6, roundTrips: 6 });
+    } finally { unwatch(); }
+  });
+
+  // #1572: each watcher gets its own IDs' rows, as the per-ID reads gave them: a live row, undefined for an ended
+  // session and for an ID that never had a row, an ID two watchers share in both, and nothing for a watcher with none.
+  // Mutations: the fan-out handing every watcher every row read (a watcher sees IDs it doesn't watch); found.get
+  // dropped for a lookup that skips missing IDs (the ended and never-seen IDs vanish from the map).
+  test("a full reconcile hands each watcher its own rows: live, ended, missing, shared (#1572)", async () => {
+    await using db = await pgDatabase({ max: 2 });
+    await using x = await gateInstance(db.url, { oauth: true });
+    const { p } = await issued(x);
+    for (const s of ["w-a", "w-b", "w-c"]) await whoami(x, p, s);
+    const [a, b, c] = ["w-a", "w-b", "w-c"].map(s => idOf(p, s)) as [string, string, string];
+    await x.hosted.release(b, "closed");
+    const seen = new Map<string, Map<string, string | undefined>[]>();
+    const watcher = (name: string, ids: string[]) => x.hosted.watchRows({
+      ids: () => ids,
+      apply(rows) { seen.set(name, [...seen.get(name) ?? [], new Map([...rows].map(([id, row]) => [id, row?.session_id]))]); },
+    });
+    const off = [watcher("one", [a, b, "never-a-session"]), watcher("two", [b, c, a]), watcher("none", [])];
+    try {
+      await x.hosted.reconcile();
+      expect(Object.fromEntries(seen)).toEqual({
+        one: [new Map([[a, a], [b, undefined], ["never-a-session", undefined]])],
+        two: [new Map([[b, undefined], [c, c], [a, a]])],
+        none: [new Map()],
+      });
+    } finally { for (const f of off) f(); }
+  });
+});

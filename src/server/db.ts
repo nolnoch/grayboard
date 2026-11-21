@@ -2579,6 +2579,9 @@ function makeHostedStore(db: Database, port: () => SessionEndPort): HostedStoreO
     writeKeyed: (keys, fn, committed) => keyedOnSqlite(db, keys, fn, committed),
     subscribe: () => () => {},
     get: async (r, id) => hostedRow(sqliteOf(r), id),
+    // One JSON parameter, so no bound-parameter limit applies however many IDs (#1572).
+    getMany: async (r, ids) => ids.length ? sqliteOf(r).query<HostedSession, [string]>(
+      "SELECT * FROM hosted_sessions WHERE session_id IN (SELECT value FROM json_each(?))").all(JSON.stringify([...new Set(ids)])) : [],
     // The single writer serializes every body, so the three lock seams lock nothing here (#807 P3 C8 decision 1): `lock`
     // reads the row on the Tx, `lockCapacity` only checks its handle, and `grantLive` reads the grant. Each refuses a
     // pool Read (sqliteOf alone accepts one): on Postgres a lock outside a transaction would be released at once.
