@@ -18,7 +18,7 @@ const KEYS = [
   "GRAYBOARD_OAUTH_BURST", "GRAYBOARD_OAUTH_PER_SEC", "GRAYBOARD_OAUTH_GLOBAL_BURST", "GRAYBOARD_OAUTH_GLOBAL_PER_SEC",
   "GRAYBOARD_AUTH_FAIL_BURST", "GRAYBOARD_AUTH_FAIL_PER_SEC", "GRAYBOARD_TRUSTED_PROXIES", "GRAYBOARD_HOSTED_IDLE_SECONDS", "GRAYBOARD_CLI_TOKEN_IDLE_DAYS", "GRAYBOARD_IDP_REAUTH_DAYS", "GRAYBOARD_IDP_RECHECK_HOURS", "GRAYBOARD_IDP_RECHECK_MAX_STALE_HOURS", "GRAYBOARD_IDP_DISABLE_LIMIT", "GRAYBOARD_GOOGLE_DIRECTORY_KEY", "GRAYBOARD_GOOGLE_DIRECTORY_ADMIN",
   "GRAYBOARD_KEYCLOAK_DIRECTORY_CLIENT_ID", "GRAYBOARD_KEYCLOAK_DIRECTORY_CLIENT_SECRET", "GRAYBOARD_KEYCLOAK_DIRECTORY_URL",
-  "GRAYBOARD_OKTA_DIRECTORY_CLIENT_ID", "GRAYBOARD_OKTA_DIRECTORY_KEY", "GRAYBOARD_OKTA_DIRECTORY_KEY_ID", "GRAYBOARD_OKTA_DIRECTORY_URL",
+  "GRAYBOARD_GOOGLE_DIRECTORY_SERVICE_ACCOUNT", "GRAYBOARD_OKTA_DIRECTORY_CLIENT_ID", "GRAYBOARD_OKTA_DIRECTORY_KEY", "GRAYBOARD_OKTA_DIRECTORY_KEY_ID", "GRAYBOARD_OKTA_DIRECTORY_URL",
   "GRAYBOARD_DELEGATE_BURST", "GRAYBOARD_DELEGATE_PER_SEC", "GRAYBOARD_DELEGATE_OPEN_CAP", "GRAYBOARD_ALIAS_SCOPE_CAP",
   ...["LISTEN", "LEGACY", "POST"].flatMap(kind => [`GRAYBOARD_MCP_${kind}_GLOBAL`, `GRAYBOARD_MCP_${kind}_PER_USER`]),
   "GRAYBOARD_HOSTED_SESSIONS_GLOBAL", "GRAYBOARD_HOSTED_SESSIONS_PER_USER", "GRAYBOARD_DELIVERY_LEASES_GLOBAL", "GRAYBOARD_DELIVERY_LEASES_PER_USER",
@@ -748,7 +748,7 @@ describe("loadConfig", () => {
   });
 
   test("with a Google directory key the startup line names Google's check, and the clock only for the rest (#930 A2b)", () => {
-    const dir = { clientEmail: "sa@p.iam.gserviceaccount.com", privateKey: "k" };
+    const dir = { kind: "key" as const, clientEmail: "sa@p.iam.gserviceaccount.com", privateKey: "k" };
     expect(describeReauth({ googleDirectory: dir })).toBe("directory check every 24 h (google)");
     expect(describeReauth({ idps: ["okta", "google"], googleDirectory: dir, idpRecheck: { recheckHours: 6, maxStaleHours: 72, disableLimit: 5 } }))
       .toBe("directory check every 6 h (google); sign-in every 30 days (no directory check: okta)");
@@ -769,11 +769,11 @@ describe("loadConfig", () => {
     const key = JSON.stringify({ type: "service_account", client_email: "sa@p.iam.gserviceaccount.com", private_key: pem });
     expect(loadConfig().googleDirectory).toBeUndefined();
     process.env.GRAYBOARD_GOOGLE_DIRECTORY_ADMIN = "admin@example.com";
-    expect(message()).toBe("GRAYBOARD_GOOGLE_DIRECTORY_ADMIN is set without GRAYBOARD_GOOGLE_DIRECTORY_KEY");
+    expect(message()).toBe("GRAYBOARD_GOOGLE_DIRECTORY_ADMIN is set without GRAYBOARD_GOOGLE_DIRECTORY_KEY or GRAYBOARD_GOOGLE_DIRECTORY_SERVICE_ACCOUNT");
     process.env.GRAYBOARD_GOOGLE_DIRECTORY_KEY = key;
-    expect(loadConfig().googleDirectory).toEqual({ clientEmail: "sa@p.iam.gserviceaccount.com", privateKey: pem, admin: "admin@example.com" });
+    expect(loadConfig().googleDirectory).toEqual({ kind: "key", clientEmail: "sa@p.iam.gserviceaccount.com", privateKey: pem, admin: "admin@example.com" });
     delete process.env.GRAYBOARD_GOOGLE_DIRECTORY_ADMIN;
-    expect(loadConfig().googleDirectory).toEqual({ clientEmail: "sa@p.iam.gserviceaccount.com", privateKey: pem });
+    expect(loadConfig().googleDirectory).toEqual({ kind: "key", clientEmail: "sa@p.iam.gserviceaccount.com", privateKey: pem });
     process.env.GRAYBOARD_GOOGLE_DIRECTORY_KEY = "{";
     expect(message()).toMatch(/GRAYBOARD_GOOGLE_DIRECTORY_KEY is not JSON/);
     // A key with no Google provider to use it.
@@ -788,8 +788,36 @@ describe("loadConfig", () => {
       writeFileSync(join(d, "key.json"), `${key}\n`);
       delete process.env.GRAYBOARD_GOOGLE_DIRECTORY_KEY;
       process.env.GRAYBOARD_GOOGLE_DIRECTORY_KEY_FILE = join(d, "key.json");
-      expect(loadConfig().googleDirectory?.clientEmail).toBe("sa@p.iam.gserviceaccount.com");
+      expect(loadConfig().googleDirectory).toMatchObject({ kind: "key", clientEmail: "sa@p.iam.gserviceaccount.com" });
     } finally { rmSync(d, { recursive: true, force: true }); }
+  });
+
+  test("GRAYBOARD_GOOGLE_DIRECTORY_SERVICE_ACCOUNT alone is GKE Workload Identity; with a key it's refused (#1565)", () => {
+    primary();
+    process.env.GRAYBOARD_GOOGLE_DIRECTORY_SERVICE_ACCOUNT = "checker@p.iam.gserviceaccount.com";
+    expect(loadConfig().googleDirectory).toEqual({ kind: "metadata", serviceAccount: "checker@p.iam.gserviceaccount.com" });
+    process.env.GRAYBOARD_GOOGLE_DIRECTORY_ADMIN = "admin@example.com";
+    expect(loadConfig().googleDirectory).toEqual({ kind: "metadata", serviceAccount: "checker@p.iam.gserviceaccount.com", admin: "admin@example.com" });
+    process.env.GRAYBOARD_GOOGLE_DIRECTORY_KEY = "{}";
+    expect(message()).toBe("set one of GRAYBOARD_GOOGLE_DIRECTORY_KEY and GRAYBOARD_GOOGLE_DIRECTORY_SERVICE_ACCOUNT, not both");
+    delete process.env.GRAYBOARD_GOOGLE_DIRECTORY_KEY;
+    process.env.GRAYBOARD_GOOGLE_DIRECTORY_SERVICE_ACCOUNT = "not an email";
+    expect(message()).toMatch(/GRAYBOARD_GOOGLE_DIRECTORY_SERVICE_ACCOUNT must be a service account's email/);
+    process.env.GRAYBOARD_GOOGLE_DIRECTORY_SERVICE_ACCOUNT = "checker@p.iam.gserviceaccount.com";
+    process.env.GRAYBOARD_IDPS = "okta";
+    okta();
+    expect(message()).toBe("GRAYBOARD_GOOGLE_DIRECTORY_SERVICE_ACCOUNT is set but GRAYBOARD_IDPS doesn't list google");
+  });
+
+  test("an external_account GRAYBOARD_GOOGLE_DIRECTORY_KEY is Workload Identity Federation (#1565)", () => {
+    primary();
+    process.env.GRAYBOARD_GOOGLE_DIRECTORY_KEY = JSON.stringify({
+      type: "external_account", audience: "//iam.googleapis.com/projects/1/locations/global/workloadIdentityPools/p/providers/x",
+      subject_token_type: "urn:ietf:params:oauth:token-type:jwt", token_url: "https://sts.googleapis.com/v1/token",
+      service_account_impersonation_url: "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/checker@p.iam.gserviceaccount.com:generateAccessToken",
+      credential_source: { file: "/var/run/secrets/token" },
+    });
+    expect(loadConfig().googleDirectory).toMatchObject({ kind: "federated", serviceAccount: "checker@p.iam.gserviceaccount.com", source: { file: "/var/run/secrets/token" } });
   });
 
   test("the Keycloak directory pair turns on oidc's directory check against the issuer's realm, or the URL named (#1555)", () => {

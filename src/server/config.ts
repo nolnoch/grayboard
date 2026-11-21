@@ -15,7 +15,7 @@ import { DEFAULT_RETENTION_DAYS, parseRetentionDays } from "../core/boards.ts";
 import { DELEGATE_LIMIT, DELEGATE_OPEN_CAP } from "../core/delegation.ts";
 import { ALIAS_SCOPE_CAP } from "./alias_cap.ts";
 import { GOOGLE_ISSUER } from "./idp_google.ts";
-import { parseDirectoryKey, type GoogleDirectoryConfig } from "./idp_google_directory.ts";
+import { parseDirectoryCredential, type GoogleDirectoryConfig } from "./idp_google_directory.ts";
 import { keycloakRealm, type KeycloakDirectoryConfig } from "./idp_keycloak_directory.ts";
 import { oktaOrgUrl, parseOktaDirectoryKey, type OktaDirectoryConfig } from "./idp_okta_directory.ts";
 import { describeCredentials, type AwsCredentialSpec } from "./aws_credentials.ts";
@@ -693,16 +693,20 @@ export function describeReauth(config: Pick<Config, "idps" | "idpReauthDays" | "
   return recheck ? `${recheck}; ${clock}` : clock;
 }
 
-// Half a configuration is a mistake, not "off": an admin without a key, or a key with no Google provider to use it.
+// Half a configuration is a mistake, not "off": an admin without a credential, or a credential with no Google provider
+// to use it. The credential is a key or external_account configuration (GRAYBOARD_GOOGLE_DIRECTORY_KEY) or, on GKE with
+// Workload Identity, the bound service account's email (GRAYBOARD_GOOGLE_DIRECTORY_SERVICE_ACCOUNT) (#1565).
 function googleDirectoryConfig(google: boolean): { googleDirectory?: GoogleDirectoryConfig } {
-  const raw = process.env.GRAYBOARD_GOOGLE_DIRECTORY_KEY;
+  const raw = process.env.GRAYBOARD_GOOGLE_DIRECTORY_KEY || undefined;
+  const serviceAccount = process.env.GRAYBOARD_GOOGLE_DIRECTORY_SERVICE_ACCOUNT || undefined;
   const admin = process.env.GRAYBOARD_GOOGLE_DIRECTORY_ADMIN;
-  if (!raw) {
-    if (admin) throw new Error("GRAYBOARD_GOOGLE_DIRECTORY_ADMIN is set without GRAYBOARD_GOOGLE_DIRECTORY_KEY");
+  if (!raw && !serviceAccount) {
+    if (admin) throw new Error("GRAYBOARD_GOOGLE_DIRECTORY_ADMIN is set without GRAYBOARD_GOOGLE_DIRECTORY_KEY or GRAYBOARD_GOOGLE_DIRECTORY_SERVICE_ACCOUNT");
     return {};
   }
-  if (!google) throw new Error("GRAYBOARD_GOOGLE_DIRECTORY_KEY is set but GRAYBOARD_IDPS doesn't list google");
-  return { googleDirectory: parseDirectoryKey(raw, admin) };
+  const set = raw ? "GRAYBOARD_GOOGLE_DIRECTORY_KEY" : "GRAYBOARD_GOOGLE_DIRECTORY_SERVICE_ACCOUNT";
+  if (!google) throw new Error(`${set} is set but GRAYBOARD_IDPS doesn't list google`);
+  return { googleDirectory: parseDirectoryCredential(raw, serviceAccount, admin) };
 }
 
 const KEYCLOAK_VARS = ["GRAYBOARD_KEYCLOAK_DIRECTORY_CLIENT_ID", "GRAYBOARD_KEYCLOAK_DIRECTORY_CLIENT_SECRET"] as const;
