@@ -1004,10 +1004,10 @@ describePg("a first contact's second wire waits for the in-flight create (Postgr
   });
 });
 
-describePg("AUDIT 1537a", () => {
+describePg("a first contact's creating entry is released on every exit (Postgres)", () => {
   const absent = (x: GateInstance, id: string) => x.state.absent.get(id) ?? 0;
   const deadline = <T>(q: Promise<T>, ms: number, what: string) => Promise.race([q, new Promise<never>((_, rej) => setTimeout(() => rej(new Error(`deadline: ${what}`)), ms))]);
-  test("AUDIT A: a registrant that throws before its exclusive body (auth refused in the gate) leaves no entry", async () => {
+  test("a registrant that throws before its exclusive body (auth refused in the gate) leaves no entry", async () => {
     await using db = await pgDatabase({ max: 2 });
     await using x = await gateInstance(db.url, { oauth: true });
     const { p } = await issued(x);
@@ -1021,7 +1021,7 @@ describePg("AUDIT 1537a", () => {
     expect(await deadline(whoami(x, p, "aud-a"), 5000, "the next first contact hung on a stale entry")).toBeNull();
     expect(d()).toEqual({ keyed: 0, miss: 0, skipped: 1 });
   });
-  test("AUDIT B: the waiter runs keyed while the creator's fn is still running (entry released before fn)", async () => {
+  test("the waiter runs keyed while the creator's fn is still running (entry released before fn)", async () => {
     await using db = await pgDatabase({ max: 2 });
     await using x = await gateInstance(db.url, { oauth: true });
     const { p } = await issued(x);
