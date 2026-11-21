@@ -83,6 +83,14 @@ export function queueBody(site: QueueSite, waited: boolean, keyed: boolean, wait
   bin(queueWait.get(site)!, QUEUE_BUCKETS, waitS);
   bin(queueHold.get(site)!, QUEUE_BUCKETS, holdS);
 }
+// A body the scheduler skipped because its request aborted before it started (#1535, store/queue.ts abandonable):
+// `waited` when it had queued (queueWaiting counted it), false when its signal had already fired at run().
+const queueSkips = new Map<QueueSite, number>(QUEUE_SITES.map(s => [s, 0]));
+export function queueSkipped(site: QueueSite, waited: boolean) {
+  if (waited) queueWaiters--;
+  queueSkips.set(site, queueSkips.get(site)! + 1);
+}
+export function queueSkippedCount(site: QueueSite): number { return queueSkips.get(site)!; }
 // Bodies waiting now, across every queue in the process.
 export function queueWaitersNow(): number { return queueWaiters; }
 // A span in which an exclusive body waited or ran (store/queue.ts): every keyed body arriving meanwhile waits behind it,
@@ -227,6 +235,8 @@ export function render(gauges: Gauges = {}): string {
   for (const [site, b] of queueHold) if (b.count) histogram(out, "grayboard_write_queue_hold_seconds", { site }, QUEUE_BUCKETS, b);
   family("grayboard_write_queue_bodies_total", "counter", "Write-queue bodies released, by calling site.");
   for (const [site, b] of queueHold) out.push(`grayboard_write_queue_bodies_total${labelText({ site })} ${b.count}`);
+  family("grayboard_write_queue_skipped_bodies_total", "counter", "Write-queue bodies skipped, never run, because the request that queued them aborted before they started, by calling site.");
+  for (const [site, n] of queueSkips) out.push(`grayboard_write_queue_skipped_bodies_total${labelText({ site })} ${n}`);
   family("grayboard_write_queue_keyed_bodies_total", "counter", "Write-queue bodies released that ran keyed (overlapping other keyed bodies), by calling site; the rest ran exclusive.");
   for (const [site, n] of queueKeyed) out.push(`grayboard_write_queue_keyed_bodies_total${labelText({ site })} ${n}`);
   family("grayboard_hosted_gate_bodies_total", "counter", "Hosted gate and delivery requests by site and how the write body ran: keyed (the fast path), miss (a keyed attempt, then the exclusive body), skipped (exclusive without an attempt).");

@@ -6,7 +6,8 @@ import { join } from "node:path";
 import { afterCommit } from "../../core/sqlite.ts";
 import { openDatabase } from "../db.ts";
 import { writeAudit } from "../audit.ts";
-import { queueFor, WriteQueue } from "./queue.ts";
+import { abandonable, atSite, queueFor, RequestAbortedError, WriteQueue } from "./queue.ts";
+import { queueSkippedCount, queueWaitersNow } from "../metrics.ts";
 import { scratchDbPath } from "../../../tests/support/scratch_db.ts";
 import { until } from "../../../tests/support/until.ts";
 
@@ -802,6 +803,286 @@ test("a COMMIT that fails rolls the body back, drops its effects and releases th
   }
   await repo.write(tx => repo.users.upsertByEmail(tx, "next@example.com", null));
   expect(userOn(db, "next@example.com")).toBeDefined();
+});
+
+// #1535: abandoned bodies. A held body, its release, and a marked body behind it.
+// A macrotask turn: every microtask pump the abort queued has run.
+const turn = () => new Promise<void>(r => setTimeout(r, 0));
+const held = (q: WriteQueue, keys?: string[]) => {
+  let release!: () => void;
+  const started = { v: false };
+  const fn = () => { started.v = true; return new Promise<void>(r => { release = r; }); };
+  const done = keys ? q.runKeyed(keys, fn) : q.run(fn);
+  return { done, started, release: () => release() };
+};
+
+describe("abandoned bodies (#1535)", () => {
+  test("a body whose signal fires while it waits never runs; its caller rejects at once, and the queue drains", async () => {
+    const q = new WriteQueue();
+    const a = held(q);
+    const ac = new AbortController();
+    let ran = false;
+    const skippedBefore = queueSkippedCount("tool"), waitersBefore = queueWaitersNow();
+    const marked = abandonable(ac.signal, () => atSite("tool", () => q.run(() => { ran = true; })));
+    const after = q.run(() => "after");
+    expect(q.waiting).toBe(2);
+    ac.abort();
+    // Rejected before the holder releases: the handler unwinds without waiting for its turn.
+    await expect(marked).rejects.toBeInstanceOf(RequestAbortedError);
+    expect(a.started.v).toBe(true);
+    a.release();
+    expect(await after).toBe("after");
+    await a.done;
+    expect(ran).toBe(false);
+    expect(q.idle).toBe(true);
+    expect(queueSkippedCount("tool") - skippedBefore).toBe(1);
+    expect(queueWaitersNow()).toBe(waitersBefore);
+  });
+
+  test("a signal already aborted at run() rejects there; nothing queues", async () => {
+    const q = new WriteQueue();
+    const ac = new AbortController();
+    ac.abort();
+    let ran = false;
+    const skippedBefore = queueSkippedCount("tool");
+    await expect(abandonable(ac.signal, () => atSite("tool", () => q.run(() => { ran = true; })))).rejects.toBeInstanceOf(RequestAbortedError);
+    expect(ran).toBe(false);
+    expect(q.idle).toBe(true);
+    expect(queueSkippedCount("tool") - skippedBefore).toBe(1);
+  });
+
+  test("a body that started is never cut short: its signal firing mid-body changes nothing", async () => {
+    const q = new WriteQueue();
+    const ac = new AbortController();
+    let release!: () => void;
+    const marked = abandonable(ac.signal, () => q.run(async () => { await new Promise<void>(r => { release = r; }); return "done"; }));
+    expect(q.held).toBe(true);
+    ac.abort();
+    release();
+    expect(await marked).toBe("done");
+    expect(q.idle).toBe(true);
+  });
+
+  test("a dead exclusive waiter stops holding back the keyed waiters behind it without waiting for a release", async () => {
+    const q = new WriteQueue(2);
+    const k1 = held(q, ["a"]);
+    const ac = new AbortController();
+    const ex = abandonable(ac.signal, () => q.run(() => "ex"));
+    const k2 = held(q, ["b"]);
+    expect(k2.started.v).toBe(false);
+    ac.abort();
+    await expect(ex).rejects.toBeInstanceOf(RequestAbortedError);
+    // k1 still runs: only the abort's own pump can start k2.
+    await until(() => k2.started.v, 5000, "the keyed waiter behind the dead exclusive one to start");
+    expect(q.waiting).toBe(0);
+    k1.release(); k2.release();
+    await Promise.all([k1.done, k2.done]);
+    expect(q.idle).toBe(true);
+  });
+
+  test("a dead keyed waiter at its key's head makes the next waiter of that key ready when it is dropped", async () => {
+    const q = new WriteQueue(2);
+    const k1 = held(q, ["a"]);
+    const ac = new AbortController();
+    let ran = false;
+    const k2 = abandonable(ac.signal, () => q.runKeyed(["a"], () => { ran = true; }));
+    const k3 = q.runKeyed(["a"], () => "k3");
+    ac.abort();
+    await expect(k2).rejects.toBeInstanceOf(RequestAbortedError);
+    k1.release();
+    expect(await k3).toBe("k3");
+    await k1.done;
+    expect(ran).toBe(false);
+    expect(q.idle).toBe(true);
+  });
+
+  // The dead waiter also held back a key nobody runs: only its drop can make that key's next waiter ready (no release
+  // of key "a" ever comes). Mutation: drop without its ready push (k3 never starts while k1 holds "b").
+  test("a dead keyed waiter's drop makes ready a waiter behind it on a key no running body holds", async () => {
+    const q = new WriteQueue(2);
+    const k1 = held(q, ["b"]);
+    const ac = new AbortController();
+    const k2 = abandonable(ac.signal, () => q.runKeyed(["a", "b"], () => "k2"));
+    const k3 = held(q, ["a"]);
+    expect(k3.started.v).toBe(false);
+    ac.abort();
+    await expect(k2).rejects.toBeInstanceOf(RequestAbortedError);
+    await until(() => k3.started.v, 5000, "the waiter behind the dead one on key a to start while k1 holds b");
+    k1.release(); k3.release();
+    await Promise.all([k1.done, k3.done]);
+    expect(q.idle).toBe(true);
+  });
+
+  // Mutation: startNext without its ready-heap-top drop (the dead body runs after its caller was told aborted). a dead keyed waiter at the ready heap's top, not the arrival head, is dropped, never launched.
+  test("a dead keyed waiter at the ready heap's top, behind a live head that isn't ready, is dropped, never launched", async () => {
+    const q = new WriteQueue(2);
+    const k1 = held(q, ["a"]), k0 = held(q, ["z"]);
+    const kA = held(q, ["a"]);
+    const ac = new AbortController();
+    let ran = false;
+    const d = abandonable(ac.signal, () => q.runKeyed(["b"], () => { ran = true; }));
+    ac.abort();
+    await expect(d).rejects.toBeInstanceOf(RequestAbortedError);
+    k0.release(); await k0.done; await turn();
+    expect(ran).toBe(false);
+    k1.release(); await k1.done;
+    await until(() => kA.started.v, 5000, "kA to start");
+    kA.release(); await kA.done;
+    expect(ran).toBe(false);
+    expect(q.idle).toBe(true);
+  });
+
+  // Mutation: drop without its heapPop (the waiter is dropped twice; the queue's indexes break). a dead keyed arrival head that sits in the ready heap leaves the heap when dropped.
+  test("a dead keyed arrival head in the ready heap leaves the heap when dropped; the queue stays consistent", async () => {
+    const q = new WriteQueue(1);
+    const k1 = held(q, ["a"]);
+    const ac = new AbortController();
+    const d = abandonable(ac.signal, () => q.runKeyed(["b"], () => "d"));
+    const k3 = held(q, ["c"]);
+    ac.abort();
+    await expect(d).rejects.toBeInstanceOf(RequestAbortedError);
+    await turn();
+    k1.release(); await k1.done;
+    await until(() => k3.started.v, 5000, "k3 to start");
+    k3.release(); await k3.done;
+    expect(q.idle).toBe(true);
+    expect(q.waiting).toBe(0);
+  });
+
+  // Mutation: startNext's dead-exclusive branch returning false (kB waits for k1). a dead exclusive waiter that is not the arrival head stops holding back a ready keyed waiter behind it.
+  test("a dead exclusive waiter that isn't the arrival head stops holding back a ready keyed waiter behind it", async () => {
+    const q = new WriteQueue(2);
+    const k1 = held(q, ["a"]);
+    const kA = held(q, ["a"]);
+    const ac = new AbortController();
+    const ex = abandonable(ac.signal, () => q.run(() => "ex"));
+    const kB = held(q, ["b"]);
+    expect(kB.started.v).toBe(false);
+    ac.abort();
+    await expect(ex).rejects.toBeInstanceOf(RequestAbortedError);
+    await until(() => kB.started.v, 2000, "kB to start while k1 still holds a");
+    expect(kA.started.v).toBe(false);
+    k1.release(); await k1.done;
+    await until(() => kA.started.v, 2000, "kA");
+    kA.release(); kB.release();
+    await Promise.all([kA.done, kB.done]);
+    expect(q.idle).toBe(true);
+  });
+
+  // Mutation: the head drop after the cap check (the dead entry stays counted while the cap is full). a dead head is dropped even while the cap is reached (its index entries go at the abort's pump).
+  test("a dead head is dropped while the cap is full", async () => {
+    const q = new WriteQueue(1);
+    const k1 = held(q);
+    const ac = new AbortController();
+    const d = abandonable(ac.signal, () => q.run(() => "d"));
+    expect(q.waiting).toBe(1);
+    ac.abort();
+    await expect(d).rejects.toBeInstanceOf(RequestAbortedError);
+    await turn();
+    expect(q.waiting).toBe(0);
+    k1.release(); await k1.done;
+    expect(q.idle).toBe(true);
+  });
+
+  // abort fired from inside a synchronously-launched body, for a waiter the same pump would start next.
+  test("a body that aborts the next waiter's signal synchronously: that waiter never runs", async () => {
+    const q = new WriteQueue(1);
+    const k1 = held(q);
+    const ac = new AbortController();
+    let ran = false;
+    const s = q.run(() => { ac.abort(); });
+    const d = abandonable(ac.signal, () => q.run(() => { ran = true; }));
+    const after = q.run(() => "after");
+    const dr = d.catch(e => e);
+    k1.release();
+    await k1.done; await s;
+    expect(await after).toBe("after");
+    expect(await dr).toBeInstanceOf(RequestAbortedError);
+    expect(ran).toBe(false);
+    expect(q.idle).toBe(true);
+  });
+
+  // random churn: many marked and unmarked keyed/exclusive waiters, random aborts; every live body runs once, no dead
+  // body runs, conflicting bodies never overlap, and the queue drains.
+  test("randomized: no dead body runs, every live body runs once, conflicting bodies never overlap, the queue drains", async () => {
+    let seed = Number(process.env.SEED ?? 12345);
+    const rnd = () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff; };
+    for (let round = 0; round < 100; round++) {
+      const q = new WriteQueue(1 + Math.floor(rnd() * 4));
+      const running = new Set<string>(); let exRunning = false, nRunning = 0;
+      const results: Promise<unknown>[] = [];
+      const ctrls: AbortController[] = [];
+      const ranCount = new Map<number, number>(); const deadAtStart = new Set<number>();
+      const signals = new Map<number, AbortSignal>();
+      for (let i = 0; i < 60; i++) {
+        const keyed = rnd() < 0.75;
+        const keys = keyed ? [...new Set(Array.from({ length: 1 + Math.floor(rnd() * 2) }, () => "k" + Math.floor(rnd() * 4)))] : undefined;
+        const marked = rnd() < 0.5;
+        const ac = new AbortController(); ctrls.push(ac);
+        if (marked) signals.set(i, ac.signal);
+        const fn = async () => {
+          if (signals.get(i)?.aborted) deadAtStart.add(i);
+          ranCount.set(i, (ranCount.get(i) ?? 0) + 1);
+          if (keys) { for (const k of keys) { if (running.has(k) || exRunning) throw new Error("overlap"); } for (const k of keys) running.add(k); }
+          else { if (nRunning > 0) throw new Error("ex overlap"); exRunning = true; }
+          nRunning++;
+          await new Promise(r => setTimeout(r, Math.floor(rnd() * 3)));
+          nRunning--;
+          if (keys) for (const k of keys) running.delete(k); else exRunning = false;
+          return i;
+        };
+        const p = marked ? abandonable(ac.signal, () => keys ? q.runKeyed(keys, fn) : q.run(fn)) : (keys ? q.runKeyed(keys, fn) : q.run(fn));
+        results.push(p.then(v => ({ ok: v }), e => ({ err: e })));
+        if (rnd() < 0.3) { const j = Math.floor(rnd() * ctrls.length); ctrls[j]!.abort(); }
+        if (rnd() < 0.2) await new Promise(r => setTimeout(r, 0));
+      }
+      for (const c of ctrls) if (rnd() < 0.2) c.abort();
+      const out = await Promise.all(results) as ({ ok: number } | { err: unknown })[];
+      out.forEach((r, i) => {
+        if ("err" in r) {
+          expect(r.err).toBeInstanceOf(RequestAbortedError);
+          expect(ranCount.get(i) ?? 0).toBe(0);
+        } else expect(ranCount.get(i)).toBe(1);
+      });
+      expect(deadAtStart.size).toBe(0);
+      await until(() => q.idle, 2000, `round ${round} idle`);
+    }
+  }, 30_000);
+
+  // Mutation: drop without `stopping--` (a dropped exclusive leaves the world-stop clock running: the next exclusive
+  // doesn't restart it, so grayboard_write_queue_world_stop_seconds_total counts idle time).
+  test("a dropped exclusive waiter stops the world-stop clock it started", async () => {
+    const q = new WriteQueue();
+    const stopping = () => (q as unknown as { stopping: number }).stopping;
+    const a = held(q);
+    const ac = new AbortController();
+    const ex = abandonable(ac.signal, () => q.run(() => "ex"));
+    expect(stopping()).toBe(2);
+    ac.abort();
+    await expect(ex).rejects.toBeInstanceOf(RequestAbortedError);
+    await turn();
+    a.release(); await a.done;
+    expect(q.idle).toBe(true);
+    expect(stopping()).toBe(0);
+  });
+
+  test("a write a marked body queues is unmarked: it runs although the signal fired", async () => {
+    const q = new WriteQueue();
+    const ac = new AbortController();
+    let inner!: Promise<string>;
+    await abandonable(ac.signal, () => q.run(() => { ac.abort(); inner = q.run(() => "inner"); }));
+    expect(await inner).toBe("inner");
+    // A body that waited, too: it starts inside its enqueuer's snapshot (#1408), with the mark cleared.
+    const ac2 = new AbortController();
+    const a = held(q);
+    let inner2!: Promise<string>;
+    const marked = abandonable(ac2.signal, () => q.run(() => { ac2.abort(); inner2 = q.run(() => "inner2"); }));
+    a.release();
+    await marked;
+    expect(await inner2).toBe("inner2");
+    await a.done;
+    expect(q.idle).toBe(true);
+  });
 });
 
 // The portable Repo-level rows above, as the backend-neutral contract every store runs (tx.contract.ts).

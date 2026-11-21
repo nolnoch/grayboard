@@ -217,10 +217,22 @@ async function open(spec: DriverSession, url: string): Promise<Live> {
   }
 }
 
+// An open that fails once its bind may have committed (connect binds, then any later step: a 429, a timeout) ends the
+// session, best effort, so its root doesn't hold its name with no lease to lapse until the idle sweep: the run's
+// `holding` gate would count it after close (#1535 audit).
 async function openOnce(spec: DriverSession, url: string): Promise<Live> {
   const s = new HostedSession(url, spec.token, spec.name, { receipt: "manual" });
+  try { return await opened(spec, s); }
+  catch (e) {
+    await s.subscriber.call("session_end").catch(() => {});
+    await s.close().catch(() => s.drop());
+    throw e;
+  }
+}
+
+async function opened(spec: DriverSession, s: HostedSession): Promise<Live> {
   const l: Live = { spec, s, dirty: true, stop: false, nextSend: 0, seq: 0, reads: spec.index % SVC_READS.length, invoked: new Map() };
-  try { await s.connect(); } catch (e) { await s.drop(); throw e; }
+  await s.connect();
   // board_create subscribes its creator; whoever loses the race subscribes. A worker's board is the service's queue.
   try { await s.call("board_create", { name: spec.board, purpose: "load test", ...(spec.service ? { kind: "queue" } : {}) }); }
   catch (e) {

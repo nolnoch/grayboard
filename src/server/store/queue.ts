@@ -1,5 +1,5 @@
 import { AsyncLocalStorage } from "node:async_hooks";
-import { queueBody, queueStarted, queueWaiting, queueWorldStop, type QueueSite } from "../metrics.ts";
+import { queueBody, queueSkipped, queueStarted, queueWaiting, queueWorldStop, type QueueSite } from "../metrics.ts";
 
 // The server's write scheduler (docs/future/postgres-server.md D4): every top-level write transaction runs through
 // it, so in-memory state a transaction reads changes only inside a scheduled transaction or its afterCommit, as it did
@@ -39,13 +39,33 @@ export function atSite<T>(site: QueueSite, fn: () => T): T { return sites.run(si
 // one site's bodies.
 export function currentSite(): QueueSite | undefined { return sites.getStore(); }
 
-// `keys`: a keyed body's, undefined for an exclusive one. `enter`: the queuing task's context, for a body that waits
+// Abandoned bodies (#1535, docs/future/postgres-server.md D4). A write queued inside `abandonable(signal, fn)` (by fn
+// itself or a task it started) carries `signal`: if it fires before the body starts, the body never runs and its
+// caller's promise rejects with RequestAbortedError, at once (the abort's listener), so the request's handler unwinds
+// without waiting for its turn. Its index entries go lazily: a dead waiter is dropped when it heads the arrival list,
+// the exclusive FIFO or the ready heap, at the next pump (the abort queues one), without taking a slot or a key. A body that has started is never touched: no
+// transaction is ever cut short. Only a request-entry body whose whole effect is its request's answer opts in (the
+// hosted gate, prior, tool and bind bodies): to its caller a skipped body is one that failed before its first
+// statement. Every body runs with the mark cleared, so a write a body, its afterCommit or its committed queues is
+// unmarked unless it opts in itself; and a body queued with no signal (undefined) is never skipped.
+const abandon = new AsyncLocalStorage<AbortSignal>();
+export function abandonable<T>(signal: AbortSignal | undefined, fn: () => T): T { return signal ? abandon.run(signal, fn) : fn(); }
+
+// What a skipped body's caller sees: its request aborted while the body waited, so nothing ran and nothing was written.
+export class RequestAbortedError extends Error {
+  override name = "RequestAbortedError";
+  constructor() { super("request aborted before its write started"); }
+}
+
+// `keys`: a keyed body's, undefined for an exclusive one. `signal`: an abandonable body's (abandonable); `off`, its
+// abort listener's removal, set while it waits. `enter`: the queuing task's context, for a body that waits
 // (AsyncLocalStorage.snapshot); one that starts at once already runs in it. `at`: performance.now() at run(), the
 // start of its wait; `began`, at its start. The rest is a waiter's place in the scheduler's indexes: `seq` its arrival
 // order, `prev`/`next` its neighbours in the arrival list, `heap` its slot in the ready heap (-1 when not in it).
 type Waiter = {
   fn: () => unknown; resolve: (value: unknown) => void; reject: (error: unknown) => void;
   keys: ReadonlySet<string> | undefined; at: number; began: number; site: QueueSite; enter?: <R>(fn: () => R) => R;
+  signal?: AbortSignal; off?: () => void;
   seq: number; prev?: Waiter; next?: Waiter; heap: number;
 };
 
@@ -149,7 +169,9 @@ export class WriteQueue {
 
   private enqueue<T>(keys: ReadonlySet<string> | undefined, fn: () => T | PromiseLike<T>): Promise<T> {
     return new Promise<T>((resolve, reject) => {
-      const w: Waiter = { fn, resolve: resolve as (value: unknown) => void, reject, keys, at: performance.now(), began: 0, site: sites.getStore() ?? "other", seq: this.seq++, heap: -1 };
+      const signal = abandon.getStore();
+      if (signal?.aborted) { queueSkipped(sites.getStore() ?? "other", false); reject(new RequestAbortedError()); return; }
+      const w: Waiter = { fn, resolve: resolve as (value: unknown) => void, reject, keys, at: performance.now(), began: 0, site: sites.getStore() ?? "other", seq: this.seq++, heap: -1, signal };
       if (keys === undefined && this.stopping++ === 0) this.stopSince = w.at;
       if (!this.pumping && this.free(w) && !this.behind(w)) {
         this.pumping = true;
@@ -158,6 +180,14 @@ export class WriteQueue {
         return;
       }
       w.enter = AsyncLocalStorage.snapshot();
+      if (signal) {
+        // The caller rejected now; the entry dropped at the next pump, which a microtask runs (not this listener's
+        // stack, which may be any code that aborted): a dead exclusive head stops holding back the keyed waiters behind
+        // it without waiting for a release.
+        const aborted = () => { w.reject(new RequestAbortedError()); queueMicrotask(() => this.pump()); };
+        signal.addEventListener("abort", aborted, { once: true });
+        w.off = () => { signal.removeEventListener("abort", aborted); };
+      }
       queueWaiting(this.waitingCount);
       this.add(w);
       this.pump();
@@ -194,11 +224,14 @@ export class WriteQueue {
   // An exclusive waiter can start only as the oldest waiter, and every waiter behind one conflicts with it; so with an
   // exclusive oldest waiter that is the only candidate, and otherwise the candidate is the oldest ready keyed waiter,
   // provided it arrived before the first exclusive waiter. O(log N) in the waiters, O(1) for an exclusive head.
+  // A dead waiter (its signal aborted) at the head of the arrival list, the exclusive FIFO or the ready heap is dropped
+  // first, before the cap: it takes no slot, and a dead exclusive waiter stops holding back the keyed ones behind it.
   private startNext(): boolean {
     this.steps++;
-    if (this.running >= this.cap) return false;
     const head = this.first;
     if (head === undefined) return false;
+    if (head.signal?.aborted) { this.drop(head); return true; }
+    if (this.running >= this.cap) return false;
     if (head.keys === undefined) {
       if (this.running > 0) return false;
       this.take(head);
@@ -208,8 +241,13 @@ export class WriteQueue {
     if (this.exclusive) return false;
     const w = this.ready[0];
     if (w === undefined) return false;
+    if (w.signal?.aborted) { this.drop(w); return true; }
     const ex = this.exclusives.peek();
-    if (ex !== undefined && ex.seq < w.seq) return false;
+    if (ex !== undefined && ex.seq < w.seq) {
+      if (!ex.signal?.aborted) return false;
+      this.drop(ex);
+      return true;
+    }
     this.heapPop();
     this.take(w);
     this.launch(w);
@@ -232,8 +270,32 @@ export class WriteQueue {
     if (this.isReady(w)) this.heapPush(w);
   }
 
-  // Unindexes a waiter that starts: it heads every FIFO it is in.
+  // Drops a dead waiter that heads the arrival list, the exclusive FIFO or the ready heap: so it heads every FIFO it is
+  // in, as a waiter that starts does, and a keyed one in the heap is its top. Its caller was rejected when the signal
+  // fired. As at a release, an exclusive one credits the world-stop clock, and the next waiter of each of a keyed one's
+  // keys becomes ready if it now heads all of its FIFOs.
+  private drop(w: Waiter): void {
+    if (w.heap === 0) this.heapPop();
+    this.take(w);
+    if (w.keys === undefined) {
+      const end = performance.now();
+      queueWorldStop((end - this.stopSince) / 1000);
+      this.stopSince = end;
+      this.stopping--;
+    } else {
+      for (const k of w.keys) {
+        this.steps++;
+        const next = this.byKey.get(k)?.peek();
+        if (next !== undefined && next.heap < 0 && this.isReady(next)) this.heapPush(next);
+      }
+    }
+    queueSkipped(w.site, true);
+  }
+
+  // Unindexes a waiter that starts or is dropped: it heads every FIFO it is in.
   private take(w: Waiter): void {
+    w.off?.();
+    w.off = undefined;
     if (w.prev) w.prev.next = w.next; else this.first = w.next;
     if (w.next) w.next.prev = w.prev; else this.last = w.prev;
     w.prev = w.next = undefined;
@@ -301,11 +363,12 @@ export class WriteQueue {
     w.began = w.enter ? performance.now() : w.at;
     queueStarted();
     let held: Promise<unknown> | undefined, out: unknown;
-    const body = () => holder.run(token, () => {
+    // The abandon mark cleared: a write the body queues is unmarked unless it opts in itself.
+    const body = () => holder.run(token, () => abandon.exit(() => {
       out = w.fn();
       const then = out !== null && (typeof out === "object" || typeof out === "function") ? (out as { then?: unknown }).then : undefined;
       if (typeof then === "function") held = new Promise((resolve, reject) => then.call(out, resolve, reject));
-    });
+    }));
     try {
       if (w.enter) w.enter(body); else body();
     } catch (error) { this.release(w, token); w.reject(error); return; }

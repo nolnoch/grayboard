@@ -22,6 +22,7 @@ import { forwardMcpStream, readMcpBody, type OwnedStream } from "./mcp-streams.t
 import { AsyncLocalStorage } from "node:async_hooks";
 import { hostedFailure } from "./hosted-diagnostics.ts";
 import { diagnosticOrigin, failureDiagnostic, type FailureSource } from "./diagnostics.ts";
+import { RequestAbortedError } from "./store/queue.ts";
 import { permitsOrigin } from "./origin.ts";
 import { RateLimiter } from "./rate_limit.ts";
 import { DEFAULT_HOSTED_CAPS, DEFAULT_MCP_LIMITS, type HostedCaps, type McpLimits } from "./config.ts";
@@ -162,9 +163,15 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
   type Exchange = { request: Request; address: string; protocol: string; principal?: number; identity?: string; session?: string; tool?: string; logged?: boolean; failure?: ApplicationError; meta?: unknown; id?: string | number | null; method?: unknown; call?: unknown; refusal?: Response; context?: Context; legacy?: Legacy; lost?: boolean; closedAtFactory?: boolean };
   const exchanges = new AsyncLocalStorage<Exchange>();
   const refusalLogs = new RateLimiter({ burst: 1, perSec: 0.1 }, { start() {}, end() {} }, now, 4096);
+  // A request its client abandoned (#1535: it aborted while the request waited, in the write queue or in `select`) is
+  // the client's timeout, i.e. server latency, not a server failure: its own line and category, at warn.
   const report = (error: unknown, source: FailureSource = "hosted-sdk", exchange = exchanges.getStore()) => {
     if (error instanceof ApplicationError || error instanceof CoreError || exchange?.failure || exchange?.refusal || exchange?.logged) return;
     if (exchange) exchange.logged = true;
+    if (error instanceof RequestAbortedError) {
+      console.warn(`[grayboard] hosted MCP client aborted: ${JSON.stringify({ principal: exchange?.principal, identity: exchange?.identity, session: exchange?.session, tool: exchange?.tool, protocol: exchange?.protocol, ...failureDiagnostic(source, error, "client_aborted") })}`);
+      return;
+    }
     console.error(`[grayboard] hosted MCP failed: ${JSON.stringify({ principal: exchange?.principal, identity: exchange?.identity, session: exchange?.session, tool: exchange?.tool, protocol: exchange?.protocol, ...failureDiagnostic(source, error) })}`);
   };
   const logRefusal = (reason: string, exchange: Exchange, detail: Record<string, unknown> = {}) => {
@@ -320,7 +327,8 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
       // A native tool call's end is touched by its tool's gate, which also reuses this selection's verdict (#907). A
       // subscriber's ending call admits no unknown ID (#1097): ending must never start a session.
       const exchange = exchanges.getStore();
-      selected = await hosted.snapshot(principal, routing, !(role === "native" && exchange?.method === "tools/call"), !(role === "subscriber" && ENDING_CALLS.has(exchange?.call)));
+      // An ending call's selection always runs (#1535): a client that ends and exits may not wait for the answer.
+      selected = await hosted.snapshot(principal, routing, !(role === "native" && exchange?.method === "tools/call"), !(role === "subscriber" && ENDING_CALLS.has(exchange?.call)), ENDING_CALLS.has(exchange?.call) ? undefined : request.signal);
     } catch (error) {
       const exchange = exchanges.getStore();
       if (exchange && error instanceof ApplicationError && error.code === "rate_limited" && typeof error.extra.retry_after_ms === "number" && Number.isFinite(error.extra.retry_after_ms) && error.extra.retry_after_ms > 0) {
@@ -348,7 +356,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     const exchange = exchanges.getStore();
     if (exchange) { exchange.principal = principal.authed.user_id; exchange.identity = context.session.identityName; exchange.session = context.session.sessionId; }
     try {
-      if (closed || request.signal.aborted) throw new Error("MCP request is closed");
+      if (closed || request.signal.aborted) throw closedError(request);
       // The bound text's facts, for a context makeServer would give it (boundInstruction): read here, since the
       // server's instructions are built synchronously. The selection read the root moments ago (#907).
       if (instruct && role !== "subscriber" && !context.session.via && !context.session.readOnly && "id" in routing) {
@@ -362,10 +370,12 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
         throw new Error("unauthenticated");
       }
       // Closed or cancelled while the check awaited: the context is finished below, never handed out.
-      if (closed || request.signal.aborted) throw new Error("MCP request is closed");
+      if (closed || request.signal.aborted) throw closedError(request);
       return context;
     } catch (error) { context.finish(); throw error; }
   }
+  // A closing endpoint's error, else the client's abort (#1535), logged as client_aborted rather than unexpected.
+  const closedError = (request: Request) => closed || !request.signal.aborted ? new Error("MCP request is closed") : new RequestAbortedError();
   function binding(context: Context): Binding {
     return { user: context.principal.authed.user_id, email: context.principal.authed.user_email, grant: context.principal.grantId, role: context.role, identity: context.session.identityFull };
   }
@@ -761,9 +771,9 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     try {
     const exchange = exchanges.getStore()!;
     if (exchange.context) {
-      if (closed || exchange.request.signal.aborted) { exchange.closedAtFactory = closed; throw new Error("MCP request is closed"); }
+      if (closed || exchange.request.signal.aborted) { exchange.closedAtFactory = closed; throw closedError(exchange.request); }
       const principal = await oauth.authenticate(exchange.request, roleScopes(exchange.context.role));
-      if (closed || exchange.request.signal.aborted) { exchange.closedAtFactory = closed; throw new Error("MCP request is closed"); }
+      if (closed || exchange.request.signal.aborted) { exchange.closedAtFactory = closed; throw closedError(exchange.request); }
       if (principal instanceof Response) refuse(principal);
     }
     const context = exchange.context ??= await select(exchange.request);
@@ -1307,7 +1317,7 @@ function registerNativeTools(server: McpServer, application: Application, hosted
   const run = async (ctx: ServerContext, tool: string, call: (session: ApplicationSession, tx: Tx) => unknown): Promise<CallToolResult> => {
     let notice: string | undefined;
     try {
-      return said(text(await timeTool(tool, async () => { const context = await current(ctx); return hosted.run(context.principal, context.sessionContext, tool, call, n => { notice = n; }, context.verdict); }) ?? "ok"), notice);
+      return said(text(await timeTool(tool, async () => { const context = await current(ctx); return hosted.run(context.principal, context.sessionContext, tool, call, n => { notice = n; }, context.verdict, context.request.signal); }) ?? "ok"), notice);
     }
     catch (e) {
       report(e, tool);
@@ -1330,11 +1340,11 @@ function registerNativeTools(server: McpServer, application: Application, hosted
   // The shared bind/unbind definitions (BIND_TOOL, UNBIND_TOOL), with the hosted input both roles take.
   server.registerTool(BIND_TOOL.name, { description: BIND_TOOL.description, _meta: BIND_TOOL._meta,
     inputSchema: HOSTED_BIND_INPUT }, async (args, ctx) => {
-    try { return await timeTool("bind", async () => { const context = await current(ctx); return hosted.bind(context.principal, context.sessionContext, args, context.declared); }); }
+    try { return await timeTool("bind", async () => { const context = await current(ctx); return hosted.bind(context.principal, context.sessionContext, args, context.declared, context.request.signal); }); }
     catch (e) { return bindRefusal(e, "bind"); }
   });
   server.registerTool(UNBIND_TOOL.name, { description: UNBIND_TOOL.description, inputSchema: HOSTED_UNBIND_INPUT }, async (args, ctx) => {
-    try { return await timeTool("unbind", async () => { const context = await current(ctx); return hosted.unbind(context.principal, context.sessionContext, args, context.declared); }); }
+    try { return await timeTool("unbind", async () => { const context = await current(ctx); return hosted.unbind(context.principal, context.sessionContext, args, context.declared, context.request.signal); }); }
     catch (e) { return bindRefusal(e, "unbind"); }
   });
   // The definitions local serves too (src/core/tools.ts), with files named by uploaded IDs (#385).
