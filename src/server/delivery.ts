@@ -4,7 +4,7 @@ import { refOf, type PendingRef } from "../core/boards.ts";
 import { testPause, testPauseAsync } from "../shared/testpause.ts";
 import { ApplicationError, type ApplicationSession, type DeliveryEvent, type IdentityInfo } from "./application.ts";
 import type { OAuthPrincipal } from "./oauth.ts";
-import type { HostedSessions, SessionContext } from "./hosted.ts";
+import type { HostedSessions, SessionContext, Verdict } from "./hosted.ts";
 import type { HostedSession } from "./hosted-types.ts";
 import { ProbeWrite, type Read, type Tx } from "./store/tx.ts";
 import { atSite } from "./store/queue.ts";
@@ -172,7 +172,9 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
     identityFull(p: DeliveryPrincipal, context: SessionContext, capability: string, checked: { row: HostedSession | undefined }): string {
       try { return getChecked(p, context, capability, checked.row).identity.identity_full; } catch (error) { return refused(p, context, error); }
     },
-    async open(p: DeliveryPrincipal, context: SessionContext, hooks: DeliveryHooks = {}, openOptions: DeliveryOpenOptions = {}): Promise<DeliveryLease> {
+    // `prior` (open, renew, pending, receipt): the request's exchange's verdict (#1537 C5, C7), which stands in for the
+    // call's second gate body (hosted.ts withPrior); without one the call runs the full gate.
+    async open(p: DeliveryPrincipal, context: SessionContext, hooks: DeliveryHooks = {}, openOptions: DeliveryOpenOptions = {}, prior?: Verdict): Promise<DeliveryLease> {
       let previous: Lease | undefined;
       return hosted.owning(p, context, async (row, _defer, tx) => {
         const holds = await application.hostedHolds(tx, row.session_id);
@@ -226,7 +228,7 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
           context: openOptions.context ?? true, row };
         track(lease);
         return opened(lease, true, hooks);
-      }, undefined, "open");
+      }, undefined, "open", prior);
     },
     accept(result: DeliveryLease) {
       const attempt = attempts.get(result);
@@ -239,7 +241,7 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
       }
       attempts.delete(result);
     },
-    async renew(p: DeliveryPrincipal, context: SessionContext, capability: string, hooks?: DeliveryHooks) {
+    async renew(p: DeliveryPrincipal, context: SessionContext, capability: string, hooks?: DeliveryHooks, prior?: Verdict) {
       return hosted.control(p, context, false, async row => {
         const renewed = ({ lease, deadline }: { lease: Lease; deadline: number }) => {
           // Nothing awaits between the body's check and here; kept as the in-memory side's own guard.
@@ -275,9 +277,9 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
           return { lease, deadline };
         }, renewed)));
         return describe(lease);
-      }, undefined, "renew").catch(error => refused(p, context, error));
+      }, undefined, "renew", prior).catch(error => refused(p, context, error));
     },
-    async pending(p: DeliveryPrincipal, context: SessionContext, capability: string, limit = 100): Promise<PendingDelivery[]> {
+    async pending(p: DeliveryPrincipal, context: SessionContext, capability: string, limit = 100, prior?: Verdict): Promise<PendingDelivery[]> {
       return hosted.control(p, context, false, async row => {
         const lease = await get(p, context, capability, row);
         await testPauseAsync("hosted:pending:in-gate");
@@ -294,9 +296,9 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
         for (const item of unseen) lease.issued.set(item.id, { item: structuredClone(item), ...(item.event.kind === "board" ? { ref: refOf(item.event.item) } : {}) });
         if (!items.length) drained.add(drainKey(lease));
         return items;
-      }, undefined, "pending").catch(error => refused(p, context, error));
+      }, undefined, "pending", prior).catch(error => refused(p, context, error));
     },
-    async receipt(p: DeliveryPrincipal, context: SessionContext, capability: string, ids: string[]): Promise<void> {
+    async receipt(p: DeliveryPrincipal, context: SessionContext, capability: string, ids: string[], prior?: Verdict): Promise<void> {
       return hosted.control(p, context, false, async root => {
         await testPauseAsync("hosted:receipt:before-txn");
         // The receipt's reads, on the body's Tx: the row, the lease, each id's issue and its fence, each board's
@@ -363,7 +365,7 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
           const row = "id" in context ? await store.lock(tx, context.id) : undefined;
           return writes(tx, await reads(tx, row));
         }, committed)));
-      }, undefined, "receipt").catch(error => refused(p, context, error));
+      }, undefined, "receipt", prior).catch(error => refused(p, context, error));
     },
     async release(p: DeliveryPrincipal, context: SessionContext, capability: string) {
       return hosted.control(p, context, true, async row => {

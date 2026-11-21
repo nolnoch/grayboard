@@ -5,7 +5,7 @@ import { SESSION_ID } from "../core/session_id.ts";
 import { ApplicationError, type ApplicationSession } from "./application.ts";
 import type { OAuthPrincipal } from "./oauth.ts";
 import type { Delivery } from "./delivery.ts";
-import type { HostedSessions, SessionContext } from "./hosted.ts";
+import type { HostedSessions, SessionContext, Verdict } from "./hosted.ts";
 import type { HostedSession } from "./hosted-types.ts";
 import { parseBoardResourceUri, type Resources } from "./resources.ts";
 import { hostedFailure } from "./hosted-diagnostics.ts";
@@ -97,7 +97,9 @@ function boardRead(uri: string) {
 
 export function registerHostedResources(server: McpServer, context: {
   role: HostedRole;
-  current(ctx?: ServerContext): { principal: OAuthPrincipal; sessionContext: SessionContext; session: ApplicationSession; request: Request };
+  // `verdict`: the exchange's selection (#907), which the subscriber's renew, receipt, pending, open and bind reuse in
+  // place of a second gate body (#1537 C5, C7: hosted.ts withPrior).
+  current(ctx?: ServerContext): { principal: OAuthPrincipal; sessionContext: SessionContext; session: ApplicationSession; request: Request; verdict?: Verdict };
   issuer: string; resource: string; resources: Resources; delivery: Delivery; hosted: HostedSessions;
   authorize(): Promise<{ row: HostedSession | undefined }>;
   leaseHooks?: () => { changed(): void; closed(): void; bind(capability: string): void };
@@ -148,7 +150,7 @@ export function registerHostedResources(server: McpServer, context: {
       const checked = await authorize(ctx.mcpReq.signal);
       if (role === "subscriber") {
         if (params.uri !== inboxUri) throw new ApplicationError("not_found", "resource not found");
-        return json(params.uri, { items: await delivery.pending(principal, sessionContext, leaseCapability(checked), 100) });
+        return json(params.uri, { items: await delivery.pending(principal, sessionContext, leaseCapability(checked), 100, context.current(ctx).verdict) });
       }
       const read = boardRead(params.uri);
       return json(params.uri, await hosted.run(principal, sessionContext, "board_read", (session, tx) => resources.read(tx, session, read.uri, read.options)));
@@ -176,7 +178,7 @@ export function registerHostedResources(server: McpServer, context: {
     description: "Add a name to this root's holds; never enrolls it for host admission.",
     inputSchema: HOSTED_BIND_INPUT,
   }, async (args, ctx) => {
-    try { context.current(ctx); await authorize(ctx.mcpReq.signal); return await hosted.bind(context.current().principal, context.current().sessionContext, args); }
+    try { context.current(ctx); await authorize(ctx.mcpReq.signal); const c = context.current(); return await hosted.bind(c.principal, c.sessionContext, args, undefined, undefined, c.verdict); }
     catch (error) { return refused(error); }
   });
   server.registerTool("unbind", {
@@ -197,9 +199,9 @@ export function registerHostedResources(server: McpServer, context: {
     description: "Explicitly acquire delivery ownership for this identity. Reads do not acknowledge items. context: false for a host that starts a turn for every item: non-waking items then wait for a waking one.",
     inputSchema: OPEN_INPUT,
   }, (args, ctx) => run(ctx, async () => {
-    const { principal, sessionContext } = context.current();
+    const { principal, sessionContext, verdict } = context.current();
     const hooks = context.leaseHooks?.();
-    const lease = await delivery.open(principal, sessionContext, hooks, args.context === undefined ? {} : { context: args.context });
+    const lease = await delivery.open(principal, sessionContext, hooks, args.context === undefined ? {} : { context: args.context }, verdict);
     hooks?.bind(lease.capability);
     try { await authorize(ctx.mcpReq.signal); delivery.accept(lease); return lease; }
     catch (error) {
@@ -209,11 +211,11 @@ export function registerHostedResources(server: McpServer, context: {
   }));
   server.registerTool("delivery_renew", {
     description: "Renew this identity's delivery lease supplied in X-Grayboard-Lease.", inputSchema: EMPTY_INPUT,
-  }, (_args, ctx) => run(ctx, checked => delivery.renew(context.current().principal, context.current().sessionContext, leaseCapability(checked))));
+  }, (_args, ctx) => run(ctx, checked => delivery.renew(context.current().principal, context.current().sessionContext, leaseCapability(checked), undefined, context.current().verdict)));
   server.registerTool("delivery_receipt", {
     description: "Receipt issued delivery IDs only after durable host admission; not a DM handling acknowledgment.",
     inputSchema: RECEIPT_INPUT,
-  }, (args, ctx) => run(ctx, checked => delivery.receipt(context.current().principal, context.current().sessionContext, leaseCapability(checked), args.ids)));
+  }, (args, ctx) => run(ctx, checked => delivery.receipt(context.current().principal, context.current().sessionContext, leaseCapability(checked), args.ids, context.current().verdict)));
   server.registerTool("delivery_release", {
     description: "Release this identity's delivery lease supplied in X-Grayboard-Lease.", inputSchema: EMPTY_INPUT,
   }, (_args, ctx) => run(ctx, checked => delivery.release(context.current().principal, context.current().sessionContext, leaseCapability(checked))));

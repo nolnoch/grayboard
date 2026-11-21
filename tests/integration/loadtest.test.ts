@@ -171,6 +171,7 @@ describe("loadtest write-queue report (#1510)", () => {
       `grayboard_hosted_gate_bodies_total{site="gate",method="selection",outcome="keyed"} ${sel}`,
       `grayboard_hosted_gate_bodies_total{site="gate",method="renew",outcome="keyed"} ${renew}`,
       `grayboard_hosted_gate_bodies_total{site="gate",method="pending",outcome="miss"} 0`,
+      `grayboard_hosted_gate_bodies_total{site="prior",method="receipt",outcome="keyed"} ${renew}`,
     ].join("\n");
     const a = queueCumulative(parseMetrics(expo2(10, [90, 10], 80, 4, 2)));
     const b = queueCumulative(parseMetrics(expo2(30, [290, 30], 260, 14, 12)));
@@ -179,7 +180,8 @@ describe("loadtest write-queue report (#1510)", () => {
     expect(q.sites.gate!.statements).toBe(10);
     expect(q.sites.gate!.roundTrips).toBe(9);
     expect(q.gate.gate).toMatchObject({ keyed: 20, miss: 0 });
-    expect(q.gateMethods).toEqual({ selection: { keyed: 10, miss: 0, skipped: 0 }, renew: { keyed: 10, miss: 0, skipped: 0 } });
+    // The prior site's by method as `prior.<method>` (#1537 C5/C7).
+    expect(q.gateMethods).toEqual({ selection: { keyed: 10, miss: 0, skipped: 0 }, renew: { keyed: 10, miss: 0, skipped: 0 }, "prior.receipt": { keyed: 10, miss: 0, skipped: 0 } });
     // A site with no statement series (SQLite) reads null.
     expect(queueStats(queueCumulative(parseMetrics(expo([10, 10, 10, 10], 0.005, [3, 3, 3, 3]))), 1).sites.gate!.statements).toBeNull();
   });
