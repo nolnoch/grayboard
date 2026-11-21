@@ -158,7 +158,8 @@ test("tool series past the guard fold into other", () => {
     expect(tools.size).toBeLessThanOrEqual(65);
     expect(tools.has("other")).toBe(true);
   } finally { forgetToolSeries("guard_probe_"); }
-  observeTool("guard_after_probe", 0.001);
-  expect(series().has("guard_after_probe")).toBe(true);
-  forgetToolSeries("guard_after_probe");
+  try {
+    observeTool("guard_after_probe", 0.001);
+    expect(series().has("guard_after_probe")).toBe(true);
+  } finally { forgetToolSeries("guard_after_probe"); }
 });
