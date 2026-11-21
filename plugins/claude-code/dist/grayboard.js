@@ -31558,6 +31558,7 @@ var StreamableHTTPClientTransport = class {
 
 // adapters/hosted-core/src/wire.ts
 import { setTimeout as sleep3 } from "timers/promises";
+import { connect as tcpConnect } from "net";
 var DELIVERY_META = "io.github.nolnoch.grayboard/delivery";
 var LAUNCHER_META = "io.github.nolnoch.grayboard/launcher";
 var MODEL_META = "io.github.nolnoch.grayboard/model";
@@ -31638,6 +31639,9 @@ class OutcomeUnknown extends ServerUnreachable {
   }
 }
 
+class ConnectProbeFailed extends ServerUnreachable {
+}
+
 class SubscriptionClosed extends Error {
   constructor() {
     super("Subscription closed");
@@ -31656,8 +31660,8 @@ function scopeRefusal(error) {
   }
   return false;
 }
-var networkCodes = new Set(["ECONNREFUSED", "ConnectionRefused", "ECONNRESET", "ETIMEDOUT", "EHOSTUNREACH", "ENETUNREACH", "ENOTFOUND", "EAI_AGAIN", "FailedToOpenSocket"]);
-var connectCodes = new Set(["ECONNREFUSED", "ConnectionRefused", "EHOSTUNREACH", "ENETUNREACH", "ENOTFOUND", "EAI_AGAIN", "FailedToOpenSocket"]);
+var networkCodes = new Set(["ECONNREFUSED", "ConnectionRefused", "ECONNRESET", "ETIMEDOUT", "EHOSTUNREACH", "ENETUNREACH", "ENOTFOUND", "EAI_AGAIN", "FailedToOpenSocket", "UND_ERR_CONNECT_TIMEOUT"]);
+var connectCodes = new Set(["ECONNREFUSED", "ConnectionRefused", "EHOSTUNREACH", "ENETUNREACH", "ENOTFOUND", "EAI_AGAIN", "FailedToOpenSocket", "UND_ERR_CONNECT_TIMEOUT"]);
 var gatewayStatuses = new Set([502, 503, 504]);
 function unreachable(error) {
   for (let e = error, depth = 0;e && depth < 8; e = e.cause, depth++) {
@@ -31701,6 +31705,38 @@ function abortOf(error, signal) {
   return false;
 }
 var connectMethods = new Set(["server/discover", "initialize"]);
+var connectProbe = { deadlineMs: 5000, coldMs: 30000, open: (host, port) => tcpConnect({ host, port }) };
+function proxied(url) {
+  const env = typeof process === "undefined" ? {} : process.env;
+  const names = url.protocol === "https:" ? ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"] : ["HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"];
+  return names.some((n) => !!env[n]);
+}
+function probe(url, signal) {
+  const host = url.hostname.replace(/^\[(.*)\]$/, "$1");
+  const port = Number(url.port || (url.protocol === "https:" ? 443 : 80));
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) {
+      reject(signal.reason);
+      return;
+    }
+    const socket = connectProbe.open(host, port);
+    const done = (error) => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", onAbort);
+      socket.destroy();
+      if (error === undefined)
+        resolve();
+      else
+        reject(error);
+    };
+    const ms = connectProbe.deadlineMs;
+    const timer = setTimeout(() => done(Object.assign(new Error(`connect to ${host}:${port} timed out after ${ms} ms`), { code: "ETIMEDOUT" })), ms);
+    const onAbort = () => done(signal.reason);
+    signal.addEventListener("abort", onAbort, { once: true });
+    socket.once("connect", () => done());
+    socket.once("error", () => done());
+  });
+}
 async function methodOf(request) {
   if (request.method !== "POST")
     return;
@@ -31718,6 +31754,8 @@ class Connection {
   connect;
   refusal;
   busy;
+  answeredAt = -Infinity;
+  probes = false;
   constructor(wireOptions, authProvider, signal, beforeRetry) {
     this.wireOptions = wireOptions;
     this.signal = signal;
@@ -31736,6 +31774,13 @@ class Connection {
         const signal = AbortSignal.any([request.signal, this.signal]);
         const method = await methodOf(request);
         const connecting = method !== undefined && connectMethods.has(method);
+        if (this.probes && method === "tools/call" && performance.now() - this.answeredAt >= connectProbe.coldMs && !proxied(endpoint)) {
+          try {
+            await probe(endpoint, signal);
+          } catch (error) {
+            throw signal.aborted ? error : new ConnectProbeFailed(error);
+          }
+        }
         for (let attempt = 0;; attempt++) {
           if (attempt) {
             try {
@@ -31753,6 +31798,7 @@ class Connection {
           }
           signal.throwIfAborted();
           const response = await fetch(request.clone(), { headers: outgoing, redirect: "error", signal });
+          this.answeredAt = performance.now();
           if (connecting && !response.ok && ![401, 403, 429].includes(response.status) && !gatewayStatuses.has(response.status)) {
             this.refusal = new ConnectRefused(response.status, (await response.clone().text().catch(() => "")).slice(0, 4096));
           }
@@ -31896,6 +31942,7 @@ class NativeWire extends Connection {
   constructor(options, authProvider, signal, sessionID, beforeRetry) {
     super(options, authProvider, signal, beforeRetry);
     this.sessionID = sessionID;
+    this.probes = true;
   }
   decorate() {}
   meta() {
@@ -36149,7 +36196,7 @@ function broken(error) {
   if (!(error instanceof ServerUnreachable))
     return false;
   for (let e = error, depth = 0;e && depth < 8; e = e instanceof Error ? e.cause : undefined, depth++) {
-    if (e instanceof SdkError && e.code === SdkErrorCode.RequestTimeout)
+    if (e instanceof ConnectProbeFailed || e instanceof SdkError && e.code === SdkErrorCode.RequestTimeout)
       return false;
   }
   return true;
