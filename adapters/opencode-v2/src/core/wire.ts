@@ -95,6 +95,10 @@ export class OutcomeUnknown extends ServerUnreachable {
     this.message = "Server unreachable mid-call; it may have taken effect, so check (dm_history, board_read, claim_list) before calling it again";
   }
 }
+// The connect probe (#1347) found the endpoint not accepting connections, so the call never left. A
+// ServerUnreachable, but not proof the shared connection is broken: calls in flight on a pooled socket may still
+// land, so the proxy keeps it, as it does after a request timeout.
+export class ConnectProbeFailed extends ServerUnreachable {}
 // The server closed the inbox stream: an outage, or a refusal (expired
 // access, rebind, revocation) the reconnect will classify. Never itself
 // proof of an outage (#423).
@@ -217,7 +221,7 @@ abstract class Connection {
   private refusal?: ConnectRefused;
   private busy?: ServerBusy;
   // When this wire last had an answer, for the connect probe; only the native role probes, as only its calls classify OutcomeUnknown.
-  private answeredAt = 0;
+  private answeredAt = -Infinity;
   protected probes = false;
   protected constructor(protected readonly wireOptions: WireOptions, authProvider: AuthProvider, readonly signal: AbortSignal, beforeRetry?: () => Promise<void>) {
     this.client = new Client(wireOptions.client, { versionNegotiation: { mode: { pin: "2026-07-28" } } });
@@ -232,9 +236,9 @@ abstract class Connection {
         const signal = AbortSignal.any([request.signal, this.signal]);
         const method = await methodOf(request);
         const connecting = method !== undefined && connectMethods.has(method);
-        if (this.probes && method === "tools/call" && Date.now() - this.answeredAt >= connectProbe.coldMs && !proxied(endpoint)) {
+        if (this.probes && method === "tools/call" && performance.now() - this.answeredAt >= connectProbe.coldMs && !proxied(endpoint)) {
           // An abort stays itself (a stop, or the caller's); any other failure means the request never left.
-          try { await probe(endpoint, signal); } catch (error) { throw signal.aborted ? error : new ServerUnreachable(error); }
+          try { await probe(endpoint, signal); } catch (error) { throw signal.aborted ? error : new ConnectProbeFailed(error); }
         }
         for (let attempt = 0; ; attempt++) {
           if (attempt) {
@@ -247,7 +251,7 @@ abstract class Connection {
           }
           signal.throwIfAborted();
           const response = await fetch(request.clone(), { headers: outgoing, redirect: "error", signal });
-          this.answeredAt = Date.now();
+          this.answeredAt = performance.now();
           if (connecting && !response.ok && ![401, 403, 429].includes(response.status) && !gatewayStatuses.has(response.status)) {
             this.refusal = new ConnectRefused(response.status, (await response.clone().text().catch(() => "")).slice(0, 4096));
           }

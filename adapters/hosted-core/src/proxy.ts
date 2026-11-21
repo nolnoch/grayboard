@@ -10,7 +10,7 @@ import snapshot from "./native-tools.json" with { type: "json" };
 import type { CallOutcome, Controller } from "./controller.js";
 import type { Operation } from "./diagnostics.js";
 import { AccessExpired, accessExpiry, same } from "./model.js";
-import { InsufficientScope, NativeWire, ServerUnreachable, type WireOptions } from "./wire.js";
+import { ConnectProbeFailed, InsufficientScope, NativeWire, ServerUnreachable, type WireOptions } from "./wire.js";
 import { HostedAttachments } from "./attachments.js";
 import { outputOf } from "./results.js";
 import {
@@ -112,11 +112,11 @@ export function unlessAborted<T>(work: Promise<T>, signal?: AbortSignal): Promis
 
 // The wire classified the failure as the transport's (a closed connection, a
 // network error, a gateway 502-504), not a request that ran out of time on a
-// working connection.
+// working connection, nor a failed connect probe (#1347), which says nothing of the pooled socket.
 function broken(error: unknown): boolean {
   if (!(error instanceof ServerUnreachable)) return false;
   for (let e: unknown = error, depth = 0; e && depth < 8; e = e instanceof Error ? e.cause : undefined, depth++) {
-    if (e instanceof SdkError && e.code === SdkErrorCode.RequestTimeout) return false;
+    if (e instanceof ConnectProbeFailed || e instanceof SdkError && e.code === SdkErrorCode.RequestTimeout) return false;
   }
   return true;
 }

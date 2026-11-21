@@ -14,7 +14,7 @@ import { Client, SdkError, SdkErrorCode, type AuthProvider, type CallToolResult 
 import { AccessExpired } from "../../adapters/hosted-core/src/model.ts";
 import type { CallOutcome } from "../../adapters/hosted-core/src/controller.ts";
 import { CallAborted, hostTools, unlessAborted, loadMode, snapshotTools, ToolProxy, type CallHooks, type NativeTool, type ProxyOptions } from "../../adapters/hosted-core/src/proxy.ts";
-import { connectProbe, NativeWire, OutcomeUnknown, ServerBusy, ServerUnreachable } from "../../adapters/hosted-core/src/wire.ts";
+import { ConnectProbeFailed, connectProbe, NativeWire, OutcomeUnknown, ServerBusy, ServerUnreachable } from "../../adapters/hosted-core/src/wire.ts";
 import { failureText } from "../../adapters/hosted-core/src/client.ts";
 import { hashToken } from "../../src/server/auth.ts";
 import { hostedSessionId } from "../../src/server/hosted.ts";
@@ -646,6 +646,9 @@ test("a call cut off after its request left reports its outcome unknown and is s
   const p = proxy({ token: async () => token });
   const list = NativeWire.prototype.listTools, fetch0 = globalThis.fetch;
   const probe0 = { ...connectProbe };
+  // The probe is skipped behind a proxy: none here, whatever this machine sets.
+  const proxyVars = ["HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"], proxyEnv = proxyVars.map(n => process.env[n]);
+  for (const n of proxyVars) delete process.env[n];
   let probes = 0;
   connectProbe.coldMs = 0;
   connectProbe.open = (host, port) => { probes++; return probe0.open(host, port); };
@@ -678,7 +681,10 @@ test("a call cut off after its request left reports its outcome unknown and is s
     expect(lists).toBe(1);
 
     mode = "503";
+    let probed = probes;
     const gateway = await failed("gateway");
+    // It passed a real probe first, and is still unknown.
+    expect(probes).toBe(probed + 1);
     expect(gateway).toBeInstanceOf(OutcomeUnknown);
     expect(gateway).toBeInstanceOf(ServerUnreachable);
     expect(failureText(gateway, "call the tool again")).toBe(unknownText);
@@ -688,7 +694,9 @@ test("a call cut off after its request left reports its outcome unknown and is s
     expect(lists).toBe(2);
 
     mode = "reset";
+    probed = probes;
     const reset = await failed("landed");
+    expect(probes).toBe(probed + 1);
     expect(reset).toBeInstanceOf(OutcomeUnknown);
     expect(failureText(reset, "call the tool again")).toBe(unknownText);
     mode = "pass";
@@ -712,6 +720,7 @@ test("a call cut off after its request left reports its outcome unknown and is s
     connectProbe.open = () => { probes++; return new Socket(); };
     mode = "blackhole";
     const blackholed = await failed("unsent");
+    expect(blackholed).toBeInstanceOf(ConnectProbeFailed);
     expect(blackholed).toBeInstanceOf(ServerUnreachable);
     expect(blackholed).not.toBeInstanceOf(OutcomeUnknown);
     expect(failureText(blackholed, "call the tool again")).toBe("Server unreachable; call the tool again");
@@ -720,10 +729,10 @@ test("a call cut off after its request left reports its outcome unknown and is s
     connectProbe.open = (host, port) => { probes++; return probe0.open(host, port); };
     mode = "pass";
     expect(await bodies()).toEqual(["landed"]);
+    // A failed probe says nothing of the pooled socket, so the shared connection was kept: no new one was listed.
+    expect(lists).toBe(4);
     // One request per call: nothing resent any of them, and the blackholed one never left.
     expect(posts).toEqual(["503", "reset", "refused"]);
-    // The 503 and the reset each passed a real probe first and were still unknown.
-    expect(before).toBeGreaterThanOrEqual(3);
 
     // A credential's own outage ran nothing, so it stays unreachable: a refresh on the request's token() (after
     // signedOut()'s), and one after the server refused a stale token with 401. Both on an open connection.
@@ -773,6 +782,7 @@ test("a call cut off after its request left reports its outcome unknown and is s
     globalThis.fetch = fetch0;
     NativeWire.prototype.listTools = list;
     Object.assign(connectProbe, probe0);
+    proxyVars.forEach((n, i) => { if (proxyEnv[i] === undefined) delete process.env[n]; else process.env[n] = proxyEnv[i]; });
     resetter.close();
   }
 });

@@ -31639,6 +31639,9 @@ class OutcomeUnknown extends ServerUnreachable {
   }
 }
 
+class ConnectProbeFailed extends ServerUnreachable {
+}
+
 class SubscriptionClosed extends Error {
   constructor() {
     super("Subscription closed");
@@ -31751,7 +31754,7 @@ class Connection {
   connect;
   refusal;
   busy;
-  answeredAt = 0;
+  answeredAt = -Infinity;
   probes = false;
   constructor(wireOptions, authProvider, signal, beforeRetry) {
     this.wireOptions = wireOptions;
@@ -31771,11 +31774,11 @@ class Connection {
         const signal = AbortSignal.any([request.signal, this.signal]);
         const method = await methodOf(request);
         const connecting = method !== undefined && connectMethods.has(method);
-        if (this.probes && method === "tools/call" && Date.now() - this.answeredAt >= connectProbe.coldMs && !proxied(endpoint)) {
+        if (this.probes && method === "tools/call" && performance.now() - this.answeredAt >= connectProbe.coldMs && !proxied(endpoint)) {
           try {
             await probe(endpoint, signal);
           } catch (error) {
-            throw signal.aborted ? error : new ServerUnreachable(error);
+            throw signal.aborted ? error : new ConnectProbeFailed(error);
           }
         }
         for (let attempt = 0;; attempt++) {
@@ -31795,7 +31798,7 @@ class Connection {
           }
           signal.throwIfAborted();
           const response = await fetch(request.clone(), { headers: outgoing, redirect: "error", signal });
-          this.answeredAt = Date.now();
+          this.answeredAt = performance.now();
           if (connecting && !response.ok && ![401, 403, 429].includes(response.status) && !gatewayStatuses.has(response.status)) {
             this.refusal = new ConnectRefused(response.status, (await response.clone().text().catch(() => "")).slice(0, 4096));
           }
@@ -36193,7 +36196,7 @@ function broken(error) {
   if (!(error instanceof ServerUnreachable))
     return false;
   for (let e = error, depth = 0;e && depth < 8; e = e instanceof Error ? e.cause : undefined, depth++) {
-    if (e instanceof SdkError && e.code === SdkErrorCode.RequestTimeout)
+    if (e instanceof ConnectProbeFailed || e instanceof SdkError && e.code === SdkErrorCode.RequestTimeout)
       return false;
   }
   return true;
