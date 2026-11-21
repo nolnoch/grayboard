@@ -759,7 +759,9 @@ test("opencode real: child restarts restore held names, tool calls and delivery,
     expect(failed.state.status).toBe("error");
     expect(failed.state.error).toContain("after 3 restarts; restart opencode to reconnect");
     expect(grayboardChildPids(oc.pid)).toEqual([]);
-    expect(oc.notices().some(n => n.includes("after 3 restarts; restart opencode to reconnect"))).toBe(true);
+    // The notice reaches the TUI on its own path, not the tool error's, so it can land after the call returns (#1561).
+    const exhausted = oc;
+    await until(() => exhausted.notices().some(n => n.includes("after 3 restarts; restart opencode to reconnect")), 5_000, "the restart exhaustion notice");
     const fresh = await oc.create();
     const reset = opencodeTool(await oc.prompt(fresh, "who"), "whoami");
     expect(reset.state.status).toBe("completed");
