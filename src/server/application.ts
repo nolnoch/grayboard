@@ -244,7 +244,8 @@ type Hub = {
   delegateOpenCap: number;
   aliasScopeCap: number;
   now: () => number;
-  // `on`: when its effect runs (`trackedCommit(hub, handle, what)`: after that handle's commit, or now for `repo.read`).
+  // `on`: when its effect runs: a request's `trackedCommit(hub, handle, what)` (after that handle's commit, or now for
+  // `repo.read`), or a background pass's `backgroundCommit(what)` (now).
   boardChanged: (on: Commit, board: string) => void;
   // ApplicationOptions.runBackground, or a stand-in that runs the work at once, untracked.
   background: Background;
@@ -625,7 +626,12 @@ function sessionActor(session: ApplicationSession, address?: string): Actor {
 
 export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
   const now = opts.now ?? Date.now;
-  const background: Background = opts.runBackground ?? ((_what, run) => { void run(() => false); });
+  // The stand-in logs a failure as app.ts's tracked one does, so a sweep handed to it never rejects unhandled.
+  const background: Background = opts.runBackground ?? ((what, run) => {
+    let running: Promise<unknown>;
+    try { running = run(() => false); } catch (e) { running = Promise.reject(e); }
+    void running.catch(e => console.error(`[grayboard] ${what} failed:`, e));
+  });
   // A Commit outside any body that runs its effect now, as background work `what` (#1493).
   const backgroundCommit = (what: string): Commit => effect => runEffect(background, what, effect);
   // A bind spends the hello bucket inside its caller's transaction (hosted's `owning`, #467): while it does, this
