@@ -1,7 +1,7 @@
 import pkg from "../../package.json" with { type: "json" };
 import { randomBytes } from "node:crypto";
 import { mcpResource, SERVICE_CLIENT_PREFIX } from "./oauth-config.ts";
-import { CREDENTIAL_NO_EXPIRY, CREDENTIAL_SOURCES, DEFAULT_SERVICE_TOKEN_LIMITS, GRANT_LIST_MAX, OAUTH_TTL, SERVICE_TOKEN_MIN_SECONDS, type CredentialSource } from "./oauth-types.ts";
+import { CREDENTIAL_NO_EXPIRY, CREDENTIAL_SOURCES, DEFAULT_SERVICE_TOKEN_LIMITS, GRANT_LIST_MAX, OAUTH_TTL, newGrantId, SERVICE_TOKEN_MIN_SECONDS, type CredentialSource } from "./oauth-types.ts";
 import { AuthorityLost, DEV_SESSION_LABEL, LastOwner, PrincipalTaken, TEAM_POLICIES, type Repo, type RoleFilter, type Team, type TeamPolicy, type User } from "./db.ts";
 import { DEFAULT_CLI_TOKEN_IDLE_DAYS, DEFAULT_IDP_REAUTH_DAYS, type Config } from "./config.ts";
 import {
@@ -976,7 +976,7 @@ async function adminServiceCredentialAdd(req: Request, authed: AuthedUser, repo:
     }
     const clientId = SERVICE_CLIENT_PREFIX + randomBytes(16).toString("hex");
     const at = (expiresAt as number | undefined) ?? CREDENTIAL_NO_EXPIRY;
-    const r = await repo.oauth.addServiceCredential(tx, { userId: svc.id, clientId, grantId: randomBytes(32).toString("base64url"), resource: mcpResource(config.publicUrl, config.devAuth),
+    const r = await repo.oauth.addServiceCredential(tx, { userId: svc.id, clientId, grantId: newGrantId(), resource: mcpResource(config.publicUrl, config.devAuth),
       source, tokenSeconds: tokenSeconds as number, expiresAt: at, secretHash: hashToken(secret) }, now);
     if (r.status !== "ok") return conflict(`service ${svc.email} can't take a credential now`);
     writeAudit(repo, tx, "service.credential_added", authed.user_email, svc.email, { client_id: clientId, secret_id: r.value.secretId, source, token_seconds: tokenSeconds,

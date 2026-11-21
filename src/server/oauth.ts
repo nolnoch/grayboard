@@ -6,7 +6,7 @@ import { createIdpRecheck, type IdpRecheck } from "./idp_recheck.ts";
 import type { AuthPeek, Repo, User } from "./db.ts";
 import type { Read, Tx } from "./store/tx.ts";
 import { BUILTIN_CLIENT_IDS, BUILTIN_CLIENTS, CLI_CLIENT, CLI_CLIENT_ID, isServiceClientId, LOGIN_SCOPE, matchesRedirect, mcpResource, oauthPublicUrl, OAUTH_SCOPES, OPENCODE_CLIENT, parseOAuthClients, sourceKeyFor, type OAuthClient } from "./oauth-config.ts";
-import { DEFAULT_SERVICE_TOKEN_LIMITS, OAUTH_TTL, type CredentialSource, type OAuthRequest, type OAuthAccess } from "./oauth-types.ts";
+import { DEFAULT_SERVICE_TOKEN_LIMITS, OAUTH_TTL, newGrantId, type CredentialSource, type OAuthRequest, type OAuthAccess } from "./oauth-types.ts";
 import { isValidEmail } from "../shared/addressing.ts";
 import { testPauseAsync } from "../shared/testpause.ts";
 import { CimdUnavailable, createCimdResolver, type CimdOptions } from "./oauth-cimd.ts";
@@ -654,7 +654,7 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
             if (optional(p, "scope") !== null && JSON.stringify(scopes(optional(p, "scope"))) !== JSON.stringify(selected)) fail("invalid_scope");
             const authorization = { clientId: client.clientId, resource, scopes: selected, redirectUri, codeChallenge: challenge(verifier), codeHash };
             if (selected.includes(LOGIN_SCOPE)) return { t, login: await repo.oauth.redeemLoginCode(tx, { ...authorization, tokenHash: hashToken(sessionToken), label: userAgent(req) }, t) };
-            return { t, grant: await repo.oauth.redeemCode(tx, { ...authorization, grantId: random(), grantExpiresAt: t + OAUTH_TTL.grant, tokens: pair(selected, t) }, t) };
+            return { t, grant: await repo.oauth.redeemCode(tx, { ...authorization, grantId: newGrantId(), grantExpiresAt: t + OAUTH_TTL.grant, tokens: pair(selected, t) }, t) };
           }));
           if (redeemed.login) {
             if (redeemed.login.status !== "ok") { if (redeemed.login.status === "replay") hostedFailure("oauth.replay", undefined, "warning"); fail("invalid_grant"); }

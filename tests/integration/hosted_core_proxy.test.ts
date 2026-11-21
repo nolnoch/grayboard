@@ -7,14 +7,14 @@
 // own OAuth issuance would.
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
-import { createServer, type AddressInfo, type Server } from "node:net";
+import { createServer, Socket, type AddressInfo, type Server } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Client, SdkError, SdkErrorCode, type AuthProvider, type CallToolResult } from "@modelcontextprotocol/client";
 import { AccessExpired } from "../../adapters/hosted-core/src/model.ts";
 import type { CallOutcome } from "../../adapters/hosted-core/src/controller.ts";
 import { CallAborted, hostTools, unlessAborted, loadMode, snapshotTools, ToolProxy, type CallHooks, type NativeTool, type ProxyOptions } from "../../adapters/hosted-core/src/proxy.ts";
-import { NativeWire, OutcomeUnknown, ServerBusy, ServerUnreachable } from "../../adapters/hosted-core/src/wire.ts";
+import { ConnectProbeFailed, connectProbe, NativeWire, OutcomeUnknown, ServerBusy, ServerUnreachable } from "../../adapters/hosted-core/src/wire.ts";
 import { failureText } from "../../adapters/hosted-core/src/client.ts";
 import { hashToken } from "../../src/server/auth.ts";
 import { hostedSessionId } from "../../src/server/hosted.ts";
@@ -631,8 +631,9 @@ test("a 401 the credential's refresh doesn't fix needs a new login: tool calls, 
 // never opened (refused, at the call or at the shared connect) ran nothing and stays "Server unreachable". The broken
 // connection is still dropped, and nothing sends the call again. A credential's own outage (a refresh on the
 // request's token() or in onUnauthorized) also ran nothing and stays unreachable; a call in flight when its proxy
-// closes is a stop, not an outage.
-test("a call cut off after its request left reports its outcome unknown and is sent once; a socket that never opened, a credential outage and a proxy close are not (#1345)", async () => {
+// closes is a stop, not an outage. Every call here runs the connect probe (#1347): one that passes changes nothing (the
+// 503 and the reset are still unknown), one that can't connect by its deadline fails the call unsent.
+test("a call cut off after its request left reports its outcome unknown and is sent once; a socket that never opened, a credential outage and a proxy close are not (#1345, #1347)", async () => {
   const listening = (server: Server) => new Promise<number>(resolve => server.listen(0, "127.0.0.1", () => resolve((server.address() as AddressInfo).port)));
   // A peer that resets every connection once the request arrives: Bun's own ECONNRESET.
   const resetter = createServer(socket => { socket.once("data", () => socket.destroy()); });
@@ -644,7 +645,14 @@ test("a call cut off after its request left reports its outcome unknown and is s
   const { token } = await issue();
   const p = proxy({ token: async () => token });
   const list = NativeWire.prototype.listTools, fetch0 = globalThis.fetch;
-  let lists = 0, mode: "pass" | "503" | "reset" | "refused" | "hold" = "pass";
+  const probe0 = { ...connectProbe };
+  // The probe is skipped behind a proxy: none here, whatever this machine sets.
+  const proxyVars = ["HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"], proxyEnv = proxyVars.map(n => process.env[n]);
+  for (const n of proxyVars) delete process.env[n];
+  let probes = 0;
+  connectProbe.coldMs = 0;
+  connectProbe.open = (host, port) => { probes++; return probe0.open(host, port); };
+  let lists = 0, mode: "pass" | "503" | "reset" | "refused" | "hold" | "blackhole" = "pass";
   const { promise: holding, resolve: held } = Promise.withResolvers<void>();
   const { promise: released, resolve: release } = Promise.withResolvers<void>();
   const posts: string[] = [];
@@ -673,7 +681,10 @@ test("a call cut off after its request left reports its outcome unknown and is s
     expect(lists).toBe(1);
 
     mode = "503";
+    let probed = probes;
     const gateway = await failed("gateway");
+    // It passed a real probe first, and is still unknown.
+    expect(probes).toBe(probed + 1);
     expect(gateway).toBeInstanceOf(OutcomeUnknown);
     expect(gateway).toBeInstanceOf(ServerUnreachable);
     expect(failureText(gateway, "call the tool again")).toBe(unknownText);
@@ -683,7 +694,9 @@ test("a call cut off after its request left reports its outcome unknown and is s
     expect(lists).toBe(2);
 
     mode = "reset";
+    probed = probes;
     const reset = await failed("landed");
+    expect(probes).toBe(probed + 1);
     expect(reset).toBeInstanceOf(OutcomeUnknown);
     expect(failureText(reset, "call the tool again")).toBe(unknownText);
     mode = "pass";
@@ -700,7 +713,32 @@ test("a call cut off after its request left reports its outcome unknown and is s
     mode = "pass";
     expect(await bodies()).toEqual(["landed"]);
     expect(lists).toBe(4);
-    // One request per call: nothing resent any of them.
+    // A blackholed endpoint (#1347): the probe's connect never completes, so the call fails at its deadline, well
+    // inside the request timeout, as plain unreachable, and its request never reaches fetch.
+    const before = probes;
+    connectProbe.deadlineMs = 100;
+    connectProbe.open = () => { probes++; return new Socket(); };
+    mode = "blackhole";
+    const blackholed = await failed("unsent");
+    expect(blackholed).toBeInstanceOf(ConnectProbeFailed);
+    expect(blackholed).toBeInstanceOf(ServerUnreachable);
+    expect(blackholed).not.toBeInstanceOf(OutcomeUnknown);
+    expect(failureText(blackholed, "call the tool again")).toBe("Server unreachable; call the tool again");
+    expect(probes).toBe(before + 1);
+    connectProbe.deadlineMs = probe0.deadlineMs;
+    connectProbe.open = (host, port) => { probes++; return probe0.open(host, port); };
+    mode = "pass";
+    expect(await bodies()).toEqual(["landed"]);
+    // A failed probe says nothing of the pooled socket, so the shared connection was kept: no new one was listed.
+    expect(lists).toBe(4);
+    // A probe whose connect errors (refused here) doesn't decide: the request's own fetch does, and this one answers,
+    // as a test's stubbed fetch or a host's shim would where a direct connect can't reach.
+    probed = probes;
+    connectProbe.open = () => { probes++; return probe0.open("127.0.0.1", 1); };
+    expect(await bodies()).toEqual(["landed"]);
+    expect(probes).toBe(probed + 1);
+    connectProbe.open = (host, port) => { probes++; return probe0.open(host, port); };
+    // One request per call: nothing resent any of them, and the blackholed one never left.
     expect(posts).toEqual(["503", "reset", "refused"]);
 
     // A credential's own outage ran nothing, so it stays unreachable: a refresh on the request's token() (after
@@ -750,6 +788,8 @@ test("a call cut off after its request left reports its outcome unknown and is s
     release();
     globalThis.fetch = fetch0;
     NativeWire.prototype.listTools = list;
+    Object.assign(connectProbe, probe0);
+    proxyVars.forEach((n, i) => { if (proxyEnv[i] === undefined) delete process.env[n]; else process.env[n] = proxyEnv[i]; });
     resetter.close();
   }
 });

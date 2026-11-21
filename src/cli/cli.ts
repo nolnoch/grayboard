@@ -20,6 +20,7 @@ import { canonicalEndpoint } from "../shared/endpoint.ts";
 import { ompAgentDir, ompSetupRefusal, piSetupAgentDir } from "../shared/pi.ts";
 import { Login } from "../../adapters/hosted-core/src/login.ts";
 import { hostedConfigPath, type HostedConfig } from "../../adapters/hosted-core/src/config.ts";
+import { protectGrantIds } from "./argv.ts";
 
 function writeCredentials(creds: Credentials): void {
   const file = credentialsPath();
@@ -1139,6 +1140,9 @@ grantsCmd
   .command("revoke <id>")
   .description("Revoke one sign-in by its id from `grants list`; that harness or CLI must sign in again, the others keep working")
   .option("--user <email>", "Another user's (org admins)")
+  // One id per call: a second operand is refused, not dropped, so `revoke <dash-id> <id>`, whose dash id the argv
+  // rewrite moves behind `--`, can't revoke the other grant (#1583).
+  .allowExcessArguments(false)
   .action(async (id: string, opts: { user?: string }) => {
     try {
       output(await makeClient().post(opts.user ? "/api/admin/grants/revoke" : "/api/grants/revoke", opts.user ? { email: opts.user, id } : { id }), globalJson());
@@ -1323,4 +1327,4 @@ credentialCmd
     } catch (e) { handleApiError(e); }
   });
 
-program.parseAsync(process.argv);
+program.parseAsync(protectGrantIds(process.argv));
