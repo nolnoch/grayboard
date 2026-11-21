@@ -90,7 +90,7 @@ export function options(argv: string[]): Options {
     postShare: n("post-share", 0.05, 0.2), burst: n("burst", 100, 20), churn: n("churn", 0.1, 0.25),
     churnEveryS: n("churn-every", 900, 20), windowS: n("window", 10, 5), graceS: n("grace", 15, 5),
     // Unset, the workers shrink to what a small fleet leaves after its users' sessions (none at the floor).
-    serviceWorkers: v["service-workers"] === undefined ? Math.max(0, Math.min(n("service-workers", 4, 2), n("sessions", 1000, 40) - Math.max(2, n("users", 100, 4)))) : n("service-workers", 4, 2), teams: v.teams === undefined ? Math.min(n("teams", 10, 2), Math.max(1, n("users", 100, 4))) : n("teams", 10, 2), svcShare: n("svc-share", 0.05, 0.2), peerShare: n("peer-share", 0.02, 0.1),
+    serviceWorkers: v["service-workers"] === undefined ? defaultWorkers(n("service-workers", 4, 2), n("sessions", 1000, 40), n("users", 100, 4)) : n("service-workers", 4, 2), teams: v.teams === undefined ? Math.min(n("teams", 10, 2), Math.max(1, n("users", 100, 4))) : n("teams", 10, 2), svcShare: n("svc-share", 0.05, 0.2), peerShare: n("peer-share", 0.02, 0.1),
     server: v.server ? [resolve(v.server)] : [process.execPath, join(ROOT, "src/server/main.ts")],
     out: v.out ? resolve(v.out) : join(ROOT, ".e2e-runs", `loadtest-${new Date().toISOString().replace(/[:.]/g, "-")}`),
     keepDb: v["keep-db"] === true,
@@ -109,6 +109,14 @@ export function options(argv: string[]): Options {
   if (o.serviceWorkers && (!Number.isInteger(o.teams) || o.teams < 1 || o.teams > o.users)) throw new Error("--teams must be a whole number from 1 to --users");
   if (o.postShare + (o.serviceWorkers ? o.svcShare + o.peerShare : 0) > 1) throw new Error("--post-share, --svc-share and --peer-share must sum to at most 1");
   return o;
+}
+
+// Unset, the workers shrink to what a small fleet leaves after its users' sessions; a fleet that leaves none is
+// refused rather than run without the service: only an explicit --service-workers 0 turns it off.
+function defaultWorkers(want: number, sessions: number, users: number): number {
+  const room = sessions - Math.max(2, users);
+  if (room < 1) throw new Error(`${sessions} sessions leave no room for a service worker after ${users} users' sessions: raise --sessions, or pass --service-workers 0 to run without the service`);
+  return Math.min(want, room);
 }
 
 // The sessions that are users' (the rest are the service's workers).
@@ -219,6 +227,36 @@ type Window = {
 };
 
 // Every hosted_sessions row left once the fleet has closed, parked children included.
+// What the server recorded of the service's traffic: the post ids of the invocations it allowed through a team's
+// service_invoke binding (authz.decision rows, src/server/application.ts board_post), every service.invoke row by
+// rule, and the service board's scope. The run's proof that its invocations took the service path, not another one.
+type ServiceAudit = { teamAllowed: Set<number>; rules: Record<string, number>; boardScope: string | null; boardKind: string | null };
+async function serviceAudit(pgDbUrl: string | undefined, dbPath: string): Promise<ServiceAudit> {
+  let details: unknown[], board: { scope: string | null; kind: string | null } | undefined;
+  if (pgDbUrl) {
+    const sql = openPg(pgDbUrl, { max: 1, applicationName: "gb-loadtest-audit" });
+    try {
+      details = (await sql`SELECT detail FROM access_log WHERE action = 'authz.decision'`).map((r: { detail: unknown }) => r.detail);
+      board = (await sql`SELECT scope, kind FROM boards WHERE name = ${SVC_BOARD}`)[0];
+    } finally { await sql.close(); }
+  } else {
+    const ro = new Database(dbPath, { readonly: true });
+    try {
+      details = (ro.query("SELECT detail FROM access_log WHERE action = 'authz.decision'").all() as { detail: string }[]).map(r => r.detail);
+      board = ro.query("SELECT scope, kind FROM boards WHERE name = ?").get(SVC_BOARD) as typeof board ?? undefined;
+    } finally { ro.close(); }
+  }
+  const teamAllowed = new Set<number>(), rules: Record<string, number> = {};
+  for (const raw of details) {
+    const d = (typeof raw === "string" ? JSON.parse(raw) : raw) as Record<string, unknown> | null;
+    if (d?.verb !== "service.invoke") continue;
+    const key = `${d.rule}:${d.allow ? "allow" : "deny"}`;
+    rules[key] = (rules[key] ?? 0) + 1;
+    if (d.allow === true && d.rule === "role.service_invoke" && typeof d.team === "string" && d.board === SVC_BOARD && typeof d.post_id === "number") teamAllowed.add(d.post_id);
+  }
+  return { teamAllowed, rules, boardScope: board?.scope ?? null, boardKind: board?.kind ?? null };
+}
+
 async function hostedRows(pgDbUrl: string | undefined, dbPath: string): Promise<number> {
   if (pgDbUrl) {
     const sql = openPg(pgDbUrl, { max: 1, applicationName: "gb-loadtest-count" });
@@ -229,6 +267,7 @@ async function hostedRows(pgDbUrl: string | undefined, dbPath: string): Promise<
 }
 
 const ADMIN = "load-admin@example.com", SERVICE = "loadsvc", SVC_BOARD = "load-svc";
+const SERVICE_OPS = { svc_invoke: 1, svc_reply: 1, peer_list: 1 };
 
 // The service, as an admin and a launcher set one up (tests/support/service_token.ts): the service (owned by the first
 // user), a credential whose run tokens outlast the run, one run token minted with client credentials, and T teams
@@ -451,6 +490,7 @@ async function main() {
     const after = await scrape();
     const drained = { leases: one(after, "grayboard_delivery_leases"), listens: one(after, "grayboard_mcp_admissions", { kind: "listen" }), posts: one(after, "grayboard_mcp_admissions", { kind: "post" }), holding: one(after, "grayboard_hosted_sessions_holding"), watches: one(after, "grayboard_resource_watches"), exchanges: one(after, "grayboard_mcp_exchanges_in_flight") };
     const rows = await hostedRows(pgDbUrl, dbPath);
+    const audit = o.serviceWorkers ? await serviceAudit(pgDbUrl, dbPath) : undefined;
 
     // Gates.
     const steady = windows.filter(w => w.steady);
@@ -492,6 +532,8 @@ async function main() {
       const h = clientSteady[op];
       if (!h && clean.length && (wanted[op] ?? true)) failures.push(`client ${op}: no samples in the clean steady windows`);
       if (h && h.count >= 100 && fastShare(h) < 0.99) failures.push(`client ${op}: ${(100 * fastShare(h)).toFixed(2)}% of ${h.count} at ≤ 100 ms (clean steady windows)`);
+      // The service's ops are rare (tens a run below the full profile): each is held to the pooled small-pool rule.
+      else if (h && op in SERVICE_OPS && tooSlow(h.count, h.buckets[BUCKETS.indexOf(0.1)]!)) failures.push(`client ${op}: ${(100 * fastShare(h)).toFixed(2)}% of ${h.count} at ≤ 100 ms (clean steady windows); want at most 1% slower, rounded up`);
     }
     // Refusals since the server started, connect and close included: the windows see only the load.
     const refusedAll = Object.fromEntries(Object.entries(refusalsTotal(after)).filter(([, v]) => v > 0));
@@ -519,7 +561,15 @@ async function main() {
       if (!svcSent.size) failures.push("no service invocation was sent");
       if (svcUnread.length) failures.push(`${svcUnread.length} of ${svcSent.size} invocations never reached a service lane (e.g. ${svcUnread.slice(0, 5).join(", ")})`);
       if (svcLost.length) failures.push(`${svcLost.length} of ${svcSent.size} invocations never came back as a reply their invoker read (e.g. ${svcLost.slice(0, 5).join(", ")})`);
+      // Proof the invocations took the service path: each allowed by a team's service_invoke binding, on a board in
+      // the service's scope, and no lane read a reply (a lane rotation would hand a lane its siblings' replies).
+      const svcPosts = drivers.flatMap(d => d.final!.svcPosts), unproven = svcPosts.filter(id => !audit!.teamAllowed.has(id));
+      if (svcPosts.length !== svcSent.size) failures.push(`${svcSent.size} invocations returned, ${svcPosts.length} with a post id`);
+      if (unproven.length) failures.push(`${unproven.length} of ${svcPosts.length} invocations have no authz.decision row allowing service.invoke through a team's binding (e.g. posts ${unproven.slice(0, 5).join(", ")}; service.invoke rows by rule ${JSON.stringify(audit!.rules)})`);
+      if (audit!.boardScope !== `service:${SERVICE}` || audit!.boardKind !== "queue") failures.push(`${SVC_BOARD} is scope ${audit!.boardScope}, kind ${audit!.boardKind}; want service:${SERVICE}, queue`);
     }
+    const laneEchoes = drivers.reduce((a, d) => a + d.final!.laneEcho, 0);
+    if (laneEchoes) failures.push(`${laneEchoes} replies reached a service lane; want 0 (a reply goes to its invoker)`);
     // RSS and heap over the steady period.
     const rssSlope = slope(steady.map(w => [w.t, w.rss])), heapSlope = slope(steady.map(w => [w.t, w.heap]));
     const meanRss = steady.reduce((a, w) => a + w.rss, 0) / Math.max(1, steady.length);
@@ -534,7 +584,7 @@ async function main() {
       toolSteady: Object.fromEntries(Object.entries(toolSteady).map(([t, x]) => [t, { count: x.count, fastShare: x.fast / x.count }])),
       clientSteady: Object.fromEntries(Object.entries(clientSteady).map(([op, h]) => [op, { count: h.count, fastShare: fastShare(h), p99Le: p99Edge(h), mean: h.sum / Math.max(1, h.count), errors: h.errors }])),
       dms: { sent: sent.size, received: recv.size, lost: lost.length }, misdelivered, posts, boardDeliveries: boardRecv,
-      service: o.serviceWorkers ? { name: SERVICE, board: SVC_BOARD, workers: o.serviceWorkers, teams: o.teams, invocations: svcSent.size, reachedLane: svcGot.size, replied: svcDone.size, lost: svcLost.length, laneEchoes: drivers.reduce((a, d) => a + d.final!.laneEcho, 0) } : null,
+      service: o.serviceWorkers ? { name: SERVICE, board: SVC_BOARD, workers: o.serviceWorkers, teams: o.teams, invocations: svcSent.size, reachedLane: svcGot.size, replied: svcDone.size, lost: svcLost.length, laneEchoes, teamAllowed: audit!.teamAllowed.size, rules: audit!.rules, boardScope: audit!.boardScope } : null,
       rss: { meanMB: meanRss / 2 ** 20, growthMB: rssGrowth / 2 ** 20, gated: o.rssGate }, heapGrowthMB: heapSlope * steadyS / 2 ** 20,
       lag: { windows: lagP99.length, p99Max: Math.max(0, ...lagP99), p99Median: lagP99.sort((a, b) => a - b)[Math.floor(lagP99.length / 2)] ?? null },
       drained, hostedRowsAfter: rows, refusals: refusedAll, clientErrors: erroredAll, failures,

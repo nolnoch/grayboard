@@ -42,10 +42,11 @@ export type DriverWindow = {
 // misdelivered: a DM read by a session it wasn't sent to, a post by one off its board, an invocation by a session
 // that isn't a lane of the service's board, or a reply by a user who didn't invoke. Invocation ids ("invoker:seq"):
 // svcSent, those whose post returned; svcGot, those a lane read; svcDone, those whose reply its invoker read.
+// svcPosts: the invocations' post ids, which the coordinator matches to the server's authz.decision rows.
 // laneEcho: replies a lane read (it subscribes the board it answers on).
 export type DriverFinal = {
   type: "final"; driver: number; sentDm: string[]; recvDm: string[]; posts: number; boardRecv: number; misdelivered: number; misdeliveredFirst: string[];
-  svcSent: string[]; svcGot: string[]; svcDone: string[]; laneEcho: number; errors: Record<string, number>;
+  svcSent: string[]; svcGot: string[]; svcDone: string[]; svcPosts: number[]; laneEcho: number; errors: Record<string, number>;
 };
 
 const RENEW_MS = 10_000;
@@ -110,6 +111,7 @@ type Live = {
 const sentDm = new Set<string>();
 const recvDm = new Set<string>();
 const svcSent = new Set<string>(), svcGot = new Set<string>(), svcDone = new Set<string>();
+const svcPosts: number[] = [];
 let posts = 0, boardRecv = 0, misdelivered = 0, laneEcho = 0;
 const misdeliveredFirst: string[] = [];
 let sending = true;
@@ -277,8 +279,9 @@ async function main() {
       } else if (svcBoard && r < config.postShare + config.svcShare) {
         const id = `${l.spec.index}:${seq}`, board = svcBoard;
         void timed("svc_invoke", async () => {
-          const res = await l.s.call("board_post", { board, body: `lt|svc|${l.spec.index}|${seq}|${board}|${Date.now()}` });
+          const res = await l.s.call<{ post_id: number }>("board_post", { board, body: `lt|svc|${l.spec.index}|${seq}|${board}|${Date.now()}` });
           svcSent.add(id);
+          svcPosts.push(res.post_id);
           return res;
         });
       } else if (svcBoard && r < config.postShare + config.svcShare + config.peerShare) {
@@ -329,7 +332,7 @@ async function main() {
       live.clear();
       const f: DriverFinal = {
         type: "final", driver: config.driver, sentDm: [...sentDm], recvDm: [...recvDm], posts, boardRecv, misdelivered, misdeliveredFirst,
-        svcSent: [...svcSent], svcGot: [...svcGot], svcDone: [...svcDone], laneEcho, errors: totalErrors,
+        svcSent: [...svcSent], svcGot: [...svcGot], svcDone: [...svcDone], svcPosts, laneEcho, errors: totalErrors,
       };
       // The final line holds every DM id: tens of KB a pipe takes in several writes. process.exit
       // drops a write still queued, so exit only once this one has reached the pipe.

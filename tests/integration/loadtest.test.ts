@@ -33,7 +33,7 @@ describe("loadtest sizing", () => {
       GRAYBOARD_HOSTED_SESSIONS: DEFAULT_HOSTED_CAPS.sessions, GRAYBOARD_DELIVERY_LEASES: DEFAULT_HOSTED_CAPS.leases,
       GRAYBOARD_MCP_LISTEN: DEFAULT_MCP_LIMITS.listen, GRAYBOARD_MCP_POST: DEFAULT_MCP_LIMITS.post,
     };
-    for (const argv of [[], ["--quick"], ["--users", "1", "--sessions", "400"], ["--sessions", "2", "--users", "2", "--drivers", "1"]]) {
+    for (const argv of [[], ["--quick"], ["--users", "1", "--sessions", "400"], ["--sessions", "2", "--users", "2", "--drivers", "1", "--service-workers", "0"]]) {
       const env = capsEnv(options(argv));
       for (const [prefix, d] of Object.entries(floors)) {
         const global = Number(env[`${prefix}_GLOBAL`]), perUser = Number(env[`${prefix}_PER_USER`]);
@@ -74,7 +74,9 @@ describe("loadtest sizing", () => {
     expect(() => options(["--users", "2", "--teams", "3"])).toThrow(/--teams/);
     expect(() => options(["--post-share", "0.5", "--svc-share", "0.4", "--peer-share", "0.2"])).toThrow(/sum to at most 1/);
     expect(options(["--sessions", "4", "--users", "3", "--drivers", "1"]).serviceWorkers).toBe(1);
-    expect(options(["--sessions", "2", "--users", "2", "--drivers", "1"]).serviceWorkers).toBe(0);
+    // A fleet that leaves no room for a worker is refused unless the service is turned off explicitly.
+    expect(() => options(["--sessions", "2", "--users", "2", "--drivers", "1"])).toThrow(/no room for a service worker.*--service-workers 0/);
+    expect(options(["--sessions", "2", "--users", "2", "--drivers", "1", "--service-workers", "0"]).serviceWorkers).toBe(0);
     expect(options(["--service-workers", "0", "--post-share", "0.9", "--svc-share", "0.5"]).serviceWorkers).toBe(0);
   });
 
@@ -126,6 +128,8 @@ describe("loadtest run", () => {
     const svc = r.summary.service;
     expect(svc.invocations, r.out).toBeGreaterThan(0);
     expect({ reachedLane: svc.reachedLane, replied: svc.replied, lost: svc.lost }).toEqual({ reachedLane: svc.invocations, replied: svc.invocations, lost: 0 });
+    // The server's record: each invocation allowed through a team's binding, on the service's queue board.
+    expect({ teamAllowed: svc.teamAllowed, boardScope: svc.boardScope, laneEchoes: svc.laneEchoes }).toEqual({ teamAllowed: svc.invocations, boardScope: "service:loadsvc", laneEchoes: 0 });
     for (const op of ["svc_invoke", "svc_reply", "svc_rtt", "peer_list"]) expect({ op, count: r.summary.clientSteady[op]?.count > 0 }).toEqual({ op, count: true });
     expect(r.summary.toolSteady.peer_list?.count).toBeGreaterThan(0);
   }, 90_000);
