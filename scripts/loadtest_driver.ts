@@ -36,6 +36,8 @@ export type DriverConfig = {
   peerShare: number;
   // The share of a user's ops that read the service's board (board_list, board_read, snapshot, catalog in turn).
   readShare: number;
+  // The share of invocations that also @mention another user's session (R5's mention resolution on the service board).
+  mentionShare: number;
   burst: number;
 };
 // Client-side latency buckets, seconds: the server's (src/server/metrics.ts LATENCY_BUCKETS).
@@ -50,12 +52,14 @@ export type DriverWindow = {
 // svcSent, those whose post returned; svcGot, those a lane read; svcDone, those whose reply its invoker read.
 // svcPosts: the invocations' post ids, which the coordinator matches to the server's authz.decision rows.
 // laneEcho: replies a lane read (it subscribes the board it answers on).
+// mentSent: invocations that @mentioned another user's session ("invoker:seq"); mentGot, those the named session read.
 // svcReads: per read op, the calls that returned (ok), those whose result named the service's board (named), and those
 // that also carried its posts (content: a board_read's thread holds the invocation and its reply; a snapshot, any post).
 export type ReadProof = { ok: number; named: number; content: number };
 export type DriverFinal = {
   type: "final"; driver: number; sentDm: string[]; recvDm: string[]; posts: number; boardRecv: number; misdelivered: number; misdeliveredFirst: string[];
   svcSent: string[]; svcGot: string[]; svcDone: string[]; svcPosts: number[]; laneEcho: number; svcReads: Record<string, ReadProof>; errors: Record<string, number>;
+  mentSent: string[]; mentGot: string[];
 };
 // The service board's reads, in the order a session takes them.
 export const SVC_READS = ["board_list", "board_read", "snapshot", "catalog"] as const;
@@ -64,8 +68,10 @@ export const PROOF_OPS = [...SVC_READS, "catalog_connect"] as const;
 
 const RENEW_MS = 10_000;
 // Body marker: lt|<kind>|<sender index>|<seq>|<to: the target index, or the board>|<sent at ms>. An invocation (svc)
-// goes to the service's board; its reply (done) carries the invocation's sender, seq and sent-at, to the invoker.
-const MARK = /lt\|(dm|post|svc|done)\|(\d+)\|(\d+)\|([\w-]+)\|(\d+)/g;
+// goes to the service's board; its reply (done) carries the invocation's sender, seq and sent-at, to the invoker. An
+// invocation that @mentions another user's session also carries lt|ment|<sender>|<seq>|<that session's index>|<sent at>:
+// the lane takes it as work, and the named session is told (boards.md §3 Service boards), not misdelivered to.
+const MARK = /lt\|(dm|post|svc|done|ment)\|(\d+)\|(\d+)\|([\w-]+)\|(\d+)/g;
 
 const newHist = (): Hist => ({ buckets: BUCKETS.map(() => 0), count: 0, sum: 0, errors: 0 });
 let ops: Record<string, Hist> = {};
@@ -132,6 +138,7 @@ const sentDm = new Set<string>();
 const recvDm = new Set<string>();
 const svcSent = new Set<string>(), svcGot = new Set<string>(), svcDone = new Set<string>();
 const svcPosts: number[] = [];
+const mentSent = new Set<string>(), mentGot = new Set<string>();
 let posts = 0, boardRecv = 0, misdelivered = 0, laneEcho = 0;
 const svcReads: Record<string, ReadProof> = Object.fromEntries(PROOF_OPS.map(op => [op, { ok: 0, named: 0, content: 0 }]));
 const misdeliveredFirst: string[] = [];
@@ -161,15 +168,23 @@ async function drain(l: Live) {
   for (const item of items) {
     const text = JSON.stringify(item.event);
     let answered: number | undefined;
+    // A user's session named in an invocation is told it: the invocation's own marker isn't misdelivered to it.
+    const mentionedMe = !l.spec.service && [...text.matchAll(MARK)].some(m => m[1] === "ment" && m[4] === String(l.spec.index));
     for (const m of text.matchAll(MARK)) {
       if (m[1] === "done" && l.spec.service) { laneEcho++; continue; }
-      const meant = m[1] === "dm" || m[1] === "done" ? m[4] === String(l.spec.index) : m[1] === "svc" ? l.spec.service === true && m[4] === l.spec.board : m[4] === l.spec.board;
+      // The lane reads the mention as part of the work post it takes.
+      if (m[1] === "ment" && l.spec.service) continue;
+      if (m[1] === "svc" && mentionedMe) continue;
+      const meant = m[1] === "dm" || m[1] === "done" || m[1] === "ment" ? m[4] === String(l.spec.index) : m[1] === "svc" ? l.spec.service === true && m[4] === l.spec.board : m[4] === l.spec.board;
       if (!meant) {
         misdelivered++;
         if (misdeliveredFirst.length < 5) misdeliveredFirst.push(`${m[0]} read by session ${l.spec.index} (${l.spec.board})`);
         continue;
       }
-      if (m[1] === "dm") {
+      if (m[1] === "ment") {
+        mentGot.add(`${m[2]}:${m[3]}`);
+        observe("mention_e2e", (Date.now() - Number(m[5])) / 1000, false);
+      } else if (m[1] === "dm") {
         recvDm.add(`${m[2]}:${m[3]}`);
         observe("dm_e2e", (Date.now() - Number(m[5])) / 1000, false);
       } else if (m[1] === "svc") {
@@ -372,9 +387,17 @@ async function main() {
         void timed("board_post", () => l.s.call("board_post", { board: l.spec.board, body: `lt|post|${l.spec.index}|${seq}|${l.spec.board}|${Date.now()}` }));
       } else if (svcBoard && r < config.postShare + config.svcShare) {
         const id = `${l.spec.index}:${seq}`, board = svcBoard;
+        // Sometimes the invocation names another user's session, which mention resolution judges on the service board.
+        let mention = "";
+        if (config.addresses.length > 1 && Math.random() < config.mentionShare) {
+          let to = Math.floor(Math.random() * (config.addresses.length - 1));
+          if (to >= l.spec.index) to++;
+          mention = ` @${config.addresses[to]!} lt|ment|${l.spec.index}|${seq}|${to}|${Date.now()}`;
+        }
         void timed("svc_invoke", async () => {
-          const res = await l.s.call<{ post_id: number }>("board_post", { board, body: `lt|svc|${l.spec.index}|${seq}|${board}|${Date.now()}` });
+          const res = await l.s.call<{ post_id: number }>("board_post", { board, body: `lt|svc|${l.spec.index}|${seq}|${board}|${Date.now()}${mention}` });
           svcSent.add(id);
+          if (mention) mentSent.add(id);
           svcPosts.push(res.post_id);
           l.invoked.set(seq, res.post_id);
           return res;
@@ -431,6 +454,7 @@ async function main() {
       const f: DriverFinal = {
         type: "final", driver: config.driver, sentDm: [...sentDm], recvDm: [...recvDm], posts, boardRecv, misdelivered, misdeliveredFirst,
         svcSent: [...svcSent], svcGot: [...svcGot], svcDone: [...svcDone], svcPosts, laneEcho, svcReads, errors: totalErrors,
+        mentSent: [...mentSent], mentGot: [...mentGot],
       };
       // The final line holds every DM id: tens of KB a pipe takes in several writes. process.exit
       // drops a write still queued, so exit only once this one has reached the pipe.
