@@ -100,7 +100,7 @@ function hostPort(ctx: Context, options: Options, binding: Binding, facts: Map<s
 // host event names stay here; everything else is hosted-core's.
 // Static mode's auto-enroll retry (#1250): 250 ms doubling to 8 s, 8 retries (about 30 s of waits in all).
 const ENROLL_RETRY_FIRST_MS = 250, ENROLL_RETRY_MAX_MS = 8_000, ENROLL_RETRIES = 8;
-const TRANSIENT_CODES = new Set(["server_unreachable", "rate_limited", "internal_error"]);
+const TRANSIENT_CODES = new Set(["server_unreachable", "server_busy", "rate_limited", "internal_error"]);
 // An outage, not an answer: worth another attempt. whoami's own 10 s timeout aborts its wire, which the wire then
 // leaves unclassified, so a TimeoutError anywhere in the cause chain counts too; so does an HTTP 429 that outlasted
 // the wire's own admission retries. `rate_limited` and `internal_error` arrive as whoami's isError codes (whoami).
@@ -250,7 +250,8 @@ export class OpenCodeController extends Controller<OpenCodeEnrollment> {
     const closed = () => this.roots.has(sessionID) ? undefined : this.record({ state: "unenrolled", sessionID, message: "Shut down while auto-enroll was retrying; the root is not enrolled", operation: "enroll", code: "server_unreachable" });
     const retry = (async () => {
       for (let attempt = 0; attempt < ENROLL_RETRIES && error !== undefined && transientEnroll(error); attempt++) {
-        this.record({ state: "retrying", sessionID, message: `Server unreachable; retrying auto-enroll (${attempt + 1}/${ENROLL_RETRIES})`, operation: "enroll", code: "server_unreachable" });
+        const busy = failureCode(error) === "server_busy";
+        this.record({ state: "retrying", sessionID, message: `${busy ? "Server at capacity" : "Server unreachable"}; retrying auto-enroll (${attempt + 1}/${ENROLL_RETRIES})`, operation: "enroll", code: busy ? "server_busy" : "server_unreachable" });
         await abortableSleep(Math.min(ENROLL_RETRY_MAX_MS, this.enrollRetryFirstMs * 2 ** attempt), this.enrollStop.signal);
         if (this.stopped) return closed();
         if (this.enrollment(sessionID)) return;

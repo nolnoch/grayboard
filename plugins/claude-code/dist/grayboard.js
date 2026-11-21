@@ -35136,10 +35136,12 @@ var fields = ["state", "message", "sessionID", "time", "held", "ownership", "ope
 var states = new Set(["approved", "active", "paused", "unbound", "unenrolled", "retrying", "rebinding", "degraded"]);
 var OPERATIONS = ["diagnostic_save", "diagnostic_emit", "pause", "configured_bind", "delivery", "enroll", "prepare", "subscriber", "reopen", "restore", "event", "stream", "before_bind", "after", "hook_dispose", "rpc_dispose", "latch_save", "wire_close", "subscription_close", "delivery_release", "release_upload", "session_end", "pause_save", "child_end", "watch_dispose", "login", "logout", "refresh", "child_register", "receipt_hook", "instructions", "login_link", "recover"];
 var operations = new Set(OPERATIONS);
-var codes = new Set(["retry_exhausted", "operation_failed", "identity_unknown", "alias_held", "not_found", "unbound", "refused", "internal_error", "bad_request", "unauthenticated", "forbidden", "rate_limited", "receipt_capacity", "child_bound", "child_registered_elsewhere", "has_children", "root_is_child", "invalid_registration", "invalid_response", "server_unreachable", "subscription_closed", "native_access_expired", "login_required", "refresh_outcome_unknown", "server_outdated", "delivery_held_elsewhere", "refresh_in_progress", "revoke_queued"]);
+var codes = new Set(["retry_exhausted", "operation_failed", "identity_unknown", "alias_held", "not_found", "unbound", "refused", "internal_error", "bad_request", "unauthenticated", "forbidden", "rate_limited", "receipt_capacity", "child_bound", "child_registered_elsewhere", "has_children", "root_is_child", "invalid_registration", "invalid_response", "server_unreachable", "server_busy", "subscription_closed", "native_access_expired", "login_required", "refresh_outcome_unknown", "server_outdated", "delivery_held_elsewhere", "refresh_in_progress", "revoke_queued"]);
 function failureCode(error) {
   if (error instanceof DeliveryStopped)
     return "retry_exhausted";
+  if (error instanceof ServerBusy)
+    return "server_busy";
   if (error instanceof ServerUnreachable)
     return "server_unreachable";
   if (error instanceof SubscriptionClosed)
@@ -35164,6 +35166,8 @@ function failureMessage(error, resumeHint) {
     return `Retry limit reached${error.item ? ` for ${error.item}; item remains unreceipted` : " before inbox progress"}; ${resumeHint}`;
   if (error instanceof OutcomeUnknown)
     return error.message;
+  if (error instanceof ServerBusy)
+    return `Server at capacity; ${resumeHint}`;
   if (error instanceof ServerUnreachable)
     return `Server unreachable; ${resumeHint}`;
   if (error instanceof AccessExpired || error instanceof ServerOutdated || error instanceof DeliveryHeldElsewhere)
@@ -36739,7 +36743,7 @@ var SWAP_CAPACITY_RETRIES = 5;
 var RECOVERY_FIRST_MS = 1000;
 var RECOVERY_MAX_MS = 30000;
 var RECOVERY_BUDGET_MS = 60 * 60000;
-var UNREACHABLE_AT_RECOVER = "Server unreachable while recovering; retrying, approval retained";
+var outageText = (error) => error instanceof ServerBusy ? "Server at capacity" : "Server unreachable";
 var refreshingAtRecover = (harness) => `Token refresh in progress in another ${harness} process while recovering; retrying, approval retained`;
 function sleep5(ms, signal) {
   return new Promise((resolve) => {
@@ -37424,11 +37428,11 @@ class Controller {
         if (error instanceof ServerUnreachable || error instanceof SubscriptionClosed || error instanceof RefreshInProgress || error instanceof AccessExpired && error.reason === "expired" && outage) {
           if (error instanceof ServerUnreachable)
             outage = true;
-          this.set(r, "retrying", error instanceof ServerUnreachable ? "Server unreachable; retrying, approval retained" : error instanceof SubscriptionClosed ? "Subscription closed; reopening, approval retained" : error instanceof RefreshInProgress ? `Token refresh in progress in another ${this.port.harness} process; retrying, approval retained` : `Access expired during a server outage; retrying until ${this.port.harness} refreshes it`, "reopen", failureCode(error));
+          this.set(r, "retrying", error instanceof ServerUnreachable ? `${outageText(error)}; retrying, approval retained` : error instanceof SubscriptionClosed ? "Subscription closed; reopening, approval retained" : error instanceof RefreshInProgress ? `Token refresh in progress in another ${this.port.harness} process; retrying, approval retained` : `Access expired during a server outage; retrying until ${this.port.harness} refreshes it`, "reopen", failureCode(error));
           ready();
           if (error instanceof AccessExpired && this.port.credential.refresh)
             await this.port.credential.refresh(e).catch((failure) => this.failure("reopen", failure));
-          await this.wait(Math.min(8000, 250 * 2 ** ++unreachable), signal);
+          await this.wait(Math.min(8000, Math.max(250 * 2 ** ++unreachable, error instanceof ServerBusy ? error.retryAfterMs : 0)), signal);
           continue;
         }
         if (error instanceof AccessExpired && error.reason === "expired" && graceLeft(grace) > 0) {
@@ -37629,7 +37633,7 @@ class Controller {
     }
   }
   retrying(r, error) {
-    const text = error instanceof RefreshInProgress ? `Token refresh in progress in another ${this.port.harness} process; retrying` : `Server unreachable at ${this.port.approval ? "restore" : "resume"}; retrying`;
+    const text = error instanceof RefreshInProgress ? `Token refresh in progress in another ${this.port.harness} process; retrying` : `${outageText(error)} at ${this.port.approval ? "restore" : "resume"}; retrying`;
     this.set(r, "retrying", this.port.approval ? `${text}, approval retained` : text, "restore", failureCode(error));
   }
   restorable(r, epoch) {
@@ -37744,7 +37748,7 @@ class Controller {
               return false;
             }
             if ((error instanceof ServerUnreachable || error instanceof RefreshInProgress) && this.restorable(r, r.epoch)) {
-              this.set(r, "retrying", error instanceof RefreshInProgress ? refreshingAtRecover(this.port.harness) : UNREACHABLE_AT_RECOVER, "recover", failureCode(error));
+              this.set(r, "retrying", error instanceof RefreshInProgress ? refreshingAtRecover(this.port.harness) : `${outageText(error)} while recovering; retrying, approval retained`, "recover", failureCode(error));
               this.retryRestore(r);
               return true;
             }

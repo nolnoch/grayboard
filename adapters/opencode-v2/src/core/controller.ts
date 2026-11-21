@@ -2,7 +2,7 @@
 // Do not edit: change hosted-core, then run `bun scripts/sync_hosted_core.ts`.
 import { createHash } from "node:crypto";
 import type { Enrollment, HostPort } from "./port.js";
-import { abortOf, InsufficientScope, LeaseUnavailable, listenCapacity, ServerUnreachable, SubscriberError, SubscriptionClosed, unreachable, Wire, type WireOptions } from "./wire.js";
+import { abortOf, InsufficientScope, LeaseUnavailable, listenCapacity, ServerBusy, ServerUnreachable, SubscriberError, SubscriptionClosed, unreachable, Wire, type WireOptions } from "./wire.js";
 import { AccessExpired, Refusal, RefreshInProgress, accessExpiry, admitPrefix, bindingOf, itemsOf, leaseOf, sameHeld, shortOf, stableID, validHeld, type BindingState, type Lease } from "./model.js";
 import { AncestryError, SessionRoutes, type SessionPath } from "./sessions.js";
 import { end, register, type Temporary } from "./children.js";
@@ -89,7 +89,8 @@ type Grace = { spent: number; lease?: () => Lease | undefined };
 // for an hour of waits: after that the pause stands until a reload's restore. The outage retries (run loop and
 // restore) ask the host the same way once the server answers with the expiry, and keep their own backoff (#916).
 const RECOVERY_FIRST_MS = 1_000, RECOVERY_MAX_MS = 30_000, RECOVERY_BUDGET_MS = 60 * 60_000;
-const UNREACHABLE_AT_RECOVER = "Server unreachable while recovering; retrying, approval retained";
+// A ServerBusy (#1553) is retried as an outage, but named for what it is: the server answered, at capacity.
+const outageText = (error: unknown) => error instanceof ServerBusy ? "Server at capacity" : "Server unreachable";
 const refreshingAtRecover = (harness: string) => `Token refresh in progress in another ${harness} process while recovering; retrying, approval retained`;
 function sleep(ms: number, signal: AbortSignal) {
   return new Promise<void>(resolve => {
@@ -722,7 +723,7 @@ export class Controller<E extends Enrollment = Enrollment> {
         // keep retrying rather than pausing, and ask the host to refresh (#916).
         if (error instanceof ServerUnreachable || error instanceof SubscriptionClosed || error instanceof RefreshInProgress || (error instanceof AccessExpired && error.reason === "expired" && outage)) {
           if (error instanceof ServerUnreachable) outage = true;
-          this.set(r, "retrying", error instanceof ServerUnreachable ? "Server unreachable; retrying, approval retained"
+          this.set(r, "retrying", error instanceof ServerUnreachable ? `${outageText(error)}; retrying, approval retained`
             : error instanceof SubscriptionClosed ? "Subscription closed; reopening, approval retained"
             : error instanceof RefreshInProgress ? `Token refresh in progress in another ${this.port.harness} process; retrying, approval retained`
             : `Access expired during a server outage; retrying until ${this.port.harness} refreshes it`, "reopen", failureCode(error));
@@ -731,7 +732,8 @@ export class Controller<E extends Enrollment = Enrollment> {
           // as the recovery does; the port acts at most once per expiry.
           // A failed request is recorded apart from the root (a drift's pause record must stand).
           if (error instanceof AccessExpired && this.port.credential.refresh) await this.port.credential.refresh(e).catch(failure => this.failure("reopen", failure));
-          await this.wait(Math.min(8000, 250 * 2 ** ++unreachable), signal);
+          // A busy server's own retry hint floors the backoff; the cap still bounds it.
+          await this.wait(Math.min(8000, Math.max(250 * 2 ** ++unreachable, error instanceof ServerBusy ? error.retryAfterMs : 0)), signal);
           continue;
         }
         if (error instanceof AccessExpired && error.reason === "expired" && graceLeft(grace) > 0) {
@@ -903,7 +905,7 @@ export class Controller<E extends Enrollment = Enrollment> {
   // host has a saved approval to retain, or a restore to speak of.
   private retrying(r: Root<E>, error: ServerUnreachable | RefreshInProgress) {
     const text = error instanceof RefreshInProgress ? `Token refresh in progress in another ${this.port.harness} process; retrying`
-      : `Server unreachable at ${this.port.approval ? "restore" : "resume"}; retrying`;
+      : `${outageText(error)} at ${this.port.approval ? "restore" : "resume"}; retrying`;
     this.set(r, "retrying", this.port.approval ? `${text}, approval retained` : text, "restore", failureCode(error));
   }
   // A saved root a retry may still prepare: nothing (a stop, pause, drift,
@@ -1019,7 +1021,7 @@ export class Controller<E extends Enrollment = Enrollment> {
             // An outage now, or another process holding the token refresh: restore's retry, on the outage
             // backoff, as resume's and restore's own prepares do (#424 6, #895, #1334).
             if ((error instanceof ServerUnreachable || error instanceof RefreshInProgress) && this.restorable(r, r.epoch)) {
-              this.set(r, "retrying", error instanceof RefreshInProgress ? refreshingAtRecover(this.port.harness) : UNREACHABLE_AT_RECOVER, "recover", failureCode(error));
+              this.set(r, "retrying", error instanceof RefreshInProgress ? refreshingAtRecover(this.port.harness) : `${outageText(error)} while recovering; retrying, approval retained`, "recover", failureCode(error));
               this.retryRestore(r);
               return true;
             }
