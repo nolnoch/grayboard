@@ -1,5 +1,6 @@
 import type { Repo } from "./db.ts";
 import { isTx, type Read } from "./store/tx.ts";
+import { atSite } from "./store/queue.ts";
 
 export type AuditAction =
   | "attachment.bound"
@@ -138,5 +139,5 @@ export function writeAudit(
 ): void {
   const row = { at: repo.now(), actor, action, target, detail: detail ? JSON.stringify(detail) : null };
   if (isTx(h)) { repo.audit.write(h, row); return; }
-  repo.post((tx) => repo.audit.write(tx, row), undefined, `audit ${action}`);
+  atSite("audit", () => repo.post((tx) => repo.audit.write(tx, row), undefined, `audit ${action}`));
 }

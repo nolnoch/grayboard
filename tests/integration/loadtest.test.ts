@@ -4,7 +4,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { capsEnv, options, parseMetrics, perUserRate, slope, tooSlow } from "../../scripts/loadtest.ts";
+import { capsEnv, options, parseMetrics, perUserRate, combineQueue, quantile, queueCumulative, queueStats, slope, tooSlow } from "../../scripts/loadtest.ts";
 import { DEFAULT_HOSTED_CAPS, DEFAULT_MCP_LIMITS } from "../../src/server/config.ts";
 import { DEFAULT_HOSTED_REQUEST_LIMIT } from "../../src/server/rate_limit.ts";
 import { runCli } from "../support/cli.ts";
@@ -77,6 +77,45 @@ describe("loadtest sizing", () => {
   });
 });
 
+describe("loadtest write-queue report (#1510)", () => {
+  // Two scrapes' worth of exposition, in the server's format: hold by site, wait by site, depth.
+  const expo = (holdCum: number[], holdSum: number, depthCum: number[]) => [
+    ...["0.001", "0.002", "0.004", "+Inf"].map((le, i) => `grayboard_write_queue_hold_seconds_bucket{site="gate",le="${le}"} ${holdCum[i]}`),
+    `grayboard_write_queue_hold_seconds_sum{site="gate"} ${holdSum}`, `grayboard_write_queue_hold_seconds_count{site="gate"} ${holdCum[3]}`,
+    ...["0.001", "0.002", "0.004", "+Inf"].map((le, i) => `grayboard_write_queue_wait_seconds_bucket{site="gate",le="${le}"} ${holdCum[i]}`),
+    `grayboard_write_queue_wait_seconds_sum{site="gate"} ${holdSum / 2}`, `grayboard_write_queue_wait_seconds_count{site="gate"} ${holdCum[3]}`,
+    ...["0", "1", "2", "+Inf"].map((le, i) => `grayboard_write_queue_depth_bucket{le="${le}"} ${depthCum[i]}`),
+    `grayboard_write_queue_depth_sum 0`, `grayboard_write_queue_depth_count ${depthCum[3]}`,
+  ].join("\n");
+
+  test("quantiles interpolate within a bucket, and one past the last edge reads as that edge", () => {
+    const h = { le: [0.001, 0.002, Infinity], cum: [50, 100, 101], sum: 0, count: 101 };
+    expect(quantile(h, 0.25)).toBeCloseTo(0.000505, 6);
+    expect(quantile(h, 0.75)).toBeCloseTo(0.001515, 6);
+    expect(quantile(h, 1)).toBe(0.002);
+    expect(quantile({ le: [1, Infinity], cum: [0, 0], sum: 0, count: 0 }, 0.5)).toBeNull();
+  });
+
+  test("a window's numbers come from the deltas between two scrapes", () => {
+    const a = queueCumulative(parseMetrics(expo([10, 10, 10, 10], 0.005, [3, 3, 3, 3])));
+    const b = queueCumulative(parseMetrics(expo([10, 60, 110, 110], 0.205, [3, 5, 7, 7])));
+    const q = queueStats(combineQueue(b, a, -1), 2);
+    expect(q.bodies).toBe(100);
+    expect(q.bodiesPerS).toBe(50);
+    expect(q.busy).toBeCloseTo(0.1, 9);
+    expect(q.hold.p50).toBeCloseTo(0.002, 9);
+    expect(q.hold.mean).toBeCloseTo(0.002, 9);
+    expect(q.maxDepth).toBe(2);
+    expect(Object.keys(q.sites)).toEqual(["gate"]);
+  });
+
+  test("--pg-latency needs --pg", () => {
+    expect(() => options(["--pg-latency", "1"])).toThrow("--pg-latency needs --pg");
+    expect(options(["--pg", "postgres://x@127.0.0.1:5432/postgres", "--pg-latency", "0.25"]).pgLatencyMs).toBe(0.25);
+    expect(options([]).pgLatencyMs).toBeUndefined();
+  });
+});
+
 async function run(extra: string[]): Promise<{ code: number; out: string; summary: any }> {
   const dir = mkdtempSync(join(tmpdir(), "gb-loadtest-test-"));
   try {
@@ -105,6 +144,11 @@ describe("loadtest run", () => {
     expect(r.summary.boardDeliveries).toBeGreaterThan(0);
     expect(Object.values(r.summary.drained)).toEqual([0, 0, 0, 0, 0, 0]);
     expect(r.summary.hostedRowsAfter).toBe(0);
+    // The server's write queue, over the steady period (#1510): every hosted call goes through the gate.
+    expect(r.summary.queueSteady.bodies).toBeGreaterThan(0);
+    expect(r.summary.queueSteady.busy).toBeGreaterThan(0);
+    expect(r.summary.queueSteady.busy).toBeLessThan(1);
+    expect(r.summary.queueSteady.sites.gate.bodies).toBeGreaterThan(0);
   }, 90_000);
 
   test("a lease cap below the fleet fails the run and names why", async () => {
