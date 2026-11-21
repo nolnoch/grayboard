@@ -25,7 +25,7 @@ import { DEFAULT_TRUSTED_PROXIES } from "./client_addr.ts";
 import { createOAuthServer } from "./oauth.ts";
 import { hashToken } from "./auth.ts";
 import { gateCount } from "./metrics.ts";
-import { GRAYBOARD_LAUNCHER_META, GRAYBOARD_MODEL_META } from "../shared/session_meta.ts";
+import { GRAYBOARD_EFFORT_META, GRAYBOARD_LAUNCHER_META, GRAYBOARD_MODEL_META } from "../shared/session_meta.ts";
 import { issueOAuth } from "../../tests/helpers/oauth.ts";
 import { hostedPause } from "../../tests/support/hosted-pause.ts";
 import type { Tx } from "./store/tx_base.ts";
@@ -727,6 +727,39 @@ describePg("hosted gate keyed fast path (Postgres)", () => {
     await Promise.all([held.catch(() => {}), revoke]);
     expect(revoked).toBe(true);
     expect(d()).toEqual({ keyed: 1, miss: 0 });
+  });
+
+  // withPrior stands in for rowFor only while the selection's change-only writes still read as made (#364): a request
+  // built before a facts switch and committed after it (a lease op with the old model and effort) reverts them, and a
+  // launcher flag can read off. A prior whose request's model, effort or launcher declaration differs from what's stored
+  // misses, and the full gate writes the request's. Mutation: the prior body without priorWouldWrite (it runs keyed and
+  // the stale facts stick).
+  test("a prior whose request's facts or launcher differ from the stored ones misses, and the full gate writes them", async () => {
+    await using db = await pgDatabase({ max: 2 });
+    await using x = await gateInstance(db.url, { oauth: true });
+    const { p } = await issued(x);
+    const meta = { [OPENCODE_SESSION_META]: "root-a", [GRAYBOARD_MODEL_META]: "new-model", [GRAYBOARD_EFFORT_META]: "low", [GRAYBOARD_LAUNCHER_META]: true };
+    const c = sessionContext(p, meta);
+    const id = idOf(p, "root-a");
+    const stored = async () => (await db.sql`SELECT model, effort, launcher FROM ids WHERE id = ${id}`)[0] as { model: string | null; effort: string | null; launcher: boolean | null };
+    // The selection writes the request's facts and launcher; with nothing between, its prior runs keyed.
+    await whoami(x, p, "root-a", meta);
+    const verdict = (await x.hosted.snapshot(p, c, false)).verdict!;
+    const warm = priorDelta();
+    await x.hosted.run(p, c, "whoami", async () => null, undefined, verdict);
+    expect(warm()).toEqual({ keyed: 1, miss: 0 });
+    for (const [what, revert] of [
+      ["model", sql => sql`UPDATE ids SET model = 'old-model' WHERE id = ${id}`],
+      ["effort", sql => sql`UPDATE ids SET effort = 'high' WHERE id = ${id}`],
+      ["launcher", sql => sql`UPDATE ids SET launcher = false WHERE id = ${id}`],
+    ] as Array<[string, (sql: typeof db.sql) => Promise<unknown>]>) {
+      // A stale write committed between the selection and the tool call's prior.
+      await revert(db.sql);
+      const d = priorDelta();
+      await x.hosted.run(p, c, "whoami", async () => null, undefined, verdict);
+      expect([what, d()]).toEqual([what, { keyed: 0, miss: 1 }]);
+      expect(await stored()).toEqual({ model: "new-model", effort: "low", launcher: true });
+    }
   });
 
   // pg_repo wires the notices' refusal (makeNotices' refuseKeyed): a notice-queuing write in a keyed body refuses by its

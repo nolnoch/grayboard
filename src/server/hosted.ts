@@ -7,6 +7,7 @@ import { DEFAULT_IDLE_SECONDS, MAX_CHILDREN, aliasLostNotice, childCapacity, asS
 import { launcherInstruction } from "../core/delegation.ts";
 import { channelInstructions, COORDINATION_INSTRUCTIONS, DEFAULT_CHANNEL_SOURCE, ownHumanInstruction } from "../core/tools.ts";
 import { normalizeAliasName } from "../core/addresses.ts";
+import { cleanFact } from "../core/text.ts";
 import { HUMAN_NAME, normalizeIdentityName } from "../shared/addressing.ts";
 import { ApplicationError, UNBOUND_READS, type Application, type ApplicationSession, type BuildFacts, type DeliverySink, type IdentityInfo, type RefusalRow } from "./application.ts";
 import type { AuthedUser } from "./auth.ts";
@@ -788,6 +789,21 @@ export function createHostedSessions(application: Application, options: { now?: 
   // park, a lapsed lease, a new ownership, root or generation, an idle window passed) runs the full gate instead, so
   // every refusal and recovery stays on its one path. `rowFor`'s writes are a selection's, already made: a request's
   // facts and launcher declaration are written only on a change, and its writes_as is fixed for the ownership.
+  // Whether rowFor would write this request's change-only facts on `row` (#364): its model and effort (setIdFacts,
+  // compared as stored, cleanFact) and its launcher declaration (declareLauncher, under rowFor's conditions). The prior
+  // stands in for rowFor only while the selection's writes still read as made: a request built before a switch and
+  // committed after it (a lease op carrying the old facts) reverts them, and this request must then write its own.
+  async function priorWouldWrite(tx: Tx, context: SessionContext, row: HostedSession): Promise<boolean> {
+    if (!("id" in context)) return false;
+    const launcher = context.launcher === true && !row.root_session_id && row.writes_as === null;
+    if (!context.facts && !launcher) return false;
+    const stored = (await repo.bindings.idFacts(tx, [row.session_id])).get(row.session_id);
+    if (!stored) return false;
+    const f = context.facts;
+    if (f?.model !== undefined && cleanFact(f.model) !== stored.model) return true;
+    if (f?.effort !== undefined && cleanFact(f.effort) !== stored.effort) return true;
+    return launcher && stored.launcher !== 1;
+  }
   async function withPrior<T>(p: OAuthPrincipal, context: SessionContext, prior: Verdict, fn: (row: HostedSession | undefined) => Promise<T>): Promise<T> {
     await authorized(p);
     if (!("id" in context) || context.id !== prior.row.session_id || prior.row.parked_at !== null) { countGate("prior", "skipped"); return withGate(p, context, false, fn); }
@@ -812,6 +828,7 @@ export function createHostedSessions(application: Application, options: { now?: 
         if (!fresh || !root || fresh.ownership_id !== prior.row.ownership_id || fresh.root_session_id !== prior.row.root_session_id || fresh.parked_at !== null
           || root.session_id !== id || root.ownership_id !== prior.root.ownership_id || root.bind_gen !== prior.root.bind_gen || root.root_session_id
           || (root.lease_deadline !== null && root.lease_deadline <= t) || idleAt(fresh) || idleAt(root)) return undefined;
+        if (await priorWouldWrite(tx, context, fresh)) return undefined;
         const seen = await touchRow(tx, root, t);
         return { row: fresh, seen: fresh === root ? seen : Math.min(seen, await touchRow(tx, fresh, t)) };
       };
