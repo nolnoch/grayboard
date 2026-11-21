@@ -52,7 +52,7 @@ test("a bind over the user's bucket is refused with a wait, writes nothing about
   const r = await refusal(a.bind("fe"));
   expect(r.code).toBe("rate_limited");
   expect(r.extra.retry_after_ms).toBeGreaterThan(0);
-  expect(r.extra.retry_after_ms).toBeLessThanOrEqual(250);
+  expect(r.extra.retry_after_ms).toBe(250);
   expect(r.message).toMatch(/too many binds for this user; retry in \ds/);
 
   // Another user's bucket is their own.
@@ -73,7 +73,7 @@ test("a bind over the user's bucket is refused with a wait, writes nothing about
   clock.t += 800;
   expect((await a.bind("fe")).alias).toBe(`${A}/fe`);
   expect(await count(srv, `SELECT COUNT(*) AS n FROM access_log WHERE action = 'bind.rate_limit_ended'`)).toBe(1);
-  expect((await detail(srv, "bind.rate_limit_ended")).refused).toBeGreaterThanOrEqual(2);
+  expect((await detail(srv, "bind.rate_limit_ended")).refused).toBe(2);
 });
 
 test("the heartbeat's sweep ends a run nobody binds after, and drops the refilled bucket (#247)", async () => {
