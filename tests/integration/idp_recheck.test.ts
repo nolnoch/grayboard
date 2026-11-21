@@ -284,7 +284,7 @@ test("an outage within a long stale bound doesn't send a covered user to the fal
 // #930 A2b: the real Google provider, its directory check pointed at a scripted Google, through the same refresh path.
 test("Google's directory check: an active answer confirms it, a suspended one disables; a refused key is transient and classed", async () => {
   const pair = await generateKeyPair("RS256", { extractable: true });
-  const key = { clientEmail: "sa@p.iam.gserviceaccount.com", privateKey: await exportPKCS8(pair.privateKey) };
+  const key = { kind: "key" as const, clientEmail: "sa@p.iam.gserviceaccount.com", privateKey: await exportPKCS8(pair.privateKey) };
   let tokenStatus = 200;
   const directory: Record<string, { suspended: boolean }> = { "111": { suspended: false }, "222": { suspended: true }, "333": { suspended: false } };
   const fakeGoogle = (async (input: string | URL | Request) => {
