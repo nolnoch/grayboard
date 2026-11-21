@@ -106,6 +106,12 @@ export interface SessionsStore {
   findById(r: Read, sessionId: number): Promise<Session | undefined>;
   revoke(tx: Tx, sessionId: number): Promise<void>;
   revokeAllForUser(tx: Tx, userId: number): Promise<void>;
+  // The user's unrevoked sessions used after `usedAfter` (the idle cutoff; 0 for all), newest use first, at most
+  // `limit` (#930's per-grant list).
+  listLive(r: Read, userId: number, usedAfter: number, limit: number): Promise<Session[]>;
+  // Revokes one of the user's live sessions in one conditional statement; false when it isn't theirs or is already
+  // revoked, so of two concurrent revokes one answers true (#930).
+  revokeOwn(tx: Tx, userId: number, sessionId: number): Promise<boolean>;
   // Revokes every live dev-auth session (`grayboard login --dev`); returns how many.
   revokeDev(tx: Tx): Promise<number>;
   touch(tx: Tx, sessionId: number, now: number): Promise<void>;
@@ -180,7 +186,7 @@ export interface ServicesStore {
   // Services with principal ids above `after`, in id order, at most `limit`, each with its owners' names.
   list(r: Read, after: number, limit: number): Promise<ServiceRow[]>;
   // The services this user owns whose every owner is now disabled: what disabling them left without an
-  // accountable owner (#930 replaces them).
+  // accountable owner; an admin grants the replacement (no automatic pick).
   orphanedBy(r: Read, userId: number): Promise<string[]>;
 }
 

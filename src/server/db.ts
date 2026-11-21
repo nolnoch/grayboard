@@ -31,9 +31,10 @@ import { requestOrigin } from "./request_context.ts";
 import { GOOGLE_ISSUER } from "./idp_google.ts";
 import { LOGIN_SCOPE, OAUTH_SCOPES } from "./oauth-config.ts";
 import type { CredentialSource, ServiceCredential, OAuthStore, OAuthAuthorization, OAuthRequest, OAuthBrowserSession, OAuthCode, OAuthGrant, OAuthTokenPair, OAuthAccess, OAuthFailure } from "./oauth-types.ts";
+import { GRANT_LIST_MAX } from "./oauth-types.ts";
 import { accessFits, accessLookup, BROWSER_SESSIONS, browserData, browserSessionInput, clampPair, clientLookup, codeData, codeInput, grantInput, isLogin, LIVE_SECRETS,
   loginInput, lookup, MINT_WINDOW_MS, mintInput, requestData, requestInput, REQUESTS_PER_BROWSER, REQUESTS_TOTAL, sameAuthorization, rotationBinding, secretLookup,
-  serviceCredentialInput, serviceSecretInput, successorInput, time } from "./oauth-rules.ts";
+  grantSummary, serviceCredentialInput, serviceSecretInput, successorInput, time, userGrantLookup, userLookup } from "./oauth-rules.ts";
 import { AuthorityLost, LastOwner, MissingParent, MissingPost, PrincipalTaken } from "./store/errors.ts";
 import type { Alias, AliasesStore } from "./store/aliases.ts";
 import type { MessageRow, MessagesStore, RetractResult } from "./store/messages.ts";
@@ -1102,7 +1103,8 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       // A service credential's add, rotate and mint only add authority: no session's shrinks, so they send no change
       // notice (each null notice is a full hosted re-check pass, and mints come per run, #270 audit M-1). The
       // generation trigger on oauth_tokens still clears the access cache. Only the revokes notify.
-      revokeServiceCredential: change(oauth.revokeServiceCredential), revokeServiceSecret: change(oauth.revokeServiceSecret) },
+      revokeServiceCredential: change(oauth.revokeServiceCredential), revokeServiceSecret: change(oauth.revokeServiceSecret),
+      revokeUserGrant: change(oauth.revokeUserGrant) },
     hosted: { ...hostedStore, insert: marks(hosted.insert, (_tx, row) => row.session_id), update: marks(hosted.update, (_tx, id) => id),
       end: marks(hosted.end, (_tx, session) => session), childEnd: marks(hosted.childEnd, (_tx, session) => session),
       park: marks(hosted.park, (_tx, session) => session), unpark: marks(hosted.unpark, (_tx, session) => session),
@@ -1205,6 +1207,16 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
           db.run("DELETE FROM oauth_codes WHERE user_id = ? AND grant_id IS NULL", [userId]);
         });
         notices.changed(tx, null);
+      },
+      async listLive(r, userId, usedAfter, limit) {
+        return sqliteOf(r).query<Session, [number, number, number]>(
+          "SELECT * FROM sessions WHERE user_id = ? AND revoked_at IS NULL AND last_used_at > ? ORDER BY last_used_at DESC, id DESC LIMIT ?",
+        ).all(userId, usedAfter, limit);
+      },
+      async revokeOwn(tx, userId, sessionId) {
+        return !!sqliteOf(tx).query<{ id: number }, [number, number, number]>(
+          "UPDATE sessions SET revoked_at = ? WHERE id = ? AND user_id = ? AND revoked_at IS NULL RETURNING id",
+        ).get(clock(), sessionId, userId);
       },
       async revokeDev(tx) {
         return sqliteOf(tx).run("UPDATE sessions SET revoked_at = ? WHERE label = ? AND revoked_at IS NULL", [clock(), DEV_SESSION_LABEL]).changes;
@@ -2028,6 +2040,8 @@ function makeOAuthStore(hosted: HostedStoreOf): OAuthStore {
     addServiceCredential: async (tx, ...a) => on(tx).addServiceCredential(...a),
     rotateServiceCredential: async (tx, ...a) => on(tx).rotateServiceCredential(...a),
     revokeServiceCredential: (tx, ...a) => settledOn(() => on(tx).revokeServiceCredential(tx, ...a)),
+    listGrants: async (r, ...a) => on(r).listGrants(...a),
+    revokeUserGrant: (tx, ...a) => settledOn(() => on(tx).revokeUserGrant(tx, ...a)),
     revokeServiceSecret: async (tx, ...a) => on(tx).revokeServiceSecret(...a),
     findServiceCredential: async (r, ...a) => on(r).findServiceCredential(...a),
     mintServiceToken: async (tx, ...a) => on(tx).mintServiceToken(...a),
@@ -2044,7 +2058,7 @@ function settledOn<T>(f: () => Promise<T>): Promise<T> {
 // Synchronous: the store wraps each async method's result in a promise. The five that can revoke a grant are the
 // store's own async methods, on the caller's Tx: a revoked grant ends its hosted sessions, whose released children's
 // IDs end through the async session-end port (#807 P3 C10d2-a).
-type OAuthRevokes = "redeemCode" | "rotateRefresh" | "revokeToken" | "revokePreBuiltinGrants" | "revokeServiceCredential";
+type OAuthRevokes = "redeemCode" | "rotateRefresh" | "revokeToken" | "revokePreBuiltinGrants" | "revokeServiceCredential" | "revokeUserGrant";
 type OAuthOps = { [K in Exclude<keyof OAuthStore, OAuthRevokes>]: OAuthStore[K] extends (h: never, ...a: infer A) => infer R ? (...a: A) => Awaited<R> : never }
   & Pick<OAuthStore, OAuthRevokes>;
 function oauthOps(db: Database, hosted: HostedStoreOf): OAuthOps {
@@ -2416,6 +2430,28 @@ function oauthOps(db: Database, hosted: HostedStoreOf): OAuthOps {
         // The grant's revocation ends every session attached to it here, in this transaction (D2, #226 §3.4).
         await revokeGrant(sp, c.grant_id, now);
         return ok({ userId: c.user_id });
+      });
+    },
+    listGrants(userId, now) {
+      if (!userLookup(userId, now)) return [];
+      return db.query<{ data: string; credential: number; last_used: number | null }, [number, number, number]>(`
+        SELECT g.data, c.id IS NOT NULL AS credential, (SELECT MAX(t.created_at) FROM oauth_tokens t WHERE t.grant_id = g.id) AS last_used
+        FROM oauth_grants g LEFT JOIN service_credentials c ON c.grant_id = g.id
+        WHERE g.user_id = ? AND g.revoked_at IS NULL AND g.expires_at > ?
+        ORDER BY COALESCE(last_used, json_extract(g.data, '$.createdAt')) DESC, g.id LIMIT ?`).all(userId, now, GRANT_LIST_MAX)
+        .map(row => grantSummary(JSON.parse(row.data), !!row.credential, row.last_used));
+    },
+    async revokeUserGrant(tx, userId, grantId, now) {
+      if (!userGrantLookup(userId, grantId, now)) return invalid;
+      return tx.savepoint(async sp => {
+        const row = db.query<{ credential: number }, [string, number, number]>(`SELECT c.id IS NOT NULL AS credential FROM oauth_grants g
+          LEFT JOIN service_credentials c ON c.grant_id = g.id WHERE g.id = ? AND g.user_id = ? AND g.revoked_at IS NULL AND g.expires_at > ?`).get(grantId, userId, now);
+        if (!row) return missing;
+        if (row.credential) return invalid;
+        const g = grant(grantId)!;
+        // The grant's revocation ends every hosted session attached to it here, in this transaction, as a credential's does.
+        await revokeGrant(sp, grantId, now);
+        return ok({ clientId: g.clientId });
       });
     },
     revokeServiceSecret(secretId, now) {

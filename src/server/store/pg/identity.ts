@@ -258,6 +258,13 @@ export function makePgIdentity({ now, hosted }: { now: () => number; hosted: PgH
       async revoke(tx, sessionId) {
         await pgOf(tx)`UPDATE sessions SET revoked_at = ${now()} WHERE id = ${sessionId}`;
       },
+      async listLive(r, userId, usedAfter, limit) {
+        return (await pgOf(r)`SELECT * FROM sessions WHERE user_id = ${userId} AND revoked_at IS NULL AND last_used_at > ${usedAfter}
+          ORDER BY last_used_at DESC, id DESC LIMIT ${limit}`).map(toSession);
+      },
+      async revokeOwn(tx, userId, sessionId) {
+        return (await pgOf(tx)`UPDATE sessions SET revoked_at = ${now()} WHERE id = ${sessionId} AND user_id = ${userId} AND revoked_at IS NULL RETURNING id`).length > 0;
+      },
       // Writes no users row, so it locks it: FOR NO KEY UPDATE conflicts with a mint's FOR SHARE (a plain FK insert's
       // KEY SHARE would not), so a CLI session, grant or code minted concurrently is either committed and revoked here
       // or minted after this commits.

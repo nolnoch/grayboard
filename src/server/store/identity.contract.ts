@@ -216,6 +216,29 @@ function sessionsAndPrincipals(it: It): void {
     expect(await h.sessions.findById(h.read, s.id + 100)).toBeUndefined();
   });
 
+  it("sessions.listLive lists one user's unrevoked sessions used after the cutoff, newest use first; revokeOwn revokes only the user's live one", async h => {
+    const { a, b, s1, s2, s3, other } = await h.write(async tx => {
+      const a = await h.users.upsertByEmail(tx, A, null), b = await h.users.upsertByEmail(tx, B, null);
+      return { a, b, s1: await h.sessions.create(tx, a.id, "h1", "laptop"), s2: await h.sessions.create(tx, a.id, "h2", null),
+        s3: await h.sessions.create(tx, a.id, "h3", "old"), other: await h.sessions.create(tx, b.id, "h4", null) };
+    });
+    const t = s1.last_used_at;
+    await h.write(async tx => { await h.sessions.touch(tx, s1.id, t + 2000); await h.sessions.touch(tx, s2.id, t + 3000); await h.sessions.touch(tx, s3.id, t + 10); });
+    const ids = async (after: number, limit = 10) => (await h.sessions.listLive(h.read, a.id, after, limit)).map(s => s.id);
+    expect(await ids(0)).toEqual([s2.id, s1.id, s3.id]);
+    expect((await h.sessions.listLive(h.read, a.id, 0, 10))[0]).toMatchObject({ user_id: a.id, token_hash: "h2", label: null, last_used_at: t + 3000 });
+    // The cutoff is exclusive: a session last used at it is idle.
+    expect(await ids(t + 10)).toEqual([s2.id, s1.id]);
+    expect(await ids(0, 1)).toEqual([s2.id]);
+    expect(await h.write(tx => h.sessions.revokeOwn(tx, b.id, s1.id))).toBe(false);
+    expect(await h.write(tx => h.sessions.revokeOwn(tx, a.id, other.id))).toBe(false);
+    expect(await h.write(tx => h.sessions.revokeOwn(tx, a.id, s1.id))).toBe(true);
+    expect(await h.write(tx => h.sessions.revokeOwn(tx, a.id, s1.id))).toBe(false);
+    expect(await h.sessions.findByTokenHash(h.read, "h1")).toBeUndefined();
+    expect(await ids(0)).toEqual([s2.id, s3.id]);
+    expect((await h.sessions.listLive(h.read, b.id, 0, 10)).map(s => s.id)).toEqual([other.id]);
+  });
+
   it("sessions.revokeDev revokes only live dev-labelled sessions and counts them", async h => {
     await h.write(async tx => {
       const u = await h.users.upsertByEmail(tx, A, null);

@@ -164,6 +164,8 @@ grayboard admin role grant team_owner bob@example.com --scope eng   # an owner o
 
 `GRAYBOARD_ADMINS` is the way back in: its emails are admins whatever the granted roles say, and they can't be revoked with a command, only by removing the email and restarting. Revoking the last granted admin on a server with `GRAYBOARD_ADMINS` unset leaves nobody who can run admin commands; the command warns when that happens, and setting the variable and restarting fixes it. Team owners are the `team_owner` role, so `admin role list --role team_owner` lists every team's owners; owners still manage their teams with `grayboard team add --role owner|member`. The first start on a database from a release without roles turns each team's existing owners into `team_owner` roles, once; rolling back to such a release afterwards shows the owners as they were before the upgrade, so restore the pre-upgrade snapshot instead. Removing someone from a team, or their leaving it, revokes their ownership. Admin and ownership changes are audit rows (`role.granted`, `role.revoked`), and so is each use of an admin role.
 
+For a lost or stolen device, revoke just that device's sign-ins: `grayboard grants list --user <email>` lists the person's harness sign-ins (by client, such as `grayboard-pi`, with when each was created and last used) and CLI tokens (`cli:<n>`, with their label), and `grayboard grants revoke <id> --user <email>` revokes one. Their other machines keep working; the device signs in again if it's found. Anyone can do the same for their own sign-ins without `--user`. For someone leaving, `grayboard admin disable-user` revokes everything at once. A service's credentials show in its list but are revoked with `grayboard admin service credential revoke`.
+
 A service principal is a named, non-human account for a pipeline's agents. An admin creates one with at least one owner, a person who answers for it and must have signed in once:
 
 ```bash
@@ -409,6 +411,6 @@ Configure it with the same environment as [3. Configure](#3-configure); mount se
 - No web admin UI — CLI only.
 - No quotas on messages or posts. What is limited: each user's binds, authentication failures per client address ([§3](#3-configure)), and each user's attachments: bytes uploaded but unsent, and bytes stored in all (`GRAYBOARD_ATTACHMENT_USER_QUOTA_BYTES`).
 - No defense against intra-company abuse — treated as an acceptable-use matter.
-- CLI tokens never auto-expire; rotation is by explicit logout or admin revocation. Hosted OAuth access tokens last an hour, refresh tokens 30 days of disuse, and a grant at most 90 days; native clients refresh and reauthorize on their own.
+- CLI tokens expire after `GRAYBOARD_CLI_TOKEN_IDLE_DAYS` of disuse (default 30); otherwise rotation is logout, `grayboard grants revoke`, or admin revocation. Hosted OAuth access tokens last an hour, refresh tokens 30 days of disuse, and a grant at most 90 days; native clients refresh and reauthorize on their own.
 
 The repository facade in `src/server/db.ts` is the seam for moving to Postgres; see [`docs/architecture.md`](../architecture.md).

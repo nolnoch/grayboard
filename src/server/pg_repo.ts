@@ -136,7 +136,7 @@ export async function makePgRepo(url: string, opts: PgRepoOptions): Promise<PgRe
     // The revokes notify, as on SQLite (db.ts makeRepo): a credential's add, rotate and mint only add authority.
     oauth: { ...oauth, findActiveAccess: auth.findActiveAccess, redeemCode: change(oauth.redeemCode, "oauth.redeemCode"), rotateRefresh: change(oauth.rotateRefresh, "oauth.rotateRefresh"),
       revokeToken: change(oauth.revokeToken, "oauth.revokeToken"), revokeServiceCredential: change(oauth.revokeServiceCredential, "oauth.revokeServiceCredential"),
-      revokeServiceSecret: change(oauth.revokeServiceSecret, "oauth.revokeServiceSecret") },
+      revokeServiceSecret: change(oauth.revokeServiceSecret, "oauth.revokeServiceSecret"), revokeUserGrant: change(oauth.revokeUserGrant, "oauth.revokeUserGrant") },
     hosted: repoHosted,
     users: { ...identity.users, isDisabled: auth.isDisabled, active: auth.active, setDisabled: change(identity.users.setDisabled, "users.setDisabled") },
     sessions: { ...identity.sessions, revokeAllForUser: change(identity.sessions.revokeAllForUser, "sessions.revokeAllForUser") },

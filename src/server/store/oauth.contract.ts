@@ -106,6 +106,7 @@ export function oauthContract(backend: OAuthBackend): void {
   loginCodes(it);
   cutover(it);
   serviceCredentials(it);
+  userGrants(it);
 }
 
 type It = (name: string, fn: (h: OAuthHarness) => Promise<void>, timeout?: number) => void;
@@ -848,5 +849,67 @@ function serviceCredentials(it: It): void {
     await h.write(tx => h.oauth.cleanup(tx, start + 600_000));
     expect(await h.rows("oauth_tokens")).toEqual([]);
     expect((await h.rows("service_credential_secrets")).map(s => s.id)).toEqual([second.value.secretId]);
+  });
+}
+
+// The per-grant list and revoke (#930).
+function userGrants(it: It): void {
+  async function two(h: OAuthHarness) {
+    const a = await world(h, "a");
+    const b = await world(h, "b");
+    return { userId: a.userId, a: await a.issue(), b: await b.issue() };
+  }
+
+  it("listGrants lists the user's live grants newest use first, a credential's grant flagged, and nothing of another user's", async h => {
+    const { userId, a, b } = await two(h);
+    const svc = await h.write(tx => h.services.create(tx, "ingest"));
+    expect(await status(h.write(tx => h.oauth.addServiceCredential(tx, credential(svc.id), start)))).toBe("ok");
+    // Same last use: the grant id breaks the tie.
+    expect(await h.oauth.listGrants(h.read, userId, start)).toEqual([
+      { id: a.grantId, clientId: binding.clientId, createdAt: start, expiresAt: start + OAUTH_TTL.grant, lastUsedAt: start, credential: false },
+      { id: b.grantId, clientId: binding.clientId, createdAt: start, expiresAt: start + OAUTH_TTL.grant, lastUsedAt: start, credential: false },
+    ]);
+    // A rotation of b's refresh token makes it the newest use.
+    expect(await status(h.write(tx => h.oauth.rotateRefresh(tx, { ...binding, refreshHash: b.tokens.refreshHash, tokens: pair(binding, start + 5) }, start + 5)))).toBe("ok");
+    expect((await h.oauth.listGrants(h.read, userId, start + 5)).map(g => [g.id, g.lastUsedAt])).toEqual([[b.grantId, start + 5], [a.grantId, start]]);
+    // A grant with no token left lists its creation as its last use.
+    expect(await h.oauth.listGrants(h.read, svc.id, start + 5)).toEqual([
+      { id: credential(svc.id).grantId, clientId: SVC_CLIENT, createdAt: start, expiresAt: credential(svc.id).expiresAt, lastUsedAt: start, credential: true }]);
+    expect(await status(h.write(tx => h.oauth.revokeUserGrant(tx, userId, a.grantId, start + 6)))).toBe("ok");
+    expect((await h.oauth.listGrants(h.read, userId, start + 6)).map(g => g.id)).toEqual([b.grantId]);
+    expect(await h.oauth.listGrants(h.read, userId, start + OAUTH_TTL.grant)).toEqual([]);
+    expect(await h.oauth.listGrants(h.read, userId + 1000, start)).toEqual([]);
+    expect(await h.oauth.listGrants(h.read, 1.5, start)).toEqual([]);
+    expect(await h.oauth.listGrants(h.read, userId, -1)).toEqual([]);
+  });
+
+  it("revokeUserGrant revokes one of the user's grants and its tokens, leaves the others, refuses a credential's, another user's and a bad input", async h => {
+    const { userId, a, b } = await two(h);
+    const svc = await h.write(tx => h.services.create(tx, "ingest"));
+    expect(await status(h.write(tx => h.oauth.addServiceCredential(tx, credential(svc.id), start)))).toBe("ok");
+    const revoke = (uid: number, grantId: string, now = start + 1) => h.write(tx => h.oauth.revokeUserGrant(tx, uid, grantId, now));
+    for (const [uid, gid, now] of [[1.5, a.grantId, start + 1], [userId, "", start + 1], [userId, 5 as unknown as string, start + 1], [userId, a.grantId, -1]] as const) {
+      expect(await status(revoke(uid, gid, now))).toBe("invalid");
+    }
+    expect(await status(revoke(userId + 1000, a.grantId))).toBe("not_found");
+    expect(await status(revoke(userId, "grant_unknown0123456789"))).toBe("not_found");
+    // A credential's grant: its owner's revoke is refused, so its own revoke keeps service.credential_revoked.
+    expect(await status(revoke(svc.id, credential(svc.id).grantId))).toBe("invalid");
+    expect(await status(revoke(userId, credential(svc.id).grantId))).toBe("not_found");
+    expect(await h.oauth.isGrantActive(h.read, credential(svc.id).grantId, start + 1)).toBe(true);
+    for (const g of [a, b]) expect(await h.oauth.isGrantActive(h.read, g.grantId, start + 1)).toBe(true);
+
+    expect(await revoke(userId, a.grantId)).toEqual({ status: "ok", value: { clientId: binding.clientId } });
+    expect(await h.oauth.isGrantActive(h.read, a.grantId, start + 1)).toBe(false);
+    expect(await h.oauth.findActiveAccess(h.read, a.tokens.accessHash, binding.resource, [], start + 1)).toBeUndefined();
+    expect(await status(h.write(tx => h.oauth.rotateRefresh(tx, { ...binding, refreshHash: a.tokens.refreshHash, tokens: pair(binding, start + 2) }, start + 2)))).not.toBe("ok");
+    // The other grant still serves and refreshes.
+    expect((await h.oauth.findActiveAccess(h.read, b.tokens.accessHash, binding.resource, [], start + 2))?.grantId).toBe(b.grantId);
+    expect(await status(h.write(tx => h.oauth.rotateRefresh(tx, { ...binding, refreshHash: b.tokens.refreshHash, tokens: pair(binding, start + 2) }, start + 2)))).toBe("ok");
+    // A second revoke finds nothing live; an expired grant is not revocable either.
+    expect(await status(revoke(userId, a.grantId, start + 3))).toBe("not_found");
+    expect(await status(revoke(userId, b.grantId, start + OAUTH_TTL.grant))).toBe("not_found");
+    // The caller audits: the store writes no row of its own.
+    expect(await h.audits("auth.grant_revoked")).toEqual([]);
   });
 }
