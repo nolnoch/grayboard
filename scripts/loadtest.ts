@@ -89,7 +89,7 @@ export function options(argv: string[]): Options {
     durationS, warmupS: n("warmup", 600, 15), periodS: n("period", 30, 3), boards: n("boards", 20, 2),
     postShare: n("post-share", 0.05, 0.2), burst: n("burst", 100, 20), churn: n("churn", 0.1, 0.25),
     churnEveryS: n("churn-every", 900, 20), windowS: n("window", 10, 5), graceS: n("grace", 15, 5),
-    // Unset, the workers shrink to what a small fleet leaves after its users' sessions (none at the floor).
+    // Unset, the workers shrink to what a small fleet leaves after its users' sessions (defaultWorkers).
     serviceWorkers: v["service-workers"] === undefined ? defaultWorkers(n("service-workers", 4, 2), n("sessions", 1000, 40), n("users", 100, 4)) : n("service-workers", 4, 2), teams: v.teams === undefined ? Math.min(n("teams", 10, 2), Math.max(1, n("users", 100, 4))) : n("teams", 10, 2), svcShare: n("svc-share", 0.05, 0.2), peerShare: n("peer-share", 0.02, 0.1),
     server: v.server ? [resolve(v.server)] : [process.execPath, join(ROOT, "src/server/main.ts")],
     out: v.out ? resolve(v.out) : join(ROOT, ".e2e-runs", `loadtest-${new Date().toISOString().replace(/[:.]/g, "-")}`),
@@ -115,6 +115,8 @@ export function options(argv: string[]): Options {
 // refused rather than run without the service: only an explicit --service-workers 0 turns it off.
 function defaultWorkers(want: number, sessions: number, users: number): number {
   const room = sessions - Math.max(2, users);
+  // A fleet the sessions/users check refuses anyway gets that error, not this one.
+  if (users > sessions || sessions < 2) return 0;
   if (room < 1) throw new Error(`${sessions} sessions leave no room for a service worker after ${users} users' sessions: raise --sessions, or pass --service-workers 0 to run without the service`);
   return Math.min(want, room);
 }
@@ -226,7 +228,6 @@ type Window = {
   driverLagP99: number; ops: number; loadavg: number[];
 };
 
-// Every hosted_sessions row left once the fleet has closed, parked children included.
 // What the server recorded of the service's traffic: the post ids of the invocations it allowed through a team's
 // service_invoke binding (authz.decision rows, src/server/application.ts board_post), every service.invoke row by
 // rule, and the service board's scope. The run's proof that its invocations took the service path, not another one.
@@ -257,6 +258,7 @@ async function serviceAudit(pgDbUrl: string | undefined, dbPath: string): Promis
   return { teamAllowed, rules, boardScope: board?.scope ?? null, boardKind: board?.kind ?? null };
 }
 
+// Every hosted_sessions row left once the fleet has closed, parked children included.
 async function hostedRows(pgDbUrl: string | undefined, dbPath: string): Promise<number> {
   if (pgDbUrl) {
     const sql = openPg(pgDbUrl, { max: 1, applicationName: "gb-loadtest-count" });
