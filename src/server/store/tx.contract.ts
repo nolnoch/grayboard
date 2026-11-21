@@ -16,6 +16,7 @@
 import { expect, test } from "bun:test";
 import { until } from "../../../tests/support/until.ts";
 import { afterCommitOf, isTx, type Read, type Tx } from "./tx_base.ts";
+import { abandonable, RequestAbortedError } from "./queue.ts";
 
 // One store, fresh per test, over a table of text values in insertion order.
 export type TxStore = {
@@ -659,6 +660,49 @@ function writePath(backend: TxBackend, it: It): void {
     await Promise.all([first, exclusive, second]);
     expect(seen).toEqual(["1", "1:effect", "1:committed", "x", "2"]);
     expect(await h.rows(h.read)).toEqual(["1", "x", "2"]);
+  });
+
+  // #1535 (D4): a request-entry write whose request aborts while it waits is skipped. It never begins: no row, no
+  // effect, no committed; its caller rejects RequestAbortedError before the holder releases. A body that started runs
+  // to its commit, and a write the aborted request (or a marked body) queues without the mark runs.
+  it("an abandonable write or keyed write whose signal fires while it waits is skipped: nothing written, committed never runs", async h => {
+    const seen: string[] = [];
+    const hold = gate();
+    const holder = h.write(async tx => { await hold.wait; await h.put(tx, "held"); });
+    const ac = new AbortController();
+    const skipped = abandonable(ac.signal, () => h.write(async tx => { seen.push("body"); await h.put(tx, "skipped"); tx.afterCommit(() => { seen.push("effect"); }); }, () => { seen.push("committed"); }));
+    const keyed = abandonable(ac.signal, () => h.writeKeyed(["root:a"], async tx => { seen.push("keyed body"); await h.put(tx, "keyed"); }));
+    // Both reject at the abort: caught now, so neither is reported unhandled while the other is awaited.
+    const failed = Promise.all([skipped.catch(e => e), keyed.catch(e => e)]);
+    ac.abort();
+    for (const e of await failed) expect(e).toBeInstanceOf(RequestAbortedError);
+    // The same request's cleanup, queued after its abort without the mark, runs.
+    const cleanup = h.write(tx => h.put(tx, "cleanup"));
+    hold.open();
+    await Promise.all([holder, cleanup]);
+    await h.drain();
+    expect(seen).toEqual([]);
+    expect(await h.rows(h.read)).toEqual(["held", "cleanup"]);
+    expect(h.queue.held).toBe(false);
+  });
+
+  it("an abandonable body that started commits normally when its signal fires mid-body; a write it queues is unmarked", async h => {
+    const seen: string[] = [];
+    const hold = gate(), entered = gate();
+    const ac = new AbortController();
+    let inner: Promise<unknown> | undefined;
+    const started = abandonable(ac.signal, () => h.write(async tx => {
+      entered.open();
+      await hold.wait;
+      await h.put(tx, "started");
+    }, () => { seen.push("committed"); inner = h.write(tx => h.put(tx, "queued by committed")); }));
+    await entered.wait;
+    ac.abort();
+    hold.open();
+    await started;
+    await inner;
+    expect(seen).toEqual(["committed"]);
+    expect(await h.rows(h.read)).toEqual(["started", "queued by committed"]);
   });
 
   // post (#807 P1b-4b): a write no caller awaits.

@@ -19,7 +19,7 @@ import { createHostedSessions, sessionContext } from "./hosted.ts";
 import { OPENCODE_CLIENT, OPENCODE_SESSION_META } from "./oauth-config.ts";
 import type { OAuthPrincipal } from "./oauth.ts";
 import { makePgRepo, type PgRepo } from "./pg_repo.ts";
-import { atSite, currentSite } from "./store/queue.ts";
+import { atSite, currentSite, RequestAbortedError } from "./store/queue.ts";
 import { DEFAULT_AUTH_FAIL_LIMIT, DEFAULT_HELLO_LIMIT } from "./rate_limit.ts";
 import { DEFAULT_TRUSTED_PROXIES } from "./client_addr.ts";
 import { createOAuthServer } from "./oauth.ts";
@@ -491,6 +491,32 @@ describePg("hosted gate keyed fast path (Postgres)", () => {
     expect(x.state.exclusive.filter(b => b.startedHeld)).toEqual([]);
     expect(d()).toEqual({ keyed: 1, miss: 0, skipped: 0 });
     if (op !== "sweep") expect(await x.repo.hosted.get(x.repo.read, id)).toBeUndefined();
+  });
+
+  // #1535: a keyed gate body whose request aborts while it waits (behind an exclusive holder) is skipped: the call
+  // rejects RequestAbortedError, and the exclusive body never runs after it (a skip isn't a miss). Mutation: keyedBody
+  // catching RequestAbortedError as MISS (the exclusive gate body runs); no signal passed (the body runs).
+  test("a keyed gate body whose request aborts while it waits is skipped, with no exclusive fallback", async () => {
+    await using db = await pgDatabase({ max: 2 });
+    await using x = await gateInstance(db.url, { oauth: true });
+    const { p } = await issued(x);
+    await whoami(x, p, "root-a");
+    const d = delta(), before = x.state.exclusive.length;
+    let release!: () => void;
+    const holder = x.q.run(() => new Promise<void>(r => { release = r; }));
+    const ac = new AbortController();
+    const call = x.hosted.run(p, sessionContext(p, { [OPENCODE_SESSION_META]: "root-a" }), "whoami", async () => null, undefined, undefined, ac.signal);
+    const failed = call.catch(e => e);
+    try {
+      await until(() => x.state.keyedQueued === 1, 10_000, "root-a's keyed gate body queued behind the holder");
+      ac.abort();
+      expect(await failed).toBeInstanceOf(RequestAbortedError);
+    } finally { release(); }
+    await holder;
+    await x.drain();
+    expect(d()).toEqual({ keyed: 0, miss: 0, skipped: 0 });
+    expect(x.state.exclusive.slice(before).filter(b => b.site === "gate")).toEqual([]);
+    expect(x.q.idle).toBe(true);
   });
 
   // A revoke (of the grant, or of only the access token) or a disable that commits after the gate's cached check and

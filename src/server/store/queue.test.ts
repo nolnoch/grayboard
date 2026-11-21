@@ -6,7 +6,8 @@ import { join } from "node:path";
 import { afterCommit } from "../../core/sqlite.ts";
 import { openDatabase } from "../db.ts";
 import { writeAudit } from "../audit.ts";
-import { queueFor, WriteQueue } from "./queue.ts";
+import { abandonable, atSite, queueFor, RequestAbortedError, WriteQueue } from "./queue.ts";
+import { queueSkippedCount, queueWaitersNow } from "../metrics.ts";
 import { scratchDbPath } from "../../../tests/support/scratch_db.ts";
 import { until } from "../../../tests/support/until.ts";
 
@@ -802,6 +803,131 @@ test("a COMMIT that fails rolls the body back, drops its effects and releases th
   }
   await repo.write(tx => repo.users.upsertByEmail(tx, "next@example.com", null));
   expect(userOn(db, "next@example.com")).toBeDefined();
+});
+
+// #1535: abandoned bodies. A held body, its release, and a marked body behind it.
+const held = (q: WriteQueue, keys?: string[]) => {
+  let release!: () => void;
+  const started = { v: false };
+  const fn = () => { started.v = true; return new Promise<void>(r => { release = r; }); };
+  const done = keys ? q.runKeyed(keys, fn) : q.run(fn);
+  return { done, started, release: () => release() };
+};
+
+describe("abandoned bodies (#1535)", () => {
+  test("a body whose signal fires while it waits never runs; its caller rejects at once, and the queue drains", async () => {
+    const q = new WriteQueue();
+    const a = held(q);
+    const ac = new AbortController();
+    let ran = false;
+    const skippedBefore = queueSkippedCount("tool"), waitersBefore = queueWaitersNow();
+    const marked = abandonable(ac.signal, () => atSite("tool", () => q.run(() => { ran = true; })));
+    const after = q.run(() => "after");
+    expect(q.waiting).toBe(2);
+    ac.abort();
+    // Rejected before the holder releases: the handler unwinds without waiting for its turn.
+    await expect(marked).rejects.toBeInstanceOf(RequestAbortedError);
+    expect(a.started.v).toBe(true);
+    a.release();
+    expect(await after).toBe("after");
+    await a.done;
+    expect(ran).toBe(false);
+    expect(q.idle).toBe(true);
+    expect(queueSkippedCount("tool") - skippedBefore).toBe(1);
+    expect(queueWaitersNow()).toBe(waitersBefore);
+  });
+
+  test("a signal already aborted at run() rejects there; nothing queues", async () => {
+    const q = new WriteQueue();
+    const ac = new AbortController();
+    ac.abort();
+    let ran = false;
+    const skippedBefore = queueSkippedCount("tool");
+    await expect(abandonable(ac.signal, () => atSite("tool", () => q.run(() => { ran = true; })))).rejects.toBeInstanceOf(RequestAbortedError);
+    expect(ran).toBe(false);
+    expect(q.idle).toBe(true);
+    expect(queueSkippedCount("tool") - skippedBefore).toBe(1);
+  });
+
+  test("a body that started is never cut short: its signal firing mid-body changes nothing", async () => {
+    const q = new WriteQueue();
+    const ac = new AbortController();
+    let release!: () => void;
+    const marked = abandonable(ac.signal, () => q.run(async () => { await new Promise<void>(r => { release = r; }); return "done"; }));
+    expect(q.held).toBe(true);
+    ac.abort();
+    release();
+    expect(await marked).toBe("done");
+    expect(q.idle).toBe(true);
+  });
+
+  test("a dead exclusive waiter stops holding back the keyed waiters behind it without waiting for a release", async () => {
+    const q = new WriteQueue(2);
+    const k1 = held(q, ["a"]);
+    const ac = new AbortController();
+    const ex = abandonable(ac.signal, () => q.run(() => "ex"));
+    const k2 = held(q, ["b"]);
+    expect(k2.started.v).toBe(false);
+    ac.abort();
+    await expect(ex).rejects.toBeInstanceOf(RequestAbortedError);
+    // k1 still runs: only the abort's own pump can start k2.
+    await until(() => k2.started.v, 5000, "the keyed waiter behind the dead exclusive one to start");
+    expect(q.waiting).toBe(0);
+    k1.release(); k2.release();
+    await Promise.all([k1.done, k2.done]);
+    expect(q.idle).toBe(true);
+  });
+
+  test("a dead keyed waiter at its key's head makes the next waiter of that key ready when it is dropped", async () => {
+    const q = new WriteQueue(2);
+    const k1 = held(q, ["a"]);
+    const ac = new AbortController();
+    let ran = false;
+    const k2 = abandonable(ac.signal, () => q.runKeyed(["a"], () => { ran = true; }));
+    const k3 = q.runKeyed(["a"], () => "k3");
+    ac.abort();
+    await expect(k2).rejects.toBeInstanceOf(RequestAbortedError);
+    k1.release();
+    expect(await k3).toBe("k3");
+    await k1.done;
+    expect(ran).toBe(false);
+    expect(q.idle).toBe(true);
+  });
+
+  // The dead waiter also held back a key nobody runs: only its drop can make that key's next waiter ready (no release
+  // of key "a" ever comes). Mutation: drop without its ready push (k3 never starts while k1 holds "b").
+  test("a dead keyed waiter's drop makes ready a waiter behind it on a key no running body holds", async () => {
+    const q = new WriteQueue(2);
+    const k1 = held(q, ["b"]);
+    const ac = new AbortController();
+    const k2 = abandonable(ac.signal, () => q.runKeyed(["a", "b"], () => "k2"));
+    const k3 = held(q, ["a"]);
+    expect(k3.started.v).toBe(false);
+    ac.abort();
+    await expect(k2).rejects.toBeInstanceOf(RequestAbortedError);
+    await until(() => k3.started.v, 5000, "the waiter behind the dead one on key a to start while k1 holds b");
+    k1.release(); k3.release();
+    await Promise.all([k1.done, k3.done]);
+    expect(q.idle).toBe(true);
+  });
+
+  test("a write a marked body queues is unmarked: it runs although the signal fired", async () => {
+    const q = new WriteQueue();
+    const ac = new AbortController();
+    let inner!: Promise<string>;
+    await abandonable(ac.signal, () => q.run(() => { ac.abort(); inner = q.run(() => "inner"); }));
+    expect(await inner).toBe("inner");
+    // A body that waited, too: it starts inside its enqueuer's snapshot (#1408), with the mark cleared.
+    const ac2 = new AbortController();
+    const a = held(q);
+    let inner2!: Promise<string>;
+    const marked = abandonable(ac2.signal, () => q.run(() => { ac2.abort(); inner2 = q.run(() => "inner2"); }));
+    a.release();
+    await marked;
+    expect(await inner2).toBe("inner2");
+    await a.done;
+    expect(q.idle).toBe(true);
+  });
 });
 
 // The portable Repo-level rows above, as the backend-neutral contract every store runs (tx.contract.ts).

@@ -15,7 +15,8 @@ import { seed } from "../support/seed.ts";
 import { drained, row, rows } from "../support/repo_sql.ts";
 import { stubAuthRead } from "../support/auth_stub.ts";
 import { until } from "../support/until.ts";
-import { render as renderMetrics } from "../../src/server/metrics.ts";
+import { queueSkippedCount, render as renderMetrics } from "../../src/server/metrics.ts";
+import { queueFor, type WriteQueue } from "../../src/server/store/queue.ts";
 
 let srv: TestServer;
 let app: TestServer["app"];
@@ -644,6 +645,70 @@ for (const outcome of ["closing", "aborted"] as const) test(`HTTP native: a disp
     await closing;
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// #1535: a client that aborts while its request waits in the write queue. The waiting body is skipped (never run), and
+// the request is logged as a client abort, its own line and category, not `hosted MCP failed … unexpected`. Two
+// stages: the exchange's selection (its gate body), and the tool body after the gate (held at `hosted:tool:in-gate`
+// while the queue is taken). In process, as #1342's abort is, since an aborted socket reads no answer.
+const writeQueue = (): WriteQueue => (app.repo as { writeQueue?: WriteQueue }).writeQueue ?? queueFor(app.db);
+for (const stage of ["selection", "tool body"] as const) test(`HTTP native: a client abort while the ${stage} waits in the write queue skips it and logs client_aborted (#1535)`, async () => {
+  const identity = `aborted-${stage === "selection" ? "select" : "tool"}`;
+  const issued = await issueOAuth(app.repo, app.oauth.resource, "carol@example.com", ["grayboard:tools", "grayboard:delivery"], Date.now(), OPENCODE_CLIENT);
+  const abort = new AbortController();
+  let target = false;
+  const client = new Client({ name: "http-test", version: "1" }, { supportedProtocolVersions: ["2026-07-28"], versionNegotiation: { mode: { pin: "2026-07-28" } } });
+  clients.push(client);
+  await client.connect(new StreamableHTTPClientTransport(new URL(`${base}/mcp`), {
+    requestInit: { headers: { Authorization: `Bearer ${issued.token}` } },
+    fetch: async (input, init) => {
+      const req = await withMeta(new Request(input, init), OPENCODE_SESSION_META, identity);
+      return target ? app.mcp.fetch(new Request(req, { signal: abort.signal }), "127.0.0.1") : fetch(req);
+    },
+  }));
+  await bindFixture(client, identity);
+  const q = writeQueue();
+  const site = stage === "selection" ? "gate" : "tool";
+  const skipped = queueSkippedCount(site);
+  const dir = mkdtempSync(join(tmpdir(), "gb-1535-")), go = join(dir, "go"), lines: string[] = [];
+  const said = spyOn(console, "error").mockImplementation((...args: unknown[]) => { lines.push(args.join(" ")); });
+  const warned = spyOn(console, "warn").mockImplementation((...args: unknown[]) => { lines.push(args.join(" ")); });
+  let release: (() => void) | undefined, holder: Promise<void> | undefined;
+  const hold = () => { holder = q.run(() => new Promise<void>(r => { release = r; })); };
+  if (stage === "tool body") { process.env.BUS_TEST_PAUSE = "hosted:tool:in-gate"; process.env.BUS_TEST_PAUSE_FILE = go; }
+  try {
+    if (stage === "selection") hold();
+    target = true;
+    const call = stage === "selection"
+      ? client.callTool({ name: "whoami", arguments: {} }).then(r => ({ result: r }), (error: unknown) => ({ error }))
+      : client.callTool({ name: "board_create", arguments: { name: "abandoned", purpose: "never" } }).then(r => ({ result: r }), (error: unknown) => ({ error }));
+    if (stage === "tool body") {
+      await until(() => lines.some(h => h.includes("test pause hit: hosted:tool:in-gate")), 10_000, "board_create's in-gate pause");
+      hold();
+      writeFileSync(go, "");
+    }
+    await until(() => q.waitingAt(site) === 1, 10_000, `the ${stage}'s body queued behind the holder`);
+    abort.abort();
+    await call;
+    await until(() => lines.some(l => l.includes("hosted MCP client aborted")), 10_000, "the client-abort line");
+    expect(queueSkippedCount(site) - skipped).toBe(1);
+  } finally {
+    writeFileSync(go, "");
+    release?.();
+    await holder;
+    said.mockRestore(); warned.mockRestore();
+    delete process.env.BUS_TEST_PAUSE;
+    delete process.env.BUS_TEST_PAUSE_FILE;
+    rmSync(dir, { recursive: true, force: true });
+  }
+  expect(lines.filter(l => l.includes("hosted MCP failed"))).toEqual([]);
+  const aborted = lines.filter(l => l.includes("hosted MCP client aborted"));
+  expect(aborted).toHaveLength(1);
+  expect(aborted[0]).toContain('"category":"client_aborted"');
+  expect(aborted[0]).toContain('"class":"RequestAbortedError"');
+  expect(aborted[0]).toContain(stage === "selection" ? '"operation":"admission"' : '"operation":"tool"');
+  // The skipped tool body wrote nothing.
+  if (stage === "tool body") expect(await app.repo.boards.get(app.repo.read, "abandoned")).toBeUndefined();
 });
 
 // #1342: the close-time 500 the SDK makes of the modern factory's own closed check (the endpoint closed while the

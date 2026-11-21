@@ -23,7 +23,7 @@ import { issueOAuth } from "../../tests/helpers/oauth.ts";
 import { createDelivery } from "./delivery.ts";
 import { claim, listClaims } from "../core/claims.ts";
 import { scratchDbPath } from "../../tests/support/scratch_db.ts";
-import { queueFor } from "./store/queue.ts";
+import { queueFor, RequestAbortedError } from "./store/queue.ts";
 import { sessionEndPort } from "./session_end.ts";
 import { seed } from "../../tests/support/seed.ts";
 import { liveGrants } from "../../tests/support/grants.ts";
@@ -1026,6 +1026,60 @@ test("tool reader gate excludes rebind and revoke during its pause prevents the 
   const operation = paused("hosted:tool:in-gate", () => hosted.run(principal, context("root"), "dm_send", () => { wrote = true; }), async () => { authorized = false; });
   await expect(operation).rejects.toHaveProperty("code", "unauthenticated");
   expect(wrote).toBe(false);
+});
+
+// #1535: a request-entry body whose request aborts while it waits in the write queue is skipped. The tool call is held
+// past its gate (`hosted:tool:in-gate`), the queue is then held, and the request aborts once the tool body queues:
+// the call rejects RequestAbortedError before the holder releases, the tool never ran and wrote no `hosted.write` row,
+// and the end-of-call touch, which the aborted request queues after, still commits.
+test("an aborted tool call's queued body is skipped; its end-of-call touch still runs (#1535)", async () => {
+  await hosted.bind(principal, context("root"), { name: "fe", create: true });
+  const id = (context("root") as { id: string }).id;
+  const q = queueFor(database.db);
+  const writes = () => (database.db.query("SELECT count(*) AS n FROM access_log WHERE action = 'hosted.write'").get() as { n: number }).n;
+  const before = writes();
+  const ac = new AbortController();
+  let wrote = false, release!: () => void, holder!: Promise<void>, rejectedWhileHeld = false;
+  const call = paused("hosted:tool:in-gate", () => hosted.run(principal, context("root"), "dm_send", () => { wrote = true; }, undefined, undefined, ac.signal), async () => {
+    holder = q.run(() => new Promise<void>(r => { release = r; }));
+    // Past the touch window, so the end-of-call touch writes.
+    now += 10_000;
+    void until(() => q.waitingAt("tool") === 1, 5000, "the tool body to queue behind the holder").then(async () => {
+      ac.abort();
+      // The tool body's caller rejects on the abort, while the holder still holds: the gate's finally then queues the
+      // end-of-call touch behind the holder, and the skipped body leaves the queue.
+      await until(() => q.waitingAt("touch") > 0, 5000, "the end-of-call touch to queue behind the holder");
+      rejectedWhileHeld = q.held && q.waitingAt("tool") === 0;
+      release();
+    });
+  });
+  await expect(call).rejects.toBeInstanceOf(RequestAbortedError);
+  await holder;
+  expect(rejectedWhileHeld).toBe(true);
+  expect(wrote).toBe(false);
+  expect(writes()).toBe(before);
+  await until(async () => (await database.repo.hosted.get(database.repo.read, id))?.last_seen_at === now, 5000, "the end-of-call touch to commit");
+});
+
+// The gate's own body, behind a held queue: skipped, so a new session's row is never created.
+test("an aborted request's queued gate body is skipped and creates no row (#1535)", async () => {
+  const q = queueFor(database.db);
+  let release!: () => void;
+  const holder = q.run(() => new Promise<void>(r => { release = r; }));
+  const rows = hostedRowCount(database.db);
+  const ac = new AbortController();
+  const call = hosted.run(principal, context("fresh"), "whoami", () => "ok", undefined, undefined, ac.signal);
+  const failed = call.catch(e => e);
+  await until(() => q.waitingAt("gate") === 1, 5000, "the gate body to queue behind the holder");
+  ac.abort();
+  expect(await failed).toBeInstanceOf(RequestAbortedError);
+  release();
+  await holder;
+  await database.repo.write(() => {});
+  expect(hostedRowCount(database.db)).toBe(rows);
+  // Without a signal the same call creates its row.
+  await hosted.run(principal, context("fresh"), "whoami", () => "ok");
+  expect(hostedRowCount(database.db)).toBe(rows + 1);
 });
 
 test("bind publishes its new hold before the after-commit pause and the first hold's mail still reaches the root", async () => {
