@@ -81,7 +81,7 @@ export async function verifySessionToken(
   const user = await repo.users.findById(repo.read, session.user_id);
   if (session.revoked_at !== null || !user || user.disabled_at !== null) return null;
   if (idleDays > 0 && repo.now() - session.last_used_at > idleDays * 86_400_000) return null;
-  if (typeof reauth === "number" ? reauthDue(user, repo.now(), reauth) : reauth.cliRefused(user)) return null;
+  if (typeof reauth === "number" ? reauthDue(user, repo.now(), reauth) : await reauth.cliRefused(user)) return null;
   // Off the request path: last-used is a stamp, not a result the caller waits on. Posted, so a touch that fires
   // while another body holds the write queue waits behind it (#807).
   touches.schedule(() => { repo.post(tx => repo.sessions.touch(tx, session.id, repo.now()), undefined, "session touch"); });

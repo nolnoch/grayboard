@@ -2,7 +2,7 @@
 // status query (IdentityProvider.status) is asked again once their IdP clock (users.idp_checked_at) is older than
 // recheckHours: blocking on a refresh, in the background on a CLI token's use. An inactive answer disables them as
 // admin disable-user does; an active one restamps the clock; anything else is transient and fails open until the
-// clock is maxStaleHours old, when a refresh answers 503 instead. Every other user stays on the GRAYBOARD_IDP_REAUTH_DAYS
+// clock is maxStaleHours old, when a refresh answers 503 and a CLI token is refused instead. Every other user stays on the GRAYBOARD_IDP_REAUTH_DAYS
 // fallback (reauthDue). Nothing here runs inside a caller's transaction: the IdP call never holds the write queue.
 import { reauthDue } from "./auth.ts";
 import { writeAudit } from "./audit.ts";
@@ -32,9 +32,11 @@ type Checked = Pick<User, "id" | "email" | "kind" | "idp_issuer" | "idp_subject"
 export type IdpRecheck = {
   // Before a refresh's rotation, for the user behind an unspent refresh token (oauth.findRefreshUser).
   beforeRefresh(userId: number): Promise<RefreshVerdict>;
-  // On a CLI token's use: true refuses it (the fallback clock ran out). A stale user with a status provider is
-  // checked in the background instead, and the token works meanwhile.
-  cliRefused(user: Checked): boolean;
+  // On a CLI token's use: true refuses it. With no status provider, the fallback clock decides. A user with one is
+  // checked in the background once stale, and the token works meanwhile; past maxStaleHours the check blocks, as a
+  // refresh's does, and only an active answer lets the token through, so a directory that stops answering bounds
+  // CLI tokens as it bounds refresh.
+  cliRefused(user: Checked): Promise<boolean>;
   // Inside a refresh's rotation: the fallback, for a user no status provider covers.
   fallbackDue(user: Checked): boolean;
 };
@@ -128,9 +130,10 @@ export function createIdpRecheck(
       if (out === "active") return "ok";
       return olderThan(u, config.maxStaleHours) ? "unavailable" : "ok";
     },
-    cliRefused(u) {
+    async cliRefused(u) {
       const p = providerFor(u);
       if (!p) return reauthDue(u, now(), config.reauthDays);
+      if (olderThan(u, config.maxStaleHours)) return await check(u, p) !== "active";
       if (olderThan(u, config.recheckHours)) hooks.background("IdP re-check", () => check(u, p));
       return false;
     },

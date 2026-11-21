@@ -156,6 +156,23 @@ test("a stale user's CLI token works while the background check runs, which disa
   expect((await srv.api(cli, "GET", "/api/whoami")).status).toBe(401);
 });
 
+test("past the stale bound a CLI token waits for the check and is refused while the IdP is down", async () => {
+  await open();
+  const cli = await srv.login(A);
+  await vouched(A, 73);
+  answer = () => new Error("down");
+  expect((await srv.api(cli, "GET", "/api/whoami")).status).toBe(401);
+  expect(calls).toEqual(["s-alice"]);
+  expect((await user(A))!.disabled_at).toBeNull();
+  // The IdP back: once the auth gate's minute-long refusal cache lapses, the same token works, and the answer
+  // restamps the clock.
+  answer = () => "active";
+  clock += 61_000;
+  expect((await srv.api(cli, "GET", "/api/whoami")).status).toBe(200);
+  expect(calls).toEqual(["s-alice", "s-alice"]);
+  expect((await user(A))!.idp_checked_at).toBe(clock);
+});
+
 test("a user the directory covers is off the GRAYBOARD_IDP_REAUTH_DAYS fallback", async () => {
   await open();
   const g = await grant();
