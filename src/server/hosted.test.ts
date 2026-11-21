@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
-import type { Tx } from "./store/tx.ts";
-import { refusalCount } from "./metrics.ts";
+import { isTx, type Tx } from "./store/tx.ts";
+import { gateCount, refusalCount } from "./metrics.ts";
+import { hostedPause } from "../../tests/support/hosted-pause.ts";
 import { until } from "../../tests/support/until.ts";
 import { AppSession } from "../../tests/support/app_session.ts";
 import { hostedRowCount } from "../../tests/support/hosted_rows.ts";
@@ -2471,6 +2472,36 @@ test("#807 P3 C8a: a same-ID row committed while a creating request waited for t
   try { await hosted.whoami(principal, context("seam-racer")); } finally { spy.mockRestore(); }
   expect(database.db.query("SELECT count(*) AS n FROM hosted_ownerships WHERE session_id = ?").get(id)).toEqual({ n: 1 });
   expect(await store.get(database.repo.read, id)).toBeDefined();
+});
+
+// #1537a: the second wire's wait is Postgres only (hosted.ts `creating`, keyedFast). On SQLite, where every gate body
+// is exclusive, a second first contact of an ID being created reads the row once and runs its own exclusive body,
+// which finds the row under the capacity lock: one row, one ownership. The first is held at its gate's
+// `hosted:gate:checked` pause until the second has read no row. Mutation: the wait without its keyedFast condition (the
+// second reads the row twice).
+test("#1537a: on SQLite a second first contact of an ID being created runs its own exclusive gate body, with no wait", async () => {
+  const id = hostedId("storm-a");
+  const store = database.repo.hosted, get = store.get.bind(store);
+  let reads = 0, absent = 0;
+  const spy = spyOn(store, "get").mockImplementation(async (r, key) => {
+    const row = await get(r, key);
+    if (key === id && !isTx(r)) { reads++; if (!row) absent++; }
+    return row;
+  });
+  const skipped = gateCount("gate", "skipped"), keyed = gateCount("gate", "keyed");
+  try {
+    // The pause's file outlives both requests: the second also stops at the pause, and leaves it after the first.
+    let second!: Promise<unknown>, started!: () => void;
+    const ready = new Promise<void>(resolve => { started = resolve; });
+    await hostedPause("hosted:gate:checked", () => Promise.all([hosted.whoami(principal, context("storm-a")), ready.then(() => second)]), async () => {
+      second = hosted.whoami(principal, context("storm-a"));
+      started();
+      await until(() => absent === 2, 10_000, "the second request read no row while the first was held");
+    });
+  } finally { spy.mockRestore(); }
+  expect({ reads, skipped: gateCount("gate", "skipped") - skipped, keyed: gateCount("gate", "keyed") - keyed }).toEqual({ reads: 2, skipped: 2, keyed: 0 });
+  expect(database.db.query("SELECT count(*) AS n FROM hosted_ownerships WHERE session_id = ?").get(id)).toEqual({ n: 1 });
+  expect(database.db.query("SELECT count(*) AS n FROM hosted_sessions WHERE session_id = ?").get(id)).toEqual({ n: 1 });
 });
 
 test("#807 P3 C8a: a call on a live root reads its grant first and locks the row before settle writes it", async () => {

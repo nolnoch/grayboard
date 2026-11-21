@@ -21,7 +21,7 @@ import { hostedFailure } from "./hosted-diagnostics.ts";
 import { decidePure, recordDecision, type PureRequest } from "./policy.ts";
 import { countGate, countRefusal, type GateMethod } from "./metrics.ts";
 import { isTx, ProbeWrite, type Read, type Tx } from "./store/tx.ts";
-import { abandonable, atSite } from "./store/queue.ts";
+import { abandonable, atSite, RequestAbortedError } from "./store/queue.ts";
 
 // `facts`: the model and effort the request reports (#364); a key the request leaves out keeps the stored value, and
 // an empty string clears it (#558).
@@ -683,6 +683,22 @@ export function createHostedSessions(application: Application, options: { now?: 
   // A keyed attempt that would have written more than the touch, or refused: it wrote nothing, and its caller runs the
   // exclusive body, which writes (or refuses) as it would have without the attempt.
   const MISS = Symbol("keyed gate miss");
+  // First contacts in flight (#1537a, D4), Postgres only (keyedFast): a session ID whose request read no row and runs
+  // the exclusive body that creates it, mapped to a promise that settles (never rejects) once that body has. A second
+  // request of the same ID (an MCP client's second wire, opened at once) that also read no row waits for it once and
+  // reads again, so it finds the row and runs keyed instead of a second exclusive body. Advisory: after the wait it
+  // takes the path of any later request, so a refused create is refused again by the waiter's own exclusive body.
+  const creating = new Map<string, Promise<void>>();
+  // `p`, or RequestAbortedError at once if `signal` fires first: a waiter whose request aborted writes nothing.
+  const settledOrAborted = (p: Promise<void>, signal: AbortSignal | undefined): Promise<void> => {
+    if (!signal) return p;
+    if (signal.aborted) return Promise.reject(new RequestAbortedError());
+    return new Promise<void>((resolve, reject) => {
+      const aborted = () => reject(new RequestAbortedError());
+      signal.addEventListener("abort", aborted, { once: true });
+      void p.then(() => { signal.removeEventListener("abort", aborted); resolve(); });
+    });
+  };
   // The gate body keyed by its root, `root:<id>`, for a request whose row exists, isn't parked and lives under `id`, and
   // whose settle and rowFor write nothing: the common call of a live session. In lock order (D4): the access and user
   // reads (authorized, uncached in a body: auth_cache ownsTx), the grant FOR SHARE (grantLive), then settle's root and
@@ -733,9 +749,31 @@ export function createHostedSessions(application: Application, options: { now?: 
     await authorized(p);
     if (!("id" in context)) return fn(undefined);
     const retry = Symbol("root changed");
+    let waitedCreate = false;
     for (;;) {
       const before = await store.get(repo.read, context.id);
       const id = before?.root_session_id ?? context.id;
+      // A first contact of an ID another request of this process is creating (#1537a, `creating`): wait once for that
+      // creator's exclusive body, then read again, keyed if its row now exists. The check and the registration run in
+      // the same synchronous step as the read's resumption, so of two concurrent reads exactly one registers. The
+      // registrant's entry goes once its exclusive body settles (before `fn`), or when it leaves the gate without one.
+      // A waiter that still reads no row runs its own exclusive body, with no second wait, so a refusal can't loop.
+      let created: (() => void) | undefined;
+      if (keyedFast && create && before === undefined) {
+        const inFlight = creating.get(context.id);
+        if (inFlight && !waitedCreate) {
+          waitedCreate = true;
+          await settledOrAborted(inFlight, signal);
+          continue;
+        }
+        if (!inFlight) {
+          let done!: () => void;
+          const mine = new Promise<void>(resolve => { done = resolve; });
+          const key = context.id;
+          creating.set(key, mine);
+          created = () => { created = undefined; if (creating.get(key) === mine) creating.delete(key); done(); };
+        }
+      }
       const result = await gate(id)[writer ? "bind" : "call"](async () => {
         const later = refusalRows();
         // Checked outside the transaction, where the auth cache serves it (#853); an idle queue runs the body below
@@ -773,7 +811,7 @@ export function createHostedSessions(application: Application, options: { now?: 
             catch (error) { await later.flush(tx); return { error }; }
           })));
           waited = true;
-          selected = await pending;
+          try { selected = await pending; } finally { created?.(); }
         }
         if ("error" in selected) throw selected.error;
         if (!selected.row) return fn(undefined);
@@ -786,7 +824,7 @@ export function createHostedSessions(application: Application, options: { now?: 
           for (const s of ids) { const n = inflight.get(s)! - 1; if (n) inflight.set(s, n); else inflight.delete(s); }
           if (endTouch) await touchAfter(row, seen);
         }
-      });
+      }).finally(() => created?.());
       if (result !== retry) return result as T;
     }
   }
