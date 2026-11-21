@@ -1451,7 +1451,7 @@ test.each([["rate_limited"], ["internal_error"]])("static mode retries an auto-e
   const s = await staticRuntime("service", undefined, undefined, () => failures-- > 0 ? { content: [{ type: "text", text: `error: ${code}` }], structuredContent: { code }, isError: true } : undefined);
   try {
     await s.r.controller.observe("session.created", { sessionID: "R" });
-    expect(rootRecord(s.r.controller, "R")).toMatchObject({ state: "retrying", operation: "enroll", code });
+    expect(rootRecord(s.r.controller, "R")).toMatchObject({ state: "retrying", operation: "enroll", code, message: `Server answered ${code}; retrying auto-enroll (1/8)` });
     await until(() => s.r.controller.enrollment("R"), 5000, "the retry enrolls R");
     expect(s.asked).toHaveLength(2);
   } finally { await s.restore(); }
