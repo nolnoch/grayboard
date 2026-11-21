@@ -235,7 +235,10 @@ export function makePgIdentity({ now, hosted }: { now: () => number; hosted: PgH
         throw new Error(`sign-in for ${email} kept losing its link to concurrent sign-ins`);
       },
       async clearSubject(tx, userId) {
-        await pgOf(tx)`UPDATE users SET idp_issuer = NULL, idp_subject = NULL WHERE id = ${userId}`;
+        await pgOf(tx)`UPDATE users SET idp_issuer = NULL, idp_subject = NULL, idp_checked_at = COALESCE(idp_checked_at, 0) WHERE id = ${userId}`;
+      },
+      async stampIdpChecked(tx, userId) {
+        await pgOf(tx)`UPDATE users SET idp_checked_at = ${now()} WHERE id = ${userId}`;
       },
       findByEmail: (r, email) => userByEmail(pgOf(r), email),
       findById: (r, userId) => userById(pgOf(r), userId),

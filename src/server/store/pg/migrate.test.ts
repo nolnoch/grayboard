@@ -111,9 +111,9 @@ describePg("migrate", () => {
   });
 });
 
-// #930: 0003 starts every linked user's IdP clock at the upgrade (pg twin of the SQLite open's stamp, db.ts).
+// #930: 0003 starts every user's IdP clock at the upgrade, unlinked ones included (pg twin of the SQLite open's stamp, db.ts).
 describePg("0003_users_idp_checked_at", () => {
-  test("stamps every row with an issuer, and none without", async () => {
+  test("stamps every row, with an issuer or without", async () => {
     await using db = await pgEmptyDatabase();
     const v3 = MIGRATIONS.findIndex(m => m.version === 3);
     await migrate(db.sql, MIGRATIONS.slice(0, v3));
@@ -121,7 +121,7 @@ describePg("0003_users_idp_checked_at", () => {
     const before = Date.now();
     await migrate(db.sql, MIGRATIONS.slice(0, v3 + 1));
     const rows = await db.sql`SELECT email, idp_checked_at FROM users ORDER BY email` as { email: string; idp_checked_at: string | number | null }[];
-    expect(rows[0]).toEqual({ email: "dev@example.com", idp_checked_at: null });
+    expect(Number(rows[0]!.idp_checked_at)).toBeGreaterThanOrEqual(before);
     expect(Number(rows[1]!.idp_checked_at)).toBeGreaterThanOrEqual(before);
   });
 });

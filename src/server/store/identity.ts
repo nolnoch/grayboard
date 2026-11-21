@@ -88,8 +88,11 @@ export interface UsersStore {
   upsertByEmail(tx: Tx, email: string, displayName: string | null): Promise<User>;
   // An IdP sign-in: matches (issuer, subject) first, then the email (F-13, #928 D4).
   signIn(tx: Tx, issuer: string, subject: string, email: string, displayName: string | null): Promise<IdpSignIn>;
-  // Forgets a user's IdP issuer and subject, so the next sign-in with the email, from any IdP, links its account.
+  // Forgets a user's IdP issuer and subject, so the next sign-in with the email, from any IdP, links its account. The
+  // IdP clock stays, and a missing one starts at 0: with no issuer, a null clock would read as exempt (#930).
   clearSubject(tx: Tx, userId: number): Promise<void>;
+  // Starts the user's IdP clock now (#930): a dev login, the one sign-in with no IdP to stamp it.
+  stampIdpChecked(tx: Tx, userId: number): Promise<void>;
   findByEmail(r: Read, email: string): Promise<User | undefined>;
   // Uncached: a fresh read on the caller's handle.
   findById(r: Read, userId: number): Promise<User | undefined>;

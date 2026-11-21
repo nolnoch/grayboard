@@ -130,6 +130,8 @@ async function devLogin(req: Request, repo: Repo, ip: string | null): Promise<Re
     const user  = await repo.users.upsertByEmail(tx, email, null);
     const disabled = refuseDisabled(repo, tx, user, { dev: true, ip: ip ?? undefined });
     if (disabled) return disabled;
+    // Dev login has no IdP to stamp the re-auth clock, so it stamps it itself (#930).
+    await repo.users.stampIdpChecked(tx, user.id);
     const raw   = mintToken();
     await repo.sessions.create(tx, user.id, hashToken(raw), DEV_SESSION_LABEL);
     writeAudit(repo, tx, "auth.login", email, null, { dev: true, ip: ip ?? undefined });

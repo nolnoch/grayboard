@@ -777,11 +777,12 @@ function initSchema(db: Database): void {
     // by Google (or dev login). Never on a later open, which would re-stamp a row unlink-idp cleared.
     db.run("UPDATE users SET idp_issuer = ?", [GOOGLE_ISSUER]);
   }
-  // users.idp_checked_at (#930): when the IdP last vouched for the user. Once, with the column, every linked row is
-  // stamped now, so an upgrade starts each clock rather than finding every user stale (pg migration 0003).
+  // users.idp_checked_at (#930): when the IdP last vouched for the user. Once, with the column, every row is stamped
+  // now, so an upgrade starts each clock rather than finding every user stale, and a row unlink-idp cleared before the
+  // upgrade (no issuer) gets a clock rather than reading as exempt (pg migration 0003).
   if (!userColumns.some(c => c.name === "idp_checked_at")) {
     db.exec(`ALTER TABLE users ADD COLUMN idp_checked_at INTEGER`);
-    db.run("UPDATE users SET idp_checked_at = ? WHERE idp_issuer IS NOT NULL", [Date.now()]);
+    db.run("UPDATE users SET idp_checked_at = ?", [Date.now()]);
   }
   // Every open: a rolled-back binary (which knows only Google) links or creates users with a subject and no issuer.
   db.run("UPDATE users SET idp_issuer = ? WHERE idp_issuer IS NULL AND idp_subject IS NOT NULL", [GOOGLE_ISSUER]);
@@ -1161,7 +1162,10 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
         }).immediate();
       },
       async clearSubject(tx, userId) {
-        sqliteOf(tx).run("UPDATE users SET idp_issuer = NULL, idp_subject = NULL WHERE id = ?", [userId]);
+        sqliteOf(tx).run("UPDATE users SET idp_issuer = NULL, idp_subject = NULL, idp_checked_at = COALESCE(idp_checked_at, 0) WHERE id = ?", [userId]);
+      },
+      async stampIdpChecked(tx, userId) {
+        sqliteOf(tx).run("UPDATE users SET idp_checked_at = ? WHERE id = ?", [clock(), userId]);
       },
       async findByEmail(r, email) { return userByEmail(sqliteOf(r), email); },
       async findById(r, userId) { return userById(sqliteOf(r), userId); },

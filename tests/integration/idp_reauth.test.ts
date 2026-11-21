@@ -1,6 +1,6 @@
 // #930: with no directory check, a person's grants and CLI tokens stop working GRAYBOARD_IDP_REAUTH_DAYS after the IdP
 // last vouched for them, on either backend (GRAYBOARD_TEST_BACKEND=pg). A refused refresh spends nothing, so the client's
-// token works again once a sign-in restarts the clock; a service principal and a dev login are exempt.
+// token works again once a sign-in restarts the clock; a row with neither issuer nor clock reads as not due.
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { issueOAuth } from "../helpers/oauth.ts";
 import { REFUSED_TOKEN_TTL_MS } from "../../src/server/auth_gate.ts";
@@ -40,7 +40,7 @@ test("past the window a refresh is invalid_grant and leaves the token unspent; a
   expect((await srv.api(cli, "GET", "/api/whoami")).status).toBe(200);
 });
 
-test("a linked row with no clock (one a release without the column linked) is due; a dev login is not", async () => {
+test("a linked row with no clock (one a release without the column linked) is due; one with neither issuer nor clock is not", async () => {
   const cli = await srv.login(A);
   await vouched(null);
   expect((await srv.api(cli, "GET", "/api/whoami")).status).toBe(401);

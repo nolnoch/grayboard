@@ -168,7 +168,7 @@ function users(it: It, sqliteOnly: (name: string, why: string, fn: (h: IdentityS
 
   // #930: every verified sign-in stamps the user's IdP clock (create, link and by-subject paths), and the returned user
   // carries the stored stamp; a refusal leaves it; an upsert (dev login) has none; unlinking keeps it.
-  it("users.signIn stamps idp_checked_at on every ok path, never on a refusal; clearSubject keeps it", async h => {
+  it("users.signIn stamps idp_checked_at on every ok path, never on a refusal; clearSubject keeps it, or zeroes a missing one; stampIdpChecked stamps", async h => {
     const stamp = async (id: number) => (await h.users.findById(h.read, id))!.idp_checked_at;
     const created = await signIn(h, G, "s-1", A, null);
     expect(typeof created.user.idp_checked_at).toBe("number");
@@ -187,6 +187,12 @@ function users(it: It, sqliteOnly: (name: string, why: string, fn: (h: IdentityS
     expect(await stamp(created.user.id)).toBe(before);
     await h.write(tx => h.users.clearSubject(tx, created.user.id));
     expect(await stamp(created.user.id)).toBe(before);
+    // A row with no clock that loses its issuer would read as exempt (#930): it starts at 0, due at once.
+    const bare = await upsert(h, "bare@example.com");
+    await h.write(tx => h.users.clearSubject(tx, bare.id));
+    expect(await stamp(bare.id)).toBe(0);
+    await h.write(tx => h.users.stampIdpChecked(tx, bare.id));
+    expect(await stamp(bare.id)).toBeGreaterThan(0);
   });
 
   it("users.clearSubject clears issuer and subject, so the next sign-in from any issuer takes the email", async h => {

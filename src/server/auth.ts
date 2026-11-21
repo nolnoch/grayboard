@@ -59,8 +59,9 @@ export function createTouchQueue(): TouchQueue {
 }
 
 // reauthDue (#930): the IdP last vouched for the user more than `days` ago, so their grants and CLI tokens stop
-// working until they sign in again. A user with no clock and no issuer (a dev login) has no IdP to go back to, and
-// a service principal never signs in, so both are exempt; an unlinked user keeps its clock, so it isn't.
+// working until they sign in again. A service principal never signs in, so it's exempt. A null clock is due with an
+// issuer (a row a release without the column linked); with neither, no token can exist (the upgrade stamps every row,
+// sign-in and dev login stamp, unlink-idp keeps or zeroes the clock), so only a test fixture's row reads that way.
 export function reauthDue(user: Pick<User, "kind" | "idp_issuer" | "idp_checked_at">, now: number, days: number): boolean {
   if (user.kind !== "user" || days <= 0) return false;
   return user.idp_checked_at !== null ? user.idp_checked_at < now - days * 86_400_000 : user.idp_issuer !== null;
