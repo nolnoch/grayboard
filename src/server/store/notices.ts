@@ -14,7 +14,10 @@
 // (`defer`): SQLite on its connection's commit frames (core/sqlite.ts afterCommit), Postgres on the Tx it's given. And
 // whether a transaction may queue one at all (`refuse`, #1510): Postgres refuses a keyed body's (store/pg/tx.ts
 // refuseKeyed, docs/future/postgres-server.md D4), since a notice's listeners run in the committing body's context
-// while other keyed bodies run. A wrapped op is refused before it runs, so its statements are never sent.
+// while other keyed bodies run. A wrapped op is refused before it runs, so its statements are never sent. `refuse` gets
+// the op's name (undefined for a bare `changed`), the refusal's text and the row the notice names (null: any): a reviewed
+// keyed caller may opt in to one op's notices for its own root's row (store/pg/tx.ts refuseKeyedNotice, #1510 chunk 4's
+// renew).
 import { isThenable, transactionOf, type Tx } from "./tx_base.ts";
 
 type Observer = {
@@ -35,7 +38,7 @@ export type Notices = {
   subscribe<F>(fn: (changed: string | null, facts?: F) => void, read?: (tx: Tx, id: string) => Promise<F>): () => void;
 };
 
-export function makeNotices(defer: (tx: Tx, effect: () => void) => void, refuse: (tx: Tx, op: string) => void = () => {}): Notices {
+export function makeNotices(defer: (tx: Tx, effect: () => void) => void, refuse: (tx: Tx, op: string | undefined, label: string, id: string | null) => void = () => {}): Notices {
   const observers = new Set<Observer>();
   // Per transaction, per observer; dropped with the transaction's root Tx. The facts read are cleared after its notices flush.
   const byTxn = new WeakMap<object, Map<Observer, Reads>>();
@@ -46,8 +49,8 @@ export function makeNotices(defer: (tx: Tx, effect: () => void) => void, refuse:
     if (!r) m.set(o, r = { pending: new Set(), facts: new Map() });
     return r;
   };
-  const changed = (tx: Tx, id: string | null) => {
-    refuse(tx, "a hosted change notice");
+  // Queues the notice; a wrapped op's was refused or allowed by name before it ran.
+  const notify = (tx: Tx, id: string | null) => {
     const txn = transactionOf(tx);
     defer(tx, () => {
       const reads = txn && byTxn.get(txn);
@@ -88,14 +91,14 @@ export function makeNotices(defer: (tx: Tx, effect: () => void) => void, refuse:
     return Promise.resolve(value).then(v => { notify(); return v; }) as R;
   };
   return {
-    changed,
+    changed(tx, id) { refuse(tx, undefined, "a hosted change notice", id); notify(tx, id); },
     change: (fn, op) => (...args) => {
-      refuse(args[0], `${op ?? (fn.name || "a write")} (it queues a change notice)`);
-      return then(fn(...args), () => changed(args[0], null));
+      refuse(args[0], op, `${op ?? (fn.name || "a write")} (it queues a change notice)`, null);
+      return then(fn(...args), () => notify(args[0], null));
     },
     marks: (fn, id, op) => (...args) => {
-      refuse(args[0], `${op ?? (fn.name || "a write")} (it queues a change notice)`);
-      return then(fn(...args), () => { const at = id(...args); readFacts(args[0], at); changed(args[0], at); });
+      refuse(args[0], op, `${op ?? (fn.name || "a write")} (it queues a change notice)`, id(...args));
+      return then(fn(...args), () => { const at = id(...args); readFacts(args[0], at); notify(args[0], at); });
     },
     subscribe(fn, read) {
       const o: Observer = { fn: fn as Observer["fn"], read };

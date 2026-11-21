@@ -441,9 +441,10 @@ export function createHostedSessions(application: Application, options: { now?: 
     !!holder && row.ownership_id === holder.row.ownership_id && row.bind_gen === holder.row.bind_gen;
   // A row's facts on the committing Tx, in its beforeCommit hook (db.ts readFacts). `holders` is read here, before
   // COMMIT, and applied after it, sound because it changes only in an apply (an afterCommit flush or the full pass's
-  // `committed`, both run by the write queue's holder) and in close(): from this hook through COMMIT to the flush
-  // the queue stays held, so only close() can come between, and the apply checks `stopped`. A matching holder needs
-  // no build, so a renew reads only the row and its holds. `build` null: the row's user is gone.
+  // `committed`, both run by a write body) and in close(): from this hook through COMMIT to the flush the body holds
+  // the row's root key (a keyed renew, #1510 chunk 4) or the whole queue, and every other apply of `holders[id]` runs
+  // in a body of that key or an exclusive one, so only close() can come between, and the apply checks `stopped`. A
+  // matching holder needs no build, so a renew reads only the row and its holds. `build` null: the row's user is gone.
   async function readHolder(tx: Tx, id: string): Promise<HolderFacts> {
     const row = await store.get(tx, id);
     const held = row && !row.root_session_id && row.parked_at === null ? await application.hostedHolds(tx, id) : [];

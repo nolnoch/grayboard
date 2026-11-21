@@ -91,8 +91,9 @@ export function queueWorldStop(seconds: number) { queueWorldStopS += seconds; }
 
 // The hosted gate's keyed fast path (#1510 chunk 3, hosted.ts withGate/withPrior): per site, a request whose body ran
 // keyed (`keyed`), one whose keyed attempt missed and ran the exclusive body after it (`miss`), and one that ran
-// exclusive without an attempt (`skipped`: SQLite, no row yet, a parked row, a prior that differed outright).
-export const GATE_SITES = ["gate", "prior"] as const;
+// exclusive without an attempt (`skipped`: SQLite, no row yet, a parked row, a prior that differed outright). Delivery's
+// renew and receipt the same (#1510 chunk 4, delivery.ts): `skipped` there is SQLite, or the keyed path turned off.
+export const GATE_SITES = ["gate", "prior", "renew", "receipt"] as const;
 export const GATE_OUTCOMES = ["keyed", "miss", "skipped"] as const;
 export type GateSite = typeof GATE_SITES[number];
 export type GateOutcome = typeof GATE_OUTCOMES[number];
@@ -228,7 +229,7 @@ export function render(gauges: Gauges = {}): string {
   for (const [site, b] of queueHold) out.push(`grayboard_write_queue_bodies_total${labelText({ site })} ${b.count}`);
   family("grayboard_write_queue_keyed_bodies_total", "counter", "Write-queue bodies released that ran keyed (overlapping other keyed bodies), by calling site; the rest ran exclusive.");
   for (const [site, n] of queueKeyed) out.push(`grayboard_write_queue_keyed_bodies_total${labelText({ site })} ${n}`);
-  family("grayboard_hosted_gate_bodies_total", "counter", "Hosted gate requests by site and how the gate body ran: keyed (the fast path), miss (a keyed attempt, then the exclusive body), skipped (exclusive without an attempt).");
+  family("grayboard_hosted_gate_bodies_total", "counter", "Hosted gate and delivery requests by site and how the write body ran: keyed (the fast path), miss (a keyed attempt, then the exclusive body), skipped (exclusive without an attempt).");
   for (const [k, n] of gateFast) { const [site, outcome] = k.split(":"); out.push(`grayboard_hosted_gate_bodies_total${labelText({ site: site!, outcome: outcome! })} ${n}`); }
   family("grayboard_write_queue_world_stop_seconds_total", "counter", "Seconds in which an exclusive write-queue body waited or ran, so keyed bodies arriving meanwhile waited behind it: its drain of the keyed bodies ahead of it plus its hold.");
   out.push(`grayboard_write_queue_world_stop_seconds_total ${num(queueWorldStopS)}`);

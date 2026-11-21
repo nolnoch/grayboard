@@ -194,6 +194,24 @@ describePg("boards store races (Postgres)", () => {
     expect(r.waited).toBe(true);
   });
 
+  // #1510 chunk 4: a queue post's first acknowledge credits its take (a claim_events write), which a keyed body may not
+  // do: the store refuses it (keyed receipt misses on a queue board before it gets here; this is the backstop) and the
+  // body rolls back. A broadcast post's acknowledge is keyed receipt's own. Mutation: the refusal dropped (the keyed
+  // acknowledge commits).
+  test("a queue post's first acknowledge refuses in a keyed body (its queue take credit); a broadcast post's runs keyed", async () => {
+    await using p = await pgPair();
+    const root = await hall(p, "queue");
+    await p.a.write(tx => bs.insertOutbox(tx, root, [[FE, { reason: "subscription", wake: true }]]));
+    const e = await caught(() => p.a.writeKeyed(["root:a"], tx => bs.acknowledge(tx, FE, { kind: "push", post_id: root })));
+    expect((e as Error).message).toContain("boards.acknowledge's queue take credit (a claim_events write) refused in a keyed write body (keys root:a)");
+    expect((await p.db.sql`SELECT delivered_at FROM outbox`)[0].delivered_at).toBeNull();
+    await p.a.write(tx => bs.create(tx, { name: "news", purpose: "p", scope: null, kind: "broadcast", createdBy: BE, now: T0 }));
+    const post = (await p.a.write(tx => bs.insertPost(tx, np("item", T0, null, "news")))).id;
+    await p.a.write(tx => bs.insertOutbox(tx, post, [[FE, { reason: "subscription", wake: true }]]));
+    await p.a.writeKeyed(["root:a"], tx => bs.acknowledge(tx, FE, { kind: "push", post_id: post }));
+    expect((await p.db.sql`SELECT delivered_at FROM outbox WHERE post_id = ${post}`)[0].delivered_at).not.toBeNull();
+  });
+
   // #1472: a receipt from S1 for FE, which S2 holds when it starts, so its first statement (delivered_at IS NULL)
   // marks nothing; FE's hold moves back to S1 at the pause before the repeat statement, which then sees S1 holding it.
   // The row stays undelivered and S2's, credited to no one. Mutation: the repeat's `delivered_at IS NOT NULL` dropped
