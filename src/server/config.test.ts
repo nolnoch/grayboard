@@ -548,6 +548,12 @@ describe("loadConfig", () => {
     expect(line).toBe("s3://example-bucket/grayboard/blobs/ (eu-central-1, endpoint http://127.0.0.1:9000; static keys)");
     for (const secret of ["AKIAEXAMPLE", "example-secret", "example-session"]) expect(line).not.toContain(secret);
     expect(describeBlobs({ blobDir: "/srv/blobs" })).toBe("directory /srv/blobs");
+    // Prefixes S3 takes as written: dots inside a segment, its other safe characters, a trailing "/".
+    for (const [ok, normalized] of [["a.b/c-d_e/", "a.b/c-d_e/"], ["x!*'()", "x!*'()/"], ["..a/b..", "..a/b../"]]) {
+      process.env.GRAYBOARD_BLOB_S3_PREFIX = ok;
+      expect(loadConfig().blobS3?.prefix).toBe(normalized);
+    }
+    process.env.GRAYBOARD_BLOB_S3_PREFIX = "grayboard/blobs";
     // One place for attachments.
     process.env.GRAYBOARD_BLOB_DIR = "/srv/blobs";
     expect(() => loadConfig()).toThrow("Set one of GRAYBOARD_BLOB_S3_BUCKET, GRAYBOARD_BLOB_DIR, not both");
@@ -555,6 +561,10 @@ describe("loadConfig", () => {
     for (const [name, bad, refusal] of [
       ["GRAYBOARD_BLOB_S3_BUCKET", "Example_Bucket", "GRAYBOARD_BLOB_S3_BUCKET must be an S3 bucket name"],
       ["GRAYBOARD_BLOB_S3_PREFIX", "/blobs", "GRAYBOARD_BLOB_S3_PREFIX must not start with \"/\""],
+      ...["../other-bucket/x", "a/../b", "a/./b", "a/..", ".", "a//b", "a b", "a\\b", "a?b", "a#b", "a%2e%2e/b", "ü/x"].map(bad =>
+        ["GRAYBOARD_BLOB_S3_PREFIX", bad, "GRAYBOARD_BLOB_S3_PREFIX must be \"/\"-separated segments"] as const),
+      ["GRAYBOARD_BLOB_S3_ENDPOINT", "https://user:pass@s3.example.com", "GRAYBOARD_BLOB_S3_ENDPOINT must not carry credentials"],
+      ["GRAYBOARD_BLOB_S3_ENDPOINT", "https://user@s3.example.com", "GRAYBOARD_BLOB_S3_ENDPOINT must not carry credentials"],
       ["GRAYBOARD_BLOB_S3_ENDPOINT", "ftp://example.com", "GRAYBOARD_BLOB_S3_ENDPOINT must be an http(s) URL"],
       ["GRAYBOARD_BLOB_S3_ENDPOINT", "not a url", "GRAYBOARD_BLOB_S3_ENDPOINT must be an http(s) URL"],
       ["GRAYBOARD_BLOB_S3_REGION", "us-east-1.evil", "the S3 region must be an AWS region name"],

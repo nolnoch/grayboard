@@ -126,7 +126,7 @@ Credentials come from the environment, in this order:
 
 Half of either pair, or neither, keeps the server from starting, and so does `S3_SESSION_TOKEN`: Bun's S3 client would sign with it. At startup the server reads a key under the prefix (`grayboard-startup-check`, which needn't exist) and doesn't start if S3 refuses; the startup log names the bucket, prefix and credential source, never a key.
 
-The role needs this policy (stand-in names):
+Give the attachments a bucket of their own. The role needs this policy (stand-in names):
 
 ```json
 {
@@ -134,13 +134,12 @@ The role needs this policy (stand-in names):
   "Statement": [
     { "Effect": "Allow", "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
       "Resource": "arn:aws:s3:::example-bucket/grayboard/blobs/*" },
-    { "Effect": "Allow", "Action": "s3:ListBucket", "Resource": "arn:aws:s3:::example-bucket",
-      "Condition": { "StringLike": { "s3:prefix": "grayboard/blobs/*" } } }
+    { "Effect": "Allow", "Action": "s3:ListBucket", "Resource": "arn:aws:s3:::example-bucket" }
   ]
 }
 ```
 
-`s3:ListBucket` is not optional: without it, S3 answers a read of a missing object with 403 Access Denied instead of 404, so a swept attachment's download fails as a server error instead of "bytes are gone", and the startup check is refused. The condition keeps it to the prefix.
+`s3:ListBucket` is not optional: without it, S3 answers a read of a missing object with 403 Access Denied instead of 404, so a swept attachment's download fails as a server error instead of "bytes are gone", and the startup check is refused. A startup refusal with `AccessDenied` on the `grayboard-startup-check` key most likely means `s3:ListBucket` is missing. It is unconditioned on purpose, which is why the bucket should be dedicated: it lets the role list every key in the bucket. Narrowing it with an `s3:prefix` condition is unverified: the check behind a missing object's 404 may not carry `s3:prefix`, so the condition can fail and turn every missing key, the startup check's among them, into 403.
 
 The bucket is the attachments' durability: turn on versioning, with a noncurrent-version expiry, so a deleted or overwritten object can be recovered. `deploy/backup.sh` mirrors a blob directory only; with S3 it has nothing to copy for attachments. Run one replica: uploads and blob sweeps are serialized within one process, and two servers sharing a bucket could sweep bytes the other has just uploaded (#808).
 

@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -15,10 +15,14 @@ import { CHECK_KEY, S3Blobs } from "./s3_blobs.ts";
 import { startFakeS3, type FakeS3 } from "../../tests/support/fake_s3.ts";
 import { startFakeSts, type FakeSts } from "../../tests/support/fake_sts.ts";
 import { scratchDbPath } from "../../tests/support/scratch_db.ts";
+import { until } from "../../tests/support/until.ts";
 
 const bytes = (s: string) => new TextEncoder().encode(s);
 const text = (b: Uint8Array) => new TextDecoder().decode(b);
-const STATIC: AwsCredentialSpec = { kind: "static", accessKeyId: "AKIASTATIC", secretAccessKey: "static-secret" };
+// With a session token of its own, so Bun never falls back to an ambient AWS_SESSION_TOKEN/S3_SESSION_TOKEN (it does
+// for an absent or empty one): these tests don't depend on the runner's env. Keys without a token, under a scrubbed and
+// hostile env, are the subprocess test's.
+const STATIC: AwsCredentialSpec = { kind: "static", accessKeyId: "AKIASTATIC", secretAccessKey: "static-secret", sessionToken: "static-session" };
 
 let s3: FakeS3;
 let sts: FakeSts;
@@ -31,7 +35,7 @@ beforeEach(() => {
   writeFileSync(join(dir, "token"), "web-identity-token");
   clock = 1_800_000_000_000;
   sts.now = () => clock;
-  s3.allow("AKIASTATIC");
+  s3.allow("AKIASTATIC", "static-session");
 });
 afterEach(() => {
   s3.stop();
@@ -158,4 +162,77 @@ test("a failed S3 put drops the upload's row", async () => {
 test("startServer refuses an S3 config without an opened repo: the store and its check come from openRepo", () => {
   expect(() => startServer({ store: { kind: "sqlite", path: scratchDbPath() }, ...s3Config() } as Config))
     .toThrow("startServer: an S3 attachment store is opened with openRepo, then passed as `repo`");
+});
+
+// Audit M1: a delete abandoned at its deadline may still land; it must not take a newer upload's bytes.
+test("a put after a delete that timed out refuses while the delete is pending, and waits for it once it settles", async () => {
+  const blobs = store({ timeoutMs: 200 });
+  const sha = sha256Hex(bytes("again"));
+  const key = blobs.key(sha);
+  await blobs.put(sha, bytes("again"));
+  const release = s3.hang("DELETE");
+  await expect(blobs.delete(sha)).rejects.toThrow("no answer in 200 ms");
+  // The delete is still in flight: a re-upload fails rather than race it (and so drops its row).
+  await expect(blobs.put(sha, bytes("again"))).rejects.toThrow(`an earlier request for ${sha} is still pending`);
+  await expect(blobs.get(sha)).rejects.toThrow("still pending");
+  expect(s3.requests.filter(r => r.method === "PUT")).toHaveLength(1);
+  release();
+  expect(blobs.abandonedCount).toBe(1);
+  await until(() => !s3.objects.has(key), 5000, "the abandoned delete lands");
+  await until(() => blobs.abandonedCount === 0, 5000, "the settled delete's entry goes");
+  // Settled: the next put goes ahead, and nothing deletes its bytes afterwards.
+  await blobs.put(sha, bytes("again"));
+  expect(text(s3.objects.get(key)!)).toBe("again");
+
+  // A delete that times out and settles while the next put waits: the put goes after it.
+  const release2 = s3.hang("DELETE");
+  await expect(blobs.delete(sha)).rejects.toThrow("no answer in 200 ms");
+  const put = blobs.put(sha, bytes("again"));
+  release2();
+  await put;
+  expect(text(s3.objects.get(key)!)).toBe("again");
+  expect(blobs.abandonedCount).toBe(0);
+  expect(s3.requests.slice(-2).map(r => r.method)).toEqual(["DELETE", "PUT"]);
+});
+
+test("the deadline's timer is cleared when the operation settles", async () => {
+  const blobs = store();
+  const set = spyOn(globalThis, "setTimeout");
+  const cleared = spyOn(globalThis, "clearTimeout");
+  try {
+    const sha = sha256Hex(bytes("timers"));
+    await blobs.put(sha, bytes("timers"));
+    await blobs.get(sha);
+    await blobs.delete(sha);
+    const timers = set.mock.results.map(r => r.value);
+    expect(timers.length).toBeGreaterThanOrEqual(3);
+    const clearedTimers = new Set(cleared.mock.calls.map(c => c[0]));
+    expect(timers.filter(t => !clearedTimers.has(t as ReturnType<typeof setTimeout>))).toEqual([]);
+  } finally {
+    set.mockRestore();
+    cleared.mockRestore();
+  }
+});
+
+// Bun fills an omitted S3Client option from S3_*/AWS_* env, read as the process starts: so a child, with a hostile env.
+test("explicit options beat a hostile S3_*/AWS_* environment", async () => {
+  s3.allow("AKIASTATIC", null);
+  const env: Record<string, string> = {};
+  for (const [k, v] of Object.entries(process.env)) if (v !== undefined && !/^(AWS|S3)_/.test(k)) env[k] = v;
+  Object.assign(env, {
+    S3_ENDPOINT: "http://127.0.0.1:9", AWS_ENDPOINT: "http://127.0.0.1:9", S3_BUCKET: "evil-bucket", AWS_BUCKET: "evil-bucket",
+    S3_ACCESS_KEY_ID: "AKIAEVIL", S3_SECRET_ACCESS_KEY: "evil", AWS_ACCESS_KEY_ID: "AKIAEVIL2", AWS_SECRET_ACCESS_KEY: "evil2",
+    S3_REGION: "eu-west-9", AWS_REGION: "eu-west-9",
+  });
+  const child = Bun.spawn(["bun", join(import.meta.dir, "../../tests/support/s3_static_child.ts"), s3.endpoint, s3.bucket], { env, stdout: "pipe", stderr: "pipe" });
+  const timer = setTimeout(() => child.kill(), 30_000);
+  try {
+    const [out, err, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+    expect({ code, err }).toEqual({ code: 0, err: "" });
+    expect(JSON.parse(out)).toEqual({ get: "child bytes", missing: "BlobMissing" });
+  } finally {
+    clearTimeout(timer);
+  }
+  expect(s3.requests.length).toBe(4);
+  expect(s3.requests.every(r => r.accessKeyId === "AKIASTATIC" && r.sessionToken === null && r.key.startsWith("p/"))).toBe(true);
 });

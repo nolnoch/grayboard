@@ -504,12 +504,17 @@ function s3BlobConfig(env: Record<string, string | undefined>): S3BlobConfig | u
   if (!/^[a-z0-9-]+$/.test(region)) throw new Error(`the S3 region must be an AWS region name like us-east-1, not "${region}"`);
   let prefix = env.GRAYBOARD_BLOB_S3_PREFIX ?? "";
   if (prefix.startsWith("/")) throw new Error(`GRAYBOARD_BLOB_S3_PREFIX must not start with "/": S3 keys have no root, not "${prefix}"`);
+  // A dot segment or an empty one would leave the prefix: Bun normalizes a path-style key's "../" into another bucket's.
+  if (!/^[A-Za-z0-9!_.*'()/-]*$/.test(prefix) || prefix.includes("//") || prefix.split("/").some(seg => seg === "." || seg === ".."))
+    throw new Error(`GRAYBOARD_BLOB_S3_PREFIX must be "/"-separated segments of letters, digits and !_.*'()-, without "." or ".." segments, not "${prefix}"`);
   if (prefix && !prefix.endsWith("/")) prefix += "/";
   const endpoint = env.GRAYBOARD_BLOB_S3_ENDPOINT || undefined;
   if (endpoint) {
     let u: URL | undefined;
     try { u = new URL(endpoint); } catch { /* refused below */ }
     if (!u || (u.protocol !== "https:" && u.protocol !== "http:")) throw new Error(`GRAYBOARD_BLOB_S3_ENDPOINT must be an http(s) URL, not "${endpoint}"`);
+    // The endpoint is printed at startup; credentials go in AWS_* variables, never in it.
+    if (u.username || u.password) throw new Error("GRAYBOARD_BLOB_S3_ENDPOINT must not carry credentials (user:password@): use AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY");
   }
   // Bun's S3 client signs with S3_SESSION_TOKEN when it's handed no session token (static keys without one), and reads
   // it from the environment as the process started: unsetting it at runtime doesn't help.
