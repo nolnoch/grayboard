@@ -48,7 +48,7 @@ try {
   process.exit(1);
 }
 console.log(`grayboard server ${pkg.version} listening on port ${server.port}`);
-console.log(`grayboard server: store ${describeStore(config.store)}`);
+console.log(`grayboard server: store ${describeStore(config.store, { writers: config.databaseWriters })}`);
 // An unauthenticated listener: say where it bound, every start.
 console.log(`grayboard server: metrics ${metrics ? `on ${metrics.hostname}:${metrics.port}` : "off"}`);
 // Write-capable hosted clients are a trust decision (#414, #429); say which at every start.

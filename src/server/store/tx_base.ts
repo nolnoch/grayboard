@@ -136,6 +136,7 @@ export abstract class BaseTx extends BaseRead {
     else if (this !== this.#root) this.#added.push(...inner.#added);
     this.settled(inner, kept);
   }
+  static rootOf(tx: BaseTx): BaseTx { return tx.#root; }
   beforeCommit(key: object, hook: (tx: Tx) => Promise<void>): void {
     this.assertLive();
     if (!this.nests) throw new Error("beforeCommit in a synchronous write body: it commits as it returns");
@@ -163,6 +164,10 @@ export abstract class BaseTx extends BaseRead {
     }
   }
 }
+
+// The transaction a Tx writes in, as an identity its savepoints' Tx share (its root Tx): what state kept per
+// transaction (store/notices.ts) is keyed on. Undefined for a handle that isn't a transaction's.
+export function transactionOf(h: Read): object | undefined { return h instanceof BaseTx ? BaseTx.rootOf(h) : undefined; }
 
 // Whether a handle is a transaction's: a function reached both inside a body and outside one writes on a `Tx` and
 // posts its own write for a `Read` (writeAudit). A settled `Tx` still answers true; writing on it throws (D4).

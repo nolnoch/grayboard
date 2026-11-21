@@ -19,6 +19,7 @@ export const sqliteBackend: TxBackend = {
     const write = repo.write as <T, R>(fn: (tx: Tx) => T | Promise<T>, committed?: (value: T) => R) => Promise<Awaited<R>>;
     return {
       write: (fn, committed) => write(fn, committed),
+      writeKeyed: (keys, fn, committed) => (repo.writeKeyed as <T, R>(keys: readonly string[], fn: (tx: Tx) => T | Promise<T>, committed?: (value: T) => R) => Promise<Awaited<R>>)(keys, fn, committed),
       post: (fn, committed, what) => repo.post(fn, committed, what),
       read: repo.read,
       queue: queueFor(db),

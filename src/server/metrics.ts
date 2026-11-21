@@ -63,13 +63,19 @@ function bin(b: Bins, edges: readonly number[], v: number) {
 const queueWait = new Map<QueueSite, Bins>(QUEUE_SITES.map(s => [s, bins(QUEUE_BUCKETS)]));
 const queueHold = new Map<QueueSite, Bins>(QUEUE_SITES.map(s => [s, bins(QUEUE_BUCKETS)]));
 const queueDepth = bins(QUEUE_DEPTH_BUCKETS);
-let queueWaiters = 0;
+const queueKeyed = new Map<QueueSite, number>(QUEUE_SITES.map(s => [s, 0]));
+let queueWaiters = 0, queueRunning = 0;
 
 // A body queued behind `ahead` others.
 export function queueWaiting(ahead: number) { queueWaiters++; bin(queueDepth, QUEUE_DEPTH_BUCKETS, ahead); }
-// A body released: `waited` when it had queued (queueWaiting counted it), its wait and hold in seconds.
-export function queueBody(site: QueueSite, waited: boolean, waitS: number, holdS: number) {
+// A body started.
+export function queueStarted() { queueRunning++; }
+// A body released: `waited` when it had queued (queueWaiting counted it), `keyed` when it ran keyed (runKeyed), its wait
+// and hold in seconds.
+export function queueBody(site: QueueSite, waited: boolean, keyed: boolean, waitS: number, holdS: number) {
+  queueRunning--;
   if (waited) queueWaiters--;
+  if (keyed) queueKeyed.set(site, queueKeyed.get(site)! + 1);
   bin(queueWait.get(site)!, QUEUE_BUCKETS, waitS);
   bin(queueHold.get(site)!, QUEUE_BUCKETS, holdS);
 }
@@ -202,10 +208,14 @@ export function render(gauges: Gauges = {}): string {
   for (const [site, b] of queueHold) if (b.count) histogram(out, "grayboard_write_queue_hold_seconds", { site }, QUEUE_BUCKETS, b);
   family("grayboard_write_queue_bodies_total", "counter", "Write-queue bodies released, by calling site.");
   for (const [site, b] of queueHold) out.push(`grayboard_write_queue_bodies_total${labelText({ site })} ${b.count}`);
+  family("grayboard_write_queue_keyed_bodies_total", "counter", "Write-queue bodies released that ran keyed (overlapping other keyed bodies), by calling site; the rest ran exclusive.");
+  for (const [site, n] of queueKeyed) out.push(`grayboard_write_queue_keyed_bodies_total${labelText({ site })} ${n}`);
   family("grayboard_write_queue_depth", "histogram", "Bodies already waiting when a body queues behind a held write queue.");
   histogram(out, "grayboard_write_queue_depth", {}, QUEUE_DEPTH_BUCKETS, queueDepth);
   family("grayboard_write_queue_waiters", "gauge", "Bodies waiting for the write queue now.");
   out.push(`grayboard_write_queue_waiters ${queueWaiters}`);
+  family("grayboard_write_queue_running", "gauge", "Bodies running now; above 1 only while keyed bodies overlap.");
+  out.push(`grayboard_write_queue_running ${queueRunning}`);
 
   for (const [suffix, g] of Object.entries(gauges)) {
     const name = `grayboard_${suffix}`;

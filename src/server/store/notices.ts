@@ -4,22 +4,22 @@
 // (a grant or a user), so observers check every one.
 //
 // An observer with `read` gets each named row's facts too, read on the committing transaction's root Tx in a
-// beforeCommit hook (#807 P3 A7g1): the row's state as it commits, not as it was when the op ran. `pending` and `facts`
-// are per observer, not per transaction, because the write queue runs one body at a time and holds itself from the hook
-// through COMMIT to the notices' flush: no other transaction's marks or notices land in between. A mark deletes its
-// id's facts first, so a notice never sees an earlier transaction's; a notice without facts (a synchronous body's Tx,
-// which refuses the hook, or a failed read) is the observer's to handle.
+// beforeCommit hook (#807 P3 A7g1): the row's state as it commits, not as it was when the op ran. The ids waiting for a
+// read and the facts read are per observer and per transaction (keyed on transactionOf, #1510): keyed write bodies
+// overlap on Postgres, and a hook that drained another transaction's pending ids would read that row on its own
+// transaction (the other's uncommitted state invisible to it) and hand the other's notice stale facts. A notice without
+// facts (a synchronous body's Tx, which refuses the hook, or a failed read) is the observer's to handle.
 //
 // Backend-neutral: it imports nothing at runtime but tx_base.ts. The backend says where a notice waits for the commit
 // (`defer`): SQLite on its connection's commit frames (core/sqlite.ts afterCommit), Postgres on the Tx it's given.
-import { isThenable, type Tx } from "./tx_base.ts";
+import { isThenable, transactionOf, type Tx } from "./tx_base.ts";
 
 type Observer = {
   fn: (changed: string | null, facts?: unknown) => void;
   read?: (tx: Tx, id: string) => Promise<unknown>;
-  pending: Set<string>;
-  facts: Map<string, unknown>;
 };
+// One observer's reads in one transaction: the ids marked and not yet read, and the facts read for its notices.
+type Reads = { pending: Set<string>; facts: Map<string, unknown> };
 
 export type Notices = {
   // Tells the observers after `tx`'s transaction commits that `id` (or, null, any row) changed.
@@ -34,32 +34,48 @@ export type Notices = {
 
 export function makeNotices(defer: (tx: Tx, effect: () => void) => void): Notices {
   const observers = new Set<Observer>();
-  const changed = (tx: Tx, id: string | null) => defer(tx, () => {
-    for (const o of observers) {
-      try { o.fn(id, id === null ? undefined : o.facts.get(id)); } catch (error) { console.error("hosted invalidation failed", error); }
-    }
-  });
+  // Per transaction, per observer; dropped with the transaction's root Tx, or after its notices flush.
+  const byTxn = new WeakMap<object, Map<Observer, Reads>>();
+  const readsOf = (txn: object, o: Observer): Reads => {
+    let m = byTxn.get(txn);
+    if (!m) byTxn.set(txn, m = new Map());
+    let r = m.get(o);
+    if (!r) m.set(o, r = { pending: new Set(), facts: new Map() });
+    return r;
+  };
+  const changed = (tx: Tx, id: string | null) => {
+    const txn = transactionOf(tx);
+    defer(tx, () => {
+      const reads = txn && byTxn.get(txn);
+      for (const o of observers) {
+        try { o.fn(id, id === null ? undefined : reads?.get(o)?.facts.get(id)); } catch (error) { console.error("hosted invalidation failed", error); }
+      }
+    });
+  };
   // Queues `id`'s facts read on `tx`'s transaction. Each read runs in its own savepoint and a failure is logged and
   // leaves no facts, so a failed read never fails the commit (on Postgres an unsavepointed failure would abort it).
   const readFacts = (tx: Tx, id: string) => {
+    const txn = transactionOf(tx);
+    if (!txn) return;
     for (const o of observers) {
       const read = o.read;
       if (!read) continue;
-      o.facts.delete(id);
-      o.pending.add(id);
+      const r = readsOf(txn, o);
+      r.facts.delete(id);
+      r.pending.add(id);
       try {
         tx.beforeCommit(o, async root => {
-          const ids = [...o.pending];
-          o.pending.clear();
+          const ids = [...r.pending];
+          r.pending.clear();
           for (const each of ids) {
-            try { o.facts.set(each, await root.savepoint(t => read(t, each))); }
+            try { r.facts.set(each, await root.savepoint(t => read(t, each))); }
             catch (error) { console.error("hosted facts read failed", error); }
           }
           // After this transaction's notices (registered before the hook ran): the facts served their flush.
-          try { root.afterCommit(() => { for (const each of ids) o.facts.delete(each); }); }
+          try { root.afterCommit(() => { for (const each of ids) r.facts.delete(each); }); }
           catch (error) { console.error("hosted facts clear failed", error); }
         });
-      } catch { o.pending.delete(id); /* a synchronous body's Tx refuses the hook: its notices carry no facts */ }
+      } catch { r.pending.delete(id); /* a synchronous body's Tx refuses the hook: its notices carry no facts */ }
     }
   };
   // An async op's notice waits for it to fulfil (#807 P3 A6c): one that rejects changed nothing, as a sync throw didn't.
@@ -72,7 +88,7 @@ export function makeNotices(defer: (tx: Tx, effect: () => void) => void): Notice
     change: fn => (...args) => then(fn(...args), () => changed(args[0], null)),
     marks: (fn, id) => (...args) => then(fn(...args), () => { const at = id(...args); readFacts(args[0], at); changed(args[0], at); }),
     subscribe(fn, read) {
-      const o: Observer = { fn: fn as Observer["fn"], read, pending: new Set(), facts: new Map() };
+      const o: Observer = { fn: fn as Observer["fn"], read };
       observers.add(o);
       return () => { observers.delete(o); };
     },

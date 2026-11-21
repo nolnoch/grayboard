@@ -10,6 +10,7 @@ import { until } from "../../../../tests/support/until.ts";
 import { txContract, type TxBackend } from "../tx.contract.ts";
 import { sqliteOf, sqliteRead } from "../tx.ts";
 import type { Read, Tx } from "../tx_base.ts";
+import { makeNotices } from "../notices.ts";
 import { makePgTransactions, pgOf, TxAborted, type PgTransactions } from "./tx.ts";
 
 // Written as a store function will be: a plain `await` on pgOf's statement, which pgOf sends as it's built.
@@ -38,10 +39,10 @@ const rejection = async (p: Promise<unknown>): Promise<any> => {
 
 // A scratch database with the contract's table, and a store on it. `db.sql` is the database's own read-write pool:
 // the test's admin and second reader.
-async function scratch(opts: { max?: number; app?: string } = {}): Promise<{ db: PgDatabase; s: PgTransactions; [Symbol.asyncDispose](): Promise<void> }> {
+async function scratch(opts: { max?: number; writers?: number; app?: string } = {}): Promise<{ db: PgDatabase; s: PgTransactions; [Symbol.asyncDispose](): Promise<void> }> {
   const db = await pgEmptyDatabase({ max: 4 });
   await db.sql`CREATE TABLE t (seq int8 GENERATED ALWAYS AS IDENTITY, v text)`;
-  const s = makePgTransactions(db.url, { max: opts.max ?? 4, applicationName: opts.app ?? "gb-test-tx" });
+  const s = makePgTransactions(db.url, { max: opts.max ?? 4, writers: opts.writers ?? 4, applicationName: opts.app ?? "gb-test-tx" });
   return { db, s, async [Symbol.asyncDispose]() { await s.close(); await db[Symbol.asyncDispose](); } };
 }
 
@@ -51,7 +52,7 @@ const pgBackend: TxBackend = {
     const { db, s, [Symbol.asyncDispose]: dispose } = await scratch();
     void db;
     return {
-      write: s.write, post: s.post, read: s.read, queue: s.queue,
+      write: s.write, writeKeyed: s.writeKeyed, post: s.post, read: s.read, queue: s.queue,
       put, rows,
       inTransaction: s.inTransaction,
       drain: () => s.write(() => {}),
@@ -465,4 +466,115 @@ describePg("Postgres in-doubt COMMIT", () => {
       }
     }, 30000);
   }
+});
+
+// #1510: keyed bodies overlap, each on its own write-pool connection, and what "inside a body" means is per body.
+describePg("Postgres write scheduler", () => {
+  // p, or a rejection naming `what` once `ms` pass: a gate that never opens fails the test, not the run.
+  const within = <T>(p: Promise<T>, what: string, ms = 10000): Promise<T> => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    return Promise.race([p, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(`${what} within ${ms} ms`)), ms); })])
+      .finally(() => clearTimeout(timer));
+  };
+
+  test("T-P19 two keyed bodies with no key in common are open at once, on two connections; an exclusive one waits for both", async () => {
+    await using x = await scratch({ writers: 2 });
+    const aIn = gate(), bIn = gate();
+    const pids: number[] = [];
+    const body = (v: string, mine: ReturnType<typeof gate>, other: ReturnType<typeof gate>) => async (tx: Tx) => {
+      await put(tx, v);
+      pids.push((await pgOf(tx)`SELECT pg_backend_pid() AS pid`)[0].pid);
+      mine.open();
+      // Each waits for the other to be inside its own transaction: on one slot this never happens.
+      await within(other.wait, `the other keyed body to start beside ${v}`);
+    };
+    let exclusiveRan = false;
+    const a = x.s.writeKeyed(["root:a"], body("a", aIn, bIn));
+    const b = x.s.writeKeyed(["root:b"], body("b", bIn, aIn));
+    const exclusive = x.s.write(async tx => { exclusiveRan = true; expect(await rows(tx)).toEqual(["a", "b"].sort()); });
+    await Promise.all([a, b]);
+    await exclusive;
+    expect(exclusiveRan).toBe(true);
+    expect(new Set(pids).size).toBe(2);
+    expect((await rows(x.s.read)).sort()).toEqual(["a", "b"]);
+  });
+
+  test("T-P20 the pool-read refusal and inTransaction answer for the calling body, not for any open one", async () => {
+    await using x = await scratch({ writers: 2 });
+    await x.s.write(tx => put(tx, "seed"));
+    const aIn = gate(), bIn = gate(), aGo = gate(), aDone = gate(), lateGo = gate(), timerFired = gate(), bGo = gate();
+    const seen: Record<string, unknown> = {};
+    const refused = async (what: string) => {
+      const e = await rejection(rows(x.s.read));
+      seen[what] = String(e.message).includes("repo.read inside the caller's own transaction") ? "refused" : e;
+    };
+    const a = x.s.writeKeyed(["root:a"], async tx => {
+      await put(tx, "a");
+      seen.aInTx = x.s.inTransaction();
+      await refused("aRead");
+      // A timer A leaves behind fires while A's transaction is still open: still A's.
+      setTimeout(() => { void refused("aTimer").then(timerFired.open); }, 0);
+      await within(timerFired.wait, "A's timer to fire");
+      // Left running past A's release, as an async afterCommit effect's continuation is.
+      tx.afterCommit(() => {
+        void lateGo.wait.then(async () => {
+          seen.aLate = { inTx: x.s.inTransaction(), mine: x.s.queue.mine, rows: (await rows(x.s.read)).sort() };
+        });
+      });
+      aIn.open();
+      await within(aGo.wait, "the test to let A commit");
+    });
+    const b = x.s.writeKeyed(["root:b"], async tx => {
+      await put(tx, "b");
+      bIn.open();
+      await within(aIn.wait, "A to be open beside B");
+      seen.bInTx = x.s.inTransaction();
+      await refused("bRead");
+      // B stays open until A's left-over continuation has run.
+      await within(bGo.wait, "the test to let B commit");
+      expect(await rows(tx)).toContain("b");
+    });
+    await within(Promise.all([aIn.wait, bIn.wait]), "both bodies to open");
+    // A task outside both bodies reads the pool while both transactions are open.
+    seen.outside = { inTx: x.s.inTransaction(), rows: await rows(x.s.read) };
+    void a.then(aDone.open);
+    aGo.open();
+    await within(aDone.wait, "A to commit");
+    lateGo.open();
+    await until(() => seen.aLate, 5000, "A's left-over continuation to run");
+    bGo.open();
+    await b;
+    expect(seen).toEqual({
+      aInTx: true, aRead: "refused", aTimer: "refused",
+      bInTx: true, bRead: "refused",
+      outside: { inTx: false, rows: ["seed"] },
+      // B is still open here: A's continuation is neither A (released) nor B.
+      aLate: { inTx: false, mine: false, rows: ["a", "seed"] },
+    });
+  });
+
+  test("T-P21 two overlapping transactions' change notices carry each its own facts, read on its own transaction", async () => {
+    await using x = await scratch({ writers: 2 });
+    const notices = makeNotices((tx, effect) => tx.afterCommit(effect));
+    const seen: Array<[string | null, unknown]> = [];
+    notices.subscribe<number>((id, facts) => { seen.push([id, facts]); },
+      async (tx, id) => (await pgOf(tx)`SELECT count(*)::int AS n FROM t WHERE v = ${id}`)[0].n);
+    const marked = notices.marks((tx: Tx, v: string) => put(tx, v), (_tx, v) => v);
+    const aMarked = gate(), bMarked = gate();
+    const a = x.s.writeKeyed(["root:a"], async tx => {
+      await marked(tx, "a");
+      aMarked.open();
+      // B marks its row before A commits: A's hook must not read B's (on A's transaction, B's row isn't there).
+      await within(bMarked.wait, "B to mark its row");
+    });
+    const b = x.s.writeKeyed(["root:b"], async tx => {
+      await within(aMarked.wait, "A to mark its row");
+      await marked(tx, "b");
+      await marked(tx, "b");
+      bMarked.open();
+      await a;
+    });
+    await Promise.all([a, b]);
+    expect(seen).toEqual([["a", 1], ["b", 2], ["b", 2]]);
+  });
 });
