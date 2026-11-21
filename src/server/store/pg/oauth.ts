@@ -301,6 +301,15 @@ export function makePgOAuth({ hosted }: { hosted: PgHostedEnds }): OAuthStore {
       const g = row.data as OAuthGrant;
       return g.clientId === clientId && g.resource === resource ? g : undefined;
     },
+    async findRefreshUser(r, h, clientId, resource, now) {
+      if (!lookup(h, now)) return undefined;
+      const [row] = await pgOf(r)`SELECT g.data FROM oauth_tokens t JOIN oauth_grants g ON g.id = t.grant_id JOIN users u ON u.id = g.user_id
+        WHERE t.hash = ${h} AND t.kind = 'refresh' AND t.spent_at IS NULL AND t.revoked_at IS NULL AND t.expires_at > ${now}
+          AND g.revoked_at IS NULL AND g.expires_at > ${now} AND u.disabled_at IS NULL`;
+      if (!row) return undefined;
+      const g = row.data as OAuthGrant;
+      return g.clientId === clientId && g.resource === resource ? g.userId : undefined;
+    },
     async rotateRefresh(tx, input, now) {
       if (!lookup(input.refreshHash, now)) return invalid;
       const sql = pgOf(tx);

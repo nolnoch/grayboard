@@ -1,7 +1,8 @@
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
-import { hashToken, mintToken, reauthDue, type AuthedUser } from "./auth.ts";
+import { hashToken, mintToken, type AuthedUser } from "./auth.ts";
 import { callbackPath, defaultProviders, DomainRefused, idpSignIn, type IdentityProvider, type UpstreamIdentity } from "./idp.ts";
-import { checkIdpConfig, DEFAULT_IDP_REAUTH_DAYS, type Config } from "./config.ts";
+import { checkIdpConfig, recheckConfig, type Config } from "./config.ts";
+import { createIdpRecheck, type IdpRecheck } from "./idp_recheck.ts";
 import type { AuthPeek, Repo } from "./db.ts";
 import type { Read, Tx } from "./store/tx.ts";
 import { BUILTIN_CLIENT_IDS, BUILTIN_CLIENTS, CLI_CLIENT, CLI_CLIENT_ID, isServiceClientId, LOGIN_SCOPE, matchesRedirect, mcpResource, oauthPublicUrl, OAUTH_SCOPES, OPENCODE_CLIENT, parseOAuthClients, sourceKeyFor, type OAuthClient } from "./oauth-config.ts";
@@ -29,6 +30,9 @@ export type OAuthOptions = {
   // Trusted dependency injection, never populated from HTTP or operator client metadata.
   // Defaults to the providers config lists (defaultProviders). Config's own checks never read this list (#928 D6).
   providers?: IdentityProvider[];
+  // The IdP re-check (#930 A2) the server shares with CLI-token auth, built over `providers`. Defaults to one with no
+  // hooks to call (a test of this module alone).
+  recheck?: IdpRecheck;
 };
 // The auth gate's keys for the caller: its address (/64 for IPv6) and, for
 // IPv6, its /48 (#274), else null.
@@ -133,7 +137,8 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
   // Built-ins and the CLI first; parseOAuthClients refuses an operator entry that reuses one of their IDs.
   const clients = new Map([...BUILTIN_CLIENTS, CLI_CLIENT, ...parseOAuthClients(JSON.stringify(config.oauthClients ?? []))].map(c => [c.clientId, c]));
   const now = options.now ?? Date.now;
-  const reauthDays = config.idpReauthDays ?? DEFAULT_IDP_REAUTH_DAYS;
+  const recheck = options.recheck ?? createIdpRecheck(repo, providers, recheckConfig(config),
+    { disconnectUser() {}, userChanged() {}, background: (what, run) => void run().catch(e => console.error(`[grayboard] ${what} failed:`, e)) }, now);
   // Before any request (the server's `ready` waits for it, #807 P3 A4), and only once the config parsed: a grant an
   // operator client issued under a now-built-in ID (before #429) would otherwise act as a built-in's.
   // Both writes are queued here, in order, so the built-in cutover commits before the CLI's and both before
@@ -659,6 +664,15 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
         } else {
           if (!client.allowRefresh) fail("invalid_grant");
           const refreshHash = hashToken(required(p, "refresh_token"));
+          // The IdP re-check (#930 A2), outside any transaction and only for a token rotation could spend: a replay
+          // still reaches the rotation's family revocation. A user it disabled is refused; an outage past the stale
+          // bound answers 503 with the token unspent, which the hosted adapters keep.
+          const owner = await repo.oauth.findRefreshUser(repo.read, refreshHash, client.clientId, resource, now());
+          if (owner !== undefined) {
+            const verdict = await recheck.beforeRefresh(owner);
+            if (verdict === "refuse") fail("invalid_grant");
+            if (verdict === "unavailable") return json({ error: "temporarily_unavailable" }, 503, { "Retry-After": "60" });
+          }
           // As the code above: the grant is read in the rotation's transaction.
           ({ t, result } = await repo.write(async tx => {
             const t = now();
@@ -671,7 +685,7 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
             // after a fresh sign-in, while a replay (not ok) still commits its family revocation.
             if (result.status === "ok") {
               const user = await repo.users.findById(tx, grant!.userId);
-              if (!user || reauthDue(user, t, reauthDays)) fail("invalid_grant");
+              if (!user || recheck.fallbackDue(user)) fail("invalid_grant");
             }
             return { t, result };
           }));

@@ -32,6 +32,7 @@ import { SizeTally, checkFile, contentDisposition, reprDigest, sanitizeFilename 
 import { ALIAS_SCOPE_CAP, aliasCapRefusal } from "./alias_cap.ts";
 import { ensureTeamBoard, onAliasCreated, onTeamJoined, onTeamLeft } from "./teams.ts";
 import type { SlackLinker } from "./slack.ts";
+import type { IdpRecheck } from "./idp_recheck.ts";
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -46,10 +47,10 @@ function badRequest(msg: string): Response { return jsonErr("bad_request", msg, 
 function conflict(msg: string): Response { return jsonErr("conflict", msg, 409); }
 function forbidden(msg: string): Response { return jsonErr("forbidden", msg, 403); }
 
-async function requireAuth(req: Request, repo: Repo, touches: TouchQueue, idleDays: number, reauthDays: number): Promise<AuthedUser | null> {
+async function requireAuth(req: Request, repo: Repo, touches: TouchQueue, idleDays: number, reauth: number | Pick<IdpRecheck, "cliRefused">): Promise<AuthedUser | null> {
   const raw = extractBearer(req);
   if (!raw) return null;
-  return verifySessionToken(raw, repo, touches, idleDays, reauthDays);
+  return verifySessionToken(raw, repo, touches, idleDays, reauth);
 }
 
 async function parseBody<T>(req: Request): Promise<T | null> {
@@ -1058,6 +1059,8 @@ export type SessionHooks = {
   disconnectUser: (userId: number) => void;
   // principal: a principal's name; its sessions' aliases are re-checked.
   accessChanged: (h: Read, principal: string, by: string) => Promise<void>;
+  // The server's IdP re-check (#930 A2), shared with the OAuth refresh path; absent, the bare fallback clock.
+  recheck?: Pick<IdpRecheck, "cliRefused">;
 };
 
 export async function handleHttp(
@@ -1078,7 +1081,7 @@ export async function handleHttp(
   const signIn = signInRoute(method, path, config);
   if (signIn) return signIn.handle(req, repo, config, ip);
 
-  const authed = await requireAuth(req, repo, touches, config.cliTokenIdleDays ?? DEFAULT_CLI_TOKEN_IDLE_DAYS, config.idpReauthDays ?? DEFAULT_IDP_REAUTH_DAYS);
+  const authed = await requireAuth(req, repo, touches, config.cliTokenIdleDays ?? DEFAULT_CLI_TOKEN_IDLE_DAYS, sessions.recheck ?? config.idpReauthDays ?? DEFAULT_IDP_REAUTH_DAYS);
   if (!authed) return jsonErr("unauthenticated", "invalid or missing token", 401);
 
   if (path === "/api/auth/logout" && method === "POST") return authLogout(authed, repo);

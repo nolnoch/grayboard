@@ -27,6 +27,11 @@ export type IdentityProvider = {
   // nonce, verified email, domain), with the email lowercased. Verification
   // lives here so no caller can skip it.
   exchange(i: ExchangeInput): Promise<UpstreamIdentity>;
+  // The directory's word on a subject this provider signed in (#930 A2, idp_recheck.ts). "inactive" only for an
+  // answer that the person is suspended, deprovisioned or gone; it throws on anything else (network, 5xx, 429, our
+  // own credential refused with 401/403, the signal's abort). Absent: the provider has no directory check, and its
+  // users re-authenticate every GRAYBOARD_IDP_REAUTH_DAYS instead.
+  status?(subject: string, signal: AbortSignal): Promise<"active" | "inactive">;
 };
 
 // A provider's refusal of a verified identity whose email is outside the org's domains (D5). The AS
