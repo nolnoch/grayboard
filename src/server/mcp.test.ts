@@ -1469,8 +1469,8 @@ function repoCalls(repo: Repo): { readonly list: { method: string; tx: boolean }
 // Allowlists, not lists of the methods that read a table: many Repo methods read alias_holds or hosted_sessions inside
 // their SQL (aliases.seen, claims, boards' delivery reads, the session end…), and a denylist misses the one it forgets.
 // B1b: the calls the notice may make outside a body's Tx. hosted.takeEnded takes no handle and reads no row;
-// hosted.write is the 250 ms sweep timer's queued write, which can tick inside the window: it takes no handle, and the
-// calls its body makes are recorded on its Tx, so a read there is still judged.
+// hosted.write is any handle-less queued hosted write (the test holds the sweep timer that makes one): the calls its
+// body makes are still recorded on its Tx, so a read there is still judged.
 const NOTICE_OFF_TX = new Set(["hosted.takeEnded", "hosted.write"]);
 // #899: the methods quiet ticks may call, on either backend: board visibility and the auth cache's refills, none of
 // which reads hosted_sessions or alias_holds (pg/boards.ts get, pg/identity.ts principals.of, pg/oauth.ts).
