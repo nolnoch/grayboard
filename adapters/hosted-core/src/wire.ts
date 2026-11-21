@@ -1,6 +1,7 @@
 import { Client, InsufficientScopeError, SdkError, SdkErrorCode, SdkHttpError, StreamableHTTPClientTransport, type AuthProvider, type CallToolResult, type Tool } from "@modelcontextprotocol/client";
 import type { Delivery, SessionFacts } from "./port.js";
 import { setTimeout as sleep } from "node:timers/promises";
+import { connect as tcpConnect, type Socket } from "node:net";
 
 export const DELIVERY_META = "io.github.nolnoch.grayboard/delivery";
 export const LAUNCHER_META = "io.github.nolnoch.grayboard/launcher";
@@ -112,9 +113,9 @@ function scopeRefusal(error: unknown): boolean {
   }
   return false;
 }
-const networkCodes = new Set(["ECONNREFUSED", "ConnectionRefused", "ECONNRESET", "ETIMEDOUT", "EHOSTUNREACH", "ENETUNREACH", "ENOTFOUND", "EAI_AGAIN", "FailedToOpenSocket"]);
+const networkCodes = new Set(["ECONNREFUSED", "ConnectionRefused", "ECONNRESET", "ETIMEDOUT", "EHOSTUNREACH", "ENETUNREACH", "ENOTFOUND", "EAI_AGAIN", "FailedToOpenSocket", "UND_ERR_CONNECT_TIMEOUT"]);
 // A failure to open the socket: no request left, so even a write is safe to call again.
-const connectCodes = new Set(["ECONNREFUSED", "ConnectionRefused", "EHOSTUNREACH", "ENETUNREACH", "ENOTFOUND", "EAI_AGAIN", "FailedToOpenSocket"]);
+const connectCodes = new Set(["ECONNREFUSED", "ConnectionRefused", "EHOSTUNREACH", "ENETUNREACH", "ENOTFOUND", "EAI_AGAIN", "FailedToOpenSocket", "UND_ERR_CONNECT_TIMEOUT"]);
 const gatewayStatuses = new Set([502, 503, 504]);
 // Walks the cause chain: the SDK rethrows fetch failures from requests, but
 // wraps them during connect (SdkError EraNegotiationFailed {cause}).
@@ -142,9 +143,9 @@ export function listenCapacity(error: unknown): boolean {
 
 // A tool call's raw failure, before reachable() classifies it: an outage
 // after its request may have left (anything but a socket that never opened)
-// is OutcomeUnknown. A ServerUnreachable already is the credential's (a
-// refresh before the request, or after a 401 or 429 the server refused it
-// with), so nothing ran and it stays as it is.
+// is OutcomeUnknown. A ServerUnreachable already is from before the request
+// left (the credential's refresh, a 401 or 429 the server refused it with, or
+// the connect probe), so nothing ran and it stays as it is.
 function outcome(error: unknown): unknown {
   for (let e = error, depth = 0; e && depth < 8; e = (e as { cause?: unknown }).cause, depth++) {
     if (e instanceof ServerUnreachable) return error;
@@ -166,6 +167,39 @@ export function abortOf(error: unknown, signal: AbortSignal): boolean {
 }
 
 const connectMethods = new Set(["server/discover", "initialize"]);
+
+// The connect probe (#1347). Neither runtime's fetch takes a connect deadline (Bun's has none; Node's undici gives up
+// at 10 s, after the SDK's 10 s request timeout), so a blackholed endpoint would fail a call as a request timeout,
+// OutcomeUnknown, though nothing left. Before a tool call on a wire with no recent answer, a plain TCP connect to the
+// endpoint under a deadline shorter than the request's (the Rust SDK's CONNECT_TIMEOUT) proves the server reachable
+// or the call unsent. Skipped behind a proxy, where a direct connect proves nothing. Tests shorten the deadline, or
+// replace `open` with a socket that never connects.
+export const connectProbe = { deadlineMs: 5_000, coldMs: 30_000, open: (host: string, port: number): Socket => tcpConnect({ host, port }) };
+function proxied(url: URL): boolean {
+  const env = typeof process === "undefined" ? {} : process.env;
+  const names = url.protocol === "https:" ? ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"] : ["HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"];
+  return names.some(n => !!env[n]);
+}
+function probe(url: URL, signal: AbortSignal): Promise<void> {
+  const host = url.hostname.replace(/^\[(.*)\]$/, "$1");
+  const port = Number(url.port || (url.protocol === "https:" ? 443 : 80));
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) { reject(signal.reason); return; }
+    const socket = connectProbe.open(host, port);
+    const done = (error?: unknown) => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", onAbort);
+      socket.destroy();
+      if (error === undefined) resolve(); else reject(error);
+    };
+    const ms = connectProbe.deadlineMs;
+    const timer = setTimeout(() => done(Object.assign(new Error(`connect to ${host}:${port} timed out after ${ms} ms`), { code: "ETIMEDOUT" })), ms);
+    const onAbort = () => done(signal.reason);
+    signal.addEventListener("abort", onAbort, { once: true });
+    socket.once("connect", () => done());
+    socket.once("error", done);
+  });
+}
 async function methodOf(request: Request): Promise<string | undefined> {
   if (request.method !== "POST") return;
   const message = await request.clone().json().catch(() => undefined) as { method?: unknown } | undefined;
@@ -180,6 +214,9 @@ abstract class Connection {
   readonly connect: () => Promise<void>;
   private refusal?: ConnectRefused;
   private busy?: ServerBusy;
+  // When this wire last had an answer, for the connect probe; only the native role probes, as only its calls classify OutcomeUnknown.
+  private answeredAt = 0;
+  protected probes = false;
   protected constructor(protected readonly wireOptions: WireOptions, authProvider: AuthProvider, readonly signal: AbortSignal, beforeRetry?: () => Promise<void>) {
     this.client = new Client(wireOptions.client, { versionNegotiation: { mode: { pin: "2026-07-28" } } });
     const endpoint = new URL(wireOptions.url);
@@ -193,6 +230,10 @@ abstract class Connection {
         const signal = AbortSignal.any([request.signal, this.signal]);
         const method = await methodOf(request);
         const connecting = method !== undefined && connectMethods.has(method);
+        if (this.probes && method === "tools/call" && Date.now() - this.answeredAt >= connectProbe.coldMs && !proxied(endpoint)) {
+          // An abort stays itself (a stop, or the caller's); any other failure means the request never left.
+          try { await probe(endpoint, signal); } catch (error) { throw signal.aborted ? error : new ServerUnreachable(error); }
+        }
         for (let attempt = 0; ; attempt++) {
           if (attempt) {
             // A guard's refusal or a credential's failure between tries is its own error, not the capacity wait's.
@@ -204,6 +245,7 @@ abstract class Connection {
           }
           signal.throwIfAborted();
           const response = await fetch(request.clone(), { headers: outgoing, redirect: "error", signal });
+          this.answeredAt = Date.now();
           if (connecting && !response.ok && ![401, 403, 429].includes(response.status) && !gatewayStatuses.has(response.status)) {
             this.refusal = new ConnectRefused(response.status, (await response.clone().text().catch(() => "")).slice(0, 4096));
           }
@@ -328,6 +370,7 @@ export class Wire extends Connection {
 export class NativeWire extends Connection {
   constructor(options: WireOptions, authProvider: AuthProvider, signal: AbortSignal, readonly sessionID?: string, beforeRetry?: () => Promise<void>) {
     super(options, authProvider, signal, beforeRetry);
+    this.probes = true;
   }
   protected decorate() {}
   protected meta() { return { ...(this.sessionID === undefined ? {} : { [this.wireOptions.sessionKey]: this.sessionID, ...this.facts(this.sessionID) }), ...this.declaration() }; }
@@ -344,7 +387,7 @@ export class NativeWire extends Connection {
   }
   // The server's result untouched: content, structuredContent, isError, _meta.
   // Called on a connected wire, so an outage here may have come after the
-  // request left: OutcomeUnknown unless the socket never opened.
+  // request left: OutcomeUnknown unless the socket never opened (or the connect probe failed, so it never tried).
   async callTool(name: string, args: Record<string, unknown>, sessionID: string, signal?: AbortSignal): Promise<CallToolResult> {
     const call = this.client.callTool({ name, arguments: args, _meta: { [this.wireOptions.sessionKey]: sessionID, ...this.declaration(), ...this.facts(sessionID) } }, this.options(signal));
     return this.reachable(call.catch(error => { throw this.signal.aborted ? error : outcome(error); }));
