@@ -409,11 +409,39 @@ function migrateHostedHolds(db: Database): void {
 // outlives the child's source row. A child registered before the column, or by
 // an older release sharing the file, gets it from its live source row here.
 // Runs after initCoreSchema, which adds ids.root_id.
+//
+// #540 2: a child that ended before then has no source row; its
+// hosted.child_registered audit rows (target: the root, detail.child: the
+// child) name its root. Each child takes its latest registration's, unless its
+// ID started as a root since (an ownership of its own begun after that
+// registration, when hostedRoot cleared root_id on purpose). The audit rows
+// are read once each: server_state's CHILD_ROOTS_AUDIT_KEY holds the last
+// access_log id read, so an open reads only rows written since the last one
+// (normally none: a registration by this code already set root_id), and never
+// refills a root_id a later role change cleared.
+const CHILD_ROOTS_AUDIT_KEY = "child_roots_audit_id";
 function recordChildRoots(db: Database): void {
   db.exec(`
     UPDATE ids SET root_id = (SELECT h.root_session_id FROM hosted_sessions h WHERE h.session_id = ids.id)
       WHERE root_id IS NULL AND id IN (SELECT session_id FROM hosted_sessions WHERE root_session_id IS NOT NULL);
   `);
+  const from = db.query<{ value: number }, [string]>(`SELECT value FROM server_state WHERE key = ?`).get(CHILD_ROOTS_AUDIT_KEY)?.value ?? 0;
+  const to = db.query<{ id: number | null }, []>(`SELECT MAX(id) AS id FROM access_log`).get()?.id ?? 0;
+  if (to <= from) return;
+  // Materialized, so each statement below reads the window's rows once (inlined, the latest-per-child pick and the
+  // ownership probe were correlated rescans of it): latest is each child's last registration in the window, reborn
+  // the children whose ID began an ownership of its own after it.
+  db.run(`
+    WITH latest AS MATERIALIZED (
+           SELECT child, root, at FROM (
+             SELECT json_extract(detail, '$.child') AS child, target AS root, at,
+                    ROW_NUMBER() OVER (PARTITION BY json_extract(detail, '$.child') ORDER BY id DESC) AS n
+               FROM access_log WHERE id > ?1 AND id <= ?2 AND action = 'hosted.child_registered' AND target IS NOT NULL AND json_valid(detail))
+            WHERE n = 1 AND child IS NOT NULL),
+         reborn AS MATERIALIZED (SELECT DISTINCT l.child FROM latest l JOIN hosted_ownerships o ON o.session_id = l.child AND o.started_at > l.at)
+    UPDATE ids SET root_id = l.root FROM latest l
+      WHERE l.child = ids.id AND ids.root_id IS NULL AND l.child NOT IN (SELECT child FROM reborn)`, [from, to]);
+  db.run(`INSERT INTO server_state (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`, [CHILD_ROOTS_AUDIT_KEY, to]);
 }
 
 // #521 5: a server sets ids.launcher only for a live hosted root's ownership (hostedDeclareLauncher), and that
