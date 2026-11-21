@@ -181,7 +181,8 @@ function refusalsTotal(s: Sample[]): Record<string, number> {
 // `cum[i]` counts observations at or under `le[i]`; the last edge is +Inf.
 export type CumHist = { le: number[]; cum: number[]; sum: number; count: number };
 // `keyed`: bodies that ran keyed, per site; `worldStop`: seconds in which an exclusive body waited or ran (chunk 2);
-// `gate`: the hosted gate's requests by `<site>:<outcome>` (grayboard_hosted_gate_bodies_total, chunk 3).
+// `gate`: keyed requests by `<site>:<outcome>` (grayboard_hosted_gate_bodies_total; gate and prior, chunk 3; renew
+// and receipt, chunk 4).
 export type QueueCum = { wait: Map<string, CumHist>; hold: Map<string, CumHist>; depth?: CumHist; keyed: Map<string, number>; worldStop: number; gate: Map<string, number> };
 export function queueCumulative(s: Sample[]): QueueCum {
   const q: QueueCum = { wait: new Map(), hold: new Map(), keyed: new Map(), worldStop: 0, gate: new Map() };
@@ -246,8 +247,9 @@ export type QueueStats = {
   // The highest depth bucket edge any body that queued met (null: none queued; past the last edge reads as it + 1).
   maxDepth: number | null;
   sites: Record<string, { bodies: number; bodiesPerS: number; busy: number; wait: Dist; hold: Dist; keyed: number }>;
-  // The hosted gate's fast path per site (gate, prior): requests whose body ran keyed, missed (a keyed attempt, then
-  // the exclusive body), or skipped it; `missRate`: misses over attempts (keyed + miss), null with none.
+  // The keyed fast path per site (the hosted gate's gate and prior, delivery's renew and receipt): requests whose body
+  // ran keyed, missed (a keyed attempt, then the exclusive body), or skipped it; `missRate`: misses over attempts
+  // (keyed + miss), null with none.
   gate: Record<string, { keyed: number; miss: number; skipped: number; missRate: number | null }>;
 };
 // A span's queue numbers from its histogram deltas over `wallS` seconds.

@@ -242,6 +242,10 @@ export interface Repo {
   // fn swallowed it. Postgres only (store/pg/tx.ts readsOnly): absent on SQLite, whose one writer has nothing to gain
   // from a keyed body, so the hosted gate's keyed fast path is Postgres's.
   readsOnly?<T>(tx: Tx, fn: () => Promise<T>): Promise<T>;
+  // writeKeyed whose body may register afterCommit effects and pass `committed`, and queue the change notices of the ops
+  // `notices` names (store/notices.ts, by op name: `hosted.update`); every other notice still refuses (D4, #1510 chunk
+  // 4). Postgres only, for the reviewed callers D4 lists (delivery's renew and receipt); absent on SQLite.
+  writeKeyedEffects?<T, R = T>(keys: readonly string[], notices: readonly string[], fn: (tx: Tx) => Promise<T>, committed?: (value: T) => R): Promise<Awaited<R>>;
   // The store's read handle outside any transaction (#807 P1c): reads committed state. The task holding an open
   // transaction can't use it (sqliteOf refuses, #807 P3 A7e2): it passes its body's Tx. A Postgres Read is a pool
   // handle and must never resolve to a transaction's connection.

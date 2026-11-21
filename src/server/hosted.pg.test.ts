@@ -29,6 +29,7 @@ import { GRAYBOARD_EFFORT_META, GRAYBOARD_LAUNCHER_META, GRAYBOARD_MODEL_META } 
 import { issueOAuth } from "../../tests/helpers/oauth.ts";
 import { hostedPause } from "../../tests/support/hosted-pause.ts";
 import type { Tx } from "./store/tx_base.ts";
+import { pgOf } from "./store/pg/tx.ts";
 
 // Above the pool's 5 s lock_timeout (pg/tx.ts), so a broken lock fails on its own error, not on Bun's timeout.
 setDefaultTimeout(30_000);
@@ -833,5 +834,455 @@ describePg("hosted gate keyed fast path (Postgres)", () => {
     expect(counts.miss).toBeGreaterThanOrEqual(4);
     expect(fastRows).toEqual(refRows);
     expect(fastRows.access_log!.length).toBeGreaterThan(0);
+  });
+});
+
+// #1510 chunk 4: delivery's renew and receipt keyed by their root on Postgres (delivery.ts keyedOr, D4). Each runs its
+// reads in a probe, then writes only the session's own rows; anything else misses into today's exclusive body. A keyed
+// renew is held at its lease UPDATE and a keyed receipt at its first markDelivered or board acknowledge (`state.hold`);
+// `state.entry`, while set, holds a renew or receipt after its gate, before its keyed body queues, so two of one root
+// can both be past their gates. Every wait has a deadline. Without GRAYBOARD_TEST_PG_URL it skips.
+async function leaseInstance(url: string, opts: { keyed?: false; side?: string } = {}) {
+  const blobDir = mkdtempSync(join(tmpdir(), "gb-pg-blobs-"));
+  let clock = T0;
+  const repo: PgRepo = await makePgRepo(url, { blobDir, applicationName: `gb-test-lease-${opts.side ?? "a"}`, max: 4, now: () => clock });
+  const store = repo.hosted;
+  const state = { hold: undefined as Gate | undefined, entry: undefined as Gate | undefined, arrived: 0, held: 0, entered: [] as string[], marked: [] as number[],
+    exclusive: [] as Array<{ site: string | undefined; startedHeld?: boolean }>, defer: undefined as Gate | undefined };
+  const keyedTx = (tx: unknown) => (tx as { txn?: { keys?: ReadonlySet<string> } }).txn?.keys !== undefined;
+  const holdHere = async (what: string) => {
+    if (!state.hold) return;
+    state.entered.push(what); state.held++;
+    try { await state.hold.wait; } finally { state.held--; }
+  };
+  const update = store.update;
+  store.update = (async (tx: Tx, id: string, patch: Parameters<typeof update>[2]) => {
+    if (keyedTx(tx) && currentSite() === "renew") await holdHere(`renew ${id}`);
+    return update(tx, id, patch);
+  }) as typeof store.update;
+  const markDelivered = repo.messages.markDelivered;
+  repo.messages.markDelivered = async (tx, id, at) => {
+    if (currentSite() === "receipt") state.marked.push(id);
+    await markDelivered(tx, id, at);
+    // After its first row lock, so a held receipt holds that message's row.
+    if (keyedTx(tx) && currentSite() === "receipt" && state.marked.length === 1) await holdHere(`receipt ${id}`);
+  };
+  const acknowledge = repo.boards.acknowledge;
+  repo.boards.acknowledge = async (tx, handle, ref, receiver) => {
+    if (keyedTx(tx) && currentSite() === "receipt") await holdHere(`ack ${handle}`);
+    return acknowledge(tx, handle, ref, receiver);
+  };
+  const writeKeyedEffects = repo.writeKeyedEffects!;
+  repo.writeKeyedEffects = (async (keys: readonly string[], notices: readonly string[], fn: (tx: Tx) => Promise<unknown>, committed?: (v: unknown) => unknown) => {
+    if (state.entry) { state.arrived++; await state.entry.wait; }
+    return writeKeyedEffects(keys, notices, fn, committed);
+  }) as typeof repo.writeKeyedEffects;
+  // Every exclusive body, hosted's and the Repo's: whether it started while a keyed body was held. `defer`: while set,
+  // a hosted write queued under no site (the timer's sweep, heartbeat and reconcile) waits on it before it queues.
+  for (const target of [repo, store] as Array<{ write: PgRepo["write"] }>) {
+    const write = target.write;
+    target.write = ((fn: (tx: Tx) => unknown, committed?: (v: unknown) => unknown) => {
+      const site = currentSite();
+      const queue = () => {
+        const b: { site: string | undefined; startedHeld?: boolean } = { site };
+        state.exclusive.push(b);
+        return write(async (tx: Tx) => { b.startedHeld = state.held > 0; return fn(tx); }, committed);
+      };
+      return target === store && site === undefined && state.defer ? state.defer.wait.then(queue) : queue();
+    }) as PgRepo["write"];
+  }
+  const application = createApplication(repo);
+  const hosted = createHostedSessions(application, { now: () => clock, isAuthorized: () => true });
+  await hosted.ready;
+  const delivery = createDelivery(hosted, { isAuthorized: () => true, ...(opts.keyed === false ? { keyed: false as const } : {}) });
+  const user = await seed(repo, tx => repo.users.upsertByEmail(tx, ME, null));
+  return {
+    repo, application, hosted, delivery, user, state, q: repo.writeQueue,
+    advance(ms: number) { clock += ms; },
+    get clock() { return clock; },
+    async [Symbol.asyncDispose]() {
+      state.hold?.open(); state.entry?.open(); state.defer?.open();
+      try { delivery.close(); await hosted.close(); await application.stopExpiry(); await repo.close(); }
+      finally { rmSync(blobDir, { recursive: true, force: true }); }
+    },
+  };
+}
+type LeaseInstance = Awaited<ReturnType<typeof leaseInstance>>;
+const leasePrincipal = async (x: LeaseInstance, sql: Awaited<ReturnType<typeof pgDatabase>>["sql"], grant = "G1"): Promise<OAuthPrincipal> => {
+  await sql`INSERT INTO oauth_grants (id, user_id, expires_at, data) VALUES (${grant}, ${x.user.id}, ${Number.MAX_SAFE_INTEGER}, '{}'::jsonb) ON CONFLICT DO NOTHING`;
+  return { authed: { user_id: x.user.id, user_email: x.user.email, kind: "user", session_id: 0 }, clientId: OPENCODE_CLIENT, sourceKey: OPENCODE_SESSION_META, grantId: grant, accessHash: "test", accessExpiry: Number.MAX_SAFE_INTEGER, scopes: ["tools", "delivery"] };
+};
+// A root `source` bound to `name` with an open lease; `changed` counts the lease's wakes.
+async function leased(x: LeaseInstance, p: OAuthPrincipal, source: string, name: string) {
+  const c = ctx(p, source);
+  await x.hosted.bind(p, c, { name, create: true });
+  const wakes = { n: 0 };
+  const lease = await x.delivery.open(p, c, { changed: () => { wakes.n++; } });
+  x.delivery.accept(lease);
+  return { c, id: idOf(p, source), lease, wakes };
+}
+const renewDelta = (site: "renew" | "receipt") => {
+  const at = { keyed: gateCount(site, "keyed"), miss: gateCount(site, "miss"), skipped: gateCount(site, "skipped") };
+  return () => ({ keyed: gateCount(site, "keyed") - at.keyed, miss: gateCount(site, "miss") - at.miss, skipped: gateCount(site, "skipped") - at.skipped });
+};
+
+describePg("keyed renew and receipt (Postgres)", () => {
+  // The renew's notice (hosted.update's, its one opted-in notice) is what moves the lease's row, which `deliver()`
+  // judges: past the first deadline a DM still wakes the lease. Mutation: renew's notices [] (the keyed update
+  // refuses and renew rejects); keyedOr's countGate("keyed") dropped (the count is 0).
+  test("a keyed renew writes the lease's columns, and its notice keeps the lease waking past its first deadline", async () => {
+    await using db = await pgDatabase({ max: 2 });
+    await using x = await leaseInstance(db.url);
+    const p = await leasePrincipal(x, db.sql);
+    const { c, id, lease, wakes } = await leased(x, p, "root-a", "fe");
+    const sender = new AppSession(x.application, x.repo, p.authed, "be", { push: false });
+    await sender.connect();
+    try {
+      x.advance(20_000);
+      const d = renewDelta("renew");
+      const renewed = await x.delivery.renew(p, c, lease.capability);
+      expect(d()).toEqual({ keyed: 1, miss: 0, skipped: 0 });
+      expect(renewed.expiresAt).toBe(x.clock + 30_000);
+      const row = (await db.sql`SELECT lease_deadline, last_seen_at FROM hosted_sessions WHERE session_id = ${id}`)[0];
+      expect([Number(row.lease_deadline), Number(row.last_seen_at)]).toEqual([x.clock + 30_000, x.clock]);
+      // Past the open's deadline, inside the renewed one.
+      x.advance(15_000);
+      const before = wakes.n;
+      await sender.send(`${ME}/fe`, "after the first deadline");
+      await until(() => wakes.n > before, 10_000, "the renewed lease woke for the DM");
+      expect(x.delivery.activeLeaseCount).toBe(1);
+    } finally { sender.close(); }
+  });
+
+  // Mutation: renew's key `root:<capability>` (two of one root overlap) or one key for every renew (different roots
+  // don't).
+  test("renews of different roots overlap; two of one root run one at a time", async () => {
+    await using db = await pgDatabase({ max: 2 });
+    await using x = await leaseInstance(db.url);
+    const p = await leasePrincipal(x, db.sql);
+    const a = await leased(x, p, "root-a", "fe"), b = await leased(x, p, "root-b", "be");
+    // Different roots: a is held at its update, and b's enters beside it.
+    x.state.hold = gate();
+    const ra = x.delivery.renew(p, a.c, a.lease.capability);
+    await until(() => x.state.held === 1, 10_000, "a's renew held");
+    const rb = x.delivery.renew(p, b.c, b.lease.capability);
+    await until(() => x.state.held === 2, 10_000, "b's renew entered beside a's");
+    x.state.hold.open();
+    await Promise.all([ra, rb]);
+    expect(x.state.entered).toEqual([`renew ${a.id}`, `renew ${b.id}`]);
+    // One root: both past their gates first, then released into the queue together; the second waits on the key.
+    x.state.entered = [];
+    x.state.entry = gate(); x.state.arrived = 0;
+    const r1 = x.delivery.renew(p, a.c, a.lease.capability), r2 = x.delivery.renew(p, a.c, a.lease.capability);
+    await until(() => x.state.arrived === 2, 10_000, "both renews past their gates");
+    x.state.hold = gate();
+    x.state.entry.open(); x.state.entry = undefined;
+    await until(() => x.state.held === 1 && x.q.waitingAt("renew") === 1, 10_000, "one renew held, the other queued on its key");
+    expect(x.state.entered).toEqual([`renew ${a.id}`]);
+    x.state.hold.open();
+    await Promise.all([r1, r2]);
+    expect(x.state.entered).toEqual([`renew ${a.id}`, `renew ${a.id}`]);
+  });
+
+  // A renew and a receipt of one root, both past their gates, run one at a time; the second waits on the root's key.
+  // Mutation: receipt's key `root:<capability>` or one per call (the receipt's mark enters beside the held renew).
+  test("a renew and a receipt of one root run one at a time", async () => {
+    await using db = await pgDatabase({ max: 2 });
+    await using x = await leaseInstance(db.url);
+    const p = await leasePrincipal(x, db.sql);
+    const { c, id, lease } = await leased(x, p, "root-a", "fe");
+    const sender = new AppSession(x.application, x.repo, p.authed, "be", { push: false });
+    await sender.connect();
+    try {
+      await sender.send(`${ME}/fe`, "one");
+      const items = await x.delivery.pending(p, c, lease.capability);
+      x.state.entry = gate(); x.state.arrived = 0; x.state.marked = [];
+      const renewed = x.delivery.renew(p, c, lease.capability);
+      await until(() => x.state.arrived === 1, 10_000, "the renew past its gate");
+      const receipt = x.delivery.receipt(p, c, lease.capability, items.map(i => i.id));
+      await until(() => x.state.arrived === 2, 10_000, "the receipt past its gate");
+      x.state.hold = gate();
+      x.state.entry.open(); x.state.entry = undefined;
+      await until(() => x.state.held === 1 && x.q.waitingAt("receipt") === 1, 10_000, "the renew held, the receipt queued on its key");
+      expect(x.state.entered).toEqual([`renew ${id}`]);
+      expect(x.state.marked).toEqual([]);
+      x.state.hold.open();
+      await Promise.all([renewed, receipt]);
+      expect(x.state.marked).toHaveLength(1);
+    } finally { sender.close(); }
+  });
+
+  // Anything the receipt's reads would write (pending's lost-ack repair is the one today) refuses in the probe: a miss,
+  // and the exclusive body runs it. Injected here as a no-op UPDATE in the cursor read pending makes. Mutation:
+  // keyedOr treating a ProbeWrite as the request's (the receipt rejects with it).
+  test("a write the receipt's probed reads would send misses, and the exclusive body sends it", async () => {
+    await using db = await pgDatabase({ max: 2 });
+    await using x = await leaseInstance(db.url);
+    const p = await leasePrincipal(x, db.sql);
+    const { c, lease } = await leased(x, p, "root-a", "fe");
+    const sender = new AppSession(x.application, x.repo, p.authed, "be", { push: false });
+    await sender.connect();
+    try {
+      await sender.send(`${ME}/fe`, "one");
+      const items = await x.delivery.pending(p, c, lease.capability);
+      const get = x.repo.cursors.get;
+      let sent = 0;
+      x.repo.cursors.get = async (r, ...a) => {
+        if (currentSite() === "receipt") { await pgOf(r)`UPDATE hosted_sessions SET last_seen_at = last_seen_at WHERE false`; sent++; }
+        return get(r, ...a);
+      };
+      const d = renewDelta("receipt");
+      await x.delivery.receipt(p, c, lease.capability, items.map(i => i.id));
+      expect(d()).toEqual({ keyed: 0, miss: 1, skipped: 0 });
+      expect(sent).toBeGreaterThan(0);
+      expect(await x.repo.cursors.directFor(x.repo.read, `${ME}/fe`)).toBe(Number(items[0]!.id.slice("direct:".length)));
+    } finally { sender.close(); }
+  });
+
+  // A lease finished while a keyed renew's update awaits: the renew misses, and the exclusive body refuses it, so the
+  // new deadline is rolled back (delivery.test.ts's #807 P3 A6e2 test, keyed). Mutation: the keyed body's lease recheck
+  // after its update dropped (the deadline commits, then `committed` refuses).
+  test("a lease finished while a keyed renew's update awaits stays finished, and its deadline is rolled back", async () => {
+    await using db = await pgDatabase({ max: 2 });
+    await using x = await leaseInstance(db.url);
+    const p = await leasePrincipal(x, db.sql);
+    const { c, id, lease } = await leased(x, p, "root-a", "fe");
+    const deadline = async () => Number((await db.sql`SELECT lease_deadline FROM hosted_sessions WHERE session_id = ${id}`)[0].lease_deadline);
+    const before = await deadline();
+    x.advance(1_000);
+    const d = renewDelta("renew");
+    x.state.hold = gate();
+    const renewed = x.delivery.renew(p, c, lease.capability);
+    await until(() => x.state.held === 1, 10_000, "the renew held at its update");
+    x.delivery.close();
+    expect(x.delivery.activeLeaseCount).toBe(0);
+    x.state.hold.open();
+    await expect(renewed).rejects.toHaveProperty("code", "not_found");
+    expect(d()).toEqual({ keyed: 0, miss: 1, skipped: 0 });
+    expect(await deadline()).toBe(before);
+  });
+
+  // Mutation: the scheduler letting an exclusive body start beside a keyed one (each exclusive body below starts held).
+  test("an end, a bind, a revoke and a sweep each wait for a running keyed renew; a bind of its root waits on its call", async () => {
+    await using db = await pgDatabase({ max: 2 });
+    await using x = await leaseInstance(db.url);
+    const p = await leasePrincipal(x, db.sql);
+    const a = await leased(x, p, "root-a", "fe");
+    await x.hosted.run(p, ctx(p, "root-b"), "whoami", () => null);
+    const other = await seed(x.repo, tx => x.repo.users.upsertByEmail(tx, "other@example.com", null));
+    x.state.exclusive = [];
+    x.state.hold = gate();
+    const renewed = x.delivery.renew(p, a.c, a.lease.capability);
+    await until(() => x.state.held === 1, 10_000, "the renew held");
+    const end = x.hosted.release(idOf(p, "root-b"), "closed");
+    const revoke = x.repo.write(tx => x.repo.sessions.revokeAllForUser(tx, other.id));
+    const bind = x.hosted.bind(p, ctx(p, "root-c"), { name: "be", create: true });
+    // The held root's own bind waits in memory, on the root's gate the renew's call holds.
+    const sameRoot = x.hosted.bind(p, a.c, { name: "qa", create: true });
+    await until(() => x.q.waitingAt("gate") >= 1 && x.q.waitingAt("other") >= 3, 10_000, "the end, the revoke, the bind and a timer body queued");
+    expect(x.state.exclusive.filter(b => b.startedHeld)).toEqual([]);
+    x.state.hold.open();
+    await Promise.all([renewed, end, revoke, bind, sameRoot]);
+    expect(x.state.exclusive.filter(b => b.startedHeld)).toEqual([]);
+    expect(x.state.entered).toEqual([`renew ${a.id}`]);
+    // The bind committed after the renew, so the lease is finished by it.
+    expect(x.delivery.activeLeaseCount).toBe(0);
+  });
+
+  // A bind another instance commits between the gate and the renew's body: the probe's row differs from the gate's,
+  // so the renew misses, and the exclusive body refuses the stale capability with one audit. Mutation: the probe's
+  // comparison with the gate's row dropped survives (get's lease match refuses the same rows: reported); keyedOr
+  // treating an ApplicationError from the probe as the request's (the renew refuses keyed, miss 0).
+  test("a renew whose root another instance re-bound since its gate misses, and the exclusive body refuses it once; a receipt the same", async () => {
+    await using db = await pgDatabase({ max: 2 });
+    await using a = await leaseInstance(db.url, { side: "a" });
+    await using b = await leaseInstance(db.url, { side: "b" });
+    const p = await leasePrincipal(a, db.sql);
+    // fe and be, so the root keeps a hold after B's unbind of fe.
+    const c = ctx(p, "root-a"), id = idOf(p, "root-a");
+    await a.hosted.bind(p, c, { name: "fe", create: true });
+    await a.hosted.bind(p, c, { name: "be", create: true });
+    const lease = await a.delivery.open(p, c);
+    a.delivery.accept(lease);
+    a.state.entry = gate(); a.state.arrived = 0;
+    const d = renewDelta("renew");
+    const renewed = a.delivery.renew(p, c, lease.capability);
+    await until(() => a.state.arrived === 1, 10_000, "the renew past its gate");
+    await b.hosted.unbind(p, c, { name: "fe" });
+    a.state.entry.open(); a.state.entry = undefined;
+    await expect(renewed).rejects.toHaveProperty("code", "not_found");
+    expect(d()).toEqual({ keyed: 0, miss: 1, skipped: 0 });
+    await atSite("other", () => a.repo.write(() => {}));
+    expect((await db.sql`SELECT count(*)::int AS n FROM access_log WHERE action = 'hosted.stale_capability' AND target = ${id}`)[0].n).toBe(1);
+    // A receipt the same: its probe's lease check refuses the new generation, a miss, and the exclusive body's refusal
+    // is audited once.
+    const r = renewDelta("receipt");
+    await expect(a.delivery.receipt(p, c, lease.capability, [])).rejects.toHaveProperty("code", "not_found");
+    expect(r()).toEqual({ keyed: 0, miss: 1, skipped: 0 });
+    const audits = async () => (await db.sql`SELECT count(*)::int AS n FROM access_log WHERE action = 'hosted.stale_capability' AND target = ${id}`)[0].n as number;
+    // The refusal's audit is posted (writeAudit): committed once the posted write has run.
+    await until(async () => await audits() === 2, 10_000, "the receipt's refusal audited");
+    await atSite("other", () => a.repo.write(() => {}));
+    expect(await audits()).toBe(2);
+  });
+
+  // The send is exclusive: it waits for the keyed receipt of its address. Mutation: receipt's key dropped to none
+  // (writeKeyedEffects([])) is refused by the scheduler; the scheduler starting the send beside it (startedHeld).
+  test("a send to the address waits for a running keyed receipt, then lands after it", async () => {
+    await using db = await pgDatabase({ max: 2 });
+    await using x = await leaseInstance(db.url);
+    const p = await leasePrincipal(x, db.sql);
+    const { c, lease } = await leased(x, p, "root-a", "fe");
+    const sender = new AppSession(x.application, x.repo, p.authed, "be", { push: false });
+    await sender.connect();
+    try {
+      await sender.send(`${ME}/fe`, "one");
+      const items = await x.delivery.pending(p, c, lease.capability);
+      expect(items).toHaveLength(1);
+      x.state.exclusive = [];
+      x.state.hold = gate();
+      const d = renewDelta("receipt");
+      const receipt = x.delivery.receipt(p, c, lease.capability, items.map(i => i.id));
+      await until(() => x.state.held === 1, 10_000, "the receipt held after its first mark");
+      const before = x.q.waiting;
+      const sent = sender.send(`${ME}/fe`, "two");
+      await until(() => x.q.waiting > before, 10_000, "the send queued");
+      expect(x.state.exclusive.filter(b => b.startedHeld)).toEqual([]);
+      x.state.hold.open();
+      await Promise.all([receipt, sent]);
+      expect(d()).toEqual({ keyed: 1, miss: 0, skipped: 0 });
+      expect(x.state.exclusive.filter(b => b.startedHeld)).toEqual([]);
+      const next = await x.delivery.pending(p, c, lease.capability);
+      expect(next.map(i => (i.event as { message: { body: string } }).message.body)).toEqual(["two"]);
+    } finally { sender.close(); }
+  });
+
+  // handleAck marks in id order whatever order the client sent (scope pair 4), so it locks messages as
+  // messages.prune's batch does. Mutation: handleAck without its sort (the marks come in the client's order).
+  test("a receipt of unsorted ids marks them in id order", async () => {
+    await using db = await pgDatabase({ max: 2 });
+    await using x = await leaseInstance(db.url);
+    const p = await leasePrincipal(x, db.sql);
+    const { c, lease } = await leased(x, p, "root-a", "fe");
+    const sender = new AppSession(x.application, x.repo, p.authed, "be", { push: false });
+    await sender.connect();
+    try {
+      for (const body of ["one", "two", "three"]) await sender.send(`${ME}/fe`, body);
+      const items = await x.delivery.pending(p, c, lease.capability);
+      x.state.marked = [];
+      await x.delivery.receipt(p, c, lease.capability, items.map(i => i.id).reverse());
+      const ids = items.map(i => Number(i.id.slice("direct:".length)));
+      expect(x.state.marked).toEqual([...ids].sort((m, n) => m - n));
+      expect(ids.length).toBe(3);
+    } finally { sender.close(); }
+  });
+
+  // The deadlock pairs (scope pairs 4 and 5), forced across two instances, since on one the scheduler never runs a
+  // prune or an end beside a keyed receipt. A's receipt of reversed ids is held after its first mark; B's prune of
+  // those messages, then B's end of the root, wait on its locks and finish after it, with no 40P01. Mutation: handleAck
+  // without its sort (the receipt holds the newest message, the prune locks the oldest and waits on it, and the
+  // receipt's next mark waits on the prune: 40P01).
+  test("another instance's prune and end of the root wait for a held keyed receipt, with no deadlock", async () => {
+    await using db = await pgDatabase({ max: 4 });
+    await using a = await leaseInstance(db.url, { side: "a" });
+    await using b = await leaseInstance(db.url, { side: "b" });
+    const p = await leasePrincipal(a, db.sql);
+    const { c, id, lease } = await leased(a, p, "root-a", "fe");
+    const sender = new AppSession(a.application, a.repo, p.authed, "be", { push: false });
+    await sender.connect();
+    try {
+      for (const body of ["one", "two", "three"]) await sender.send(`${ME}/fe`, body);
+      const items = await a.delivery.pending(p, c, lease.capability);
+      a.state.marked = [];
+      a.state.hold = gate();
+      const receipt = a.delivery.receipt(p, c, lease.capability, items.map(i => i.id).reverse());
+      await until(() => a.state.held === 1, 10_000, "the receipt held after its first mark");
+      const prune = atSite("other", () => b.repo.write(tx => b.repo.messages.prune(tx, a.clock + 1)));
+      await until(async () => await lockWaiters(db.sql) >= 1, 10_000, "the prune waits on the receipt's row lock");
+      a.state.hold.open();
+      await receipt;
+      await prune;
+      expect(await db.sql`SELECT id FROM messages`).toEqual([]);
+
+      // The end: B ends the root while A's next receipt is held.
+      await sender.send(`${ME}/fe`, "four");
+      const more = await a.delivery.pending(p, c, lease.capability);
+      a.state.marked = [];
+      a.state.hold = gate();
+      const second = a.delivery.receipt(p, c, lease.capability, more.map(i => i.id));
+      await until(() => a.state.held === 1, 10_000, "the second receipt held");
+      const ended = b.hosted.release(id, "closed");
+      await until(async () => await lockWaiters(db.sql) >= 1, 10_000, "the end waits on the receipt's root lock");
+      a.state.hold.open();
+      await second;
+      await ended;
+      expect(await b.repo.hosted.get(b.repo.read, id)).toBeUndefined();
+    } finally { sender.close(); }
+  });
+});
+
+describePg("keyed renew and receipt rows (Postgres)", () => {
+  // One script on two databases: keyed (receipts of DMs and a broadcast push, renews) with misses (a queue board's
+  // push, whose first ack credits its take; a stale capability's renew and receipt, each refused and audited once by
+  // the exclusive body), and the same with the keyed path off. Mutations: keyedOr letting a queue board's receipt run
+  // keyed (the store's backstop refuses it: the receipt rejects); the miss path skipping the exclusive body (the
+  // rows differ); a stale capability counted as the request's in the keyed body (audited twice or not at all).
+  test("miss-then-exclusive writes the same rows as the exclusive bodies alone", async () => {
+    const script = async (x: LeaseInstance, sql: Awaited<ReturnType<typeof pgDatabase>>["sql"]) => {
+      const p = await leasePrincipal(x, sql);
+      const tool = (source: string, name: string, args: Record<string, unknown>) =>
+        x.hosted.run(p, ctx(p, source), name, (session, tx) => x.application.call(tx, session, name, args));
+      await x.hosted.bind(p, ctx(p, "root-s"), { name: "ops", create: true });
+      await tool("root-s", "board_create", { name: "b1", purpose: "broadcast" });
+      await tool("root-s", "board_create", { name: "q1", purpose: "queue", kind: "queue" });
+      const { c, lease } = await leased(x, p, "root-a", "fe");
+      await tool("root-a", "board_subscribe", { board: "b1", mode: "push" });
+      await tool("root-a", "board_subscribe", { board: "q1", mode: "push" });
+      // A fixed key, so the sender's ID is the same in both runs.
+      const sender = new AppSession(x.application, x.repo, p.authed, "be", { push: false, key: "rows-sender-key" });
+      await sender.connect();
+      const renew = renewDelta("renew"), receipt = renewDelta("receipt");
+      try {
+        x.state.defer = gate();
+        for (const body of ["one", "two"]) { await sender.send(`${ME}/fe`, body); x.advance(10); }
+        await tool("root-s", "board_post", { board: "b1", body: "news" }); x.advance(10);
+        await tool("root-s", "board_post", { board: "q1", body: "job" }); x.advance(10);
+        const items = await x.delivery.pending(p, c, lease.capability);
+        const kinds = items.map(i => i.id.split(":")[0]);
+        expect(kinds).toEqual(["direct", "direct", "push", "push"]);
+        x.advance(10);
+        await x.delivery.receipt(p, c, lease.capability, [items[1]!.id, items[0]!.id]); x.advance(10);
+        await x.delivery.receipt(p, c, lease.capability, [items[2]!.id]); x.advance(10);
+        await x.delivery.receipt(p, c, lease.capability, [items[3]!.id]); x.advance(10);
+        await x.delivery.renew(p, c, lease.capability); x.advance(10);
+        await expect(x.delivery.renew(p, c, "no-such-capability")).rejects.toHaveProperty("code", "not_found"); x.advance(10);
+        await expect(x.delivery.receipt(p, c, lease.capability, ["direct:999999"])).rejects.toHaveProperty("code", "not_found"); x.advance(10);
+        await x.delivery.renew(p, c, lease.capability);
+        await atSite("other", () => x.repo.write(() => {}));
+      } finally { sender.close(); }
+      return { renew: renew(), receipt: receipt() };
+    };
+    const dump = async (sql: Awaited<ReturnType<typeof pgDatabase>>["sql"]) => {
+      const out: Record<string, string[]> = {};
+      for (const [table, drop] of [["hosted_sessions", []], ["messages", []], ["mailbox_cursors", []], ["outbox", []], ["subscriptions", []], ["claim_events", ["id"]], ["dm_acks", []], ["access_log", ["id"]]] as const) {
+        const rows: Array<Record<string, unknown>> = await sql.unsafe(`SELECT * FROM ${table}`);
+        // A message's delivered_at is the application's wall clock (application.ts now), not the injected one: only
+        // whether it was set is compared.
+        const norm = (r: Record<string, unknown>) => table === "messages" ? { ...r, delivered_at: r.delivered_at === null ? null : "set" } : r;
+        out[table] = rows.map(r => JSON.stringify(Object.fromEntries(Object.entries(norm(r)).filter(([k]) => !(drop as readonly string[]).includes(k)).sort(([a], [b]) => a < b ? -1 : 1)), (_k, v) => typeof v === "bigint" ? String(v) : v)).sort();
+      }
+      return out;
+    };
+    await using fastDb = await pgDatabase({ max: 2 });
+    await using refDb = await pgDatabase({ max: 2 });
+    let fastRows: Record<string, string[]>, refRows: Record<string, string[]>, fast: Awaited<ReturnType<typeof script>>, ref: Awaited<ReturnType<typeof script>>;
+    { await using x = await leaseInstance(fastDb.url, { side: "fast" }); fast = await script(x, fastDb.sql); fastRows = await dump(fastDb.sql); }
+    { await using x = await leaseInstance(refDb.url, { side: "ref", keyed: false }); ref = await script(x, refDb.sql); refRows = await dump(refDb.sql); }
+    expect(fast).toEqual({ renew: { keyed: 2, miss: 1, skipped: 0 }, receipt: { keyed: 2, miss: 2, skipped: 0 } });
+    expect(ref).toEqual({ renew: { keyed: 0, miss: 0, skipped: 3 }, receipt: { keyed: 0, miss: 0, skipped: 4 } });
+    expect(fastRows).toEqual(refRows);
+    // The rows the receipts wrote: both DMs delivered, the take credited, two stale-capability audits.
+    expect(fastRows.messages!.every(r => !r.includes('"delivered_at":null'))).toBe(true);
+    expect(fastRows.access_log!.filter(r => r.includes("hosted.stale_capability"))).toHaveLength(2);
   });
 });

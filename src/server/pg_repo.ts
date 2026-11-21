@@ -32,7 +32,7 @@ import { makePgOAuth } from "./store/pg/oauth.ts";
 import { makePgSessionEnd } from "./store/pg/session_end.ts";
 import { makePgSlack } from "./store/pg/slack.ts";
 import { openPg } from "./store/pg/sql.ts";
-import { makePgTransactions, refuseKeyed } from "./store/pg/tx.ts";
+import { makePgTransactions, refuseKeyedNotice } from "./store/pg/tx.ts";
 import type { Tx } from "./store/tx.ts";
 import type { WriteQueue } from "./store/queue.ts";
 import { makePgWriteReceipts } from "./store/pg/write_receipts.ts";
@@ -82,11 +82,14 @@ export async function makePgRepo(url: string, opts: PgRepoOptions): Promise<PgRe
   }
 
   // Each notice waits on the Tx it's given (store/notices.ts).
-  // A keyed body queues none (refuseKeyed, D4).
-  const notices = makeNotices((tx, effect) => tx.afterCommit(effect), (tx, op) => refuseKeyed(tx, op));
+  // A keyed body queues none (refuseKeyed, D4), but those its caller opted in to by op (refuseKeyedNotice: renew's).
+  const notices = makeNotices((tx, effect) => tx.afterCommit(effect), (tx, op, label) => refuseKeyedNotice(tx, op, label));
   const { change, marks } = notices;
-  // The Repo's keyed write takes no options: `{ effects: true }` lives only on PgTransactions (D4, audit L7).
+  // The Repo's keyed write takes no options: `{ effects: true }` lives only on PgTransactions (D4, audit L7), and on
+  // writeKeyedEffects, the named opt-in for the reviewed callers D4 lists (delivery's renew and receipt).
   const writeKeyed = ((keys: readonly string[], fn: (tx: Tx) => Promise<unknown>, committed?: (value: unknown) => unknown) => t.writeKeyed(keys, fn, committed)) as Repo["writeKeyed"];
+  const writeKeyedEffects = ((keys: readonly string[], notices: readonly string[], fn: (tx: Tx) => Promise<unknown>, committed?: (value: unknown) => unknown) =>
+    t.writeKeyed(keys, fn, committed, { effects: true, notices })) as NonNullable<Repo["writeKeyedEffects"]>;
   // The end a released hosted child's ID ends through, made from the finished Repo on first use, as db.ts openDatabase does.
   let port: SessionEndPort | undefined;
   const hosted = makePgHosted({ sessionEnd: deferredSessionEnd(() => port ??= sessionEndPort(opts.humanReach ?? "team")(repo)) });
@@ -114,6 +117,7 @@ export async function makePgRepo(url: string, opts: PgRepoOptions): Promise<PgRe
     post: t.post,
     postKeyed: t.postKeyed,
     readsOnly: t.readsOnly,
+    writeKeyedEffects,
     writeQueue: t.queue,
     read: t.read,
     authRead: auth.authRead,

@@ -297,7 +297,12 @@ export function makePgBoards({ clock }: { clock: () => number }): BoardsStore {
         const again: Row[] = await sql`UPDATE outbox SET delivered_at = ${now}
           WHERE handle = ${handle} AND post_id = ${ref.post_id} AND delivered_at IS NOT NULL AND ${held} RETURNING post_id`;
         if (again.length === 0 && receiver !== undefined) return;
-      } else if (row.kind === "queue") await creditQueueTakes(sql, handle, row.board as string, [ref.post_id], receiver);
+      } else if (row.kind === "queue") {
+        // A claim_events write: exclusive bodies only (D4, #1510 chunk 4). Keyed receipt misses on a queue board before
+        // it gets here; this is the backstop.
+        refuseKeyed(tx, "boards.acknowledge's queue take credit (a claim_events write)");
+        await creditQueueTakes(sql, handle, row.board as string, [ref.post_id], receiver);
+      }
       // Push-mode subscribers have now seen it in full: count it as read.
       if (row.reason === "subscription") {
         await sql`UPDATE subscriptions SET cursor = GREATEST(cursor, ${ref.post_id}::int8), notified_id = GREATEST(notified_id, ${ref.post_id}::int8)
