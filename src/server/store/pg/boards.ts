@@ -108,10 +108,10 @@ const flag = (v: unknown): number | null => (v === null || v === undefined ? nul
 
 // ── core's shared fragments, over a handle expression (a parameter, or a column in views) ──
 // NOT_OWN: not written by the reader's session, as its address, its session (or the session holding it) or a child
-// of that session.
+// of that session, the child's root as recorded when written (author_root, #540; a row without one reads it now).
 const notOwn = (sql: PgSql, h: PgFragment) => sql.fragment`NOT (p.author = ${h} OR p.author_id IS NOT NULL
   AND COALESCE((SELECT ah.id FROM alias_holds ah WHERE ah.address = ${h}), ${h})
-    IN (p.author_id, COALESCE((SELECT ri.root_id FROM ids ri WHERE ri.id = p.author_id), p.author_id)))`;
+    IN (p.author_id, COALESCE(p.author_root, (SELECT ri.root_id FROM ids ri WHERE ri.id = p.author_id), p.author_id)))`;
 // NOT_PUSHED: no outbox row for the reader (digests). NOT_PUSHED_YET: none that woke or was delivered (views' counts).
 const notPushed = (sql: PgSql, h: PgFragment) => sql.fragment`NOT EXISTS (SELECT 1 FROM outbox o WHERE o.handle = ${h} AND o.post_id = p.id)`;
 const notPushedYet = (sql: PgSql, h: PgFragment) => sql.fragment`NOT EXISTS (SELECT 1 FROM outbox o WHERE o.handle = ${h} AND o.post_id = p.id
@@ -491,9 +491,10 @@ export function makePgBoards({ clock }: { clock: () => number }): BoardsStore {
         throw new MissingPost(p.parentId, p.board);
       }
       try {
-        const [row] = await sql`INSERT INTO posts AS p (board, author, body, parent_id, created_at, expires_at, author_id, via, author_user, human)
+        const [row] = await sql`INSERT INTO posts AS p (board, author, body, parent_id, created_at, expires_at, author_id, via, author_user, human, author_root)
           VALUES (${p.board}, ${p.author}, ${p.body}, ${p.parentId}::int8, ${p.now}, ${p.expiresAt}::int8, ${p.authorId}::text, ${p.via}::text,
-            ${p.authorUser}::text, ${p.human === true}) RETURNING ${postCols(sql)}`;
+            ${p.authorUser}::text, ${p.human === true},
+            COALESCE((SELECT ri.root_id FROM ids ri WHERE ri.id = ${p.authorId}::text), ${p.authorId}::text)) RETURNING ${postCols(sql)}`;
         return toPost(row);
       } catch (e) {
         if (p.parentId !== null && foreignKeyViolation(e) === POST_PARENT_CONSTRAINT) throw new MissingPost(p.parentId, p.board);

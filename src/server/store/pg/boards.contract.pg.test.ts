@@ -44,6 +44,8 @@ async function openPg(): Promise<{ h: BoardsHarness; sql: PgDatabase["sql"] }> {
           ${o.status ?? null}::text, ${o.status === undefined ? null : 1}::int8)`;
     },
     async hold(address, id, boundAt) { await sql`INSERT INTO alias_holds (address, id, bound_at) VALUES (${address}, ${id}, ${boundAt})`; },
+    async setRoot(id, root) { await sql`UPDATE ids SET root_id = ${root}::text WHERE id = ${id}`; },
+    async legacyPost(id) { await sql`UPDATE posts SET author_root = NULL WHERE id = ${id}`; },
     async claim(c) {
       await sql`INSERT INTO claims (key, holder, note, board, acquired_at, expires_at, holder_user)
         VALUES (${c.key}, ${c.holder}, 'held', ${c.board}::text, ${c.at}, ${c.at + 60_000}, NULL)`;

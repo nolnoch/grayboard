@@ -599,9 +599,12 @@ const NOT_PUSHED_YET = `NOT EXISTS (SELECT 1 FROM outbox o WHERE o.handle = ? AN
 // reader's address nor by the session that is it or holds it, nor by a child
 // of that session (#523: a subagent writing under its addresses, whose posts
 // are its root's own), whichever of its addresses it wrote as. Binds the
-// reader's address three times.
+// reader's address three times. The child's root is the one recorded when
+// the post was written (author_root, #540); only a row from before that
+// column reads the author's root as it is now (COALESCE stops at the first
+// non-null, so a newer row runs no subquery).
 const NOT_OWN = `NOT (p.author = ? OR p.author_id IS NOT NULL AND COALESCE((SELECT id FROM alias_holds WHERE address = ?), ?)
-  IN (p.author_id, COALESCE((SELECT root_id FROM ids WHERE id = p.author_id), p.author_id)))`;
+  IN (p.author_id, COALESCE(p.author_root, (SELECT root_id FROM ids WHERE id = p.author_id), p.author_id)))`;
 
 export type BoardSummary = Board & { mode: SubMode | null; unread: number; posts: number };
 
@@ -1448,12 +1451,12 @@ export type NewPost = {
   authorId: string | null; via: string | null; authorUser: string | null; human: boolean;
 };
 
-/** Writes a post's row. */
+/** Writes a post's row, with its author's root as of now (author_root, #540). */
 export function insertPost(db: Database, p: NewPost): Post {
   return showPost(db
     .prepare(
-      `INSERT INTO posts (board, author, body, parent_id, created_at, expires_at, author_id, via, author_user, human)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING ${POST_COLS}`,
+      `INSERT INTO posts (board, author, body, parent_id, created_at, expires_at, author_id, via, author_user, human, author_root)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, COALESCE((SELECT root_id FROM ids WHERE id = ?7), ?7)) RETURNING ${POST_COLS}`,
     )
     .get(p.board, p.author, p.body, p.parentId, p.now, p.expiresAt, p.authorId, p.via, p.authorUser, p.human ? 1 : 0) as PostRow);
 }
