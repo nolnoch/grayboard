@@ -2,6 +2,7 @@ import { describe, test, expect, beforeEach, afterEach } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { generateKeyPairSync } from "node:crypto";
 import { checkIdpConfig, describeBlobs, describeReauth, describeStore, FILE_SECRETS, loadConfig } from "./config.ts";
 
 const KEYS = [
@@ -15,7 +16,7 @@ const KEYS = [
   "GRAYBOARD_HELLO_BURST", "GRAYBOARD_HELLO_PER_SEC",
   "GRAYBOARD_HOSTED_REQUEST_BURST", "GRAYBOARD_HOSTED_REQUEST_PER_SEC", "GRAYBOARD_HOSTED_SUBSCRIBER_BURST", "GRAYBOARD_HOSTED_SUBSCRIBER_PER_SEC",
   "GRAYBOARD_OAUTH_BURST", "GRAYBOARD_OAUTH_PER_SEC", "GRAYBOARD_OAUTH_GLOBAL_BURST", "GRAYBOARD_OAUTH_GLOBAL_PER_SEC",
-  "GRAYBOARD_AUTH_FAIL_BURST", "GRAYBOARD_AUTH_FAIL_PER_SEC", "GRAYBOARD_TRUSTED_PROXIES", "GRAYBOARD_HOSTED_IDLE_SECONDS", "GRAYBOARD_CLI_TOKEN_IDLE_DAYS", "GRAYBOARD_IDP_REAUTH_DAYS", "GRAYBOARD_IDP_RECHECK_HOURS", "GRAYBOARD_IDP_RECHECK_MAX_STALE_HOURS", "GRAYBOARD_IDP_DISABLE_LIMIT",
+  "GRAYBOARD_AUTH_FAIL_BURST", "GRAYBOARD_AUTH_FAIL_PER_SEC", "GRAYBOARD_TRUSTED_PROXIES", "GRAYBOARD_HOSTED_IDLE_SECONDS", "GRAYBOARD_CLI_TOKEN_IDLE_DAYS", "GRAYBOARD_IDP_REAUTH_DAYS", "GRAYBOARD_IDP_RECHECK_HOURS", "GRAYBOARD_IDP_RECHECK_MAX_STALE_HOURS", "GRAYBOARD_IDP_DISABLE_LIMIT", "GRAYBOARD_GOOGLE_DIRECTORY_KEY", "GRAYBOARD_GOOGLE_DIRECTORY_ADMIN",
   "GRAYBOARD_DELEGATE_BURST", "GRAYBOARD_DELEGATE_PER_SEC", "GRAYBOARD_DELEGATE_OPEN_CAP", "GRAYBOARD_ALIAS_SCOPE_CAP",
   ...["LISTEN", "LEGACY", "POST"].flatMap(kind => [`GRAYBOARD_MCP_${kind}_GLOBAL`, `GRAYBOARD_MCP_${kind}_PER_USER`]),
   "GRAYBOARD_HOSTED_SESSIONS_GLOBAL", "GRAYBOARD_HOSTED_SESSIONS_PER_USER", "GRAYBOARD_DELIVERY_LEASES_GLOBAL", "GRAYBOARD_DELIVERY_LEASES_PER_USER",
@@ -742,6 +743,44 @@ describe("loadConfig", () => {
     expect(describeReauth({})).toBe("sign-in every 30 days (no directory check: google)");
     expect(describeReauth({ idps: ["google", "oidc"], idpReauthDays: 7 })).toBe("sign-in every 7 days (no directory check: google, oidc)");
     expect(describeReauth({ idps: ["oidc"], idpReauthDays: 0 })).toBe("off (GRAYBOARD_IDP_REAUTH_DAYS=0; no directory check: oidc)");
+  });
+
+  test("with a Google directory key the startup line names Google's check, and the clock only for the rest (#930 A2b)", () => {
+    const dir = { clientEmail: "sa@p.iam.gserviceaccount.com", privateKey: "k" };
+    expect(describeReauth({ googleDirectory: dir })).toBe("directory check every 24 h (google)");
+    expect(describeReauth({ idps: ["okta", "google"], googleDirectory: dir, idpRecheck: { recheckHours: 6, maxStaleHours: 72, disableLimit: 5 } }))
+      .toBe("directory check every 6 h (google); sign-in every 30 days (no directory check: okta)");
+    expect(describeReauth({ idps: ["google", "okta"], googleDirectory: dir, idpReauthDays: 0 }))
+      .toBe("directory check every 24 h (google); off (GRAYBOARD_IDP_REAUTH_DAYS=0; no directory check: okta)");
+  });
+
+  test("GRAYBOARD_GOOGLE_DIRECTORY_KEY turns on Google's directory check; half a configuration refuses to start (#930 A2b)", () => {
+    primary();
+    const pem = generateKeyPairSync("rsa", { modulusLength: 2048 }).privateKey.export({ type: "pkcs8", format: "pem" }) as string;
+    const key = JSON.stringify({ type: "service_account", client_email: "sa@p.iam.gserviceaccount.com", private_key: pem });
+    expect(loadConfig().googleDirectory).toBeUndefined();
+    process.env.GRAYBOARD_GOOGLE_DIRECTORY_ADMIN = "admin@example.com";
+    expect(message()).toBe("GRAYBOARD_GOOGLE_DIRECTORY_ADMIN is set without GRAYBOARD_GOOGLE_DIRECTORY_KEY");
+    process.env.GRAYBOARD_GOOGLE_DIRECTORY_KEY = key;
+    expect(loadConfig().googleDirectory).toEqual({ clientEmail: "sa@p.iam.gserviceaccount.com", privateKey: pem, admin: "admin@example.com" });
+    delete process.env.GRAYBOARD_GOOGLE_DIRECTORY_ADMIN;
+    expect(loadConfig().googleDirectory).toEqual({ clientEmail: "sa@p.iam.gserviceaccount.com", privateKey: pem });
+    process.env.GRAYBOARD_GOOGLE_DIRECTORY_KEY = "{";
+    expect(message()).toMatch(/GRAYBOARD_GOOGLE_DIRECTORY_KEY is not JSON/);
+    // A key with no Google provider to use it.
+    process.env.GRAYBOARD_GOOGLE_DIRECTORY_KEY = key;
+    process.env.GRAYBOARD_IDPS = "okta";
+    okta();
+    expect(message()).toBe("GRAYBOARD_GOOGLE_DIRECTORY_KEY is set but GRAYBOARD_IDPS doesn't list google");
+    // The key from a file, as every secret can be.
+    process.env.GRAYBOARD_IDPS = "okta, google";
+    const d = mkdtempSync(join(tmpdir(), "gb-secrets-"));
+    try {
+      writeFileSync(join(d, "key.json"), `${key}\n`);
+      delete process.env.GRAYBOARD_GOOGLE_DIRECTORY_KEY;
+      process.env.GRAYBOARD_GOOGLE_DIRECTORY_KEY_FILE = join(d, "key.json");
+      expect(loadConfig().googleDirectory?.clientEmail).toBe("sa@p.iam.gserviceaccount.com");
+    } finally { rmSync(d, { recursive: true, force: true }); }
   });
 
   test("the hello limit defaults to 60 and 1/s; set, the burst is a whole number up to 10000 and the rate at least 0.1/s", () => {

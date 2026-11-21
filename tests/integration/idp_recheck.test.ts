@@ -4,6 +4,8 @@
 import { afterEach, expect, test } from "bun:test";
 import { issueOAuth } from "../helpers/oauth.ts";
 import type { IdentityProvider } from "../../src/server/idp.ts";
+import { GOOGLE_ISSUER, googleProvider } from "../../src/server/idp_google.ts";
+import { exportPKCS8, generateKeyPair } from "jose";
 import { createIdpRecheck, TRANSIENT_BACKOFF_MS } from "../../src/server/idp_recheck.ts";
 import { accessAudits } from "../support/audit.ts";
 import { exec, row } from "../support/repo_sql.ts";
@@ -274,4 +276,42 @@ test("an outage within a long stale bound doesn't send a covered user to the fal
   await vouched(A, 31 * 24);
   answer = () => new Error("down");
   expect((await refresh(g.refreshToken)).status).toBe(200);
+});
+
+// #930 A2b: the real Google provider, its directory check pointed at a scripted Google, through the same refresh path.
+test("Google's directory check: an active answer confirms it, a suspended one disables; a refused key is transient and classed", async () => {
+  const pair = await generateKeyPair("RS256", { extractable: true });
+  const key = { clientEmail: "sa@p.iam.gserviceaccount.com", privateKey: await exportPKCS8(pair.privateKey) };
+  let tokenStatus = 200;
+  const directory: Record<string, { suspended: boolean }> = { "111": { suspended: false }, "222": { suspended: true }, "333": { suspended: false } };
+  const fakeGoogle = (async (input: string | URL | Request) => {
+    const url = new URL(String(input));
+    if (url.host === "token.test") return tokenStatus === 200 ? Response.json({ access_token: "t", expires_in: 3600 }) : Response.json({ error: "invalid_grant" }, { status: tokenStatus });
+    const user = directory[url.pathname.split("/").pop()!];
+    return user ? Response.json(user) : new Response("", { status: 404 });
+  }) as typeof fetch;
+  const google = googleProvider({ clientId: "c", clientSecret: "s", orgDomain: "example.com" }, key,
+    { tokenUrl: "https://token.test", apiBase: "https://api.test", fetch: fakeGoogle, now: () => clock });
+  clock = Date.now(); calls = [];
+  srv = await TestServer.open({ idpRecheck: { recheckHours: 24, maxStaleHours: 72, disableLimit: 5 }, admins: [ROOT] },
+    { now: () => clock, oauth: { now: () => clock, providers: [google] } });
+  await srv.app.ready;
+  const link = (email: string, subject: string, hoursAgo: number) =>
+    exec(srv, "UPDATE users SET idp_issuer = ?, idp_subject = ?, idp_checked_at = ? WHERE email = ?", GOOGLE_ISSUER, subject, clock - hoursAgo * HOUR, email);
+  const c = await grant(C), a = await grant(A), b = await grant(B);
+  await link(C, "111", 25); await link(A, "222", 25); await link(B, "333", 25);
+  expect((await refresh(c.refreshToken)).status).toBe(200);
+  expect((await user(C))!.idp_checked_at).toBe(clock);
+  expect((await refresh(a.refreshToken)).status).toBe(400);
+  expect((await user(A))!.disabled_at).not.toBeNull();
+  expect((await accessAudits(srv, "auth.idp_disabled")).map(x => x.detail)).toEqual([{ provider: "google", issuer: GOOGLE_ISSUER, reason: "inactive" }]);
+  // A refused key: Bob is due, the check fails, he keeps working within the stale bound, and the class names the key.
+  tokenStatus = 400;
+  clock += 2 * HOUR;
+  await exec(srv, "UPDATE users SET idp_checked_at = ? WHERE email = ?", clock - 25 * HOUR, B);
+  const warn = console.warn;
+  console.warn = () => {};
+  try { expect((await refresh(b.refreshToken)).status).toBe(200); } finally { console.warn = warn; }
+  expect((await user(B))!.disabled_at).toBeNull();
+  expect((await accessAudits(srv, "auth.idp_check_failed")).map(x => x.detail.error_class)).toEqual(["google_token_refused"]);
 });

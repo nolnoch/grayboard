@@ -15,6 +15,7 @@ import { DEFAULT_RETENTION_DAYS, parseRetentionDays } from "../core/boards.ts";
 import { DELEGATE_LIMIT, DELEGATE_OPEN_CAP } from "../core/delegation.ts";
 import { ALIAS_SCOPE_CAP } from "./alias_cap.ts";
 import { GOOGLE_ISSUER } from "./idp_google.ts";
+import { parseDirectoryKey, type GoogleDirectoryConfig } from "./idp_google_directory.ts";
 import { describeCredentials, type AwsCredentialSpec } from "./aws_credentials.ts";
 import type { RecheckConfig } from "./idp_recheck.ts";
 
@@ -81,6 +82,9 @@ export type Config = {
   // The IdP re-check for providers with a directory check (#930 A2): hours between checks, hours a refresh fails open
   // through an IdP outage before answering 503, and automatic disables an hour before they stop.
   idpRecheck?: { recheckHours: number; maxStaleHours: number; disableLimit: number };
+  // Google's directory check (#930 A2b, idp_google_directory.ts): a service account's key, and the admin it
+  // impersonates under domain-wide delegation. Unset, Google users stay on the GRAYBOARD_IDP_REAUTH_DAYS clock.
+  googleDirectory?: GoogleDirectoryConfig;
   // Emails allowed to run admin commands. Empty means nobody can.
   admins: string[];
   oauthClients?: OAuthClient[];
@@ -128,7 +132,7 @@ export type Config = {
 // Docker and Kubernetes convention, so a secret needn't sit in the process environment's source.
 export const FILE_SECRETS = [
   "GRAYBOARD_DATABASE_URL", "GOOGLE_OAUTH_CLIENT_SECRET", "GRAYBOARD_MCP_GOOGLE_CLIENT_SECRET",
-  "GRAYBOARD_OKTA_CLIENT_SECRET", "GRAYBOARD_OIDC_CLIENT_SECRET", "SLACK_APP_TOKEN", "SLACK_BOT_TOKEN",
+  "GRAYBOARD_OKTA_CLIENT_SECRET", "GRAYBOARD_OIDC_CLIENT_SECRET", "SLACK_APP_TOKEN", "SLACK_BOT_TOKEN", "GRAYBOARD_GOOGLE_DIRECTORY_KEY",
 ] as const;
 
 // Resolves each NAME_FILE into env.NAME before anything reads it. Both set (to different values) is refused: which
@@ -203,6 +207,7 @@ export function loadConfig(): Config {
     idps,
     ...(okta ? { okta } : {}),
     ...(oidc ? { oidc } : {}),
+    ...googleDirectoryConfig(google),
     publicUrl: publicUrl.replace(/\/$/, ""),
     messageRetentionDays: retentionDays("GRAYBOARD_MESSAGE_RETENTION_DAYS", process.env.GRAYBOARD_MESSAGE_RETENTION_DAYS, DEFAULT_RETENTION_DAYS),
     auditRetentionDays:   retentionDays("GRAYBOARD_AUDIT_RETENTION_DAYS",   process.env.GRAYBOARD_AUDIT_RETENTION_DAYS,   90),
@@ -662,12 +667,29 @@ export function recheckConfig(config: Pick<Config, "idpRecheck" | "idpReauthDays
   };
 }
 
-// The startup line for #930's fallback: which sign-in providers the server can't ask about a user's status, so their
-// users re-authenticate every GRAYBOARD_IDP_REAUTH_DAYS instead. No provider has a directory check yet.
-export function describeReauth(config: Pick<Config, "idps" | "idpReauthDays">): string {
+// The startup line for #930: which sign-in providers have a directory check (only Google, with a directory key), and
+// which the server can't ask about a user's status, so their users re-authenticate every GRAYBOARD_IDP_REAUTH_DAYS.
+export function describeReauth(config: Pick<Config, "idps" | "idpReauthDays" | "idpRecheck" | "googleDirectory">): string {
   const days = config.idpReauthDays ?? DEFAULT_IDP_REAUTH_DAYS;
-  const unchecked = (config.idps ?? ["google"]).join(", ");
-  return days > 0 ? `sign-in every ${days} days (no directory check: ${unchecked})` : `off (GRAYBOARD_IDP_REAUTH_DAYS=0; no directory check: ${unchecked})`;
+  const idps = config.idps ?? ["google"];
+  const checked = idps.filter(id => id === "google" && config.googleDirectory);
+  const unchecked = idps.filter(id => !checked.includes(id));
+  const recheck = checked.length ? `directory check every ${recheckConfig(config).recheckHours} h (${checked.join(", ")})` : "";
+  if (!unchecked.length) return recheck;
+  const clock = days > 0 ? `sign-in every ${days} days (no directory check: ${unchecked.join(", ")})` : `off (GRAYBOARD_IDP_REAUTH_DAYS=0; no directory check: ${unchecked.join(", ")})`;
+  return recheck ? `${recheck}; ${clock}` : clock;
+}
+
+// Half a configuration is a mistake, not "off": an admin without a key, or a key with no Google provider to use it.
+function googleDirectoryConfig(google: boolean): { googleDirectory?: GoogleDirectoryConfig } {
+  const raw = process.env.GRAYBOARD_GOOGLE_DIRECTORY_KEY;
+  const admin = process.env.GRAYBOARD_GOOGLE_DIRECTORY_ADMIN;
+  if (!raw) {
+    if (admin) throw new Error("GRAYBOARD_GOOGLE_DIRECTORY_ADMIN is set without GRAYBOARD_GOOGLE_DIRECTORY_KEY");
+    return {};
+  }
+  if (!google) throw new Error("GRAYBOARD_GOOGLE_DIRECTORY_KEY is set but GRAYBOARD_IDPS doesn't list google");
+  return { googleDirectory: parseDirectoryKey(raw, admin) };
 }
 
 // Port 0 (an ephemeral port, what tests use) through 65535. Gated to plain digits so
