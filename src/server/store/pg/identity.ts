@@ -34,6 +34,7 @@ import type { Read, Tx } from "../tx_base.ts";
 import { insertAudit } from "./audit_row.ts";
 import { principalTaken, SERVICE_NAME_CONSTRAINTS, uniqueViolation } from "./errors.ts";
 import type { PgHostedEnds } from "./hosted_port.ts";
+import { endSignIns } from "./oauth.ts";
 import { int8, int8OrNull } from "./sql.ts";
 import { pgOf, type PgFragment, type PgSql } from "./tx.ts";
 
@@ -262,8 +263,13 @@ export function makePgIdentity({ now, hosted }: { now: () => number; hosted: PgH
         return (await pgOf(r)`SELECT * FROM sessions WHERE user_id = ${userId} AND revoked_at IS NULL AND last_used_at > ${usedAfter}
           ORDER BY last_used_at DESC, id DESC LIMIT ${limit}`).map(toSession);
       },
+      // The users row first, as revokeUserGrant (pg/oauth.ts) and for the same consent race (#1552).
       async revokeOwn(tx, userId, sessionId) {
-        return (await pgOf(tx)`UPDATE sessions SET revoked_at = ${now()} WHERE id = ${sessionId} AND user_id = ${userId} AND revoked_at IS NULL RETURNING id`).length > 0;
+        const sql = pgOf(tx);
+        await sql`SELECT 1 FROM users WHERE id = ${userId} FOR NO KEY UPDATE`;
+        if (!(await sql`UPDATE sessions SET revoked_at = ${now()} WHERE id = ${sessionId} AND user_id = ${userId} AND revoked_at IS NULL RETURNING id`).length) return false;
+        await endSignIns(sql, userId);
+        return true;
       },
       // Writes no users row, so it locks it: FOR NO KEY UPDATE conflicts with a mint's FOR SHARE (a plain FK insert's
       // KEY SHARE would not), so a CLI session, grant or code minted concurrently is either committed and revoked here

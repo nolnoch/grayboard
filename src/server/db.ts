@@ -1214,9 +1214,12 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
         ).all(userId, usedAfter, limit);
       },
       async revokeOwn(tx, userId, sessionId) {
-        return !!sqliteOf(tx).query<{ id: number }, [number, number, number]>(
+        const db = sqliteOf(tx);
+        const revoked = !!db.query<{ id: number }, [number, number, number]>(
           "UPDATE sessions SET revoked_at = ? WHERE id = ? AND user_id = ? AND revoked_at IS NULL RETURNING id",
         ).get(clock(), sessionId, userId);
+        if (revoked) endSignIns(db, userId);
+        return revoked;
       },
       async revokeDev(tx) {
         return sqliteOf(tx).run("UPDATE sessions SET revoked_at = ? WHERE label = ? AND revoked_at IS NULL", [clock(), DEV_SESSION_LABEL]).changes;
@@ -2000,6 +2003,14 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
 }
 
 // A CLI session row: sessions.create's, and a login code's redemption's in its own transaction (#928 D8).
+// What a per-grant revoke (#930) ends beside the grant or CLI token: the user's browser sessions, since a live one
+// consents without the IdP and could mint a replacement on the lost device (#1552), and the unspent codes one
+// already minted. Not the device's alone: nothing ties a browser session to a grant, so every browser signs in again.
+function endSignIns(db: Database, userId: number): void {
+  db.run("DELETE FROM oauth_browsers WHERE user_id = ?", [userId]);
+  db.run("DELETE FROM oauth_codes WHERE user_id = ? AND grant_id IS NULL AND session_id IS NULL", [userId]);
+}
+
 function insertSession(db: Database, userId: number, tokenHash: string, label: string | null, now: number): Session {
   const r = db.run(
     `INSERT INTO sessions (user_id, token_hash, created_at, last_used_at, label) VALUES (?, ?, ?, ?, ?)`,
@@ -2451,6 +2462,7 @@ function oauthOps(db: Database, hosted: HostedStoreOf): OAuthOps {
         const g = grant(grantId)!;
         // The grant's revocation ends every hosted session attached to it here, in this transaction, as a credential's does.
         await revokeGrant(sp, grantId, now);
+        endSignIns(db, userId);
         return ok({ clientId: g.clientId });
       });
     },
