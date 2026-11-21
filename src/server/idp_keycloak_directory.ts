@@ -18,16 +18,18 @@ const MAX_SUBJECT = 255;
 
 // Each kind an operator acts on differently has its own name, the audit row's error_class: the token endpoint refused
 // the client (its id, secret or service account), the admin API refused the token (the role or the kc-admin-api
-// scope), the user is locked out by brute-force detection (not offboarded: never a disable), anything else.
+// scope), the user is locked out by brute-force detection, a federated user reads disabled (both maybe not offboarded:
+// never a disable), anything else (a network failure or refused redirect among them).
+type ErrorName = "keycloak_token_refused" | "keycloak_directory_refused" | "keycloak_locked_out" | "keycloak_federated_disabled" | "keycloak_directory_error";
 class DirectoryError extends Error {
-  constructor(name: "keycloak_token_refused" | "keycloak_directory_refused" | "keycloak_locked_out" | "keycloak_directory_error", message: string) { super(message); this.name = name; }
+  constructor(name: ErrorName, message: string, options?: ErrorOptions) { super(message, options); this.name = name; }
 }
 
 // The realm's issuer split into Keycloak's base URL and the realm, or null when it isn't a Keycloak realm URL.
 export function keycloakRealm(issuer: string): { baseUrl: string; realm: string } | null {
   const m = /^(https?:\/\/[^/?#]+(?:\/[^?#]*?)?)\/realms\/([^/?#]+)\/?$/.exec(issuer);
   if (!m) return null;
-  return { baseUrl: m[1]!, realm: decodeURIComponent(m[2]!) };
+  try { return { baseUrl: m[1]!, realm: decodeURIComponent(m[2]!) }; } catch { return null; }
 }
 
 // status(subject, signal): "inactive" when Keycloak says the user is disabled (and not by brute-force lockout) or
@@ -42,7 +44,12 @@ export function keycloakDirectoryStatus(config: KeycloakDirectoryConfig, options
 
   // Every request: no redirects, a bounded body, parsed as JSON when it is (null otherwise).
   async function request(url: string, init: RequestInit): Promise<{ status: number; ok: boolean; body: unknown }> {
-    const res = await send(url, { ...init, redirect: "error" });
+    let res: Response;
+    try { res = await send(url, { ...init, redirect: "error" }); } catch (error) {
+      // The caller's abort stays itself, for the re-check's timeout.
+      if (init.signal?.aborted) throw error;
+      throw new DirectoryError("keycloak_directory_error", `Keycloak request failed: ${(error as Error).message}`, { cause: error });
+    }
     const raw = await cappedBody(res, MAX_BODY);
     if (raw === null) throw new DirectoryError("keycloak_directory_error", `Keycloak response over ${MAX_BODY} bytes`);
     let body: unknown = null;
@@ -99,6 +106,10 @@ export function keycloakDirectoryStatus(config: KeycloakDirectoryConfig, options
     if (user.id !== subject) throw new DirectoryError("keycloak_directory_error", "Keycloak user lookup answered for another id");
     if (typeof user.enabled !== "boolean") throw new DirectoryError("keycloak_directory_error", "Keycloak user is malformed");
     if (user.enabled) return "active";
+    // Keycloak reads a federated (LDAP, Kerberos) user as disabled when its provider is switched off, and every one of
+    // that provider's users with it: telling that from an offboarding needs view-realm. A deleted one is still a 404.
+    if (typeof user.federationLink === "string" && user.federationLink)
+      throw new DirectoryError("keycloak_federated_disabled", "a federated Keycloak user reads disabled, which a disabled user storage provider also gives");
     // A permanent brute-force lockout also clears `enabled`: that's an attack on the account, not an offboarding.
     const lock = await admin(`/attack-detection/brute-force/users/${id}`, signal, "brute-force status");
     if (!lock.ok) throw new DirectoryError("keycloak_directory_error", `Keycloak brute-force status failed (${lock.status})`);

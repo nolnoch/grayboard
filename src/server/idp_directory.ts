@@ -6,7 +6,7 @@
 const TOKEN_MARGIN_MS = 60_000;
 // The token request is shared by every check waiting on it, so it runs on its own clock, never one caller's: a caller
 // that gives up stops waiting, and the mint goes on for the others.
-export const MINT_TIMEOUT_MS = 10_000;
+const MINT_TIMEOUT_MS = 10_000;
 // The audit row carries only an error's class; the IdP's text is what tells an operator what to fix.
 const LOG_EVERY_MS = 10 * 60_000;
 
@@ -42,7 +42,7 @@ export function throttledWarn(prefix: string, now: () => number) {
 }
 
 // p, given up on (with the signal's reason) when the signal aborts first; p itself runs on.
-export function abortable<T>(p: Promise<T>, signal: AbortSignal): Promise<T> {
+function abortable<T>(p: Promise<T>, signal: AbortSignal): Promise<T> {
   if (signal.aborted) return Promise.reject(signal.reason);
   return new Promise<T>((resolve, reject) => {
     const stop = () => reject(signal.reason);

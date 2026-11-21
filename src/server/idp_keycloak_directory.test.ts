@@ -64,6 +64,12 @@ test("a disabled user is inactive unless brute-force detection locked it", async
   expect(k.seen.at(-1)!.url).toBe(`${LOCKS}${ID}`);
   const locked = keycloak({ user: disabled, lock: () => ({ status: 200, body: { disabled: true, numFailures: 30 } }) });
   expect((await failure(keycloakDirectoryStatus(config, locked.options)(ID, signal()))).name).toBe("keycloak_locked_out");
+  // A federated user reads disabled when its provider is off: never inactive, and no brute-force call.
+  const ldap = keycloak({ user: i => ({ status: 200, body: { id: i, enabled: false, federationLink: "ldap-component-id" } }) });
+  expect((await failure(keycloakDirectoryStatus(config, ldap.options)(ID, signal()))).name).toBe("keycloak_federated_disabled");
+  expect(ldap.seen.some(s => s.url.startsWith(LOCKS))).toBe(false);
+  // An enabled federated user is active.
+  expect(await keycloakDirectoryStatus(config, keycloak({ user: i => ({ status: 200, body: { id: i, enabled: true, federationLink: "x" } }) }).options)(ID, signal())).toBe("active");
   // An enabled user never costs the second call.
   const active = keycloak();
   await keycloakDirectoryStatus(config, active.options)(ID, signal());
@@ -93,6 +99,22 @@ test("every other answer throws, named for what an operator fixes", async () => 
   ];
   for (const [script, name] of cases)
     expect((await failure(keycloakDirectoryStatus(config, keycloak(script).options)(ID, signal()))).name).toBe(name);
+});
+
+test("a network failure or refused redirect is keycloak_directory_error; the caller's abort stays itself", async () => {
+  const down = (async () => { throw new TypeError("fetch failed"); }) as unknown as typeof fetch;
+  const e = await failure(keycloakDirectoryStatus(config, { fetch: down })(ID, signal()));
+  expect([e.name, (e.cause as Error).message]).toEqual(["keycloak_directory_error", "fetch failed"]);
+  // fetch rejects with the signal's reason once the caller aborts mid-request.
+  const caller = new AbortController();
+  const k = keycloak();
+  const midRequest = (async (input: string | URL | Request, init?: RequestInit) => {
+    if (String(input) === TOKEN_URL) return k.options.fetch(input, init);
+    caller.abort(new Error("timeout"));
+    throw init!.signal!.reason;
+  }) as typeof fetch;
+  const pending = failure(keycloakDirectoryStatus(config, { now: k.options.now, fetch: midRequest })(ID, caller.signal));
+  expect((await pending).message).toBe("timeout");
 });
 
 test("a body over the cap throws rather than buffering it", async () => {
@@ -174,6 +196,6 @@ test("keycloakRealm splits a realm issuer into its base and realm", () => {
   expect(keycloakRealm("https://sso.example.com/realms/acme")).toEqual({ baseUrl: "https://sso.example.com", realm: "acme" });
   expect(keycloakRealm("https://sso.example.com/auth/realms/acme")).toEqual({ baseUrl: "https://sso.example.com/auth", realm: "acme" });
   expect(keycloakRealm("https://sso.example.com:8443/realms/a%20b")).toEqual({ baseUrl: "https://sso.example.com:8443", realm: "a b" });
-  for (const issuer of ["https://sso.example.com", "https://sso.example.com/realms/", "https://sso.example.com/realms/acme/x", "https://login.okta.example.com/oauth2/default", "https://sso.example.com/realms/acme?x=1"])
+  for (const issuer of ["https://sso.example.com", "https://sso.example.com/realms/", "https://sso.example.com/realms/acme/x", "https://login.okta.example.com/oauth2/default", "https://sso.example.com/realms/acme?x=1", "https://sso.example.com/realms/a%zz"])
     expect(keycloakRealm(issuer)).toBeNull();
 });
