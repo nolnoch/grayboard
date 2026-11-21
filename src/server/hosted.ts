@@ -799,10 +799,13 @@ export function createHostedSessions(application: Application, options: { now?: 
       // SHARE, plain reads, then the touch's UPDATEs, root first. No row lock before the touch: a row an exclusive
       // body changes waits for this body, or this body for it, and its reads see the change only after it commits;
       // either way an end or park this body missed lands before (it refused) or after the call it lets through, as on
-      // the exclusive path.
-      const touched = await atSite("prior", () => store.writeKeyed([`root:${id}`], async tx => {
-        await authorized(p, tx);
-        await grantLive(tx, p);
+      // the exclusive path. Without the fast path (SQLite, keyedGate: false) the body is exclusive, as before chunk 3:
+      // the queue's one writer leaves nothing to re-read in the body.
+      const body = async (tx: Tx) => {
+        if (keyedFast) {
+          await authorized(p, tx);
+          await grantLive(tx, p);
+        }
         const fresh = await store.get(tx, prior.row.session_id);
         const root = !fresh ? undefined : fresh.root_session_id ? await store.get(tx, fresh.root_session_id) : fresh;
         const t = now();
@@ -811,8 +814,9 @@ export function createHostedSessions(application: Application, options: { now?: 
           || (root.lease_deadline !== null && root.lease_deadline <= t) || idleAt(fresh) || idleAt(root)) return undefined;
         const seen = await touchRow(tx, root, t);
         return { row: fresh, seen: fresh === root ? seen : Math.min(seen, await touchRow(tx, fresh, t)) };
-      }));
-      countGate("prior", !touched ? "miss" : keyedFast ? "keyed" : "skipped");
+      };
+      const touched = await atSite("prior", () => keyedFast ? store.writeKeyed([`root:${id}`], body) : store.write(body));
+      countGate("prior", !keyedFast ? "skipped" : touched ? "keyed" : "miss");
       if (!touched) return MISS;
       const { row, seen } = touched;
       const ids = [...new Set([row.session_id, id])];

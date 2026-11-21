@@ -350,13 +350,22 @@ const RESOURCE = `${ORIGIN}/hosted/mcp`;
 // One server's hosted composition with an injected clock and, with `oauth`, the real authorization (oauth.ts
 // isAuthorized: the auth cache outside a body, uncached reads inside one). `state.hold`: a keyed gate body waits on it
 // once settle has locked its rows. `defer`: while set, a write queued under no site (the timer's sweep, heartbeat and
-// reconcile) waits on it before it queues, so a test's clock moves reach its own requests first.
+// reconcile) waits on it before it queues, so a test's clock moves reach its own requests first. `beforePrior`: run once
+// as the next prior body (withPrior's keyed body) is queued, after its checks outside the body. `priorHold`: a keyed
+// prior body waits on it at its first row read, after its authorization and grant reads.
 async function gateInstance(url: string, opts: { oauth?: boolean; keyedGate?: false; side?: string; idleSeconds?: number } = {}) {
   const blobDir = mkdtempSync(join(tmpdir(), "gb-pg-blobs-"));
   let clock = T0;
   const repo: PgRepo = await makePgRepo(url, { blobDir, applicationName: `gb-test-gate-${opts.side ?? "a"}`, max: 4, now: () => clock });
   const store = repo.hosted;
-  const state = { hold: undefined as Gate | undefined, held: 0, keyedQueued: 0, defer: undefined as Gate | undefined, exclusive: [] as Array<{ site: string | undefined; startedHeld?: boolean }> };
+  const state = { hold: undefined as Gate | undefined, held: 0, keyedQueued: 0, defer: undefined as Gate | undefined, exclusive: [] as Array<{ site: string | undefined; startedHeld?: boolean }>,
+    beforePrior: undefined as (() => Promise<void>) | undefined, priorHold: undefined as Gate | undefined };
+  const isKeyed = (tx: unknown) => (tx as { txn?: { keys?: ReadonlySet<string> } }).txn?.keys !== undefined;
+  const get = store.get.bind(store);
+  store.get = (async (r: Parameters<typeof store.get>[0], id: string) => {
+    if (isKeyed(r) && currentSite() === "prior" && state.priorHold) { state.held++; try { await state.priorHold.wait; } finally { state.held--; } }
+    return get(r, id);
+  }) as typeof store.get;
   const lock = store.lock.bind(store);
   store.lock = async (tx: Tx, id: string) => {
     const row = await lock(tx, id);
@@ -367,6 +376,11 @@ async function gateInstance(url: string, opts: { oauth?: boolean; keyedGate?: fa
   // Keyed gate bodies queued and not yet started.
   const writeKeyed = store.writeKeyed;
   store.writeKeyed = ((keys: readonly string[], fn: (tx: Tx) => unknown, committed?: (v: unknown) => unknown) => {
+    if (currentSite() === "prior" && state.beforePrior) {
+      const before = state.beforePrior;
+      state.beforePrior = undefined;
+      return before().then(() => writeKeyed(keys, fn as (tx: Tx) => Promise<unknown>, committed));
+    }
     if (currentSite() !== "gate") return writeKeyed(keys, fn as (tx: Tx) => Promise<unknown>, committed);
     state.keyedQueued++;
     return writeKeyed(keys, async (tx: Tx) => { state.keyedQueued--; return fn(tx); }, committed);
@@ -394,7 +408,7 @@ async function gateInstance(url: string, opts: { oauth?: boolean; keyedGate?: fa
     // and close touches among them.
     drain: () => atSite("other", () => repo.write(() => {})),
     async [Symbol.asyncDispose]() {
-      state.hold?.open(); state.defer?.open();
+      state.hold?.open(); state.defer?.open(); state.priorHold?.open();
       try { await hosted.close(); await application.stopExpiry(); oauth?.close(); await repo.close(); }
       finally { rmSync(blobDir, { recursive: true, force: true }); }
     },
@@ -416,6 +430,10 @@ const whoami = (x: GateInstance, p: OAuthPrincipal, source: string, meta: Record
 const delta = () => {
   const at = { keyed: gateCount("gate", "keyed"), miss: gateCount("gate", "miss"), skipped: gateCount("gate", "skipped") };
   return () => ({ keyed: gateCount("gate", "keyed") - at.keyed, miss: gateCount("gate", "miss") - at.miss, skipped: gateCount("gate", "skipped") - at.skipped });
+};
+const priorDelta = () => {
+  const at = { keyed: gateCount("prior", "keyed"), miss: gateCount("prior", "miss") };
+  return () => ({ keyed: gateCount("prior", "keyed") - at.keyed, miss: gateCount("prior", "miss") - at.miss });
 };
 const lockWaiters = async (sql: Awaited<ReturnType<typeof pgDatabase>>["sql"]) =>
   (await sql`SELECT count(*)::int AS n FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock'`)[0].n as number;
@@ -579,6 +597,150 @@ describePg("hosted gate keyed fast path (Postgres)", () => {
   // and one without (keyedGate: false), then every row of the tables the gate writes compared. Mutation: keyedBody
   // without its probe (readsOnly): the keyed attempt writes a park or an end itself and the exclusive body runs on
   // top, so the rows differ.
+  // The timer's sweep parks an idle child of the held root only once the keyed gate body has committed: the sweep body
+  // itself (queued at the site "other" here, unlike the timer's) waits, starts after the hold, and parks. The timer's own
+  // bodies are deferred so none of them parks the child first. Mutation: as above, the scheduler letting an exclusive
+  // body start beside a keyed one.
+  test("a sweep that parks the held root's idle child waits for the keyed gate body, then parks it", async () => {
+    await using db = await pgDatabase({ max: 2 });
+    await using x = await gateInstance(db.url, { oauth: true, idleSeconds: 60 });
+    const { p } = await issued(x);
+    await whoami(x, p, "root-a");
+    await atSite("other", () => x.hosted.register(p, sessionContext(p, { [OPENCODE_SESSION_META]: "root-a" }), "kid-a"));
+    await whoami(x, p, "kid-a");
+    x.state.defer = gate();
+    x.advance(36_000);
+    await whoami(x, p, "root-a");
+    x.advance(30_000);
+    const kid = idOf(p, "kid-a");
+    const d = delta();
+    x.state.hold = gate();
+    const held = whoami(x, p, "root-a");
+    await until(() => x.state.held === 1, 10_000, "root-a's keyed gate body held");
+    const before = x.state.exclusive.length;
+    const sweep = atSite("other", () => x.hosted.sweep(true));
+    await until(() => x.q.waiting >= 1, 10_000, "the sweep queued");
+    const body = x.state.exclusive.slice(before).filter(b => b.site === "other");
+    expect(body).toHaveLength(1);
+    expect(body[0]!.startedHeld).toBeUndefined();
+    expect((await x.repo.hosted.get(x.repo.read, kid))?.parked_at).toBeNull();
+    x.state.hold.open();
+    await Promise.all([held, sweep]);
+    expect(body[0]!.startedHeld).toBe(false);
+    expect((await x.repo.hosted.get(x.repo.read, kid))?.parked_at).not.toBeNull();
+    expect(d()).toEqual({ keyed: 1, miss: 0, skipped: 0 });
+  });
+
+  // An in-process bind of the held root: the BindGate holds it behind the running call, so it queues nothing until the
+  // keyed body and the call finish, then binds.
+  test("an in-process bind of the held root waits for the keyed gate body's call, then binds", async () => {
+    await using db = await pgDatabase({ max: 2 });
+    await using x = await gateInstance(db.url, { oauth: true });
+    const { p } = await issued(x);
+    await whoami(x, p, "root-a");
+    const d = delta();
+    x.state.hold = gate();
+    const held = whoami(x, p, "root-a");
+    await until(() => x.state.held === 1, 10_000, "root-a's keyed gate body held");
+    let bound = false;
+    const bind = x.hosted.bind(p, sessionContext(p, { [OPENCODE_SESSION_META]: "root-a" }), { name: "fe", create: true }).then(r => { bound = true; return r; });
+    await new Promise(r => setTimeout(r, 200));
+    expect(bound).toBe(false);
+    expect(x.state.held).toBe(1);
+    expect((await db.sql`SELECT count(*)::int AS n FROM aliases WHERE name = 'fe'`)[0].n).toBe(0);
+    x.state.hold.open();
+    await Promise.all([held, bind]);
+    expect(bound).toBe(true);
+    expect((await db.sql`SELECT count(*)::int AS n FROM aliases WHERE name = 'fe'`)[0].n).toBe(1);
+    expect(x.state.exclusive.filter(b => b.startedHeld)).toEqual([]);
+    expect(d().keyed).toBeGreaterThanOrEqual(1);
+  });
+
+  // The pool's pre-read names a root the row no longer lives under (here: the child read as a root): the keyed body,
+  // keyed by that stale root, finds the row under another and misses before its touch, so no keyed body writes another
+  // key's rows; the exclusive body then sees the change and the retry runs keyed under the real root. Mutation: the
+  // keyed body's `!== id` MISS dropped (it touches root-a's rows under key `root:<kid>`: keyed 2, miss 0).
+  test("a row under another root than the pool read named misses before its touch", async () => {
+    await using db = await pgDatabase({ max: 2 });
+    await using x = await gateInstance(db.url, { oauth: true });
+    const { p } = await issued(x);
+    await whoami(x, p, "root-a");
+    await atSite("other", () => x.hosted.register(p, sessionContext(p, { [OPENCODE_SESSION_META]: "root-a" }), "kid-a"));
+    await whoami(x, p, "kid-a");
+    const kid = idOf(p, "kid-a");
+    const get = x.repo.hosted.get;
+    let stale = true;
+    x.repo.hosted.get = (async (r: Parameters<typeof get>[0], id: string) => {
+      const row = await get(r, id);
+      if (stale && r === x.repo.read && id === kid && row) { stale = false; return { ...row, root_session_id: null }; }
+      return row;
+    }) as typeof get;
+    const d = delta();
+    await whoami(x, p, "kid-a");
+    expect(stale).toBe(false);
+    expect(d()).toEqual({ keyed: 1, miss: 1, skipped: 0 });
+  });
+
+  // A revoke of only the access token (the grant stays live) or a disable committed after withPrior's checks outside the
+  // body and before its keyed body: the body's own authorization, read uncached in its transaction, refuses before it
+  // compares or touches anything. Mutation: the prior body without authorized(p, tx) (it runs keyed and touches, and only
+  // the tool body's fence refuses: prior keyed 1).
+  for (const op of ["access revoke", "disable"] as const) test(`a ${op} committed between withPrior's checks and its keyed body refuses it`, async () => {
+    await using db = await pgDatabase({ max: 2 });
+    await using x = await gateInstance(db.url, { oauth: true });
+    const { p, access } = await issued(x);
+    await whoami(x, p, "root-a");
+    const c = sessionContext(p, { [OPENCODE_SESSION_META]: "root-a" });
+    const verdict = (await x.hosted.snapshot(p, c, false)).verdict!;
+    // The path works: a prior call with nothing between runs keyed.
+    const warm = priorDelta();
+    await x.hosted.run(p, c, "whoami", async () => null, undefined, verdict);
+    expect(warm()).toEqual({ keyed: 1, miss: 0 });
+    const d = priorDelta();
+    x.state.beforePrior = async () => {
+      await atSite("other", () => x.repo.write(tx => op === "disable" ? x.repo.users.setDisabled(tx, p.authed.user_id, true) : x.repo.oauth.revokeToken(tx, hashToken(access), OPENCODE_CLIENT, x.clock)));
+    };
+    await expect(x.hosted.run(p, c, "whoami", async () => null, undefined, verdict)).rejects.toThrow("unauthenticated");
+    expect(x.state.beforePrior).toBeUndefined();
+    expect(d()).toEqual({ keyed: 0, miss: 0 });
+  });
+
+  // The prior body share-locks its grant before it reads the rows: another process's revoke of the grant waits for the
+  // body (and the body, reading after a revoke, refuses), so no call outlives its grant's revoke. Mutation: the prior
+  // body without grantLive (the revoke's UPDATE commits while the body is held).
+  test("another process's grant revoke waits for a running prior body's share lock", async () => {
+    await using db = await pgDatabase({ max: 3 });
+    await using x = await gateInstance(db.url, { oauth: true });
+    const { p } = await issued(x);
+    await whoami(x, p, "root-a");
+    const c = sessionContext(p, { [OPENCODE_SESSION_META]: "root-a" });
+    const verdict = (await x.hosted.snapshot(p, c, false)).verdict!;
+    const d = priorDelta();
+    x.state.priorHold = gate();
+    const held = x.hosted.run(p, c, "whoami", async () => null, undefined, verdict);
+    await until(() => x.state.held === 1, 10_000, "the prior body held after its grant read");
+    let revoked = false;
+    const revoke = db.sql`UPDATE oauth_grants SET revoked_at = ${x.clock} WHERE id = ${p.grantId}`.then(() => { revoked = true; });
+    await until(async () => await lockWaiters(db.sql) >= 1, 10_000, "the revoke waiting on the grant's share lock");
+    expect(revoked).toBe(false);
+    x.state.priorHold.open();
+    await Promise.all([held.catch(() => {}), revoke]);
+    expect(revoked).toBe(true);
+    expect(d()).toEqual({ keyed: 1, miss: 0 });
+  });
+
+  // pg_repo wires the notices' refusal (makeNotices' refuseKeyed): a notice-queuing write in a keyed body refuses by its
+  // op name before its statement runs. Mutation: makeNotices without the refusal (the write runs, and only the
+  // afterCommit refusal, naming no op, rolls it back).
+  test("a notice-queuing Repo write in a keyed body refuses by its op name and writes nothing", async () => {
+    await using db = await pgDatabase({ max: 2 });
+    await using x = await gateInstance(db.url, { oauth: true });
+    const { p } = await issued(x);
+    await expect(atSite("other", () => x.repo.writeKeyed(["k"], tx => x.repo.users.setDisabled(tx, p.authed.user_id, true))))
+      .rejects.toThrow("users.setDisabled (it queues a change notice) refused in a keyed write body");
+    expect((await db.sql`SELECT disabled_at FROM users WHERE id = ${p.authed.user_id}`)[0].disabled_at).toBeNull();
+  });
+
   test("miss-then-exclusive writes the same rows as the exclusive body alone", async () => {
     const script = async (x: GateInstance, sql: Awaited<ReturnType<typeof pgDatabase>>["sql"]) => {
       const user = await seed(x.repo, tx => x.repo.users.upsertByEmail(tx, ME, null));

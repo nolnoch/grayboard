@@ -93,7 +93,9 @@ describe("team management", () => {
     const [a, root] = await Promise.all([srv.login(A), srv.login(ROOT)]);
     expect((await srv.api(a, "POST", "/api/admin/enable-user", { email: A })).status).toBe(403);
     expect((await srv.api(root, "POST", "/api/admin/enable-user", { email: A })).status).toBe(200);
-    expect(await rows()).toEqual([
+    // Two actors' posted audits are keyed by subject (`audit:a:<actor>`, docs/future/postgres-server.md D4): on Postgres
+    // they overlap and may commit out of posting order, so they're compared by actor.
+    expect((await rows()).sort((x, y) => String(x.actor).localeCompare(String(y.actor)))).toEqual([
       { actor: A, target: null, verb: "admin", allow: false, rule: "role.org_admin", route: "/api/admin/enable-user" },
       { actor: ROOT, target: null, verb: "admin", allow: true, rule: "admin.env", route: "/api/admin/enable-user" },
     ]);
