@@ -12,7 +12,7 @@ import type { Read, Tx } from "./tx_base.ts";
 // Neither: a dev-auth user, or one an admin unlinked.
 // A user row (#270 D1): a person, or a service whose `email` holds its name (never an email: it has no "@"). The kind
 // is its principal row's, read with the row (USER_SQL): there's no users.kind column.
-export type User     = { id: number; email: string; display_name: string | null; created_at: number; disabled_at: number | null; idp_issuer: string | null; idp_subject: string | null; kind: "user" | "service" };
+export type User     = { id: number; email: string; display_name: string | null; created_at: number; disabled_at: number | null; idp_issuer: string | null; idp_subject: string | null; idp_checked_at: number | null; kind: "user" | "service" };
 // What an IdP sign-in resolved to (security audit F-13, #928 D4). `linked`: the
 // user had no subject yet and now has this one. Refusals: `subject_mismatch`,
 // the email's user belongs to another account at the same IdP (the email was

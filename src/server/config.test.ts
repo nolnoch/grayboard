@@ -2,7 +2,7 @@ import { describe, test, expect, beforeEach, afterEach } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { checkIdpConfig, describeBlobs, describeStore, FILE_SECRETS, loadConfig } from "./config.ts";
+import { checkIdpConfig, describeBlobs, describeReauth, describeStore, FILE_SECRETS, loadConfig } from "./config.ts";
 
 const KEYS = [
   "GRAYBOARD_DEV_AUTH", "GRAYBOARD_DB_PATH", "GRAYBOARD_DATABASE_URL", "GRAYBOARD_UNRELEASED_POSTGRES", "GRAYBOARD_PUBLIC_URL", "GRAYBOARD_ORG_DOMAIN",
@@ -15,7 +15,7 @@ const KEYS = [
   "GRAYBOARD_HELLO_BURST", "GRAYBOARD_HELLO_PER_SEC",
   "GRAYBOARD_HOSTED_REQUEST_BURST", "GRAYBOARD_HOSTED_REQUEST_PER_SEC", "GRAYBOARD_HOSTED_SUBSCRIBER_BURST", "GRAYBOARD_HOSTED_SUBSCRIBER_PER_SEC",
   "GRAYBOARD_OAUTH_BURST", "GRAYBOARD_OAUTH_PER_SEC", "GRAYBOARD_OAUTH_GLOBAL_BURST", "GRAYBOARD_OAUTH_GLOBAL_PER_SEC",
-  "GRAYBOARD_AUTH_FAIL_BURST", "GRAYBOARD_AUTH_FAIL_PER_SEC", "GRAYBOARD_TRUSTED_PROXIES", "GRAYBOARD_HOSTED_IDLE_SECONDS", "GRAYBOARD_CLI_TOKEN_IDLE_DAYS",
+  "GRAYBOARD_AUTH_FAIL_BURST", "GRAYBOARD_AUTH_FAIL_PER_SEC", "GRAYBOARD_TRUSTED_PROXIES", "GRAYBOARD_HOSTED_IDLE_SECONDS", "GRAYBOARD_CLI_TOKEN_IDLE_DAYS", "GRAYBOARD_IDP_REAUTH_DAYS",
   "GRAYBOARD_DELEGATE_BURST", "GRAYBOARD_DELEGATE_PER_SEC", "GRAYBOARD_DELEGATE_OPEN_CAP", "GRAYBOARD_ALIAS_SCOPE_CAP",
   ...["LISTEN", "LEGACY", "POST"].flatMap(kind => [`GRAYBOARD_MCP_${kind}_GLOBAL`, `GRAYBOARD_MCP_${kind}_PER_USER`]),
   "GRAYBOARD_HOSTED_SESSIONS_GLOBAL", "GRAYBOARD_HOSTED_SESSIONS_PER_USER", "GRAYBOARD_DELIVERY_LEASES_GLOBAL", "GRAYBOARD_DELIVERY_LEASES_PER_USER",
@@ -705,6 +705,25 @@ describe("loadConfig", () => {
       process.env.GRAYBOARD_CLI_TOKEN_IDLE_DAYS = bad;
       expect(() => loadConfig()).toThrow(/GRAYBOARD_CLI_TOKEN_IDLE_DAYS must be a whole number of days/);
     }
+  });
+
+  test("IdP re-auth days default to 30; 0 means never; else plain digits up to 3650 (#930)", () => {
+    process.env.GRAYBOARD_DEV_AUTH = "1";
+    expect(loadConfig().idpReauthDays).toBe(30);
+    for (const [raw, days] of [["", 30], ["0", 0], ["1", 1], ["3650", 3650]] as const) {
+      process.env.GRAYBOARD_IDP_REAUTH_DAYS = raw;
+      expect(loadConfig().idpReauthDays).toBe(days);
+    }
+    for (const bad of [" 7", "07", "1e2", "1.5", "-1", "3651", "never"]) {
+      process.env.GRAYBOARD_IDP_REAUTH_DAYS = bad;
+      expect(() => loadConfig()).toThrow(/GRAYBOARD_IDP_REAUTH_DAYS must be a whole number of days/);
+    }
+  });
+
+  test("the startup line names the re-auth window and every provider with no directory check (#930)", () => {
+    expect(describeReauth({})).toBe("sign-in every 30 days (no directory check: google)");
+    expect(describeReauth({ idps: ["google", "oidc"], idpReauthDays: 7 })).toBe("sign-in every 7 days (no directory check: google, oidc)");
+    expect(describeReauth({ idps: ["oidc"], idpReauthDays: 0 })).toBe("off (GRAYBOARD_IDP_REAUTH_DAYS=0; no directory check: oidc)");
   });
 
   test("the hello limit defaults to 60 and 1/s; set, the burst is a whole number up to 10000 and the rate at least 0.1/s", () => {

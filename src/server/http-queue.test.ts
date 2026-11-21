@@ -35,7 +35,7 @@ test("#807: a session touch that fires while another body holds the write queue 
   cleanups.push(() => holder.release());
   // The hold is a repo.write itself: taken before the spy, so the spy sees only the touch's post.
   const posted = spyOn(repo, "post");
-  expect(await verifySessionToken("raw-token", repo, touches, 0)).not.toBeNull();
+  expect(await verifySessionToken("raw-token", repo, touches, 0, 0)).not.toBeNull();
   await until(() => posted.mock.calls.length > 0, 5000, "the scheduled touch was posted");
   // Long enough for the posted write to commit on either backend if nothing held the queue.
   await Bun.sleep(100);

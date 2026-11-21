@@ -1,6 +1,7 @@
 import { createHash, randomBytes } from "node:crypto";
 import type { Principal } from "../core/resolver.ts";
 import type { Repo } from "./db.ts";
+import type { User } from "./store/identity.ts";
 import type { SignedIn } from "./policy.ts";
 
 // The signed-in principal: its users row's id and name (an email, or a service's name), and its kind, read with the
@@ -57,15 +58,25 @@ export function createTouchQueue(): TouchQueue {
   };
 }
 
+// reauthDue (#930): the IdP last vouched for the user more than `days` ago, so their grants and CLI tokens stop
+// working until they sign in again. A user with no clock and no issuer (a dev login) has no IdP to go back to, and
+// a service principal never signs in, so both are exempt; an unlinked user keeps its clock, so it isn't.
+export function reauthDue(user: Pick<User, "kind" | "idp_issuer" | "idp_checked_at">, now: number, days: number): boolean {
+  if (user.kind !== "user" || days <= 0) return false;
+  return user.idp_checked_at !== null ? user.idp_checked_at < now - days * 86_400_000 : user.idp_issuer !== null;
+}
+
 // idleDays: a token unused that long is refused (security audit F-14); 0 never
 // expires one. Use, not age, so an agent that keeps working never loses its token.
-export async function verifySessionToken(raw: string, repo: Repo, touches: TouchQueue, idleDays: number): Promise<AuthedUser | null> {
+// reauthDays: see reauthDue.
+export async function verifySessionToken(raw: string, repo: Repo, touches: TouchQueue, idleDays: number, reauthDays: number): Promise<AuthedUser | null> {
   const hash = hashToken(raw);
   const session = await repo.sessions.findByTokenHash(repo.read, hash);
   if (!session) return null;
   const user = await repo.users.findById(repo.read, session.user_id);
   if (session.revoked_at !== null || !user || user.disabled_at !== null) return null;
   if (idleDays > 0 && repo.now() - session.last_used_at > idleDays * 86_400_000) return null;
+  if (reauthDue(user, repo.now(), reauthDays)) return null;
   // Off the request path: last-used is a stamp, not a result the caller waits on. Posted, so a touch that fires
   // while another body holds the write queue waits behind it (#807).
   touches.schedule(() => { repo.post(tx => repo.sessions.touch(tx, session.id, repo.now()), undefined, "session touch"); });

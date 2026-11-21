@@ -52,7 +52,7 @@ const refused = (s: Settled<unknown>) =>
 // A hosted session's ID, from the raw session ID its client sent.
 const hostedId = async (w: { repo: Repo }, raw: string) => (await w.repo.hosted.all(w.repo.read)).find(h => h.source_session_id === raw)!.session_id;
 
-const authedOf = async (srv: TestServer, token: string) => (await verifySessionToken(token, srv.app.repo, srv.app.touches, 0))!;
+const authedOf = async (srv: TestServer, token: string) => (await verifySessionToken(token, srv.app.repo, srv.app.touches, 0, 0))!;
 
 describePg("session end races through the server (Postgres)", () => {
   // E4 through the server, end first: an ID's end (revoke's endIdsIn runs endSessionServer, held on A) against that
