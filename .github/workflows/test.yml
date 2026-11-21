@@ -201,6 +201,7 @@ jobs:
             src/server/hosted-auth.test.ts
             src/server/hosted-persistence.test.ts
             src/server/hosted-postcommit.test.ts
+            src/server/hosted.pg.test.ts
             src/server/hosted.test.ts
             src/server/idp.test.ts
             src/server/idp_google.test.ts
@@ -324,6 +325,7 @@ jobs:
             tests/integration/opencode.test.ts
             tests/integration/pg_board_races.pg.test.ts
             tests/integration/pg_session_races.pg.test.ts
+            tests/integration/pg_team_board_race.pg.test.ts
             tests/integration/retention_upgrade.test.ts
             tests/integration/rust_fixtures.test.ts
             tests/integration/rust_responses.test.ts
