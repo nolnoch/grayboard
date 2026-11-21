@@ -2048,14 +2048,14 @@ function makeOAuthStore(hosted: HostedStoreOf): OAuthStore {
   };
 }
 
-// A call's promise, its synchronous throw (a settled Tx, a foreign handle) as a rejection: the five revoking OAuth
+// A call's promise, its synchronous throw (a settled Tx, a foreign handle) as a rejection: the revoking OAuth
 // methods are forwarded without an async wrapper, whose extra hop would hold the write queue a tick longer.
 function settledOn<T>(f: () => Promise<T>): Promise<T> {
   try { return f(); } catch (e) { return Promise.reject(e); }
 }
 
 // The store's methods without their handle, bound to one connection.
-// Synchronous: the store wraps each async method's result in a promise. The five that can revoke a grant are the
+// Synchronous: the store wraps each async method's result in a promise. The ones that can revoke a grant are the
 // store's own async methods, on the caller's Tx: a revoked grant ends its hosted sessions, whose released children's
 // IDs end through the async session-end port (#807 P3 C10d2-a).
 type OAuthRevokes = "redeemCode" | "rotateRefresh" | "revokeToken" | "revokePreBuiltinGrants" | "revokeServiceCredential" | "revokeUserGrant";

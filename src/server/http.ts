@@ -1022,7 +1022,7 @@ async function grantList(target: { id: number }, current: number | null, repo: R
   return json({ grants: [
     ...grants.map(g => ({ id: g.id, kind: g.credential ? "credential" : "oauth", client_id: g.clientId, created_at: g.createdAt, last_used_at: g.lastUsedAt, expires_at: g.expiresAt })),
     ...sessions.map(s => ({ id: `cli:${s.id}`, kind: "cli", label: s.label, created_at: s.created_at, last_used_at: s.last_used_at, expires_at: null, ...(s.id === current ? { current: true } : {}) })),
-  ] });
+  ].sort((a, b) => b.last_used_at - a.last_used_at) });
 }
 async function grantRevoke(target: { id: number; email: string }, id: unknown, authed: AuthedUser, repo: Repo): Promise<Response> {
   if (typeof id !== "string" || id === "" || id.length > 200) return badRequest("id required (from grants list)");
