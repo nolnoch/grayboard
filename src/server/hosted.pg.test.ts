@@ -24,11 +24,11 @@ import { DEFAULT_AUTH_FAIL_LIMIT, DEFAULT_HELLO_LIMIT } from "./rate_limit.ts";
 import { DEFAULT_TRUSTED_PROXIES } from "./client_addr.ts";
 import { createOAuthServer } from "./oauth.ts";
 import { hashToken } from "./auth.ts";
-import { gateCount, statementTotals } from "./metrics.ts";
+import { gateCount, refusalCount, statementTotals } from "./metrics.ts";
 import { GRAYBOARD_EFFORT_META, GRAYBOARD_LAUNCHER_META, GRAYBOARD_MODEL_META } from "../shared/session_meta.ts";
 import { issueOAuth } from "../../tests/helpers/oauth.ts";
 import { hostedPause } from "../../tests/support/hosted-pause.ts";
-import type { Tx } from "./store/tx_base.ts";
+import { isTx, type Tx } from "./store/tx_base.ts";
 import { pgOf } from "./store/pg/tx.ts";
 
 // Above the pool's 5 s lock_timeout (pg/tx.ts), so a broken lock fails on its own error, not on Bun's timeout.
@@ -354,18 +354,20 @@ const RESOURCE = `${ORIGIN}/hosted/mcp`;
 // reconcile) waits on it before it queues, so a test's clock moves reach its own requests first. `beforePrior`: run once
 // as the next prior body (withPrior's keyed body) is queued, after its checks outside the body. `priorHold`: a keyed
 // prior body waits on it at its first row read, after its authorization and grant reads.
-async function gateInstance(url: string, opts: { oauth?: boolean; keyedGate?: false; side?: string; idleSeconds?: number } = {}) {
+async function gateInstance(url: string, opts: { oauth?: boolean; keyedGate?: false; side?: string; idleSeconds?: number; caps?: { perUser: number; global: number } } = {}) {
   const blobDir = mkdtempSync(join(tmpdir(), "gb-pg-blobs-"));
   let clock = T0;
   const repo: PgRepo = await makePgRepo(url, { blobDir, applicationName: `gb-test-gate-${opts.side ?? "a"}`, max: 4, now: () => clock });
   const store = repo.hosted;
   const state = { hold: undefined as Gate | undefined, held: 0, keyedQueued: 0, defer: undefined as Gate | undefined, exclusive: [] as Array<{ site: string | undefined; startedHeld?: boolean }>,
-    beforePrior: undefined as (() => Promise<void>) | undefined, priorHold: undefined as Gate | undefined };
+    beforePrior: undefined as (() => Promise<void>) | undefined, priorHold: undefined as Gate | undefined, absent: new Map<string, number>() };
   const isKeyed = (tx: unknown) => (tx as { txn?: { keys?: ReadonlySet<string> } }).txn?.keys !== undefined;
   const get = store.get.bind(store);
   store.get = (async (r: Parameters<typeof store.get>[0], id: string) => {
     if (isKeyed(r) && currentSite() === "prior" && state.priorHold) { state.held++; try { await state.priorHold.wait; } finally { state.held--; } }
-    return get(r, id);
+    const row = await get(r, id);
+    if (!isTx(r) && row === undefined) state.absent.set(id, (state.absent.get(id) ?? 0) + 1);
+    return row;
   }) as typeof store.get;
   const lock = store.lock.bind(store);
   store.lock = async (tx: Tx, id: string) => {
@@ -399,7 +401,7 @@ async function gateInstance(url: string, opts: { oauth?: boolean; keyedGate?: fa
   const application = createApplication(repo);
   const oauth = opts.oauth ? createOAuthServer(repo, { store: { kind: "postgres", url }, blobDir, httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl: `${ORIGIN}:443/hosted`, messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES }, { now: () => clock }) : undefined;
   await oauth?.ready;
-  const hosted = createHostedSessions(application, { now: () => clock, isAuthorized: oauth ? (p, r) => oauth.isAuthorized(p, r) : () => true, ...(opts.keyedGate === false ? { keyedGate: false as const } : {}), ...(opts.idleSeconds ? { idleSeconds: opts.idleSeconds } : {}) });
+  const hosted = createHostedSessions(application, { now: () => clock, isAuthorized: oauth ? (p, r) => oauth.isAuthorized(p, r) : () => true, ...(opts.keyedGate === false ? { keyedGate: false as const } : {}), ...(opts.idleSeconds ? { idleSeconds: opts.idleSeconds } : {}), ...(opts.caps ? { caps: opts.caps } : {}) });
   await hosted.ready;
   return {
     repo, hosted, state, oauth, q: repo.writeQueue,
@@ -883,6 +885,122 @@ describePg("hosted gate keyed fast path (Postgres)", () => {
     expect(counts.miss).toBeGreaterThanOrEqual(4);
     expect(fastRows).toEqual(refRows);
     expect(fastRows.access_log!.length).toBeGreaterThan(0);
+  });
+});
+
+// #1537a: a second request of an ID whose first request is creating it (an MCP client's two wires, opened at once)
+// waits for the creator's exclusive body and reads again (hosted.ts withGate, `creating`). The creator is held at the
+// gate's `hosted:gate:checked` pause, after its registration and before its body; the second request's pool read of
+// the row (`state.absent`, counted when it returns no row) shows it read before the creation. Every wait has a deadline.
+describePg("a first contact's second wire waits for the in-flight create (Postgres)", () => {
+  const rows = async (sql: Awaited<ReturnType<typeof pgDatabase>>["sql"], id: string) => ({
+    sessions: (await sql`SELECT count(*)::int AS n FROM hosted_sessions WHERE session_id = ${id}`)[0].n as number,
+    ownerships: (await sql`SELECT count(*)::int AS n FROM access_log WHERE action = 'hosted.ownership_started' AND target = ${id}`)[0].n as number,
+  });
+  const absent = (x: GateInstance, id: string) => x.state.absent.get(id) ?? 0;
+  // Two first contacts of one ID: the first held at its gate until the second (and any request it starts) has read
+  // no row `reads` times. The pause's file outlives both, since the second passes the same pause point after the first.
+  // Returns both results.
+  async function pair(x: GateInstance, first: () => Promise<unknown>, second: () => Promise<unknown>, id: string, reads = 1) {
+    const at = absent(x, id);
+    const settled = (q: Promise<unknown>) => q.then(v => ({ ok: v }), (e: unknown) => ({ error: e }));
+    let other!: Promise<unknown>, started!: () => void;
+    const ready = new Promise<void>(resolve => { started = resolve; });
+    return await hostedPause("hosted:gate:checked", () => Promise.all([settled(first()), ready.then(() => other)]), async () => {
+      other = settled(second());
+      started();
+      await until(() => absent(x, id) >= at + 1 + reads, 10_000, "the second request read no row while the first was held");
+    });
+  }
+
+  // The second wire runs one keyed gate body, not a second exclusive one; one row, one ownership. Then the ID's end and
+  // a second pair on it: the first pair's entry left the map, so the second pair waits the same way.
+  // Mutations: no wait (both bodies exclusive: skipped 2); the entry never deleted (the second pair's first request
+  // waits on the stale entry and doesn't register, so its second runs exclusive too: skipped 2).
+  test("two first contacts of one new ID: one exclusive body, one keyed; one row and one ownership audit; again after its end", async () => {
+    await using db = await pgDatabase({ max: 2 });
+    await using x = await gateInstance(db.url, { oauth: true });
+    const { p } = await issued(x);
+    const id = idOf(p, "new-a");
+    for (const round of [1, 2]) {
+      const d = delta();
+      const [one, two] = await pair(x, () => whoami(x, p, "new-a"), () => whoami(x, p, "new-a"), id);
+      expect([one, two]).toEqual([{ ok: null }, { ok: null }]);
+      expect(d()).toEqual({ keyed: 1, miss: 0, skipped: 1 });
+      await x.drain();
+      expect(await rows(db.sql, id)).toEqual({ sessions: 1, ownerships: round });
+      if (round === 1) { await x.hosted.release(id, "closed"); expect(await rows(db.sql, id)).toEqual({ sessions: 0, ownerships: 1 }); }
+    }
+  });
+
+  // The first request refused at capacity: each waiter reads no row again and runs its own exclusive body, which
+  // refuses and counts its own refusal. Two waiters: whichever re-reads first registers, and the other doesn't wait
+  // for it, so each request reads the row at most twice (5 reads). Mutation: the loop waiting twice (the later
+  // waiter waits for the earlier one and reads a third time: 6).
+  test("a first contact refused at capacity: each waiter refuses too, counted per request, after one wait each", async () => {
+    await using db = await pgDatabase({ max: 2 });
+    await using x = await gateInstance(db.url, { oauth: true, caps: { perUser: 1, global: 16 } });
+    const { p } = await issued(x);
+    await whoami(x, p, "full");
+    const id = idOf(p, "new-b");
+    const d = delta(), refused = refusalCount("hosted_session"), at = absent(x, id);
+    const [one, rest] = await pair(x, () => whoami(x, p, "new-b"), () => Promise.all([whoami(x, p, "new-b").catch((e: unknown) => e), whoami(x, p, "new-b").catch((e: unknown) => e)]), id, 2);
+    const errors = [(one as { error: unknown }).error, ...(rest as { ok: unknown[] }).ok];
+    expect(errors.map(e => (e as { code?: string }).code)).toEqual(["bad_request", "bad_request", "bad_request"]);
+    expect(refusalCount("hosted_session") - refused).toBe(3);
+    expect(d()).toEqual({ keyed: 0, miss: 0, skipped: 3 });
+    expect(absent(x, id) - at).toBe(5);
+    expect(await rows(db.sql, id)).toEqual({ sessions: 0, ownerships: 0 });
+  });
+
+  // A waiter whose request aborts rejects RequestAbortedError at once, while the creator is still held, and writes
+  // nothing; it never registered, so the ID's next pair (after its end) waits as the first did.
+  // Mutation: the wait ignoring the signal (the waiter rejects only once the creator's body settles, after the hold).
+  test("a waiter whose request aborts rejects RequestAbortedError before the create settles and writes nothing", async () => {
+    await using db = await pgDatabase({ max: 2 });
+    await using x = await gateInstance(db.url, { oauth: true });
+    const { p } = await issued(x);
+    const id = idOf(p, "new-c");
+    const d = delta(), before = x.state.exclusive.length, at = absent(x, id);
+    const ac = new AbortController();
+    // The aborted waiter never reaches the pause point, so the pause need only outlive the first request.
+    let failed: unknown;
+    await hostedPause("hosted:gate:checked", () => whoami(x, p, "new-c"), async () => {
+      const second = x.hosted.run(p, ctx(p, "new-c"), "whoami", async () => null, undefined, undefined, ac.signal);
+      void second.catch(e => { failed = e; });
+      await until(() => absent(x, id) === at + 2, 10_000, "the second request read no row while the first was held");
+      ac.abort();
+      await until(() => failed !== undefined, 10_000, "the aborted waiter rejected while the creator was held");
+    });
+    expect(failed).toBeInstanceOf(RequestAbortedError);
+    await x.drain();
+    expect(d()).toEqual({ keyed: 0, miss: 0, skipped: 1 });
+    expect(x.state.exclusive.slice(before).filter(b => b.site === "gate")).toHaveLength(1);
+    expect(await rows(db.sql, id)).toEqual({ sessions: 1, ownerships: 1 });
+    await x.hosted.release(id, "closed");
+    const again = delta();
+    await pair(x, () => whoami(x, p, "new-c"), () => whoami(x, p, "new-c"), id);
+    expect(again()).toEqual({ keyed: 1, miss: 0, skipped: 1 });
+  });
+
+  // Another user's request naming the ID being created (a forged context: IDs derive from the user) waits, finds the
+  // creator's row, misses in the keyed probe (ownRow) and refuses in its exclusive body, which writes its
+  // `authz.decision` row: the wait changes nothing about the refusal.
+  test("another user's second wire on the ID being created refuses as not found and writes its authz.decision row", async () => {
+    await using db = await pgDatabase({ max: 2 });
+    await using x = await gateInstance(db.url, { oauth: true });
+    const { p } = await issued(x);
+    const { p: other } = await issued(x, "other@example.com");
+    const id = idOf(p, "new-d");
+    const d = delta();
+    const [one, two] = await pair(x, () => whoami(x, p, "new-d"), () => x.hosted.run(other, ctx(p, "new-d"), "whoami", async () => null), id);
+    expect(one).toEqual({ ok: null });
+    expect((two as { error?: { code?: string } }).error?.code).toBe("not_found");
+    expect(d()).toEqual({ keyed: 0, miss: 1, skipped: 1 });
+    await x.drain();
+    const decisions = await db.sql`SELECT actor, detail->>'rule' AS rule, detail->>'verb' AS verb FROM access_log WHERE action = 'authz.decision' AND target = ${id}`;
+    expect(decisions.map((r: Record<string, unknown>) => ({ ...r }))).toEqual([{ actor: "other@example.com", rule: "hosted.other_user", verb: "hosted.session" }]);
+    expect(await rows(db.sql, id)).toEqual({ sessions: 1, ownerships: 1 });
   });
 });
 
