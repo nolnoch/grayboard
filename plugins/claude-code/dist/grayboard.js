@@ -31624,8 +31624,10 @@ class ServerUnreachable extends Error {
 class ServerBusy extends ServerUnreachable {
   retryAfterMs;
   constructor(retryAfterMs) {
-    super(new Error(`server at capacity (rate_limited); retry after ${retryAfterMs} ms`));
-    this.retryAfterMs = retryAfterMs;
+    const ms = Number.isFinite(retryAfterMs) && retryAfterMs > 0 ? retryAfterMs : 1000;
+    super(new Error(`server at capacity (rate_limited); retry after ${ms} ms`));
+    this.retryAfterMs = ms;
+    this.message = "Server at capacity";
   }
 }
 

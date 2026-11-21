@@ -1451,7 +1451,7 @@ test.each([["rate_limited"], ["internal_error"]])("static mode retries an auto-e
   const s = await staticRuntime("service", undefined, undefined, () => failures-- > 0 ? { content: [{ type: "text", text: `error: ${code}` }], structuredContent: { code }, isError: true } : undefined);
   try {
     await s.r.controller.observe("session.created", { sessionID: "R" });
-    expect(rootRecord(s.r.controller, "R")).toMatchObject({ state: "retrying", operation: "enroll", code: "server_unreachable" });
+    expect(rootRecord(s.r.controller, "R")).toMatchObject({ state: "retrying", operation: "enroll", code });
     await until(() => s.r.controller.enrollment("R"), 5000, "the retry enrolls R");
     expect(s.asked).toHaveLength(2);
   } finally { await s.restore(); }
@@ -1713,6 +1713,15 @@ test("static mode: retries run out on whoami 503s record the outage and a new ru
     await retriesSettled(s.r.controller);
     expect(s.asked).toHaveLength(9);
     expect(rootRecord(s.r.controller, "R")).toMatchObject({ state: "unenrolled", operation: "enroll", code: "server_unreachable", message: "Auto-enroll gave up after 8 retries (server_unreachable); once the server answers, the launcher must start a new run" });
+  } finally { await s.restore(); }
+});
+test("static mode: retries run out on a server at capacity record server_busy (#1553)", async () => {
+  const s = await staticRuntime("service", undefined, undefined, () => { throw new ServerBusy(800); });
+  (s.r.controller as unknown as { enrollRetryFirstMs: number }).enrollRetryFirstMs = 1;
+  try {
+    await s.r.controller.observe("session.created", { sessionID: "R" });
+    await retriesSettled(s.r.controller);
+    expect(rootRecord(s.r.controller, "R")).toMatchObject({ state: "unenrolled", operation: "enroll", code: "server_busy", message: "Auto-enroll gave up after 8 retries (server_busy); once the server answers, the launcher must start a new run" });
   } finally { await s.restore(); }
 });
 // #1250 re-verify I-A: an isError result with no structuredContent is never parsed as whoami's JSON answer.

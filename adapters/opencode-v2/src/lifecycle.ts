@@ -250,8 +250,9 @@ export class OpenCodeController extends Controller<OpenCodeEnrollment> {
     const closed = () => this.roots.has(sessionID) ? undefined : this.record({ state: "unenrolled", sessionID, message: "Shut down while auto-enroll was retrying; the root is not enrolled", operation: "enroll", code: "server_unreachable" });
     const retry = (async () => {
       for (let attempt = 0; attempt < ENROLL_RETRIES && error !== undefined && transientEnroll(error); attempt++) {
-        const busy = failureCode(error) === "server_busy";
-        this.record({ state: "retrying", sessionID, message: `${busy ? "Server at capacity" : "Server unreachable"}; retrying auto-enroll (${attempt + 1}/${ENROLL_RETRIES})`, operation: "enroll", code: busy ? "server_busy" : "server_unreachable" });
+        // The outage's own code, as enrollExhausted records it; a busy server says so (#1553).
+        const code = failureCode(error), outage = TRANSIENT_CODES.has(code) ? code : "server_unreachable";
+        this.record({ state: "retrying", sessionID, message: `${outage === "server_busy" ? "Server at capacity" : "Server unreachable"}; retrying auto-enroll (${attempt + 1}/${ENROLL_RETRIES})`, operation: "enroll", code: outage });
         await abortableSleep(Math.min(ENROLL_RETRY_MAX_MS, this.enrollRetryFirstMs * 2 ** attempt), this.enrollStop.signal);
         if (this.stopped) return closed();
         if (this.enrollment(sessionID)) return;

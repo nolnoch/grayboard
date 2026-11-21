@@ -71,8 +71,16 @@ export class ServerUnreachable extends Error {
 // its retries or its timeout ran out (#1536): the server is up but at capacity. A ServerUnreachable,
 // so every outage path retries it rather than reading the SDK's causeless
 // version-negotiation failure the 429 would otherwise become.
+// Its own message, so every warning that prints the raw error says capacity, not unreachable (#1553); a hint that
+// isn't a positive finite number reads as one second, so no caller's wait floor can collapse to zero.
 export class ServerBusy extends ServerUnreachable {
-  constructor(readonly retryAfterMs: number) { super(new Error(`server at capacity (rate_limited); retry after ${retryAfterMs} ms`)); }
+  readonly retryAfterMs: number;
+  constructor(retryAfterMs: number) {
+    const ms = Number.isFinite(retryAfterMs) && retryAfterMs > 0 ? retryAfterMs : 1000;
+    super(new Error(`server at capacity (rate_limited); retry after ${ms} ms`));
+    this.retryAfterMs = ms;
+    this.message = "Server at capacity";
+  }
 }
 // A tool call's request left, then the transport failed (a reset, a gateway
 // 502-504, a stream cut short, a timeout): the server may have run it, so the
