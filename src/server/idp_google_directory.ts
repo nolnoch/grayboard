@@ -74,11 +74,6 @@ export function parseDirectoryCredential(raw: string | undefined, serviceAccount
   return { kind: "key", clientEmail: k.client_email, privateKey: k.private_key, ...delegated };
 }
 
-// The service account key path, as before #1565.
-export function parseDirectoryKey(raw: string, admin: string | undefined): GoogleDirectoryConfig {
-  return parseDirectoryCredential(raw, undefined, admin);
-}
-
 function serviceAccountEmail(v: string, what: string): string {
   if (!/^[^\s@/:]+@[^\s@/:]+$/.test(v)) throw new Error(`${what} must be a service account's email address`);
   return v;
@@ -101,7 +96,9 @@ function parseExternalAccount(k: Record<string, unknown>): Extract<GoogleDirecto
   if (tokenUrl.protocol !== "https:" || !tokenUrl.hostname.endsWith(".googleapis.com")) throw new Error(`${where}: token_url must be Google's STS endpoint (https, a googleapis.com host)`);
   const impersonation = typeof k.service_account_impersonation_url === "string" ? IMPERSONATION_URL.exec(k.service_account_impersonation_url) : null;
   if (!impersonation) throw new Error(`${where}: service_account_impersonation_url must name the service account (https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/EMAIL:generateAccessToken)`);
-  const serviceAccount = serviceAccountEmail(decodeURIComponent(impersonation[1]!), `${where}: service_account_impersonation_url's service account`);
+  let encoded: string;
+  try { encoded = decodeURIComponent(impersonation[1]!); } catch { throw new Error(`${where}: service_account_impersonation_url's service account is not valid percent-encoding`); }
+  const serviceAccount = serviceAccountEmail(encoded, `${where}: service_account_impersonation_url's service account`);
   const cs = k.credential_source as Record<string, unknown> | undefined;
   if (typeof cs !== "object" || cs === null) throw new Error(`${where}: credential_source is missing`);
   if ("environment_id" in cs) throw new Error(`${where}: an AWS credential_source isn't supported; on EKS, point credential_source.file at the pod's projected service account token`);
@@ -172,12 +169,15 @@ export function googleDirectoryStatus(config: GoogleDirectoryConfig, options: Go
   async function subjectToken(source: SubjectSource, signal: AbortSignal): Promise<string> {
     let text: string;
     if ("file" in source) {
-      try { text = await readFile(source.file, "utf8"); } catch (e) {
+      try { text = await readFile(source.file, { encoding: "utf8", signal }); } catch (e) {
+        if (signal.aborted) throw e;
         throw refused(new DirectoryError("google_token_refused", `cannot read the federated subject token ${source.file}: ${(e as NodeJS.ErrnoException).code ?? (e as Error).message}`));
       }
     } else {
       const res = await send(source.url, { signal, headers: source.headers });
-      if (!res.ok) throw refused(new DirectoryError("google_token_refused", `federated subject token request failed (${res.status})`));
+      // As check(): a refusal is the credential's fault; anything else not OK is the source's.
+      if ([400, 401, 403, 404].includes(res.status)) throw refused(new DirectoryError("google_token_refused", `federated subject token request failed (${res.status})`));
+      if (!res.ok) throw new DirectoryError("google_directory_error", `federated subject token request failed (${res.status})`);
       text = await res.text();
     }
     let token: unknown = text.trim();

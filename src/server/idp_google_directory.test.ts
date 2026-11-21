@@ -6,7 +6,7 @@ import { exportPKCS8, generateKeyPair, jwtVerify, type KeyLike } from "jose";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { DIRECTORY_SCOPE, GOOGLE_TOKEN_URL, googleDirectoryStatus, parseDirectoryCredential, parseDirectoryKey } from "./idp_google_directory.ts";
+import { DIRECTORY_SCOPE, GOOGLE_TOKEN_URL, googleDirectoryStatus, parseDirectoryCredential } from "./idp_google_directory.ts";
 
 const SA = "checker@proj.iam.gserviceaccount.com";
 let pem: string, pub: KeyLike;
@@ -39,7 +39,7 @@ const failure = (p: Promise<unknown>) => p.then(() => { throw new Error("expecte
 
 test("an active user is active; the JWT-bearer assertion carries Google's claims and the token is reused", async () => {
   const g = google();
-  const status = googleDirectoryStatus(parseDirectoryKey(keyJson(), undefined), g.options);
+  const status = googleDirectoryStatus(parseDirectoryCredential(keyJson(), undefined, undefined), g.options);
   expect(await status("1234567890", signal())).toBe("active");
   expect(await status("1234567890", signal())).toBe("active");
   expect(g.tokens()).toHaveLength(1);
@@ -57,14 +57,14 @@ test("an active user is active; the JWT-bearer assertion carries Google's claims
 
 test("under domain-wide delegation the assertion's sub is the admin it impersonates", async () => {
   const g = google();
-  await googleDirectoryStatus(parseDirectoryKey(keyJson(), "admin@example.com"), g.options)("1", signal());
+  await googleDirectoryStatus(parseDirectoryCredential(keyJson(), undefined, "admin@example.com"), g.options)("1", signal());
   expect((await jwtVerify(g.tokens()[0]!.assertion!, pub, { currentDate: new Date(1_000_000_000_000) })).payload.sub).toBe("admin@example.com");
 });
 
 test("suspended, archived and a 404 are inactive", async () => {
   for (const reply of [{ status: 200, body: { suspended: true, archived: false } }, { status: 200, body: { suspended: false, archived: true } }, { status: 404, body: { error: { code: 404 } } }]) {
     const g = google({ user: () => reply });
-    expect(await googleDirectoryStatus(parseDirectoryKey(keyJson(), undefined), g.options)("1", signal())).toBe("inactive");
+    expect(await googleDirectoryStatus(parseDirectoryCredential(keyJson(), undefined, undefined), g.options)("1", signal())).toBe("inactive");
   }
 });
 
@@ -85,14 +85,14 @@ test("every other answer throws, named for what an operator fixes", async () => 
   ];
   for (const [script, name] of cases) {
     const g = google(script);
-    expect((await failure(googleDirectoryStatus(parseDirectoryKey(keyJson(), undefined), g.options)("1", signal()))).name).toBe(name);
+    expect((await failure(googleDirectoryStatus(parseDirectoryCredential(keyJson(), undefined, undefined), g.options)("1", signal()))).name).toBe(name);
   }
 });
 
 test("a token is minted again near its expiry and after a 401; concurrent first calls share one mint", async () => {
   let refuse = false;
   const g = google({ user: () => refuse ? { status: 401 } : { status: 200, body: { suspended: false } } });
-  const status = googleDirectoryStatus(parseDirectoryKey(keyJson(), undefined), g.options);
+  const status = googleDirectoryStatus(parseDirectoryCredential(keyJson(), undefined, undefined), g.options);
   await Promise.all([status("1", signal()), status("2", signal()), status("3", signal())]);
   expect(g.tokens()).toHaveLength(1);
   g.advance(3600_000 - 60_000);
@@ -107,7 +107,7 @@ test("a token is minted again near its expiry and after a 401; concurrent first 
 
 test("a subject that isn't a Google user id throws without a request", async () => {
   const g = google();
-  const status = googleDirectoryStatus(parseDirectoryKey(keyJson(), undefined), g.options);
+  const status = googleDirectoryStatus(parseDirectoryCredential(keyJson(), undefined, undefined), g.options);
   for (const subject of ["..", ".", "../x?y", "", "12a"]) expect((await failure(status(subject, signal()))).name).toBe("google_directory_error");
   expect(g.seen).toEqual([]);
 });
@@ -122,7 +122,7 @@ test("a caller's abort stops its own wait, not the shared token request; users.g
     if (String(input) === "https://token.test") await gate;
     return g.options.fetch(input, init);
   }) as typeof fetch;
-  const status = googleDirectoryStatus(parseDirectoryKey(keyJson(), undefined), { ...g.options, fetch: fetchFn });
+  const status = googleDirectoryStatus(parseDirectoryCredential(keyJson(), undefined, undefined), { ...g.options, fetch: fetchFn });
   const quitter = new AbortController(), stayer = new AbortController();
   const first = failure(status("1", quitter.signal));
   const second = status("2", stayer.signal);
@@ -141,7 +141,7 @@ test("a refused credential logs Google's error text once per window; the class g
   console.warn = (m: string) => { warned.push(m); };
   try {
     const g = google({ token: () => ({ status: 400, body: { error: "unauthorized_client" } }) });
-    const status = googleDirectoryStatus(parseDirectoryKey(keyJson(), undefined), g.options);
+    const status = googleDirectoryStatus(parseDirectoryCredential(keyJson(), undefined, undefined), g.options);
     expect((await failure(status("1", signal()))).name).toBe("google_token_refused");
     await failure(status("1", signal()));
     expect(warned).toHaveLength(1);
@@ -150,7 +150,7 @@ test("a refused credential logs Google's error text once per window; the class g
     await failure(status("1", signal()));
     expect(warned).toHaveLength(2);
     const d = google({ user: () => ({ status: 403, body: { error: { message: "Not Authorized to access this resource/api" } } }) });
-    expect((await failure(googleDirectoryStatus(parseDirectoryKey(keyJson(), undefined), d.options)("1", signal()))).name).toBe("google_directory_refused");
+    expect((await failure(googleDirectoryStatus(parseDirectoryCredential(keyJson(), undefined, undefined), d.options)("1", signal()))).name).toBe("google_directory_refused");
     expect(warned.at(-1)).toContain("Not Authorized");
   } finally { console.warn = warn; }
 });
@@ -169,9 +169,9 @@ test("a key that isn't a service account's RSA key, or an admin that isn't an em
     [keyJson({ private_key: `\n${pem}` }), undefined, /not a PKCS#8 RSA private key/],
     [keyJson(), "admin", /must be an admin's email/],
     [keyJson(), "", /must be an admin's email/],
-  ] as const) expect(() => parseDirectoryKey(raw, admin)).toThrow(msg);
+  ] as const) expect(() => parseDirectoryCredential(raw, undefined, admin)).toThrow(msg);
   // The refusal never echoes the key.
-  try { parseDirectoryKey(keyJson({ private_key: "SECRETSECRET" }), undefined); } catch (e) { expect((e as Error).message).not.toContain("SECRET"); }
+  try { parseDirectoryCredential(keyJson({ private_key: "SECRETSECRET" }), undefined, undefined); } catch (e) { expect((e as Error).message).not.toContain("SECRET"); }
 });
 
 // #1565: keyless. A fake Google with the metadata server, STS, IAM Credentials, the token endpoint and users.get.
@@ -298,6 +298,7 @@ test("keyless refusals are classed for what an operator fixes", async () => {
     [{ sts: () => ({ status: 503 }) }, { url: "http://subject.test/t" }, "google_directory_error"],
     [{ subject: () => ({ status: 403 }) }, { url: "http://subject.test/t" }, "google_token_refused"],
     [{ subject: () => ({ status: 200, body: "" }) }, { url: "http://subject.test/t" }, "google_token_refused"],
+    [{ subject: () => ({ status: 503 }) }, { url: "http://subject.test/t" }, "google_directory_error"],
     [{}, { file: "/nonexistent/gb-wif-token" }, "google_token_refused"],
   ] as const) {
     const g = keyless(script);
@@ -314,6 +315,7 @@ test("an external_account configuration that couldn't work is refused at startup
     [{ token_url: 7 }, /token_url is not a URL/],
     [{ service_account_impersonation_url: undefined }, /service_account_impersonation_url must name the service account/],
     [{ service_account_impersonation_url: `https://evil.example.com/v1/projects/-/serviceAccounts/${SA}:generateAccessToken` }, /service_account_impersonation_url must name/],
+    [{ service_account_impersonation_url: "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/a%E0%A4%A:generateAccessToken" }, /not valid percent-encoding/],
     [{ credential_source: undefined }, /credential_source is missing/],
     [{ credential_source: { environment_id: "aws1", regional_cred_verification_url: "x" } }, /AWS credential_source isn't supported/],
     [{ credential_source: { executable: { command: "/bin/x" } } }, /only a file or url credential_source/],

@@ -809,6 +809,17 @@ describe("loadConfig", () => {
     expect(message()).toBe("GRAYBOARD_GOOGLE_DIRECTORY_SERVICE_ACCOUNT is set but GRAYBOARD_IDPS doesn't list google");
   });
 
+  test("an external_account GRAYBOARD_GOOGLE_DIRECTORY_KEY is Workload Identity Federation (#1565)", () => {
+    primary();
+    process.env.GRAYBOARD_GOOGLE_DIRECTORY_KEY = JSON.stringify({
+      type: "external_account", audience: "//iam.googleapis.com/projects/1/locations/global/workloadIdentityPools/p/providers/x",
+      subject_token_type: "urn:ietf:params:oauth:token-type:jwt", token_url: "https://sts.googleapis.com/v1/token",
+      service_account_impersonation_url: "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/checker@p.iam.gserviceaccount.com:generateAccessToken",
+      credential_source: { file: "/var/run/secrets/token" },
+    });
+    expect(loadConfig().googleDirectory).toMatchObject({ kind: "federated", serviceAccount: "checker@p.iam.gserviceaccount.com", source: { file: "/var/run/secrets/token" } });
+  });
+
   test("the Keycloak directory pair turns on oidc's directory check against the issuer's realm, or the URL named (#1555)", () => {
     process.env.GRAYBOARD_IDPS = "oidc";
     oidc();
