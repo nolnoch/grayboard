@@ -5,7 +5,7 @@ import { CREDENTIAL_NO_EXPIRY, CREDENTIAL_SOURCES, DEFAULT_SERVICE_TOKEN_LIMITS,
 import { AuthorityLost, DEV_SESSION_LABEL, LastOwner, PrincipalTaken, TEAM_POLICIES, type Repo, type RoleFilter, type Team, type TeamPolicy, type User } from "./db.ts";
 import { DEFAULT_CLI_TOKEN_IDLE_DAYS, DEFAULT_IDP_REAUTH_DAYS, type Config } from "./config.ts";
 import {
-  verifySessionToken, extractBearer,
+  verifySessionToken, extractBearer, IdpUnavailable,
   mintToken, hashToken, principalOfAuthed, signedIn, type AuthedUser, type TouchQueue,
 } from "./auth.ts";
 import { defaultProviders } from "./idp.ts";
@@ -32,11 +32,12 @@ import { SizeTally, checkFile, contentDisposition, reprDigest, sanitizeFilename 
 import { ALIAS_SCOPE_CAP, aliasCapRefusal } from "./alias_cap.ts";
 import { ensureTeamBoard, onAliasCreated, onTeamJoined, onTeamLeft } from "./teams.ts";
 import type { SlackLinker } from "./slack.ts";
+import type { IdpRecheck } from "./idp_recheck.ts";
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
-function json(body: unknown, status = 200): Response {
-  return Response.json(body, { status });
+function json(body: unknown, status = 200, headers?: Record<string, string>): Response {
+  return Response.json(body, { status, headers });
 }
 function jsonErr(code: string, message: string, status: number): Response {
   return json({ code, message }, status);
@@ -46,10 +47,10 @@ function badRequest(msg: string): Response { return jsonErr("bad_request", msg, 
 function conflict(msg: string): Response { return jsonErr("conflict", msg, 409); }
 function forbidden(msg: string): Response { return jsonErr("forbidden", msg, 403); }
 
-async function requireAuth(req: Request, repo: Repo, touches: TouchQueue, idleDays: number, reauthDays: number): Promise<AuthedUser | null> {
+async function requireAuth(req: Request, repo: Repo, touches: TouchQueue, idleDays: number, reauth: number | Pick<IdpRecheck, "cliVerdict">): Promise<AuthedUser | null> {
   const raw = extractBearer(req);
   if (!raw) return null;
-  return verifySessionToken(raw, repo, touches, idleDays, reauthDays);
+  return verifySessionToken(raw, repo, touches, idleDays, reauth);
 }
 
 async function parseBody<T>(req: Request): Promise<T | null> {
@@ -1058,6 +1059,8 @@ export type SessionHooks = {
   disconnectUser: (userId: number) => void;
   // principal: a principal's name; its sessions' aliases are re-checked.
   accessChanged: (h: Read, principal: string, by: string) => Promise<void>;
+  // The server's IdP re-check (#930 A2), shared with the OAuth refresh path; absent, the bare fallback clock.
+  recheck?: Pick<IdpRecheck, "cliVerdict">;
 };
 
 export async function handleHttp(
@@ -1078,7 +1081,14 @@ export async function handleHttp(
   const signIn = signInRoute(method, path, config);
   if (signIn) return signIn.handle(req, repo, config, ip);
 
-  const authed = await requireAuth(req, repo, touches, config.cliTokenIdleDays ?? DEFAULT_CLI_TOKEN_IDLE_DAYS, config.idpReauthDays ?? DEFAULT_IDP_REAUTH_DAYS);
+  let authed: AuthedUser | null;
+  try {
+    authed = await requireAuth(req, repo, touches, config.cliTokenIdleDays ?? DEFAULT_CLI_TOKEN_IDLE_DAYS, sessions.recheck ?? config.idpReauthDays ?? DEFAULT_IDP_REAUTH_DAYS);
+  } catch (e) {
+    // Not a 401: the token stands, so the auth gate charges nothing and the CLI says to retry, not to sign in.
+    if (!(e instanceof IdpUnavailable)) throw e;
+    return json({ code: "temporarily_unavailable", message: "the identity provider is unreachable; retry in a minute" }, 503, { "Retry-After": "60" });
+  }
   if (!authed) return jsonErr("unauthenticated", "invalid or missing token", 401);
 
   if (path === "/api/auth/logout" && method === "POST") return authLogout(authed, repo);

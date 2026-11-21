@@ -15,7 +15,7 @@ const KEYS = [
   "GRAYBOARD_HELLO_BURST", "GRAYBOARD_HELLO_PER_SEC",
   "GRAYBOARD_HOSTED_REQUEST_BURST", "GRAYBOARD_HOSTED_REQUEST_PER_SEC", "GRAYBOARD_HOSTED_SUBSCRIBER_BURST", "GRAYBOARD_HOSTED_SUBSCRIBER_PER_SEC",
   "GRAYBOARD_OAUTH_BURST", "GRAYBOARD_OAUTH_PER_SEC", "GRAYBOARD_OAUTH_GLOBAL_BURST", "GRAYBOARD_OAUTH_GLOBAL_PER_SEC",
-  "GRAYBOARD_AUTH_FAIL_BURST", "GRAYBOARD_AUTH_FAIL_PER_SEC", "GRAYBOARD_TRUSTED_PROXIES", "GRAYBOARD_HOSTED_IDLE_SECONDS", "GRAYBOARD_CLI_TOKEN_IDLE_DAYS", "GRAYBOARD_IDP_REAUTH_DAYS",
+  "GRAYBOARD_AUTH_FAIL_BURST", "GRAYBOARD_AUTH_FAIL_PER_SEC", "GRAYBOARD_TRUSTED_PROXIES", "GRAYBOARD_HOSTED_IDLE_SECONDS", "GRAYBOARD_CLI_TOKEN_IDLE_DAYS", "GRAYBOARD_IDP_REAUTH_DAYS", "GRAYBOARD_IDP_RECHECK_HOURS", "GRAYBOARD_IDP_RECHECK_MAX_STALE_HOURS", "GRAYBOARD_IDP_DISABLE_LIMIT",
   "GRAYBOARD_DELEGATE_BURST", "GRAYBOARD_DELEGATE_PER_SEC", "GRAYBOARD_DELEGATE_OPEN_CAP", "GRAYBOARD_ALIAS_SCOPE_CAP",
   ...["LISTEN", "LEGACY", "POST"].flatMap(kind => [`GRAYBOARD_MCP_${kind}_GLOBAL`, `GRAYBOARD_MCP_${kind}_PER_USER`]),
   "GRAYBOARD_HOSTED_SESSIONS_GLOBAL", "GRAYBOARD_HOSTED_SESSIONS_PER_USER", "GRAYBOARD_DELIVERY_LEASES_GLOBAL", "GRAYBOARD_DELIVERY_LEASES_PER_USER",
@@ -717,6 +717,24 @@ describe("loadConfig", () => {
     for (const bad of [" 7", "07", "1e2", "1.5", "-1", "3651", "never"]) {
       process.env.GRAYBOARD_IDP_REAUTH_DAYS = bad;
       expect(() => loadConfig()).toThrow(/GRAYBOARD_IDP_REAUTH_DAYS must be a whole number of days/);
+    }
+  });
+
+  test("the IdP re-check defaults to 24 h, 72 h stale and 5 disables an hour; the stale bound is at least the interval (#930 A2)", () => {
+    process.env.GRAYBOARD_DEV_AUTH = "1";
+    expect(loadConfig().idpRecheck).toEqual({ recheckHours: 24, maxStaleHours: 72, disableLimit: 5 });
+    process.env.GRAYBOARD_IDP_RECHECK_HOURS = "6";
+    process.env.GRAYBOARD_IDP_RECHECK_MAX_STALE_HOURS = "6";
+    process.env.GRAYBOARD_IDP_DISABLE_LIMIT = "20";
+    expect(loadConfig().idpRecheck).toEqual({ recheckHours: 6, maxStaleHours: 6, disableLimit: 20 });
+    process.env.GRAYBOARD_IDP_RECHECK_MAX_STALE_HOURS = "5";
+    expect(() => loadConfig()).toThrow(/GRAYBOARD_IDP_RECHECK_MAX_STALE_HOURS \(5\) must be at least GRAYBOARD_IDP_RECHECK_HOURS \(6\)/);
+    process.env.GRAYBOARD_IDP_RECHECK_MAX_STALE_HOURS = "";
+    for (const [name, bad] of [["GRAYBOARD_IDP_RECHECK_HOURS", "0"], ["GRAYBOARD_IDP_RECHECK_HOURS", "06"], ["GRAYBOARD_IDP_DISABLE_LIMIT", "0"], ["GRAYBOARD_IDP_DISABLE_LIMIT", "1.5"]] as const) {
+      const was = process.env[name];
+      process.env[name] = bad;
+      expect(() => loadConfig()).toThrow(new RegExp(`${name} must be a whole number`));
+      process.env[name] = was;
     }
   });
 

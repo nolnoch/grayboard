@@ -641,6 +641,8 @@ test("#807 P1c-7: the users store runs on the handle it's given", async () => {
   await expect(repo.users.signIn(kept, GOOGLE_ISSUER, "s-1", "c@example.com", null)).rejects.toThrow(settled);
   await expect(repo.users.clearSubject(kept, u.id)).rejects.toThrow(settled);
   await expect(repo.users.setDisabled(kept, u.id, true)).rejects.toThrow(settled);
+  await expect(repo.users.stampIdpChecked(kept, u.id)).rejects.toThrow(settled);
+  await expect(repo.users.lockById(kept, u.id)).rejects.toThrow(settled);
   await expect(repo.users.setDisabled({} as Tx, u.id, true)).rejects.toThrow("not a SQLite store handle");
   expect((await repo.users.findByEmail(repo.read, "b@example.com"))).toBeUndefined();
   expect((await repo.users.findByEmail(repo.read, "c@example.com"))).toBeUndefined();
@@ -684,6 +686,7 @@ test("#807 P1c-8: the OAuth store runs on the handle it's given", async () => {
   await expect(o.findBrowserSession(kept, "s", 1)).rejects.toThrow(settled);
   await expect(o.findCodeScopes(kept, "c", "c", "r", "u", 1)).rejects.toThrow(settled);
   await expect(o.findRefreshGrant(kept, "h", "c", "r", 1)).rejects.toThrow(settled);
+  await expect(o.findRefreshUser(kept, "h", "c", "r", 1)).rejects.toThrow(settled);
   await expect(o.findActiveAccess(kept, "h", "r", [], 1)).rejects.toThrow(settled);
   await expect(o.isGrantActive(kept, "g", 1)).rejects.toThrow(settled);
   await expect(o.revokeToken({} as Tx, "t", "c", 1)).rejects.toThrow("not a SQLite store handle");

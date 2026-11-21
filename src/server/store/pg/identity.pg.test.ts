@@ -236,6 +236,19 @@ describePg("identity races (Postgres)", () => {
     expect(r.waited).toBe(true);
   });
 
+  // #930: the IdP re-check's disable re-reads the user with lockById. A sign-in's restamp holding the row makes it
+  // wait and then read the restamped clock, so the check sees the IdP vouched again and disables nobody; a plain read
+  // wouldn't wait and would read the old clock.
+  test("lockById waits for a restamp holding the users row, then reads its clock", async () => {
+    await using p = await pair();
+    const [u] = await users(p, "stamp@example.com");
+    await p.a.write(async tx => { await pgOf(tx)`UPDATE users SET idp_checked_at = 1 WHERE id = ${u!.id}`; });
+    const r = await race(p, tx => p.g.users.stampIdpChecked(tx, u!.id), tx => p.g.users.lockById(tx, u!.id));
+    expect(r.b).toMatchObject({ ok: true, value: { id: u!.id } });
+    expect((r.b as { value: User }).value.idp_checked_at).not.toBe(1);
+    expect(r.waited).toBe(true);
+  });
+
   test("T-C3-6 two teams.create of one name: the second is PrincipalTaken and its transaction goes on", async () => {
     await using p = await pair();
     const [u] = await users(p, A);

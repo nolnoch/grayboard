@@ -325,6 +325,11 @@ function refresh(it: It): void {
     expect(await h.oauth.findRefreshGrant(h.read, input.tokens.refreshHash, "foreign", binding.resource, start)).toBeUndefined();
     expect(await h.oauth.findRefreshGrant(h.read, input.tokens.refreshHash, binding.clientId, "wrong", start)).toBeUndefined();
     expect(await h.oauth.findRefreshGrant(h.read, input.tokens.accessHash, binding.clientId, binding.resource, start)).toBeUndefined();
+    // findRefreshUser (#930): the same bindings, and only while the token is unspent.
+    expect(await h.oauth.findRefreshUser(h.read, input.tokens.refreshHash, binding.clientId, binding.resource, start)).toBe(w.userId);
+    expect(await h.oauth.findRefreshUser(h.read, input.tokens.refreshHash, "foreign", binding.resource, start)).toBeUndefined();
+    expect(await h.oauth.findRefreshUser(h.read, input.tokens.refreshHash, binding.clientId, "wrong", start)).toBeUndefined();
+    expect(await h.oauth.findRefreshUser(h.read, input.tokens.accessHash, binding.clientId, binding.resource, start)).toBeUndefined();
     for (const change of [{ clientId: "foreign" }, { resource: "wrong" }, { scopes: ["grayboard:delivery"] }, { tokens: { ...next.tokens, resource: "wrong" } },
       { tokens: { ...next.tokens, refreshHash: next.refreshHash } }, { tokens: { ...next.tokens, accessHash: next.refreshHash } }, { refreshHash: "raw-refresh" }]) {
       expect(await status(h.write(tx => h.oauth.rotateRefresh(tx, { ...next, ...change }, start + 1)))).toBe("invalid");
@@ -337,6 +342,10 @@ function refresh(it: It): void {
     const rotated = await h.write(tx => h.oauth.rotateRefresh(tx, next, start + 1));
     expect(rotated).toMatchObject({ status: "ok", value: { grant: { id: input.grantId }, tokens: next.tokens } });
     expect((await h.rows("oauth_tokens")).find(t => t.hash === input.tokens.refreshHash)).toMatchObject({ spent_at: start + 1, revoked_at: null });
+    // A spent token still finds its grant (a replay resolves its scopes), but no user to re-check.
+    expect(await h.oauth.findRefreshGrant(h.read, input.tokens.refreshHash, binding.clientId, binding.resource, start + 1)).toBeDefined();
+    expect(await h.oauth.findRefreshUser(h.read, input.tokens.refreshHash, binding.clientId, binding.resource, start + 1)).toBeUndefined();
+    expect(await h.oauth.findRefreshUser(h.read, next.tokens.refreshHash, binding.clientId, binding.resource, start + 1)).toBe(w.userId);
     const newest = { ...binding, refreshHash: next.tokens.refreshHash, tokens: pair(binding, start + 2) };
     expect(await status(h.write(tx => h.oauth.rotateRefresh(tx, newest, start + 2)))).toBe("ok");
     expect(await status(h.write(tx => h.oauth.rotateRefresh(tx, { ...next, clientId: "foreign" }, start + 3)))).toBe("invalid");

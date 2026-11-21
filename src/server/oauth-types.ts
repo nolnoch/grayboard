@@ -74,6 +74,10 @@ export interface OAuthStore {
   redeemLoginCode(tx: Tx, input: OAuthAuthorization & { codeHash: string; tokenHash: string; label: string | null }, now: number): Promise<OAuthResult<{ sessionId: number; userId: number }>>;
   // Resolves original scopes for an omitted refresh scope; rotation rechecks everything atomically.
   findRefreshGrant(r: Read, refreshHash: string, clientId: string, resource: string, now: number): Promise<OAuthGrant | undefined>;
+  // The user behind an unspent, unrevoked, unexpired refresh token of a live grant bound to the client and resource,
+  // else undefined (#930): the IdP re-check runs only for a token rotation could spend, so a replay still reaches
+  // rotateRefresh's family revocation.
+  findRefreshUser(r: Read, refreshHash: string, clientId: string, resource: string, now: number): Promise<number | undefined>;
   // input.scopes requests nonempty canonical access scopes within the original grant; tokens.scopes must match.
   // Requested TTLs are validated then clamped to the persisted absolute grant deadline; use returned deadlines.
   rotateRefresh(tx: Tx, input: OAuthBinding & { refreshHash: string; tokens: OAuthTokenPair }, now: number): Promise<OAuthResult<{ grant: OAuthGrant; tokens: OAuthTokenPair }>>;

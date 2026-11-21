@@ -16,6 +16,7 @@ import { DELEGATE_LIMIT, DELEGATE_OPEN_CAP } from "../core/delegation.ts";
 import { ALIAS_SCOPE_CAP } from "./alias_cap.ts";
 import { GOOGLE_ISSUER } from "./idp_google.ts";
 import { describeCredentials, type AwsCredentialSpec } from "./aws_credentials.ts";
+import type { RecheckConfig } from "./idp_recheck.ts";
 
 export type McpLimits = Record<"listen" | "legacy" | "post", { global: number; perUser: number }>;
 export const DEFAULT_MCP_LIMITS: McpLimits = { listen: { global: 128, perUser: 32 }, legacy: { global: 256, perUser: 32 }, post: { global: 256, perUser: 64 } };
@@ -77,6 +78,9 @@ export type Config = {
   cliTokenIdleDays?: number;
   // Days a user's grants and CLI tokens keep working after the IdP last vouched for them (#930); 0 never.
   idpReauthDays?: number;
+  // The IdP re-check for providers with a directory check (#930 A2): hours between checks, hours a refresh fails open
+  // through an IdP outage before answering 503, and automatic disables an hour before they stop.
+  idpRecheck?: { recheckHours: number; maxStaleHours: number; disableLimit: number };
   // Emails allowed to run admin commands. Empty means nobody can.
   admins: string[];
   oauthClients?: OAuthClient[];
@@ -205,6 +209,7 @@ export function loadConfig(): Config {
     devAuth,
     cliTokenIdleDays: idleDays(process.env.GRAYBOARD_CLI_TOKEN_IDLE_DAYS),
     idpReauthDays: reauthDays(process.env.GRAYBOARD_IDP_REAUTH_DAYS),
+    idpRecheck: parseRecheck(process.env),
     admins: parseList(process.env.GRAYBOARD_ADMINS),
     oauthClients: parseOAuthClients(process.env.GRAYBOARD_OAUTH_CLIENTS),
     oauthCimdClients: parseCimdClients(process.env.GRAYBOARD_OAUTH_CIMD_CLIENTS),
@@ -628,6 +633,33 @@ function reauthDays(raw: string | undefined): number {
     throw new Error(`GRAYBOARD_IDP_REAUTH_DAYS must be a whole number of days from 0 (never) to 3650, not "${raw}"`);
   }
   return Number(raw);
+}
+
+export const DEFAULT_IDP_RECHECK_HOURS = 24;
+export const DEFAULT_IDP_RECHECK_MAX_STALE_HOURS = 72;
+export const DEFAULT_IDP_DISABLE_LIMIT = 5;
+
+// The IdP re-check's knobs (#930 A2): whole numbers, the stale bound at least the interval (a check is due before
+// its failure can count against the bound), the limit at least 1 (0 would make the first disable trip the breaker).
+function parseRecheck(env: Record<string, string | undefined>): NonNullable<Config["idpRecheck"]> {
+  const whole = (name: string, fallback: number, min: number, max: number): number => {
+    const raw = env[name];
+    if (raw === undefined || raw === "") return fallback;
+    if (!/^(0|[1-9][0-9]*)$/.test(raw) || Number(raw) < min || Number(raw) > max) throw new Error(`${name} must be a whole number from ${min} to ${max}, not "${raw}"`);
+    return Number(raw);
+  };
+  const recheckHours = whole("GRAYBOARD_IDP_RECHECK_HOURS", DEFAULT_IDP_RECHECK_HOURS, 1, 8760);
+  const maxStaleHours = whole("GRAYBOARD_IDP_RECHECK_MAX_STALE_HOURS", DEFAULT_IDP_RECHECK_MAX_STALE_HOURS, 1, 87600);
+  if (maxStaleHours < recheckHours) throw new Error(`GRAYBOARD_IDP_RECHECK_MAX_STALE_HOURS (${maxStaleHours}) must be at least GRAYBOARD_IDP_RECHECK_HOURS (${recheckHours})`);
+  return { recheckHours, maxStaleHours, disableLimit: whole("GRAYBOARD_IDP_DISABLE_LIMIT", DEFAULT_IDP_DISABLE_LIMIT, 1, 10000) };
+}
+
+// The re-check's whole configuration, defaults filled in.
+export function recheckConfig(config: Pick<Config, "idpRecheck" | "idpReauthDays">): RecheckConfig {
+  return {
+    recheckHours: DEFAULT_IDP_RECHECK_HOURS, maxStaleHours: DEFAULT_IDP_RECHECK_MAX_STALE_HOURS, disableLimit: DEFAULT_IDP_DISABLE_LIMIT,
+    ...config.idpRecheck, reauthDays: config.idpReauthDays ?? DEFAULT_IDP_REAUTH_DAYS,
+  };
 }
 
 // The startup line for #930's fallback: which sign-in providers the server can't ask about a user's status, so their

@@ -1169,6 +1169,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       },
       async findByEmail(r, email) { return userByEmail(sqliteOf(r), email); },
       async findById(r, userId) { return userById(sqliteOf(r), userId); },
+      async lockById(tx, userId) { return userById(sqliteOf(tx), userId); },
       isDisabled: auth.isDisabled,
       active: auth.active,
       async setDisabled(tx, userId, disabled) {
@@ -2056,6 +2057,7 @@ function makeOAuthStore(hosted: HostedStoreOf): OAuthStore {
     redeemCode: (tx, ...a) => settledOn(() => on(tx).redeemCode(tx, ...a)),
     redeemLoginCode: async (tx, ...a) => on(tx).redeemLoginCode(...a),
     findRefreshGrant: async (r, ...a) => on(r).findRefreshGrant(...a),
+    findRefreshUser: async (r, ...a) => on(r).findRefreshUser(...a),
     rotateRefresh: (tx, ...a) => settledOn(() => on(tx).rotateRefresh(tx, ...a)),
     revokeToken: (tx, ...a) => settledOn(() => on(tx).revokeToken(tx, ...a)),
     findActiveAccess: async (r, ...a) => on(r).findActiveAccess(...a),
@@ -2308,6 +2310,16 @@ function oauthOps(db: Database, hosted: HostedStoreOf): OAuthOps {
       if (!row) return undefined;
       const g: OAuthGrant = JSON.parse(row.data);
       return g.clientId === clientId && g.resource === resource ? g : undefined;
+    },
+    findRefreshUser(h, clientId, resource, now) {
+      if (!lookup(h, now)) return undefined;
+      const row = db.query<{ data: string }, [string, number, number]>(`
+        SELECT g.data FROM oauth_tokens t JOIN oauth_grants g ON g.id = t.grant_id JOIN users u ON u.id = g.user_id
+        WHERE t.hash = ? AND t.kind = 'refresh' AND t.spent_at IS NULL AND t.revoked_at IS NULL AND t.expires_at > ?
+          AND g.revoked_at IS NULL AND g.expires_at > ? AND u.disabled_at IS NULL`).get(h, now, now);
+      if (!row) return undefined;
+      const g: OAuthGrant = JSON.parse(row.data);
+      return g.clientId === clientId && g.resource === resource ? g.userId : undefined;
     },
     async rotateRefresh(tx, input, now) {
       if (!lookup(input.refreshHash, now)) return invalid;

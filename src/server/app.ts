@@ -13,7 +13,9 @@ import { UploadGate } from "./uploads.ts";
 import { startRetentionJobs } from "./retention.ts";
 import { createTouchQueue } from "./auth.ts";
 import { writeAudit } from "./audit.ts";
-import type { Config } from "./config.ts";
+import { checkIdpConfig, recheckConfig, type Config } from "./config.ts";
+import { defaultProviders } from "./idp.ts";
+import { createIdpRecheck } from "./idp_recheck.ts";
 import { SlackBridge } from "./slack.ts";
 import { serveMetrics, startLagSampler, type Gauges } from "./metrics.ts";
 import { testPauseAsync } from "../shared/testpause.ts";
@@ -103,7 +105,14 @@ export function startServer(config: Config, opts: StartOptions = {}) {
   // The deferred session-touch queue this server owns; stop() cancels it
   // before closing the db (a fired-after-close touch is an unhandled crash).
   const touches = createTouchQueue();
-  const oauth = createOAuthServer(repo, config, opts.oauth);
+  // The IdP re-check (#930 A2) over the providers the AS signs in with, shared by refresh and CLI-token auth: one
+  // process-wide record of which providers answered positive, one breaker, one in-flight call per user.
+  if (!opts.oauth?.providers) checkIdpConfig(config);
+  const providers = opts.oauth?.providers ?? defaultProviders(config);
+  const recheck = createIdpRecheck(repo, providers, recheckConfig(config), {
+    disconnectUser, userChanged: id => slack?.userChanged(id), background: (what, run) => background(what, () => run()),
+  }, opts.oauth?.now ?? (() => repo.now()));
+  const oauth = createOAuthServer(repo, config, { ...opts.oauth, providers, recheck });
   const mcp = createHostedMcp(application, oauth, { trustedOrigin: new URL(config.publicUrl).origin, now: opts.now, limits: config.mcpLimits, caps: config.hostedCaps, ...(config.hostedIdleSeconds ? { idleSeconds: config.hostedIdleSeconds } : {}) });
   const mcpPath = new URL(oauth.resource).pathname;
 
@@ -203,7 +212,7 @@ export function startServer(config: Config, opts: StartOptions = {}) {
       if (!isJsonRequest(req)) return Response.json({ code: "unsupported_media_type", message: "sign-in takes Content-Type: application/json" }, { status: 415 });
       authGate.charge(caller, req, path, "sign-in");
     }
-    return handleHttp(req, repo, application.access, config, touches, wake, slack, { disconnectUser, accessChanged }, caller.ip, application.boardsChanged, url).then((res) => authGate.chargeRefusedToken(caller, req, path, res));
+    return handleHttp(req, repo, application.access, config, touches, wake, slack, { disconnectUser, accessChanged, recheck }, caller.ip, application.boardsChanged, url).then((res) => authGate.chargeRefusedToken(caller, req, path, res));
   }
 
   // Every value an O(1) getter (vision P13): no row count, no walk over sessions.
