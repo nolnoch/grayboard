@@ -358,6 +358,52 @@ describePg("OAuth races (Postgres)", () => {
     });
   }
 
+  // #1557: a per-grant revoke takes the users row, then the grant row FOR NO KEY UPDATE, the lock a rotation takes (#1066).
+  // The two rotation races pin outcomes, not that lock: the revoke's UPDATE of the grant waits on a rotation's row lock
+  // without it. What they catch is a revoke that leaves a committed successor pair live, or a rotation minting past it.
+  async function redeemed(p: Pair) {
+    const w = await world(p);
+    await w.until("code");
+    const red = w.redemption();
+    expect((await p.a.write(tx => p.o.redeemCode(tx, red, start))).status).toBe("ok");
+    const revoke = (tx: Tx) => p.o.revokeUserGrant(tx, w.userId, red.grantId, start + 1);
+    const rotate = (tx: Tx) => p.o.rotateRefresh(tx, { ...grantAuth, refreshHash: red.tokens.refreshHash, tokens: pairOf("next", grantAuth, start + 1) }, start + 1);
+    const nextAccess = () => p.o.findActiveAccess(p.a.read, sha("access-next"), grantAuth.resource, [], start + 1);
+    return { red, revoke, rotate, nextAccess };
+  }
+
+  // Mutation: neither the users row nor the grant row locked (either alone serializes two revokes of one user's grant):
+  // the second revoke reads the grant live and answers ok, so the caller writes a second auth.grant_revoked row.
+  test("two revokeUserGrant of one grant: the second waits, then answers not_found and ends nothing more (#1557)", async () => {
+    await using p = await pair();
+    const { red, revoke } = await redeemed(p);
+    const r = await race(p, revoke, revoke);
+    expect([st(r.a), st(r.b)]).toEqual(["ok", "not_found"]);
+    expect(p.rec.ended).toEqual([{ kind: "grant", grantId: red.grantId }]);
+    expect(r.waited).toBe(true);
+  });
+
+  test("rotation first: revokeUserGrant waits for it, then revokes the grant with the successor pair (#1557)", async () => {
+    await using p = await pair();
+    const { red, revoke, rotate, nextAccess } = await redeemed(p);
+    const r = await race(p, rotate, revoke);
+    expect([st(r.a), st(r.b)]).toEqual(["ok", "ok"]);
+    expect(await p.o.isGrantActive(p.a.read, red.grantId, start + 1)).toBe(false);
+    expect(await nextAccess()).toBeUndefined();
+    expect(r.waited).toBe(true);
+  });
+
+  test("revokeUserGrant first: a rotation behind it waits, then refuses and mints no pair (#1557)", async () => {
+    await using p = await pair();
+    const { red, revoke, rotate } = await redeemed(p);
+    const r = await race(p, revoke, rotate);
+    expect(st(r.a)).toBe("ok");
+    expect(st(r.b)).toBe("invalid");
+    expect(await count(p, "oauth_tokens", p.db.sql`hash IN (${sha("access-next")}, ${sha("refresh-next")})`)).toBe(0);
+    expect(await p.o.isGrantActive(p.a.read, red.grantId, start + 1)).toBe(false);
+    expect(r.waited).toBe(true);
+  });
+
   test("T-C4-10 cutover: two boots claim the key; one revokes and audits, the other returns 0 without error", async () => {
     await using p = await pair();
     const w = await world(p);

@@ -1164,37 +1164,48 @@ describePg("keyed renew and receipt (Postgres)", () => {
   });
 
   // Mutation: renew's key `root:<capability>` (two of one root overlap) or one key for every renew (different roots
-  // don't).
+  // don't). `defer` holds the timer's site-less writes: one queued behind a's held renew is exclusive, and every keyed
+  // waiter behind it waits (queue.ts behind()), so b's renew would never enter (#1547). Every renew settles before the
+  // dispose closes delivery, so a failure here is not charged to the next test.
   test("renews of different roots overlap; two of one root run one at a time", async () => {
     await using db = await pgDatabase({ max: 2 });
     await using x = await leaseInstance(db.url);
     const p = await leasePrincipal(x, db.sql);
     const a = await leased(x, p, "root-a", "fe"), b = await leased(x, p, "root-b", "be");
-    // Different roots: a is held at its update, and b's enters beside it.
-    x.state.hold = gate();
-    const ra = x.delivery.renew(p, a.c, a.lease.capability);
-    await until(() => x.state.held === 1, 10_000, "a's renew held");
-    const rb = x.delivery.renew(p, b.c, b.lease.capability);
-    await until(() => x.state.held === 2, 10_000, "b's renew entered beside a's");
-    x.state.hold.open();
-    await Promise.all([ra, rb]);
-    expect(x.state.entered).toEqual([`renew ${a.id}`, `renew ${b.id}`]);
-    // One root: both past their gates first, then released into the queue together; the second waits on the key.
-    x.state.entered = [];
-    x.state.entry = gate(); x.state.arrived = 0;
-    const r1 = x.delivery.renew(p, a.c, a.lease.capability), r2 = x.delivery.renew(p, a.c, a.lease.capability);
-    await until(() => x.state.arrived === 2, 10_000, "both renews past their gates");
-    x.state.hold = gate();
-    x.state.entry.open(); x.state.entry = undefined;
-    await until(() => x.state.held === 1 && x.q.waitingAt("renew") === 1, 10_000, "one renew held, the other queued on its key");
-    expect(x.state.entered).toEqual([`renew ${a.id}`]);
-    x.state.hold.open();
-    await Promise.all([r1, r2]);
-    expect(x.state.entered).toEqual([`renew ${a.id}`, `renew ${a.id}`]);
+    const renews: Promise<unknown>[] = [];
+    const renew = (l: typeof a) => { const r = x.delivery.renew(p, l.c, l.lease.capability); renews.push(r); return r; };
+    x.state.defer = gate();
+    try {
+      // Different roots: a is held at its update, and b's enters beside it.
+      x.state.hold = gate();
+      const ra = renew(a);
+      await until(() => x.state.held === 1, 10_000, "a's renew held");
+      const rb = renew(b);
+      await until(() => x.state.held === 2, 10_000, "b's renew entered beside a's");
+      x.state.hold.open();
+      await Promise.all([ra, rb]);
+      expect(x.state.entered).toEqual([`renew ${a.id}`, `renew ${b.id}`]);
+      // One root: both past their gates first, then released into the queue together; the second waits on the key.
+      x.state.entered = [];
+      x.state.entry = gate(); x.state.arrived = 0;
+      const r1 = renew(a), r2 = renew(a);
+      await until(() => x.state.arrived === 2, 10_000, "both renews past their gates");
+      x.state.hold = gate();
+      x.state.entry.open(); x.state.entry = undefined;
+      await until(() => x.state.held === 1 && x.q.waitingAt("renew") === 1, 10_000, "one renew held, the other queued on its key");
+      expect(x.state.entered).toEqual([`renew ${a.id}`]);
+      x.state.hold.open();
+      await Promise.all([r1, r2]);
+      expect(x.state.entered).toEqual([`renew ${a.id}`, `renew ${a.id}`]);
+    } finally {
+      x.state.hold?.open(); x.state.entry?.open(); x.state.defer.open();
+      await Promise.allSettled(renews);
+    }
   });
 
   // A renew and a receipt of one root, both past their gates, run one at a time; the second waits on the root's key.
   // Mutation: receipt's key `root:<capability>` or one per call (the receipt's mark enters beside the held renew).
+  // `defer` and the settled finally as in the test above (#1547).
   test("a renew and a receipt of one root run one at a time", async () => {
     await using db = await pgDatabase({ max: 2 });
     await using x = await leaseInstance(db.url);
@@ -1202,13 +1213,14 @@ describePg("keyed renew and receipt (Postgres)", () => {
     const { c, id, lease } = await leased(x, p, "root-a", "fe");
     const sender = new AppSession(x.application, x.repo, p.authed, "be", { push: false });
     await sender.connect();
+    let renewed: Promise<unknown> | undefined, receipt: Promise<unknown> | undefined;
     try {
       await sender.send(`${ME}/fe`, "one");
       const items = await x.delivery.pending(p, c, lease.capability);
-      x.state.entry = gate(); x.state.arrived = 0; x.state.marked = [];
-      const renewed = x.delivery.renew(p, c, lease.capability);
+      x.state.entry = gate(); x.state.arrived = 0; x.state.marked = []; x.state.defer = gate();
+      renewed = x.delivery.renew(p, c, lease.capability);
       await until(() => x.state.arrived === 1, 10_000, "the renew past its gate");
-      const receipt = x.delivery.receipt(p, c, lease.capability, items.map(i => i.id));
+      receipt = x.delivery.receipt(p, c, lease.capability, items.map(i => i.id));
       await until(() => x.state.arrived === 2, 10_000, "the receipt past its gate");
       x.state.hold = gate();
       x.state.entry.open(); x.state.entry = undefined;
@@ -1218,7 +1230,11 @@ describePg("keyed renew and receipt (Postgres)", () => {
       x.state.hold.open();
       await Promise.all([renewed, receipt]);
       expect(x.state.marked).toHaveLength(1);
-    } finally { sender.close(); }
+    } finally {
+      x.state.hold?.open(); x.state.entry?.open(); x.state.defer?.open();
+      await Promise.allSettled([renewed, receipt]);
+      sender.close();
+    }
   });
 
   // Anything the receipt's reads would write (pending's lost-ack repair is the one today) refuses in the probe: a miss,

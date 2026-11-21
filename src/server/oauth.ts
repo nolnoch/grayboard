@@ -3,7 +3,7 @@ import { hashToken, mintToken, type AuthedUser } from "./auth.ts";
 import { callbackPath, defaultProviders, DomainRefused, idpSignIn, type IdentityProvider, type UpstreamIdentity } from "./idp.ts";
 import { checkIdpConfig, recheckConfig, type Config } from "./config.ts";
 import { createIdpRecheck, type IdpRecheck } from "./idp_recheck.ts";
-import type { AuthPeek, Repo } from "./db.ts";
+import type { AuthPeek, Repo, User } from "./db.ts";
 import type { Read, Tx } from "./store/tx.ts";
 import { BUILTIN_CLIENT_IDS, BUILTIN_CLIENTS, CLI_CLIENT, CLI_CLIENT_ID, isServiceClientId, LOGIN_SCOPE, matchesRedirect, mcpResource, oauthPublicUrl, OAUTH_SCOPES, OPENCODE_CLIENT, parseOAuthClients, sourceKeyFor, type OAuthClient } from "./oauth-config.ts";
 import { DEFAULT_SERVICE_TOKEN_LIMITS, OAUTH_TTL, type CredentialSource, type OAuthRequest, type OAuthAccess } from "./oauth-types.ts";
@@ -674,9 +674,12 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
             if (verdict === "refuse") fail("invalid_grant");
             if (verdict === "unavailable") return json({ error: "temporarily_unavailable" }, 503, { "Retry-After": "60" });
           }
-          // As the code above: the grant is read in the rotation's transaction.
-          ({ t, result } = await atSite("oauth", () => repo.write(async tx => {
+          // As the code above: the grant is read in the rotation's transaction. A user the fallback clock refuses is
+          // audited after the transaction, which the refusal's throw rolls back with any row written inside it (#1558).
+          let due: User | undefined;
+          try { ({ t, result } = await atSite("oauth", () => repo.write(async tx => {
             const t = now();
+            due = undefined;
             const grant = await repo.oauth.findRefreshGrant(tx, refreshHash, client.clientId, resource, t);
             if (!grant) fail("invalid_grant");
             const selected = scopes(optional(p, "scope"), grant!.scopes);
@@ -686,10 +689,11 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
             // after a fresh sign-in, while a replay (not ok) still commits its family revocation.
             if (result.status === "ok") {
               const user = await repo.users.findById(tx, grant!.userId);
-              if (!user || recheck.fallbackDue(user)) fail("invalid_grant");
+              if (!user) fail("invalid_grant");
+              if (recheck.fallbackDue(user!)) { due = user; fail("invalid_grant"); }
             }
             return { t, result };
-          })));
+          }))); } catch (e) { if (due) recheck.reauthRefused(due, "refresh", client.clientId); throw e; }
         }
         if (result.status !== "ok") { if (result.status === "replay") hostedFailure("oauth.replay", undefined, "warning"); fail("invalid_grant"); }
         return json({ access_token: access, token_type: "Bearer", expires_in: Math.floor((result.value.tokens.accessExpiresAt - t) / 1000), scope: result.value.tokens.scopes.join(" "),

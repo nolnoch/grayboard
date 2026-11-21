@@ -17,6 +17,7 @@ const KEYS = [
   "GRAYBOARD_HOSTED_REQUEST_BURST", "GRAYBOARD_HOSTED_REQUEST_PER_SEC", "GRAYBOARD_HOSTED_SUBSCRIBER_BURST", "GRAYBOARD_HOSTED_SUBSCRIBER_PER_SEC",
   "GRAYBOARD_OAUTH_BURST", "GRAYBOARD_OAUTH_PER_SEC", "GRAYBOARD_OAUTH_GLOBAL_BURST", "GRAYBOARD_OAUTH_GLOBAL_PER_SEC",
   "GRAYBOARD_AUTH_FAIL_BURST", "GRAYBOARD_AUTH_FAIL_PER_SEC", "GRAYBOARD_TRUSTED_PROXIES", "GRAYBOARD_HOSTED_IDLE_SECONDS", "GRAYBOARD_CLI_TOKEN_IDLE_DAYS", "GRAYBOARD_IDP_REAUTH_DAYS", "GRAYBOARD_IDP_RECHECK_HOURS", "GRAYBOARD_IDP_RECHECK_MAX_STALE_HOURS", "GRAYBOARD_IDP_DISABLE_LIMIT", "GRAYBOARD_GOOGLE_DIRECTORY_KEY", "GRAYBOARD_GOOGLE_DIRECTORY_ADMIN",
+  "GRAYBOARD_KEYCLOAK_DIRECTORY_CLIENT_ID", "GRAYBOARD_KEYCLOAK_DIRECTORY_CLIENT_SECRET", "GRAYBOARD_KEYCLOAK_DIRECTORY_URL",
   "GRAYBOARD_DELEGATE_BURST", "GRAYBOARD_DELEGATE_PER_SEC", "GRAYBOARD_DELEGATE_OPEN_CAP", "GRAYBOARD_ALIAS_SCOPE_CAP",
   ...["LISTEN", "LEGACY", "POST"].flatMap(kind => [`GRAYBOARD_MCP_${kind}_GLOBAL`, `GRAYBOARD_MCP_${kind}_PER_USER`]),
   "GRAYBOARD_HOSTED_SESSIONS_GLOBAL", "GRAYBOARD_HOSTED_SESSIONS_PER_USER", "GRAYBOARD_DELIVERY_LEASES_GLOBAL", "GRAYBOARD_DELIVERY_LEASES_PER_USER",
@@ -752,6 +753,10 @@ describe("loadConfig", () => {
       .toBe("directory check every 6 h (google); sign-in every 30 days (no directory check: okta)");
     expect(describeReauth({ idps: ["google", "okta"], googleDirectory: dir, idpReauthDays: 0 }))
       .toBe("directory check every 24 h (google); off (GRAYBOARD_IDP_REAUTH_DAYS=0; no directory check: okta)");
+    const kc = { baseUrl: "https://sso.example.com", realm: "eng", clientId: "c", clientSecret: "s" };
+    expect(describeReauth({ idps: ["oidc", "google"], keycloakDirectory: kc }))
+      .toBe("directory check every 24 h (oidc); sign-in every 30 days (no directory check: google)");
+    expect(describeReauth({ idps: ["google", "oidc"], googleDirectory: dir, keycloakDirectory: kc })).toBe("directory check every 24 h (google, oidc)");
   });
 
   test("GRAYBOARD_GOOGLE_DIRECTORY_KEY turns on Google's directory check; half a configuration refuses to start (#930 A2b)", () => {
@@ -781,6 +786,57 @@ describe("loadConfig", () => {
       process.env.GRAYBOARD_GOOGLE_DIRECTORY_KEY_FILE = join(d, "key.json");
       expect(loadConfig().googleDirectory?.clientEmail).toBe("sa@p.iam.gserviceaccount.com");
     } finally { rmSync(d, { recursive: true, force: true }); }
+  });
+
+  test("the Keycloak directory pair turns on oidc's directory check against the issuer's realm, or the URL named (#1555)", () => {
+    process.env.GRAYBOARD_IDPS = "oidc";
+    oidc();
+    expect(loadConfig().keycloakDirectory).toBeUndefined();
+    process.env.GRAYBOARD_KEYCLOAK_DIRECTORY_CLIENT_ID = "grayboard-directory";
+    process.env.GRAYBOARD_KEYCLOAK_DIRECTORY_CLIENT_SECRET = "dir-private";
+    expect(loadConfig().keycloakDirectory).toEqual({ baseUrl: "https://sso.example.com", realm: "eng", clientId: "grayboard-directory", clientSecret: "dir-private" });
+    // In-cluster, plain http: the public hostname keeps /admin off.
+    for (const url of ["http://keycloak.auth.svc:8080", "https://kc.internal/auth"]) {
+      process.env.GRAYBOARD_KEYCLOAK_DIRECTORY_URL = url;
+      expect(loadConfig().keycloakDirectory).toMatchObject({ baseUrl: url, realm: "eng" });
+    }
+    for (const url of ["keycloak:8080", "ftp://kc", "http://kc/", "http://kc?x", "http://u:p@kc", "http://kc/realms/eng", ""]) {
+      process.env.GRAYBOARD_KEYCLOAK_DIRECTORY_URL = url;
+      expect(message()).toMatch(/^GRAYBOARD_KEYCLOAK_DIRECTORY_URL must be an http\(s\) URL/);
+    }
+    delete process.env.GRAYBOARD_KEYCLOAK_DIRECTORY_URL;
+    // The secret from a file, as every secret can be.
+    const d = mkdtempSync(join(tmpdir(), "gb-secrets-"));
+    try {
+      writeFileSync(join(d, "secret"), "dir-file-secret\n");
+      delete process.env.GRAYBOARD_KEYCLOAK_DIRECTORY_CLIENT_SECRET;
+      process.env.GRAYBOARD_KEYCLOAK_DIRECTORY_CLIENT_SECRET_FILE = join(d, "secret");
+      expect(loadConfig().keycloakDirectory?.clientSecret).toBe("dir-file-secret");
+    } finally { rmSync(d, { recursive: true, force: true }); }
+  });
+
+  test("half a Keycloak directory configuration, or one with nothing to check, refuses to start (#1555)", () => {
+    process.env.GRAYBOARD_IDPS = "oidc";
+    oidc();
+    process.env.GRAYBOARD_KEYCLOAK_DIRECTORY_CLIENT_ID = "grayboard-directory";
+    expect(message()).toBe("GRAYBOARD_KEYCLOAK_DIRECTORY_CLIENT_ID set, so GRAYBOARD_KEYCLOAK_DIRECTORY_CLIENT_SECRET is required too");
+    delete process.env.GRAYBOARD_KEYCLOAK_DIRECTORY_CLIENT_ID;
+    process.env.GRAYBOARD_KEYCLOAK_DIRECTORY_URL = "http://kc:8080";
+    expect(message()).toMatch(/^GRAYBOARD_KEYCLOAK_DIRECTORY_URL set, so GRAYBOARD_KEYCLOAK_DIRECTORY_CLIENT_ID is required too/);
+    delete process.env.GRAYBOARD_KEYCLOAK_DIRECTORY_URL;
+    process.env.GRAYBOARD_KEYCLOAK_DIRECTORY_CLIENT_ID = "grayboard-directory";
+    process.env.GRAYBOARD_KEYCLOAK_DIRECTORY_CLIENT_SECRET = "has space";
+    expect(message()).toMatch(/must be nonempty credentials without whitespace/);
+    expect(message()).not.toContain("has space");
+    process.env.GRAYBOARD_KEYCLOAK_DIRECTORY_CLIENT_SECRET = "dir-private";
+    // An issuer that isn't a Keycloak realm.
+    process.env.GRAYBOARD_OIDC_ISSUER = "https://login.example.com/oauth2/default";
+    expect(message()).toMatch(/^GRAYBOARD_OIDC_ISSUER is not a Keycloak realm URL/);
+    // No oidc provider to check.
+    for (const k of ["GRAYBOARD_OIDC_ISSUER", "GRAYBOARD_OIDC_CLIENT_ID", "GRAYBOARD_OIDC_ALLOWED_DOMAINS"]) delete process.env[k];
+    process.env.GRAYBOARD_IDPS = "okta";
+    okta();
+    expect(message()).toMatch(/set but GRAYBOARD_IDPS doesn't list oidc/);
   });
 
   test("the hello limit defaults to 60 and 1/s; set, the burst is a whole number up to 10000 and the rate at least 0.1/s", () => {

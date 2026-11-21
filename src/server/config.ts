@@ -16,6 +16,7 @@ import { DELEGATE_LIMIT, DELEGATE_OPEN_CAP } from "../core/delegation.ts";
 import { ALIAS_SCOPE_CAP } from "./alias_cap.ts";
 import { GOOGLE_ISSUER } from "./idp_google.ts";
 import { parseDirectoryKey, type GoogleDirectoryConfig } from "./idp_google_directory.ts";
+import { keycloakRealm, type KeycloakDirectoryConfig } from "./idp_keycloak_directory.ts";
 import { describeCredentials, type AwsCredentialSpec } from "./aws_credentials.ts";
 import type { RecheckConfig } from "./idp_recheck.ts";
 
@@ -85,6 +86,10 @@ export type Config = {
   // Google's directory check (#930 A2b, idp_google_directory.ts): a service account's key, and the admin it
   // impersonates under domain-wide delegation. Unset, Google users stay on the GRAYBOARD_IDP_REAUTH_DAYS clock.
   googleDirectory?: GoogleDirectoryConfig;
+  // Keycloak's directory check (#1555, idp_keycloak_directory.ts) for the oidc provider when its issuer is a Keycloak
+  // realm: a confidential client whose service account reads users through the admin REST API. Unset, oidc users stay
+  // on the GRAYBOARD_IDP_REAUTH_DAYS clock.
+  keycloakDirectory?: KeycloakDirectoryConfig;
   // Emails allowed to run admin commands. Empty means nobody can.
   admins: string[];
   oauthClients?: OAuthClient[];
@@ -133,6 +138,7 @@ export type Config = {
 export const FILE_SECRETS = [
   "GRAYBOARD_DATABASE_URL", "GOOGLE_OAUTH_CLIENT_SECRET", "GRAYBOARD_MCP_GOOGLE_CLIENT_SECRET",
   "GRAYBOARD_OKTA_CLIENT_SECRET", "GRAYBOARD_OIDC_CLIENT_SECRET", "SLACK_APP_TOKEN", "SLACK_BOT_TOKEN", "GRAYBOARD_GOOGLE_DIRECTORY_KEY",
+  "GRAYBOARD_KEYCLOAK_DIRECTORY_CLIENT_SECRET",
 ] as const;
 
 // Resolves each NAME_FILE into env.NAME before anything reads it. Both set (to different values) is refused: which
@@ -208,6 +214,7 @@ export function loadConfig(): Config {
     ...(okta ? { okta } : {}),
     ...(oidc ? { oidc } : {}),
     ...googleDirectoryConfig(google),
+    ...keycloakDirectoryConfig(oidc),
     publicUrl: publicUrl.replace(/\/$/, ""),
     messageRetentionDays: retentionDays("GRAYBOARD_MESSAGE_RETENTION_DAYS", process.env.GRAYBOARD_MESSAGE_RETENTION_DAYS, DEFAULT_RETENTION_DAYS),
     auditRetentionDays:   retentionDays("GRAYBOARD_AUDIT_RETENTION_DAYS",   process.env.GRAYBOARD_AUDIT_RETENTION_DAYS,   90),
@@ -667,12 +674,13 @@ export function recheckConfig(config: Pick<Config, "idpRecheck" | "idpReauthDays
   };
 }
 
-// The startup line for #930: which sign-in providers have a directory check (only Google, with a directory key), and
-// which the server can't ask about a user's status, so their users re-authenticate every GRAYBOARD_IDP_REAUTH_DAYS.
-export function describeReauth(config: Pick<Config, "idps" | "idpReauthDays" | "idpRecheck" | "googleDirectory">): string {
+// The startup line for #930: which sign-in providers have a directory check (Google with a directory key, oidc with
+// Keycloak's), and which the server can't ask about a user's status, so their users re-authenticate every
+// GRAYBOARD_IDP_REAUTH_DAYS.
+export function describeReauth(config: Pick<Config, "idps" | "idpReauthDays" | "idpRecheck" | "googleDirectory" | "keycloakDirectory">): string {
   const days = config.idpReauthDays ?? DEFAULT_IDP_REAUTH_DAYS;
   const idps = config.idps ?? ["google"];
-  const checked = idps.filter(id => id === "google" && config.googleDirectory);
+  const checked = idps.filter(id => (id === "google" && config.googleDirectory) || (id === "oidc" && config.keycloakDirectory));
   const unchecked = idps.filter(id => !checked.includes(id));
   const recheck = checked.length ? `directory check every ${recheckConfig(config).recheckHours} h (${checked.join(", ")})` : "";
   if (!unchecked.length) return recheck;
@@ -690,6 +698,32 @@ function googleDirectoryConfig(google: boolean): { googleDirectory?: GoogleDirec
   }
   if (!google) throw new Error("GRAYBOARD_GOOGLE_DIRECTORY_KEY is set but GRAYBOARD_IDPS doesn't list google");
   return { googleDirectory: parseDirectoryKey(raw, admin) };
+}
+
+const KEYCLOAK_VARS = ["GRAYBOARD_KEYCLOAK_DIRECTORY_CLIENT_ID", "GRAYBOARD_KEYCLOAK_DIRECTORY_CLIENT_SECRET"] as const;
+
+// Keycloak's directory check: the checker client's pair, both or neither, and only for an oidc provider whose issuer
+// is a Keycloak realm URL. GRAYBOARD_KEYCLOAK_DIRECTORY_URL, optional, is Keycloak's base as this server reaches it
+// (the part before /realms/): a deployment that keeps /admin off its public hostname names an internal one, and
+// http is allowed there. Its default is the issuer's own base.
+function keycloakDirectoryConfig(oidc: OidcConfig | undefined): { keycloakDirectory?: KeycloakDirectoryConfig } {
+  const set = [...KEYCLOAK_VARS, "GRAYBOARD_KEYCLOAK_DIRECTORY_URL"].filter(name => process.env[name] !== undefined);
+  if (!set.length) return {};
+  for (const name of KEYCLOAK_VARS) if (!process.env[name]) throw new Error(`${set.join(", ")} set, so ${name} is required too`);
+  if (!oidc) throw new Error(`${set.join(", ")} set but GRAYBOARD_IDPS doesn't list oidc: the Keycloak directory check is for the oidc provider`);
+  const clientId = process.env.GRAYBOARD_KEYCLOAK_DIRECTORY_CLIENT_ID!;
+  const clientSecret = process.env.GRAYBOARD_KEYCLOAK_DIRECTORY_CLIENT_SECRET!;
+  if (!CREDENTIAL.test(clientId) || !CREDENTIAL.test(clientSecret))
+    throw new Error("GRAYBOARD_KEYCLOAK_DIRECTORY_CLIENT_ID and GRAYBOARD_KEYCLOAK_DIRECTORY_CLIENT_SECRET must be nonempty credentials without whitespace");
+  const realm = keycloakRealm(oidc.issuer);
+  if (!realm) throw new Error("GRAYBOARD_OIDC_ISSUER is not a Keycloak realm URL (https://host/realms/<realm>), which the Keycloak directory check needs");
+  const raw = process.env.GRAYBOARD_KEYCLOAK_DIRECTORY_URL;
+  if (raw === undefined) return { keycloakDirectory: { ...realm, clientId, clientSecret } };
+  let url: URL | undefined;
+  try { url = new URL(raw); } catch { /* refused below */ }
+  if (!url || !(url.protocol === "https:" || url.protocol === "http:") || /[?#]/.test(raw) || raw.endsWith("/") || url.username || url.password || url.pathname.includes("/realms/"))
+    throw new Error("GRAYBOARD_KEYCLOAK_DIRECTORY_URL must be an http(s) URL with no query, fragment, credentials or trailing slash: Keycloak's base, the part of a realm URL before /realms/");
+  return { keycloakDirectory: { baseUrl: raw, realm: realm.realm, clientId, clientSecret } };
 }
 
 // Port 0 (an ephemeral port, what tests use) through 65535. Gated to plain digits so

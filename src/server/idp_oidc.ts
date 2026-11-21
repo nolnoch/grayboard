@@ -50,7 +50,7 @@ type OidcErrorClass = new (message: string, options?: ErrorOptions) => OidcError
 
 // RFC 6749 §2.3.1: the client ID and secret are each form-encoded (application/x-www-form-urlencoded) before base64.
 const formEncode = (s: string) => new URLSearchParams({ v: s }).toString().slice(2);
-const basicAuthorization = (id: string, secret: string) => `Basic ${Buffer.from(`${formEncode(id)}:${formEncode(secret)}`).toString("base64")}`;
+export const basicAuthorization = (id: string, secret: string) => `Basic ${Buffer.from(`${formEncode(id)}:${formEncode(secret)}`).toString("base64")}`;
 
 export function oidcProvider(o: OidcProviderOptions): IdentityProvider {
   const now = o.now ?? Date.now;
