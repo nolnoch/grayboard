@@ -21,7 +21,7 @@ const ROOT = resolve(import.meta.dir, "../..");
 describe("loadtest sizing", () => {
   // #1539: the op mix is a weighted round robin, so a short run's rare op always gets its share; a random draw per op
   // left the small fleet's 0.1-share peer_list with no clean-window sample often enough to fail CI.
-  test("the op mix gives every op its share, within one, over any run of draws", () => {
+  test("the op mix gives every op its share, within 1.5, over any window of draws", () => {
     const next = opMix({ postShare: 0.2, svcShare: 0.2, peerShare: 0.1, readShare: 0.3, svcBoard: "load-svc" });
     const draws = Array.from({ length: 200 }, () => next());
     const shares = { board_post: 0.2, svc_invoke: 0.2, peer_list: 0.1, svc_read: 0.3, dm_send: 0.2 };
