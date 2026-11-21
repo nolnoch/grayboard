@@ -23,10 +23,10 @@ function graph(entry: string): Set<string> {
   return seen;
 }
 
-test("app.ts's import graph reaches neither pg_repo.ts nor src/server/store/pg/", () => {
+test("app.ts's import graph reaches neither pg_repo.ts, src/server/store/pg/ nor the S3 store's Bun.S3Client", () => {
   const files = [...graph(join(import.meta.dir, "app.ts"))].map((f) => relative(ROOT, f));
   expect(files).toContain("src/server/db.ts");
-  expect(files.filter((f) => f === "src/server/pg_repo.ts" || f.startsWith("src/server/store/pg/"))).toEqual([]);
+  expect(files.filter((f) => f === "src/server/pg_repo.ts" || f === "src/server/s3_blobs.ts" || f.startsWith("src/server/store/pg/"))).toEqual([]);
 });
 
 test("open_repo.ts does reach pg_repo.ts (the walk can see it)", () => {

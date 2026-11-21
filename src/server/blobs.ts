@@ -66,6 +66,14 @@ export class DiskBlobs implements BlobStore {
   }
 }
 
+// A store's BlobStore from its options (db.ts, pg_repo.ts): `blobs` when given (an S3 store, #1509), else a directory
+// store at `blobDir`.
+export function blobStore(opts: { blobDir?: string; blobs?: BlobStore }): BlobStore {
+  if (opts.blobs) return opts.blobs;
+  if (!opts.blobDir) throw new Error("no attachment store: pass blobDir or blobs");
+  return new DiskBlobs(opts.blobDir);
+}
+
 // Makes a rename in `dir` durable.
 async function syncDir(dir: string): Promise<void> {
   const d = await open(dir, "r");
