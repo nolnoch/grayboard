@@ -105,6 +105,15 @@ test("an IdP outage fails open within the stale bound, then answers 503 with the
   expect((await refresh(g2.refreshToken)).status).toBe(200);
 });
 
+test("a status call that never answers times out as transient, even when the provider ignores the abort", async () => {
+  await open();
+  const g = await grant();
+  await vouched(A, 25);
+  answer = () => new Promise(() => {});
+  expect((await refresh(g.refreshToken)).status).toBe(200);
+  expect((await accessAudits(srv, "auth.idp_check_failed")).map(a => a.detail.error_class)).toEqual(["timeout"]);
+}, 15_000);
+
 test("past the disable limit in an hour automatic disables stop, and the check fails open", async () => {
   await open({ recheckHours: 24, maxStaleHours: 72, disableLimit: 1 });
   await confirm();
