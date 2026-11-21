@@ -20,6 +20,7 @@ import { hostedFailure } from "./hosted-diagnostics.ts";
 import { decidePure, recordDecision, type PureRequest } from "./policy.ts";
 import { countRefusal } from "./metrics.ts";
 import { isTx, type Read, type Tx } from "./store/tx.ts";
+import { atSite } from "./store/queue.ts";
 
 // `facts`: the model and effort the request reports (#364); a key the request leaves out keeps the stored value, and
 // an empty string clears it (#558).
@@ -388,13 +389,13 @@ export function createHostedSessions(application: Application, options: { now?: 
   // but a full-row update), so the call ends without a transaction (#998).
   async function touchAfter(row: HostedSession, seen: number) {
     if (stopped || now() - seen < touchEvery) return;
-    try { await store.write(async tx => {
+    try { await atSite("touch", () => store.write(async tx => {
       const current = await store.get(tx, row.session_id), root = row.root_session_id ? await store.get(tx, row.root_session_id) : current;
       if (!current || !root || current.ownership_id !== row.ownership_id || current.root_session_id !== row.root_session_id || current.parked_at !== null || root.ownership_id !== row.ownership_id) return;
       const t = now();
       await touchRow(tx, root, t);
       if (current !== root) await touchRow(tx, current, t);
-    }); } catch (failure) { console.error(`hosted ${row.session_id}: end-of-call touch not written: ${failure instanceof Error ? failure.message : String(failure)}`); }
+    })); } catch (failure) { console.error(`hosted ${row.session_id}: end-of-call touch not written: ${failure instanceof Error ? failure.message : String(failure)}`); }
   }
   // A parked child acts again (#566): admitted against its root's child capacity and the user's and global rows,
   // as a registration is (a refusal leaves it parked), under the root's grant, which `attach` moved past it.
@@ -699,14 +700,14 @@ export function createHostedSessions(application: Application, options: { now?: 
         // One queued body: settle commits whether or not rowFor refuses (rowFor's savepoint rolls back alone, and its
         // refusal rows are written after it, in the same commit), and nothing runs between them, so `settled` is
         // current when rowFor reads it.
-        const pending = store.write(async tx => {
+        const pending = atSite("gate", () => store.write(async tx => {
           if (waited || stale) await authorized(p, tx);
           await grantLive(tx, p);
           // authorized(p) passed with no commit to the auth tables since: settle skips p's own disabled read (#881).
           const settled = await settle(tx, context.id, p.authed.user_id);
           try { return { row: await tx.savepoint(async sp => { const r = await rowFor(sp, p, context, later.defer, create, wake, declare, settled); return r && { r, seen: await touch(sp, r) }; }) }; }
           catch (error) { await later.flush(tx); return { error }; }
-        });
+        }));
         waited = true;
         const selected = await pending;
         if ("error" in selected) throw selected.error;
@@ -738,7 +739,7 @@ export function createHostedSessions(application: Application, options: { now?: 
     const result = await gate(id).call(async () => {
       await authorized(p);
       if (stopped) return MISS;
-      const touched = await store.write(async tx => {
+      const touched = await atSite("prior", () => store.write(async tx => {
         const fresh = await store.get(tx, prior.row.session_id);
         const root = !fresh ? undefined : fresh.root_session_id ? await store.get(tx, fresh.root_session_id) : fresh;
         const t = now();
@@ -747,7 +748,7 @@ export function createHostedSessions(application: Application, options: { now?: 
           || (root.lease_deadline !== null && root.lease_deadline <= t) || idleAt(fresh) || idleAt(root)) return undefined;
         const seen = await touchRow(tx, root, t);
         return { row: fresh, seen: fresh === root ? seen : Math.min(seen, await touchRow(tx, fresh, t)) };
-      });
+      }));
       if (!touched) return MISS;
       const { row, seen } = touched;
       const ids = [...new Set([row.session_id, id])];
@@ -880,12 +881,12 @@ export function createHostedSessions(application: Application, options: { now?: 
         selected.session.afterRollback = late.defer;
         try {
           await testPauseAsync("hosted:tool:in-gate");
-          return await store.write<T>(async tx => {
+          return await atSite("tool", () => store.write<T>(async tx => {
             await fence(tx, p, row, root);
             const value = await fn(selected.session, tx);
             if (!writeReads.has(tool)) await audit(tx, row!.session_id, "hosted.write", { tool, session: row!.session_id, root: root!.session_id, grant: p.grantId, held: selected.session.holds, writes_as: root!.writes_as }, p);
             return value;
-          });
+          }));
         } catch (error) {
           await late.flushQueued();
           throw error;

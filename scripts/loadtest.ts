@@ -6,9 +6,17 @@
 //   bun scripts/loadtest.ts --quick         # a minute's smoke at 40 sessions
 //   bun scripts/loadtest.ts --sessions 500 --duration 900 --period 20
 //   bun scripts/loadtest.ts --pg postgres://u:p@host:5432/postgres   # the server on Postgres (#807)
+//   bun scripts/loadtest.ts --pg postgres://… --pg-latency 1          # …with 1 ms added each way (#1510)
 //
 // --pg names a cluster: the run creates an empty database there (gb_loadtest_<time>), the server migrates it at
-// startup, and the run drops it at the end unless --keep-db.
+// startup, and the run drops it at the end unless --keep-db. --pg-latency <ms> puts a delay proxy
+// (tests/support/delay_proxy.ts) between the server and the cluster, adding that many ms to each direction's data, so
+// every round trip grows by twice it; the run's own seeding and counting connections go direct.
+//
+// Each window also reports the server's write queue (grayboard_write_queue_*, #1510): bodies/s, busy (the share of the
+// window some body held a queue), wait and hold p50/p99 (interpolated within histogram buckets, as Prometheus's
+// histogram_quantile does), the deepest queue a body met, and the same per calling site; summary.json has them over the
+// steady period.
 //
 // Exit bar (#805): every session leased throughout; each steady window's native tool calls at
 // p99 < 100 ms (at least 99% at or under the 0.1 s bucket edge: no interpolation); RSS flat over
@@ -52,6 +60,7 @@ import { DEFAULT_SERVICE_TOKEN_LIMITS, OAUTH_TTL, SERVICE_TOKEN_MIN_SECONDS } fr
 import { issueOAuth } from "../tests/helpers/oauth.ts";
 import { HOSTED_CLIENT, HOSTED_SCOPES } from "../tests/support/hosted_session.ts";
 import { devLogin, ServerProcess } from "../tests/support/server.ts";
+import { startDelayProxy, type DelayProxy } from "../tests/support/delay_proxy.ts";
 import { BUCKETS, SVC_READS, type DriverConfig, type DriverFinal, type DriverSession, type DriverWindow, type Hist, type ReadProof } from "./loadtest_driver.ts";
 
 const ROOT = resolve(import.meta.dir, "..");
@@ -67,6 +76,8 @@ export type Options = {
   readShare: number;
   // A Postgres cluster URL; absent runs the server on a SQLite file.
   pg?: string;
+  // Milliseconds added to each direction between the server and Postgres (a delay proxy); absent, none.
+  pgLatencyMs?: number;
 };
 
 export function options(argv: string[]): Options {
@@ -76,7 +87,7 @@ export function options(argv: string[]): Options {
       duration: { type: "string" }, warmup: { type: "string" }, period: { type: "string" }, boards: { type: "string" },
       "post-share": { type: "string" }, burst: { type: "string" }, churn: { type: "string" }, "churn-every": { type: "string" },
       "service-workers": { type: "string" }, teams: { type: "string" }, "svc-share": { type: "string" }, "peer-share": { type: "string" }, "read-share": { type: "string" },
-      window: { type: "string" }, grace: { type: "string" }, server: { type: "string" }, out: { type: "string" }, "keep-db": { type: "boolean" }, pg: { type: "string" },
+      window: { type: "string" }, grace: { type: "string" }, server: { type: "string" }, out: { type: "string" }, "keep-db": { type: "boolean" }, pg: { type: "string" }, "pg-latency": { type: "string" },
       // Server env overrides, KEY=VALUE, applied after the caps the run computes.
       env: { type: "string", multiple: true },
     },
@@ -102,6 +113,7 @@ export function options(argv: string[]): Options {
     out: v.out ? resolve(v.out) : join(ROOT, ".e2e-runs", `loadtest-${new Date().toISOString().replace(/[:.]/g, "-")}`),
     keepDb: v["keep-db"] === true,
     ...(v.pg ? { pg: v.pg } : {}),
+    ...(v["pg-latency"] !== undefined ? { pgLatencyMs: n("pg-latency", 0, 0) } : {}),
     env: Object.fromEntries((v.env ?? []).map((kv) => {
       const eq = kv.indexOf("=");
       if (eq < 1) throw new Error(`--env takes KEY=VALUE, not "${kv}"`);
@@ -115,6 +127,7 @@ export function options(argv: string[]): Options {
   if (!Number.isInteger(o.serviceWorkers) || userSessions(o) < Math.max(2, o.users)) throw new Error("--service-workers must be a whole number that leaves at least 2 sessions, and one per user, to the users");
   if (o.serviceWorkers && (!Number.isInteger(o.teams) || o.teams < 1 || o.teams > o.users)) throw new Error("--teams must be a whole number from 1 to --users");
   if (o.postShare + (o.serviceWorkers ? o.svcShare + o.peerShare + o.readShare : 0) > 1) throw new Error("--post-share, --svc-share, --peer-share and --read-share must sum to at most 1");
+  if (o.pgLatencyMs !== undefined && !o.pg) throw new Error("--pg-latency needs --pg");
   return o;
 }
 
@@ -163,6 +176,73 @@ function refusalsTotal(s: Sample[]): Record<string, number> {
   for (const x of s) if (x.name === "grayboard_capacity_refusals_total") r[x.labels.kind!] = x.value;
   return r;
 }
+
+// The write queue's histograms (#1510), cumulative as scraped: per site for wait and hold, and the depth at enqueue.
+// `cum[i]` counts observations at or under `le[i]`; the last edge is +Inf.
+export type CumHist = { le: number[]; cum: number[]; sum: number; count: number };
+export type QueueCum = { wait: Map<string, CumHist>; hold: Map<string, CumHist>; depth?: CumHist };
+export function queueCumulative(s: Sample[]): QueueCum {
+  const q: QueueCum = { wait: new Map(), hold: new Map() };
+  const slot = (name: string, labels: Record<string, string>): CumHist | undefined => {
+    const m = /^grayboard_write_queue_(wait|hold)_seconds_/.exec(name);
+    if (m) { const map = q[m[1] as "wait" | "hold"]; return map.get(labels.site!) ?? map.set(labels.site!, { le: [], cum: [], sum: 0, count: 0 }).get(labels.site!)!; }
+    if (name.startsWith("grayboard_write_queue_depth_")) return q.depth ??= { le: [], cum: [], sum: 0, count: 0 };
+    return undefined;
+  };
+  for (const x of s) {
+    const h = slot(x.name, x.labels);
+    if (!h) continue;
+    if (x.name.endsWith("_bucket")) { h.le.push(x.labels.le === "+Inf" ? Infinity : Number(x.labels.le)); h.cum.push(x.value); }
+    else if (x.name.endsWith("_sum")) h.sum = x.value;
+    else if (x.name.endsWith("_count")) h.count = x.value;
+  }
+  return q;
+}
+// a - b (b absent: a), or a + b: one histogram's shape on both sides.
+function combine(a: CumHist, b: CumHist | undefined, sign: 1 | -1): CumHist {
+  if (!b) return sign === 1 ? a : { ...a, cum: [...a.cum] };
+  return { le: a.le, cum: a.cum.map((c, i) => c + sign * (b.cum[i] ?? 0)), sum: a.sum + sign * b.sum, count: a.count + sign * b.count };
+}
+export function combineQueue(a: QueueCum, b: QueueCum, sign: 1 | -1): QueueCum {
+  const maps = (x: Map<string, CumHist>, y: Map<string, CumHist>) => {
+    const out = new Map<string, CumHist>();
+    for (const [k, h] of x) out.set(k, combine(h, y.get(k), sign));
+    if (sign === 1) for (const [k, h] of y) if (!x.has(k)) out.set(k, h);
+    return out;
+  };
+  return { wait: maps(a.wait, b.wait), hold: maps(a.hold, b.hold), ...(a.depth ? { depth: combine(a.depth, b.depth, sign) } : b.depth && sign === 1 ? { depth: b.depth } : {}) };
+}
+// The q-quantile, interpolated linearly within its bucket (histogram_quantile's rule); one in the +Inf bucket reads as
+// the last finite edge. Null with no observations.
+export function quantile(h: CumHist, q: number): number | null {
+  if (!h.count) return null;
+  const rank = q * h.count;
+  const i = h.cum.findIndex(c => c >= rank);
+  if (i < 0) return null;
+  const upper = h.le[i]!, lower = i ? h.le[i - 1]! : 0, below = i ? h.cum[i - 1]! : 0;
+  if (upper === Infinity) return lower;
+  const inBucket = h.cum[i]! - below;
+  return inBucket ? lower + (upper - lower) * (rank - below) / inBucket : upper;
+}
+const sumHists = (hs: Iterable<CumHist>): CumHist | undefined => { let out: CumHist | undefined; for (const h of hs) out = out ? combine(out, h, 1) : h; return out; };
+type Dist = { p50: number | null; p99: number | null; mean: number | null };
+const dist = (h: CumHist | undefined): Dist => h && h.count ? { p50: quantile(h, 0.5), p99: quantile(h, 0.99), mean: h.sum / h.count } : { p50: null, p99: null, mean: null };
+export type QueueStats = {
+  bodies: number; bodiesPerS: number; busy: number; wait: Dist; hold: Dist;
+  // The highest depth bucket edge any body that queued met (null: none queued; past the last edge reads as it + 1).
+  maxDepth: number | null;
+  sites: Record<string, { bodies: number; bodiesPerS: number; busy: number; wait: Dist; hold: Dist }>;
+};
+// A span's queue numbers from its histogram deltas over `wallS` seconds.
+export function queueStats(d: QueueCum, wallS: number): QueueStats {
+  const hold = sumHists(d.hold.values()), wait = sumHists(d.wait.values());
+  let maxDepth: number | null = null;
+  if (d.depth) for (let i = 0; i < d.depth.le.length; i++) if (d.depth.cum[i]! - (i ? d.depth.cum[i - 1]! : 0) > 0) maxDepth = d.depth.le[i] === Infinity ? d.depth.le[i - 1]! + 1 : d.depth.le[i]!;
+  const sites: QueueStats["sites"] = {};
+  for (const [site, h] of d.hold) if (h.count) sites[site] = { bodies: h.count, bodiesPerS: h.count / wallS, busy: h.sum / wallS, wait: dist(d.wait.get(site)), hold: dist(h) };
+  return { bodies: hold?.count ?? 0, bodiesPerS: (hold?.count ?? 0) / wallS, busy: (hold?.sum ?? 0) / wallS, wait: dist(wait), hold: dist(hold), maxDepth, sites };
+}
+const ms = (x: number | null) => x === null ? "-" : (x * 1000).toFixed(2);
 
 // The share of a client histogram at or under 0.1 s.
 const fastShare = (h: { buckets: number[]; count: number }) => h.count ? h.buckets[BUCKETS.indexOf(0.1)]! / h.count : 1;
@@ -233,6 +313,8 @@ type Window = {
   leases: number; listens: number; holding: number; live: number; refusals: Record<string, number>;
   tools: Record<string, { count: number; fast: number }>; client: Record<string, Hist>; clientErrors: Record<string, number>;
   driverLagP99: number; ops: number; loadavg: number[];
+  // The server's write queue over the window; absent when the server exports no queue metrics.
+  queue?: QueueStats;
 };
 
 // What the server recorded of the service's traffic: the post ids of the invocations it allowed through a team's
@@ -331,11 +413,19 @@ async function main() {
   const windows: Window[] = [];
   let exitCode = 0;
   let srv: ServerProcess | undefined;
+  let proxy: DelayProxy | undefined;
+  // The steady period's write-queue deltas, kept outside the try so an aborted run still reports them.
+  let steadyQueue: QueueCum = { wait: new Map(), hold: new Map() }, steadyQueueS = 0;
   // A driver killed by a signal (the scope's OOM killer) keeps a null exitCode.
   const exited = (d: Driver) => d.proc.exitCode !== null || d.proc.signalCode !== null;
   try {
     if (pgAdmin) await pgAdmin.unsafe(`CREATE DATABASE "${pgName}"`);
-    srv = await ServerProcess.start(o.server, pgDbUrl ? { url: pgDbUrl, blobDir } : { dbPath }, env);
+    if (pgDbUrl && o.pgLatencyMs !== undefined) {
+      const u = new URL(pgDbUrl);
+      proxy = startDelayProxy({ hostname: u.hostname, port: Number(u.port || 5432) }, o.pgLatencyMs);
+      log(`postgres delay proxy on 127.0.0.1:${proxy.port}: +${o.pgLatencyMs} ms each way (round trip +${2 * o.pgLatencyMs} ms); the server connects through it`);
+    }
+    srv = await ServerProcess.start(o.server, pgDbUrl ? { url: proxy ? proxy.url(pgDbUrl) : pgDbUrl, blobDir } : { dbPath }, env);
     const server = srv;
     let metricsUrl: string | undefined;
     for (const deadline = Date.now() + 10_000; !metricsUrl; await Bun.sleep(50)) {
@@ -432,7 +522,7 @@ async function main() {
 
     // The load: a scrape per window; a churn wave every churnEveryS.
     const start = Date.now(), end = start + o.durationS * 1000;
-    let prev = await scrape(), prevTools = toolCumulative(prev), prevRef = refusalsTotal(prev);
+    let prev = await scrape(), prevTools = toolCumulative(prev), prevRef = refusalsTotal(prev), prevQueue = queueCumulative(prev), prevAt = Date.now();
     let nextChurn = start + o.churnEveryS * 1000, churnUntil = 0, churnsSent = 0;
     // Each scrape asks every driver for its window since the last ask, so the two cover one span.
     // Report 0 opens the first window: what drivers did before the load started is dropped.
@@ -465,20 +555,24 @@ async function main() {
         live += w.live;
       });
       const lagSamples = ["0.5", "0.99", "1"].map(q => one(s, "grayboard_event_loop_lag_seconds", { quantile: q }));
+      const queueNow = queueCumulative(s), queueDelta = combineQueue(queueNow, prevQueue, -1), wallS = (now - prevAt) / 1000;
+      const steadyWindow = next - o.windowS * 1000 - start >= o.warmupS * 1000;
+      if (steadyWindow && queueNow.hold.size) { steadyQueue = combineQueue(steadyQueue, queueDelta, 1); steadyQueueS += wallS; }
       const w: Window = {
         // Steady from the first window that starts after the warm-up (#1038), by schedule, so scrape jitter can't flip it.
-        at: now, t: (now - start) / 1000, steady: next - o.windowS * 1000 - start >= o.warmupS * 1000, churning: now < churnUntil,
+        at: now, t: (now - start) / 1000, steady: steadyWindow, churning: now < churnUntil,
         rss: one(s, "grayboard_process_resident_memory_bytes") ?? -1, heap: one(s, "grayboard_process_heap_used_bytes") ?? -1,
         ...(lagSamples.every(x => x !== undefined) ? { lag: { p50: lagSamples[0]!, p99: lagSamples[1]!, max: lagSamples[2]! } } : {}),
         leases: one(s, "grayboard_delivery_leases") ?? -1, listens: one(s, "grayboard_mcp_admissions", { kind: "listen" }) ?? -1,
         holding: one(s, "grayboard_hosted_sessions_holding") ?? -1, live, refusals, tools, client, clientErrors, driverLagP99,
         ops: ["dm_send", "board_post", "svc_invoke", "peer_list", ...SVC_READS].reduce((a, op) => a + (client[op]?.count ?? 0), 0), loadavg: loadavg(),
+        ...(queueNow.hold.size ? { queue: queueStats(queueDelta, wallS) } : {}),
       };
       windows.push(w);
       appendFileSync(join(o.out, "windows.jsonl"), JSON.stringify(w) + "\n");
       const toolAll = Object.values(tools).reduce((a, x) => ({ count: a.count + x.count, fast: a.fast + x.fast }), { count: 0, fast: 0 });
-      log(`t=${w.t.toFixed(0)}s${w.steady ? "" : " (warm-up)"}${w.churning ? " (churn)" : ""} leases=${w.leases} listens=${w.listens} live=${w.live} rss=${(w.rss / 2 ** 20).toFixed(0)}MB heap=${(w.heap / 2 ** 20).toFixed(0)}MB lag.p99=${w.lag ? (w.lag.p99 * 1000).toFixed(1) : "-"}ms tools=${toolAll.count} (${(100 * (toolAll.count ? toolAll.fast / toolAll.count : 1)).toFixed(2)}% ≤100ms) ops=${w.ops} inbox≤100ms=${client.inbox ? (100 * fastShare(client.inbox)).toFixed(2) : "-"}% drvlag=${(driverLagP99 * 1000).toFixed(0)}ms load=${w.loadavg[0]!.toFixed(1)}${Object.keys(refusals).length ? ` REFUSED ${JSON.stringify(refusals)}` : ""}${Object.keys(clientErrors).length ? ` ERRORS ${JSON.stringify(clientErrors)}` : ""}`);
-      prev = s; prevTools = toolCumulative(s); prevRef = ref;
+      log(`t=${w.t.toFixed(0)}s${w.steady ? "" : " (warm-up)"}${w.churning ? " (churn)" : ""} leases=${w.leases} listens=${w.listens} live=${w.live} rss=${(w.rss / 2 ** 20).toFixed(0)}MB heap=${(w.heap / 2 ** 20).toFixed(0)}MB lag.p99=${w.lag ? (w.lag.p99 * 1000).toFixed(1) : "-"}ms tools=${toolAll.count} (${(100 * (toolAll.count ? toolAll.fast / toolAll.count : 1)).toFixed(2)}% ≤100ms) ops=${w.ops} inbox≤100ms=${client.inbox ? (100 * fastShare(client.inbox)).toFixed(2) : "-"}% drvlag=${(driverLagP99 * 1000).toFixed(0)}ms load=${w.loadavg[0]!.toFixed(1)}${w.queue ? ` queue: ${w.queue.bodiesPerS.toFixed(0)}/s busy=${(100 * w.queue.busy).toFixed(1)}% wait.p50/p99=${ms(w.queue.wait.p50)}/${ms(w.queue.wait.p99)}ms hold.p50/p99=${ms(w.queue.hold.p50)}/${ms(w.queue.hold.p99)}ms depth≤${w.queue.maxDepth ?? 0}` : ""}${Object.keys(refusals).length ? ` REFUSED ${JSON.stringify(refusals)}` : ""}${Object.keys(clientErrors).length ? ` ERRORS ${JSON.stringify(clientErrors)}` : ""}`);
+      prev = s; prevTools = toolCumulative(s); prevRef = ref; prevQueue = queueNow; prevAt = now;
       if (o.churn > 0 && o.churnEveryS > 0 && now >= nextChurn && next + o.windowS * 1000 <= end) {
         send(`churn ${o.churn}`); churnsSent++;
         nextChurn += o.churnEveryS * 1000;
@@ -605,27 +699,46 @@ async function main() {
     if (o.rssGate && rssGrowth > Math.max(0.1 * meanRss, 64 * 2 ** 20)) failures.push(`RSS grew ${(rssGrowth / 2 ** 20).toFixed(0)} MB over the steady ${steadyS} s (mean ${(meanRss / 2 ** 20).toFixed(0)} MB); want flat (< 10% or 64 MB)`);
     for (const [k, v] of Object.entries(drained)) if (v !== 0) failures.push(`after close, ${k} = ${v}; want 0`);
     const lagP99 = windows.filter(w => w.lag).map(w => w.lag!.p99);
+    const queueSteady = steadyQueueS > 0 ? queueStats(steadyQueue, steadyQueueS) : null;
 
     const summary = {
       options: { ...o, server: o.server.join(" ") }, env, connected, windows: windows.length, steadyWindows: steady.length, cleanWindows: clean.length,
       toolSteady: Object.fromEntries(Object.entries(toolSteady).map(([t, x]) => [t, { count: x.count, fastShare: x.fast / x.count }])),
+      toolSteadyAll: toolPool.count ? { count: toolPool.count, fastShare: toolPool.fast / toolPool.count } : null,
       clientSteady: Object.fromEntries(Object.entries(clientSteady).map(([op, h]) => [op, { count: h.count, fastShare: fastShare(h), p99Le: p99Edge(h), mean: h.sum / Math.max(1, h.count), errors: h.errors }])),
       dms: { sent: sent.size, received: recv.size, lost: lost.length }, misdelivered, posts, boardDeliveries: boardRecv,
       service: o.serviceWorkers ? { name: SERVICE, board: SVC_BOARD, workers: o.serviceWorkers, teams: o.teams, invocations: svcSent.size, reachedLane: svcGot.size, replied: svcDone.size, lost: svcLost.length, laneEchoes, teamAllowed: audit!.teamAllowed.size, rules: audit!.rules, boardScope: audit!.boardScope, reads: svcReads } : null,
       rss: { meanMB: meanRss / 2 ** 20, growthMB: rssGrowth / 2 ** 20, gated: o.rssGate }, heapGrowthMB: heapSlope * steadyS / 2 ** 20,
       lag: { windows: lagP99.length, p99Max: Math.max(0, ...lagP99), p99Median: lagP99.sort((a, b) => a - b)[Math.floor(lagP99.length / 2)] ?? null },
-      drained, hostedRowsAfter: rows, refusals: refusedAll, clientErrors: erroredAll, failures,
+      drained, hostedRowsAfter: rows, refusals: refusedAll, clientErrors: erroredAll, queueSteady, pgLatencyMs: o.pgLatencyMs ?? null, failures,
     };
     writeFileSync(join(o.out, "summary.json"), JSON.stringify(summary, null, 2) + "\n");
     log(`summary: ${JSON.stringify({ connected, dms: summary.dms, posts, boardDeliveries: boardRecv, service: summary.service, rss: summary.rss, heapGrowthMB: summary.heapGrowthMB.toFixed(1), lag: summary.lag, hostedRowsAfter: rows })}`);
+    if (queueSteady) {
+      const q = queueSteady;
+      log(`write queue, steady: ${q.bodiesPerS.toFixed(0)} bodies/s, busy ${(100 * q.busy).toFixed(1)}%, wait p50/p99 ${ms(q.wait.p50)}/${ms(q.wait.p99)} ms, hold p50/p99 ${ms(q.hold.p50)}/${ms(q.hold.p99)} ms, depth ≤ ${q.maxDepth ?? 0}`);
+      for (const [site, x] of Object.entries(q.sites).sort((a, b) => b[1].busy - a[1].busy)) log(`  ${site}: ${x.bodiesPerS.toFixed(1)}/s, busy ${(100 * x.busy).toFixed(1)}%, hold p50/p99 ${ms(x.hold.p50)}/${ms(x.hold.p99)} ms, wait p99 ${ms(x.wait.p99)} ms`);
+    }
     if (failures.length) { log(`FAIL (${failures.length}):`); for (const f of failures.slice(0, 50)) log(`  ${f}`); exitCode = 1; }
     else log("PASS");
   } catch (e) {
     log(`loadtest aborted: ${e instanceof Error ? e.stack ?? e.message : e}`);
     exitCode = 2;
+    // What the windows measured before the abort (a saturated server can stall the close past its deadline): the
+    // steady tool calls and write queue, so the run still has numbers. No gate was judged.
+    const toolSteady: Record<string, { count: number; fast: number }> = {};
+    for (const w of windows.filter(x => x.steady)) for (const [t, x] of Object.entries(w.tools)) { const a = toolSteady[t] ??= { count: 0, fast: 0 }; a.count += x.count; a.fast += x.fast; }
+    const pool = Object.values(toolSteady).reduce((a, x) => ({ count: a.count + x.count, fast: a.fast + x.fast }), { count: 0, fast: 0 });
+    writeFileSync(join(o.out, "summary.json"), JSON.stringify({
+      aborted: e instanceof Error ? e.message : String(e), options: { ...o, server: o.server.join(" ") }, windows: windows.length, steadyWindows: windows.filter(x => x.steady).length,
+      toolSteady: Object.fromEntries(Object.entries(toolSteady).map(([t, x]) => [t, { count: x.count, fastShare: x.fast / x.count }])),
+      toolSteadyAll: pool.count ? { count: pool.count, fastShare: pool.fast / pool.count } : null,
+      queueSteady: steadyQueueS > 0 ? queueStats(steadyQueue, steadyQueueS) : null, pgLatencyMs: o.pgLatencyMs ?? null,
+    }, null, 2) + "\n");
   } finally {
     for (const d of drivers) if (!exited(d)) d.proc.kill("SIGKILL");
     if (srv) { await srv.stop(); writeFileSync(join(o.out, "server.log"), srv.log()); }
+    proxy?.stop();
     if (!o.keepDb) {
       rmSync(scratch, { recursive: true, force: true });
       if (pgAdmin) await pgAdmin.unsafe(`DROP DATABASE IF EXISTS "${pgName}" WITH (FORCE)`).catch(e => log(`dropping ${pgName}: ${e instanceof Error ? e.message : e}`));

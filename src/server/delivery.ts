@@ -7,6 +7,7 @@ import type { OAuthPrincipal } from "./oauth.ts";
 import type { HostedSessions, SessionContext } from "./hosted.ts";
 import type { HostedSession } from "./hosted-types.ts";
 import type { Read } from "./store/tx.ts";
+import { atSite } from "./store/queue.ts";
 import { hostedFailure } from "./hosted-diagnostics.ts";
 import { countRefusal } from "./metrics.ts";
 
@@ -209,7 +210,7 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
     },
     async renew(p: DeliveryPrincipal, context: SessionContext, capability: string, hooks?: DeliveryHooks) {
       return hosted.control(p, context, false, async row => {
-        const { lease } = await store.write(async tx => {
+        const { lease } = await atSite("renew", () => store.write(async tx => {
           // Locked before it is read (#807 P3 C8 R2): a bind's generation bump committed meanwhile is the row judged here,
           // and the update writes the lease's columns only.
           const fresh = await store.lock(tx, row.session_id);
@@ -226,7 +227,7 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
           lease.expiresAt = deadline;
           if (hooks) lease.hooks = hooks;
           return { lease };
-        });
+        }));
         return describe(lease);
       }).catch(error => refused(p, context, error));
     },
@@ -252,7 +253,7 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
     async receipt(p: DeliveryPrincipal, context: SessionContext, capability: string, ids: string[]): Promise<void> {
       return hosted.control(p, context, false, async () => {
         await testPauseAsync("hosted:receipt:before-txn");
-        await store.write(async tx => {
+        await atSite("receipt", () => store.write(async tx => {
           testPause("hosted:receipt:in-txn");
           // Locked before its generation is judged against the receipts (#807 P3 C8 R2).
           const row = "id" in context ? await store.lock(tx, context.id) : undefined;
@@ -290,7 +291,7 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
           }
           drained.add(drainKey(lease));
           while (lease.acknowledged.size > ACKED_HISTORY) lease.acknowledged.delete(lease.acknowledged.keys().next().value!);
-        });
+        }));
       }).catch(error => refused(p, context, error));
     },
     async release(p: DeliveryPrincipal, context: SessionContext, capability: string) {

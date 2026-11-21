@@ -45,6 +45,41 @@ export async function timeTool<T>(tool: string, fn: () => Promise<T> | T): Promi
   try { return await fn(); } finally { observeTool(tool, (performance.now() - start) / 1000); }
 }
 
+// The write queue (store/queue.ts, docs/future/postgres-server.md D4), process-wide across every queue in the process.
+// A body's wait runs from run() to its start, its hold from its start to its release (a synchronous body's return or
+// throw, an async body's settling). Seconds, from SQLite's ~20 µs bodies to a stalled Postgres commit.
+export const QUEUE_BUCKETS = [0.00002, 0.00005, 0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5];
+// Waiters ahead of a body that queues (an idle queue's body isn't counted: it never waits).
+export const QUEUE_DEPTH_BUCKETS = [0, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000];
+// Who queued a body: a literal its caller sets (store/queue.ts `atSite`), never a request's value or a stack frame.
+// The hot callers have their own; every other body is `other`.
+export const QUEUE_SITES = ["gate", "prior", "tool", "renew", "receipt", "touch", "audit", "other"] as const;
+export type QueueSite = typeof QUEUE_SITES[number];
+
+// Per-bucket counts, not cumulative (the last slot is +Inf): an observation is one increment; the scrape sums them.
+type Bins = { counts: number[]; sum: number; count: number };
+const bins = (edges: readonly number[]): Bins => ({ counts: new Array<number>(edges.length + 1).fill(0), sum: 0, count: 0 });
+function bin(b: Bins, edges: readonly number[], v: number) {
+  let i = 0;
+  while (i < edges.length && v > edges[i]!) i++;
+  b.counts[i]!++; b.sum += v; b.count++;
+}
+const queueWait = new Map<QueueSite, Bins>(QUEUE_SITES.map(s => [s, bins(QUEUE_BUCKETS)]));
+const queueHold = new Map<QueueSite, Bins>(QUEUE_SITES.map(s => [s, bins(QUEUE_BUCKETS)]));
+const queueDepth = bins(QUEUE_DEPTH_BUCKETS);
+let queueWaiters = 0;
+
+// A body queued behind `ahead` others.
+export function queueWaiting(ahead: number) { queueWaiters++; bin(queueDepth, QUEUE_DEPTH_BUCKETS, ahead); }
+// A body released: `waited` when it had queued (queueWaiting counted it), its wait and hold in seconds.
+export function queueBody(site: QueueSite, waited: boolean, waitS: number, holdS: number) {
+  if (waited) queueWaiters--;
+  bin(queueWait.get(site)!, QUEUE_BUCKETS, waitS);
+  bin(queueHold.get(site)!, QUEUE_BUCKETS, holdS);
+}
+// Bodies waiting now, across every queue in the process.
+export function queueWaitersNow(): number { return queueWaiters; }
+
 // Event-loop lag, in windows: each window's p50/p99/max of the loop's delay, then a reset. The
 // scrape reports the last finished window, so it costs nothing and doesn't depend on the scraper's
 // cadence. Shared by every server in the process: started and stopped by reference count; the
@@ -123,6 +158,12 @@ const labelText = (labels: Record<string, string>) => {
 };
 const num = (v: number) => Number.isFinite(v) ? String(v) : v > 0 ? "+Inf" : v < 0 ? "-Inf" : "NaN";
 
+function histogram(out: string[], name: string, labels: Record<string, string>, edges: readonly number[], b: Bins) {
+  let cum = 0;
+  edges.forEach((le, i) => { cum += b.counts[i]!; out.push(`${name}_bucket${labelText({ ...labels, le: String(le) })} ${cum}`); });
+  out.push(`${name}_bucket${labelText({ ...labels, le: "+Inf" })} ${b.count}`, `${name}_sum${labelText(labels)} ${num(b.sum)}`, `${name}_count${labelText(labels)} ${b.count}`);
+}
+
 export function render(gauges: Gauges = {}): string {
   const out: string[] = [];
   const family = (name: string, type: string, help: string) => { out.push(`# HELP ${name} ${help}`, `# TYPE ${name} ${type}`); };
@@ -158,6 +199,17 @@ export function render(gauges: Gauges = {}): string {
       `grayboard_tool_call_duration_seconds_sum${labelText({ tool })} ${num(h.sum)}`,
       `grayboard_tool_call_duration_seconds_count${labelText({ tool })} ${h.count}`);
   }
+
+  family("grayboard_write_queue_wait_seconds", "histogram", "Write-queue wait, from run() to the body's start, by calling site.");
+  for (const [site, b] of queueWait) if (b.count) histogram(out, "grayboard_write_queue_wait_seconds", { site }, QUEUE_BUCKETS, b);
+  family("grayboard_write_queue_hold_seconds", "histogram", "Write-queue hold, from a body's start to its release, by calling site.");
+  for (const [site, b] of queueHold) if (b.count) histogram(out, "grayboard_write_queue_hold_seconds", { site }, QUEUE_BUCKETS, b);
+  family("grayboard_write_queue_bodies_total", "counter", "Write-queue bodies released, by calling site.");
+  for (const [site, b] of queueHold) out.push(`grayboard_write_queue_bodies_total${labelText({ site })} ${b.count}`);
+  family("grayboard_write_queue_depth", "histogram", "Bodies already waiting when a body queues behind a held write queue.");
+  histogram(out, "grayboard_write_queue_depth", {}, QUEUE_DEPTH_BUCKETS, queueDepth);
+  family("grayboard_write_queue_waiters", "gauge", "Bodies waiting for the write queue now.");
+  out.push(`grayboard_write_queue_waiters ${queueWaiters}`);
 
   for (const [suffix, g] of Object.entries(gauges)) {
     const name = `grayboard_${suffix}`;
