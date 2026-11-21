@@ -825,11 +825,12 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
   }
   // The server closes the session: it leaves the hub, and its transport is
   // told why and closes. `h`: the body it runs in, whose `Tx` takes close's rows (#807 P3 A3).
+  // The transport is told even when close's row writes refuse on `h` (a read-only probe's Tx, #1510 chunk 4 audit L2):
+  // the session is already out of the hub by then, and an untold sink would keep its delivery lease tracked.
   function terminate(session: ApplicationSession, error: ApplicationError, h: Read = repo.read) {
     detach(session);
     session.closedBy = error;
-    close(session, h);
-    session.sink.closed(error);
+    try { close(session, h); } finally { session.sink.closed(error); }
   }
   // The session open and current; a closed one is refused with why.
   function stillOpen(session: ApplicationSession) {

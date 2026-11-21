@@ -106,11 +106,14 @@ export function refuseKeyed(h: Read, op: string, needs?: string): void {
   throw new Error(keyedRefusal(op, keys, needs));
 }
 // A change notice's guard (store/notices.ts, pg_repo.ts): refuseKeyed, except that a keyed body whose caller opted in
-// to `op`'s notice (writeKeyed's `notices`, D4) queues it. `op`: the wrapped write's name (`hosted.update`), undefined
-// for a bare notice, which no body opts in to; `label`: the refusal's text. A probe refuses every notice.
-export function refuseKeyedNotice(h: Read, op: string | undefined, label: string): void {
-  if (h instanceof PgTx && !h.txn.probe && op !== undefined && h.txn.notices?.has(op)) return;
-  refuseKeyed(h, label);
+// to `op`'s notice (writeKeyed's `notices`, D4) queues it for a row of its own root: one whose `root:<id>` the body
+// holds. `op`: the wrapped write's name (`hosted.update`), undefined for a bare notice, which no body opts in to;
+// `label`: the refusal's text; `id`: the row the notice names, null for any row (never opted in). A probe refuses
+// every notice.
+export function refuseKeyedNotice(h: Read, op: string | undefined, label: string, id: string | null = null): void {
+  const opted = h instanceof PgTx && op !== undefined && h.txn.notices?.has(op) === true;
+  if (opted && !h.txn.probe && id !== null && h.txn.keys?.has(`root:${id}`)) return;
+  refuseKeyed(h, opted ? `${label} for ${id ?? "any row"}, not this body's root` : label);
 }
 const keyedRefusal = (op: string, keys: ReadonlySet<string>, needs?: string) =>
   `${op} refused in a keyed write body (keys ${[...keys].join(", ")})${needs === undefined ? "" : ` without the key ${needs}`}: it runs in an exclusive body (write) (docs/future/postgres-server.md D4)`;

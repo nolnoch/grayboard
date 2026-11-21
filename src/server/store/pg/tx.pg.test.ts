@@ -656,7 +656,7 @@ describePg("keyed write bodies (Postgres store guard)", () => {
     const d = makePgTransactions(db.url, { max: 2, applicationName: "gb-test-keyed" });
     const one = makePgTransactions(db.url, { max: 2, writers: 1, applicationName: "gb-test-keyed" });
     try {
-      expect(DEFAULT_DATABASE_WRITERS).toBe(4);
+      expect(DEFAULT_DATABASE_WRITERS).toBe(8);
       expect(d.queue.cap).toBe(DEFAULT_DATABASE_WRITERS);
       let release!: () => void;
       const held = new Promise<void>(r => { release = r; });
@@ -779,7 +779,7 @@ describePg("keyed write bodies (Postgres store guard)", () => {
   // afterCommit refusal still fires, but only after its statement ran, so the op's name is missing from the error).
   test("a change notice's op refuses in a keyed body before its statement is sent, naming the op and the keys; an exclusive body marks", async () => {
     await using x = await scratch();
-    const notices = makeNotices((tx, effect) => tx.afterCommit(effect), (tx, op, label) => refuseKeyedNotice(tx, op, label));
+    const notices = makeNotices((tx, effect) => tx.afterCommit(effect), (tx, op, label, id) => refuseKeyedNotice(tx, op, label, id));
     const seen: Array<string | null> = [];
     notices.subscribe<null>(id => { seen.push(id); }, async () => null);
     let sent = 0;
@@ -793,21 +793,24 @@ describePg("keyed write bodies (Postgres store guard)", () => {
     expect(seen).toEqual(["m", null]);
   });
 
-  // #1510 chunk 4: renew's opt-in (Repo.writeKeyedEffects). Mutations: refuseKeyedNotice without its `notices` check
-  // (t.change commits keyed); without its probe check (the probe's marked write is sent); deferEffect's or
+  // #1510 chunk 4: renew's opt-in (Repo.writeKeyedEffects), for its own root's row only (audit L1). Mutations:
+  // refuseKeyedNotice without its `notices` check (t.change commits keyed); without its root-key check (the mark of
+  // row b commits under root:a); without its probe check (the probe's marked write is sent); deferEffect's or
   // beforeCommit's probe check dropped (the probe registers the notice's effect or its facts hook, so the marked op
   // inside the probe fails later, naming the statement, not the op).
   test("a keyed body opted in to one op's notices queues those and refuses every other notice, and a probe refuses them all", async () => {
     await using x = await scratch();
-    const notices = makeNotices((tx, effect) => tx.afterCommit(effect), (tx, op, label) => refuseKeyedNotice(tx, op, label));
+    const notices = makeNotices((tx, effect) => tx.afterCommit(effect), (tx, op, label, id) => refuseKeyedNotice(tx, op, label, id));
     const seen: Array<string | null> = [];
     notices.subscribe<string>(id => { seen.push(id); }, async () => "facts");
     let sent = 0;
     const marked = notices.marks(async (tx: Tx, v: string) => { sent++; await put(tx, v); }, (_tx, v) => v, "t.put");
     const changed = notices.change(async (tx: Tx) => { sent++; await put(tx, "c"); }, "t.change");
     const opted = <T>(fn: (tx: Tx) => Promise<T>) => x.s.writeKeyed(["root:a"], fn, undefined, { effects: true, notices: ["t.put"] });
-    await opted(tx => marked(tx, "m"));
-    expect([sent, seen]).toEqual([1, ["m"]]);
+    await opted(tx => marked(tx, "a"));
+    expect([sent, seen]).toEqual([1, ["a"]]);
+    // Another root's row refuses before its statement is sent.
+    expect((await rejection(opted(tx => marked(tx, "b")))).message).toContain("t.put (it queues a change notice) for b, not this body's root refused in a keyed write body (keys root:a)");
     expect((await rejection(opted(tx => changed(tx)))).message).toContain("t.change (it queues a change notice) refused in a keyed write body (keys root:a)");
     expect((await rejection(opted(async tx => { notices.changed(tx, "z"); })))).toHaveProperty("message", expect.stringContaining("a hosted change notice refused in a keyed write body (keys root:a)"));
     // Without `effects`, the names lift nothing.
@@ -815,11 +818,11 @@ describePg("keyed write bodies (Postgres store guard)", () => {
     // A probe refuses the opted-in op, and any effect or hook, as a ProbeWrite before a statement is sent.
     const probed = await rejection(opted(tx => x.s.readsOnly(tx, () => marked(tx, "p"))));
     expect(probed).toBeInstanceOf(ProbeWrite);
-    expect(probed.message).toContain("t.put (it queues a change notice) refused in a read-only probe");
+    expect(probed.message).toContain("t.put (it queues a change notice) for p, not this body's root refused in a read-only probe");
     expect(await rejection(opted(tx => x.s.readsOnly(tx, async () => { tx.afterCommit(() => {}); })))).toBeInstanceOf(ProbeWrite);
     expect(await rejection(opted(tx => x.s.readsOnly(tx, async () => { tx.beforeCommit({}, async () => {}); })))).toBeInstanceOf(ProbeWrite);
-    expect([sent, seen]).toEqual([1, ["m"]]);
-    expect(await rows(x.s.read)).toEqual(["m"]);
+    expect([sent, seen]).toEqual([1, ["a"]]);
+    expect(await rows(x.s.read)).toEqual(["a"]);
   });
 
   // Mutation: drop insertClaimEvent's refuseKeyed (the keyed event commits).

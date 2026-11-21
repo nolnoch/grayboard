@@ -1039,6 +1039,127 @@ describePg("keyed renew and receipt (Postgres)", () => {
     } finally { sender.close(); }
   });
 
+  // Across processes the probe's FOR UPDATE of the root is the ownership recheck (#1510 chunk 4 audit M1): another
+  // instance's unbind (bind_gen + 1, lease_deadline NULL) waits for a keyed renew held past its probe, then commits
+  // over it. Mutation: the renew probe's store.lock as store.get (the unbind commits first and the renew's UPDATE
+  // re-arms a lease on the unbound root).
+  test("another instance's unbind waits for a keyed renew held after its probe, and leaves no lease on the root", async () => {
+    await using db = await pgDatabase({ max: 4 });
+    await using a = await leaseInstance(db.url, { side: "a" });
+    await using b = await leaseInstance(db.url, { side: "b" });
+    const p = await leasePrincipal(a, db.sql);
+    const { c, id, lease } = await leased(a, p, "root-a", "fe");
+    a.advance(1_000);
+    a.state.hold = gate();
+    const renewed = a.delivery.renew(p, c, lease.capability);
+    await until(() => a.state.held === 1, 10_000, "the renew held before its update");
+    const unbound = b.hosted.unbind(p, c, { name: "fe" });
+    try { await until(async () => await lockWaiters(db.sql) >= 1, 10_000, "the unbind waiting on the renew's root lock"); }
+    finally { a.state.hold.open(); }
+    await renewed;
+    await unbound;
+    expect((await db.sql`SELECT lease_deadline FROM hosted_sessions WHERE session_id = ${id}`)[0].lease_deadline).toBeNull();
+  });
+
+  // The same for a keyed receipt held at its first mark: the probe's lock holds another instance's unbind until the
+  // receipt commits. Mutation: the receipt probe's store.lock as store.get (the unbind commits beside the receipt).
+  test("another instance's unbind waits for a keyed receipt held after its probe", async () => {
+    await using db = await pgDatabase({ max: 4 });
+    await using a = await leaseInstance(db.url, { side: "a" });
+    await using b = await leaseInstance(db.url, { side: "b" });
+    const p = await leasePrincipal(a, db.sql);
+    const { c, lease } = await leased(a, p, "root-a", "fe");
+    const sender = new AppSession(a.application, a.repo, p.authed, "be", { push: false });
+    await sender.connect();
+    try {
+      await sender.send(`${ME}/fe`, "one");
+      const items = await a.delivery.pending(p, c, lease.capability);
+      a.state.marked = []; a.state.hold = gate();
+      const receipt = a.delivery.receipt(p, c, lease.capability, items.map(i => i.id));
+      await until(() => a.state.held === 1, 10_000, "the receipt held after its first mark");
+      let done = false;
+      const unbound = b.hosted.unbind(p, c, { name: "fe" }).finally(() => { done = true; });
+      try {
+        await until(async () => done || await lockWaiters(db.sql) >= 1, 10_000, "the unbind waiting on the receipt's root lock, or done");
+        expect(done).toBe(false);
+      } finally { a.state.hold.open(); }
+      await receipt;
+      await unbound;
+      expect(await a.repo.cursors.directFor(a.repo.read, `${ME}/fe`)).toBe(Number(items[0]!.id.slice("direct:".length)));
+    } finally { sender.close(); }
+  });
+
+  // A user disabled by an outside commit the probe's authorization read missed (#1510 chunk 4 audit L2): pending's
+  // valid() terminates the session inside the probe, whose Tx refuses close's row write. The transport is still told,
+  // so the lease finishes, as the exclusive body's terminate finishes it. Mutation: terminate's sink.closed outside its
+  // finally (the lease stays tracked).
+  test("a user disabled outside the queue during a keyed receipt's probe leaves no lease tracked", async () => {
+    await using db = await pgDatabase({ max: 2 });
+    await using x = await leaseInstance(db.url);
+    const p = await leasePrincipal(x, db.sql);
+    const { c, lease } = await leased(x, p, "root-a", "fe");
+    const sender = new AppSession(x.application, x.repo, p.authed, "be", { push: false });
+    await sender.connect();
+    try {
+      await sender.send(`${ME}/fe`, "one");
+      const items = await x.delivery.pending(p, c, lease.capability);
+      await db.sql`UPDATE users SET disabled_at = 1 WHERE id = ${x.user.id}`;
+      const d = renewDelta("receipt");
+      // The probe's terminate finished the lease, so the exclusive body finds the capability stale.
+      await expect(x.delivery.receipt(p, c, lease.capability, items.map(i => i.id))).rejects.toHaveProperty("code", "not_found");
+      expect(d()).toEqual({ keyed: 0, miss: 1, skipped: 0 });
+      expect(x.delivery.activeLeaseCount).toBe(0);
+    } finally { sender.close(); }
+  });
+
+  // An ApplicationError from the receipt's writes (its session closed meanwhile, outside the queue) is a miss, not the
+  // request's error: the keyed attempt rolls back and the exclusive body runs, refusing the closed session as it would
+  // have alone (#1510 chunk 4 audit L3). A bare close leaves the lease open, so the exclusive body's refusal is the
+  // session's, not a stale capability's. Mutation: keyedOr's write part rethrowing ApplicationError (m09: the request
+  // fails from the keyed attempt, counted neither keyed nor missed, and the exclusive body never runs).
+  test("a session closed during a keyed receipt's writes misses, and the exclusive body refuses it", async () => {
+    await using db = await pgDatabase({ max: 2 });
+    await using x = await leaseInstance(db.url);
+    const p = await leasePrincipal(x, db.sql);
+    const { c, lease } = await leased(x, p, "root-a", "fe");
+    const sender = new AppSession(x.application, x.repo, p.authed, "be", { push: false });
+    await sender.connect();
+    try {
+      await sender.send(`${ME}/fe`, "one");
+      const items = await x.delivery.pending(p, c, lease.capability);
+      const receiptDirect = x.application.receiptDirect;
+      const calls: Array<string | undefined> = [];
+      x.application.receiptDirect = async (tx, session, ...rest) => {
+        // On the body's Tx: its row write (the touch) rolls back with the keyed attempt.
+        if (calls.push(currentSite()) === 1) x.application.close(session, tx);
+        return receiptDirect(tx, session, ...rest);
+      };
+      const d = renewDelta("receipt");
+      await expect(x.delivery.receipt(p, c, lease.capability, items.map(i => i.id))).rejects.toThrow("session is closed");
+      expect(d()).toEqual({ keyed: 0, miss: 1, skipped: 0 });
+      // Only the keyed attempt reached the writes: the exclusive body's reads (pending's valid) refuse the closed session.
+      expect(calls).toEqual(["receipt"]);
+      expect(await x.repo.cursors.directFor(x.repo.read, `${ME}/fe`)).toBe(0);
+    } finally { sender.close(); }
+  });
+
+  // The notices a keyed body may queue are fixed in pg_repo.ts, not by the caller (#1510 chunk 4 audit L1), and only
+  // for its own root's row. Mutations: KEYED_NOTICE_OPS check dropped (hosted.end's opt-in is accepted and the body
+  // runs); refuseKeyedNotice's root-key check dropped (another root's update commits keyed).
+  test("writeKeyedEffects accepts only hosted.update's notices, for the body's own root's row", async () => {
+    await using db = await pgDatabase({ max: 2 });
+    await using x = await leaseInstance(db.url);
+    const p = await leasePrincipal(x, db.sql);
+    const { id } = await leased(x, p, "root-a", "fe");
+    const { id: other } = await leased(x, p, "root-b", "be");
+    let ran = 0;
+    await expect(x.repo.writeKeyedEffects!([`root:${id}`], ["hosted.update", "hosted.end"], async () => { ran++; })).rejects.toThrow("a keyed body may not queue hosted.end's notices");
+    expect(ran).toBe(0);
+    await expect(x.repo.writeKeyedEffects!([`root:${id}`], ["hosted.update"], tx => x.repo.hosted.update(tx, other, { last_seen_at: 1 }))).rejects.toThrow(`for ${other}, not this body's root refused in a keyed write body`);
+    await x.repo.writeKeyedEffects!([`root:${id}`], ["hosted.update"], tx => x.repo.hosted.update(tx, id, { last_seen_at: 1 }));
+    expect(Number((await db.sql`SELECT last_seen_at FROM hosted_sessions WHERE session_id = ${id}`)[0].last_seen_at)).toBe(1);
+  });
+
   // A lease finished while a keyed renew's update awaits: the renew misses, and the exclusive body refuses it, so the
   // new deadline is rolled back (delivery.test.ts's #807 P3 A6e2 test, keyed). Mutation: the keyed body's lease recheck
   // after its update dropped (the deadline commits, then `committed` refuses).

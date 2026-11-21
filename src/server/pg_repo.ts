@@ -62,6 +62,10 @@ export type PgRepoOptions = {
 // reaches it only through the Repo's writes.
 export type PgRepo = Repo & { readonly writeQueue: WriteQueue };
 
+// The change notices a keyed body may queue (Repo.writeKeyedEffects, D4): renew's lease update. A caller can't widen
+// the set; refuseKeyedNotice further limits it to a row of the body's own root key.
+const KEYED_NOTICE_OPS: ReadonlySet<string> = new Set(["hosted.update"]);
+
 export async function makePgRepo(url: string, opts: PgRepoOptions): Promise<PgRepo> {
   const clock = opts.now ?? Date.now;
   const app = opts.applicationName ?? "grayboard";
@@ -83,13 +87,18 @@ export async function makePgRepo(url: string, opts: PgRepoOptions): Promise<PgRe
 
   // Each notice waits on the Tx it's given (store/notices.ts).
   // A keyed body queues none (refuseKeyed, D4), but those its caller opted in to by op (refuseKeyedNotice: renew's).
-  const notices = makeNotices((tx, effect) => tx.afterCommit(effect), (tx, op, label) => refuseKeyedNotice(tx, op, label));
+  const notices = makeNotices((tx, effect) => tx.afterCommit(effect), (tx, op, label, id) => refuseKeyedNotice(tx, op, label, id));
   const { change, marks } = notices;
   // The Repo's keyed write takes no options: `{ effects: true }` lives only on PgTransactions (D4, audit L7), and on
   // writeKeyedEffects, the named opt-in for the reviewed callers D4 lists (delivery's renew and receipt).
   const writeKeyed = ((keys: readonly string[], fn: (tx: Tx) => Promise<unknown>, committed?: (value: unknown) => unknown) => t.writeKeyed(keys, fn, committed)) as Repo["writeKeyed"];
-  const writeKeyedEffects = ((keys: readonly string[], notices: readonly string[], fn: (tx: Tx) => Promise<unknown>, committed?: (value: unknown) => unknown) =>
-    t.writeKeyed(keys, fn, committed, { effects: true, notices })) as NonNullable<Repo["writeKeyedEffects"]>;
+  // The notices a keyed body may opt in to are fixed here, not by the caller (#1510 chunk 4 audit L1): renew's lease
+  // columns' `hosted.update`, and refuseKeyedNotice allows it only for a row of the body's own root key.
+  const writeKeyedEffects = ((keys: readonly string[], notices: readonly string[], fn: (tx: Tx) => Promise<unknown>, committed?: (value: unknown) => unknown) => {
+    const other = notices.find(n => !KEYED_NOTICE_OPS.has(n));
+    if (other !== undefined) return Promise.reject(new Error(`writeKeyedEffects: a keyed body may not queue ${other}'s notices; only ${[...KEYED_NOTICE_OPS].join(", ")} (docs/future/postgres-server.md D4)`));
+    return t.writeKeyed(keys, fn, committed, { effects: true, notices });
+  }) as NonNullable<Repo["writeKeyedEffects"]>;
   // The end a released hosted child's ID ends through, made from the finished Repo on first use, as db.ts openDatabase does.
   let port: SessionEndPort | undefined;
   const hosted = makePgHosted({ sessionEnd: deferredSessionEnd(() => port ??= sessionEndPort(opts.humanReach ?? "team")(repo)) });

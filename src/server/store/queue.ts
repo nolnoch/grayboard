@@ -64,8 +64,9 @@ class Fifo {
 
 // The Postgres store's write pool size and scheduler cap when nothing sets one (GRAYBOARD_DATABASE_WRITERS, config.ts;
 // makePgTransactions, makePgRepo). Tests reach the production W through these defaults (#1520 L4); W = 1, the single
-// queue, is passed explicitly as the A/B control.
-export const DEFAULT_DATABASE_WRITERS = 4;
+// queue, is passed explicitly as the A/B control. 8: the 300-session localhost bar passes at 8 and not at 4 once renew
+// and receipt are keyed (#1510 chunk 4, docs/future/postgres-server.md D4).
+export const DEFAULT_DATABASE_WRITERS = 8;
 
 export class WriteQueue {
   private running = 0;
