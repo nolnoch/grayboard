@@ -74,6 +74,15 @@ test("defaultProviders gives Google a status check only with GRAYBOARD_GOOGLE_DI
   expect(providers.map(p => [p.id, typeof p.status])).toEqual([["okta", "undefined"], ["google", "function"]]);
 });
 
+// #1555: oidc has a status check exactly when the server has Keycloak's directory pair.
+test("defaultProviders gives oidc a status check only with Keycloak's directory configuration", () => {
+  const oidc = { issuer: "https://sso.example.com/realms/eng", clientId: "grayboard", allowedDomains: ["example.com"], label: "SSO" };
+  expect(defaultProviders({ ...base, idps: ["oidc"], oidc } as Config)[0]!.status).toBeUndefined();
+  const keycloakDirectory = { baseUrl: "https://sso.example.com", realm: "eng", clientId: "c", clientSecret: "s" };
+  const providers = defaultProviders({ ...base, idps: ["oidc", "okta"], oidc, keycloakDirectory } as Config);
+  expect(providers.map(p => [p.id, p.issuer, typeof p.status])).toEqual([["oidc", oidc.issuer, "function"], ["okta", OKTA_ISSUER, "undefined"]]);
+});
+
 test("defaultProviders builds Okta from Config in the listed order, fetching nothing until first use, with its own client", async () => {
   const fetched: string[] = [];
   let tokenAuthorization: string | null = null;
