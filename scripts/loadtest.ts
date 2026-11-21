@@ -35,7 +35,7 @@
 // svc_reply, peer_list); every invocation must come back as a reply its invoker read. At --read-share a user's op reads
 // the service's board through R5's other canSee sites (#1511), in turn: board_list, board_read (a thread of its own
 // answered invocations), the snapshot (resources/read) and the catalog (resources/list, also read by every session as
-// it connects, timed as catalog_connect and not latency-gated, though its result counts toward the catalog's proof).
+// it connects, timed and proved as catalog_connect, its latency not gated).
 // Each is its own op, and each result must show the board (every board_read thread its invocation and reply, some
 // snapshot a post), or the run fails.
 //
@@ -61,7 +61,7 @@ import { issueOAuth } from "../tests/helpers/oauth.ts";
 import { HOSTED_CLIENT, HOSTED_SCOPES } from "../tests/support/hosted_session.ts";
 import { devLogin, ServerProcess } from "../tests/support/server.ts";
 import { startDelayProxy, type DelayProxy } from "../tests/support/delay_proxy.ts";
-import { BUCKETS, SVC_READS, type DriverConfig, type DriverFinal, type DriverSession, type DriverWindow, type Hist, type ReadProof } from "./loadtest_driver.ts";
+import { BUCKETS, PROOF_OPS, SVC_READS, type DriverConfig, type DriverFinal, type DriverSession, type DriverWindow, type Hist, type ReadProof } from "./loadtest_driver.ts";
 
 const ROOT = resolve(import.meta.dir, "..");
 
@@ -677,12 +677,14 @@ async function main() {
     }
     // Proof the reads saw the service's board (#1511): every result named it, and the reads of its posts returned some (a
     // board_read's thread, every time: the invocation and its reply; a snapshot, once invocations have put posts there).
-    const svcReads: Record<string, ReadProof> = Object.fromEntries(SVC_READS.map(op => [op, drivers.reduce((a, d) => {
+    const svcReads: Record<string, ReadProof> = Object.fromEntries(PROOF_OPS.map(op => [op, drivers.reduce((a, d) => {
       const p = d.final!.svcReads[op] ?? { ok: 0, named: 0, content: 0 };
       return { ok: a.ok + p.ok, named: a.named + p.named, content: a.content + p.content };
     }, { ok: 0, named: 0, content: 0 })]));
-    for (const op of SVC_READS) {
+    for (const op of PROOF_OPS) {
       const p = svcReads[op]!;
+      // The connect-time catalog is proved only on churn's reconnects, so it may have none; any it has must show the board.
+      if (op === "catalog_connect") { if (o.serviceWorkers && p.named < p.ok) failures.push(`${p.ok - p.named} of ${p.ok} ${op} results didn't show ${SVC_BOARD}`); continue; }
       if (!wanted[op]) continue;
       if (!p.ok) failures.push(`no ${op} of ${SVC_BOARD} returned`);
       if (p.named < p.ok) failures.push(`${p.ok - p.named} of ${p.ok} ${op} results didn't show ${SVC_BOARD}`);

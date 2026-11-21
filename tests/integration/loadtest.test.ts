@@ -185,6 +185,21 @@ describe("loadtest run", () => {
       const p = svc.reads[op];
       expect({ op, ok: p.ok > 0, named: p.named, content: op === "snapshot" ? p.content > 0 : p.content }).toEqual({ op, ok: true, named: p.ok, content: op === "snapshot" ? true : p.ok });
     }
+    expect(svc.reads.catalog_connect.named).toBe(svc.reads.catalog_connect.ok);
+  }, 90_000);
+
+  test("with no invocations the reads still rotate: board_list, the snapshot and the catalog each run and see the board", async () => {
+    const r = await run(["--svc-share", "0"]);
+    expect({ code: r.code, failures: r.summary?.failures }, r.out).toEqual({ code: 0, failures: [] });
+    const svc = r.summary.service;
+    expect(svc.invocations).toBe(0);
+    for (const op of ["board_list", "snapshot", "catalog"]) {
+      expect({ op, count: r.summary.clientSteady[op]?.count > 0 }).toEqual({ op, count: true });
+      const p = svc.reads[op];
+      expect({ op, ok: p.ok > 0, named: p.named }).toEqual({ op, ok: true, named: p.ok });
+    }
+    // board_read has no answered thread to read, so it never runs.
+    expect({ steady: r.summary.clientSteady.board_read, proved: svc.reads.board_read.ok }).toEqual({ steady: undefined, proved: 0 });
   }, 90_000);
 
   test("a lease cap below the fleet fails the run and names why", async () => {

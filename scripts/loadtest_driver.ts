@@ -59,6 +59,8 @@ export type DriverFinal = {
 };
 // The service board's reads, in the order a session takes them.
 export const SVC_READS = ["board_list", "board_read", "snapshot", "catalog"] as const;
+// The proofs the driver reports: the reads, and the catalog every session reads as it connects.
+export const PROOF_OPS = [...SVC_READS, "catalog_connect"] as const;
 
 const RENEW_MS = 10_000;
 // Body marker: lt|<kind>|<sender index>|<seq>|<to: the target index, or the board>|<sent at ms>. An invocation (svc)
@@ -131,7 +133,7 @@ const recvDm = new Set<string>();
 const svcSent = new Set<string>(), svcGot = new Set<string>(), svcDone = new Set<string>();
 const svcPosts: number[] = [];
 let posts = 0, boardRecv = 0, misdelivered = 0, laneEcho = 0;
-const svcReads: Record<string, ReadProof> = Object.fromEntries(SVC_READS.map(op => [op, { ok: 0, named: 0, content: 0 }]));
+const svcReads: Record<string, ReadProof> = Object.fromEntries(PROOF_OPS.map(op => [op, { ok: 0, named: 0, content: 0 }]));
 const misdeliveredFirst: string[] = [];
 let sending = true;
 
@@ -238,8 +240,9 @@ async function openOnce(spec: DriverSession, url: string): Promise<Live> {
   l.stopWatch = () => subscription.close();
   l.loop = deliveryLoop(l);
   // A harness host lists the resources at its start: the catalog, judged per board (a service board's binding read).
-  // Timed as its own op, reported but not gated: churn reconnects land it in the steady windows.
-  if (svcBoard) await timed("catalog_connect", () => catalog(l, svcBoard!));
+  // Timed and proved as its own op, its latency reported but not gated: churn reconnects land it in the steady windows.
+  // The session's connect time includes this round trip.
+  if (svcBoard) await timed("catalog_connect", () => catalog(l, svcBoard!, "catalog_connect"));
   return l;
 }
 
@@ -257,7 +260,7 @@ const postsOf = (v: unknown): { id?: unknown; body?: unknown }[] => {
 };
 
 // The catalog (resources/list on the native role), every page; it must list the service's board.
-async function catalog(l: Live, board: string) {
+async function catalog(l: Live, board: string, op: "catalog" | "catalog_connect") {
   const counted = proving, uris: string[] = [];
   let cursor: string | undefined;
   const seen = new Set<string>();
@@ -268,7 +271,7 @@ async function catalog(l: Live, board: string) {
     if (cursor !== undefined && seen.has(cursor)) throw new Error(`catalog: cursor ${cursor} repeated`);
     if (cursor !== undefined) seen.add(cursor);
   } while (cursor);
-  proved(counted, "catalog", uris.includes(`grayboard://boards/${board}`), true);
+  proved(counted, op, uris.includes(`grayboard://boards/${board}`), true);
 }
 
 // One read of the service's board, the next of SVC_READS in this session's turn. board_read waits for a thread to read:
@@ -304,7 +307,7 @@ function svcRead(l: Live, board: string) {
       proved(counted, op, (v as { board?: { name?: unknown } } | undefined)?.board?.name === board, postsOf(v).length > 0);
     });
   } else {
-    void timed(op, () => catalog(l, board));
+    void timed(op, () => catalog(l, board, "catalog"));
   }
 }
 
