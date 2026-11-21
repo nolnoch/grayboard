@@ -851,7 +851,8 @@ test("global POST admission remains bounded across distinct authenticated users"
 // Rebuilds OAuth and hosted MCP on a fake clock and captures the 1 s timers for explicit ticks: `tick` runs every one,
 // `tickStream` only the stream timer, which createHostedMcp starts last.
 // `manual`: the 1 s timers run only when the test calls tick or tickStream, never on real time.
-async function clocked(limits?: McpLimits, streamRecheckMs?: number, manual = false) {
+// `holdSweep`: the hosted 250 ms sweep timer never runs, for an oracle that counts every Repo call in a window (#1497).
+async function clocked(limits?: McpLimits, streamRecheckMs?: number, manual = false, holdSweep = false) {
   await hosted.close(); oauth.close();
   const time = { now: Date.now() };
   oauth = createOAuthServer(store.repo, { store: { kind: "sqlite" as const, path: scratchDbPath() }, blobDir, httpPort: 0, googleClientId: "dev", googleClientSecret: "", orgDomain: "example.com", publicUrl: "https://grayboard.example.com", messageRetentionDays: 90, auditRetentionDays: 90, devAuth: true, admins: [], helloLimit: DEFAULT_HELLO_LIMIT, authFailLimit: DEFAULT_AUTH_FAIL_LIMIT, trustedProxies: DEFAULT_TRUSTED_PROXIES }, { now: () => time.now });
@@ -859,7 +860,7 @@ async function clocked(limits?: McpLimits, streamRecheckMs?: number, manual = fa
   const interval = globalThis.setInterval;
   const spy = spyOn(globalThis, "setInterval").mockImplementation(((fn: () => void, ms: number, ...args: unknown[]) => {
     if (ms === 1000) intervals.push(fn);
-    return manual && ms === 1000 ? interval(() => {}, 3_600_000) : interval(fn, ms, ...args);
+    return (manual && ms === 1000) || (holdSweep && ms === 250) ? interval(() => {}, 3_600_000) : interval(fn, ms, ...args);
   }) as typeof setInterval);
   try { hosted = createHostedMcp(application, oauth, { trustedOrigin: oauth.issuer, now: () => time.now, ...(limits ? { limits } : {}), ...(streamRecheckMs ? { streamRecheckMs } : {}) }); }
   finally { spy.mockRestore(); }
@@ -1467,8 +1468,10 @@ function repoCalls(repo: Repo): { readonly list: { method: string; tx: boolean }
 }
 // Allowlists, not lists of the methods that read a table: many Repo methods read alias_holds or hosted_sessions inside
 // their SQL (aliases.seen, claims, boards' delivery reads, the session end…), and a denylist misses the one it forgets.
-// B1b: the calls the notice may make outside a body's Tx. hosted.takeEnded takes no handle and reads no row.
-const NOTICE_OFF_TX = new Set(["hosted.takeEnded"]);
+// B1b: the calls the notice may make outside a body's Tx. hosted.takeEnded takes no handle and reads no row;
+// hosted.write is the 250 ms sweep timer's queued write, which can tick inside the window: it takes no handle, and the
+// calls its body makes are recorded on its Tx, so a read there is still judged.
+const NOTICE_OFF_TX = new Set(["hosted.takeEnded", "hosted.write"]);
 // #899: the methods quiet ticks may call, on either backend: board visibility and the auth cache's refills, none of
 // which reads hosted_sessions or alias_holds (pg/boards.ts get, pg/identity.ts principals.of, pg/oauth.ts).
 const QUIET_TICK = new Set(["boards.get", "oauth.findActiveAccess", "users.active", "principals.of"]);
@@ -1527,8 +1530,8 @@ test("#902: a native tool call authorizes under one auth-generation read and lea
 
 // #899: the stream timer re-reads a live's hosted rows only when they could have changed. A listen checked once
 // (stamped), then each way it can end, within a tick of the write or deadline that ends it.
-async function stampedListen(recheckMs = 3_600_000, manual = false) {
-  const { time, tick, tickStream } = await clocked(undefined, recheckMs, manual);
+async function stampedListen(recheckMs = 3_600_000, manual = false, holdSweep = false) {
+  const { time, tick, tickStream } = await clocked(undefined, recheckMs, manual, holdSweep);
   const grant = await issueOAuth(store.repo, oauth.resource, "alice@example.com", ["grayboard:tools"], time.now, OPENCODE_CLIENT);
   token = grant.token;
   const client = await connect();
@@ -2014,7 +2017,7 @@ test("#807 P3 A7d: a legacy session a POST re-authorizes while the sweep's reads
 // The oracle (#1497): every Repo method the quiet ticks call must be in QUIET_TICK, so none reads a hosted row or an
 // alias hold, and none writes.
 test("#899: a quiet tick reads no hosted row or alias hold for a stamped listen or legacy GET", async () => {
-  const f = await stampedListen();
+  const f = await stampedListen(3_600_000, false, true); // the sweep timer held: its ticks read hosted rows
   const legacy = await connect("2025-11-25");
   expect(await legacy.subscribeResource({ uri: "grayboard://boards/stamped" })).toEqual({});
   await untilHosted(() => hosted.activeGetStreams === 1);
