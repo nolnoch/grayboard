@@ -30,6 +30,9 @@
 // a realistic database round trip, run as `--sessions 300 --period 6 --pg … --pg-latency 0.25` at W = 8. Every check
 // above stays, except that each "≥ 99% at ≤ 100 ms" (per window, per tool, all tools pooled, each client op) becomes
 // p99 ≤ 1 s on the same histogram (≥ 99% at or under the 1 s bucket edge), and the steady world stop must be ≤ 70%. The
+// lapsed-leases item also fails on any lease the drivers saw lapse outside churn and close (a lease op answering
+// LeaseUnavailable), which the per-window lease gauge misses when a lease lapses and is replaced within a window; the
+// count is in summary.json (lapsedLeases) under either bar. The
 // run prints `PILOT GATE: PASS|FAIL` with a line per item (connect, lost DMs, lapsed leases, tool p99, world stop, the
 // other checks) above the FAIL list; summary.json carries it as `pilot`.
 //
@@ -581,6 +584,10 @@ export function judge(input: JudgeInput) {
   const lost = [...sent].filter(id => !recv.has(id));
   if (!sent.size) fail("no DM was sent", "dms");
   if (lost.length) fail(`${lost.length} of ${sent.size} DMs never reached their recipient (e.g. ${lost.slice(0, 5).join(", ")})`, "dms");
+  // Leases lost outside churn and close, as the drivers saw them (#1537): exact where the per-window lease gauge misses a
+  // lease that lapses and is replaced within a window. Gated only under the pilot bar, so the latency bar's list is unchanged.
+  const lapsed = finals.reduce((a, f) => a + (f.lapsed ?? 0), 0), lapsedFirst = finals.flatMap(f => f.lapsedFirst ?? []).slice(0, 5);
+  if (pilot && lapsed) fail(`${lapsed} delivery leases lapsed outside churn and close (e.g. ${lapsedFirst.join("; ")})`, "leases");
   const misdelivered = finals.reduce((a, f) => a + f.misdelivered, 0);
   if (misdelivered) fail(`${misdelivered} deliveries reached the wrong session (e.g. ${finals.flatMap(f => f.misdeliveredFirst).slice(0, 5).join("; ")})`);
   const posts = finals.reduce((a, f) => a + f.posts, 0), boardRecv = finals.reduce((a, f) => a + f.boardRecv, 0);
@@ -631,7 +638,7 @@ export function judge(input: JudgeInput) {
     else if (queueSteady.worldStop > PILOT_WORLD_STOP) fail(`steady world stop ${(100 * queueSteady.worldStop).toFixed(1)}%; want ≤ ${(100 * PILOT_WORLD_STOP).toFixed(1)}%`, "stop");
   }
   return {
-    tagged, failures: tagged.map(f => f.text), steady, clean, toolSteady, toolPool, clientSteady, erroredAll, sent, recv, lost, misdelivered, posts, boardRecv,
+    tagged, failures: tagged.map(f => f.text), steady, clean, toolSteady, toolPool, clientSteady, erroredAll, sent, recv, lost, lapsed, lapsedFirst, misdelivered, posts, boardRecv,
     svcSent, svcGot, svcDone, svcLost, svcReads, laneEchoes, heapSlope, meanRss, steadyS, rssGrowth,
   };
 }
@@ -649,7 +656,7 @@ export function pilotBlock(o: Options, v: Verdict, connected: number, queueStead
     `PILOT GATE: ${v.failures.length ? "FAIL" : "PASS"}`,
     `  connect: ${mark("connect")} (${connected}/${o.sessions} sessions)`,
     `  lost DMs: ${mark("dms")} (${v.lost.length} of ${v.sent.size})`,
-    `  lapsed leases: ${mark("leases")} (${failed("leases")} steady windows short of ${o.sessions} leases or listens)`,
+    `  lapsed leases: ${mark("leases")} (${v.lapsed} lapsed outside churn and close; ${v.tagged.filter(f => f.item === "leases" && f.text.startsWith("t=")).length} steady windows short of ${o.sessions} leases or listens)`,
     `  tool p99 ${GATE_EDGE.pilot.label}: ${mark("p99")} (server tools p99 ${ms(p99)} ms over ${toolSteadyHist?.count ?? 0} steady calls; ${failed("p99")} checks over)`,
     `  world stop ≤ ${(100 * PILOT_WORLD_STOP).toFixed(0)}%: ${mark("stop")} (${queueSteady ? `${(100 * queueSteady.worldStop).toFixed(1)}%` : "unmeasured"})`,
     `  other checks: ${others ? `FAIL (${others}, below)` : "PASS"}`,
@@ -890,7 +897,7 @@ async function main() {
       toolSteady: Object.fromEntries(Object.entries(toolSteady).map(([t, x]) => [t, { count: x.count, fastShare: x.fast / x.count }])),
       toolSteadyAll: toolPool.count ? { count: toolPool.count, fastShare: toolPool.fast / toolPool.count } : null,
       clientSteady: Object.fromEntries(Object.entries(clientSteady).map(([op, h]) => [op, { count: h.count, fastShare: fastShare(h), p99Le: p99Edge(h), mean: h.sum / Math.max(1, h.count), errors: h.errors }])),
-      dms: { sent: sent.size, received: recv.size, lost: lost.length }, misdelivered, posts, boardDeliveries: boardRecv,
+      dms: { sent: sent.size, received: recv.size, lost: lost.length }, lapsedLeases: { count: v.lapsed, first: v.lapsedFirst }, misdelivered, posts, boardDeliveries: boardRecv,
       service: o.serviceWorkers ? { name: SERVICE, board: SVC_BOARD, workers: o.serviceWorkers, teams: o.teams, invocations: svcSent.size, reachedLane: svcGot.size, replied: svcDone.size, lost: svcLost.length, laneEchoes, teamAllowed: audit!.teamAllowed.size, rules: audit!.rules, boardScope: audit!.boardScope, reads: svcReads } : null,
       rss: { meanMB: meanRss / 2 ** 20, growthMB: rssGrowth / 2 ** 20, gated: o.rssGate }, heapGrowthMB: heapSlope * steadyS / 2 ** 20,
       lag: { windows: lagP99.length, p99Max: Math.max(0, ...lagP99), p99Median: lagP99.sort((a, b) => a - b)[Math.floor(lagP99.length / 2)] ?? null },

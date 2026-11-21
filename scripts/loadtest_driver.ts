@@ -20,6 +20,7 @@
 import { monitorEventLoopDelay } from "node:perf_hooks";
 import { HostedSession, HostedToolError } from "../tests/support/hosted_session.ts";
 import { errorClass } from "./loadtest_errors.ts";
+import { LeaseUnavailable } from "../adapters/hosted-core/src/wire.ts";
 
 // service: one of the service's workers (its run token, its queue board as `board`), which sends no scheduled traffic.
 export type DriverSession = { index: number; email: string; token: string; name: string; address: string; board: string; service?: true };
@@ -56,6 +57,9 @@ export type DriverWindow = {
 export type ReadProof = { ok: number; named: number; content: number };
 export type DriverFinal = {
   type: "final"; driver: number; sentDm: string[]; recvDm: string[]; posts: number; boardRecv: number; misdelivered: number; misdeliveredFirst: string[];
+  // Leases lost outside churn and close (#1537): each session whose inbox read, renew or receipt answered that its lease
+  // is gone (LeaseUnavailable: the server's "no live delivery lease" not_found, or unbound), and the first few by session.
+  lapsed: number; lapsedFirst: string[];
   svcSent: string[]; svcGot: string[]; svcDone: string[]; svcPosts: number[]; laneEcho: number; svcReads: Record<string, ReadProof>; errors: Record<string, number>;
 };
 // The service board's reads, in the order a session takes them.
@@ -103,6 +107,25 @@ async function timed<T>(op: string, fn: () => Promise<T>): Promise<T | undefined
   } finally { inflight--; }
 }
 
+// A lease operation (the inbox read, renew, receipt), timed as any op, that also notes a lapse: the server closed the
+// session's lease without the driver releasing it (expired, or changed under it). Close releases only after the loop and
+// its last drain have finished, so no deliberate close reaches here.
+export function leaseOp<T>(l: { spec: { index: number; name: string }; lapsed?: boolean }, op: string, fn: () => Promise<T>): Promise<T | undefined> {
+  return timed(op, async () => {
+    try { return await fn(); }
+    catch (e) {
+      if (e instanceof LeaseUnavailable && !l.lapsed) {
+        l.lapsed = true; lapsed++;
+        if (lapsedFirst.length < 5) lapsedFirst.push(`session ${l.spec.index} (${l.spec.name}) at ${op}: ${e.code}`);
+      }
+      throw e;
+    }
+  });
+}
+
+// The lapses noted so far (the final report's).
+export const lapses = () => ({ lapsed, lapsedFirst: [...lapsedFirst] });
+
 type Live = {
   spec: DriverSession;
   s: HostedSession;
@@ -118,6 +141,8 @@ type Live = {
   reads: number;
   invoked: Map<number, number>;
   doneThread?: number;
+  // Its lease answered LeaseUnavailable: counted once, since the driver never reopens a lease (a churned session is a new Live).
+  lapsed?: boolean;
   // A board_read whose turn came before the session had a thread to read: it runs once one exists.
   owedRead?: boolean;
 };
@@ -129,6 +154,8 @@ const svcPosts: number[] = [];
 let posts = 0, boardRecv = 0, misdelivered = 0, laneEcho = 0;
 const svcReads: Record<string, ReadProof> = Object.fromEntries(PROOF_OPS.map(op => [op, { ok: 0, named: 0, content: 0 }]));
 const misdeliveredFirst: string[] = [];
+let lapsed = 0;
+const lapsedFirst: string[] = [];
 let sending = true;
 
 let svcBoard: string | null = null;
@@ -147,7 +174,7 @@ function postIdOf(event: unknown): number | undefined {
 // One inbox pass, as the controller makes it: read, then per item a renew and its receipt. A lane answers an
 // invocation before its receipt, as a worker finishes the job before it acks the delivery.
 async function drain(l: Live) {
-  const read = await timed("inbox", () => l.s.subscriber.read("grayboard://inbox"));
+  const read = await leaseOp(l, "inbox", () => l.s.subscriber.read("grayboard://inbox"));
   // A failed read leaves the items on the server: try again shortly rather than at the next renewal.
   if (read === undefined) { await Bun.sleep(250); l.dirty = true; return; }
   const items = itemsOf(read);
@@ -182,9 +209,9 @@ async function drain(l: Live) {
         observe("post_e2e", (Date.now() - Number(m[5])) / 1000, false);
       }
     }
-    await timed("renew", () => l.s.subscriber.call("delivery_renew"));
+    await leaseOp(l, "renew", () => l.s.subscriber.call("delivery_renew"));
     let receipted = false;
-    await timed("receipt", async () => { await l.s.receipt([item.id]); receipted = true; });
+    await leaseOp(l, "receipt", async () => { await l.s.receipt([item.id]); receipted = true; });
     if (receipted && answered !== undefined) l.doneThread = answered;
   }
   if (items.length === 100) l.dirty = true;
@@ -196,7 +223,7 @@ async function deliveryLoop(l: Live) {
   while (!l.stop) {
     if (l.dirty) { l.dirty = false; await drain(l); }
     if (Date.now() >= renewal) {
-      await timed("renew", () => l.s.subscriber.call("delivery_renew"));
+      await leaseOp(l, "renew", () => l.s.subscriber.call("delivery_renew"));
       renewal = Date.now() + RENEW_MS; l.dirty = true;
     }
     if (l.dirty || l.stop) continue;
@@ -437,7 +464,7 @@ async function main() {
       await Promise.all([...live.values()].map(l => timed("close", () => close(l))));
       live.clear();
       const f: DriverFinal = {
-        type: "final", driver: config.driver, sentDm: [...sentDm], recvDm: [...recvDm], posts, boardRecv, misdelivered, misdeliveredFirst,
+        type: "final", driver: config.driver, sentDm: [...sentDm], recvDm: [...recvDm], posts, boardRecv, misdelivered, misdeliveredFirst, lapsed, lapsedFirst,
         svcSent: [...svcSent], svcGot: [...svcGot], svcDone: [...svcDone], svcPosts, laneEcho, svcReads, errors: totalErrors,
       };
       // The final line holds every DM id: tens of KB a pipe takes in several writes. process.exit
