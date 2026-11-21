@@ -315,8 +315,9 @@ test("a startup write that fails rejects ready, and the server stops and serves 
     app = startServer(config, { hostname, background: false }); await app.ready;
     await app.stop(); app = undefined;
     const db = new Database(config.store.path);
-    db.run("CREATE TRIGGER fail_state_insert BEFORE INSERT ON server_state BEGIN SELECT RAISE(ABORT, 'startup write refused'); END");
-    db.run("CREATE TRIGGER fail_state_update BEFORE UPDATE ON server_state BEGIN SELECT RAISE(ABORT, 'startup write refused'); END");
+    // Not the open's own child-roots watermark (#540, db.ts recordChildRoots): failing that fails the open itself.
+    db.run("CREATE TRIGGER fail_state_insert BEFORE INSERT ON server_state WHEN NEW.key <> 'child_roots_audit_id' BEGIN SELECT RAISE(ABORT, 'startup write refused'); END");
+    db.run("CREATE TRIGGER fail_state_update BEFORE UPDATE ON server_state WHEN NEW.key <> 'child_roots_audit_id' BEGIN SELECT RAISE(ABORT, 'startup write refused'); END");
     db.close();
 
     app = startServer(config, { hostname, background: false });

@@ -322,6 +322,11 @@ export function initCoreSchema(db: Database): void {
   // for every other post (a system post written as a human's handle among them); null for posts from before it, which
   // fall back to whether the author is the declared human at delivery (postHuman). Never shown on reads (POST_COLS).
   if (!postCols.some((c) => c.name === "human")) db.exec(`ALTER TABLE posts ADD COLUMN human INTEGER`);
+  // The root of the session that wrote it (#540), judged when it's written: author_id's ids.root_id, or author_id
+  // itself for a root's post; null with no author_id and for posts from before it, which fall back to the author's
+  // root as it is now. NOT_OWN reads it, so a raw ID's later change of role (a former child starting as a root clears
+  // its root_id; a root registered as a child gains one) never moves its earlier posts. Never shown on reads.
+  if (!postCols.some((c) => c.name === "author_root")) db.exec(`ALTER TABLE posts ADD COLUMN author_root TEXT`);
 
   // The principal an upload counts against (#284 decision 13): a server
   // user's email, null in local mode. Backfilled from the uploader's "email/"

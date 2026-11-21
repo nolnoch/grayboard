@@ -34,6 +34,11 @@ export type BoardsHarness = {
   alias(address: string, o?: { human?: boolean; queueOff?: boolean; lastSeen?: number }): Promise<void>;
   session(id: string, principal: string | null, o?: { viewer?: boolean; endedAt?: number; rootId?: string; status?: string }): Promise<void>;
   hold(address: string, id: string, boundAt: number): Promise<void>;
+  // A session's ids.root_id set or cleared after its rows were written (hostedRoot's write: a former child's ID that
+  // starts as a root clears it; a root with no holds registered as a child sets it).
+  setRoot(id: string, root: string | null): Promise<void>;
+  // A post's author_root cleared (#540), as a row written before the column has it.
+  legacyPost(id: number): Promise<void>;
   claim(c: { key: string; holder: string; board: string | null; at: number }): Promise<void>;
   // session: claim_events.session_id (#1351), the session that took it; absent, a row from before the column (null).
   claimEvent(e: { key: string; handle: string; event: string; board: string | null; at: number; session?: string }): Promise<void>;
@@ -637,6 +642,45 @@ function reads(it: It): void {
     expect((await b.views(h.read, [BE], "hall")).map(v => [v.row.posts, v.row.unread])).toEqual([[3, 1]]);
     const got = await h.write(tx => b.read(tx, "hall", BE, {}));
     expect([got.posts.map(p => p.id), got.unread_remaining]).toEqual([[theirs], 0]);
+  });
+
+  // #540: whose post it is was settled when it was written. A child's ID that later starts as a root (hostedRoot clears
+  // its root_id) keeps its child posts its old root's own, and its posts as a root are its own, not the old root's. A
+  // root later registered as a child (root_id set) keeps its earlier posts out of its new root's own.
+  it("views and read judge a post's ownership by its author's root when written, not as it is now", async h => {
+    const b = h.boards;
+    await h.session(S1, ME);
+    await h.session(CHILD, ME, { rootId: S1 });
+    await h.session(S2, ME);
+    await h.hold(BE, S1, T0);
+    await board(h, "hall");
+    await sub(h, BE, "hall", "digest");
+    await write(h, np("hall", `${ME}/kid`, "as S1's child", T0, { authorId: CHILD, via: CHILD }));
+    const before = await write(h, np("hall", OPS, "S2 as a root", T0 + 1, { authorId: S2 }));
+    await h.setRoot(CHILD, null);
+    await h.setRoot(S2, S1);
+    const after = await write(h, np("hall", `${ME}/kid`, "CHILD as a root", T0 + 2, { authorId: CHILD }));
+    const child = await write(h, np("hall", OPS, "S2 as S1's child", T0 + 3, { authorId: S2, via: S2 }));
+    expect((await b.views(h.read, [BE], "hall")).map(v => [v.row.posts, v.row.unread])).toEqual([[4, 2]]);
+    const got = await h.write(tx => b.read(tx, "hall", BE, {}));
+    expect([got.posts.map(p => p.id), got.unread_remaining]).toEqual([[before, after], 0]);
+    expect(child).toBeGreaterThan(after);
+  });
+
+  // #540: a row from before author_root falls back to its author's root as it is now.
+  it("views and read judge a pre-author_root post's ownership by its author's root as it is now", async h => {
+    const b = h.boards;
+    await h.session(S1, ME);
+    await h.session(CHILD, ME, { rootId: S1 });
+    await h.hold(BE, S1, T0);
+    await board(h, "hall");
+    await sub(h, BE, "hall", "digest");
+    const old = await write(h, np("hall", `${ME}/kid`, "as S1's child", T0, { authorId: CHILD, via: CHILD }));
+    await h.legacyPost(old);
+    expect((await b.views(h.read, [BE], "hall")).map(v => [v.row.posts, v.row.unread])).toEqual([[1, 0]]);
+    await h.setRoot(CHILD, null);
+    expect((await b.views(h.read, [BE], "hall")).map(v => [v.row.posts, v.row.unread])).toEqual([[1, 1]]);
+    expect((await h.write(tx => b.read(tx, "hall", BE, {}))).posts.map(p => p.id)).toEqual([old]);
   });
 
   it("openSummaries: every open board by name, its post count, no mode, nothing unread", async h => {

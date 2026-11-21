@@ -30,6 +30,8 @@ export const sqliteBoardsBackend: BoardsBackend = {
       session: (id, principal, o = {}) => run("INSERT INTO ids (id, principal, started_at, last_seen, ended_at, viewer, root_id, status, status_at) VALUES (?, ?, 0, 0, ?, ?, ?, ?, ?)",
         [id, principal, o.endedAt ?? null, o.viewer ? 1 : 0, o.rootId ?? null, o.status ?? null, o.status === undefined ? null : 1]),
       hold: (address, id, boundAt) => run("INSERT INTO alias_holds (address, id, bound_at) VALUES (?, ?, ?)", [address, id, boundAt]),
+      setRoot: (id, root) => run("UPDATE ids SET root_id = ? WHERE id = ?", [root, id]),
+      legacyPost: id => run("UPDATE posts SET author_root = NULL WHERE id = ?", [id]),
       claim: c => run("INSERT INTO claims (key, holder, note, board, acquired_at, expires_at, holder_user) VALUES (?, ?, 'held', ?, ?, ?, NULL)",
         [c.key, c.holder, c.board, c.at, c.at + 60_000]),
       claimEvent: e => run("INSERT INTO claim_events (key, handle, event, board, at, session_id) VALUES (?, ?, ?, ?, ?, ?)",
