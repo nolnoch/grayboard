@@ -1,14 +1,17 @@
 // Verified TLS to Postgres (#1525). The deploy verifies the database's certificate through the URL alone
-// (`?sslmode=verify-full&sslrootcert=<CA bundle>`): openPg passes the URL to Bun.SQL untouched, and Bun.SQL reads both
-// parameters. Nothing in this repo parses them, so this file pins the driver's behavior against a Bun upgrade that drops
-// it. No Postgres needed: a fake endpoint answers the SSLRequest with 'S' and runs the server side of the handshake, so
-// "the handshake completed" is the accept signal and a client-side certificate error is the refuse signal.
+// (`?sslmode=verify-full&sslrootcert=<CA bundle>`): the store's two Bun.SQL sites, openPg (sql.ts) and openPgListener
+// (auth_generation.ts), hand the URL over untouched, and Bun.SQL reads both parameters. Nothing in this repo parses them,
+// so this file pins the driver's behavior against a Bun upgrade that drops it. No Postgres needed: a fake endpoint
+// answers the SSLRequest with 'S' and runs the server side of the handshake, so "the handshake completed" is the accept
+// signal and a client-side certificate error is the refuse signal. A second fake answers 'N', the downgrade an attacker
+// on the path would try.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import net from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import tls from "node:tls";
+import { openPgListener } from "./auth_generation.ts";
 import { waitForPg } from "./connect.ts";
 import { openPg } from "./sql.ts";
 
@@ -40,17 +43,10 @@ function errorResponse(sqlstate: string, message: string): Buffer {
   return Buffer.concat([head, body]);
 }
 
-let server: net.Server;
 const sockets = new Set<net.Socket>();
-let port = 0;
-// Server-side handshakes completed, per connection attempt.
-let handshakes = 0;
-
-beforeAll(async () => {
-  makeCerts();
-  const key = await Bun.file(join(dir, "server.key")).text();
-  const cert = await Bun.file(join(dir, "server.crt")).text();
-  server = net.createServer(sock => {
+// A fake whose `onRequest` runs once the 8-byte SSLRequest has arrived; anything else first is dropped.
+async function fake(onRequest: (sock: net.Socket) => void): Promise<{ server: net.Server; port: number }> {
+  const server = net.createServer(sock => {
     sockets.add(sock);
     sock.on("close", () => sockets.delete(sock));
     sock.on("error", () => {});
@@ -60,43 +56,63 @@ beforeAll(async () => {
       if (buf.length < 8) return;
       sock.off("data", onData);
       if (buf.readInt32BE(4) !== SSL_REQUEST) { sock.destroy(); return; }
-      sock.write("S");
-      const secure = new tls.TLSSocket(sock, { isServer: true, key, cert });
-      secure.on("error", () => {});
-      // Past the handshake, refuse the login with a protocol ErrorResponse so the client fails at once; a bare close
-      // would leave it waiting out its connection timeout.
-      secure.on("secure", () => { handshakes++; secure.end(errorResponse("28000", "tls test: handshake accepted")); });
+      onRequest(sock);
     };
     sock.on("data", onData);
   });
   await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
-  port = (server.address() as net.AddressInfo).port;
+  return { server, port: (server.address() as net.AddressInfo).port };
+}
+
+let tlsFake: { server: net.Server; port: number };
+let plainFake: { server: net.Server; port: number };
+// Server-side handshakes completed on the TLS fake, and bytes the 'N' fake received after its 'N'.
+let handshakes = 0;
+let bytesAfterN = 0;
+
+beforeAll(async () => {
+  makeCerts();
+  const key = await Bun.file(join(dir, "server.key")).text();
+  const cert = await Bun.file(join(dir, "server.crt")).text();
+  tlsFake = await fake(sock => {
+    sock.write("S");
+    const secure = new tls.TLSSocket(sock, { isServer: true, key, cert });
+    secure.on("error", () => {});
+    // Past the handshake, refuse the login with a protocol ErrorResponse so the client fails at once; a bare close
+    // would leave it waiting out its connection timeout.
+    secure.on("secure", () => { handshakes++; secure.end(errorResponse("28000", "tls test: handshake accepted")); });
+  });
+  plainFake = await fake(sock => {
+    sock.on("data", (chunk: Buffer) => { bytesAfterN += chunk.length; });
+    sock.write("N");
+  });
 });
 
 afterAll(async () => {
   // A refused handshake leaves its socket to the client, so close() alone would wait on them.
   for (const s of sockets) s.destroy();
-  await new Promise<void>(resolve => server.close(() => resolve()));
+  for (const f of [tlsFake, plainFake]) await new Promise<void>(resolve => f.server.close(() => resolve()));
   rmSync(dir, { recursive: true, force: true });
 });
 
 const ACCEPTED = { handshake: true, code: "ERR_POSTGRES_SERVER_ERROR" };
-const url = (host: string, query: string) => `postgres://u:p@${host}:${port}/d?${query}`;
+const url = (host: string, query: string, port = tlsFake.port) => `postgres://u:p@${host}:${port}/d?${query}`;
 const verifyFull = (host: string, ca: string) => url(host, `sslmode=verify-full&sslrootcert=${join(dir, ca)}`);
+const codeOf = (e: unknown) => String((e as { code?: unknown }).code ?? "");
 
-// One connection attempt through openPg, with startup params as the transaction store sets them (store/pg/tx.ts).
-// Resolves to whether the server's handshake completed and the client's error code. The fake refuses every login, so an
-// accepted connection ends in the server error it read over TLS (ACCEPTED), a refused one in a certificate error.
-async function attempt(u: string): Promise<{ handshake: boolean; code: string }> {
+// One connection attempt through openPg, with startup params as the transaction store sets them (store/pg/tx.ts), or
+// through the auth generation's listener. Resolves to whether the TLS fake's handshake completed and the client's error
+// code. The fake refuses every login, so an accepted connection ends in the server error it read over TLS (ACCEPTED), a
+// refused one in a certificate error.
+async function attempt(u: string, via: "pool" | "listener" = "pool"): Promise<{ handshake: boolean; code: string }> {
   const before = handshakes;
-  const sql = openPg(u, { max: 1, connectionTimeout: 5, applicationName: "tls-test", connection: { lock_timeout: 1000 } });
   let code = "";
-  try {
-    await sql`select 1`;
-  } catch (e) {
-    code = String((e as { code?: unknown }).code ?? "");
-  } finally {
-    await sql.close().catch(() => {});
+  if (via === "pool") {
+    const sql = openPg(u, { max: 1, connectionTimeout: 5, applicationName: "tls-test", connection: { lock_timeout: 1000 } });
+    try { await sql`select 1`; } catch (e) { code = codeOf(e); } finally { await sql.close().catch(() => {}); }
+  } else {
+    const l = openPgListener(u, "tls-test")(() => {});
+    try { await l.listen("tls_test", () => {}); } catch (e) { code = codeOf(e); } finally { await l.close().catch(() => {}); }
   }
   return { handshake: handshakes > before, code };
 }
@@ -120,18 +136,32 @@ describe("Postgres TLS through the URL (#1525)", () => {
   });
 
   test("verify-full refuses a missing CA file", async () => {
-    const r = await attempt(verifyFull("localhost", "missing.pem"));
-    expect(r.handshake).toBe(false);
-    expect(r.code).toBe("ERR_INVALID_ARG_TYPE");
+    expect(await attempt(verifyFull("localhost", "missing.pem"))).toEqual({ handshake: false, code: "ERR_INVALID_ARG_TYPE" });
   });
 
   test("verify-full with no CA file refuses a certificate outside the system store", async () => {
     expect(await attempt(url("localhost", "sslmode=verify-full"))).toEqual({ handshake: false, code: "UNABLE_TO_VERIFY_LEAF_SIGNATURE" });
   });
 
-  // The docs warn that require doesn't verify: this is that claim.
+  // The docs warn that require without a CA file doesn't verify: this is that claim.
   test("require with no CA file encrypts without verifying", async () => {
     expect(await attempt(url("localhost", "sslmode=require"))).toEqual(ACCEPTED);
+  });
+
+  test("the auth generation's listener verifies the same way", async () => {
+    expect(await attempt(verifyFull("localhost", "ca-right.pem"), "listener")).toEqual(ACCEPTED);
+    expect(await attempt(verifyFull("localhost", "ca-wrong.pem"), "listener")).toEqual({ handshake: false, code: "UNABLE_TO_VERIFY_LEAF_SIGNATURE" });
+    expect(await attempt(verifyFull("127.0.0.1", "ca-right.pem"), "listener")).toEqual({ handshake: false, code: "ERR_TLS_CERT_ALTNAME_INVALID" });
+  });
+
+  // A server (or anything on the path) that declines TLS must not get a plaintext startup, which would carry the user
+  // name and open a cleartext password exchange.
+  test("verify-full and require refuse a server that declines TLS, sending nothing after", async () => {
+    for (const q of [`sslmode=verify-full&sslrootcert=${join(dir, "ca-right.pem")}`, "sslmode=require"]) {
+      bytesAfterN = 0;
+      expect(await attempt(url("localhost", q, plainFake.port))).toEqual({ handshake: false, code: "ERR_POSTGRES_TLS_NOT_AVAILABLE" });
+      expect(bytesAfterN).toBe(0);
+    }
   });
 
   test("a certificate refusal fails the startup wait at once instead of retrying", async () => {
