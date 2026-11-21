@@ -19,6 +19,7 @@
 // blamed on the server.
 import { monitorEventLoopDelay } from "node:perf_hooks";
 import { HostedSession, HostedToolError } from "../tests/support/hosted_session.ts";
+import { errorClass } from "./loadtest_errors.ts";
 
 // service: one of the service's workers (its run token, its queue board as `board`), which sends no scheduled traffic.
 export type DriverSession = { index: number; email: string; token: string; name: string; address: string; board: string; service?: true };
@@ -80,15 +81,8 @@ function observe(op: string, seconds: number, failed: boolean) {
   h.count++; h.sum += seconds; if (failed) h.errors++;
 }
 
-function errorCode(e: unknown): string {
-  if (e instanceof HostedToolError) return `${e.tool}:${e.code ?? "refused"}`;
-  const m = e instanceof Error ? e.message : String(e);
-  const status = /\b(4\d\d|5\d\d)\b/.exec(m)?.[1];
-  return status ? `http_${status}` : (e instanceof Error ? e.name : "error");
-}
-
 function noteError(op: string, e: unknown) {
-  const code = `${op}/${errorCode(e)}`;
+  const code = `${op}/${errorClass(e)}`;
   errors[code] = (errors[code] ?? 0) + 1;
   totalErrors[code] = (totalErrors[code] ?? 0) + 1;
   if (firstErrors.length < 5) firstErrors.push(`${code}: ${e instanceof Error ? e.message : String(e)}`.slice(0, 400));
@@ -366,7 +360,9 @@ async function main() {
     const opened = await Promise.all(wave.map(spec => timed("connect", () => open(spec, config.url))));
     for (const l of opened) if (l) live.set(l.spec.index, l);
   }
-  emit({ type: "ready", driver: config.driver, live: live.size, want: config.sessions.length });
+  // The connect phase's failures by class (#1532), so the coordinator can say why a session didn't connect.
+  const connectErrors = Object.fromEntries(Object.entries(totalErrors).filter(([k]) => k.startsWith("connect/")));
+  emit({ type: "ready", driver: config.driver, live: live.size, want: config.sessions.length, connectErrors });
 
   // Agent traffic on a wall-clock schedule: an op fires when due, whether or not the last returned.
   const start = Date.now();

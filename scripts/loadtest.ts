@@ -301,18 +301,23 @@ export function slope(points: [number, number][]): number {
 
 // What N forces, at a quarter's headroom: sessions, leases and listens are one per session; a
 // session's POSTs overlap its listen and each other (a renew, a read and an agent call at once:
-// at twice sessions per user the default cadence drew rate_limited). The per-user caps follow
-// sessions per user. Never below a shipped default, and a per-user cap never above its global
-// (the server refuses to start on that).
+// at twice sessions per user the default cadence drew rate_limited), so the POST caps, global and
+// per user, allow four per session. A listen holds its POST slot for the stream's life, and a
+// connect POSTs from both wires at once: a global POST cap of one per session refused the burst's
+// discovers with a plain 429, which the SDK reports as a version negotiation failure and nothing
+// retries (#1532: 52 of 300 sessions never connected). The per-user caps follow sessions per user.
+// Never below a shipped default, and a per-user cap never above its global (the server refuses to
+// start on that).
+export const POSTS_PER_SESSION = 4;
 export function capsEnv(o: Options): Record<string, string> {
   const n = Math.ceil(o.sessions * 1.25), perUser = Math.ceil(Math.ceil(userSessions(o) / o.users) * 1.25);
-  const pair = (prefix: string, d: { global: number; perUser: number }, scoped = perUser) => {
-    const global = Math.max(n, d.global);
+  const pair = (prefix: string, d: { global: number; perUser: number }, scoped = perUser, wanted = n) => {
+    const global = Math.max(wanted, d.global);
     return { [`${prefix}_GLOBAL`]: String(global), [`${prefix}_PER_USER`]: String(Math.min(global, Math.max(scoped, d.perUser))) };
   };
   return {
     ...pair("GRAYBOARD_HOSTED_SESSIONS", DEFAULT_HOSTED_CAPS.sessions), ...pair("GRAYBOARD_DELIVERY_LEASES", DEFAULT_HOSTED_CAPS.leases),
-    ...pair("GRAYBOARD_MCP_LISTEN", DEFAULT_MCP_LIMITS.listen), ...pair("GRAYBOARD_MCP_POST", DEFAULT_MCP_LIMITS.post, perUser * 4),
+    ...pair("GRAYBOARD_MCP_LISTEN", DEFAULT_MCP_LIMITS.listen), ...pair("GRAYBOARD_MCP_POST", DEFAULT_MCP_LIMITS.post, perUser * POSTS_PER_SESSION, n * POSTS_PER_SESSION),
     // The service's workers: one lease each, under its own per-service cap (its buckets' defaults are far above them).
     ...(Math.ceil(o.serviceWorkers * 1.25) > DEFAULT_HOSTED_CAPS.leases.perService! ? { GRAYBOARD_DELIVERY_LEASES_PER_SERVICE: String(Math.min(Math.max(n, DEFAULT_HOSTED_CAPS.leases.global), Math.ceil(o.serviceWorkers * 1.25))) } : {}),
     // Board watches: one per session at most here; the per-session default stands.
@@ -439,7 +444,7 @@ async function main() {
   const env = { ...caps, ...o.env, GRAYBOARD_METRICS_ADDR: "127.0.0.1:0", GRAYBOARD_ADMINS: ADMIN, HOME: join(scratch, "home") };
   mkdirSync(env.HOME, { recursive: true });
   log(`server env: ${Object.entries(env).filter(([k]) => k !== "HOME").map(([k, v]) => `${k}=${v}`).join(" ")} (about ${perUserRate(o).tools.toFixed(1)} tool and ${perUserRate(o).subscriber.toFixed(1)} delivery requests/s per user)`);
-  type Driver = { proc: ReturnType<typeof Bun.spawn>; windows: DriverWindow[]; ready?: { live: number; want: number }; final?: DriverFinal; churned: number; quiesced: boolean; read: Promise<void> };
+  type Driver = { proc: ReturnType<typeof Bun.spawn>; windows: DriverWindow[]; ready?: { live: number; want: number; connectErrors?: Record<string, number> }; final?: DriverFinal; churned: number; quiesced: boolean; read: Promise<void> };
   const drivers: Driver[] = [];
   const failures: string[] = [];
   const windows: Window[] = [];
@@ -550,7 +555,10 @@ async function main() {
     await waitAll("connect", d => d.ready !== undefined, Math.max(120_000, o.sessions * 200));
     const connected = drivers.reduce((a, d) => a + d.ready!.live, 0);
     log(`connected ${connected}/${o.sessions} in ${((Date.now() - t0) / 1000).toFixed(1)} s`);
-    if (connected !== o.sessions) failures.push(`only ${connected} of ${o.sessions} sessions connected`);
+    const connectErrors: Record<string, number> = {};
+    for (const d of drivers) for (const [k, v] of Object.entries(d.ready!.connectErrors ?? {})) connectErrors[k] = (connectErrors[k] ?? 0) + v;
+    if (Object.keys(connectErrors).length) log(`connect failures by class: ${JSON.stringify(connectErrors)}`);
+    if (connected !== o.sessions) failures.push(`only ${connected} of ${o.sessions} sessions connected${Object.keys(connectErrors).length ? `: ${JSON.stringify(connectErrors)}` : ""}`);
 
     // The load: a scrape per window; a churn wave every churnEveryS.
     const start = Date.now(), end = start + o.durationS * 1000;
@@ -678,7 +686,11 @@ async function main() {
     const refusedAll = Object.fromEntries(Object.entries(refusalsTotal(after)).filter(([, v]) => v > 0));
     const erroredAll: Record<string, number> = {};
     for (const w of windows) for (const [k, v] of Object.entries(w.clientErrors)) erroredAll[k] = (erroredAll[k] ?? 0) + v;
-    for (const d of drivers) for (const [k, v] of Object.entries(d.final!.errors)) erroredAll[k] = Math.max(erroredAll[k] ?? 0, v);
+    // Each driver's final counts are its whole run's, connect included; the windows' sums can miss what came after the
+    // last report. Summed over drivers, not the max of one (#1532: 20 of 51 connect failures were counted that way).
+    const finalErrors: Record<string, number> = {};
+    for (const d of drivers) for (const [k, v] of Object.entries(d.final!.errors)) finalErrors[k] = (finalErrors[k] ?? 0) + v;
+    for (const [k, v] of Object.entries(finalErrors)) erroredAll[k] = Math.max(erroredAll[k] ?? 0, v);
     if (Object.keys(refusedAll).length) failures.push(`capacity refusals: ${JSON.stringify(refusedAll)}`);
     if (Object.keys(erroredAll).length) failures.push(`client errors: ${JSON.stringify(erroredAll)}`);
     // DM accounting: every DM a send call returned for reached its recipient's lease.
