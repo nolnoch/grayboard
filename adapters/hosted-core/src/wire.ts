@@ -195,7 +195,6 @@ abstract class Connection {
           if (method && connectMethods.has(method) && !response.ok && ![401, 403, 429].includes(response.status) && !gatewayStatuses.has(response.status)) {
             this.refusal = new ConnectRefused(response.status, (await response.clone().text().catch(() => "")).slice(0, 4096));
           }
-          if (response.ok) this.admissionRetryAfterMs = undefined;
           if (response.status !== 429) return response;
           const body = await response.clone().json().catch(() => undefined) as { error?: { data?: { code?: string; retry_after_ms?: number } } } | undefined;
           const data = body?.error?.data;
