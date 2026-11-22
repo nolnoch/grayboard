@@ -163,7 +163,7 @@ testSqlite("file only", () => { console.log("RAN file only"); });
       await srv.stop();
     }
     const u = new URL(db.url);
-    expect(srv.log()).toContain(`store postgres ${u.host}/${db.name}`);
+    expect(srv.log()).toContain(`store postgres ${u.host}/${db.name}, 8 writers, no TLS`);
     expect(srv.log()).not.toContain(`${u.username}:${u.password}@`);
     // The open (and its migration) failing fails the startup before anything listens.
     const missing = await ServerProcess.start(main, { url: pgUrl(`${db.name}_missing`) }).then(() => "listened", (e: Error) => e.message);

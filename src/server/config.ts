@@ -585,7 +585,7 @@ export function describeStore(store: Store, opts?: { writers: number | undefined
     const tls = opts?.tls ? `, ${opts.tls}` : "";
     return `postgres ${u.host}${u.pathname}${writers}${tls}`;
   } catch {
-    return `postgres (unparsable URL)${writers}`;
+    return `postgres (unparsable URL)${writers}${opts?.tls ? `, ${opts.tls}` : ""}`;
   }
 }
 
