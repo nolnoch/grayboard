@@ -2,7 +2,29 @@
 import { expect, test } from "bun:test";
 import { describePg, pgEmptyDatabase } from "../../../../tests/support/pg.ts";
 import type { AuditFields } from "../identity.ts";
-import { int8, int8OrNull, type AuditDetail, type JsonParam } from "./sql.ts";
+import { int8, int8OrNull, pgTlsMode, type AuditDetail, type JsonParam } from "./sql.ts";
+
+// The startup line's TLS mode reads Bun.SQL's internal sslMode (no connection is made): this pins it, so a Bun upgrade
+// that moves the field or renumbers the enum fails here rather than misreporting a deploy's TLS.
+test("pgTlsMode names the TLS mode Bun.SQL resolved, whichever parameter set it", () => {
+  // Bun.SQL reads these from the environment; a developer's shell may export one.
+  const saved = Object.fromEntries(["PGSSLMODE", "PG_SSLMODE", "TLS_DATABASE_URL", "TLS_POSTGRES_DATABASE_URL"].map(k => [k, process.env[k]]));
+  for (const k of Object.keys(saved)) delete process.env[k];
+  try {
+    const at = (q: string) => pgTlsMode(`postgres://u:p@127.0.0.1:1/db${q}`);
+    expect(at("")).toBe("no TLS");
+    expect(at("?sslmode=disable")).toBe("no TLS");
+    expect(at("?sslmode=prefer")).toBe("TLS if offered (prefer: may be plaintext)");
+    expect(at("?sslmode=require")).toBe("TLS, certificate unchecked (require)");
+    expect(at("?SSLMODE=require")).toBe("TLS, certificate unchecked (require)");
+    expect(at("?ssl=true")).toBe("TLS, certificate unchecked (require)");
+    expect(at("?tls=true")).toBe("TLS, certificate unchecked (require)");
+    expect(at("?sslmode=verify-ca")).toBe("TLS, CA checked (verify-ca)");
+    expect(at("?sslmode=verify-full&sslrootcert=/nonexistent.pem")).toBe("TLS, verified (verify-full)");
+  } finally {
+    for (const [k, v] of Object.entries(saved)) if (v !== undefined) process.env[k] = v;
+  }
+});
 
 test("int8 maps strings, numbers and bigints to a safe integer and refuses the rest", () => {
   expect(int8("1")).toBe(1);

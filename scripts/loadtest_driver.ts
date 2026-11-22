@@ -307,6 +307,24 @@ async function catalog(l: Live, board: string, op: "catalog" | "catalog_connect"
   proved(counted, op, uris.includes(`grayboard://boards/${board}`), true);
 }
 
+// The driver's op mix (#1539): smooth weighted round robin over the shares, not a random draw per op, so over any
+// window of draws each op's count stays under 2 from its share (1.4 at the test's shares, 1.52 at the full profile's).
+// A 14 s small fleet makes ~36 draws a driver, and random draws left a 0.1-share op with no sample in the clean steady
+// windows often enough to fail CI. The service's ops are in the mix only with a service board; dm_send takes the rest.
+type MixOp = "board_post" | "svc_invoke" | "peer_list" | "svc_read" | "dm_send";
+export function opMix(config: Pick<DriverConfig, "postShare" | "svcShare" | "peerShare" | "readShare" | "svcBoard">): () => MixOp {
+  const shares: [MixOp, number][] = [["board_post", config.postShare]];
+  if (config.svcBoard) shares.push(["svc_invoke", config.svcShare], ["peer_list", config.peerShare], ["svc_read", config.readShare]);
+  shares.push(["dm_send", Math.max(0, 1 - shares.reduce((a, [, w]) => a + w, 0))]);
+  const mix = shares.filter(([, w]) => w > 0), total = mix.reduce((a, [, w]) => a + w, 0), current = mix.map(() => 0);
+  return () => {
+    let best = 0;
+    for (let i = 0; i < mix.length; i++) { current[i]! += mix[i]![1]; if (current[i]! > current[best]!) best = i; }
+    current[best]! -= total;
+    return mix[best]![0];
+  };
+}
+
 // One read of the service's board, the next of SVC_READS in this session's turn. board_read waits for a thread to read:
 // a turn that comes before the session's first answered invocation passes to the next read, and board_read is owed
 // until the session has a thread. The rotation always advances, so the other reads stay in turn (with no invocations
@@ -394,6 +412,7 @@ async function main() {
   // Agent traffic on a wall-clock schedule: an op fires when due, whether or not the last returned.
   const start = Date.now();
   for (const l of live.values()) l.nextSend = start + Math.random() * config.periodMs;
+  const nextOp = opMix(config);
   const tick = setInterval(() => {
     if (!sending) return;
     const now = Date.now();
@@ -401,11 +420,11 @@ async function main() {
       if (l.stop || l.spec.service || now < l.nextSend) continue;
       l.nextSend += config.periodMs * (0.5 + Math.random());
       if (l.nextSend < now) l.nextSend = now + config.periodMs * Math.random();
-      const seq = ++l.seq, r = Math.random();
-      if (r < config.postShare) {
+      const seq = ++l.seq, op = nextOp();
+      if (op === "board_post") {
         posts++;
         void timed("board_post", () => l.s.call("board_post", { board: l.spec.board, body: `lt|post|${l.spec.index}|${seq}|${l.spec.board}|${Date.now()}` }));
-      } else if (svcBoard && r < config.postShare + config.svcShare) {
+      } else if (op === "svc_invoke") {
         const id = `${l.spec.index}:${seq}`, board = svcBoard;
         void timed("svc_invoke", async () => {
           const res = await l.s.call<{ post_id: number }>("board_post", { board, body: `lt|svc|${l.spec.index}|${seq}|${board}|${Date.now()}` });
@@ -414,10 +433,10 @@ async function main() {
           l.invoked.set(seq, res.post_id);
           return res;
         });
-      } else if (svcBoard && r < config.postShare + config.svcShare + config.peerShare) {
+      } else if (op === "peer_list") {
         void timed("peer_list", () => l.s.call("peer_list", {}));
-      } else if (svcBoard && r < config.postShare + config.svcShare + config.peerShare + config.readShare) {
-        svcRead(l, svcBoard);
+      } else if (op === "svc_read") {
+        svcRead(l, svcBoard!);
       } else {
         let to = Math.floor(Math.random() * (config.addresses.length - 1));
         if (to >= l.spec.index) to++;

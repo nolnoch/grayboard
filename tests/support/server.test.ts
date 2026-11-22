@@ -149,9 +149,9 @@ testSqlite("file only", () => { console.log("RAN file only"); });
     }
   });
 
-  // main.ts end to end: the URL behind the gate opens (and migrates) the Postgres Repo, and the startup line names the
+  // main.ts end to end: the URL opens (and migrates) the Postgres Repo with no gate, and the startup line names the
   // host and database, never the credentials.
-  test("ServerProcess on a url: main.ts serves Postgres, logs no credentials, and refuses the url without the gate", async () => {
+  test("ServerProcess on a url: main.ts serves Postgres and logs no credentials", async () => {
     await using db = await pgDatabase({ max: 1 });
     const main = [process.execPath, join(ROOT, "src/server/main.ts")];
     const srv = await ServerProcess.start(main, { url: db.url });
@@ -163,9 +163,8 @@ testSqlite("file only", () => { console.log("RAN file only"); });
       await srv.stop();
     }
     const u = new URL(db.url);
-    expect(srv.log()).toContain(`store postgres ${u.host}/${db.name}`);
+    expect(srv.log()).toContain(`store postgres ${u.host}/${db.name}, 8 writers, no TLS`);
     expect(srv.log()).not.toContain(`${u.username}:${u.password}@`);
-    await expect(ServerProcess.start(main, { url: db.url }, { GRAYBOARD_UNRELEASED_POSTGRES: "" })).rejects.toThrow("GRAYBOARD_DATABASE_URL needs GRAYBOARD_UNRELEASED_POSTGRES=1");
     // The open (and its migration) failing fails the startup before anything listens.
     const missing = await ServerProcess.start(main, { url: pgUrl(`${db.name}_missing`) }).then(() => "listened", (e: Error) => e.message);
     expect(missing).toContain(`grayboard server: startup failed: opening postgres ${u.host}/${db.name}_missing`);

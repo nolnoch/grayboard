@@ -44,8 +44,8 @@ export type OktaConfig = { issuer: string; clientId: string; clientSecret: strin
 // a public one (no secret) that the token endpoint knows by PKCE alone.
 export type OidcConfig = { issuer: string; clientId: string; clientSecret?: string; allowedDomains: string[]; label: string };
 
-// The server's database (#807 P3 C11b): a SQLite file, or a Postgres URL behind GRAYBOARD_UNRELEASED_POSTGRES=1 until
-// the cutover (docs/future/postgres-server.md D8 P3, P5).
+// The server's database (#807): a SQLite file, or a Postgres URL. Both ship until the SQLite store is deleted after
+// the pilot deploys (docs/future/postgres-server.md D8).
 export type Store = { kind: "sqlite"; path: string } | { kind: "postgres"; url: string };
 
 // An S3 attachment store (#1509), in place of a blob directory: GRAYBOARD_BLOB_S3_*. `prefix` is "" or ends in "/".
@@ -500,9 +500,8 @@ function urlHostname(raw: string): string {
 }
 
 // One of GRAYBOARD_DATABASE_URL and GRAYBOARD_DB_PATH: both set would hide a misconfigured deploy behind a silent
-// precedence. The URL needs the unreleased gate (PS D8: the two stores never coexist in a release, so a release cut
-// before P5 must not honour it) and somewhere to keep attachments: an explicit blob directory (no database directory
-// to put it beside) or an S3 bucket. Either store may keep them in S3 (#1509), and then has no blob directory.
+// precedence. The URL needs somewhere to keep attachments: an explicit blob directory (no database directory to put
+// it beside) or an S3 bucket. Either store may keep them in S3 (#1509), and then has no blob directory.
 function storeConfig(env: Record<string, string | undefined>): { store: Store; blobDir?: string; blobS3?: S3BlobConfig } {
   const url = env.GRAYBOARD_DATABASE_URL, path = env.GRAYBOARD_DB_PATH, blobDir = env.GRAYBOARD_BLOB_DIR;
   if (url && path) throw new Error("Set one of GRAYBOARD_DATABASE_URL, GRAYBOARD_DB_PATH, not both");
@@ -510,7 +509,8 @@ function storeConfig(env: Record<string, string | undefined>): { store: Store; b
   if (blobS3 && blobDir) throw new Error("Set one of GRAYBOARD_BLOB_S3_BUCKET, GRAYBOARD_BLOB_DIR, not both: attachments live in one place");
   if (path) return blobS3 ? { store: { kind: "sqlite", path }, blobS3 } : { store: { kind: "sqlite", path }, blobDir: blobDir || join(dirname(path), "blobs") };
   if (!url) throw new Error("Required env var GRAYBOARD_DB_PATH (or GRAYBOARD_DATABASE_URL) is not set");
-  if (env.GRAYBOARD_UNRELEASED_POSTGRES !== "1") throw new Error("GRAYBOARD_DATABASE_URL needs GRAYBOARD_UNRELEASED_POSTGRES=1: the Postgres store is unreleased");
+  // Bun.SQL picks its adapter from the scheme (mysql://, sqlite:// …): anything but Postgres is a misconfiguration.
+  if (!/^postgres(ql)?:\/\//i.test(url)) throw new Error("GRAYBOARD_DATABASE_URL must start with postgres:// or postgresql://");
   if (blobS3) return { store: { kind: "postgres", url }, blobS3 };
   if (!blobDir) throw new Error("GRAYBOARD_DATABASE_URL needs GRAYBOARD_BLOB_DIR or GRAYBOARD_BLOB_S3_BUCKET: there's no database directory to keep attachments beside");
   return { store: { kind: "postgres", url }, blobDir };
@@ -575,15 +575,17 @@ export function describeBlobs(config: Pick<Config, "blobDir" | "blobS3">): strin
 }
 
 // What the startup line names: the backend and where, never a URL's credentials. Given `writers` (the config's
-// databaseWriters), a Postgres store's line says how many write connections it opens, so a run's W is on record.
-export function describeStore(store: Store, opts?: { writers: number | undefined }): string {
+// databaseWriters), a Postgres store's line says how many write connections it opens, and given `tls` (store/pg/sql.ts pgTlsMode), the
+// TLS mode, so a run's W and TLS are on record.
+export function describeStore(store: Store, opts?: { writers: number | undefined; tls?: string }): string {
   if (store.kind === "sqlite") return `sqlite ${store.path}`;
   const writers = opts ? `, ${opts.writers ?? DEFAULT_DATABASE_WRITERS} writers` : "";
   try {
     const u = new URL(store.url);
-    return `postgres ${u.host}${u.pathname}${writers}`;
+    const tls = opts?.tls ? `, ${opts.tls}` : "";
+    return `postgres ${u.host}${u.pathname}${writers}${tls}`;
   } catch {
-    return `postgres (unparsable URL)${writers}`;
+    return `postgres (unparsable URL)${writers}${opts?.tls ? `, ${opts.tls}` : ""}`;
   }
 }
 
