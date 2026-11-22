@@ -361,12 +361,23 @@ const isTemplate = (v: unknown): v is TemplateStringsArray => Array.isArray(v) &
 
 // A statement's text for the probe: its literal pieces, with each `sql.fragment` value's own text (fragmentText) in
 // its place; any other value is a gap.
+// A template with no fragment value has the same text on every call, so it's built once per call site (a template's
+// strings array is one frozen object per site) and held (#1627: built per statement, it was 3% of the event loop at
+// #912's load).
 const fragmentText = new WeakMap<object, string>();
-const statementText = (strings: readonly string[], values: readonly unknown[]) =>
+const siteText = new WeakMap<readonly string[], string>();
+const isFragment = (v: unknown) => typeof v === "object" && v !== null && fragmentText.has(v);
+const buildText = (strings: readonly string[], values: readonly unknown[]) =>
   strings.map((piece, i) => {
     const v = values[i];
     return i < values.length ? `${piece} ${typeof v === "object" && v !== null ? fragmentText.get(v) ?? "" : ""} ` : piece;
   }).join("");
+const statementText = (strings: readonly string[], values: readonly unknown[]) => {
+  if (!Object.isFrozen(strings) || values.some(isFragment)) return buildText(strings, values);
+  let text = siteText.get(strings);
+  if (text === undefined) { text = buildText(strings, values); siteText.set(strings, text); }
+  return text;
+};
 
 // Bun nests a fragment by its Query class; its own `then` stops it being sent alone (Bun would run it as a statement).
 function fragment(q: SQL.Query<unknown>): PgFragment {

@@ -913,6 +913,28 @@ describePg("readsOnly (Postgres read-only probe)", () => {
     expect(await rows(x.s.read)).toEqual(["a"]);
   });
 
+  // #1627: a call site's text is held once built, unless a fragment fills it. Mutations: holding the text of a site
+  // with a fragment value (the second call reads as the first's SELECT and passes); holding a plain site's text across
+  // different literal pieces (impossible for one site, so the plain site's repeat must stay judged by its own text).
+  test("one call site judged per call: a fragment's text isn't held from an earlier call, a plain site's repeat is", async () => {
+    await using x = await scratch();
+    await x.s.write(tx => put(tx, "a"));
+    const out = await x.s.writeKeyed(["root:a"], async tx => {
+      const sql = pgOf(tx);
+      const site = (head: unknown) => sql`${head} WHERE v = ${"a"}`;
+      const plain = () => sql`SELECT v FROM t WHERE v = ${"a"}`;
+      const read = await x.s.readsOnly(tx, async () => (await site(sql.fragment`SELECT v FROM t`)).length);
+      const write = await rejection(x.s.readsOnly(tx, async () => { await site(sql.fragment`DELETE FROM t`); }));
+      const again = await x.s.readsOnly(tx, async () => (await plain()).length + (await plain()).length);
+      return { read, write, again };
+    });
+    expect(out.read).toBe(1);
+    expect(out.write).toBeInstanceOf(ProbeWrite);
+    expect(out.write.message).toContain(`the statement "DELETE FROM t …" refused in a read-only probe`);
+    expect(out.again).toBe(2);
+    expect(await rows(x.s.read)).toEqual(["a"]);
+  });
+
   // Mutation: refuseKeyed without its probe branch (the store's refusal is a plain Error, which the gate counts as a
   // failure, not a miss).
   test("a store's keyed refusal inside the probe is the probe's ProbeWrite, before anything is sent", async () => {
