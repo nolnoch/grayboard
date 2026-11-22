@@ -6,7 +6,7 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { capsEnv, options, parseMetrics, perUserRate, combineQueue, quantile, queueCumulative, queueStats, slope, tooSlow, userSessions, judge, pilotBlock, toolCumulative, toolHist, GATE_EDGE, type JudgeInput, type Verdict, type Window } from "../../scripts/loadtest.ts";
-import { BUCKETS, lapses, leaseOp, type Hist } from "../../scripts/loadtest_driver.ts";
+import { BUCKETS, lapses, leaseOp, opMix, type Hist } from "../../scripts/loadtest_driver.ts";
 import { LeaseUnavailable, SubscriberError } from "../../adapters/hosted-core/src/wire.ts";
 import { LATENCY_BUCKETS } from "../../src/server/metrics.ts";
 import { DEFAULT_HOSTED_CAPS, DEFAULT_MCP_LIMITS } from "../../src/server/config.ts";
@@ -19,6 +19,26 @@ import { errorClass } from "../../scripts/loadtest_errors.ts";
 const ROOT = resolve(import.meta.dir, "../..");
 
 describe("loadtest sizing", () => {
+  // #1539: the op mix is a weighted round robin, so a short run's rare op always gets its share; a random draw per op
+  // left the small fleet's 0.1-share peer_list with no clean-window sample often enough to fail CI.
+  test("the op mix gives every op its share, within 1.5, over any window of draws", () => {
+    const next = opMix({ postShare: 0.2, svcShare: 0.2, peerShare: 0.1, readShare: 0.3, svcBoard: "load-svc" });
+    const draws = Array.from({ length: 200 }, () => next());
+    const shares = { board_post: 0.2, svc_invoke: 0.2, peer_list: 0.1, svc_read: 0.3, dm_send: 0.2 };
+    for (const start of [0, 7, 33, 101]) for (const len of [10, 20, 36, 99]) {
+      const span = draws.slice(start, start + len);
+      for (const [op, share] of Object.entries(shares)) {
+        const n = span.filter(d => d === op).length;
+        expect({ op, start, len, ok: Math.abs(n - share * len) <= 1.5 }).toEqual({ op, start, len, ok: true });
+      }
+    }
+    // Without a service board its ops leave the mix and dm_send takes their share.
+    const plain = opMix({ postShare: 0.25, svcShare: 0.2, peerShare: 0.1, readShare: 0.3, svcBoard: null });
+    const plainDraws = Array.from({ length: 40 }, () => plain());
+    expect({ board_post: plainDraws.filter(d => d === "board_post").length, dm_send: plainDraws.filter(d => d === "dm_send").length })
+      .toEqual({ board_post: 10, dm_send: 30 });
+  });
+
   test("the full profile fits both default per-user request buckets; the quick one raises the subscriber one", () => {
     const full = options([]);
     expect(perUserRate(full).total).toBeLessThan(10);
