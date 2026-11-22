@@ -21,7 +21,7 @@ import { expect, test } from "bun:test";
 import { grantRole, revokeRole, type Granter, type RoleSpec } from "../roles.ts";
 import { authorize, type AuthzRequest } from "../policy.ts";
 import { AuthorityLost, LastOwner, PrincipalTaken } from "./errors.ts";
-import type { IdentityGroups, MemberAuthority, User } from "./identity.ts";
+import { NO_MEMBER_AUTHORITY, type IdentityGroups, type MemberAuthority, type TeamsStore, type User } from "./identity.ts";
 import type { Read, Tx } from "./tx_base.ts";
 
 // One store, fresh per row.
@@ -69,6 +69,11 @@ export function identityContract(backend: IdentityBackend): void {
 }
 
 type It = (name: string, fn: (h: IdentityStore) => Promise<void>) => void;
+
+// #1247: a membership change names its authority, as a grant does. Compile-time only: `by` going optional again
+// makes the parameter admit undefined, and these no longer typecheck.
+type Admits<T, U> = [U] extends [T] ? true : false;
+export const membershipAuthorityRequired: [Admits<Parameters<TeamsStore["addMember"]>[3], undefined>, Admits<Parameters<TeamsStore["removeMember"]>[3], undefined>] = [false, false];
 
 const upsert = (h: IdentityStore, email: string, name: string | null = null) => h.write(tx => h.users.upsertByEmail(tx, email, name));
 const signIn = (h: IdentityStore, issuer: string, subject: string, email: string, name: string | null) =>
@@ -370,9 +375,9 @@ function teams(it: It, sqliteOnly: (name: string, why: string, fn: (h: IdentityS
     });
     const [u1, u2, u3] = us as [User, User, User];
     const added = await h.write(async tx => [
-      await h.teams.addMember(tx, ts[0]!.id, u3.id), await h.teams.addMember(tx, ts[0]!.id, u1.id), await h.teams.addMember(tx, ts[0]!.id, u2.id),
-      await h.teams.addMember(tx, ts[2]!.id, u1.id), await h.teams.addMember(tx, ts[1]!.id, u1.id),
-      await h.teams.addMember(tx, ts[0]!.id, u3.id),
+      await h.teams.addMember(tx, ts[0]!.id, u3.id, NO_MEMBER_AUTHORITY), await h.teams.addMember(tx, ts[0]!.id, u1.id, NO_MEMBER_AUTHORITY), await h.teams.addMember(tx, ts[0]!.id, u2.id, NO_MEMBER_AUTHORITY),
+      await h.teams.addMember(tx, ts[2]!.id, u1.id, NO_MEMBER_AUTHORITY), await h.teams.addMember(tx, ts[1]!.id, u1.id, NO_MEMBER_AUTHORITY),
+      await h.teams.addMember(tx, ts[0]!.id, u3.id, NO_MEMBER_AUTHORITY),
     ]);
     expect(added).toEqual([true, true, true, true, true, false]);
     // On Postgres an UPDATE writes the row's new version at the end of the heap, so a scan with no ORDER BY now meets
@@ -411,8 +416,8 @@ function teams(it: It, sqliteOnly: (name: string, why: string, fn: (h: IdentityS
     const { a, b, c, t } = await h.write(async tx => {
       const [a, b, c] = [await h.users.upsertByEmail(tx, A, null), await h.users.upsertByEmail(tx, B, null), await h.users.upsertByEmail(tx, C, null)];
       const t = await h.teams.create(tx, "eng", a.id);
-      await h.teams.addMember(tx, t.id, a.id);
-      await h.teams.addMember(tx, t.id, b.id);
+      await h.teams.addMember(tx, t.id, a.id, NO_MEMBER_AUTHORITY);
+      await h.teams.addMember(tx, t.id, b.id, NO_MEMBER_AUTHORITY);
       return { a, b, c, t };
     });
     const share = async (x: number, y: number) => [
@@ -431,7 +436,7 @@ function teams(it: It, sqliteOnly: (name: string, why: string, fn: (h: IdentityS
     const { t, b } = await h.write(async tx => {
       const [a, b, c] = [await h.users.upsertByEmail(tx, A, null), await h.users.upsertByEmail(tx, B, null), await h.users.upsertByEmail(tx, C, null)];
       const t = await h.teams.create(tx, "eng", a.id);
-      for (const u of [a, b, c]) await h.teams.addMember(tx, t.id, u.id);
+      for (const u of [a, b, c]) await h.teams.addMember(tx, t.id, u.id, NO_MEMBER_AUTHORITY);
       for (const e of [A, B]) await grantRole(h, tx, { holder: e, role: "team_owner", scope: "eng" }, { email: A, userId: a.id, authority: "none" });
       return { t, b, c };
     });
@@ -442,12 +447,12 @@ function teams(it: It, sqliteOnly: (name: string, why: string, fn: (h: IdentityS
     expect((await h.teams.listMembers(h.read, t.id)).map(m => m.email)).toEqual([A, C]);
     expect(await h.audits("role.revoked")).toEqual([{ actor: A, target: B, detail_type: "object", detail: expect.objectContaining({ binding: before!.id, role: "team_owner", principal: B, scope: "eng", via: "test" }) }]);
     const c = (await h.users.findByEmail(h.read, C))!;
-    expect(await h.write(tx => h.teams.removeMember(tx, t.id, c.id))).toBeNull();
+    expect(await h.write(tx => h.teams.removeMember(tx, t.id, c.id, NO_MEMBER_AUTHORITY))).toBeNull();
     expect(await h.teams.listMemberUserIds(h.read, t.id)).toEqual([(await h.users.findByEmail(h.read, A))!.id]);
     expect(await h.audits("role.revoked")).toHaveLength(1);
     // A sole member may give up the last ownership: there's no one left to manage.
     const a = (await h.users.findByEmail(h.read, A))!;
-    expect(await h.write(tx => h.teams.removeMember(tx, t.id, a.id))).toMatchObject({ principal: A, role: "team_owner" });
+    expect(await h.write(tx => h.teams.removeMember(tx, t.id, a.id, NO_MEMBER_AUTHORITY))).toMatchObject({ principal: A, role: "team_owner" });
     expect(await h.teams.listMembers(h.read, t.id)).toEqual([]);
   });
 
@@ -455,12 +460,12 @@ function teams(it: It, sqliteOnly: (name: string, why: string, fn: (h: IdentityS
     const { t, a } = await h.write(async tx => {
       const [a, b] = [await h.users.upsertByEmail(tx, A, null), await h.users.upsertByEmail(tx, B, null)];
       const t = await h.teams.create(tx, "eng", a.id);
-      await h.teams.addMember(tx, t.id, a.id);
-      await h.teams.addMember(tx, t.id, b.id);
+      await h.teams.addMember(tx, t.id, a.id, NO_MEMBER_AUTHORITY);
+      await h.teams.addMember(tx, t.id, b.id, NO_MEMBER_AUTHORITY);
       await grantRole(h, tx, { holder: A, role: "team_owner", scope: "eng" }, { email: A, userId: a.id, authority: "none" });
       return { t, a };
     });
-    const e = await h.write(tx => caught(() => h.teams.removeMember(tx, t.id, a.id)));
+    const e = await h.write(tx => caught(() => h.teams.removeMember(tx, t.id, a.id, NO_MEMBER_AUTHORITY)));
     expect(e).toBeInstanceOf(LastOwner);
     expect(e).toMatchObject({ scope: "eng", kind: "team" });
     expect(await h.teams.isMember(h.read, t.id, a.id)).toBe(true);
@@ -476,7 +481,7 @@ function teams(it: It, sqliteOnly: (name: string, why: string, fn: (h: IdentityS
     for (const e of [A, B, C, D]) us.push(await h.users.upsertByEmail(tx, e, null));
     const [a, b, c] = us as [User, User, User];
     const t = await h.teams.create(tx, "eng", a.id);
-    for (const u of [a, b, c]) await h.teams.addMember(tx, t.id, u.id);
+    for (const u of [a, b, c]) await h.teams.addMember(tx, t.id, u.id, NO_MEMBER_AUTHORITY);
     for (const e of [A, B]) await grantRole(h, tx, { holder: e, role: "team_owner", scope: "eng" }, { email: A, userId: a.id, authority: "none" });
     return { t, us: us as [User, User, User, User] };
   });
@@ -486,7 +491,7 @@ function teams(it: It, sqliteOnly: (name: string, why: string, fn: (h: IdentityS
     expect(await h.write(tx => h.teams.addMember(tx, t.id, d.id, asOwner(b)))).toBe(true);
     expect(await h.write(tx => h.teams.addMember(tx, t.id, d.id, asOwner(b)))).toBe(false);
     await h.write(tx => revokeRole(h, tx, { holder: B, role: "team_owner", scope: "eng" }, { email: A, userId: a.id, authority: "none" }, false));
-    await h.write(tx => h.teams.removeMember(tx, t.id, d.id));
+    await h.write(tx => h.teams.removeMember(tx, t.id, d.id, NO_MEMBER_AUTHORITY));
     // Caught in the body, which commits: a new member and an existing one alike.
     for (const u of [d, c]) expect(await h.write(tx => caught(() => h.teams.addMember(tx, t.id, u.id, asOwner(b))))).toBeInstanceOf(AuthorityLost);
     expect(await h.teams.listMemberUserIds(h.read, t.id)).toEqual([a.id, b.id, c.id]);
@@ -521,7 +526,7 @@ async function cast(h: IdentityStore) {
     const alice = await h.users.upsertByEmail(tx, A, null);
     const bob = await h.users.upsertByEmail(tx, B, null);
     const eng = await h.teams.create(tx, "eng", admin.id);
-    await h.teams.addMember(tx, eng.id, alice.id);
+    await h.teams.addMember(tx, eng.id, alice.id, NO_MEMBER_AUTHORITY);
     const boot: Granter = { email: D, userId: admin.id, authority: "none" };
     const org = await grantRole(h, tx, { holder: D, role: "org_admin", scope: null }, boot);
     if (!("binding" in org)) throw new Error("cast: org_admin not granted");
@@ -579,7 +584,7 @@ function roles(it: It): void {
     // A team owner's authority covers their own team.
     await grant(spec(A, "team_owner", "eng"));
     const alice = (await h.users.findByEmail(h.read, A))!;
-    await h.write(async tx => h.teams.addMember(tx, (await h.teams.findByName(tx, "eng"))!.id, bob.id));
+    await h.write(async tx => h.teams.addMember(tx, (await h.teams.findByName(tx, "eng"))!.id, bob.id, NO_MEMBER_AUTHORITY));
     expect(await grant(spec(B, "team_owner", "eng"), { email: A, userId: alice.id, authority: "owner_or_admin" })).toMatchObject({ changed: true });
   });
 
@@ -588,8 +593,8 @@ function roles(it: It): void {
     await h.write(async tx => {
       for (const s of ["ingest", "ci"]) await h.services.create(tx, s);
       const ops = await h.teams.create(tx, "ops", alice.id);
-      await h.teams.addMember(tx, ops.id, alice.id);
-      await h.teams.addMember(tx, eng.id, bob.id);
+      await h.teams.addMember(tx, ops.id, alice.id, NO_MEMBER_AUTHORITY);
+      await h.teams.addMember(tx, eng.id, bob.id, NO_MEMBER_AUTHORITY);
       for (const holder of ["ops", "eng", "ci"]) expect(await grantRole(h, tx, spec(holder, "service_invoke", "ingest"), asAdmin)).toMatchObject({ changed: true });
     });
     const id = async (holder: string) => (await h.roles.find(h.read, holder, "service_invoke", "ingest"))!.id;
@@ -603,7 +608,7 @@ function roles(it: It): void {
     expect(await h.roles.invokeBinding(h.read, user(A), "ingest")).toEqual({ id: await id(A), team: null });
     // Membership is read live: bob's right ends with his membership.
     expect(await h.roles.invokeBinding(h.read, user(B), "ingest")).toEqual({ id: await id("eng"), team: "eng" });
-    await h.write(tx => h.teams.removeMember(tx, eng.id, bob.id));
+    await h.write(tx => h.teams.removeMember(tx, eng.id, bob.id, NO_MEMBER_AUTHORITY));
     expect(await h.roles.invokeBinding(h.read, user(B), "ingest")).toBeUndefined();
     // Another service's scope, a team name read as a user, a service read as a user, and the admin: nothing.
     expect(await h.roles.invokeBinding(h.read, user(A), "ci")).toBeUndefined();
@@ -621,7 +626,7 @@ function roles(it: It): void {
       await h.services.create(tx, "ingest");
       for (const name of ["qa_b", "qa-z"]) {
         const t = await h.teams.create(tx, name, alice.id);
-        await h.teams.addMember(tx, t.id, alice.id);
+        await h.teams.addMember(tx, t.id, alice.id, NO_MEMBER_AUTHORITY);
         expect(await grantRole(h, tx, spec(name, "service_invoke", "ingest"), asAdmin)).toMatchObject({ changed: true });
       }
     });
@@ -632,7 +637,7 @@ function roles(it: It): void {
   it("roles.revoke deletes the binding and writes a role.revoked row carrying all of it", async h => {
     const { bob, eng, asAdmin } = await cast(h);
     await h.write(async tx => {
-      await h.teams.addMember(tx, eng.id, bob.id);
+      await h.teams.addMember(tx, eng.id, bob.id, NO_MEMBER_AUTHORITY);
       for (const e of [A, B]) await grantRole(h, tx, spec(e, "team_owner", "eng"), asAdmin);
     });
     const b = (await h.roles.find(h.read, B, "team_owner", "eng"))!;
@@ -654,7 +659,7 @@ function roles(it: It): void {
   it("roles.revoke of a team's or service's last owner is LastOwner, and a caller that commits past it keeps the binding", async h => {
     const { bob, eng, asAdmin } = await cast(h);
     await h.write(async tx => {
-      await h.teams.addMember(tx, eng.id, bob.id);
+      await h.teams.addMember(tx, eng.id, bob.id, NO_MEMBER_AUTHORITY);
       await grantRole(h, tx, spec(A, "team_owner", "eng"), asAdmin);
       await h.services.create(tx, "ingest");
       await grantRole(h, tx, spec(A, "service_owner", "ingest"), asAdmin);
@@ -675,7 +680,7 @@ function roles(it: It): void {
   it("roles.list filters by role, holder and scope name, in id order after a cursor, up to a limit", async h => {
     const { bob, eng, org, asAdmin } = await cast(h);
     await h.write(async tx => {
-      await h.teams.addMember(tx, eng.id, bob.id);
+      await h.teams.addMember(tx, eng.id, bob.id, NO_MEMBER_AUTHORITY);
       await h.services.create(tx, "ingest");
       await grantRole(h, tx, spec(B, "team_owner", "eng"), asAdmin);
       await grantRole(h, tx, spec(A, "service_owner", "ingest"), asAdmin);
@@ -701,7 +706,7 @@ function roles(it: It): void {
   it("authorize reads the identity groups: team.manage, admin and msg.wake decision on bindings, membership and policy", async h => {
     const { admin, alice, bob, eng, org, asAdmin } = await cast(h);
     const owner = await h.write(async tx => {
-      await h.teams.addMember(tx, eng.id, bob.id);
+      await h.teams.addMember(tx, eng.id, bob.id, NO_MEMBER_AUTHORITY);
       return grantRole(h, tx, spec(A, "team_owner", "eng"), asAdmin);
     });
     const ownerId = "binding" in owner ? owner.binding.id : -1;

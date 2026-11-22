@@ -15,6 +15,7 @@ import { closeSessions } from "../support/mcp.ts";
 import { TestServer } from "../support/server.ts";
 import { seed } from "../support/seed.ts";
 import { drained, exec, execOn, rows as sqlRows } from "../support/repo_sql.ts";
+import { NO_MEMBER_AUTHORITY } from "../../src/server/store/identity.ts";
 
 const B = "bob@example.com";
 let srv: TestServer;
@@ -111,7 +112,7 @@ test("a recheck inside a caller's body resyncs a live holder from the holds the 
   const repo = srv.app.repo;
   await seed(repo, async tx => {
     const team = (await repo.teams.findByName(tx, "eng"))!;
-    await repo.teams.removeMember(tx, team.id, (await repo.users.findByEmail(tx, B))!.id);
+    await repo.teams.removeMember(tx, team.id, (await repo.users.findByEmail(tx, B))!.id, NO_MEMBER_AUTHORITY);
     await srv.app.application.accessChanged(tx, B, "alice@example.com");
     // After the recheck returned: the body drops the other hold too.
     await execOn(tx, `DELETE FROM alias_holds WHERE address = ?`, `${B}/side`);
@@ -139,7 +140,7 @@ test("leaving a team releases its aliases from the leaver's sessions; revalidate
   build = srv.appSession(bob, "eng/build");
   expect((await build.connect()).bind).toMatchObject({ alias: "eng/build" });
   const team = (await srv.app.repo.teams.findByName(srv.app.repo.read, "eng"))!;
-  await seed(srv.app.repo, async (tx) => srv.app.repo.teams.removeMember(tx, team.id, (await srv.app.repo.users.findByEmail(tx, B))!.id));
+  await seed(srv.app.repo, async (tx) => srv.app.repo.teams.removeMember(tx, team.id, (await srv.app.repo.users.findByEmail(tx, B))!.id, NO_MEMBER_AUTHORITY));
   expect(await holder("eng/build")).toEqual([build.id]);
   await srv.app.revalidate();
   expect(await holder("eng/build")).toEqual([]);

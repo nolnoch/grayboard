@@ -44,6 +44,7 @@ import { claimsContract } from "./store/claims.contract.ts";
 import { sqliteClaimsBackend } from "./store/claims.contract.sqlite.ts";
 import { boardsContract } from "./store/boards.contract.ts";
 import { sqliteBoardsBackend } from "./store/boards.contract.sqlite.ts";
+import { NO_MEMBER_AUTHORITY } from "./store/identity.ts";
 
 const person = (email: string, name: string) => ({ scope_kind: "person" as const, scope_ref: email, name });
 
@@ -391,7 +392,7 @@ test("schema: team ownership is seeded into role bindings once, from team_member
   await seed(first.repo, async tx => {
     const u = await Promise.all(["a", "b", "c", "d"].map(n => first.repo.users.upsertByEmail(tx, `${n}@example.com`, null)));
     const eng = await first.repo.teams.create(tx, "eng", u[0]!.id), ops = await first.repo.teams.create(tx, "ops", u[1]!.id), qa = await first.repo.teams.create(tx, "qa", u[2]!.id);
-    for (const [t, m] of [[eng, 0], [eng, 1], [eng, 3], [ops, 1], [ops, 2], [qa, 3]] as const) await first.repo.teams.addMember(tx, t.id, u[m]!.id);
+    for (const [t, m] of [[eng, 0], [eng, 1], [eng, 3], [ops, 1], [ops, 2], [qa, 3]] as const) await first.repo.teams.addMember(tx, t.id, u[m]!.id, NO_MEMBER_AUTHORITY);
   });
   // As a pre-#927 server left them: eng's creator a with a null role, d an explicit owner, b a member; ops's creator
   // b demoted to member and c its owner; qa's creator c gone, d a member.
@@ -745,16 +746,16 @@ test("#807 P1c-10: team writes run on the handle they're given", async () => {
   const { kept, t, a, b } = await seed(repo, async tx => {
     const a = await repo.users.upsertByEmail(tx, "a@example.com", null), b = await repo.users.upsertByEmail(tx, "b@example.com", null);
     const t = await repo.teams.create(tx, "ops", a.id);
-    await repo.teams.addMember(tx, t.id, a.id);
+    await repo.teams.addMember(tx, t.id, a.id, NO_MEMBER_AUTHORITY);
     await grantOwner(repo, tx, "ops", "a@example.com");
     return { kept: tx, t, a, b };
   });
   const settled = /used after its transaction settled/;
   await expect(repo.teams.create(kept, "dev", a.id)).rejects.toThrow(settled);
-  await expect(repo.teams.addMember(kept, t.id, b.id)).rejects.toThrow(settled);
-  await expect(repo.teams.removeMember(kept, t.id, a.id)).rejects.toThrow(settled);
+  await expect(repo.teams.addMember(kept, t.id, b.id, NO_MEMBER_AUTHORITY)).rejects.toThrow(settled);
+  await expect(repo.teams.removeMember(kept, t.id, a.id, NO_MEMBER_AUTHORITY)).rejects.toThrow(settled);
   await expect(repo.teams.setPolicy(kept, t.id, "collaborative")).rejects.toThrow(settled);
-  await expect(repo.teams.addMember({} as Tx, t.id, b.id)).rejects.toThrow("not a SQLite store handle");
+  await expect(repo.teams.addMember({} as Tx, t.id, b.id, NO_MEMBER_AUTHORITY)).rejects.toThrow("not a SQLite store handle");
   expect((await repo.teams.findByName(repo.read, "dev"))).toBeUndefined();
   expect((await repo.teams.listMembers(repo.read, t.id))).toEqual([{ user_id: a.id, email: "a@example.com", role: "owner" }]);
   expect((await repo.teams.findByName(repo.read, "ops"))?.policy).toBe("open");
@@ -974,7 +975,7 @@ test("#807 P3 B5b1: a team follow refuses an alias that can't see the team board
     await repo.users.upsertByEmail(tx, "b@example.com", null);
     await repo.aliases.create(tx, person("b@example.com", "be"), "b@example.com");
     const team = await repo.teams.create(tx, "crew", a.id);
-    await repo.teams.addMember(tx, team.id, a.id);
+    await repo.teams.addMember(tx, team.id, a.id, NO_MEMBER_AUTHORITY);
     return team;
   });
   await expect(seed(repo, tx => onTeamJoined(repo, tx, team, "b@example.com"))).rejects.toThrow("no such board #crew; see board_list");
