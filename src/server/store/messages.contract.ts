@@ -353,7 +353,7 @@ function reads(it: It): void {
     const read = await send(h, C, B, "read");
     const delivered = await send(h, C, A, "delivered");
     await h.cursor(B, read.id);
-    await h.write(tx => h.messages.markDelivered(tx, delivered.id, T0 + 101));
+    await h.write(tx => h.messages.deliver(tx, [A], [delivered.id], T0 + 101));
     const out = await h.messages.undeliveredFrom(h.read, [C]);
     expect(out).toEqual([
       { recipient: cap, n: 1, oldest_id: toCap.id },
@@ -406,12 +406,24 @@ function acksAndRetract(it: It): void {
   });
 
   // M17.
-  it("markDelivered stamps a message once: the first stamp stands", async h => {
+  it("deliver stamps a message once: the first stamp stands; it returns each recipient's highest id", async h => {
     const m = await send(h, A, B, "m");
-    await h.write(tx => h.messages.markDelivered(tx, m.id, T0 + 5));
-    await h.write(tx => h.messages.markDelivered(tx, m.id, T0 + 9));
+    expect(await h.write(tx => h.messages.deliver(tx, [B], [m.id], T0 + 5))).toEqual(new Map([[B, m.id]]));
+    await h.write(tx => h.messages.deliver(tx, [B], [m.id], T0 + 9));
     expect((await h.messages.getById(h.read, m.id))?.delivered_at).toBe(T0 + 5);
-    await h.write(tx => h.messages.markDelivered(tx, m.id + 1000, T0 + 9));
+    expect(await h.write(tx => h.messages.deliver(tx, [B], [m.id + 1000], T0 + 9))).toEqual(new Map());
+  });
+
+  // #1510 chunk 5: one call for a receipt's batch. Only direct messages to the given recipients count; a null stamp
+  // (given up, not handed) stamps nothing but still names the read point.
+  it("deliver: a batch in any order, only the recipients' direct mail, per recipient the highest id; a null stamp writes none", async h => {
+    const b1 = await send(h, A, B, "b1"), c1 = await send(h, A, C, "c1"), b2 = await send(h, A, B, "b2"), toA = await send(h, B, A, "not B's or C's");
+    expect(await h.write(tx => h.messages.deliver(tx, [B, C], [b2.id, toA.id, c1.id, b1.id], T0 + 5))).toEqual(new Map([[B, b2.id], [C, c1.id]]));
+    for (const m of [b1, c1, b2]) expect((await h.messages.getById(h.read, m.id))?.delivered_at).toBe(T0 + 5);
+    expect((await h.messages.getById(h.read, toA.id))?.delivered_at).toBeNull();
+    expect(await h.write(tx => h.messages.deliver(tx, [A], [toA.id], null))).toEqual(new Map([[A, toA.id]]));
+    expect((await h.messages.getById(h.read, toA.id))?.delivered_at).toBeNull();
+    expect(await h.write(tx => h.messages.deliver(tx, [A], [], T0 + 9))).toEqual(new Map());
   });
 
   // M18.
@@ -446,8 +458,7 @@ function acksAndRetract(it: It): void {
     const toC2 = await send(h, A, C, "at C's read point");
     const toC3 = await send(h, A, C, "past it still");
     await h.write(async tx => {
-      await h.messages.markDelivered(tx, delivered.id, T0 + 1);
-      await h.messages.markDelivered(tx, both.id, T0 + 1);
+      await h.messages.deliver(tx, [B], [delivered.id, both.id], T0 + 1);
     });
     await h.cursor(C, toC2.id);
     const before = await h.messageRows();

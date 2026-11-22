@@ -5,14 +5,40 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { capsEnv, options, parseMetrics, perUserRate, combineQueue, quantile, queueCumulative, queueStats, slope, tooSlow, userSessions } from "../../scripts/loadtest.ts";
+import { capsEnv, options, parseMetrics, perUserRate, combineQueue, quantile, queueCumulative, queueStats, slope, tooSlow, userSessions, judge, pilotBlock, toolCumulative, toolHist, GATE_EDGE, type JudgeInput, type Verdict, type Window } from "../../scripts/loadtest.ts";
+import { BUCKETS, lapses, leaseOp, opMix, type Hist } from "../../scripts/loadtest_driver.ts";
+import { LeaseUnavailable, SubscriberError } from "../../adapters/hosted-core/src/wire.ts";
+import { LATENCY_BUCKETS } from "../../src/server/metrics.ts";
 import { DEFAULT_HOSTED_CAPS, DEFAULT_MCP_LIMITS } from "../../src/server/config.ts";
 import { DEFAULT_HOSTED_REQUEST_LIMIT } from "../../src/server/rate_limit.ts";
 import { runCli } from "../support/cli.ts";
+import { SdkError, SdkErrorCode, SdkHttpError } from "@modelcontextprotocol/client";
+import { ServerUnreachable } from "../../adapters/hosted-core/src/wire.ts";
+import { errorClass } from "../../scripts/loadtest_errors.ts";
 
 const ROOT = resolve(import.meta.dir, "../..");
 
 describe("loadtest sizing", () => {
+  // #1539: the op mix is a weighted round robin, so a short run's rare op always gets its share; a random draw per op
+  // left the small fleet's 0.1-share peer_list with no clean-window sample often enough to fail CI.
+  test("the op mix gives every op its share, within 1.5, over any window of draws", () => {
+    const next = opMix({ postShare: 0.2, svcShare: 0.2, peerShare: 0.1, readShare: 0.3, svcBoard: "load-svc" });
+    const draws = Array.from({ length: 200 }, () => next());
+    const shares = { board_post: 0.2, svc_invoke: 0.2, peer_list: 0.1, svc_read: 0.3, dm_send: 0.2 };
+    for (const start of [0, 7, 33, 101]) for (const len of [10, 20, 36, 99]) {
+      const span = draws.slice(start, start + len);
+      for (const [op, share] of Object.entries(shares)) {
+        const n = span.filter(d => d === op).length;
+        expect({ op, start, len, ok: Math.abs(n - share * len) <= 1.5 }).toEqual({ op, start, len, ok: true });
+      }
+    }
+    // Without a service board its ops leave the mix and dm_send takes their share.
+    const plain = opMix({ postShare: 0.25, svcShare: 0.2, peerShare: 0.1, readShare: 0.3, svcBoard: null });
+    const plainDraws = Array.from({ length: 40 }, () => plain());
+    expect({ board_post: plainDraws.filter(d => d === "board_post").length, dm_send: plainDraws.filter(d => d === "dm_send").length })
+      .toEqual({ board_post: 10, dm_send: 30 });
+  });
+
   test("the full profile fits both default per-user request buckets; the quick one raises the subscriber one", () => {
     const full = options([]);
     expect(perUserRate(full).total).toBeLessThan(10);
@@ -41,6 +67,24 @@ describe("loadtest sizing", () => {
           .toEqual({ argv, prefix, global: true, perUser: true, within: true });
       }
     }
+  });
+
+  test("the POST caps leave every listener its slot and a connect's two wires theirs (#1532)", () => {
+    for (const argv of [[], ["--quick"], ["--sessions", "300", "--service-workers", "0"], ["--users", "1", "--sessions", "400"]]) {
+      const o = options(argv), env = capsEnv(o);
+      // A listen holds a POST slot for its stream's life; a connect POSTs discover from both wires at once.
+      expect({ argv, fits: Number(env.GRAYBOARD_MCP_POST_GLOBAL) >= Number(env.GRAYBOARD_MCP_LISTEN_GLOBAL) + 2 * o.sessions }).toEqual({ argv, fits: true });
+    }
+  });
+
+  test("a client error is classed by its cause chain: the SDK's code, an HTTP status and a capacity 429's body (#1532)", () => {
+    const capacity = new SdkHttpError(SdkErrorCode.EraNegotiationFailed, "probe", { status: 429, statusText: "Too Many Requests", text: "MCP request capacity reached" });
+    expect(errorClass(new SdkError(SdkErrorCode.EraNegotiationFailed, "Version negotiation probe failed", undefined, { cause: capacity }))).toBe("SdkError(ERA_NEGOTIATION_FAILED)<http_429(MCP request capacity reached)");
+    expect(errorClass(new ServerUnreachable(new SdkError(SdkErrorCode.RequestTimeout, "Request timed out")))).toBe("ServerUnreachable<SdkError(REQUEST_TIMEOUT)");
+    // A JSON body is the server's structured refusal, not a capacity line: the status alone.
+    expect(errorClass(new SdkHttpError(SdkErrorCode.ClientHttpNotImplemented, "x", { status: 503, text: "{\"code\":\"internal\"}" }))).toBe("http_503");
+    expect(errorClass(Object.assign(new Error("reset"), { code: "ECONNRESET" }))).toBe("Error(ECONNRESET)");
+    expect(errorClass("boom")).toBe("string");
   });
 
   test("slope is least squares in units per second", () => {
@@ -99,13 +143,15 @@ describe("loadtest sizing", () => {
 
 describe("loadtest write-queue report (#1510)", () => {
   // Two scrapes' worth of exposition, in the server's format: hold by site, wait by site, depth.
-  const expo = (holdCum: number[], holdSum: number, depthCum: number[]) => [
+  const expo = (holdCum: number[], holdSum: number, depthCum: number[], keyed = 0, stop = 0, gate: [number, number, number] = [0, 0, 0]) => [
     ...["0.001", "0.002", "0.004", "+Inf"].map((le, i) => `grayboard_write_queue_hold_seconds_bucket{site="gate",le="${le}"} ${holdCum[i]}`),
     `grayboard_write_queue_hold_seconds_sum{site="gate"} ${holdSum}`, `grayboard_write_queue_hold_seconds_count{site="gate"} ${holdCum[3]}`,
     ...["0.001", "0.002", "0.004", "+Inf"].map((le, i) => `grayboard_write_queue_wait_seconds_bucket{site="gate",le="${le}"} ${holdCum[i]}`),
     `grayboard_write_queue_wait_seconds_sum{site="gate"} ${holdSum / 2}`, `grayboard_write_queue_wait_seconds_count{site="gate"} ${holdCum[3]}`,
     ...["0", "1", "2", "+Inf"].map((le, i) => `grayboard_write_queue_depth_bucket{le="${le}"} ${depthCum[i]}`),
     `grayboard_write_queue_depth_sum 0`, `grayboard_write_queue_depth_count ${depthCum[3]}`,
+    `grayboard_write_queue_keyed_bodies_total{site="gate"} ${keyed}`, `grayboard_write_queue_world_stop_seconds_total ${stop}`,
+    ...(["keyed", "miss", "skipped"] as const).map((o, i) => `grayboard_hosted_gate_bodies_total{site="gate",outcome="${o}"} ${gate[i]}`),
   ].join("\n");
 
   test("quantiles interpolate within a bucket, and one past the last edge reads as that edge", () => {
@@ -117,8 +163,8 @@ describe("loadtest write-queue report (#1510)", () => {
   });
 
   test("a window's numbers come from the deltas between two scrapes", () => {
-    const a = queueCumulative(parseMetrics(expo([10, 10, 10, 10], 0.005, [3, 3, 3, 3])));
-    const b = queueCumulative(parseMetrics(expo([10, 60, 110, 110], 0.205, [3, 5, 7, 7])));
+    const a = queueCumulative(parseMetrics(expo([10, 10, 10, 10], 0.005, [3, 3, 3, 3], 4, 0.5, [2, 1, 5])));
+    const b = queueCumulative(parseMetrics(expo([10, 60, 110, 110], 0.205, [3, 5, 7, 7], 29, 1.3, [20, 4, 9])));
     const q = queueStats(combineQueue(b, a, -1), 2);
     expect(q.bodies).toBe(100);
     expect(q.bodiesPerS).toBe(50);
@@ -127,12 +173,186 @@ describe("loadtest write-queue report (#1510)", () => {
     expect(q.hold.mean).toBeCloseTo(0.002, 9);
     expect(q.maxDepth).toBe(2);
     expect(Object.keys(q.sites)).toEqual(["gate"]);
+    // 25 of the window's 100 bodies ran keyed; 0.8 s of its 2 s were a world stop (#1510 chunk 2).
+    expect(q.keyed).toBeCloseTo(0.25, 9);
+    expect(q.sites.gate!.keyed).toBeCloseTo(0.25, 9);
+    expect(q.worldStop).toBeCloseTo(0.4, 9);
+    // The gate's fast path in the window: 18 keyed, 3 missed, 4 skipped; 3 of 21 attempts missed (#1510 chunk 3).
+    expect(q.gate).toEqual({ gate: { keyed: 18, miss: 3, skipped: 4, missRate: 3 / 21 } });
+  });
+
+  // #1537 PR 0. Mutations: the gate line summing replaced by a set (gate.keyed reads one method's); statements per body
+  // over the window's bodies dropped for the cumulative (reads 9, not 10); the tool site left out of gateMethod (#1573: no
+  // tool.<method> entries).
+  test("statements and round trips per body per site, and the gate's bodies by method, come from the window's deltas", () => {
+    const expo2 = (holdCount: number, st: [number, number], rt: number, sel: number, renew: number) => [
+      `grayboard_write_queue_hold_seconds_bucket{site="gate",le="+Inf"} ${holdCount}`, `grayboard_write_queue_hold_seconds_sum{site="gate"} 0.1`, `grayboard_write_queue_hold_seconds_count{site="gate"} ${holdCount}`,
+      `grayboard_write_queue_statements_bucket{site="gate",le="+Inf"} ${st[1]}`, `grayboard_write_queue_statements_sum{site="gate"} ${st[0]}`, `grayboard_write_queue_statements_count{site="gate"} ${st[1]}`,
+      `grayboard_write_queue_round_trips_sum{site="gate"} ${rt}`, `grayboard_write_queue_round_trips_count{site="gate"} ${st[1]}`,
+      `grayboard_hosted_gate_bodies_total{site="gate",method="selection",outcome="keyed"} ${sel}`,
+      `grayboard_hosted_gate_bodies_total{site="gate",method="renew",outcome="keyed"} ${renew}`,
+      `grayboard_hosted_gate_bodies_total{site="gate",method="pending",outcome="miss"} 0`,
+      `grayboard_hosted_gate_bodies_total{site="prior",method="receipt",outcome="keyed"} ${renew}`,
+      `grayboard_hosted_gate_bodies_total{site="tool",method="dm_send",outcome="keyed"} ${renew}`,
+      `grayboard_hosted_gate_bodies_total{site="tool",method="board_post",outcome="keyed"} ${sel}`,
+      `grayboard_hosted_gate_bodies_total{site="tool",method="board_post",outcome="miss"} ${sel - 3}`,
+    ].join("\n");
+    const a = queueCumulative(parseMetrics(expo2(10, [90, 10], 80, 4, 2)));
+    const b = queueCumulative(parseMetrics(expo2(30, [290, 30], 260, 14, 12)));
+    const q = queueStats(combineQueue(b, a, -1), 2);
+    // 200 statements and 180 round trips over the window's 20 bodies.
+    expect(q.sites.gate!.statements).toBe(10);
+    expect(q.sites.gate!.roundTrips).toBe(9);
+    expect(q.gate.gate).toMatchObject({ keyed: 20, miss: 0 });
+    // The prior site's by method as `prior.<method>` (#1537 C5/C7), the tool site's as `tool.<method>` (#1573); its
+    // `tool` line sums them.
+    expect(q.gateMethods).toEqual({
+      selection: { keyed: 10, miss: 0, skipped: 0 }, renew: { keyed: 10, miss: 0, skipped: 0 }, "prior.receipt": { keyed: 10, miss: 0, skipped: 0 },
+      "tool.dm_send": { keyed: 10, miss: 0, skipped: 0 }, "tool.board_post": { keyed: 10, miss: 10, skipped: 0 },
+    });
+    expect(q.gate.tool).toMatchObject({ keyed: 20, miss: 10 });
+    // A site with no statement series (SQLite) reads null.
+    expect(queueStats(queueCumulative(parseMetrics(expo([10, 10, 10, 10], 0.005, [3, 3, 3, 3]))), 1).sites.gate!.statements).toBeNull();
   });
 
   test("--pg-latency needs --pg", () => {
     expect(() => options(["--pg-latency", "1"])).toThrow("--pg-latency needs --pg");
     expect(options(["--pg", "postgres://x@127.0.0.1:5432/postgres", "--pg-latency", "0.25"]).pgLatencyMs).toBe(0.25);
     expect(options([]).pgLatencyMs).toBeUndefined();
+  });
+});
+
+// #1537: the pilot gate, judged on synthetic windows. The base fleet passes the pilot bar and fails the latency one: every
+// tool call and client op is 80% at ≤ 100 ms and 100% at ≤ 1 s, and the world stop is 50%.
+describe("loadtest pilot gate (#1537)", () => {
+  const argv = ["--sessions", "300", "--users", "100", "--period", "6", "--duration", "60", "--warmup", "10", "--service-workers", "0"];
+  // n calls: `fast` at 0.05 s, up to `sec` at 0.5 s, the rest at 2 s, as the driver's cumulative buckets count them.
+  const hist = (n: number, fast: number, sec: number): Hist => ({ buckets: BUCKETS.map(le => le < 0.05 ? 0 : le < 0.5 ? fast : le < 2.5 ? sec : n), count: n, sum: 0, errors: 0 });
+  const CLIENT_OPS = ["inbox", "renew", "receipt", "dm_send", "board_post"];
+  const win = (t: number, steady = true): Window => ({
+    at: t * 1000, t, steady, churning: false, rss: 1e8, heap: 5e7, leases: 300, listens: 300, holding: 300, live: 300, refusals: {},
+    tools: { dm_send: { count: 500, fast: 400, le1: 500 } },
+    // A service op's small pool (peer_list), held to the pooled small-pool rule.
+    client: { ...Object.fromEntries(CLIENT_OPS.map(op => [op, hist(500, 400, 500)])), peer_list: hist(10, 8, 10) },
+    clientErrors: {}, driverLagP99: 0, ops: 500, loadavg: [1, 1, 1],
+  });
+  const stop = (share: number) => queueStats({ wait: new Map(), hold: new Map(), keyed: new Map(), worldStop: share * 50, gate: new Map(), gateMethod: new Map(), statements: new Map(), roundTrips: new Map() }, 50);
+  const base = (gate: string[] = ["--gate", "pilot"]): JudgeInput => ({
+    o: options([...argv, ...gate]), windows: [win(10, false), ...[20, 30, 40, 50, 60].map(t => win(t))], connected: 300, connectErrors: {},
+    finals: [{ type: "final", driver: 0, sentDm: ["0:1", "1:1"], recvDm: ["0:1", "1:1"], posts: 3, boardRecv: 5, misdelivered: 0, misdeliveredFirst: [], lapsed: 0, lapsedFirst: [], svcSent: [], svcGot: [], svcDone: [], svcPosts: [], laneEcho: 0, svcReads: {}, errors: {} }],
+    refusedAll: {}, drained: { leases: 0, listens: 0, posts: 0, holding: 0, watches: 0, exchanges: 0 }, queueSteady: stop(0.5),
+  });
+  // Every tool's calls over the steady period, as the run sums them from the server's exposition: 2,500 dm_send calls,
+  // 2,000 at ≤ 0.1 s, the rest in (0.25 s, 0.5 s], so p99 interpolates to 487.5 ms.
+  const toolSteadyHist = toolHist(parseMetrics(LATENCY_BUCKETS.map(le => `grayboard_tool_call_duration_seconds_bucket{tool="dm_send",le="${le}"} ${le < 0.1 ? 0 : le < 0.5 ? 2000 : 2500}`)
+    .concat(`grayboard_tool_call_duration_seconds_bucket{tool="dm_send",le="+Inf"} 2500`, `grayboard_tool_call_duration_seconds_sum{tool="dm_send"} 500`, `grayboard_tool_call_duration_seconds_count{tool="dm_send"} 2500`).join("\n")));
+  const items = (v: Verdict): string[] => [...new Set(v.tagged.map(f => f.item ?? "other"))];
+
+  // The driver's count: a session whose lease op answers LeaseUnavailable lapsed, once per session (it never reopens a
+  // lease); any other refusal isn't a lapse. Mutations: counting every LeaseUnavailable, or any error.
+  test("the driver counts a lapsed lease once per session, from a lease op's LeaseUnavailable only", async () => {
+    const a = { spec: { index: 7, name: "load-7" } }, b = { spec: { index: 8, name: "load-8" } };
+    const before = lapses().lapsed;
+    expect(await leaseOp(a, "renew", async () => 1)).toBe(1);
+    await leaseOp(a, "inbox", () => Promise.reject(new SubscriberError("rate_limited")));
+    expect(lapses().lapsed - before).toBe(0);
+    await leaseOp(a, "renew", () => Promise.reject(new LeaseUnavailable()));
+    await leaseOp(a, "receipt", () => Promise.reject(new LeaseUnavailable()));
+    await leaseOp(b, "inbox", () => Promise.reject(new LeaseUnavailable("unbound")));
+    expect(lapses().lapsed - before).toBe(2);
+    expect(lapses().lapsedFirst.slice(-2)).toEqual(["session 7 (load-7) at renew: not_found", "session 8 (load-8) at inbox: unbound"]);
+  });
+
+  test("both edges are bucket edges of the client's and the server's histograms", () => {
+    expect(BUCKETS).toEqual(LATENCY_BUCKETS);
+    for (const e of [GATE_EDGE.latency.le, GATE_EDGE.pilot.le]) expect(BUCKETS).toContain(e);
+  });
+
+  test("--gate is latency (the default, unset) or pilot", () => {
+    expect(options([]).gate).toBeUndefined();
+    expect(options(["--gate", "latency"]).gate).toBeUndefined();
+    expect(options(["--gate", "pilot"]).gate).toBe("pilot");
+    expect(() => options(["--gate", "fast"])).toThrow(`--gate is latency or pilot, not "fast"`);
+  });
+
+  test("the server's tool calls at ≤ 1 s and the pooled histogram come from the exposition", () => {
+    const s = parseMetrics([`grayboard_tool_call_duration_seconds_bucket{tool="a",le="0.1"} 3`, `grayboard_tool_call_duration_seconds_bucket{tool="a",le="1"} 7`,
+      `grayboard_tool_call_duration_seconds_bucket{tool="a",le="+Inf"} 9`, `grayboard_tool_call_duration_seconds_count{tool="a"} 9`,
+      `grayboard_tool_call_duration_seconds_bucket{tool="b",le="0.1"} 1`, `grayboard_tool_call_duration_seconds_bucket{tool="b",le="1"} 1`,
+      `grayboard_tool_call_duration_seconds_bucket{tool="b",le="+Inf"} 1`, `grayboard_tool_call_duration_seconds_count{tool="b"} 1`].join("\n"));
+    expect(toolCumulative(s).get("a")).toEqual({ count: 9, fast: 3, le1: 7 });
+    expect(toolHist(s)).toEqual({ le: [0.1, 1, Infinity], cum: [4, 8, 10], sum: 0, count: 10 });
+    expect(toolHist([])).toBeUndefined();
+    expect(quantile(toolSteadyHist!, 0.99)).toBeCloseTo(0.4875, 9);
+  });
+
+  test("a fleet that holds up passes, and the verdict block names each item with what it measured", () => {
+    const i = base(), v = judge(i);
+    expect(v.failures).toEqual([]);
+    expect(pilotBlock(i.o, v, i.connected, i.queueSteady, toolSteadyHist)).toEqual([
+      "PILOT GATE: PASS",
+      "  connect: PASS (300/300 sessions)",
+      "  lost DMs: PASS (0 of 2)",
+      "  lapsed leases: PASS (0 lapsed outside churn and close; 0 steady windows short of 300 leases or listens)",
+      "  tool p99 ≤ 1 s: PASS (server tools p99 487.50 ms over 2500 steady calls; 0 checks over)",
+      "  world stop ≤ 70%: PASS (50.0%)",
+      "  other checks: PASS",
+    ]);
+    // 70.0% is within the bar.
+    expect(judge({ ...i, queueSteady: stop(0.7) }).failures).toEqual([]);
+  });
+
+  // Each item failing alone fails the gate on that item only. Mutations: the lease check's tag dropped; the world stop
+  // gated on `>=` (70% fails) or not at all; the client edge left at 0.1 s; the server's `le1` read as `fast`.
+  test("each item fails alone, and fails the gate", () => {
+    const cases: [string, (i: JudgeInput) => void, string, RegExp][] = [
+      ["connect", i => { i.connected = 299; }, "connect", /^only 299 of 300 sessions connected$/],
+      ["dms", i => { i.finals[0]!.recvDm = ["0:1"]; }, "dms", /^1 of 2 DMs never reached their recipient \(e\.g\. 1:1\)$/],
+      ["leases", i => { i.windows[3]!.leases = 299; }, "leases", /^t=40s: 299 leases, 300 listens; want 300 of each$/],
+      // A lease that lapsed and was replaced inside one window: the gauge reads 300 every window, the driver saw it.
+      ["lapse", i => { Object.assign(i.finals[0]!, { lapsed: 1, lapsedFirst: ["session 7 (load-7) at renew: not_found"] }); }, "leases", /^1 delivery leases lapsed outside churn and close \(e\.g\. session 7 \(load-7\) at renew: not_found\)$/],
+      ["server p99", i => { i.windows[3]!.tools.dm_send!.le1 = 480; }, "p99", /^t=40s: 96\.00% of 500 tool calls at ≤ 1 s; want ≥ 99%$/],
+      ["client p99", i => { for (const w of i.windows) w.client.renew = hist(500, 400, 480); }, "p99", /^client renew: 96\.00% of 2500 at ≤ 1 s \(clean steady windows\)$/],
+      ["service op p99", i => { for (const w of i.windows) w.client.peer_list = hist(10, 8, 9); }, "p99", /^client peer_list: 90\.00% of 50 at ≤ 1 s \(clean steady windows\); want at most 1% slower, rounded up$/],
+      ["missing le1", i => { for (const w of i.windows) delete w.tools.dm_send!.le1; }, "p99", /^dm_send: 0\.00% of 2500 at ≤ 1 s over the steady period$/],
+      ["world stop", i => { i.queueSteady = stop(0.71); }, "stop", /^steady world stop 71\.0%; want ≤ 70\.0%$/],
+      ["world stop unmeasured", i => { i.queueSteady = null; }, "stop", /^no steady write-queue sample: world stop unmeasured$/],
+      ["other", i => { i.windows[2]!.clientErrors = { "dm_send/x": 1 }; }, "other", /^client errors: \{"dm_send\/x":1\}$/],
+    ];
+    for (const [name, mutate, item, text] of cases) {
+      const i = base();
+      mutate(i);
+      const v = judge(i), block = pilotBlock(i.o, v, i.connected, i.queueSteady, toolSteadyHist);
+      expect({ name, items: items(v) }).toEqual({ name, items: [item] });
+      expect({ name, matched: v.failures.some(f => text.test(f)) }, v.failures.join("\n")).toEqual({ name, matched: true });
+      expect({ name, verdict: block[0] }).toEqual({ name, verdict: "PILOT GATE: FAIL" });
+      const failing = block.slice(1).filter(l => /: FAIL/.test(l)).map(l => l.trim().split(":")[0]);
+      const label: string = { connect: "connect", dms: "lost DMs", leases: "lapsed leases", p99: "tool p99 ≤ 1 s", stop: "world stop ≤ 70%", other: "other checks" }[item]!;
+      expect({ name, failing }).toEqual({ name, failing: [label] });
+    }
+  });
+
+  // The latency bar is the one the run always had: the same fleet fails on every 100 ms check, worded as before, and the
+  // world stop isn't gated. Mutation: the edge picked from the pilot bar regardless of --gate.
+  test("the latency bar is unchanged", () => {
+    const i = base([]);
+    i.queueSteady = stop(0.99);
+    const want = [
+      ...[20, 30, 40, 50, 60].map(t => `t=${t}s: 80.00% of 500 tool calls at ≤ 100 ms; want ≥ 99%`),
+      "dm_send: 80.00% of 2500 at ≤ 100 ms over the steady period",
+      "all tools: 80.00% of 2500 at ≤ 100 ms over the steady period",
+      ...CLIENT_OPS.map(op => `client ${op}: 80.00% of 2500 at ≤ 100 ms (clean steady windows)`),
+      "client peer_list: 80.00% of 50 at ≤ 100 ms (clean steady windows); want at most 1% slower, rounded up",
+    ];
+    expect(judge(i).failures).toEqual(want);
+    // Without the 1 s count (a latency run's windows carry none) the verdict is the same.
+    for (const w of i.windows) delete w.tools.dm_send!.le1;
+    expect(judge(i).failures).toEqual(want);
+    // A driver-seen lapse adds nothing to the latency bar's list (the summary still reports it).
+    const lapsedRun = judge({ ...i, finals: [{ ...i.finals[0]!, lapsed: 2, lapsedFirst: ["a", "b"] }] });
+    expect({ failures: lapsedRun.failures, lapsed: lapsedRun.lapsed, first: lapsedRun.lapsedFirst }).toEqual({ failures: want, lapsed: 2, first: ["a", "b"] });
+    // The connect miss comes first, as the run always reported it.
+    expect(judge({ ...i, connected: 2, connectErrors: { http_429: 298 } }).failures[0]).toBe(`only 2 of 300 sessions connected: {"http_429":298}`);
   });
 });
 

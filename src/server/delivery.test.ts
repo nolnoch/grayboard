@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
-import { refusalCount } from "./metrics.ts";
+import { gateCount, GATE_METHODS, type GateMethod, refusalCount } from "./metrics.ts";
 import { until } from "../../tests/support/until.ts";
 import { AppSession } from "../../tests/support/app_session.ts";
 import { hostedRowCount } from "../../tests/support/hosted_rows.ts";
@@ -65,6 +65,23 @@ test("stale receipt audit survives rollback exactly once without committing any 
   expect(JSON.stringify(rows)).not.toContain(lease.capability);
   await delivery.receipt(bob, context(bob), lease.capability, [items[0]!.id]);
   expect(store.db.query("SELECT count(*) AS n FROM access_log WHERE action = 'hosted.stale_capability'").get()).toEqual({ n: 1 });
+});
+
+// #1537 PR 0: each hosted call's gate body is counted under its own method (SQLite: every gate body is `skipped`), so
+// the subscriber calls' second gate (control) is told from the exchange's selection. Mutation: control's or owning's
+// method dropped (counted under `control` or `owning`); snapshot's (counted under `tool`).
+test("the gate counter labels each call's gate body by method: selection, open, renew, pending, receipt, release, whoami", async () => {
+  const at = Object.fromEntries(GATE_METHODS.map(m => [m, gateCount("gate", "skipped", m)])) as Record<GateMethod, number>;
+  const counted = () => Object.fromEntries(GATE_METHODS.map(m => [m, gateCount("gate", "skipped", m) - at[m]]).filter(([, n]) => n !== 0));
+  await hosted.snapshot(bob, context(bob));
+  const lease = await delivery.open(bob, context(bob));
+  await delivery.renew(bob, context(bob), lease.capability);
+  await send();
+  const items = await delivery.pending(bob, context(bob), lease.capability);
+  await delivery.receipt(bob, context(bob), lease.capability, [items[0]!.id]);
+  await hosted.whoami(bob, context(bob));
+  await delivery.release(bob, context(bob), lease.capability);
+  expect(counted()).toEqual({ selection: 1, open: 1, renew: 1, pending: 1, receipt: 1, whoami: 1, release: 1 });
 });
 
 test("shutdown detaches each accepted lease with one hosted.lease_detached row naming its session (#424)", async () => {

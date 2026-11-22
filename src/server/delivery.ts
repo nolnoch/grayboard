@@ -1,15 +1,16 @@
 import { randomBytes } from "node:crypto";
 import { DEFAULT_HOSTED_CAPS, type HostedCaps } from "./config.ts";
 import { refOf, type PendingRef } from "../core/boards.ts";
-import { testPause, testPauseAsync } from "../shared/testpause.ts";
+import { testPause, testPauseAsync, testPaused } from "../shared/testpause.ts";
 import { ApplicationError, type ApplicationSession, type DeliveryEvent, type IdentityInfo } from "./application.ts";
 import type { OAuthPrincipal } from "./oauth.ts";
-import type { HostedSessions, SessionContext } from "./hosted.ts";
+import type { HostedSessions, SessionContext, Verdict } from "./hosted.ts";
 import type { HostedSession } from "./hosted-types.ts";
-import type { Read } from "./store/tx.ts";
+import type { Board } from "./store/boards.ts";
+import { ProbeWrite, type Read, type Tx } from "./store/tx.ts";
 import { atSite } from "./store/queue.ts";
 import { hostedFailure } from "./hosted-diagnostics.ts";
-import { countRefusal } from "./metrics.ts";
+import { countGate, countRefusal } from "./metrics.ts";
 
 export type DeliveryPrincipal = OAuthPrincipal;
 export type DeliveryLease = { capability: string; identity: IdentityInfo; expiresAt: number; ownership: number; bind_gen: number };
@@ -19,7 +20,8 @@ export type PendingDelivery = { id: string; actionable: boolean; event: Delivery
 export type DeliveryOpenOptions = { context?: boolean };
 export type DeliveryHooks = { changed?: () => void | Promise<void>; closed?: () => void | Promise<void> };
 // `r`: the body's Tx when the check runs inside one, so it sees that body's own revokes; else the pool.
-export type DeliveryOptions = { isAuthorized(principal: DeliveryPrincipal, r?: Read): boolean | Promise<boolean>; now?: () => number; caps?: HostedCaps["leases"] };
+// `keyed: false`: renew and receipt run exclusive on Postgres too (a test's reference run; #1510 chunk 4).
+export type DeliveryOptions = { isAuthorized(principal: DeliveryPrincipal, r?: Read): boolean | Promise<boolean>; now?: () => number; caps?: HostedCaps["leases"]; keyed?: false };
 type Issued = { item: PendingDelivery; ref?: PendingRef };
 // What a retried receipt of an acknowledged id re-checks, without the item's body (#805).
 type Acked = { ownership: number; bind_gen: number; address?: string; board?: string };
@@ -36,6 +38,9 @@ type Lease = {
   row: HostedSession | undefined;
 };
 const notify = (operation: "delivery.changed" | "delivery.closed", fn?: () => void | Promise<void>) => { try { void Promise.resolve(fn?.()).catch(e => hostedFailure(operation, e)); } catch (e) { hostedFailure(operation, e); } };
+// A keyed renew's or receipt's miss (#1510 chunk 4): thrown inside the keyed body, so its transaction rolls back with
+// nothing committed and no effect run, then the exclusive body runs as it would have.
+class KeyedMiss extends Error {}
 class StaleCapability extends ApplicationError {
   constructor() { super("not_found", "no live delivery lease for this session; it was closed (expired or changed). Open a new one."); }
 }
@@ -48,8 +53,67 @@ function itemOf(event: DeliveryEvent, lease: Lease): PendingDelivery {
 }
 export function createDelivery(hosted: HostedSessions, options: DeliveryOptions) {
   const application = hosted.application, store = application.repo.hosted, pool = application.repo.read;
+  // Renew and receipt keyed by their root on Postgres (#1510 chunk 4, docs/future/postgres-server.md D4); SQLite's one
+  // writer has nothing to gain, and its Repo has neither the probe nor the opt-in.
+  const { readsOnly, writeKeyedEffects } = application.repo;
+  const keyedOn = options.keyed !== false && readsOnly !== undefined && writeKeyedEffects !== undefined;
+  // A keyed attempt at `site` under `root`'s key and `keys` (receipt's `board:<name>` keys, #1595), then the exclusive body on a miss. `probe`: the body's reads, in a
+  // read-only probe (ProbeWrite before any write); `write`: its writes. Inside the body a ProbeWrite, an ApplicationError
+  // (a stale capability among them: the exclusive body refuses it again and audits it once, outside) or a KeyedMiss is a
+  // miss: the body throws, so it rolls back, and its effects and `committed` never run. Any other failure is the request's.
+  async function keyedOr<P, T, R>(site: "renew" | "receipt", root: string, keys: readonly string[], notices: readonly string[], probe: (tx: Tx) => Promise<P>, write: (tx: Tx, read: P) => Promise<T>,
+    committed: (value: T) => R, exclusive: () => Promise<Awaited<R>>): Promise<Awaited<R>> {
+    if (!keyedOn) { countGate(site, "skipped"); return exclusive(); }
+    try {
+      const out = await atSite(site, () => writeKeyedEffects!([`root:${root}`, ...keys], notices, async tx => {
+        let read: P;
+        try { read = await readsOnly!(tx, () => probe(tx)); }
+        catch (error) { throw error instanceof ProbeWrite || error instanceof ApplicationError ? new KeyedMiss() : error; }
+        try { return await write(tx, read); }
+        catch (error) { throw error instanceof ApplicationError ? new KeyedMiss() : error; }
+      }, committed));
+      countGate(site, "keyed");
+      return out;
+    } catch (error) {
+      if (!(error instanceof KeyedMiss)) throw error;
+    }
+    countGate(site, "miss");
+    return exclusive();
+  }
   const ttl = hosted.leaseTtl, now = options.now ?? hosted.now, caps = options.caps ?? DEFAULT_HOSTED_CAPS.leases;
   const leases = new Map<string, Lease>();
+  // A board's kind by name, for receipt's plan (#1595). Never stale only because a board's kind is fixed at its create
+  // (no store write changes `boards.kind`; archive sets only archived_at) and a board is never deleted, so a name is
+  // never reused for another kind. A change that adds either must drop this cache (docs/future/postgres-server.md D4).
+  // Bounded: cleared when full (boards are few).
+  const boardKinds = new Map<string, Board["kind"]>();
+  const BOARD_KINDS_MAX = 4096;
+  // The queue boards a keyed receipt of `ids` holds `board:<name>` for (#1595), planned before its body from the lease's
+  // issued items (in memory, no authorization) and the kind cache; a board's first sighting reads the pool. The body's
+  // probe decides again on its own Tx and misses on a queue board this left out (a concurrent pending issued it after
+  // the plan), so the plan only has to be right in the common case. Ids the reads refuse (not an array, too many,
+  // duplicates, no lease) plan nothing: the probe refuses them, a miss. A board the pool doesn't find is held anyway.
+  async function planReceiptBoards(capability: string, ids: unknown): Promise<string[]> {
+    if (!Array.isArray(ids) || ids.length > 100 || new Set(ids).size !== ids.length) return [];
+    const lease = leases.get(capability);
+    if (!lease) return [];
+    const pushed = new Set<string>();
+    for (const id of ids) {
+      const issued = lease.issued.get(id);
+      if (issued?.ref?.kind === "push") pushed.add(boardOf(issued.item)!);
+    }
+    // Split before the await: a concurrent plan may cache one of `unknown` meanwhile, which must not count it twice.
+    const unknown = [...pushed].filter(b => !boardKinds.has(b)), queue = [...pushed].filter(b => boardKinds.get(b) === "queue");
+    const found = await Promise.all(unknown.map(b => application.repo.boards.get(pool, b)));
+    unknown.forEach((b, i) => {
+      const board = found[i];
+      if (!board) { queue.push(b); return; }
+      if (boardKinds.size >= BOARD_KINDS_MAX) boardKinds.clear();
+      boardKinds.set(b, board.kind);
+      if (board.kind === "queue") queue.push(b);
+    });
+    return queue.sort();
+  }
   // A session holds at most one lease (a reopen finishes the previous first): looked up and counted without a
   // scan (#805).
   const bySession = new Map<string, Lease>(), perUser = new Map<number, number>();
@@ -141,7 +205,9 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
     identityFull(p: DeliveryPrincipal, context: SessionContext, capability: string, checked: { row: HostedSession | undefined }): string {
       try { return getChecked(p, context, capability, checked.row).identity.identity_full; } catch (error) { return refused(p, context, error); }
     },
-    async open(p: DeliveryPrincipal, context: SessionContext, hooks: DeliveryHooks = {}, openOptions: DeliveryOpenOptions = {}): Promise<DeliveryLease> {
+    // `prior` (open, renew, pending, receipt): the request's exchange's verdict (#1537 C5, C7), which stands in for the
+    // call's second gate body (hosted.ts withPrior); without one the call runs the full gate.
+    async open(p: DeliveryPrincipal, context: SessionContext, hooks: DeliveryHooks = {}, openOptions: DeliveryOpenOptions = {}, prior?: Verdict): Promise<DeliveryLease> {
       let previous: Lease | undefined;
       return hosted.owning(p, context, async (row, _defer, tx) => {
         const holds = await application.hostedHolds(tx, row.session_id);
@@ -195,7 +261,7 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
           context: openOptions.context ?? true, row };
         track(lease);
         return opened(lease, true, hooks);
-      });
+      }, undefined, "open", prior);
     },
     accept(result: DeliveryLease) {
       const attempt = attempts.get(result);
@@ -208,9 +274,30 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
       }
       attempts.delete(result);
     },
-    async renew(p: DeliveryPrincipal, context: SessionContext, capability: string, hooks?: DeliveryHooks) {
+    async renew(p: DeliveryPrincipal, context: SessionContext, capability: string, hooks?: DeliveryHooks, prior?: Verdict) {
       return hosted.control(p, context, false, async row => {
-        const { lease } = await atSite("renew", () => store.write(async tx => {
+        const renewed = ({ lease, deadline }: { lease: Lease; deadline: number }) => {
+          // Nothing awaits between the body's check and here; kept as the in-memory side's own guard.
+          if (leases.get(capability) !== lease) stale(p, context, capability);
+          lease.expiresAt = deadline;
+          if (hooks) lease.hooks = hooks;
+          return { lease };
+        };
+        // Keyed (D4): the same reads in a probe, then only the lease's two columns and their notice (hosted.update's,
+        // which delivery's and the streams' listeners need: a lease row's deadline is what `deliver()` and a live's
+        // stamp judge). Any difference from the gate's row (its ownership, generation, grant or root), a lease that
+        // no longer matches it, or a stale capability is a miss: the exclusive body then renews or refuses.
+        const { lease } = await keyedOr("renew", row.session_id, [], ["hosted.update"], async tx => {
+          const fresh = await store.lock(tx, row.session_id);
+          if (!fresh || fresh.session_id !== row.session_id || fresh.root_session_id !== null || fresh.ownership_id !== row.ownership_id ||
+            fresh.bind_gen !== row.bind_gen || fresh.grant_id !== row.grant_id) throw new KeyedMiss();
+          return { fresh, lease: await get(p, context, capability, fresh, tx) };
+        }, async (tx, { fresh, lease }) => {
+          const deadline = now() + ttl;
+          await store.update(tx, fresh.session_id, { lease_deadline: deadline, last_seen_at: now() });
+          if (leases.get(capability) !== lease) throw new KeyedMiss();
+          return { lease, deadline };
+        }, renewed, () => atSite("renew", () => store.write(async tx => {
           // Locked before it is read (#807 P3 C8 R2): a bind's generation bump committed meanwhile is the row judged here,
           // and the update writes the lease's columns only.
           const fresh = await store.lock(tx, row.session_id);
@@ -221,17 +308,11 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
           // rolls the new deadline back, and stays finished.
           if (leases.get(capability) !== lease) stale(p, context, capability);
           return { lease, deadline };
-        }, ({ lease, deadline }) => {
-          // Nothing awaits between the body's check and here; kept as the in-memory side's own guard.
-          if (leases.get(capability) !== lease) stale(p, context, capability);
-          lease.expiresAt = deadline;
-          if (hooks) lease.hooks = hooks;
-          return { lease };
-        }));
+        }, renewed)));
         return describe(lease);
-      }).catch(error => refused(p, context, error));
+      }, undefined, "renew", prior).catch(error => refused(p, context, error));
     },
-    async pending(p: DeliveryPrincipal, context: SessionContext, capability: string, limit = 100): Promise<PendingDelivery[]> {
+    async pending(p: DeliveryPrincipal, context: SessionContext, capability: string, limit = 100, prior?: Verdict): Promise<PendingDelivery[]> {
       return hosted.control(p, context, false, async row => {
         const lease = await get(p, context, capability, row);
         await testPauseAsync("hosted:pending:in-gate");
@@ -248,15 +329,14 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
         for (const item of unseen) lease.issued.set(item.id, { item: structuredClone(item), ...(item.event.kind === "board" ? { ref: refOf(item.event.item) } : {}) });
         if (!items.length) drained.add(drainKey(lease));
         return items;
-      }).catch(error => refused(p, context, error));
+      }, undefined, "pending", prior).catch(error => refused(p, context, error));
     },
-    async receipt(p: DeliveryPrincipal, context: SessionContext, capability: string, ids: string[]): Promise<void> {
-      return hosted.control(p, context, false, async () => {
+    async receipt(p: DeliveryPrincipal, context: SessionContext, capability: string, ids: string[], prior?: Verdict): Promise<void> {
+      return hosted.control(p, context, false, async root => {
         await testPauseAsync("hosted:receipt:before-txn");
-        await atSite("receipt", () => store.write(async tx => {
-          testPause("hosted:receipt:in-txn");
-          // Locked before its generation is judged against the receipts (#807 P3 C8 R2).
-          const row = "id" in context ? await store.lock(tx, context.id) : undefined;
+        // The receipt's reads, on the body's Tx: the row, the lease, each id's issue and its fence, each board's
+        // visibility, and the directs' order against the unread ones. `row`: context's row, locked.
+        const reads = async (tx: Tx, row: HostedSession | undefined) => {
           const lease = await get(p, context, capability, row, tx);
           if (!row || row.root_session_id) stale(p, context, capability);
           if (!Array.isArray(ids) || ids.length > 100 || new Set(ids).size !== ids.length) stale(p, context, capability);
@@ -279,28 +359,59 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
             const requested = new Set(direct.map(r => r.item.id));
             if (unread.length < direct.length || unread.slice(0, direct.length).some(e => !requested.has(itemOf(e, lease).id))) stale(p, context, capability);
           }
+          return { lease, records, direct };
+        };
+        const writes = async (tx: Tx, { lease, records, direct }: Awaited<ReturnType<typeof reads>>) => {
           await application.receiptDirect(tx, lease.session, direct.map(r => r.item.event.kind === "direct" ? r.item.event.message.id : stale(p, context, capability)));
           await application.receiptBoards(tx, lease.session, records.filter(r => r.ref).map(r => r.ref!));
           return { lease, records };
-        }, ({ lease, records }) => {
-          // No lease recheck: get rechecked after its await, the body holds the queue, and a lease a shutdown finished
-          // since is detached (its maps cleared), so writing to it changes nothing a caller reads.
+        };
+        const committed = ({ lease, records }: { lease: Lease; records: Issued[] }) => {
+          // No lease recheck: get rechecked after its await, the body holds its root's key (or the queue), and a lease
+          // a shutdown finished since is detached (its maps cleared), so writing to it changes nothing a caller reads.
           for (const { item } of records) {
             lease.issued.delete(item.id);
             lease.acknowledged.set(item.id, { ownership: item.ownership, bind_gen: item.bind_gen, ...(item.address !== undefined ? { address: item.address } : {}), ...(boardOf(item) !== undefined ? { board: boardOf(item) } : {}) });
           }
           drained.add(drainKey(lease));
           while (lease.acknowledged.size > ACKED_HISTORY) lease.acknowledged.delete(lease.acknowledged.keys().next().value!);
-        }));
-      }).catch(error => refused(p, context, error));
+          // Emptied once applied: the body's value can outlive the call (bun:jsc kept this array reachable after the
+          // receipt returned once its reads and writes became functions of their own), and it holds the items' bodies (#805).
+          records.length = 0;
+        };
+        // Keyed (D4): the reads in a probe (pending's lost-ack repair, a write, is a miss there), then the session's own
+        // rows: the direct messages' delivered_at, locked in id order, then each address's cursor (handleAck), then each board
+        // item's outbox row, a queue push's take credit (claim_events) and a push subscription's row, and receiptBoards'
+        // in-memory effects. It holds `board:<name>` for each queue board among its pushes (#1595), planned here; the
+        // probe judges the boards again on its Tx and misses on a queue board the plan left out (`held`, never re-derived
+        // from the records). A row other than the gate's root (or one whose ownership, generation, grant or root changed
+        // since it), such a board, or a stale capability is a miss.
+        const held = keyedOn ? await planReceiptBoards(capability, ids) : [];
+        if (testPaused("delivery:receipt:planned")) await testPauseAsync("delivery:receipt:planned");
+        const heldSet = new Set(held);
+        await keyedOr("receipt", root.session_id, held.map(b => `board:${b}`), [], async tx => {
+          const row = "id" in context && context.id === root.session_id ? await store.lock(tx, context.id) : undefined;
+          if (!row || row.root_session_id !== null || row.ownership_id !== root.ownership_id || row.bind_gen !== root.bind_gen || row.grant_id !== root.grant_id) throw new KeyedMiss();
+          const read = await reads(tx, row);
+          for (const board of new Set(read.records.filter(r => r.ref?.kind === "push").map(r => boardOf(r.item)!))) {
+            if (!heldSet.has(board) && (await application.repo.boards.get(tx, board))?.kind === "queue") throw new KeyedMiss();
+          }
+          return read;
+        }, writes, committed, () => atSite("receipt", () => store.write(async tx => {
+          testPause("hosted:receipt:in-txn");
+          // Locked before its generation is judged against the receipts (#807 P3 C8 R2).
+          const row = "id" in context ? await store.lock(tx, context.id) : undefined;
+          return writes(tx, await reads(tx, row));
+        }, committed)));
+      }, undefined, "receipt", prior).catch(error => refused(p, context, error));
     },
     async release(p: DeliveryPrincipal, context: SessionContext, capability: string) {
       return hosted.control(p, context, true, async row => {
-        await store.write(async tx => {
+        await atSite("end", () => store.write(async tx => {
           await get(p, context, capability, await store.lock(tx, row.session_id), tx);
           await store.end(tx, row.session_id, "closed", now());
-        });
-      }, () => undefined).catch(error => refused(p, context, error));
+        }));
+      }, () => undefined, "release").catch(error => refused(p, context, error));
     },
     async cancel(result: DeliveryLease) {
       const attempt = attempts.get(result);
@@ -312,12 +423,12 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
       const capability = result.capability;
       await hosted.gate(lease.sessionId).bind(async () => {
         if (leases.get(capability) !== lease || !lease.cancelledCreator || lease.pendingOpens.size || lease.acceptedVersion) return;
-        await store.write(async tx => {
+        await atSite("end", () => store.write(async tx => {
           if (matches(lease, await store.lock(tx, lease.sessionId))) await store.end(tx, lease.sessionId, "closed", now());
           await hosted.settle(tx, lease.sessionId);
         }, () => {
           finish(lease);
-        });
+        }));
       });
     },
     revalidate() { hosted.sweep().catch(e => hostedFailure("hosted.sweep", e)); },

@@ -14157,7 +14157,7 @@ class StdioServerTransport {
 // package.json
 var package_default = {
   name: "grayboard",
-  version: "2.4.2",
+  version: "3.0.0",
   description: "Durable Claude-to-Claude message bus over the channels protocol",
   type: "module",
   private: true,
@@ -31558,6 +31558,7 @@ var StreamableHTTPClientTransport = class {
 
 // adapters/hosted-core/src/wire.ts
 import { setTimeout as sleep3 } from "timers/promises";
+import { connect as tcpConnect } from "net";
 var DELIVERY_META = "io.github.nolnoch.grayboard/delivery";
 var LAUNCHER_META = "io.github.nolnoch.grayboard/launcher";
 var MODEL_META = "io.github.nolnoch.grayboard/model";
@@ -31621,11 +31622,24 @@ class ServerUnreachable extends Error {
   }
 }
 
+class ServerBusy extends ServerUnreachable {
+  retryAfterMs;
+  constructor(retryAfterMs) {
+    const ms = Number.isFinite(retryAfterMs) && retryAfterMs > 0 ? retryAfterMs : 1000;
+    super(new Error(`server at capacity (rate_limited); retry after ${ms} ms`));
+    this.retryAfterMs = ms;
+    this.message = "Server at capacity";
+  }
+}
+
 class OutcomeUnknown extends ServerUnreachable {
   constructor(cause) {
     super(cause);
     this.message = "Server unreachable mid-call; it may have taken effect, so check (dm_history, board_read, claim_list) before calling it again";
   }
+}
+
+class ConnectProbeFailed extends ServerUnreachable {
 }
 
 class SubscriptionClosed extends Error {
@@ -31646,8 +31660,8 @@ function scopeRefusal(error) {
   }
   return false;
 }
-var networkCodes = new Set(["ECONNREFUSED", "ConnectionRefused", "ECONNRESET", "ETIMEDOUT", "EHOSTUNREACH", "ENETUNREACH", "ENOTFOUND", "EAI_AGAIN", "FailedToOpenSocket"]);
-var connectCodes = new Set(["ECONNREFUSED", "ConnectionRefused", "EHOSTUNREACH", "ENETUNREACH", "ENOTFOUND", "EAI_AGAIN", "FailedToOpenSocket"]);
+var networkCodes = new Set(["ECONNREFUSED", "ConnectionRefused", "ECONNRESET", "ETIMEDOUT", "EHOSTUNREACH", "ENETUNREACH", "ENOTFOUND", "EAI_AGAIN", "FailedToOpenSocket", "UND_ERR_CONNECT_TIMEOUT"]);
+var connectCodes = new Set(["ECONNREFUSED", "ConnectionRefused", "EHOSTUNREACH", "ENETUNREACH", "ENOTFOUND", "EAI_AGAIN", "FailedToOpenSocket", "UND_ERR_CONNECT_TIMEOUT"]);
 var gatewayStatuses = new Set([502, 503, 504]);
 function unreachable(error) {
   for (let e = error, depth = 0;e && depth < 8; e = e.cause, depth++) {
@@ -31691,6 +31705,43 @@ function abortOf(error, signal) {
   return false;
 }
 var connectMethods = new Set(["server/discover", "initialize"]);
+var connectProbe = {
+  deadlineMs: 5000,
+  coldMs: 30000,
+  lookup: undefined,
+  open: (host, port) => tcpConnect({ host, port, autoSelectFamily: true, ...connectProbe.lookup && { lookup: connectProbe.lookup } })
+};
+function proxied(url) {
+  const env = typeof process === "undefined" ? {} : process.env;
+  const names = url.protocol === "https:" ? ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"] : ["HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"];
+  return names.some((n) => !!env[n]);
+}
+function probe(url, signal) {
+  const host = url.hostname.replace(/^\[(.*)\]$/, "$1");
+  const port = Number(url.port || (url.protocol === "https:" ? 443 : 80));
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) {
+      reject(signal.reason);
+      return;
+    }
+    const socket = connectProbe.open(host, port);
+    const done = (error) => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", onAbort);
+      socket.destroy();
+      if (error === undefined)
+        resolve();
+      else
+        reject(error);
+    };
+    const ms = connectProbe.deadlineMs;
+    const timer = setTimeout(() => done(Object.assign(new Error(`connect to ${host}:${port} timed out after ${ms} ms`), { code: "ETIMEDOUT" })), ms);
+    const onAbort = () => done(signal.reason);
+    signal.addEventListener("abort", onAbort, { once: true });
+    socket.once("connect", () => done());
+    socket.once("error", () => done());
+  });
+}
 async function methodOf(request) {
   if (request.method !== "POST")
     return;
@@ -31707,6 +31758,9 @@ class Connection {
   admissionRetryAfterMs;
   connect;
   refusal;
+  busy;
+  answeredAt = -Infinity;
+  probes = false;
   constructor(wireOptions, authProvider, signal, beforeRetry) {
     this.wireOptions = wireOptions;
     this.signal = signal;
@@ -31724,29 +31778,47 @@ class Connection {
         this.decorate(outgoing);
         const signal = AbortSignal.any([request.signal, this.signal]);
         const method = await methodOf(request);
+        const connecting = method !== undefined && connectMethods.has(method);
+        if (this.probes && method === "tools/call" && performance.now() - this.answeredAt >= connectProbe.coldMs && !proxied(endpoint)) {
+          try {
+            await probe(endpoint, signal);
+          } catch (error) {
+            throw signal.aborted ? error : new ConnectProbeFailed(error);
+          }
+        }
         for (let attempt = 0;; attempt++) {
           if (attempt) {
-            await beforeRetry?.();
-            const token = await authProvider.token();
-            if (token)
-              outgoing.set("Authorization", `Bearer ${token}`);
-            else
-              outgoing.delete("Authorization");
+            try {
+              await beforeRetry?.();
+              const token = await authProvider.token();
+              if (token)
+                outgoing.set("Authorization", `Bearer ${token}`);
+              else
+                outgoing.delete("Authorization");
+            } catch (error) {
+              if (connecting)
+                this.busy = undefined;
+              throw error;
+            }
           }
           signal.throwIfAborted();
           const response = await fetch(request.clone(), { headers: outgoing, redirect: "error", signal });
-          if (method && connectMethods.has(method) && !response.ok && ![401, 403, 429].includes(response.status) && !gatewayStatuses.has(response.status)) {
+          this.answeredAt = performance.now();
+          if (connecting && !response.ok && ![401, 403, 429].includes(response.status) && !gatewayStatuses.has(response.status)) {
             this.refusal = new ConnectRefused(response.status, (await response.clone().text().catch(() => "")).slice(0, 4096));
           }
-          if (response.status !== 429)
-            return response;
-          const body = await response.clone().json().catch(() => {
+          const body = response.status === 429 ? await response.clone().json().catch(() => {
             return;
-          });
+          }) : undefined;
           const data = body?.error?.data;
-          if (data?.code !== "rate_limited" || typeof data.retry_after_ms !== "number" || !Number.isFinite(data.retry_after_ms) || data.retry_after_ms <= 0)
+          if (data?.code !== "rate_limited" || typeof data.retry_after_ms !== "number" || !Number.isFinite(data.retry_after_ms) || data.retry_after_ms <= 0) {
+            if (connecting)
+              this.busy = undefined;
             return response;
+          }
           this.admissionRetryAfterMs = data.retry_after_ms;
+          if (connecting)
+            this.busy = new ServerBusy(data.retry_after_ms);
           if (attempt === 7)
             return response;
           await response.body?.cancel().catch(() => {});
@@ -31764,7 +31836,7 @@ class Connection {
       try {
         await this.reachable(this.client.connect(transport, { signal, timeout: 1e4 }));
       } catch (error) {
-        throw this.refusal ?? error;
+        throw this.refusal ?? (!this.signal.aborted || this.signal.reason?.name === "TimeoutError" ? this.busy : undefined) ?? error;
       }
     };
   }
@@ -31875,6 +31947,7 @@ class NativeWire extends Connection {
   constructor(options, authProvider, signal, sessionID, beforeRetry) {
     super(options, authProvider, signal, beforeRetry);
     this.sessionID = sessionID;
+    this.probes = true;
   }
   decorate() {}
   meta() {
@@ -35117,10 +35190,12 @@ var fields = ["state", "message", "sessionID", "time", "held", "ownership", "ope
 var states = new Set(["approved", "active", "paused", "unbound", "unenrolled", "retrying", "rebinding", "degraded"]);
 var OPERATIONS = ["diagnostic_save", "diagnostic_emit", "pause", "configured_bind", "delivery", "enroll", "prepare", "subscriber", "reopen", "restore", "event", "stream", "before_bind", "after", "hook_dispose", "rpc_dispose", "latch_save", "wire_close", "subscription_close", "delivery_release", "release_upload", "session_end", "pause_save", "child_end", "watch_dispose", "login", "logout", "refresh", "child_register", "receipt_hook", "instructions", "login_link", "recover"];
 var operations = new Set(OPERATIONS);
-var codes = new Set(["retry_exhausted", "operation_failed", "identity_unknown", "alias_held", "not_found", "unbound", "refused", "internal_error", "bad_request", "unauthenticated", "forbidden", "rate_limited", "receipt_capacity", "child_bound", "child_registered_elsewhere", "has_children", "root_is_child", "invalid_registration", "invalid_response", "server_unreachable", "subscription_closed", "native_access_expired", "login_required", "refresh_outcome_unknown", "server_outdated", "delivery_held_elsewhere", "refresh_in_progress", "revoke_queued"]);
+var codes = new Set(["retry_exhausted", "operation_failed", "identity_unknown", "alias_held", "not_found", "unbound", "refused", "internal_error", "bad_request", "unauthenticated", "forbidden", "rate_limited", "receipt_capacity", "child_bound", "child_registered_elsewhere", "has_children", "root_is_child", "invalid_registration", "invalid_response", "server_unreachable", "server_busy", "subscription_closed", "native_access_expired", "login_required", "refresh_outcome_unknown", "server_outdated", "delivery_held_elsewhere", "refresh_in_progress", "revoke_queued"]);
 function failureCode(error) {
   if (error instanceof DeliveryStopped)
     return "retry_exhausted";
+  if (error instanceof ServerBusy)
+    return "server_busy";
   if (error instanceof ServerUnreachable)
     return "server_unreachable";
   if (error instanceof SubscriptionClosed)
@@ -35145,6 +35220,8 @@ function failureMessage(error, resumeHint) {
     return `Retry limit reached${error.item ? ` for ${error.item}; item remains unreceipted` : " before inbox progress"}; ${resumeHint}`;
   if (error instanceof OutcomeUnknown)
     return error.message;
+  if (error instanceof ServerBusy)
+    return `Server at capacity; ${resumeHint}`;
   if (error instanceof ServerUnreachable)
     return `Server unreachable; ${resumeHint}`;
   if (error instanceof AccessExpired || error instanceof ServerOutdated || error instanceof DeliveryHeldElsewhere)
@@ -36124,7 +36201,7 @@ function broken(error) {
   if (!(error instanceof ServerUnreachable))
     return false;
   for (let e = error, depth = 0;e && depth < 8; e = e instanceof Error ? e.cause : undefined, depth++) {
-    if (e instanceof SdkError && e.code === SdkErrorCode.RequestTimeout)
+    if (e instanceof ConnectProbeFailed || e instanceof SdkError && e.code === SdkErrorCode.RequestTimeout)
       return false;
   }
   return true;
@@ -36720,7 +36797,7 @@ var SWAP_CAPACITY_RETRIES = 5;
 var RECOVERY_FIRST_MS = 1000;
 var RECOVERY_MAX_MS = 30000;
 var RECOVERY_BUDGET_MS = 60 * 60000;
-var UNREACHABLE_AT_RECOVER = "Server unreachable while recovering; retrying, approval retained";
+var outageText = (error) => error instanceof ServerBusy ? "Server at capacity" : "Server unreachable";
 var refreshingAtRecover = (harness) => `Token refresh in progress in another ${harness} process while recovering; retrying, approval retained`;
 function sleep5(ms, signal) {
   return new Promise((resolve) => {
@@ -37405,11 +37482,11 @@ class Controller {
         if (error instanceof ServerUnreachable || error instanceof SubscriptionClosed || error instanceof RefreshInProgress || error instanceof AccessExpired && error.reason === "expired" && outage) {
           if (error instanceof ServerUnreachable)
             outage = true;
-          this.set(r, "retrying", error instanceof ServerUnreachable ? "Server unreachable; retrying, approval retained" : error instanceof SubscriptionClosed ? "Subscription closed; reopening, approval retained" : error instanceof RefreshInProgress ? `Token refresh in progress in another ${this.port.harness} process; retrying, approval retained` : `Access expired during a server outage; retrying until ${this.port.harness} refreshes it`, "reopen", failureCode(error));
+          this.set(r, "retrying", error instanceof ServerUnreachable ? `${outageText(error)}; retrying, approval retained` : error instanceof SubscriptionClosed ? "Subscription closed; reopening, approval retained" : error instanceof RefreshInProgress ? `Token refresh in progress in another ${this.port.harness} process; retrying, approval retained` : `Access expired during a server outage; retrying until ${this.port.harness} refreshes it`, "reopen", failureCode(error));
           ready();
           if (error instanceof AccessExpired && this.port.credential.refresh)
             await this.port.credential.refresh(e).catch((failure) => this.failure("reopen", failure));
-          await this.wait(Math.min(8000, 250 * 2 ** ++unreachable), signal);
+          await this.wait(Math.min(8000, Math.max(250 * 2 ** ++unreachable, error instanceof ServerBusy ? error.retryAfterMs : 0)), signal);
           continue;
         }
         if (error instanceof AccessExpired && error.reason === "expired" && graceLeft(grace) > 0) {
@@ -37610,7 +37687,7 @@ class Controller {
     }
   }
   retrying(r, error) {
-    const text = error instanceof RefreshInProgress ? `Token refresh in progress in another ${this.port.harness} process; retrying` : `Server unreachable at ${this.port.approval ? "restore" : "resume"}; retrying`;
+    const text = error instanceof RefreshInProgress ? `Token refresh in progress in another ${this.port.harness} process; retrying` : `${outageText(error)} at ${this.port.approval ? "restore" : "resume"}; retrying`;
     this.set(r, "retrying", this.port.approval ? `${text}, approval retained` : text, "restore", failureCode(error));
   }
   restorable(r, epoch) {
@@ -37725,7 +37802,7 @@ class Controller {
               return false;
             }
             if ((error instanceof ServerUnreachable || error instanceof RefreshInProgress) && this.restorable(r, r.epoch)) {
-              this.set(r, "retrying", error instanceof RefreshInProgress ? refreshingAtRecover(this.port.harness) : UNREACHABLE_AT_RECOVER, "recover", failureCode(error));
+              this.set(r, "retrying", error instanceof RefreshInProgress ? refreshingAtRecover(this.port.harness) : `${outageText(error)} while recovering; retrying, approval retained`, "recover", failureCode(error));
               this.retryRestore(r);
               return true;
             }

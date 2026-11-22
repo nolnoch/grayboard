@@ -30,7 +30,7 @@ import { endSessionServer } from "./session_end.ts";
 import { principalOfAuthed, type AuthedUser } from "./auth.ts";
 import {
   age, checkBody, parseAliasMeta, pendingKey, postPreChecks, refOf,
-  cleanFact, idCollisionText, normalizeBoard, getBoard,
+  cleanFact, idCollisionText, normalizeBoard, getBoard, mentionTokens, postBranch,
   type AliasMetaSet, type Board, type CoreDb, type PendingRef, type ReadResult, type SnapshotOptions, type UnboundPeer,
 } from "../core/boards.ts";
 import { addressParts, aliasScope, type AliasScope, type ParsedAddress } from "../core/addresses.ts";
@@ -48,7 +48,7 @@ import { expiryTimer } from "../core/claims.ts";
 import { detached } from "./request_context.ts";
 import { onAliasCreated } from "./teams.ts";
 import { boardAccess, ownScopeOn, seerIn, type BoardAccess } from "./access.ts";
-import { boardCatalog, boardSnapshot, pendingOf, visibleBoards } from "./board_reads.ts";
+import { boardCatalog, boardSnapshot, pendingOf, readableBoard, visibleBoards } from "./board_reads.ts";
 import { callBoardTool, claimsSeen, serverBoardActor } from "./boards.ts";
 import { PROMISE_DAYS, STALE_UNDELIVERED_MS, alreadyRetracted, historyLimit, inboxDays, promised, queuedNote, retractRefusal, showMessage, unanswered, undeliveredInstruction, type InboxItem, type PromiseItem } from "../shared/inbox.ts";
 import type { Pending } from "../shared/notifications.ts";
@@ -128,6 +128,8 @@ export type UnbindResult = { alias: string; released: boolean; held: string[]; l
  * ID is routing, not a capability (#229).
  */
 export const UNBOUND_READS = new Set(["board_list", "board_read", "peer_list", "claim_list"]);
+// The board tools that change nothing (#1604): board_read is not one (it advances the reader's cursor and outbox).
+export const PURE_READS: ReadonlySet<string> = new Set(["board_list", "peer_list", "claim_list"]);
 const UNBOUND_ERROR = "no bus name yet. Call bind(name) to resume a name (see the candidates in your instructions, or peer_list), or bind(name, create: true) for a new one.";
 
 // Only sessions registered by this application may execute operations.
@@ -159,6 +161,8 @@ export class ApplicationSession {
   // The ID its writes carry as provenance; unset for a writer with no
   // session (the bridge's humans, a hosted request with no context).
   writerId?: string;
+  // A hosted session's root ID: its own for a root. Keys its keyed writes (`root:<id>`, #1510).
+  hostedRoot = "";
   // A hosted child's own ID (#523): it acts under its root's addresses, and
   // its writes store this as `via` so readers see which subagent wrote them.
   // The root's read state isn't its: its board_read peeks, and dm_inbox and
@@ -276,7 +280,7 @@ const trackedCommit = (hub: Hub, h: Read, what: string): Commit => (effect) => a
 // awaited (#807 D4; never `repo.post`, which refuses an async body, B5a1 H2).
 const lostAck = (hub: Hub, h: Read, handle: string, receiver: string | undefined) => async (ref: PendingRef): Promise<void> => {
   if (isTx(h)) return hub.repo.boards.acknowledge(h, handle, ref, receiver);
-  void hub.repo.write((tx: Tx) => hub.repo.boards.acknowledge(tx, handle, ref, receiver)).catch((error) => console.error("lost-visibility push ack failed", error));
+  void atSite("boards", () => hub.repo.write((tx: Tx) => hub.repo.boards.acknowledge(tx, handle, ref, receiver))).catch((error) => console.error("lost-visibility push ack failed", error));
 };
 
 // The session a receipt or read by `s` credits, and must still hold the address it marks (#1466): the one whose ID
@@ -641,7 +645,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
   // refused take always rolls it back. Outside a bind (a sweep, outside any body) the row is posted.
   let streakAt: { tx: Tx; afterRollback?: (write: RefusalRow) => void } | undefined;
   const streakRow = (write: SyncRow) => {
-    if (!streakAt) { repo.post(write, undefined, "bind rate-limit row"); return; }
+    if (!streakAt) { atSite("limiter", () => repo.post(write, undefined, "bind rate-limit row")); return; }
     write(streakAt.tx); streakAt.afterRollback?.(write);
   };
   const bindLimiter = (limit: RateLimit) => new RateLimiter(limit, {
@@ -654,7 +658,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
       streakRow(w => writeAudit(repo, w, "bind.rate_limit_ended", email, null, { refused }));
     },
   }, opts.now);
-  const delegateRow = (write: SyncRow) => { if (hub.delegateRows) hub.delegateRows.push(write); else repo.post(write, undefined, "delegation throttle row"); };
+  const delegateRow = (write: SyncRow) => { if (hub.delegateRows) hub.delegateRows.push(write); else atSite("limiter", () => repo.post(write, undefined, "delegation throttle row")); };
   const hub: Hub = {
     repo,
     registry: new Map(),
@@ -763,7 +767,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
   // on the pool (#807 P3 B2).
   const claimTimer = expiryTimer({
     next: () => repo.claims.nextExpiry(repo.read),
-    sweep: () => repo.write(tx => sweepClaims(repo, hub.access, tx, repo.now())),
+    sweep: () => atSite("claims", () => repo.write(tx => sweepClaims(repo, hub.access, tx, repo.now()))),
     now: () => repo.now(),
   }, handles => wake(hub, backgroundCommit("claim expiry wake"), handles), boards => boardsChanged(backgroundCommit("claim expiry board change"), boards));
   const expiry = { arm: () => detached(() => claimTimer.arm()), stop: () => claimTimer.stop() };
@@ -786,10 +790,19 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     touchedIds.set(id, t);
     return true;
   }
+  // The last-seen touch outside a body is keyed by the writer's hosted root (#1510, docs/future/postgres-server.md D4): one
+  // UPDATE of ids.last_seen on the writer's row (the root's or a child's), a column no key or foreign key covers and no
+  // trigger watches. The root alone doesn't exclude every other writer of the row (#1527 L1): `hostedRoot` is fixed
+  // when the session is built, so two sessions of one writer ID (a child re-registered under a new root, a hosted and
+  // a non-hosted one) can carry different roots; their touches would commit out of order and move last_seen back. So
+  // the touch carries `id:<writer>` too: touches of one writer start in arrival order, each stamping the clock when it
+  // runs. A keyed gate body of the writer's root may hold the row FOR NO KEY UPDATE (its facts read) and writes no
+  // last_seen; the one-statement touch waits on it and on nothing after, so no cycle forms. Close's other write, the
+  // human release row, stays exclusive.
   function close(session: ApplicationSession, h: Read = repo.read) {
-    const write = (row: (tx: Tx) => Promise<void>, what: string, site: "touch" | "other" = "other") => {
+    const write = (row: (tx: Tx) => Promise<void>, what: string, site: "touch" | "human" = "human", keys?: string[]) => {
       if (isTx(h)) h.beforeCommit({}, row);
-      else void atSite(site, () => repo.write(row)).catch(e => console.error(`[grayboard] ${what} failed:`, e));
+      else void atSite(site, () => keys ? repo.writeKeyed(keys, row) : repo.write(row)).catch(e => console.error(`[grayboard] ${what} failed:`, e));
     };
     if (!session.active) return;
     session.active = false;
@@ -810,15 +823,16 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     // Close runs from sync finally blocks and commit callbacks: the touch is written at `h`'s commit or queued, not
     // awaited (#807 P1b-4b, P3 B1c).
     const writer = session.writerId;
-    if (writer && touchDue(writer)) write(tx => repo.bindings.touchId(tx, writer), "last-seen touch", "touch");
+    if (writer && touchDue(writer)) write(tx => repo.bindings.touchId(tx, writer), "last-seen touch", "touch", [`root:${session.hostedRoot || writer}`, `id:${writer}`]);
   }
   // The server closes the session: it leaves the hub, and its transport is
   // told why and closes. `h`: the body it runs in, whose `Tx` takes close's rows (#807 P3 A3).
+  // The transport is told even when close's row writes refuse on `h` (a read-only probe's Tx, #1510 chunk 4 audit L2):
+  // the session is already out of the hub by then, and an untold sink would keep its delivery lease tracked.
   function terminate(session: ApplicationSession, error: ApplicationError, h: Read = repo.read) {
     detach(session);
     session.closedBy = error;
-    close(session, h);
-    session.sink.closed(error);
+    try { close(session, h); } finally { session.sink.closed(error); }
   }
   // The session open and current; a closed one is refused with why.
   function stillOpen(session: ApplicationSession) {
@@ -868,10 +882,10 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
   // `ready` then rejects and the server exits, as the idle-queue post this replaced threw out of startup (#807 P3 A1).
   // `ids` reads the IDs to end on the write's Tx (#807 P3 A7h1: the hosted filter's reads await); none ends nothing.
   function endIds(ids: (tx: Tx) => Promise<string[]>, why: string): Promise<void> {
-    return repo.write(async tx => {
+    return atSite("alias", () => repo.write(async tx => {
       const list = await ids(tx);
       return list.length ? endIdsIn(tx, list, why) : null;
-    }, ends => { if (ends) afterEnds(ends.woken, ends.bounces); }).then(() => {});
+    }, ends => { if (ends) afterEnds(ends.woken, ends.bounces); })).then(() => {});
   }
   type Ends = { woken: Set<string>; bounces: MessageRow[] };
   // endIds's body, inside a write body: `tx` is that body's. Each end's savepoint runs on its own Tx.
@@ -975,7 +989,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
       afterEnds(ends.woken, ends.bounces);
     };
     if (isTx(h)) return body(h).then(value => { h.afterCommit(() => committed(value)); });
-    return repo.write(body, committed).then(() => {}, error => console.error("[grayboard] alias recheck failed:", error));
+    return atSite("alias", () => repo.write(body, committed)).then(() => {}, error => console.error("[grayboard] alias recheck failed:", error));
   }
   // Takes aliases from sessions whose principals may no longer act in their
   // scopes (S9). A holder keeps its ID and its other holds: only the revoked
@@ -1044,7 +1058,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
   // caller that never replays leaves it down, or live direct messages would wait for a drain that never runs.
   async function attachHuman(authed: AuthedUser, sink: DeliverySink, current?: (tx: Tx) => string | null | Promise<string | null>, replays = false): Promise<{ session: ApplicationSession; ok: HelloResult }> {
     const addr = `${authed.user_email}/${HUMAN_NAME}`;
-    return repo.write(async tx => {
+    return atSite("human", () => repo.write(async tx => {
       if ((await repo.users.findById(tx, authed.user_id))?.disabled_at != null) fail("unauthenticated", "session is closed");
       const stale = await current?.(tx);
       if (stale) fail("unauthenticated", stale);
@@ -1072,7 +1086,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
       hub.registry.set(addr, session);
       if (replays) owe(session);
       return { session, ok: { id: HUMAN_NAME, ...helloFields(hub, authed, hello) } };
-    });
+    }));
   }
 
   // bind (#284 S2, PR 4 S1): add an alias to this session's holds. One it
@@ -1249,6 +1263,7 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
       const session = new ApplicationSession(authed, sink, false, push);
       session.transport = "hosted";
       session.sessionId = id;
+      session.hostedRoot = root ?? id;
       session.place = row?.place ?? null;
       session.readOnly = holds.length === 0 && writesAs === null;
       session.toolsOnly = writesAs !== null;
@@ -1432,6 +1447,111 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
       await valid(session, false, tx);
       return handleSend(hub, tx, session, recipient, body, options.parent_id ?? null, options.pending === true, options.attachment_ids, options.resend === true, options.as);
     },
+    // A dm_send's plan for a keyed body (#1537 PR 5, D4), read on the pool, or undefined when it runs exclusive
+    // (`send` as ever): a Slack-bridge human's session (its bodies share one afterRollback, 808 §1.5), a closed or
+    // read-only one, a send with files (a replay's blob sweep and the upload quota stay exclusive in v1), one whose
+    // recipient doesn't resolve (the exclusive body gives the refusal and writes its row), and one to a Slack-bridge
+    // human's live session (its sink would run the bridge's delivery in the keyed body's commit).
+    async sendPlan(session: ApplicationSession, recipient: string, options: { parent_id?: number; attachment_ids?: unknown; as?: string } = {}): Promise<SendPlan | undefined> {
+      if (session.human || session.readOnly || !session.active || hub.delegateRows !== undefined) return undefined;
+      if (options.attachment_ids !== undefined && !(Array.isArray(options.attachment_ids) && options.attachment_ids.length === 0)) return undefined;
+      try {
+        const from = await sendAs(hub, repo.read, session, options.as, options.parent_id ?? null);
+        const to = await resolvePeer(repo, repo.read, from, recipient, session.sessionId || from);
+        if (to.kind === "team") return undefined;
+        const live = hub.registry.get(to.address);
+        if (live?.human) return undefined;
+        return { from, to: to.address, live, holder: live ? live.hostedRoot || live.sessionId || null : null };
+      } catch (error) {
+        if (error instanceof ApplicationError || error instanceof CoreError) return undefined;
+        throw error;
+      }
+    },
+    // `send` in a keyed body under `plan` (hosted.ts dmSend): valid()'s checks without its terminate, whose row
+    // writes and registry changes stay exclusive (a disabled user, a closed or read-only session each throw
+    // KeyedSendMiss or the refusal, and the exclusive body then refuses and writes as it would have); a delegate's
+    // rows in flight (hub.delegateRows, a delegate body's) the same; then handleSend checking its resolution
+    // against the plan.
+    async sendKeyed(
+      tx: Tx, session: ApplicationSession, plan: SendPlan, recipient: string, body: string,
+      options: { parent_id?: number; pending?: boolean; attachment_ids?: number[]; resend?: boolean; as?: string } = {},
+    ) {
+      stillOpen(session);
+      if (session.human || session.readOnly || hub.delegateRows !== undefined) throw new KeyedSendMiss("the session's state needs the exclusive body");
+      const disabled = await repo.users.isDisabled(tx, session.authed.user_id);
+      await testPauseAsync("valid:user:read");
+      stillOpen(session);
+      if (disabled) throw new KeyedSendMiss("its user is disabled");
+      return handleSend(hub, tx, session, recipient, body, options.parent_id ?? null, options.pending === true, options.attachment_ids, options.resend === true, options.as, plan);
+    },
+    // A board_post's plan for a keyed body (#1537 PR 6, D4), read on the pool, or undefined when it runs exclusive
+    // (`call` as ever): a Slack-bridge human's session, a closed or read-only one, a delegate's rows in flight; a post
+    // with files or `attachments` (the upload binding and quota stay exclusive in v1); one whose body names an `@id:`
+    // (until the mention sort of #808 pair 9); an invocation the pool denies (the exclusive body records the deny and
+    // charges its limiter once); one by a human address; and one the pool refuses (the exclusive body gives the refusal
+    // and writes its row). A queue board's post and reply, and an allowed invocation, plan their board (#1594): their
+    // claim rows are the board's queue keys, which `board:<name>` serializes; the body decides the invocation again.
+    async postPlan(session: ApplicationSession, args: Record<string, unknown>): Promise<PostPlan | undefined> {
+      if (session.human || session.readOnly || !session.active || hub.delegateRows !== undefined) return undefined;
+      if (args.attachments !== undefined) return undefined;
+      if (args.attachment_ids !== undefined && !(Array.isArray(args.attachment_ids) && args.attachment_ids.length === 0)) return undefined;
+      if (typeof args.board !== "string" || typeof args.body !== "string" || idMention(args.body)) return undefined;
+      const parentId = args.parent_id ?? null;
+      if (parentId !== null && typeof parentId !== "number") return undefined;
+      try {
+        childState(session, "board_post");
+        const actor = await serverBoardActor(repo, hub.access, repo.read, "board_post", args, { addresses: session.addresses, asAddresses: asAddresses(session), ownScope: session.authed.user_email });
+        const inv = await invocation(repo, repo.read, actor, args.board);
+        if (inv && !inv.d.allow) return undefined;
+        const b = await readableBoard(repo, hub.access, repo.read, actor, args.board);
+        if (await repo.aliases.isHuman(repo.read, actor)) return undefined;
+        return { board: b.name };
+      } catch (error) {
+        if (error instanceof ApplicationError || error instanceof CoreError) return undefined;
+        throw error;
+      }
+    },
+    // `call` for board_post in a keyed body under `plan` (hosted.ts boardPost): valid()'s checks without its terminate
+    // (sendKeyed's), then handleBoardPost checking its own resolution against the plan before the insert.
+    async postKeyed(tx: Tx, session: ApplicationSession, plan: PostPlan, args: Record<string, unknown>) {
+      stillOpen(session);
+      if (session.human || session.readOnly || hub.delegateRows !== undefined) throw new KeyedSendMiss("the session's state needs the exclusive body");
+      const disabled = await repo.users.isDisabled(tx, session.authed.user_id);
+      await testPauseAsync("valid:user:read");
+      stillOpen(session);
+      if (disabled) throw new KeyedSendMiss("its user is disabled");
+      try { return await handleCall(hub, tx, session, "board_post", args, undefined, plan); }
+      finally { tx.afterCommit(() => expiry.arm()); }
+    },
+    // A board_read's plan for a keyed body (#1604 step 2b, D4), read on the pool, or undefined when it runs exclusive:
+    // the sessions postPlan leaves exclusive (a principal's read writes nothing, so it gains nothing here), a session
+    // whose addresses aren't its own holds (no `receiverOf`: a tools-only session's writes_as is another root's hold,
+    // whose receipt marks the same outbox and subscription rows under that root's key alone), and a read the pool
+    // refuses (the exclusive body gives the refusal and writes its row). The board is the one the body's read point
+    // and outbox writes are on; pg/boards.ts read refuses them without `board:<name>`.
+    async readPlan(session: ApplicationSession, args: Record<string, unknown>): Promise<PostPlan | undefined> {
+      if (session.human || session.readOnly || !session.active || hub.delegateRows !== undefined || receiverOf(session) === undefined) return undefined;
+      if (typeof args.board !== "string") return undefined;
+      try {
+        childState(session, "board_read");
+        const actor = await serverBoardActor(repo, hub.access, repo.read, "board_read", args, { addresses: session.addresses, asAddresses: asAddresses(session), ownScope: session.authed.user_email });
+        return { board: (await readableBoard(repo, hub.access, repo.read, actor, args.board)).name };
+      } catch (error) {
+        if (error instanceof ApplicationError || error instanceof CoreError) return undefined;
+        throw error;
+      }
+    },
+    // `call` for board_read in a keyed body under `plan` (hosted.ts boardRead): postKeyed's checks, then the read.
+    async readKeyed(tx: Tx, session: ApplicationSession, plan: PostPlan, args: Record<string, unknown>) {
+      stillOpen(session);
+      if (session.human || session.readOnly || hub.delegateRows !== undefined || receiverOf(session) === undefined) throw new KeyedSendMiss("the session's state needs the exclusive body");
+      const disabled = await repo.users.isDisabled(tx, session.authed.user_id);
+      await testPauseAsync("valid:user:read");
+      stillOpen(session);
+      if (disabled) throw new KeyedSendMiss("its user is disabled");
+      try { return await handleCall(hub, tx, session, "board_read", args, undefined, plan); }
+      finally { tx.afterCommit(() => expiry.arm()); }
+    },
     async delegate(tx: Tx, session: ApplicationSession, request: Omit<DelegateRequest, "type" | "req_id">) {
       await valid(session, false, tx);
       return handleDelegate(hub, tx, session, request);
@@ -1521,8 +1641,9 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     async receiptBoards(tx: Tx, session: ApplicationSession, refs: PendingRef[]) {
       await valid(session, false, tx);
       const receiver = receiverOf(session);
+      // One batch per address (#1510 chunk 5), where a loop ran one acknowledge per ref and address.
+      if (refs.length) for (const a of session.addresses) await repo.boards.acknowledgeMany(tx, a, refs, receiver);
       for (const r of refs) {
-        for (const a of session.addresses) await repo.boards.acknowledge(tx, a, r, receiver);
         tx.afterCommit(() => {
           session.inflight.delete(pendingKey(r));
           session.boardDrain?.acked.add(ackKey(r));
@@ -1548,9 +1669,16 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     },
     async call(tx: Tx, session: ApplicationSession, tool: string, args: Record<string, unknown>, publish?: (result: unknown) => void) {
       await valid(session, UNBOUND_READS.has(tool), tx);
-      // Armed on a refusal too: a call can commit work (an expiring claim) before it throws (#385 item 15f).
+      // Armed on a refusal too: a call can commit work (an expiring claim) before it throws (#385 item 15f). A pure
+      // read in a keyed read-only probe (#1604 hosted.ts KEYED_READS) registers none, since the probe refuses an
+      // afterCommit: its caller arms after the body commits (armClaims).
       try { return await handleCall(hub, tx, session, tool, args, publish); }
-      finally { tx.afterCommit(() => expiry.arm()); }
+      finally { if (!(PURE_READS.has(tool) && repo.probing?.(tx))) tx.afterCommit(() => expiry.arm()); }
+    },
+    // The claim expiry timer re-armed from the store's next expiry, after a commit and outside any body: a keyed read's
+    // in place of the afterCommit its probe can't register (#1604).
+    armClaims() {
+      expiry.arm();
     },
     // The server's one BoardAccess: HTTP's claim calls judge boards with it, as the hub's tools do (#807 P3 B5b3c).
     access: hub.access,
@@ -1696,13 +1824,14 @@ type Peer = Exclude<ParsedAddress, { kind: "bare" }>;
 // `viewer` (the session's ID, else `from`) is whose sight the not-found
 // suggestions follow (#348), as peer_list's: the session's user, not the
 // address it acts as.
-async function resolvePeer(repo: Repo, r: Read, from: string, input: string, viewer: string = from): Promise<Peer> {
+// `find`: the caller's alias lookup (a send's memo, aliasFinder); the store's by default.
+async function resolvePeer(repo: Repo, r: Read, from: string, input: string, viewer: string = from, find: AliasFind = directFind(repo)): Promise<Peer> {
   const p = addressParts(input);
   if (!p) fail("bad_request", `invalid address "${input}": expected "id:…", "scope/name" or "team:name"`);
   if (p.kind !== "bare") return p;
   const scope = await ownScopeOn(repo, r, from);
   const own = scope ? addressParts(`${scope}/${p.name}`) : null;
-  if (own?.kind === "alias" && (await repo.aliases.find(r, own.address))) return own;
+  if (own?.kind === "alias" && (await find(r, own.address))) return own;
   if (p.name === HUMAN_NAME) {
     // A bare "human" is always your own (addressing.ts HUMAN_NAME), never the
     // one alias anyone has with the name: another user's is reached by its
@@ -1729,12 +1858,43 @@ async function resolvePeer(repo: Repo, r: Read, from: string, input: string, vie
 // see exists: to anyone outside the team its names read as missing (alias.see, #348), for mail too (#1014); a
 // service's names are its own and its service_invoke holders' (alias.see_service, #270 D4), so anyone else's mail to
 // one reads like mail to a missing name. A person's names are an open directory.
-async function aliasHidden(repo: Repo, r: Read, viewer: string, address: string): Promise<boolean> {
-  const a = await repo.aliases.find(r, address);
+async function aliasHidden(repo: Repo, r: Read, viewer: string, address: string, find: AliasFind = directFind(repo)): Promise<boolean> {
+  const a = await find(r, address);
   if (!a || a.scope_kind === "person" || a.scope_ref === null) return false;
   const vp = await seerIn(repo, r, viewer, a.scope_kind === "service");
   return vp === null || !(await authorize(repo, r, {}, { verb: "alias.see", principal: vp, scope: { scope_kind: a.scope_kind, scope_ref: a.scope_ref } })).allow;
 }
+
+// An alias lookup by address on the handle given (#1537 C6). `aliasFinder`'s is one send body's memo: resolvePeer,
+// prepareSend, aliasHidden and wakeUser each read the recipient's alias, up to five times per send, and the body
+// writes no alias, so the first read answers the rest. On Postgres (READ COMMITTED) each statement already saw its
+// own instant, so the memo only fixes which one; every check here reads one alias row and decides on it alone. The
+// handle is the caller's per call (a savepoint's inside writeOnce), all of one transaction.
+type AliasFind = (r: Read, address: string) => ReturnType<Repo["aliases"]["find"]>;
+const directFind = (repo: Repo): AliasFind => (r, address) => repo.aliases.find(r, address);
+function aliasFinder(repo: Repo): AliasFind {
+  const seen = new Map<string, ReturnType<Repo["aliases"]["find"]>>();
+  return (r, address) => {
+    let found = seen.get(address);
+    if (!found) seen.set(address, found = repo.aliases.find(r, address));
+    return found;
+  };
+}
+
+// A keyed dm_send's plan (#1537 PR 5, docs/future/postgres-server.md D4), resolved on the pool before its body:
+// `from` the address it goes out as, `to` the recipient's full handle, `live` the recipient's registered holder then
+// (undefined: none), and `holder` that holder's root, whose key the body also takes (D5's conservative key: a renew of
+// that root rebuilds or finishes the holder). The body resolves all three again (handleSend `keyed`); any difference
+// is a KeyedSendMiss.
+export type SendPlan = { from: string; to: string; live: ApplicationSession | undefined; holder: string | null };
+// A keyed send that must run exclusive instead: thrown inside its keyed body, before the message's insert, so the body
+// rolls back with nothing written and its caller runs the exclusive body (hosted.ts dmSend).
+export class KeyedSendMiss extends Error {}
+// A board_post's plan for a keyed body (#1537 PR 6, D4): the board it posts on, as the pool resolved it. The body's
+// own resolution must name the same board, or it throws KeyedSendMiss before the post's insert.
+export type PostPlan = { board: string };
+// An `@id:` mention in an author's body: board_post's keyed body leaves those to the exclusive one (D4).
+const idMention = (body: string) => mentionTokens(body).some(t => t.startsWith("id:"));
 
 // A send checked and resolved, ready to write: `from` the address it goes
 // out as, `to` the recipient's full handle, `digests` its files' blob
@@ -1763,6 +1923,7 @@ async function sendAs(hub: Hub, r: Read, session: ApplicationSession, as: string
 // write is still ambient until the audit slice).
 async function prepareSend(
   hub: Hub, r: Tx, session: ApplicationSession, from: string, recipientStr: string, body: string, parentId: number | null, pending: boolean, attachmentIdsRaw: unknown,
+  find: AliasFind = directFind(hub.repo),
 ): Promise<PreparedSend> {
   const { repo } = hub;
   let ids: number[];
@@ -1776,7 +1937,7 @@ async function prepareSend(
     throw e;
   }
 
-  const to = await resolvePeer(repo, r, from, recipientStr, session.sessionId || from);
+  const to = await resolvePeer(repo, r, from, recipientStr, session.sessionId || from, find);
   if (to.kind === "team") fail("bad_request", `${to.address} isn't a person; to reach a team, board_post to its board #${to.name}`);
   // An ID's deliverability is checked in the write's transaction (writeSend).
   // A team's alias the sender may not see reads as one nobody has (#1014), unless this replies in a thread with it:
@@ -1787,7 +1948,7 @@ async function prepareSend(
     const parent = await repo.messages.getById(r, parentId);
     return participant(parent, session.addresses) && replyPeer(parent, session.addresses) === address;
   }
-  if (to.kind === "alias" && (!(await repo.aliases.find(r, to.address)) || ((await aliasHidden(repo, r, session.sessionId || from, to.address)) && !(await replyingTo(to.address))))) {
+  if (to.kind === "alias" && (!(await find(r, to.address)) || ((await aliasHidden(repo, r, session.sessionId || from, to.address, find)) && !(await replyingTo(to.address))))) {
     fail("not_found", `identity "${to.address}" not found; peer_list shows exact handles`);
   }
   const req: AuthzRequest = { verb: "msg.send", from, to: to.address };
@@ -1813,17 +1974,21 @@ async function prepareSend(
 // queued body. Binds change the registry only in queued bodies or afterCommit (D4), but a session's close
 // (a request's end, the bridge's detach, a revalidate's terminate) changes it at once, outside the queue: so the
 // recipient is read again after the wake decision's await, and the result says what deliverSend would do then.
-async function writeSend(hub: Hub, tx: Tx, session: ApplicationSession, p: PreparedSend): Promise<Written<SendResult> & { msg: MessageRow }> {
+// `find`: the send's alias memo (aliasFinder). `guard`: called with no await before the insert's statement is sent (a
+// keyed send's last resolution check, sendKeyed); a throw there writes nothing.
+async function writeSend(hub: Hub, tx: Tx, session: ApplicationSession, p: PreparedSend, find: AliasFind = directFind(hub.repo), guard?: () => void): Promise<Written<SendResult> & { msg: MessageRow }> {
   const { repo, registry } = hub;
   let msg: MessageRow;
   try {
-    if (addressParts(p.to)?.kind === "id") {
-      const why = await repo.sessionEnd.refusal(tx, p.to);
-      if (why) throw why;
-    }
     // Every send is its sender's own words (dm_send, delegate): the row records whether the sender bears the human
-    // mark now, in the write's transaction (#1364), as a post's does (#1355).
-    const human = await repo.aliases.isHuman(tx, p.from);
+    // mark now, in the write's transaction (#1364), as a post's does (#1355). Read beside an ID's end check, which is
+    // independent of it (#1537 C6: one round trip on Postgres).
+    const [why, human] = await Promise.all([
+      addressParts(p.to)?.kind === "id" ? repo.sessionEnd.refusal(tx, p.to) : undefined,
+      repo.aliases.isHuman(tx, p.from),
+    ]);
+    if (why) throw why;
+    guard?.();
     msg = await repo.messages.insert(tx, p.from, "user", p.to, p.body, p.parentId, p.pending, { ids: p.ids, uploader: uploaderOf(session) }, session.writerId ?? null, session.via ?? null, session.authed.user_email, human);
   } catch (e) {
     if (e instanceof CoreError) throw coreRefusal(e);
@@ -1836,14 +2001,21 @@ async function writeSend(hub: Hub, tx: Tx, session: ApplicationSession, p: Prepa
     // Named whenever it isn't the primary (S4).
     ...(p.from !== session.primary ? { sent_as: p.from } : {}),
   };
-  const seen = (await repo.bindings.lastSeen(tx, [p.to])).get(p.to) ?? null;
-  const decided = await unwoken(repo, tx, session, registry.get(p.to), p.to);
+  // Independent reads, in one flight on Postgres (#1537 C6): the recipient's last sight, the wake decision, and, when
+  // no live holder is there to take the message now, the sender's undelivered count for the queued answer.
+  const before = registry.get(p.to);
+  const [seenOf, decided, undeliveredEarly] = await Promise.all([
+    repo.bindings.lastSeen(tx, [p.to]),
+    unwoken(repo, tx, session, before, p.to, find),
+    before?.active ? undefined : repo.messages.undeliveredFrom(tx, session.addresses),
+  ]);
+  const seen = seenOf.get(p.to) ?? null;
   await testPauseAsync("send:wake:decided");
   // Read after the await (#807 P3 A7f2, H-A): a wake note about a holder that closed meanwhile is dropped.
   const live = registry.get(p.to);
   // Snapshot with `live`: wakeUser may await an alias read (#807 P3 A7f3), and the payload must describe one instant.
   const liveActive = live?.active;
-  const wake = (await wakeUser(repo, tx, live, p.to)) === decided.user ? decided.fields : {};
+  const wake = (await wakeUser(repo, tx, live, p.to, find)) === decided.user ? decided.fields : {};
   const payload: SendResult = liveActive
     ? { message_id: msg.id, delivered_now: true, ...f, ...wake }
     : {
@@ -1851,7 +2023,7 @@ async function writeSend(hub: Hub, tx: Tx, session: ApplicationSession, p: Prepa
         delivered_now: false,
         ...f,
         ...(seen ? { recipient_last_seen: `${age(hub.now() - seen)} ago` } : {}),
-        undelivered_from_you: (await repo.messages.undeliveredFrom(tx, session.addresses)).find((u) => u.recipient === p.to)?.n ?? 1,
+        undelivered_from_you: (undeliveredEarly ?? await repo.messages.undeliveredFrom(tx, session.addresses)).find((u) => u.recipient === p.to)?.n ?? 1,
         note: queuedNote(p.to, seen),
         ...wake,
       };
@@ -1862,10 +2034,10 @@ async function writeSend(hub: Hub, tx: Tx, session: ApplicationSession, p: Prepa
 }
 
 // The user a wake is judged against: `live`'s, else a person alias's; undefined says nothing.
-async function wakeUser(repo: Repo, r: Read, live: ApplicationSession | undefined, to: string): Promise<string | undefined> {
+async function wakeUser(repo: Repo, r: Read, live: ApplicationSession | undefined, to: string, find: AliasFind = directFind(repo)): Promise<string | undefined> {
   if (live?.human || to.endsWith(`/${HUMAN_NAME}`)) return undefined;
   if (live) return live.authed.user_email;
-  const a = await repo.aliases.find(r, to);
+  const a = await find(r, to);
   return a?.scope_kind === "person" ? a.scope_ref ?? undefined : undefined;
 }
 
@@ -1877,8 +2049,8 @@ async function wakeUser(repo: Repo, r: Read, live: ApplicationSession | undefine
 // alias or an ID with no live holder says nothing, as does a human (a person
 // reads it; msg.send already decided reach). Each pull decides again
 // (pending()), so this reflects the grant at send time, not a promise.
-async function unwoken(repo: Repo, r: Read, session: ApplicationSession, live: ApplicationSession | undefined, to: string): Promise<{ user: string | undefined; fields: { wakes?: false; wake_note?: string } }> {
-  const toUser = await wakeUser(repo, r, live, to);
+async function unwoken(repo: Repo, r: Read, session: ApplicationSession, live: ApplicationSession | undefined, to: string, find: AliasFind = directFind(repo)): Promise<{ user: string | undefined; fields: { wakes?: false; wake_note?: string } }> {
+  const toUser = await wakeUser(repo, r, live, to, find);
   if (toUser === undefined) return { user: undefined, fields: {} };
   const decision = await authorize(repo, r, {}, { verb: "msg.wake", from_user: session.authed.user_email, to_user: toUser });
   if (decision.allow) return { user: toUser, fields: {} };
@@ -1938,13 +2110,22 @@ async function writeOnce<W extends Written>(
   return out;
 }
 
+// `keyed`: the plan a keyed body runs under (application.sendKeyed): this body's own resolution must give the same
+// sender, recipient and live holder, or it throws KeyedSendMiss, the last check right before the insert's statement.
 async function handleSend(
   hub: Hub, tx: Tx, session: ApplicationSession, recipient: string, body: string, parentId: number | null, pending: boolean, ids: unknown, resend: boolean, as: string | undefined,
+  keyed?: SendPlan,
 ): Promise<SendResult> {
-  const p = await prepareSend(hub, tx, session, await sendAs(hub, tx, session, as, parentId), recipient, body, parentId, pending, ids);
+  const find = aliasFinder(hub.repo);
+  const from = await sendAs(hub, tx, session, as, parentId);
+  if (keyed && from !== keyed.from) throw new KeyedSendMiss("its sender resolved differently in the body");
+  const p = await prepareSend(hub, tx, session, from, recipient, body, parentId, pending, ids, find);
+  if (keyed && p.to !== keyed.to) throw new KeyedSendMiss("its recipient resolved differently in the body");
+  if (keyed && p.ids.length) throw new KeyedSendMiss("it carries files");
+  const guard = keyed && (() => { if (hub.registry.get(p.to) !== keyed.live) throw new KeyedSendMiss("the recipient's live holder changed"); });
   // Keyed by what the server resolved, so two spellings of one call collide.
   const args = { to: p.to, body: p.body, parent_id: p.parentId, pending: p.pending, attachments: p.digests };
-  const out = await writeOnce(hub, tx, session, "dm_send", p.from, args, resend, p.ids, sp => writeSend(hub, sp, session, p));
+  const out = await writeOnce(hub, tx, session, "dm_send", p.from, args, resend, p.ids, sp => writeSend(hub, sp, session, p, find, guard || undefined));
   if ("replay" in out) return out.replay;
   tx.afterCommit(() => {
     // Committed, not yet answered: a lost answer's window (tests force it here).
@@ -2143,7 +2324,7 @@ async function handleRetract(hub: Hub, tx: Tx, session: ApplicationSession, id: 
   return {};
 }
 
-async function handleCall(hub: Hub, tx: Tx, session: ApplicationSession, tool: string, args: Record<string, unknown>, publish?: (result: unknown) => void): Promise<unknown> {
+async function handleCall(hub: Hub, tx: Tx, session: ApplicationSession, tool: string, args: Record<string, unknown>, publish?: (result: unknown) => void, keyed?: PostPlan): Promise<unknown> {
   const { repo } = hub;
   if (!isBoardTool(tool)) fail("bad_request", `unknown tool: ${tool}`);
   childState(session, tool);
@@ -2166,7 +2347,8 @@ async function handleCall(hub: Hub, tx: Tx, session: ApplicationSession, tool: s
     throw e;
   }
   const { as: _as, ...rest } = args;
-  if (tool === "board_post") return handleBoardPost(hub, tx, session, actor, rest, ctx, publish);
+  if (tool === "board_post") return handleBoardPost(hub, tx, session, actor, rest, ctx, publish, keyed);
+  if (keyed && tool !== "board_read") throw new KeyedSendMiss(`${tool} has no keyed body`);
   // A claim announced on a service's board is a post there too (#270 D6): decided as board_post's is.
   const inv = tool === "claim_take" ? await invocation(repo, tx, actor, rest.board) : null;
   if (inv && !inv.d.allow) {
@@ -2179,11 +2361,23 @@ async function handleCall(hub: Hub, tx: Tx, session: ApplicationSession, tool: s
     const a = inv && as === actor && inv.req.board === board ? inv : await invocation(repo, sp, as, board);
     if (a?.d.allow) recordDecision(repo, sp, sessionActor(session, as), a.req, a.d, { post_id: postId });
   };
+  // A keyed board_read's board, resolved on its own Tx, is the one it holds `board:<name>` for, or it misses (#1604): a
+  // backstop, since readableBoard returns the input's own row; a board that turned unreadable since the plan refuses
+  // here, and the exclusive body gives that refusal.
+  if (keyed) {
+    let b: { name: string };
+    try { b = await readableBoard(repo, hub.access, tx, actor, rest.board as string); }
+    catch (e) { if (e instanceof CoreError) throw coreRefusal(e); throw e; }
+    if (b.name !== keyed.board) throw new KeyedSendMiss(`#${String(rest.board)} resolves to #${b.name} now, not the planned #${keyed.board}`);
+  }
   let outcome;
   const receiver = receiverOf(session);
   try { outcome = await callBoardTool(repo, hub.access, tx, actor, tool, rest, { ...ctx, ...(session.readOnly ? { principal: userOf(session) } : {}), ...(receiver ? { receiver } : {}), announced }); }
   catch (e) {
     if (e instanceof CoreError) throw coreRefusal(e);
+    // A keyed body's fault (a store's refuseKeyed, a deadlock) fails the call as board_post's does, not a refusal the
+    // caller would answer with the exclusive body.
+    if (keyed) throw e;
     console.error(`[grayboard] ${tool} failed:`, e);
     return fail("internal", `${tool} failed`);
   }
@@ -2199,13 +2393,18 @@ async function handleCall(hub: Hub, tx: Tx, session: ApplicationSession, tool: s
   for (const board of new Set(outcome.boards ?? [])) hub.boardChanged(trackedCommit(hub, tx, "call board change"), board);
   // The transitional adapter publishes its answer before the resulting deliveries.
   if (publish) tx.afterCommit(() => publish(outcome.result));
-  wake(hub, trackedCommit(hub, tx, "call wake"), outcome.wake);
+  // Only when there is someone to wake: an empty wake would register an afterCommit, which a read tool's keyed probe
+  // refuses (#1604 hosted.ts KEYED_READS).
+  if (outcome.wake.length) wake(hub, trackedCommit(hub, tx, "call wake"), outcome.wake);
   return outcome.result;
 }
 
 // board_post, deduplicated (#254): a repeat replays the first post's result,
-// and a queue board gets no second work item.
-async function handleBoardPost(hub: Hub, tx: Tx, session: ApplicationSession, me: string, args: Record<string, unknown>, ctx: ToolContext, publish?: (result: unknown) => void): Promise<unknown> {
+// and a queue board gets no second work item. `keyed`: the plan a keyed body runs under (application.postKeyed): any
+// case postPlan leaves exclusive, met here on the body's own reads, throws KeyedSendMiss before the post's insert. A
+// registry read (`ctx.online`) passes only on a queue board, whose lane order prefers a live lane (#1594, D4): one
+// synchronous read, a preference the claim TTL repairs, as dm_send's holder read is; anywhere else it misses.
+async function handleBoardPost(hub: Hub, tx: Tx, session: ApplicationSession, me: string, args: Record<string, unknown>, ctx: ToolContext, publish?: (result: unknown) => void, keyed?: PostPlan): Promise<unknown> {
   const { repo } = hub;
   const { resend, ...postArgs } = args;
   let out: DedupOutcome<Written<BoardPostResult> & { wake: string[] }>;
@@ -2222,12 +2421,22 @@ async function handleBoardPost(hub: Hub, tx: Tx, session: ApplicationSession, me
     // A post on a service's board is an invocation (#270 D6), decided here for the acting address's principal: a deny
     // is recorded after the rollback and answers as a missing board; an allow is recorded with the post it carries.
     const inv = await invocation(repo, tx, me, postArgs.board);
+    // Decided again on the body's own transaction (principle 11): a deny here misses before its row is deferred, and
+    // the exclusive body records it and charges the limiter once (#1594). An allow is recorded with the post below.
+    if (keyed && inv && !inv.d.allow) throw new KeyedSendMiss("its invocation was denied in the body");
     if (inv && !inv.d.allow) {
       rowAfterRollback(session, tx, w => recordDecision(repo, w, sessionActor(session, me), inv.req, inv.d));
       throw hiddenBoard(inv);
     }
     // Its board is reused inside the savepoint: the same transaction, so the same row (b5b2 Decision 9).
     const { board, gate } = await postGateOn(repo, hub.access, tx, me, postArgs.board, parentId);
+    if (keyed) {
+      if (board.name !== keyed.board) throw new KeyedSendMiss("its board resolved differently in the body");
+      if (gate.human || gate.announcement) throw new KeyedSendMiss("its post needs the exclusive body");
+      if (ids.length || postArgs.attachments !== undefined) throw new KeyedSendMiss("it carries files");
+      if (idMention(postArgs.body)) throw new KeyedSendMiss("it names an @id:");
+      if ((board.kind ?? "broadcast") !== "queue") ctx = { ...ctx, online: () => { throw new KeyedSendMiss("it reads the registry"); } };
+    }
     // Core's order (#1225): the gate, then the body and mode checks, then the uploads, so a call with several faults
     // is refused for the same one in both modes. serverPost runs the same checks again; they hold, so they pass.
     postPreChecks(board.name, postArgs.body, gate.announcement, { online: ctx.online, attachments: { ids, send: ctx.files } });
@@ -2241,7 +2450,9 @@ async function handleBoardPost(hub: Hub, tx: Tx, session: ApplicationSession, me
     });
   } catch (e) {
     if (e instanceof CoreError) throw coreRefusal(e);
-    if (e instanceof ApplicationError) throw e;
+    // A keyed body's fault (a store's refuseKeyed among them) fails the call as it is, as dm_send's does, rather than
+    // passing for a refusal its caller would answer with the exclusive body.
+    if (e instanceof ApplicationError || e instanceof KeyedSendMiss || keyed) throw e;
     console.error("[grayboard] board_post failed:", e);
     return fail("internal", "board_post failed");
   }
@@ -2396,12 +2607,10 @@ async function handleThread(r: Read, session: ApplicationSession, messageId: num
 
 // A receipt: the harness was handed these ids. Each stamps its delivery time
 // once (unless `at` is null: given up, not handed) and moves its recipient
-// address's cursor; only your own direct messages count (S8).
+// address's cursor; only your own direct messages count (S8). The stamps lock in id order, whatever order the caller
+// gave (#1510 scope pair 4), messages.prune's by-id order, so the two never deadlock. Set-based (#1510 chunk 5): one
+// read and one stamp for the batch, then a cursor move per recipient address, where a loop ran three per id.
 async function handleAck(tx: Tx, session: ApplicationSession, messageIds: number[], repo: Repo, at: number | null): Promise<void> {
-  for (const msgId of messageIds) {
-    const msg = await repo.messages.getById(tx, msgId);
-    if (!msg || msg.recipient_type !== "user" || !session.addresses.includes(msg.recipient)) continue;
-    if (at !== null) await repo.messages.markDelivered(tx, msgId, at);
-    await repo.cursors.advance(tx, msg.recipient, "direct", msg.recipient, msgId);
-  }
+  const last = await repo.messages.deliver(tx, [...session.addresses], [...messageIds].sort((a, b) => a - b), at);
+  for (const [recipient, id] of [...last].sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)) await repo.cursors.advance(tx, recipient, "direct", recipient, id);
 }

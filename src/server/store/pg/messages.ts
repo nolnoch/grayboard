@@ -31,7 +31,7 @@ import { insertAudit } from "./audit_row.ts";
 import { bindLocked, dropAttachments, lockUnsent, withAttachments } from "./attachment_rows.ts";
 import { missingParent } from "./errors.ts";
 import { int8, int8OrNull } from "./sql.ts";
-import { pgOf, type PgSql } from "./tx.ts";
+import { pgOf, refuseKeyed, type PgSql } from "./tx.ts";
 
 type Row = Record<string, unknown>;
 const toMessage = (r: Row): MessageRow => ({
@@ -49,6 +49,8 @@ export function makePgMessages({ clock, attachmentLimits }: { clock: () => numbe
   const att = (sql: PgSql, list: MessageRow[]) => withAttachments(sql, "message", list);
   return {
     async insert(tx, sender, recipientType, recipient, body, parentId, pending = false, files, senderId = null, via = null, senderUser = null, human = false) {
+      // Ids commit in allocation order only among bodies that exclude each other on the recipient's stream (G1, D4).
+      refuseKeyed(tx, "messages.insert", `dm:${recipient}`);
       const sql = pgOf(tx);
       // Every refusal before the first write (decision 5, 8): the transaction stays usable when the caller catches it.
       if (parentId !== null && (await sql`SELECT id FROM messages WHERE id = ${parentId} FOR KEY SHARE`).length === 0) throw new MissingParent(parentId);
@@ -167,8 +169,20 @@ export function makePgMessages({ clock, attachmentLimits }: { clock: () => numbe
         SELECT ${reader}, m.id, ${clock()} FROM messages m WHERE m.id = ${id} FOR KEY SHARE OF m
         ON CONFLICT DO NOTHING`;
     },
-    async markDelivered(tx, id, at) {
-      await pgOf(tx)`UPDATE messages SET delivered_at = ${at} WHERE id = ${id} AND delivered_at IS NULL`;
+    async deliver(tx, recipients, ids, at) {
+      if (!ids.length || !recipients.length) return new Map();
+      const sql = pgOf(tx);
+      const mine = await sql`SELECT id, recipient, delivered_at FROM messages
+        WHERE id = ANY(${ids}::int8[]) AND recipient_type = 'user' AND recipient = ANY(${recipients}::text[])`;
+      const unstamped = mine.filter((m: Row) => m.delivered_at === null).map((m: Row) => int8(m.id));
+      // The rows a stamp writes, locked by id first (prune's order), as the old per-id UPDATEs in id order were;
+      // FOR NO KEY UPDATE is the UPDATE's own lock, so an end's FOR KEY SHARE (unreadFor) doesn't wait on it.
+      if (at !== null && unstamped.length) await sql`UPDATE messages SET delivered_at = ${at}
+        WHERE id IN (SELECT id FROM messages WHERE id = ANY(${unstamped}::int8[]) AND delivered_at IS NULL ORDER BY id FOR NO KEY UPDATE)
+          AND delivered_at IS NULL`;
+      const last = new Map<string, number>();
+      for (const m of mine) last.set(m.recipient as string, Math.max(last.get(m.recipient as string) ?? 0, int8(m.id)));
+      return last;
     },
     async retract(tx, sender, id, by): Promise<RetractResult> {
       const sql = pgOf(tx);
@@ -213,6 +227,8 @@ export function makePgMessages({ clock, attachmentLimits }: { clock: () => numbe
     // The parent FOR KEY SHARE first, as insert's reply does: a retract that committed first leaves no parent, and the
     // bounce writes nothing (null) rather than fail 23503 and abort the end's transaction.
     async bounce(tx, from, to, parentId, body, now) {
+      // An insert too: the same stream key as insert's (G1, D4).
+      refuseKeyed(tx, "messages.bounce", `dm:${to}`);
       const sql = pgOf(tx);
       if ((await sql`SELECT id FROM messages WHERE id = ${parentId} FOR KEY SHARE`).length === 0) return null;
       const [row] = await rows(sql`INSERT INTO messages (sender, sender_id, recipient_type, recipient, body, parent_id, created_at, pending, kind, human)

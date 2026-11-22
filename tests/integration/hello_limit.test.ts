@@ -35,8 +35,11 @@ const detail = async (srv: TestServer, action: string) => {
 
 
 test("a bind over the user's bucket is refused with a wait, writes nothing about the name, and passes after the wait", async () => {
-  // Each bind takes a token (#284: binds create aliases).
-  const srv = await serve({ helloLimit: { burst: 3, perSec: 4 } });
+  // Each bind takes a token (#284: binds create aliases). The limiter runs on a clock the test moves (#1576): on the
+  // wall clock, a slow runner's Postgres round trips refilled a token between the two refusals.
+  const clock = { t: Date.now() };
+  const srv = await TestServer.open({ helloLimit: { burst: 3, perSec: 4 } }, { now: () => clock.t });
+  cleanup.push(() => srv.stop());
   const alice = await srv.login(A);
   const bob = await srv.login("bob@example.com");
   const a = srv.appSession(alice, null);
@@ -49,14 +52,13 @@ test("a bind over the user's bucket is refused with a wait, writes nothing about
   const r = await refusal(a.bind("fe"));
   expect(r.code).toBe("rate_limited");
   expect(r.extra.retry_after_ms).toBeGreaterThan(0);
-  expect(r.extra.retry_after_ms).toBeLessThanOrEqual(250);
+  expect(r.extra.retry_after_ms).toBe(250);
   expect(r.message).toMatch(/too many binds for this user; retry in \ds/);
 
   // Another user's bucket is their own.
   await srv.appSession(bob, "be").connect();
 
-  // A second refusal in the same run is audited once. The reads come after it: the whole run has to fit in the
-  // 250ms one token takes to refill, and a Postgres read's round trips would spend that window.
+  // A second refusal in the same run is audited once.
   expect((await refusal(a.bind("fe"))).code).toBe("rate_limited");
   // Neither refusal wrote anything about the name.
   expect(await count(srv, `SELECT COUNT(*) AS n FROM binding_events WHERE name = ?`, `${A}/fe`)).toBe(0);
@@ -67,14 +69,11 @@ test("a bind over the user's bucket is refused with a wait, writes nothing about
   expect(start).toMatchObject({ session_id: a.id });
   expect(start.retry_after_ms).toBe(r.extra.retry_after_ms);
 
-  // The run ends only once the bucket is full again (3 tokens at 4/s: 750ms
-  // from empty). The wait is the bucket's own clock, not a race; polling with
-  // binds would keep it from filling.
-  const fullAt = Date.now() + 800;
-  await until(() => Date.now() >= fullAt);
+  // The run ends only once the bucket is full again (3 tokens at 4/s: 750ms from empty).
+  clock.t += 800;
   expect((await a.bind("fe")).alias).toBe(`${A}/fe`);
   expect(await count(srv, `SELECT COUNT(*) AS n FROM access_log WHERE action = 'bind.rate_limit_ended'`)).toBe(1);
-  expect((await detail(srv, "bind.rate_limit_ended")).refused).toBeGreaterThanOrEqual(2);
+  expect((await detail(srv, "bind.rate_limit_ended")).refused).toBe(2);
 });
 
 test("the heartbeat's sweep ends a run nobody binds after, and drops the refilled bucket (#247)", async () => {

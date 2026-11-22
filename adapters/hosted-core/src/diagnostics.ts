@@ -1,5 +1,5 @@
 import type { KeyValueStorage } from "./port.js";
-import { OutcomeUnknown, ServerUnreachable, SubscriberError, SubscriptionClosed, shownText } from "./wire.js";
+import { OutcomeUnknown, ServerBusy, ServerUnreachable, SubscriberError, SubscriptionClosed, shownText } from "./wire.js";
 import { AccessExpired, DeliveryHeldElsewhere, RefreshInProgress, ServerOutdated, validHeld } from "./model.js";
 
 export type RecordStatus = { state: string; message: string; sessionID?: string; time: number; held?: string[]; ownership?: number; operation: string; code?: string; failure?: { operation: string; code: string; time: number } };
@@ -16,9 +16,11 @@ const states = new Set(["approved", "active", "paused", "unbound", "unenrolled",
 const OPERATIONS = ["diagnostic_save", "diagnostic_emit", "pause", "configured_bind", "delivery", "enroll", "prepare", "subscriber", "reopen", "restore", "event", "stream", "before_bind", "after", "hook_dispose", "rpc_dispose", "latch_save", "wire_close", "subscription_close", "delivery_release", "release_upload", "session_end", "pause_save", "child_end", "watch_dispose", "login", "logout", "refresh", "child_register", "receipt_hook", "instructions", "login_link", "recover"] as const;
 export type Operation = typeof OPERATIONS[number];
 const operations = new Set<string>(OPERATIONS);
-const codes = new Set(["retry_exhausted", "operation_failed", "identity_unknown", "alias_held", "not_found", "unbound", "refused", "internal_error", "bad_request", "unauthenticated", "forbidden", "rate_limited", "receipt_capacity", "child_bound", "child_registered_elsewhere", "has_children", "root_is_child", "invalid_registration", "invalid_response", "server_unreachable", "subscription_closed", "native_access_expired", "login_required", "refresh_outcome_unknown", "server_outdated", "delivery_held_elsewhere", "refresh_in_progress", "revoke_queued"]);
+const codes = new Set(["retry_exhausted", "operation_failed", "identity_unknown", "alias_held", "not_found", "unbound", "refused", "internal_error", "bad_request", "unauthenticated", "forbidden", "rate_limited", "receipt_capacity", "child_bound", "child_registered_elsewhere", "has_children", "root_is_child", "invalid_registration", "invalid_response", "server_unreachable", "server_busy", "subscription_closed", "native_access_expired", "login_required", "refresh_outcome_unknown", "server_outdated", "delivery_held_elsewhere", "refresh_in_progress", "revoke_queued"]);
 export function failureCode(error: unknown): string {
   if (error instanceof DeliveryStopped) return "retry_exhausted";
+  // A ServerBusy is a ServerUnreachable the controller retries the same way, but the server is up: at capacity (#1553).
+  if (error instanceof ServerBusy) return "server_busy";
   if (error instanceof ServerUnreachable) return "server_unreachable";
   if (error instanceof SubscriptionClosed) return "subscription_closed";
   if (error instanceof AccessExpired) return error.reason === "expired" ? "native_access_expired" : error.reason;
@@ -36,6 +38,7 @@ export function failureMessage(error: unknown, resumeHint: string): string {
   if (error instanceof DeliveryStopped) return `Retry limit reached${error.item ? ` for ${error.item}; item remains unreceipted` : " before inbox progress"}; ${resumeHint}`;
   // A tool call cut off mid-flight: "call it again" could repeat a write (#1345).
   if (error instanceof OutcomeUnknown) return error.message;
+  if (error instanceof ServerBusy) return `Server at capacity; ${resumeHint}`;
   if (error instanceof ServerUnreachable) return `Server unreachable; ${resumeHint}`;
   if (error instanceof AccessExpired || error instanceof ServerOutdated || error instanceof DeliveryHeldElsewhere) return error.message;
   if (error instanceof RefreshInProgress) return `${error.message}; ${resumeHint}`;

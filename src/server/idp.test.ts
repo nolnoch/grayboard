@@ -66,6 +66,30 @@ test("defaultProviders is Google alone by default, on the MCP pair when set, els
   }
 });
 
+// #930 A2b: Google has a directory status check exactly when the server has a directory key (Okta's, #1563, likewise with its service app).
+test("defaultProviders gives Google a status check only with GRAYBOARD_GOOGLE_DIRECTORY_KEY or _SERVICE_ACCOUNT", () => {
+  const directory = { kind: "key" as const, clientEmail: "sa@p.iam.gserviceaccount.com", privateKey: "unused until the first check" };
+  expect(defaultProviders({ ...base, okta: undefined } as Config)[0]!.status).toBeUndefined();
+  const providers = defaultProviders({ ...base, idps: ["okta", "google"], googleDirectory: directory });
+  expect(providers.map(p => [p.id, typeof p.status])).toEqual([["okta", "undefined"], ["google", "function"]]);
+});
+
+// #1555: oidc has a status check exactly when the server has Keycloak's directory pair.
+test("defaultProviders gives oidc a status check only with Keycloak's directory configuration", () => {
+  const oidc = { issuer: "https://sso.example.com/realms/eng", clientId: "grayboard", allowedDomains: ["example.com"], label: "SSO" };
+  expect(defaultProviders({ ...base, idps: ["oidc"], oidc } as Config)[0]!.status).toBeUndefined();
+  const keycloakDirectory = { baseUrl: "https://sso.example.com", realm: "eng", clientId: "c", clientSecret: "s" };
+  const providers = defaultProviders({ ...base, idps: ["oidc", "okta"], oidc, keycloakDirectory } as Config);
+  expect(providers.map(p => [p.id, p.issuer, typeof p.status])).toEqual([["oidc", oidc.issuer, "function"], ["okta", OKTA_ISSUER, "undefined"]]);
+});
+
+// #1563: okta has a status check exactly when the server has Okta's directory pair.
+test("defaultProviders gives okta a status check only with Okta's directory configuration", () => {
+  const oktaDirectory = { orgUrl: "https://example.okta.com", clientId: "0oa1", privateKey: "unused until the first check", alg: "RS256" };
+  const providers = defaultProviders({ ...base, idps: ["okta", "google"], oktaDirectory } as Config);
+  expect(providers.map(p => [p.id, p.issuer, typeof p.status])).toEqual([["okta", OKTA_ISSUER, "function"], ["google", expect.any(String), "undefined"]]);
+});
+
 test("defaultProviders builds Okta from Config in the listed order, fetching nothing until first use, with its own client", async () => {
   const fetched: string[] = [];
   let tokenAuthorization: string | null = null;

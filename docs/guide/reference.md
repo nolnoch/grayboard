@@ -29,6 +29,8 @@ grayboard bridge slack [--mode local]    # local mode; see Slack bridge setup
 grayboard login [--dev <email>] [--server <url>]  # sign in through the server in your browser (it asks you to authorize Grayboard for the CLI)
 grayboard logout
 grayboard whoami                         # the handle this shell acts as (and, locally, the session's other names); in server mode, also your user, identities and teams
+grayboard grants list                    # server mode; each harness sign-in and CLI token you have, newest use first
+grayboard grants revoke <id>             # server mode; sign out that one harness or CLI; the others keep working
 
 grayboard slack link                     # server mode; a code to send to the server's Slack app
 grayboard slack unlink
@@ -48,6 +50,8 @@ grayboard team policy <name> collaborative|delegating|open   # an owner or admin
 grayboard team delete-alias <team> <name>          # an owner or admin; a name no session is using, freeing a slot under the server's per-scope cap
 
 grayboard admin revoke-session --email <e>   # every session the user has
+grayboard grants list --user <e>         # an admin; another user's sign-ins
+grayboard grants revoke <id> --user <e>  # an admin; revoke one of them, e.g. a lost laptop's
 grayboard admin disable-user --email <e>   # also signs them out everywhere; they can't sign in
 grayboard admin enable-user --email <e>    # they sign in again; old sign-ins stay revoked
 grayboard admin unlink-idp --email <e>     # forget the user's sign-in account (see the server guide)

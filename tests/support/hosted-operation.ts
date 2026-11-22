@@ -9,6 +9,10 @@ import type { OAuthPrincipal } from "../../src/server/oauth.ts";
 const [path, blobs, raw] = process.argv.slice(2);
 const input = JSON.parse(raw!) as { principal: OAuthPrincipal; operation: "bind" | "register" | "end" | "revoke" | "sweep" | "receipt"; now: number; name?: string; rawSession?: string; child?: string; refreshHash?: string; sweepAt?: number };
 const { db, repo } = openDatabase(path!, { blobDir: blobs!, sessionEnd: sessionEndPort("team") });
+// A forced overlap parks one worker inside its transaction while the other waits on the lock. The server's 5 s busy
+// timeout would decide that wait when a loaded machine is slow to commit after the release, failing the waiter with
+// SQLITE_BUSY (#1134), so a worker outwaits any test's own timeout instead.
+db.exec("PRAGMA busy_timeout = 60000");
 const application = createApplication(repo);
 let now = input.now;
 const isAuthorized = (p: OAuthPrincipal, r = repo.read) => repo.oauth.isGrantActive(r, p.grantId, now);

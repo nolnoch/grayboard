@@ -7,14 +7,14 @@
 // own OAuth issuance would.
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
-import { createServer, type AddressInfo, type Server } from "node:net";
+import { createServer, getDefaultAutoSelectFamily, setDefaultAutoSelectFamily, Socket, type AddressInfo, type Server } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Client, SdkError, SdkErrorCode, type AuthProvider, type CallToolResult } from "@modelcontextprotocol/client";
 import { AccessExpired } from "../../adapters/hosted-core/src/model.ts";
 import type { CallOutcome } from "../../adapters/hosted-core/src/controller.ts";
 import { CallAborted, hostTools, unlessAborted, loadMode, snapshotTools, ToolProxy, type CallHooks, type NativeTool, type ProxyOptions } from "../../adapters/hosted-core/src/proxy.ts";
-import { NativeWire, OutcomeUnknown, ServerUnreachable } from "../../adapters/hosted-core/src/wire.ts";
+import { ConnectProbeFailed, connectProbe, NativeWire, OutcomeUnknown, ServerBusy, ServerUnreachable } from "../../adapters/hosted-core/src/wire.ts";
 import { failureText } from "../../adapters/hosted-core/src/client.ts";
 import { hashToken } from "../../src/server/auth.ts";
 import { hostedSessionId } from "../../src/server/hosted.ts";
@@ -631,8 +631,9 @@ test("a 401 the credential's refresh doesn't fix needs a new login: tool calls, 
 // never opened (refused, at the call or at the shared connect) ran nothing and stays "Server unreachable". The broken
 // connection is still dropped, and nothing sends the call again. A credential's own outage (a refresh on the
 // request's token() or in onUnauthorized) also ran nothing and stays unreachable; a call in flight when its proxy
-// closes is a stop, not an outage.
-test("a call cut off after its request left reports its outcome unknown and is sent once; a socket that never opened, a credential outage and a proxy close are not (#1345)", async () => {
+// closes is a stop, not an outage. Every call here runs the connect probe (#1347): one that passes changes nothing (the
+// 503 and the reset are still unknown), one that can't connect by its deadline fails the call unsent.
+test("a call cut off after its request left reports its outcome unknown and is sent once; a socket that never opened, a credential outage and a proxy close are not (#1345, #1347)", async () => {
   const listening = (server: Server) => new Promise<number>(resolve => server.listen(0, "127.0.0.1", () => resolve((server.address() as AddressInfo).port)));
   // A peer that resets every connection once the request arrives: Bun's own ECONNRESET.
   const resetter = createServer(socket => { socket.once("data", () => socket.destroy()); });
@@ -644,7 +645,14 @@ test("a call cut off after its request left reports its outcome unknown and is s
   const { token } = await issue();
   const p = proxy({ token: async () => token });
   const list = NativeWire.prototype.listTools, fetch0 = globalThis.fetch;
-  let lists = 0, mode: "pass" | "503" | "reset" | "refused" | "hold" = "pass";
+  const probe0 = { ...connectProbe };
+  // The probe is skipped behind a proxy: none here, whatever this machine sets.
+  const proxyVars = ["HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"], proxyEnv = proxyVars.map(n => process.env[n]);
+  for (const n of proxyVars) delete process.env[n];
+  let probes = 0;
+  connectProbe.coldMs = 0;
+  connectProbe.open = (host, port) => { probes++; return probe0.open(host, port); };
+  let lists = 0, mode: "pass" | "503" | "reset" | "refused" | "hold" | "blackhole" = "pass";
   const { promise: holding, resolve: held } = Promise.withResolvers<void>();
   const { promise: released, resolve: release } = Promise.withResolvers<void>();
   const posts: string[] = [];
@@ -673,7 +681,10 @@ test("a call cut off after its request left reports its outcome unknown and is s
     expect(lists).toBe(1);
 
     mode = "503";
+    let probed = probes;
     const gateway = await failed("gateway");
+    // It passed a real probe first, and is still unknown.
+    expect(probes).toBe(probed + 1);
     expect(gateway).toBeInstanceOf(OutcomeUnknown);
     expect(gateway).toBeInstanceOf(ServerUnreachable);
     expect(failureText(gateway, "call the tool again")).toBe(unknownText);
@@ -683,7 +694,9 @@ test("a call cut off after its request left reports its outcome unknown and is s
     expect(lists).toBe(2);
 
     mode = "reset";
+    probed = probes;
     const reset = await failed("landed");
+    expect(probes).toBe(probed + 1);
     expect(reset).toBeInstanceOf(OutcomeUnknown);
     expect(failureText(reset, "call the tool again")).toBe(unknownText);
     mode = "pass";
@@ -696,10 +709,36 @@ test("a call cut off after its request left reports its outcome unknown and is s
     expect(refused).toBeInstanceOf(ServerUnreachable);
     expect(refused).not.toBeInstanceOf(OutcomeUnknown);
     expect(failureText(refused, "call the tool again")).toBe("Server unreachable; call the tool again");
+    expect(failureText(new ServerBusy(800), "call the tool again")).toBe("Server at capacity; call the tool again"); // #1553
     mode = "pass";
     expect(await bodies()).toEqual(["landed"]);
     expect(lists).toBe(4);
-    // One request per call: nothing resent any of them.
+    // A blackholed endpoint (#1347): the probe's connect never completes, so the call fails at its deadline, well
+    // inside the request timeout, as plain unreachable, and its request never reaches fetch.
+    const before = probes;
+    connectProbe.deadlineMs = 100;
+    connectProbe.open = () => { probes++; return new Socket(); };
+    mode = "blackhole";
+    const blackholed = await failed("unsent");
+    expect(blackholed).toBeInstanceOf(ConnectProbeFailed);
+    expect(blackholed).toBeInstanceOf(ServerUnreachable);
+    expect(blackholed).not.toBeInstanceOf(OutcomeUnknown);
+    expect(failureText(blackholed, "call the tool again")).toBe("Server unreachable; call the tool again");
+    expect(probes).toBe(before + 1);
+    connectProbe.deadlineMs = probe0.deadlineMs;
+    connectProbe.open = (host, port) => { probes++; return probe0.open(host, port); };
+    mode = "pass";
+    expect(await bodies()).toEqual(["landed"]);
+    // A failed probe says nothing of the pooled socket, so the shared connection was kept: no new one was listed.
+    expect(lists).toBe(4);
+    // A probe whose connect errors (refused here) doesn't decide: the request's own fetch does, and this one answers,
+    // as a test's stubbed fetch or a host's shim would where a direct connect can't reach.
+    probed = probes;
+    connectProbe.open = () => { probes++; return probe0.open("127.0.0.1", 1); };
+    expect(await bodies()).toEqual(["landed"]);
+    expect(probes).toBe(probed + 1);
+    connectProbe.open = (host, port) => { probes++; return probe0.open(host, port); };
+    // One request per call: nothing resent any of them, and the blackholed one never left.
     expect(posts).toEqual(["503", "reset", "refused"]);
 
     // A credential's own outage ran nothing, so it stays unreachable: a refresh on the request's token() (after
@@ -749,6 +788,118 @@ test("a call cut off after its request left reports its outcome unknown and is s
     release();
     globalThis.fetch = fetch0;
     NativeWire.prototype.listTools = list;
+    Object.assign(connectProbe, probe0);
+    proxyVars.forEach((n, i) => { if (proxyEnv[i] === undefined) delete process.env[n]; else process.env[n] = proxyEnv[i]; });
     resetter.close();
+  }
+});
+
+// #1585: the probe's connect races a host's addresses as fetch does, so a dual-stack host whose IPv6 route blackholes
+// (or is missing) still connects over IPv4, even where the process turned the runtime's default off.
+test("the connect probe falls back to IPv4 when a host's IPv6 address doesn't connect (#1585)", async () => {
+  const server = createServer(socket => socket.end());
+  const port = await new Promise<number>(resolve => server.listen(0, "127.0.0.1", () => resolve((server.address() as AddressInfo).port)));
+  const probe0 = { ...connectProbe };
+  const default0 = getDefaultAutoSelectFamily();
+  let socket: Socket | undefined;
+  try {
+    // The IPv6 discard prefix (RFC 6666) first: dropped where IPv6 routes, unreachable where it doesn't.
+    connectProbe.lookup = ((_host: string, options: { all?: boolean }, callback: (...args: unknown[]) => void) => {
+      const addresses = [{ address: "100::1", family: 6 }, { address: "127.0.0.1", family: 4 }];
+      if (options.all) callback(null, addresses); else callback(null, addresses[0]!.address, addresses[0]!.family);
+    }) as typeof connectProbe.lookup;
+    setDefaultAutoSelectFamily(false);
+    socket = connectProbe.open("dual-stack.test", port);
+    const outcome = await new Promise<string>(resolve => {
+      const timer = setTimeout(() => resolve("no connect within 4 s"), 4_000);
+      socket!.once("connect", () => { clearTimeout(timer); resolve(`connected to ${socket!.remoteAddress}`); });
+      socket!.once("error", error => { clearTimeout(timer); resolve(`error: ${error.message}`); });
+    });
+    expect(outcome).toBe("connected to 127.0.0.1");
+  } finally {
+    socket?.destroy();
+    setDefaultAutoSelectFamily(default0);
+    Object.assign(connectProbe, probe0);
+    server.close();
+  }
+});
+
+// #1585: a tool call probes only on a wire with no answer within coldMs, never behind a proxy (a direct connect proves
+// nothing there), and an abort mid-probe ends it at once: the socket destroyed, the call aborted, not unreachable, and
+// its request never sent.
+test("the connect probe runs only on a cold wire and never behind a proxy; an abort mid-probe destroys its socket (#1585)", async () => {
+  const { token } = await issue();
+  const p = proxy({ token: async () => token });
+  const probe0 = { ...connectProbe }, fetch0 = globalThis.fetch;
+  const proxyVars = ["HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy"], proxyEnv = proxyVars.map(n => process.env[n]);
+  for (const n of proxyVars) delete process.env[n];
+  const sockets: Socket[] = [];
+  connectProbe.open = (host, port) => { const socket = probe0.open(host, port); sockets.push(socket); return socket; };
+  let whoamis = 0;
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    if (input instanceof Request && input.method === "POST" && (await input.clone().text()).includes(`"name":"whoami"`)) whoamis++;
+    return fetch0(input, init);
+  }) as typeof fetch;
+  const whoami = async (signal?: AbortSignal) => JSON.parse(textOf(await p.call("whoami", {}, "pi-root", signal))) as { primary: string };
+  try {
+    expect((await p.call("bind", { name: "proxy-probe", create: true }, "pi-root")).isError).toBeUndefined();
+    // Warm: the wire answered within coldMs, so no probe.
+    connectProbe.coldMs = 60_000;
+    expect((await whoami()).primary).toBe("alice@example.com/proxy-probe");
+    expect(sockets.length).toBe(0);
+    // Cold: one probe, which passes.
+    connectProbe.coldMs = 0;
+    expect((await whoami()).primary).toBe("alice@example.com/proxy-probe");
+    expect(sockets.length).toBe(1);
+    // Behind a proxy (the loopback server is exempt, so the request itself goes direct): no probe, under either spelling.
+    process.env.NO_PROXY = process.env.no_proxy = "127.0.0.1,localhost";
+    for (const name of ["HTTP_PROXY", "all_proxy"]) {
+      process.env[name] = "http://127.0.0.1:1";
+      expect((await whoami()).primary).toBe("alice@example.com/proxy-probe");
+      delete process.env[name];
+    }
+    expect(sockets.length).toBe(1);
+    for (const n of ["NO_PROXY", "no_proxy"]) delete process.env[n];
+
+    // An abort mid-probe: the connect never completes, and the deadline is far off.
+    connectProbe.deadlineMs = 30_000;
+    let held: Socket | undefined;
+    connectProbe.open = () => (held = new Socket());
+    const before = whoamis, started = performance.now();
+    const controller = new AbortController();
+    const call = whoami(controller.signal).then(() => undefined, (error: unknown) => error);
+    await until(() => held, 5_000, "the probe to open its socket");
+    controller.abort();
+    const aborted = await call;
+    // The SDK's own cancel rejects the call first, so what the probe rejects with never reaches the caller (here or at
+    // the wire stop below); the probe's abort path is judged by its socket and by the request it never sent.
+    expect(aborted).toBeInstanceOf(CallAborted);
+    expect(aborted).not.toBeInstanceOf(ServerUnreachable);
+    await until(() => held!.destroyed, 2_000, "the probe to destroy its socket");
+    expect(performance.now() - started).toBeLessThan(connectProbe.deadlineMs);
+    expect(whoamis).toBe(before);
+    // The wire is untouched: the next call, warm, goes straight out.
+    connectProbe.coldMs = 60_000;
+    expect((await whoami()).primary).toBe("alice@example.com/proxy-probe");
+    expect(whoamis).toBe(before + 1);
+
+    // The wire's own stop mid-probe (the proxy closing, no caller abort to mask it): a stop, never unreachable.
+    const closing = proxy({ token: async () => token });
+    expect((await closing.call("whoami", {}, "pi-root")).isError).toBeUndefined();
+    connectProbe.coldMs = 0;
+    held = undefined;
+    const sent = whoamis;
+    const inFlight = closing.call("whoami", {}, "pi-root").then(() => undefined, (error: unknown) => error);
+    await until(() => held, 5_000, "the probe to open its socket");
+    await closing.close();
+    const stopped = await inFlight;
+    expect(stopped).toBeInstanceOf(Error);
+    expect(stopped).not.toBeInstanceOf(ServerUnreachable);
+    await until(() => held!.destroyed, 2_000, "the probe to destroy its socket");
+    expect(whoamis).toBe(sent);
+  } finally {
+    globalThis.fetch = fetch0;
+    Object.assign(connectProbe, probe0);
+    proxyVars.forEach((n, i) => { if (proxyEnv[i] === undefined) delete process.env[n]; else process.env[n] = proxyEnv[i]; });
   }
 });

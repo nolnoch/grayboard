@@ -10,10 +10,12 @@ export type FailureSource = keyof typeof failureSources;
 
 // Stack text includes multiline messages and can be forged, even for real filenames.
 // Derive provenance from the catch site only; never read messages, stacks or causes.
-export function failureDiagnostic(source: FailureSource, error?: unknown) {
+// `category`: "unexpected" for a fault; "client_aborted" for a request its client abandoned while it waited (#1535);
+// "server_cut" for one the server cut, closing its endpoint or stopping (#1541).
+export function failureDiagnostic(source: FailureSource, error?: unknown, category: "unexpected" | "client_aborted" | "server_cut" = "unexpected") {
   const context = typeof source === "string" && Object.hasOwn(failureSources, source)
     ? failureSources[source] : { source: "server", operation: "unknown" };
-  return { ...context, category: "unexpected", ...errorDiagnostic(error) };
+  return { ...context, category, ...errorDiagnostic(error) };
 }
 
 const errorClass = /^([A-Z][A-Za-z0-9]{0,55})?(Error|Exception)$/;

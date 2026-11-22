@@ -31,9 +31,10 @@ import { requestOrigin } from "./request_context.ts";
 import { GOOGLE_ISSUER } from "./idp_google.ts";
 import { LOGIN_SCOPE, OAUTH_SCOPES } from "./oauth-config.ts";
 import type { CredentialSource, ServiceCredential, OAuthStore, OAuthAuthorization, OAuthRequest, OAuthBrowserSession, OAuthCode, OAuthGrant, OAuthTokenPair, OAuthAccess, OAuthFailure } from "./oauth-types.ts";
+import { GRANT_LIST_MAX } from "./oauth-types.ts";
 import { accessFits, accessLookup, BROWSER_SESSIONS, browserData, browserSessionInput, clampPair, clientLookup, codeData, codeInput, grantInput, isLogin, LIVE_SECRETS,
   loginInput, lookup, MINT_WINDOW_MS, mintInput, requestData, requestInput, REQUESTS_PER_BROWSER, REQUESTS_TOTAL, sameAuthorization, rotationBinding, secretLookup,
-  serviceCredentialInput, serviceSecretInput, successorInput, time } from "./oauth-rules.ts";
+  grantSummary, serviceCredentialInput, serviceSecretInput, successorInput, time, userGrantLookup, userLookup } from "./oauth-rules.ts";
 import { AuthorityLost, LastOwner, MissingParent, MissingPost, PrincipalTaken } from "./store/errors.ts";
 import type { Alias, AliasesStore } from "./store/aliases.ts";
 import type { MessageRow, MessagesStore, RetractResult } from "./store/messages.ts";
@@ -46,10 +47,10 @@ import type { WriteReceipt, WriteReceiptsStore } from "./store/write_receipts.ts
 import { AUDIT_WRITE_ON_READ, type AccessLogRow, type AuditStore } from "./store/audit.ts";
 import type { SlackLink, SlackProgress, SlackStore, SlackThread } from "./store/slack.ts";
 import { jsonTextSafe, textSafeOrNull } from "./store/json_safe.ts";
-import { DEV_SESSION_LABEL, TEAM_POLICIES, type User, type IdpSignIn, type Session, type PrincipalRow, type Team, type TeamPolicy, type TeamMember, type RoleBinding, type InvokeBinding, type RoleAuthority, type RoleRevoke, type MemberAuthority, type MemberRemoval, type ServiceRow, type UsersStore, type SessionsStore, type PrincipalsStore, type TeamsStore, type RolesStore, type ServicesStore } from "./store/identity.ts";
+import { DEV_SESSION_LABEL, TEAM_POLICIES, type User, type IdpSignIn, type Session, type PrincipalRow, type Team, type TeamPolicy, type TeamMember, type RoleBinding, type InvokeBinding, type RoleAuthority, type RoleRevoke, type MemberAuthority, type ServiceRow, type UsersStore, type SessionsStore, type PrincipalsStore, type TeamsStore, type RolesStore, type ServicesStore } from "./store/identity.ts";
 // The identity groups' row types and interfaces live in store/identity.ts for the Postgres store (#807 P3 C3a);
 // re-exported for every importer.
-export { DEV_SESSION_LABEL, TEAM_POLICIES } from "./store/identity.ts";
+export { DEV_SESSION_LABEL, NO_MEMBER_AUTHORITY, TEAM_POLICIES } from "./store/identity.ts";
 export type { User, IdpSignIn, Session, PrincipalRow, Team, TeamPolicy, TeamRole, TeamMember, RoleBinding, InvokeBinding, RoleAuthority, RoleGrant, RoleRevoke, MemberAuthority, MemberRemoval, RoleFilter, ServiceRow, UsersStore, SessionsStore, PrincipalsStore, TeamsStore, RolesStore, ServicesStore, JsonValue, AuditFields, IdentityGroups } from "./store/identity.ts";
 // The aliases and messages groups' row types and interfaces live in store/aliases.ts and store/messages.ts (#807 P3 C5a).
 export type { Alias, AliasTarget, AliasesStore, AliasScopeRow } from "./store/aliases.ts";
@@ -72,7 +73,7 @@ export type { DelegationStore, ReadDelegationFacts } from "./store/delegation.ts
 // Row types
 // Every read of a user row goes through this, so `kind` is never missing (a "SELECT *" would type-check without it).
 // A users row with no service principal is a person's: user principals are seeded on every open.
-const USER_SQL = `SELECT u.id, u.email, u.display_name, u.created_at, u.disabled_at, u.idp_issuer, u.idp_subject,
+const USER_SQL = `SELECT u.id, u.email, u.display_name, u.created_at, u.disabled_at, u.idp_issuer, u.idp_subject, u.idp_checked_at,
   CASE WHEN p.id IS NULL THEN 'user' ELSE 'service' END AS kind
   FROM users u LEFT JOIN principals p ON p.user_id = u.id AND p.kind = 'service'`;
 // A user row by id, the auth cache's read (tests count it).
@@ -149,10 +150,10 @@ function queued<T, R>(db: Database, fn: (tx: Tx) => T | PromiseLike<T>, committe
 
 // Repo.writeKeyed on SQLite: write, once the keys pass the check Postgres's scheduler makes (store/queue.ts runKeyed),
 // so a caller's bad key fails on both stores.
+const BAD_KEYS = "runKeyed needs at least one key, each a non-empty string";
+const badKeys = (keys: readonly string[]) => !Array.isArray(keys) || keys.length === 0 || keys.some(k => typeof k !== "string" || k === "");
 function keyedOnSqlite<T, R>(db: Database, keys: readonly string[], fn: (tx: Tx) => T | PromiseLike<T>, committed?: (value: T) => R): Promise<Awaited<R>> {
-  if (!Array.isArray(keys) || keys.length === 0 || keys.some(k => typeof k !== "string" || k === "")) {
-    return Promise.reject(new Error("runKeyed needs at least one key, each a non-empty string"));
-  }
+  if (badKeys(keys)) return Promise.reject(new Error(BAD_KEYS));
   return queued(db, fn, committed);
 }
 
@@ -233,6 +234,32 @@ export interface Repo {
   // write goes on its Tx). A promise `committed` returns is caught and its rejection logged as `what` failed on every
   // branch (#1051). fn may be async (#807 P3 A3), except from the queue's holder; its Tx is live until fn settles.
   post<T>(fn: (tx: Tx) => T | Promise<T>, committed?: (value: T) => unknown, what?: string): boolean;
+  // post, keyed (#1510): on Postgres the body runs as writeKeyed's does, overlapping keyed bodies that share none of
+  // `keys`; on SQLite it is post, run-now branch and all. For a write that reads no in-memory state and writes rows no
+  // other body orders by (a posted audit row, audit.ts writeAudit).
+  postKeyed<T>(keys: readonly string[], fn: (tx: Tx) => T | Promise<T>, committed?: (value: T) => unknown, what?: string): boolean;
+  // Runs fn in a read-only probe of `tx`'s transaction (#1510, docs/future/postgres-server.md D4): a statement fn sends
+  // on it that would write refuses ProbeWrite (store/tx_base.ts) before it's sent, and the probe rejects with it even if
+  // fn swallowed it. Postgres only (store/pg/tx.ts readsOnly): absent on SQLite, whose one writer has nothing to gain
+  // from a keyed body, so the hosted gate's keyed fast path is Postgres's.
+  readsOnly?<T>(tx: Tx, fn: () => Promise<T>): Promise<T>;
+  // Whether `h` is a body's Tx inside a readsOnly probe (#1604): code that would register an afterCommit a probe refuses
+  // asks first. Postgres only, beside readsOnly.
+  probing?(h: Read): boolean;
+  // writeKeyed whose body may register afterCommit effects and pass `committed`, and queue the change notices of the ops
+  // `notices` names (store/notices.ts, by op name: `hosted.update`); every other notice still refuses (D4, #1510 chunk
+  // 4). Postgres only, for the reviewed callers D4 lists (delivery's renew and receipt); absent on SQLite.
+  writeKeyedEffects?<T, R = T>(keys: readonly string[], notices: readonly string[], fn: (tx: Tx) => Promise<T>, committed?: (value: T) => R): Promise<Awaited<R>>;
+  // writeKeyed for dm_send's keyed body (#1537 PR 5, D4): its afterCommit effects run (deliverSend), it queues no change
+  // notice and passes no `committed`. Refused unless `keys` name a root (`root:<id>`) and exactly one recipient stream
+  // (`dm:<address>`), so the one message it may insert (messages.insert refuses without its `dm:` key) is ordered on
+  // its stream and its effects run under that key. Postgres only, for hosted.ts dmSend; absent on SQLite.
+  writeKeyedSend?<T>(keys: readonly string[], fn: (tx: Tx) => Promise<T>): Promise<T>;
+  // writeKeyed for board_post's keyed body (#1537 PR 6, D4): writeKeyedSend's terms with the board for the stream.
+  // Refused unless `keys` are exactly one root (`root:<id>`) and one board (`board:<name>`), so the one post it may
+  // insert (boards.insertPost refuses without its `board:` key) is ordered on its board. Postgres only, for hosted.ts
+  // boardPost; absent on SQLite.
+  writeKeyedPost?<T>(keys: readonly string[], fn: (tx: Tx) => Promise<T>): Promise<T>;
   // The store's read handle outside any transaction (#807 P1c): reads committed state. The task holding an open
   // transaction can't use it (sqliteOf refuses, #807 P3 A7e2): it passes its body's Tx. A Postgres Read is a pool
   // handle and must never resolve to a transaction's connection.
@@ -763,6 +790,13 @@ function initSchema(db: Database): void {
     // by Google (or dev login). Never on a later open, which would re-stamp a row unlink-idp cleared.
     db.run("UPDATE users SET idp_issuer = ?", [GOOGLE_ISSUER]);
   }
+  // users.idp_checked_at (#930): when the IdP last vouched for the user. Once, with the column, every row is stamped
+  // now, so an upgrade starts each clock rather than finding every user stale, and a row unlink-idp cleared before the
+  // upgrade (no issuer) gets a clock rather than reading as exempt (pg migration 0003).
+  if (!userColumns.some(c => c.name === "idp_checked_at")) {
+    db.exec(`ALTER TABLE users ADD COLUMN idp_checked_at INTEGER`);
+    db.run("UPDATE users SET idp_checked_at = ?", [Date.now()]);
+  }
   // Every open: a rolled-back binary (which knows only Google) links or creates users with a subject and no issuer.
   db.run("UPDATE users SET idp_issuer = ? WHERE idp_issuer IS NULL AND idp_subject IS NOT NULL", [GOOGLE_ISSUER]);
   // Every open, since a rolled-back binary recreates it: one `sub` is not unique across issuers.
@@ -971,7 +1005,6 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
     const auth = teamAuthority(by, teamId);
     return !!db.query<{ ok: number }, (number | null)[]>(`SELECT ${auth.sql} AS ok`).get(...auth.args)!.ok;
   };
-  const NO_AUTHORITY: MemberRemoval = { byUser: null, authority: "none", actor: null };
   const bindingDetail = (b: RoleBinding) => ({
     binding: b.id, role: b.role, principal: b.principal, principal_id: b.principal_id, scope: b.scope, scope_id: b.scope_id,
     granted_by: b.granted_by, granter: b.granter, granted_at: b.granted_at,
@@ -1075,6 +1108,10 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
     write: <T, R = T>(fn: (tx: Tx) => T | Promise<T>, committed?: (value: T) => R) => queued(db, fn, committed),
     writeKeyed: <T, R = T>(keys: readonly string[], fn: (tx: Tx) => T | Promise<T>, committed?: (value: T) => R) => keyedOnSqlite(db, keys, fn, committed),
     post: <T>(fn: (tx: Tx) => T | Promise<T>, committed?: (value: T) => unknown, what = "write") => posted(db, fn, committed, what),
+    postKeyed: <T>(keys: readonly string[], fn: (tx: Tx) => T | Promise<T>, committed?: (value: T) => unknown, what = "write") => {
+      if (badKeys(keys)) throw new Error(BAD_KEYS);
+      return posted(db, fn, committed, what);
+    },
     read: sqliteRead(db),
     authRead: auth.authRead,
     authPeek: auth.authPeek,
@@ -1085,7 +1122,8 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       // A service credential's add, rotate and mint only add authority: no session's shrinks, so they send no change
       // notice (each null notice is a full hosted re-check pass, and mints come per run, #270 audit M-1). The
       // generation trigger on oauth_tokens still clears the access cache. Only the revokes notify.
-      revokeServiceCredential: change(oauth.revokeServiceCredential), revokeServiceSecret: change(oauth.revokeServiceSecret) },
+      revokeServiceCredential: change(oauth.revokeServiceCredential), revokeServiceSecret: change(oauth.revokeServiceSecret),
+      revokeUserGrant: change(oauth.revokeUserGrant) },
     hosted: { ...hostedStore, insert: marks(hosted.insert, (_tx, row) => row.session_id), update: marks(hosted.update, (_tx, id) => id),
       end: marks(hosted.end, (_tx, session) => session), childEnd: marks(hosted.childEnd, (_tx, session) => session),
       park: marks(hosted.park, (_tx, session) => session), unpark: marks(hosted.unpark, (_tx, session) => session),
@@ -1096,20 +1134,22 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       },
       async signIn(tx, issuer, subject, email, displayName) {
         const db = sqliteOf(tx);
+        // Each verified sign-in restamps the user's IdP clock (#930), which the reauth fallback reads.
+        const at = clock();
         return db.transaction((): IdpSignIn => {
           // A link is conditional on the row still being unlinked and enabled (D3): on Postgres another sign-in may
           // link it, or an admin disable it, between the read and the write. Zero rows: re-read and decide again.
           const link = (id: number) => db.run(
-            `UPDATE users SET idp_issuer = ?, idp_subject = ?, display_name = ?
+            `UPDATE users SET idp_issuer = ?, idp_subject = ?, display_name = ?, idp_checked_at = ?
              WHERE id = ? AND idp_subject IS NULL AND (idp_issuer IS NULL OR idp_issuer = ?) AND disabled_at IS NULL`,
-            [issuer, subject, displayName, id, issuer]).changes === 1;
+            [issuer, subject, displayName, at, id, issuer]).changes === 1;
           for (let attempt = 0; attempt < 3; attempt++) {
             // 1. This IdP account's user.
             const bySubject = db.query<User, [string, string]>(`${USER_SQL} WHERE u.idp_issuer = ? AND u.idp_subject = ?`).get(issuer, subject);
             if (bySubject) {
               if (bySubject.email !== email) return { status: "email_changed", user: bySubject };
-              db.run("UPDATE users SET display_name = ? WHERE id = ?", [displayName, bySubject.id]);
-              return { status: "ok", user: { ...bySubject, display_name: displayName }, linked: false };
+              db.run("UPDATE users SET display_name = ?, idp_checked_at = ? WHERE id = ?", [displayName, at, bySubject.id]);
+              return { status: "ok", user: { ...bySubject, display_name: displayName, idp_checked_at: at }, linked: false };
             }
             const byEmail = db.query<User, [string]>(`${USER_SQL} WHERE u.email = ?`).get(email);
             // A service's row (#270 D1): no IdP account links to it, whatever the issuer.
@@ -1123,21 +1163,25 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
               // must not bind it to whoever tried (security audit F-13).
               if (byEmail.disabled_at !== null) return { status: "ok", user: byEmail, linked: false };
               // 4 and 5. This IdP's unlinked row, or a row with neither.
-              if (link(byEmail.id)) return { status: "ok", user: { ...byEmail, idp_issuer: issuer, idp_subject: subject, display_name: displayName }, linked: true };
+              if (link(byEmail.id)) return { status: "ok", user: { ...byEmail, idp_issuer: issuer, idp_subject: subject, display_name: displayName, idp_checked_at: at }, linked: true };
               continue;
             }
             // 6. A new user, created with both.
             const user = upsertUser(db, email, displayName, clock());
-            if (link(user.id)) return { status: "ok", user: { ...user, idp_issuer: issuer, idp_subject: subject }, linked: false };
+            if (link(user.id)) return { status: "ok", user: { ...user, idp_issuer: issuer, idp_subject: subject, idp_checked_at: at }, linked: false };
           }
           throw new Error(`sign-in for ${email} kept losing its link to concurrent sign-ins`);
         }).immediate();
       },
       async clearSubject(tx, userId) {
-        sqliteOf(tx).run("UPDATE users SET idp_issuer = NULL, idp_subject = NULL WHERE id = ?", [userId]);
+        sqliteOf(tx).run("UPDATE users SET idp_issuer = NULL, idp_subject = NULL, idp_checked_at = COALESCE(idp_checked_at, 0) WHERE id = ?", [userId]);
+      },
+      async stampIdpChecked(tx, userId) {
+        sqliteOf(tx).run("UPDATE users SET idp_checked_at = ? WHERE id = ?", [clock(), userId]);
       },
       async findByEmail(r, email) { return userByEmail(sqliteOf(r), email); },
       async findById(r, userId) { return userById(sqliteOf(r), userId); },
+      async lockById(tx, userId) { return userById(sqliteOf(tx), userId); },
       isDisabled: auth.isDisabled,
       active: auth.active,
       async setDisabled(tx, userId, disabled) {
@@ -1186,8 +1230,23 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
           await endHostedWhere(hosted, sp, "revoked", now, row => row.user_id === userId);
           db.run("UPDATE oauth_grants SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL", [now, userId]);
           db.run("DELETE FROM oauth_codes WHERE user_id = ? AND grant_id IS NULL", [userId]);
+          // A live browser session consents without the IdP, so revoke-all ends them as a per-grant revoke does (#1552).
+          db.run("DELETE FROM oauth_browsers WHERE user_id = ?", [userId]);
         });
         notices.changed(tx, null);
+      },
+      async listLive(r, userId, usedAfter, limit) {
+        return sqliteOf(r).query<Session, [number, number, number]>(
+          "SELECT * FROM sessions WHERE user_id = ? AND revoked_at IS NULL AND last_used_at > ? ORDER BY last_used_at DESC, id DESC LIMIT ?",
+        ).all(userId, usedAfter, limit);
+      },
+      async revokeOwn(tx, userId, sessionId) {
+        const db = sqliteOf(tx);
+        const revoked = !!db.query<{ id: number }, [number, number, number]>(
+          "UPDATE sessions SET revoked_at = ? WHERE id = ? AND user_id = ? AND revoked_at IS NULL RETURNING id",
+        ).get(clock(), sessionId, userId);
+        if (revoked) endSignIns(db, userId);
+        return revoked;
       },
       async revokeDev(tx) {
         return sqliteOf(tx).run("UPDATE sessions SET revoked_at = ? WHERE label = ? AND revoked_at IS NULL", [clock(), DEV_SESSION_LABEL]).changes;
@@ -1378,6 +1437,8 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       pendingPushes: async (r, handle) => pendingPushes(sqliteOf(r), handle),
       pendingDigests: async (r, handle) => pendingDigests(sqliteOf(r), handle),
       acknowledge: async (tx, handle, ref, receiver) => acknowledge(sqliteOf(tx), handle, ref, receiver),
+      // In process, so a loop costs no round trips.
+      acknowledgeMany: async (tx, handle, refs, receiver) => { const db = sqliteOf(tx); for (const ref of refs) acknowledge(db, handle, ref, receiver); },
       ensure: async (tx, name, purpose, scope, createdBy) => ensureBoard(sqliteOf(tx), name, purpose, scope, createdBy),
       isSubscribed: async (r, handle, board) => isSubscribed(sqliteOf(r), handle, board),
       setSubscription: async (tx, handle, board, mode) => setSubscription(sqliteOf(tx), handle, board, mode),
@@ -1453,7 +1514,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       async listForUser(r, userId) { return teamsOf(sqliteOf(r), userId); },
       // Conditional on the actor's authority in its own statement, as roles.grant is; zero rows is an existing member
       // or the authority gone, and a second read says which. SQLite's single writer serializes both with any revoke.
-      async addMember(tx, teamId, userId, by = NO_AUTHORITY) {
+      async addMember(tx, teamId, userId, by) {
         const db = sqliteOf(tx);
         const auth = teamAuthority(by, teamId);
         const added = db.run(
@@ -1465,7 +1526,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       },
       // The authority is read once, before any write: the revoke below may delete the very binding it rests on (an
       // owner removing themselves), so a re-check after it would refuse what the decision allowed.
-      async removeMember(tx, teamId, userId, by = NO_AUTHORITY) {
+      async removeMember(tx, teamId, userId, by) {
         const db = sqliteOf(tx);
         return db.transaction(() => {
           if (!authorityHolds(db, by, teamId)) throw new AuthorityLost();
@@ -1727,8 +1788,18 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       async ack(tx, reader, id) {
         sqliteOf(tx).run("INSERT OR IGNORE INTO dm_acks (reader, message_id, acked_at) SELECT ?, id, ? FROM messages WHERE id = ?", [reader, clock(), id]);
       },
-      async markDelivered(tx, id, at) {
-        sqliteOf(tx).run("UPDATE messages SET delivered_at = ? WHERE id = ? AND delivered_at IS NULL", [at, id]);
+      async deliver(tx, recipients, ids, at) {
+        const db = sqliteOf(tx);
+        const mine = db.query<{ id: number; recipient: string }, [string, string]>(
+          `SELECT id, recipient FROM messages WHERE id IN (SELECT value FROM json_each(?)) AND recipient_type = 'user'
+             AND recipient IN (SELECT value FROM json_each(?)) ORDER BY id`,
+        ).all(JSON.stringify(ids), JSON.stringify(recipients));
+        if (at !== null && mine.length) {
+          db.run("UPDATE messages SET delivered_at = ? WHERE id IN (SELECT value FROM json_each(?)) AND delivered_at IS NULL", [at, JSON.stringify(mine.map(m => m.id))]);
+        }
+        const last = new Map<string, number>();
+        for (const m of mine) last.set(m.recipient, Math.max(last.get(m.recipient) ?? 0, m.id));
+        return last;
       },
       async retract(tx, sender, id, by) {
         const db = sqliteOf(tx);
@@ -1971,6 +2042,14 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
 }
 
 // A CLI session row: sessions.create's, and a login code's redemption's in its own transaction (#928 D8).
+// What a per-grant revoke (#930) ends beside the grant or CLI token: the user's browser sessions, since a live one
+// consents without the IdP and could mint a replacement on the lost device (#1552), and the unspent codes one
+// already minted. Not the device's alone: nothing ties a browser session to a grant, so every browser signs in again.
+function endSignIns(db: Database, userId: number): void {
+  db.run("DELETE FROM oauth_browsers WHERE user_id = ?", [userId]);
+  db.run("DELETE FROM oauth_codes WHERE user_id = ? AND grant_id IS NULL AND session_id IS NULL", [userId]);
+}
+
 function insertSession(db: Database, userId: number, tokenHash: string, label: string | null, now: number): Session {
   const r = db.run(
     `INSERT INTO sessions (user_id, token_hash, created_at, last_used_at, label) VALUES (?, ?, ?, ?, ?)`,
@@ -2002,6 +2081,7 @@ function makeOAuthStore(hosted: HostedStoreOf): OAuthStore {
     redeemCode: (tx, ...a) => settledOn(() => on(tx).redeemCode(tx, ...a)),
     redeemLoginCode: async (tx, ...a) => on(tx).redeemLoginCode(...a),
     findRefreshGrant: async (r, ...a) => on(r).findRefreshGrant(...a),
+    findRefreshUser: async (r, ...a) => on(r).findRefreshUser(...a),
     rotateRefresh: (tx, ...a) => settledOn(() => on(tx).rotateRefresh(tx, ...a)),
     revokeToken: (tx, ...a) => settledOn(() => on(tx).revokeToken(tx, ...a)),
     findActiveAccess: async (r, ...a) => on(r).findActiveAccess(...a),
@@ -2011,23 +2091,25 @@ function makeOAuthStore(hosted: HostedStoreOf): OAuthStore {
     addServiceCredential: async (tx, ...a) => on(tx).addServiceCredential(...a),
     rotateServiceCredential: async (tx, ...a) => on(tx).rotateServiceCredential(...a),
     revokeServiceCredential: (tx, ...a) => settledOn(() => on(tx).revokeServiceCredential(tx, ...a)),
+    listGrants: async (r, ...a) => on(r).listGrants(...a),
+    revokeUserGrant: (tx, ...a) => settledOn(() => on(tx).revokeUserGrant(tx, ...a)),
     revokeServiceSecret: async (tx, ...a) => on(tx).revokeServiceSecret(...a),
     findServiceCredential: async (r, ...a) => on(r).findServiceCredential(...a),
     mintServiceToken: async (tx, ...a) => on(tx).mintServiceToken(...a),
   };
 }
 
-// A call's promise, its synchronous throw (a settled Tx, a foreign handle) as a rejection: the five revoking OAuth
+// A call's promise, its synchronous throw (a settled Tx, a foreign handle) as a rejection: the revoking OAuth
 // methods are forwarded without an async wrapper, whose extra hop would hold the write queue a tick longer.
 function settledOn<T>(f: () => Promise<T>): Promise<T> {
   try { return f(); } catch (e) { return Promise.reject(e); }
 }
 
 // The store's methods without their handle, bound to one connection.
-// Synchronous: the store wraps each async method's result in a promise. The five that can revoke a grant are the
+// Synchronous: the store wraps each async method's result in a promise. The ones that can revoke a grant are the
 // store's own async methods, on the caller's Tx: a revoked grant ends its hosted sessions, whose released children's
 // IDs end through the async session-end port (#807 P3 C10d2-a).
-type OAuthRevokes = "redeemCode" | "rotateRefresh" | "revokeToken" | "revokePreBuiltinGrants" | "revokeServiceCredential";
+type OAuthRevokes = "redeemCode" | "rotateRefresh" | "revokeToken" | "revokePreBuiltinGrants" | "revokeServiceCredential" | "revokeUserGrant";
 type OAuthOps = { [K in Exclude<keyof OAuthStore, OAuthRevokes>]: OAuthStore[K] extends (h: never, ...a: infer A) => infer R ? (...a: A) => Awaited<R> : never }
   & Pick<OAuthStore, OAuthRevokes>;
 function oauthOps(db: Database, hosted: HostedStoreOf): OAuthOps {
@@ -2253,6 +2335,16 @@ function oauthOps(db: Database, hosted: HostedStoreOf): OAuthOps {
       const g: OAuthGrant = JSON.parse(row.data);
       return g.clientId === clientId && g.resource === resource ? g : undefined;
     },
+    findRefreshUser(h, clientId, resource, now) {
+      if (!lookup(h, now)) return undefined;
+      const row = db.query<{ data: string }, [string, number, number]>(`
+        SELECT g.data FROM oauth_tokens t JOIN oauth_grants g ON g.id = t.grant_id JOIN users u ON u.id = g.user_id
+        WHERE t.hash = ? AND t.kind = 'refresh' AND t.spent_at IS NULL AND t.revoked_at IS NULL AND t.expires_at > ?
+          AND g.revoked_at IS NULL AND g.expires_at > ? AND u.disabled_at IS NULL`).get(h, now, now);
+      if (!row) return undefined;
+      const g: OAuthGrant = JSON.parse(row.data);
+      return g.clientId === clientId && g.resource === resource ? g.userId : undefined;
+    },
     async rotateRefresh(tx, input, now) {
       if (!lookup(input.refreshHash, now)) return invalid;
       return tx.savepoint(async sp => {
@@ -2401,6 +2493,29 @@ function oauthOps(db: Database, hosted: HostedStoreOf): OAuthOps {
         return ok({ userId: c.user_id });
       });
     },
+    listGrants(userId, now) {
+      if (!userLookup(userId, now)) return [];
+      return db.query<{ data: string; credential: number; last_used: number | null }, [number, number, number]>(`
+        SELECT g.data, c.id IS NOT NULL AS credential, (SELECT MAX(t.created_at) FROM oauth_tokens t WHERE t.grant_id = g.id) AS last_used
+        FROM oauth_grants g LEFT JOIN service_credentials c ON c.grant_id = g.id
+        WHERE g.user_id = ? AND g.revoked_at IS NULL AND g.expires_at > ?
+        ORDER BY COALESCE(last_used, json_extract(g.data, '$.createdAt')) DESC, g.id LIMIT ?`).all(userId, now, GRANT_LIST_MAX)
+        .map(row => grantSummary(JSON.parse(row.data), !!row.credential, row.last_used));
+    },
+    async revokeUserGrant(tx, userId, grantId, now) {
+      if (!userGrantLookup(userId, grantId, now)) return invalid;
+      return tx.savepoint(async sp => {
+        const row = db.query<{ credential: number }, [string, number, number]>(`SELECT c.id IS NOT NULL AS credential FROM oauth_grants g
+          LEFT JOIN service_credentials c ON c.grant_id = g.id WHERE g.id = ? AND g.user_id = ? AND g.revoked_at IS NULL AND g.expires_at > ?`).get(grantId, userId, now);
+        if (!row) return missing;
+        if (row.credential) return invalid;
+        const g = grant(grantId)!;
+        // The grant's revocation ends every hosted session attached to it here, in this transaction, as a credential's does.
+        await revokeGrant(sp, grantId, now);
+        endSignIns(db, userId);
+        return ok({ clientId: g.clientId });
+      });
+    },
     revokeServiceSecret(secretId, now) {
       if (!secretLookup(secretId, now)) return invalid;
       return db.transaction(() => {
@@ -2478,6 +2593,9 @@ function makeHostedStore(db: Database, port: () => SessionEndPort): HostedStoreO
     writeKeyed: (keys, fn, committed) => keyedOnSqlite(db, keys, fn, committed),
     subscribe: () => () => {},
     get: async (r, id) => hostedRow(sqliteOf(r), id),
+    // One JSON parameter, so no bound-parameter limit applies however many IDs (#1572).
+    getMany: async (r, ids) => ids.length ? sqliteOf(r).query<HostedSession, [string]>(
+      "SELECT * FROM hosted_sessions WHERE session_id IN (SELECT value FROM json_each(?))").all(JSON.stringify([...new Set(ids)])) : [],
     // The single writer serializes every body, so the three lock seams lock nothing here (#807 P3 C8 decision 1): `lock`
     // reads the row on the Tx, `lockCapacity` only checks its handle, and `grantLive` reads the grant. Each refuses a
     // pool Read (sqliteOf alone accepts one): on Postgres a lock outside a transaction would be released at once.

@@ -83,7 +83,7 @@ describePg("messages store races (Postgres)", () => {
     now = T0;
     await using p = await pgPair();
     const m = await root(p);
-    const r = await race(p, tx => ms.markDelivered(tx, m.id, T0 + 5), retract(m.id));
+    const r = await race(p, tx => ms.deliver(tx, [m.recipient], [m.id], T0 + 5), retract(m.id));
     committed(r.a);
     expect(outcome(r.b)).toBe("read");
     expect((await ms.getById(p.a.read, m.id))?.delivered_at).toBe(T0 + 5);

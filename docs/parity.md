@@ -48,10 +48,11 @@ The baseline every later change is measured against: as of v2.4.0, every cell is
 | 20 | Runtime role bindings (`org_admin`, `team_owner`) and `grayboard admin role` | n/a | yes | n/a | yes | n/a | yes | n/a | yes |
 | 21 | A service's agent signs in with a run token from a service credential (no browser) | n/a | yes | n/a | yes | n/a | yes | n/a | yes |
 | 22 | Invoke a service by posting on its board under a `service_invoke` grant; the service's reply wakes the invoker | n/a | yes | n/a | yes | n/a | yes | n/a | yes |
+| 23 | List and revoke one sign-in (an OAuth grant or a CLI token) at a time, own or (admin) another user's | n/a | yes | n/a | yes | n/a | yes | n/a | yes |
 
 ## Evidence by row
 
-Rows 1–8: `parity-delivery.md`. Rows 9–16: `parity-access.md`. Rows 17–22: §Not covered.
+Rows 1–8: `parity-delivery.md`. Rows 9–16: `parity-access.md`. Rows 17–23: §Not covered.
 
 ## Notes (known limits, not cells)
 
@@ -112,3 +113,8 @@ The Rust client SDK (`sdk/rust`, #929) is a library for services, not a harness 
 
 - Local (all four): n/a. A grant means something only with more than one principal (`vision.md` §1).
 - Every hosted cell: server-side, through the shared `board_post` and `claim_take` and the pull's writer marks, the same for every harness (#270 step 5; `server-services.md` §2, `boards.md` §3 Service boards). The service's own side needs its run token (row 21). Proof: `tests/integration/service_invoke.test.ts` (hosted-core wire sessions: one service lane, actionable; the reply wakes a direct and a team holder; a team-bound session, a non-holder and a removed member refused as a missing board with deny rows; no invoker lane on rotation, decline or mention; `ungranted` after a revoke; hidden on every listing and read), `tests/integration/role_bindings.test.ts` (the CLI grants a team).
+
+### 23. List and revoke one sign-in (an OAuth grant or a CLI token) at a time, own or (admin) another user's
+
+- Local (all four): n/a. Local mode has no sign-in to revoke (`vision.md` §1).
+- Every hosted cell: server-side HTTP routes and the CLI (`grayboard grants`), the same for every harness, since each harness's sign-in is one OAuth grant (#930; `server-access.md` §1); no MCP tool. A revoked harness meets the sign-in flow of row 9. Proof: `tests/integration/grants.test.ts` (own and admin list and revoke over HTTP and through the CLI; another user's id is a 404; a revoked grant no longer refreshes while the user's other grant does; a credential's grant is a 409).

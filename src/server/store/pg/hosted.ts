@@ -41,7 +41,7 @@ import { insertAudit } from "./audit_row.ts";
 import type { PgSessionEndPort } from "./hosted_port.ts";
 import type { AuditDetail } from "./sql.ts";
 import { int8, int8OrNull } from "./sql.ts";
-import { pgOf, type PgSql } from "./tx.ts";
+import { pgOf, refuseKeyed, type PgSql } from "./tx.ts";
 
 // pg_advisory_xact_lock(class, 0) for admission (`full()`): the two-int4 form beside ALIAS_CAP_LOCK and the OAuth
 // classes, one key for every user, since the global cap spans them.
@@ -131,6 +131,11 @@ export function makePgHosted({ sessionEnd }: { sessionEnd: PgSessionEndPort }): 
 
   return {
     get: (r, id) => { const sql = pgOf(r); return one(sql`SELECT ${cols(sql)} FROM hosted_sessions WHERE session_id = ${id}`); },
+    getMany: async (r, ids) => {
+      if (!ids.length) return [];
+      const sql = pgOf(r);
+      return sessions(sql`SELECT ${cols(sql)} FROM hosted_sessions WHERE session_id = ANY(${[...new Set(ids)]}::text[])`);
+    },
     // A child's root first, then the row (store/hosted.ts's order). A child's root never changes while its row exists
     // (a convert deletes and inserts), so the root read before the lock is the row's; the re-check covers a row
     // deleted and registered again under another root in between.
@@ -143,6 +148,8 @@ export function makePgHosted({ sessionEnd }: { sessionEnd: PgSessionEndPort }): 
       return row;
     },
     async lockCapacity(tx) {
+      // The capacity paths (admission, its nested sweep) stay exclusive (D4).
+      refuseKeyed(tx, "hosted.lockCapacity");
       const sql = lockOn(tx);
       await sql`SELECT pg_advisory_xact_lock(${HOSTED_CAP_LOCK}::int4, 0)`;
       capped.add(tx);
@@ -295,9 +302,14 @@ export function makePgHosted({ sessionEnd }: { sessionEnd: PgSessionEndPort }): 
     async restateWritesAs(tx, id, writesAs) {
       await pgOf(tx)`UPDATE ids SET writes_as = ${writesAs} WHERE id = ${id} AND writes_as IS NULL`;
     },
-    // One statement: two declarers get one true between them.
+    // Read first (#1510): every request of an ownership may declare and only its first writes, so the common call is a
+    // read, which the hosted gate's keyed fast path can make in its read-only probe (D4). The UPDATE alone decides: two
+    // declarers get one true between them.
     async declareLauncher(tx, id) {
-      return (await pgOf(tx)`UPDATE ids SET launcher = true WHERE id = ${id} AND launcher IS DISTINCT FROM true RETURNING 1`).length > 0;
+      const sql = pgOf(tx);
+      const [row] = await sql`SELECT launcher FROM ids WHERE id = ${id}`;
+      if (!row || row.launcher === true) return false;
+      return (await sql`UPDATE ids SET launcher = true WHERE id = ${id} AND launcher IS DISTINCT FROM true RETURNING 1`).length > 0;
     },
     async launcher(r, id) {
       const [row] = await pgOf(r)`SELECT launcher FROM ids WHERE id = ${id}`;

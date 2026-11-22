@@ -7,8 +7,10 @@ import { DEFAULT_IDLE_SECONDS, MAX_CHILDREN, aliasLostNotice, childCapacity, asS
 import { launcherInstruction } from "../core/delegation.ts";
 import { channelInstructions, COORDINATION_INSTRUCTIONS, DEFAULT_CHANNEL_SOURCE, ownHumanInstruction } from "../core/tools.ts";
 import { normalizeAliasName } from "../core/addresses.ts";
+import { CoreError } from "../core/errors.ts";
+import { cleanFact } from "../core/text.ts";
 import { HUMAN_NAME, normalizeIdentityName } from "../shared/addressing.ts";
-import { ApplicationError, UNBOUND_READS, type Application, type ApplicationSession, type BuildFacts, type DeliverySink, type IdentityInfo, type RefusalRow } from "./application.ts";
+import { ApplicationError, KeyedSendMiss, PURE_READS, UNBOUND_READS, type Application, type ApplicationSession, type BuildFacts, type DeliverySink, type IdentityInfo, type RefusalRow } from "./application.ts";
 import type { AuthedUser } from "./auth.ts";
 import type { OAuthPrincipal } from "./oauth.ts";
 import { BUILTIN_CLIENT_IDS, OPENCODE_CLIENT, harnessFor } from "./oauth-config.ts";
@@ -18,9 +20,9 @@ import type { HostedEnd, HostedLost, HostedSession, LostReader } from "./hosted-
 import { writeAudit, type AuditAction } from "./audit.ts";
 import { hostedFailure } from "./hosted-diagnostics.ts";
 import { decidePure, recordDecision, type PureRequest } from "./policy.ts";
-import { countRefusal } from "./metrics.ts";
-import { isTx, type Read, type Tx } from "./store/tx.ts";
-import { atSite } from "./store/queue.ts";
+import { countGate, countRefusal, type GateMethod, TOOL_METHODS } from "./metrics.ts";
+import { isTx, ProbeWrite, type Read, type Tx } from "./store/tx.ts";
+import { abandonable, atSite, RequestAbortedError } from "./store/queue.ts";
 
 // `facts`: the model and effort the request reports (#364); a key the request leaves out keeps the stored value, and
 // an empty string clears it (#558).
@@ -191,9 +193,15 @@ const shortOf = (email: string) => (address: string) => address.startsWith(`${em
 const LOST_ALL = "It has no bus name now, so it only reads: bind(name) to take another.";
 const quietSink: DeliverySink = { deliver() {}, closed() {} };
 const writeReads = new Set([...UNBOUND_READS, "whoami", "dm_history", "dm_thread", "dm_inbox"]);
+// The tools whose body runs keyed on its root in a read-only probe on Postgres (#1604, runTool): those that read and
+// write nothing in the common case: the board tools' PURE_READS, and dm_history. board_read is not one (it advances the
+// reader's cursor and outbox), nor dm_inbox and dm_thread, whose recursive CTE the probe can't tell from a write.
+const KEYED_READS: ReadonlySet<string> = new Set([...PURE_READS, "dm_history"]);
 // How often the sweep timer records the server's liveness; after a crash the
 // restart credit can overshoot the real downtime by at most this (#423).
 const HEARTBEAT_MS = 1000;
+// The heartbeat body's write key (D4): the one server_state row it writes.
+const HEARTBEAT_KEY = "server:alive_at";
 // A running server's alive_at lags by up to a heartbeat plus a timer tick
 // (and event-loop delay); a gap within this bound is no measurable downtime.
 const LIVE_STALENESS_MS = 2 * HEARTBEAT_MS;
@@ -206,7 +214,10 @@ const RECONCILE_EVERY = 120;
 // Activity writes coalesce (#912): a touch skips a row whose last_seen_at is within this of now, at most a tenth
 // of the idle window, so the idle sweep sees a row at most that much older than its last call.
 const TOUCH_EVERY_MS = 5_000;
-export function createHostedSessions(application: Application, options: { now?: () => number; idleSeconds?: number; caps?: HostedCaps["sessions"]; isAuthorized(principal: OAuthPrincipal, r?: Read): boolean | Promise<boolean> }) {
+// `keyedGate: false` turns the gate's keyed fast path off (#1510): tests' reference for what the exclusive body writes.
+// `keyedTools: false` the same for keyed tool bodies (dm_send's, #1537 PR 5). The read tools' keyed bodies (#1604) also
+// need the gate's fast path, so `keyedGate: false` turns them off too.
+export function createHostedSessions(application: Application, options: { now?: () => number; idleSeconds?: number; caps?: HostedCaps["sessions"]; keyedGate?: false; keyedTools?: false; isAuthorized(principal: OAuthPrincipal, r?: Read): boolean | Promise<boolean> }) {
   const repo = application.repo, store = repo.hosted;
   const now = options.now ?? Date.now;
   // GRAYBOARD_HOSTED_IDLE_SECONDS is parsed strictly in config.ts and arrives here as options.idleSeconds.
@@ -387,9 +398,14 @@ export function createHostedSessions(application: Application, options: { now?: 
   // start-of-call touch stands. `seen`: the older last_seen_at the start-of-call touch left on the row and its root.
   // While both are within the touch window, the touch below would write nothing (no write moves last_seen_at back
   // but a full-row update), so the call ends without a transaction (#998).
+  // Keyed by the row's root (#1510, docs/future/postgres-server.md D4): it writes last_seen_at of that root and of the
+  // row, which is the root or one of its children, and nothing else. Plain reads, then two single-row UPDATEs, root
+  // first: every other body that writes those rows is exclusive (gate, end, bind, sweep, revoke, park) or carries the
+  // same key, so it never overlaps one, and a touch of another root writes disjoint rows. hosted_sessions has no
+  // trigger, and an UPDATE that leaves the grant column alone runs no foreign-key check.
   async function touchAfter(row: HostedSession, seen: number) {
     if (stopped || now() - seen < touchEvery) return;
-    try { await atSite("touch", () => store.write(async tx => {
+    try { await atSite("touch", () => store.writeKeyed([`root:${row.root_session_id ?? row.session_id}`], async tx => {
       const current = await store.get(tx, row.session_id), root = row.root_session_id ? await store.get(tx, row.root_session_id) : current;
       if (!current || !root || current.ownership_id !== row.ownership_id || current.root_session_id !== row.root_session_id || current.parked_at !== null || root.ownership_id !== row.ownership_id) return;
       const t = now();
@@ -434,9 +450,10 @@ export function createHostedSessions(application: Application, options: { now?: 
     !!holder && row.ownership_id === holder.row.ownership_id && row.bind_gen === holder.row.bind_gen;
   // A row's facts on the committing Tx, in its beforeCommit hook (db.ts readFacts). `holders` is read here, before
   // COMMIT, and applied after it, sound because it changes only in an apply (an afterCommit flush or the full pass's
-  // `committed`, both run by the write queue's holder) and in close(): from this hook through COMMIT to the flush
-  // the queue stays held, so only close() can come between, and the apply checks `stopped`. A matching holder needs
-  // no build, so a renew reads only the row and its holds. `build` null: the row's user is gone.
+  // `committed`, both run by a write body) and in close(): from this hook through COMMIT to the flush the body holds
+  // the row's root key (a keyed renew, #1510 chunk 4) or the whole queue, and every other apply of `holders[id]` runs
+  // in a body of that key or an exclusive one, so only close() can come between, and the apply checks `stopped`. A
+  // matching holder needs no build, so a renew reads only the row and its holds. `build` null: the row's user is gone.
   async function readHolder(tx: Tx, id: string): Promise<HolderFacts> {
     const row = await store.get(tx, id);
     const held = row && !row.root_session_id && row.parked_at === null ? await application.hostedHolds(tx, id) : [];
@@ -469,22 +486,22 @@ export function createHostedSessions(application: Application, options: { now?: 
     fullQueued = mine;
     // Cleared again when it settles: a write refused before its body starts (a failed BEGIN) must not leave every
     // later request sharing its rejection.
-    mine.promise = store.write(async tx => {
+    mine.promise = atSite("reconcile", () => store.write(async tx => {
       if (fullQueued === mine) fullQueued = undefined;
       return readAll(tx);
-    }, applyAll).finally(() => { if (fullQueued === mine) fullQueued = undefined; });
+    }, applyAll)).finally(() => { if (fullQueued === mine) fullQueued = undefined; });
     return mine.promise;
   }
   async function readAll(tx: Tx) {
     // The rows each watcher follows, parked ones too, read on this Tx (#807 P3 A7h2): `applyAll` hands them over
     // before the queue's next body, so no commit lands between this read and the watcher's check. Read first, and
     // each rebuild below in its own savepoint, so a rebuild that throws can't keep a revocation from its watchers.
+    // Every watcher's IDs in one statement (#1572), then each watcher gets its own: a watched ID with no row maps to
+    // undefined, as a per-ID read gave it.
+    const wanted = [...watchers].map(w => [w, [...w.ids()]] as const);
+    const found = new Map((await store.getMany(tx, wanted.flatMap(([, ids]) => ids))).map(r => [r.session_id, r]));
     const watched = new Map<RowWatcher, Map<string, HostedSession | undefined>>();
-    for (const w of watchers) {
-      const rows = new Map<string, HostedSession | undefined>();
-      for (const id of [...w.ids()]) rows.set(id, await store.get(tx, id));
-      watched.set(w, rows);
-    }
+    for (const [w, ids] of wanted) watched.set(w, new Map(ids.map(id => [id, found.get(id)])));
     const held = await application.holdsByOwner(tx);
     const rows = (await store.all(tx)).filter(r => !r.root_session_id && held.has(r.session_id));
     const builds = new Map<string, { authed: AuthedUser; facts: BuildFacts }>();
@@ -531,7 +548,7 @@ export function createHostedSessions(application: Application, options: { now?: 
   // it directly. The commits tell reconcile which rows changed, and their facts are read on the committing transaction.
   // Through the write queue (startup's first sweep too, which the server's `ready` waits for before anything serves,
   // #807 P3 A4). `nested`: inside the caller's transaction (a capacity refusal's re-sweep), on `outer`, that
-  // transaction's Tx.
+  // transaction's Tx. Its callers name its queue site (the timer's and startup's: "sweep").
   function sweep(full = true, mode: "queued" | "nested" = "queued", outer?: Tx): Promise<void> {
     if (stopped) return Promise.resolve();
     if (full) sweptAt = now();
@@ -553,6 +570,27 @@ export function createHostedSessions(application: Application, options: { now?: 
     // savepoint or register's write body, and neither catches, so a throw here rolls that back whole, as a refusal
     // rolls this sweep back. A catch added around either would commit a half-done sweep.
     return body(outer);
+  }
+  // The timer's sweep (#1537 PR 6, docs/future/postgres-server.md D4). On Postgres it first asks the pool whether the
+  // body would find a row, and queues nothing when it wouldn't: an exclusive body drains every keyed one, and the timer
+  // queues one each tick. A full pass skipped this way counts as one run now (`sweptAt`): it found nothing to end then.
+  function timerSweep(full: boolean): Promise<void> {
+    if (repo.readsOnly === undefined) return sweep(full);
+    if (full) sweptAt = now();
+    return sweepDue(full).then(due => due ? sweep(full) : undefined);
+  }
+  // Whether a queued sweep's body would find a row to judge, read on the pool with the body's queries: a lease lapsed,
+  // and for a full pass a disabled user's root or an idle row (busy or not; the body judges that). Each query takes the
+  // clock now, and the body would take it later, so a row the body would find and this misses only became due after
+  // this read, the next tick's sweep finds it, as it would a row due just after a sweep that ran. A read that throws
+  // runs the body, as before this check.
+  async function sweepDue(full: boolean): Promise<boolean> {
+    try {
+      const t = now();
+      if ((await store.expired(repo.read, t)).length) return true;
+      if (!full) return false;
+      return (await store.disabled(repo.read)).length > 0 || (await store.idle(repo.read, t - idle)).length > 0;
+    } catch (e) { hostedFailure("hosted.sweep", e); return true; }
   }
   // The store parks it only if it is still idle (#807 P3 C8 R6): a touch committed since the read keeps it active.
   async function park(tx: Tx, row: HostedSession, parkedUnder: Set<string>) {
@@ -612,7 +650,7 @@ export function createHostedSessions(application: Application, options: { now?: 
   // live server (a concurrent opener). Writing alive_at in the same
   // transaction makes a second start measure ~0, so the credit is applied once.
   function creditDowntime(): Promise<void> {
-    return store.write(async tx => {
+    return atSite("startup", () => store.write(async tx => {
       const t = now(), alive = await store.aliveAt(tx), downtime = alive === undefined ? null : t - alive;
       let credited = 0;
       if (alive !== undefined && downtime !== null && downtime > LIVE_STALENESS_MS) {
@@ -637,7 +675,7 @@ export function createHostedSessions(application: Application, options: { now?: 
       // when no lease was live (alive_at null: no heartbeat on this schema yet).
       writeAudit(repo, tx, "server.started", null, null, { alive_at: alive ?? null, now: t, downtime_ms: downtime, credited });
       await store.heartbeat(tx, t);
-    });
+    }));
   }
   // Rows a refusal produced inside a transaction its throw rolls back (#452, #467): `defer` collects them while it
   // runs, `flush` writes them once it has unwound. One that fails there is a structured diagnostic and counted
@@ -659,27 +697,116 @@ export function createHostedSessions(application: Application, options: { now?: 
         const pending = rows.splice(0);
         let failed = 0;
         try {
-          await store.write(async tx => {
+          await atSite("refusal", () => store.write(async tx => {
             failed = 0;
             for (const write of pending) {
               try { await tx.savepoint(write); } catch (failure) { failed++; hostedFailure("hosted.refusal_row", failure); }
             }
-          });
+          }));
           refusalRowsLost += failed;
         } catch (failure) { refusalRowsLost += pending.length; hostedFailure("hosted.refusal_row", failure); }
       },
     };
   }
+  // The gate's keyed fast path (#1510 chunk 3, docs/future/postgres-server.md D4), Postgres only (Repo.readsOnly).
+  const keyedFast = options.keyedGate !== false && repo.readsOnly !== undefined;
+  // The tool bodies keyed on Postgres (#1537 PR 5 dm_send, PR 6 board_post; D4): each through its own Repo writer
+  // (writeKeyedSend, writeKeyedPost), absent on SQLite.
+  const keyedTools = options.keyedTools !== false;
+  // A keyed attempt that would have written more than the touch, or refused: it wrote nothing, and its caller runs the
+  // exclusive body, which writes (or refuses) as it would have without the attempt.
+  const MISS = Symbol("keyed gate miss");
+  // First contacts in flight (#1537a, D4), Postgres only (keyedFast): a session ID whose request read no row and runs
+  // the exclusive body that creates it, mapped to a promise that settles (never rejects) once that body has. A second
+  // request of the same ID (an MCP client's second wire, opened at once) that also read no row waits for it once and
+  // reads again, so it finds the row and runs keyed instead of a second exclusive body. Advisory: after the wait it
+  // takes the path of any later request, so a refused create is refused again by the waiter's own exclusive body.
+  const creating = new Map<string, Promise<void>>();
+  // `p`, or RequestAbortedError at once if `signal` fires first: a waiter whose request aborted writes nothing.
+  const settledOrAborted = (p: Promise<void>, signal: AbortSignal | undefined): Promise<void> => {
+    if (!signal) return p;
+    if (signal.aborted) return Promise.reject(new RequestAbortedError());
+    return new Promise<void>((resolve, reject) => {
+      const aborted = () => reject(new RequestAbortedError());
+      signal.addEventListener("abort", aborted, { once: true });
+      void p.then(() => { signal.removeEventListener("abort", aborted); resolve(); });
+    });
+  };
+  // The gate body keyed by its root, `root:<id>`, for a request whose row exists, isn't parked and lives under `id`, and
+  // whose settle and rowFor write nothing: the common call of a live session. In lock order (D4): the access and user
+  // reads (authorized, uncached in a body: auth_cache ownsTx), the grant FOR SHARE (grantLive), then settle's root and
+  // row FOR UPDATE (store.lock), then rowFor's ids row FOR NO KEY UPDATE (setIdFacts), all reads; the touch's UPDATEs
+  // write the locked rows. settle and rowFor run in a read-only probe (readsOnly): any write they reach (an end, a
+  // park, an eviction, an unpark, a creation, a facts or launcher change, an audit or refusal row) refuses before its
+  // statement is sent, and so does the capacity lock; the body then returns MISS with nothing written, its refusal rows
+  // (`later`) dropped. An ApplicationError there (another user's row, a changed shape, an unbound child) is a MISS
+  // too, so the exclusive body writes its refusal rows. A refusal of the authorization or the grant, before the probe,
+  // is the request's, as the exclusive body's would be: neither writes. Any other failure is the request's.
+  // Sound against the exclusive writers of these rows (revoke, disable, bind, end, park, sweep): on one process the
+  // scheduler never runs them beside a keyed body, and the body's authorized and grantLive read what committed before
+  // it began; across processes a revoke waits on the grant's share lock, and the others on the rows' locks.
+  // `signal`: the request's, for a body skipped if it aborts before the body starts (withGate).
+  async function keyedBody(p: OAuthPrincipal, context: SessionContext & { id: string }, id: string, create: boolean, wake: boolean, declare: boolean, signal: AbortSignal | undefined): Promise<{ r: HostedSession; seen: number } | typeof MISS> {
+    const readsOnly = repo.readsOnly!;
+    return abandonable(signal, () => atSite("gate", () => store.writeKeyed([`root:${id}`], async tx => {
+      await authorized(p, tx);
+      await grantLive(tx, p);
+      let found: { row: HostedSession; root: HostedSession } | typeof MISS;
+      try {
+        found = await readsOnly(tx, async () => {
+          const settled = await settle(tx, context.id, p.authed.user_id);
+          if (!settled?.row || settled.row.parked_at !== null) return MISS;
+          const row = await rowFor(tx, p, context, () => {}, create, wake, declare, settled);
+          if (!row || (row.root_session_id ?? row.session_id) !== id) return MISS;
+          return { row, root: await rootOf(tx, row) };
+        });
+      } catch (error) {
+        if (error instanceof ProbeWrite || error instanceof ApplicationError) return MISS;
+        throw error;
+      }
+      if (found === MISS) return MISS;
+      const { row, root } = found, t = now();
+      const seen = await touchRow(tx, root, t);
+      return { r: row, seen: row.session_id === root.session_id ? seen : Math.min(seen, await touchRow(tx, row, t)) };
+    })));
+  }
   // `endTouch`: whether the call's end is touched (`touchAfter`); an exchange's selection for a tool call leaves it
   // to the tool's own gate, which ends later (#907). `create`: false admits no unknown ID (#1097): `fn` then gets no
-  // row, and the gate writes nothing but settle's.
-  async function withGate<T>(p: OAuthPrincipal, context: SessionContext, writer: boolean, fn: (row: HostedSession | undefined) => Promise<T>, wake = true, declare = true, endTouch = true, create = true): Promise<T> {
+  // row, and the gate writes nothing but settle's. `signal`: the request's (#1535), for an entry call: its gate body is
+  // skipped, rejecting RequestAbortedError, if the signal fires while the body waits in the write queue (store/queue.ts
+  // abandonable); undefined (an ending call, a caller with no request) always runs. Nothing the gate body writes is
+  // owed to anyone but this request: settle's ends and parks are the sweep's, which the timer and the next request
+  // apply anyway, and its refusal rows exist only once it runs. `method`: the call this gate serves, for the gate
+  // counter's label (metrics.ts countGate, #1537 PR 0).
+  async function withGate<T>(p: OAuthPrincipal, context: SessionContext, writer: boolean, fn: (row: HostedSession | undefined) => Promise<T>, wake = true, declare = true, endTouch = true, create = true, signal?: AbortSignal, method: GateMethod = "tool"): Promise<T> {
     await authorized(p);
     if (!("id" in context)) return fn(undefined);
     const retry = Symbol("root changed");
+    let waitedCreate = false;
     for (;;) {
       const before = await store.get(repo.read, context.id);
       const id = before?.root_session_id ?? context.id;
+      // A first contact of an ID another request of this process is creating (#1537a, `creating`): wait once for that
+      // creator's exclusive body, then read again, keyed if its row now exists. The check and the registration run in
+      // the same synchronous step as the read's resumption, so of two concurrent reads exactly one registers. The
+      // registrant's entry goes once its exclusive body settles (before `fn`), or when it leaves the gate without one.
+      // A waiter that still reads no row runs its own exclusive body, with no second wait, so a refusal can't loop.
+      let created: (() => void) | undefined;
+      if (keyedFast && create && before === undefined) {
+        const inFlight = creating.get(context.id);
+        if (inFlight && !waitedCreate) {
+          waitedCreate = true;
+          await settledOrAborted(inFlight, signal);
+          continue;
+        }
+        if (!inFlight) {
+          let done!: () => void;
+          const mine = new Promise<void>(resolve => { done = resolve; });
+          const key = context.id;
+          creating.set(key, mine);
+          created = () => { created = undefined; if (creating.get(key) === mine) creating.delete(key); done(); };
+        }
+      }
       const result = await gate(id)[writer ? "bind" : "call"](async () => {
         const later = refusalRows();
         // Checked outside the transaction, where the auth cache serves it (#853); an idle queue runs the body below
@@ -697,19 +824,28 @@ export function createHostedSessions(application: Application, options: { now?: 
         await testPauseAsync("hosted:gate:checked");
         let waited = false, stale = true;
         try { stale = g === undefined || repo.commitGeneration() !== g; } catch { stale = true; }
+        // The keyed fast path first, where it can run (keyedBody); a miss wrote nothing and runs the exclusive body
+        // below, which checks authorization in its transaction again.
+        const keyed = keyedFast && before !== undefined && before.parked_at === null ? await keyedBody(p, context, id, create, wake, declare, signal) : undefined;
+        countGate("gate", keyed === undefined ? "skipped" : keyed === MISS ? "miss" : "keyed", method);
+        if (keyed === MISS) waited = true;
         // One queued body: settle commits whether or not rowFor refuses (rowFor's savepoint rolls back alone, and its
         // refusal rows are written after it, in the same commit), and nothing runs between them, so `settled` is
         // current when rowFor reads it.
-        const pending = atSite("gate", () => store.write(async tx => {
-          if (waited || stale) await authorized(p, tx);
-          await grantLive(tx, p);
-          // authorized(p) passed with no commit to the auth tables since: settle skips p's own disabled read (#881).
-          const settled = await settle(tx, context.id, p.authed.user_id);
-          try { return { row: await tx.savepoint(async sp => { const r = await rowFor(sp, p, context, later.defer, create, wake, declare, settled); return r && { r, seen: await touch(sp, r) }; }) }; }
-          catch (error) { await later.flush(tx); return { error }; }
-        }));
-        waited = true;
-        const selected = await pending;
+        let selected: { row?: { r: HostedSession; seen: number } } | { error: unknown };
+        if (keyed !== undefined && keyed !== MISS) selected = { row: keyed };
+        else {
+          const pending = abandonable(signal, () => atSite("gate", () => store.write(async tx => {
+            if (waited || stale) await authorized(p, tx);
+            await grantLive(tx, p);
+            // authorized(p) passed with no commit to the auth tables since: settle skips p's own disabled read (#881).
+            const settled = await settle(tx, context.id, p.authed.user_id);
+            try { return { row: await tx.savepoint(async sp => { const r = await rowFor(sp, p, context, later.defer, create, wake, declare, settled); return r && { r, seen: await touch(sp, r) }; }) }; }
+            catch (error) { await later.flush(tx); return { error }; }
+          })));
+          waited = true;
+          try { selected = await pending; } finally { created?.(); }
+        }
         if ("error" in selected) throw selected.error;
         if (!selected.row) return fn(undefined);
         const { r: row, seen } = selected.row;
@@ -721,7 +857,7 @@ export function createHostedSessions(application: Application, options: { now?: 
           for (const s of ids) { const n = inflight.get(s)! - 1; if (n) inflight.set(s, n); else inflight.delete(s); }
           if (endTouch) await touchAfter(row, seen);
         }
-      });
+      }).finally(() => created?.());
       if (result !== retry) return result as T;
     }
   }
@@ -731,24 +867,68 @@ export function createHostedSessions(application: Application, options: { now?: 
   // park, a lapsed lease, a new ownership, root or generation, an idle window passed) runs the full gate instead, so
   // every refusal and recovery stays on its one path. `rowFor`'s writes are a selection's, already made: a request's
   // facts and launcher declaration are written only on a change, and its writes_as is fixed for the ownership.
-  const MISS = Symbol("prior stale");
-  async function withPrior<T>(p: OAuthPrincipal, context: SessionContext, prior: Verdict, fn: (row: HostedSession | undefined) => Promise<T>): Promise<T> {
+  // Whether rowFor would write this request's change-only facts on `row` (#364): its model and effort (setIdFacts,
+  // compared as stored, cleanFact) and its launcher declaration (declareLauncher, under rowFor's conditions). The prior
+  // stands in for rowFor only while the selection's writes still read as made: a request built before a switch and
+  // committed after it (a lease op carrying the old facts) reverts them, and this request must then write its own.
+  async function priorWouldWrite(tx: Tx, context: SessionContext, row: HostedSession): Promise<boolean> {
+    if (!("id" in context)) return false;
+    const launcher = context.launcher === true && !row.root_session_id && row.writes_as === null;
+    if (!context.facts && !launcher) return false;
+    const stored = (await repo.bindings.idFacts(tx, [row.session_id])).get(row.session_id);
+    if (!stored) return false;
+    const f = context.facts;
+    if (f?.model !== undefined && cleanFact(f.model) !== stored.model) return true;
+    if (f?.effort !== undefined && cleanFact(f.effort) !== stored.effort) return true;
+    return launcher && stored.launcher !== 1;
+  }
+  // `signal`: the request's, as withGate's: the touch is skipped if it fires while the body waits, rejecting the call.
+  // `writer`: the call runs alone under the root's BindGate (gate(id).bind), as withGate's writer: `owning`'s bind and
+  // delivery open (#1537 C7). `method`: the call, for the counter (countGate). Every fallback (a prior that differs
+  // outright, a stopped server, a body that misses) is the caller's full gate: withGate with the same `writer`, `signal`
+  // and `method`, which admits (create) and wakes as `run`, `control` and `owning` ask. Called outside the BindGate's
+  // callback, so a writer's fallback never waits on its own gate.
+  async function withPrior<T>(p: OAuthPrincipal, context: SessionContext, prior: Verdict, fn: (row: HostedSession | undefined) => Promise<T>, signal?: AbortSignal, writer = false, method: GateMethod = "tool"): Promise<T> {
+    const full = () => withGate(p, context, writer, fn, true, true, true, true, signal, method);
     await authorized(p);
-    if (!("id" in context) || context.id !== prior.row.session_id || prior.row.parked_at !== null) return withGate(p, context, false, fn);
+    if (!("id" in context) || context.id !== prior.row.session_id || prior.row.parked_at !== null) { countGate("prior", "skipped", method); return full(); }
     const id = prior.root.session_id;
-    const result = await gate(id).call(async () => {
+    const result = await gate(id)[writer ? "bind" : "call"](async () => {
+      // The gate's stamp (withGate, #807 P3 A7d2): the generation read before the pool check, compared after it.
+      let g: string | undefined;
+      try { g = repo.commitGeneration(); } catch { g = undefined; }
       await authorized(p);
       if (stopped) return MISS;
-      const touched = await atSite("prior", () => store.write(async tx => {
+      let waited = false, stale = true;
+      try { stale = g === undefined || repo.commitGeneration() !== g; } catch { stale = true; }
+      // Keyed by the root (#1510 chunk 3, D4), as the gate's fast path: authorization read in the body, the grant FOR
+      // SHARE, plain reads, then the touch's UPDATEs, root first. No row lock before the touch: a row an exclusive
+      // body changes waits for this body, or this body for it, and its reads see the change only after it commits;
+      // either way an end or park this body missed lands before (it refused) or after the call it lets through, as on
+      // the exclusive path. Without the fast path (SQLite, keyedGate: false) the body is exclusive, as before chunk 3.
+      // There authorization is read in the body as the full gate's exclusive body reads it (#1537 C5): again in the
+      // transaction when the body waited in the queue or something committed since the pool check, so a body queued
+      // behind a revoke or disable refuses `unauthenticated` with no row, as the gate's does, never handing control's
+      // renew, receipt or pending a call whose lease check answers not_found and audits a stale capability. `waited`
+      // is set right after write() returns: a body that starts at once runs before that and sees false. The grant is
+      // read in every body, as the gate's.
+      const body = async (tx: Tx) => {
+        if (keyedFast || waited || stale) await authorized(p, tx);
+        await grantLive(tx, p);
         const fresh = await store.get(tx, prior.row.session_id);
         const root = !fresh ? undefined : fresh.root_session_id ? await store.get(tx, fresh.root_session_id) : fresh;
         const t = now();
         if (!fresh || !root || fresh.ownership_id !== prior.row.ownership_id || fresh.root_session_id !== prior.row.root_session_id || fresh.parked_at !== null
           || root.session_id !== id || root.ownership_id !== prior.root.ownership_id || root.bind_gen !== prior.root.bind_gen || root.root_session_id
           || (root.lease_deadline !== null && root.lease_deadline <= t) || idleAt(fresh) || idleAt(root)) return undefined;
+        if (await priorWouldWrite(tx, context, fresh)) return undefined;
         const seen = await touchRow(tx, root, t);
         return { row: fresh, seen: fresh === root ? seen : Math.min(seen, await touchRow(tx, fresh, t)) };
-      }));
+      };
+      const pending = abandonable(signal, () => atSite("prior", () => keyedFast ? store.writeKeyed([`root:${id}`], body) : store.write(body)));
+      waited = true;
+      const touched = await pending;
+      countGate("prior", !keyedFast ? "skipped" : touched ? "keyed" : "miss", method);
       if (!touched) return MISS;
       const { row, seen } = touched;
       const ids = [...new Set([row.session_id, id])];
@@ -759,7 +939,7 @@ export function createHostedSessions(application: Application, options: { now?: 
         await touchAfter(row, seen);
       }
     });
-    return result === MISS ? withGate(p, context, false, fn) : result as T;
+    return result === MISS ? full() : result as T;
   }
   async function attach(tx: Tx, p: OAuthPrincipal, row: HostedSession): Promise<HostedSession> {
     await authorized(p, tx);
@@ -808,17 +988,110 @@ export function createHostedSessions(application: Application, options: { now?: 
   // The read first, so a call with nothing pending opens no transaction.
   async function takeLost(p: OAuthPrincipal, row: HostedSession | undefined, reader: LostReader): Promise<HostedLost[]> {
     if (!row || row.root_session_id || !(await store.lost(repo.read, row.session_id, reader)).length) return [];
-    return store.write(async tx => {
+    return atSite("lost", () => store.write(async tx => {
       if (reader === "controller") return store.reportLost(tx, row.session_id, now());
       const taken = await store.tellLost(tx, row.session_id, now());
       if (taken.length) await audit(tx, row.session_id, "hosted.alias_lost_notified", { aliases: taken.map(l => l.alias), ownership: row.ownership_id }, p);
       return taken;
-    });
+    }));
   }
   // The agent's notice for lost holds, said as the plugin says its alias_lost frame.
   async function lostNotice(p: OAuthPrincipal, row: HostedSession, lost: HostedLost[]): Promise<string> {
     const short = shortOf(p.authed.user_email), primary = (await application.hostedHolds(repo.read, row.session_id))[0];
     return aliasLostNotice(lost.map(l => ({ alias: short(l.alias), reason: l.reason })), primary === undefined ? null : short(primary), lost.some(l => l.primary), LOST_ALL);
+  }
+  // A tool call's body after its gate (or prior). `keyed` (dm_send's, #1537 PR 5; board_post's, PR 6; D4): where
+  // keyedTools is on and the tool's writer exists, the call's plan, read on the pool, picks a keyed body under the
+  // sender's root and the plan's own keys (dm_send: the recipient's stream and its live holder's root, D5's
+  // conservative key; board_post: the board); that body fences, runs `keyed.fn`, which checks the plan again before
+  // it inserts, and audits as the exclusive body does. A KeyedSendMiss or a refusal (ApplicationError,
+  // CoreError) inside it rolls it back with nothing committed: its refusal rows are dropped unwritten, and the exclusive
+  // body runs and refuses, or writes, as it would have alone. No plan (application.sendPlan's exclusive cases) runs
+  // the exclusive body at once. A request aborted while the keyed body waits rejects with no exclusive fallback.
+  async function runTool<T, P>(p: OAuthPrincipal, context: SessionContext, tool: string, fn: (session: ApplicationSession, tx: Tx) => T | Promise<T>, told: ((notice: string) => void) | undefined, prior: Verdict | undefined, signal: AbortSignal | undefined,
+    keyed?: {
+      plan: (session: ApplicationSession) => Promise<P | undefined>; keys: (plan: P) => string[];
+      write: (<V>(keys: readonly string[], fn: (tx: Tx) => Promise<V>) => Promise<V>) | undefined;
+      fn: (session: ApplicationSession, tx: Tx, plan: P) => Promise<T>;
+    },
+    // A pure read under a write tool's name (the board snapshot resource, `readResource`): KEYED_READS's path.
+    pure?: true): Promise<T> {
+    const toolMethod: GateMethod = (TOOL_METHODS as readonly string[]).includes(tool) ? tool as GateMethod : "other";
+    const body = async (row: HostedSession | undefined) => {
+      const taken = told ? await takeLost(p, row, "agent") : [];
+      if (taken.length) told!(await lostNotice(p, row!, taken));
+      const root = row ? await rootOf(repo.read, row) : undefined;
+      const held = root ? await application.hostedHolds(repo.read, root.session_id) : [];
+      if (!(root && named(root, held)) && !UNBOUND_READS.has(tool) && tool !== "whoami") {
+        throw new ApplicationError("unbound", row?.root_session_id ? childUnbound(row.root_session_id) : "unbound; bind a name first, or have this session's root register it as a child (session_register)");
+      }
+      const selected = await snapshot(p, row, held, root);
+      const late = refusalRows();
+      selected.session.afterRollback = late.defer;
+      const audited = async (tx: Tx) => {
+        if (!writeReads.has(tool)) await audit(tx, row!.session_id, "hosted.write", { tool, session: row!.session_id, root: root!.session_id, grant: p.grantId, held: selected.session.holds, writes_as: root!.writes_as }, p);
+      };
+      try {
+        await testPauseAsync("hosted:tool:in-gate");
+        if (keyed && keyedTools && keyed.write && row && root) {
+          const write = keyed.write;
+          const plan = await keyed.plan(selected.session);
+          if (!plan) countGate("tool", "skipped", toolMethod);
+          else {
+            const keys = [...new Set([`root:${root.session_id}`, ...keyed.keys(plan)])];
+            const attempt = refusalRows();
+            selected.session.afterRollback = attempt.defer;
+            try {
+              const value = await abandonable(signal, () => atSite("tool", () => write(keys, async tx => {
+                await fence(tx, p, row, root);
+                const v = await keyed.fn(selected.session, tx, plan);
+                await audited(tx);
+                return v;
+              })));
+              countGate("tool", "keyed", toolMethod);
+              return value;
+            } catch (error) {
+              if (!(error instanceof KeyedSendMiss || error instanceof ApplicationError || error instanceof CoreError)) throw error;
+            } finally { selected.session.afterRollback = late.defer; }
+            countGate("tool", "miss", toolMethod);
+          }
+        } else if (keyed) countGate("tool", "skipped", toolMethod);
+        else if ((KEYED_READS.has(tool) || pure) && keyedFast && keyedTools && row && root) {
+          // A read tool's body keyed on its root (#1604, D4): the fence locks the row and root as the exclusive body's
+          // does, then `fn` runs in a read-only probe. A write it would make (a cursor, an afterCommit effect) refuses
+          // before its statement and the call runs the exclusive body, as does a refusal (its refusal rows, deferred
+          // in memory, are dropped and the exclusive body writes them as before). Sound against bind, renew and end on the same root:
+          // they hold `root:<id>` or run exclusive.
+          const readsOnly = repo.readsOnly!;
+          const attempt = refusalRows();
+          selected.session.afterRollback = attempt.defer;
+          try {
+            const value = await abandonable(signal, () => atSite("tool", () => store.writeKeyed([`root:${root.session_id}`], async tx => {
+              await fence(tx, p, row, root);
+              return readsOnly(tx, async () => fn(selected.session, tx));
+            })));
+            countGate("tool", "keyed", toolMethod);
+            // What `call`'s afterCommit would have done (every call re-reads the next claim expiry). The resource
+          // catalog's board_list, which never went through `call`, re-arms too: one pool read.
+            if (PURE_READS.has(tool)) application.armClaims();
+            return value;
+          } catch (error) {
+            if (!(error instanceof ProbeWrite || error instanceof ApplicationError || error instanceof CoreError)) throw error;
+          } finally { selected.session.afterRollback = late.defer; }
+          countGate("tool", "miss", toolMethod);
+        } else countGate("tool", "skipped", toolMethod);
+        return await abandonable(signal, () => atSite("tool", () => store.write<T>(async tx => {
+          await fence(tx, p, row, root);
+          const value = await fn(selected.session, tx);
+          await audited(tx);
+          return value;
+        })));
+      } catch (error) {
+        await late.flushQueued();
+        throw error;
+      } finally { application.close(selected.session); }
+    };
+    return prior ? withPrior(p, context, prior, body, signal) : withGate(p, context, false, body, true, true, true, true, signal);
   }
   const service = {
     application,
@@ -858,41 +1131,55 @@ export function createHostedSessions(application: Application, options: { now?: 
     // gate does, except session_end's, so ending a parked child is never refused for capacity.
     // `verdict`: the rows it selected, for the same request's tool call (`run`'s `prior`, #907). `endTouch`: false
     // for a tool call's exchange, whose tool gate touches its end.
-    // `create`: false for a session_end exchange, which admits no unknown ID (#1097).
-    async snapshot(p: OAuthPrincipal, context: SessionContext, endTouch = true, create = true) {
+    // `create`: false for a session_end exchange, which admits no unknown ID (#1097). `signal`: the request's, unless
+    // it is an ending call (withGate).
+    async snapshot(p: OAuthPrincipal, context: SessionContext, endTouch = true, create = true, signal?: AbortSignal) {
       return withGate(p, context, false, async row => {
         const root = row ? await rootOf(repo.read, row) : undefined;
         return { ...await snapshot(p, row, undefined, root), verdict: row && root ? { row, root } as Verdict : undefined };
-      }, false, true, endTouch, create);
+      }, false, true, endTouch, create, signal, "selection");
     },
     // `told` (a native tool call): gets the alias_lost notice, if any, for the result. `prior`: its exchange's
-    // verdict (#907).
-    async run<T>(p: OAuthPrincipal, context: SessionContext, tool: string, fn: (session: ApplicationSession, tx: Tx) => T | Promise<T>, told?: (notice: string) => void, prior?: Verdict): Promise<T> {
-      const body = async (row: HostedSession | undefined) => {
-        const taken = told ? await takeLost(p, row, "agent") : [];
-        if (taken.length) told!(await lostNotice(p, row!, taken));
-        const root = row ? await rootOf(repo.read, row) : undefined;
-        const held = root ? await application.hostedHolds(repo.read, root.session_id) : [];
-        if (!(root && named(root, held)) && !UNBOUND_READS.has(tool) && tool !== "whoami") {
-          throw new ApplicationError("unbound", row?.root_session_id ? childUnbound(row.root_session_id) : "unbound; bind a name first, or have this session's root register it as a child (session_register)");
-        }
-        const selected = await snapshot(p, row, held, root);
-        const late = refusalRows();
-        selected.session.afterRollback = late.defer;
-        try {
-          await testPauseAsync("hosted:tool:in-gate");
-          return await atSite("tool", () => store.write<T>(async tx => {
-            await fence(tx, p, row, root);
-            const value = await fn(selected.session, tx);
-            if (!writeReads.has(tool)) await audit(tx, row!.session_id, "hosted.write", { tool, session: row!.session_id, root: root!.session_id, grant: p.grantId, held: selected.session.holds, writes_as: root!.writes_as }, p);
-            return value;
-          }));
-        } catch (error) {
-          await late.flushQueued();
-          throw error;
-        } finally { application.close(selected.session); }
-      };
-      return prior ? withPrior(p, context, prior, body) : withGate(p, context, false, body);
+    // verdict (#907). `signal`: the request's (withGate): the gate, the prior and the tool body are each skipped if it
+    // fires while they wait in the write queue; the end-of-call touch and refusal rows always run.
+    async run<T>(p: OAuthPrincipal, context: SessionContext, tool: string, fn: (session: ApplicationSession, tx: Tx) => T | Promise<T>, told?: (notice: string) => void, prior?: Verdict, signal?: AbortSignal): Promise<T> {
+      return runTool(p, context, tool, fn, told, prior, signal);
+    },
+    // A board's snapshot resource (`mcp-resources.ts` resources/read): `run` under board_read's name and gate, its body
+    // keyed on the root in a read-only probe on Postgres (#1604), as the read tools' are. The snapshot writes nothing
+    // (no cursor, no outbox); a write it ever made would refuse in the probe and run the exclusive body.
+    async readResource<T>(p: OAuthPrincipal, context: SessionContext, fn: (session: ApplicationSession, tx: Tx) => T | Promise<T>): Promise<T> {
+      return runTool(p, context, "board_read", fn, undefined, undefined, undefined, undefined, true);
+    },
+    // The dm_send tool: `run`, with a keyed body first on Postgres (#1537 PR 5, docs/future/postgres-server.md D4).
+    async dmSend(p: OAuthPrincipal, context: SessionContext, to: string, body: string, options: Parameters<Application["send"]>[4] = {}, told?: (notice: string) => void, prior?: Verdict, signal?: AbortSignal) {
+      return runTool(p, context, "dm_send", (session, tx) => application.send(tx, session, to, body, options), told, prior, signal, {
+        plan: session => application.sendPlan(session, to, options),
+        keys: plan => [`dm:${plan.to}`, ...(plan.holder ? [`root:${plan.holder}`] : [])],
+        write: repo.writeKeyedSend?.bind(repo),
+        fn: (session, tx, plan) => application.sendKeyed(tx, session, plan, to, body, options),
+      });
+    },
+    // The board_post tool: `run`, with a keyed body first on Postgres (#1537 PR 6, docs/future/postgres-server.md D4),
+    // under the poster's root and the board.
+    async boardPost(p: OAuthPrincipal, context: SessionContext, args: Record<string, unknown>, told?: (notice: string) => void, prior?: Verdict, signal?: AbortSignal) {
+      return runTool(p, context, "board_post", (session, tx) => application.call(tx, session, "board_post", args), told, prior, signal, {
+        plan: session => application.postPlan(session, args),
+        keys: plan => [`board:${plan.board}`],
+        write: repo.writeKeyedPost?.bind(repo),
+        fn: (session, tx, plan) => application.postKeyed(tx, session, plan, args),
+      });
+    },
+    // The board_read tool: `run`, with a keyed body first on Postgres (#1604 step 2b, D4), under the reader's root and
+    // the board: its read point, outbox and queue take credits are the reader's rows on that board, which board_post
+    // (the board's key), receipt (the root's) and every exclusive writer serialize with.
+    async boardRead(p: OAuthPrincipal, context: SessionContext, args: Record<string, unknown>, told?: (notice: string) => void, prior?: Verdict, signal?: AbortSignal) {
+      return runTool(p, context, "board_read", (session, tx) => application.call(tx, session, "board_read", args), told, prior, signal, {
+        plan: session => application.readPlan(session, args),
+        keys: plan => [`board:${plan.board}`],
+        write: repo.writeKeyedPost?.bind(repo),
+        fn: (session, tx, plan) => application.readKeyed(tx, session, plan, args),
+      });
     },
     async transfer<T>(p: OAuthPrincipal, context: SessionContext, fn: (session: ApplicationSession, guard: (r: Read) => Promise<void>) => Promise<T>): Promise<T> {
       return withGate(p, context, false, async row => {
@@ -915,11 +1202,15 @@ export function createHostedSessions(application: Application, options: { now?: 
           await late.flushQueued();
           throw error;
         } finally { application.close(selected.session); }
-      });
+      }, true, true, true, true, undefined, "transfer");
     },
-    // `defer`: for a session `fn` opens, its `afterRollback`. `tx`: the body's.
-    async owning<T, R = T>(p: OAuthPrincipal, context: SessionContext, fn: (row: HostedSession, defer: (write: RefusalRow) => void, tx: Tx) => T | Promise<T>, committed?: (value: T) => R | Promise<R>): Promise<R> {
-      return withGate(p, context, true, async row => {
+    // `defer`: for a session `fn` opens, its `afterRollback`. `tx`: the body's. `signal`: the request's (withGate), for
+    // bind and unbind: the gate and the body are each skipped, with `committed`, if it fires while they wait. `method`:
+    // the call, for the gate counter (withGate). `prior`: the request's exchange's verdict (#1537 C7), which stands in
+    // for the gate's settle and rowFor as in `run` (withPrior, as a writer): attach then locks the root, authorizes on
+    // the body's Tx and fences the row against it, as after the full gate.
+    async owning<T, R = T>(p: OAuthPrincipal, context: SessionContext, fn: (row: HostedSession, defer: (write: RefusalRow) => void, tx: Tx) => T | Promise<T>, committed?: (value: T) => R | Promise<R>, signal?: AbortSignal, method: GateMethod = "owning", prior?: Verdict): Promise<R> {
+      const body = async (row: HostedSession | undefined) => {
         if (!row) throw new ApplicationError("unbound", `this request carries no session context (${("missing" in context ? context.missing : "missing")}), so it can only read.`);
         rootOnly(row);
         await testPauseAsync("hosted:owning:before-txn");
@@ -928,18 +1219,22 @@ export function createHostedSessions(application: Application, options: { now?: 
         // every open's cap check); its own failure isn't a rollback, so it flushes no refusal rows.
         let done = false;
         try {
-          return await store.write(async tx => { await grantLive(tx, p); return fn(await attach(tx, p, row), late.defer, tx); }, (result: T) => { done = true; return committed ? committed(result) : result as unknown as R; });
+          return await abandonable(signal, () => atSite("owning", () => store.write(async tx => { await grantLive(tx, p); return fn(await attach(tx, p, row), late.defer, tx); }, (result: T) => { done = true; return committed ? committed(result) : result as unknown as R; })));
         } catch (error) { if (!done) await late.flushQueued(); throw error; }
-      });
+      };
+      return prior ? withPrior(p, context, prior, body, signal, true, method) : withGate(p, context, true, body, true, true, true, true, signal, method);
     },
     // `absent`: an ending call's answer for an ID the server doesn't hold, which it then doesn't admit (#1097).
-    async control<T>(p: OAuthPrincipal, context: SessionContext, writer: boolean, fn: (row: HostedSession) => Promise<T> | T, absent?: () => T): Promise<T> {
-      return withGate(p, context, writer, async row => {
+    // `method`: the call, for the gate counter (withGate). `prior`: the request's exchange's verdict (#1537 C5), for a
+    // call that admits (no `absent`): withPrior then stands in for the second gate body, as for `run`'s tool call.
+    async control<T>(p: OAuthPrincipal, context: SessionContext, writer: boolean, fn: (row: HostedSession) => Promise<T> | T, absent?: () => T, method: GateMethod = "control", prior?: Verdict): Promise<T> {
+      const body = async (row: HostedSession | undefined) => {
         if (!row && absent) return absent();
         if (!row) throw new ApplicationError("unbound", "unbound; bind a name first");
         rootOnly(row);
         return fn(row);
-      }, true, true, true, !absent);
+      };
+      return prior && !absent ? withPrior(p, context, prior, body, undefined, writer, method) : withGate(p, context, writer, body, true, true, true, !absent, undefined, method);
     },
     // `held`: every hold, oldest first, and `primary` the one it sends as (#451): the client's
     // hold list, which the Controller restarts on when it changes (a bind, an unbind, a revocation).
@@ -961,10 +1256,11 @@ export function createHostedSessions(application: Application, options: { now?: 
           ...(row?.root_session_id ? { root: root?.session_id, child: true } : {}),
           // A child binds nothing, so it isn't offered names to bind (#523).
           ...(!(root && named(root, held)) ? { unbound: true, ...(offered ? { candidates: offered } : {}) } : {}) };
-      });
+      }, true, true, true, true, undefined, "whoami");
     },
-    // `declared`: the native request's declaration (deliveryDeclaration); text only.
-    async bind(p: OAuthPrincipal, context: SessionContext, args: { name: string; create?: boolean; meta?: Record<string, unknown>; where?: string }, declared?: DeclaredDelivery) {
+    // `declared`: the native request's declaration (deliveryDeclaration); text only. `prior`: the request's exchange's
+    // verdict (owning).
+    async bind(p: OAuthPrincipal, context: SessionContext, args: { name: string; create?: boolean; meta?: Record<string, unknown>; where?: string }, declared?: DeclaredDelivery, signal?: AbortSignal, prior?: Verdict) {
       const normalized = normalizeAliasName(args.name);
       if (!normalized.ok) throw new ApplicationError("bad_request", normalized.error);
       const result = await service.owning(p, context, async (row, defer, tx) => {
@@ -997,7 +1293,7 @@ export function createHostedSessions(application: Application, options: { now?: 
         await testPauseAsync("hosted:bind:after-commit");
         await authorized(p);
         return result;
-      });
+      }, signal, "bind", prior);
       // A push client opens delivery right after bind and reports it itself if it can't. A
       // poll session gets no channel lines, as in its `initialize` text.
       const short = shortOf(p.authed.user_email), held = result.ok.held.map(short), name = short(result.ok.alias);
@@ -1014,7 +1310,7 @@ export function createHostedSessions(application: Application, options: { now?: 
     },
     // unbind (#451): release one hold. Its mail and claims stay with the alias; the primary becomes the
     // oldest remaining hold, and the last one leaves the root unbound but owning, its lease closed.
-    async unbind(p: OAuthPrincipal, context: SessionContext, args: { name: string }, declared?: DeclaredDelivery) {
+    async unbind(p: OAuthPrincipal, context: SessionContext, args: { name: string }, declared?: DeclaredDelivery, signal?: AbortSignal) {
       const result = await service.owning(p, context, async (row, defer, tx) => {
         const before = await application.hostedHolds(tx, row.session_id);
         const selected = await application.hostedSession(tx, p.authed, row.session_id, before, row.writes_as, row, quietSink);
@@ -1032,7 +1328,7 @@ export function createHostedSessions(application: Application, options: { now?: 
         await testPauseAsync("hosted:unbind:after-commit");
         await authorized(p);
         return result;
-      });
+      }, signal, "unbind");
       const short = shortOf(p.authed.user_email), held = result.ok.held.map(short), alias = short(result.ok.alias);
       if (!result.ok.released) return { content: [{ type: "text" as const, text: notHolding(alias) }], structuredContent: { name: held[0] ?? null, instructions: [], ownership: result.ownership } };
       const source = declared?.mode === "poll" ? null : declared?.source ?? DEFAULT_CHANNEL_SOURCE;
@@ -1057,7 +1353,7 @@ export function createHostedSessions(application: Application, options: { now?: 
         if (index < ids.length) return gate(ids[index]!).bind(() => locked(index + 1));
         await testPauseAsync("hosted:register:before-txn");
         const later = refusalRows();
-        try { return await store.write(async tx => {
+        try { return await atSite("register", () => store.write(async tx => {
           await authorized(p, tx);
           await grantLive(tx, p);
           testPause("hosted:register:in-txn");
@@ -1098,7 +1394,7 @@ export function createHostedSessions(application: Application, options: { now?: 
             source_session_id: child, writes_as: null, bind_gen: 0, root_session_id: root.session_id, place: null, lease_deadline: null, created_at: now(), last_seen_at: now(), suggested: null, parked_at: null });
           await audit(tx, root.session_id, "hosted.child_registered", { child: childId, ownership: root.ownership_id, source_session_id: child, via });
           return { message: "registered", child: childId, root: root.session_id };
-        }); } catch (e) { await later.flushQueued(); throw e; }
+        })); } catch (e) { await later.flushQueued(); throw e; }
       };
       return locked(0);
     },
@@ -1110,19 +1406,19 @@ export function createHostedSessions(application: Application, options: { now?: 
         if (row.root_session_id && target !== row.session_id) rootOnly(row);
         const root = await rootOf(repo.read, row);
         const later = refusalRows();
-        try { await store.write(async tx => {
+        try { await atSite("end", () => store.write(async tx => {
           await fence(tx, p, row, root);
           const candidate = await store.get(tx, target);
           if (candidate) ownRow(p, candidate, later.defer, row.session_id);
           // The caller's own session outside this root, or a missing ID: not a policy question, so no row.
           if (!candidate || candidate.ownership_id !== row.ownership_id || (candidate.session_id !== row.session_id && candidate.root_session_id !== row.session_id)) throw new ApplicationError("not_found", "session not found");
           await (candidate.root_session_id ? store.childEnd(tx, target, now(), "closed") : store.end(tx, target, "closed", now()));
-        }); } catch (e) { await later.flushQueued(); throw e; }
+        })); } catch (e) { await later.flushQueued(); throw e; }
         return { ended: true };
-      }, false, false, true, false);
+      }, false, false, true, false, undefined, "end");
     },
     release(id: string, reason: HostedEnd, deadline?: number): Promise<void> {
-      return store.write(tx => store.end(tx, id, reason, now(), deadline));
+      return atSite("end", () => store.write(tx => store.end(tx, id, reason, now(), deadline)));
     },
     close() {
       stopped = true;
@@ -1133,7 +1429,7 @@ export function createHostedSessions(application: Application, options: { now?: 
       // A clean stop records its exact time, so the next start credits leases
       // with the real downtime rather than up to a heartbeat interval more.
       // Returned, so the caller awaits its commit before it closes the database.
-      return store.write(tx => store.heartbeat(tx, now())).catch(e => hostedFailure("hosted.heartbeat", e));
+      return heartbeat(now()).catch(e => hostedFailure("hosted.heartbeat", e));
     },
     instructions: hostedUnboundInstruction,
   };
@@ -1145,8 +1441,14 @@ export function createHostedSessions(application: Application, options: { now?: 
   const ready = creditDowntime().then(() => {
     if (stopped) return;
     unsubscribe = store.subscribe<HolderFacts>((changed, facts) => { void reconcile(changed, facts).catch(e => hostedFailure("hosted.reconcile", e)); }, readHolder);
-    return sweep(true).then(() => requestFull());
+    return atSite("sweep", () => sweep(true)).then(() => requestFull());
   });
+  // The liveness stamp (#423), keyed on its one row (#1537 PR 6, D4): it writes server_state's alive_at and nothing
+  // else, no notice, hook or effect. Its only readers are creditDowntime's exclusive body and the next start's. Stamps
+  // share the key, so they commit in the order the timer (and close) queued them, as they did exclusive.
+  function heartbeat(t: number): Promise<void> {
+    return atSite("heartbeat", () => store.writeKeyed([HEARTBEAT_KEY], tx => store.heartbeat(tx, t)));
+  }
   let beat = now(), tick = 0, sweeping = false, fullDue = false;
   const timer = setInterval(() => {
     tick++;
@@ -1156,7 +1458,7 @@ export function createHostedSessions(application: Application, options: { now?: 
     if (!sweeping) {
       const full = fullDue;
       sweeping = true; fullDue = false;
-      sweep(full).catch(e => hostedFailure("hosted.sweep", e)).finally(() => { sweeping = false; });
+      atSite("sweep", () => timerSweep(full)).catch(e => hostedFailure("hosted.sweep", e)).finally(() => { sweeping = false; });
     }
     // The backstop: holds can change outside the hosted store's commits (#399).
     if (tick % RECONCILE_EVERY === 0) try { reconcile().catch(e => hostedFailure("hosted.reconcile", e)); } catch (e) { hostedFailure("hosted.reconcile", e); }
@@ -1164,7 +1466,7 @@ export function createHostedSessions(application: Application, options: { now?: 
     if (t - beat >= HEARTBEAT_MS || t < beat) {
       const last = beat;
       beat = t; // set now, so a write still queued at the next tick isn't queued again; a failure retries next tick
-      store.write(tx => store.heartbeat(tx, t)).catch(e => { beat = last; hostedFailure("hosted.heartbeat", e); });
+      heartbeat(t).catch(e => { beat = last; hostedFailure("hosted.heartbeat", e); });
     }
   }, TICK_MS);
   timer.unref();

@@ -8,7 +8,7 @@
 // Nothing here reads a database; nothing it imports at runtime reaches bun:sqlite or db.ts (store/pg/isolation.test.ts).
 import { LOGIN_SCOPE, OAUTH_SCOPES } from "./oauth-config.ts";
 import { CREDENTIAL_SOURCES, OAUTH_TTL, SERVICE_TOKEN_MIN_SECONDS, type CredentialSource, type OAuthAuthorization, type OAuthBinding,
-  type OAuthBrowserSession, type OAuthCode, type OAuthGrant, type OAuthRequest, type OAuthTokenPair, type ServiceTokenLimits } from "./oauth-types.ts";
+  type OAuthBrowserSession, type OAuthCode, type GrantSummary, type OAuthGrant, type OAuthRequest, type OAuthTokenPair, type ServiceTokenLimits } from "./oauth-types.ts";
 
 // A capability input: a SHA-256 hex digest, never the secret itself.
 export const hash = (s: string) => /^[a-f0-9]{64}$/.test(s);
@@ -31,6 +31,13 @@ export const accessLookup = (h: string, requiredScopes: string[], now: number) =
 // A service credential named by client ID, and a secret by its id.
 export const clientLookup = (clientId: string, now: number) => time(now) && typeof clientId === "string";
 export const secretLookup = (secretId: number, now: number) => time(now) && Number.isSafeInteger(secretId);
+// A user's grants (#930): listed by user id, one revoked by user id and grant id.
+export const userLookup = (userId: number, now: number) => time(now) && Number.isSafeInteger(userId);
+export const userGrantLookup = (userId: number, grantId: string, now: number) => userLookup(userId, now) && typeof grantId === "string" && grantId !== "";
+// A listed grant: what its stored record and the list's joins say, and nothing else of the record (scopes and
+// resource stay server-side).
+export const grantSummary = (g: OAuthGrant, credential: boolean, lastUsed: number | null): GrantSummary =>
+  ({ id: g.id, clientId: g.clientId, createdAt: g.createdAt, expiresAt: g.expiresAt, lastUsedAt: lastUsed ?? g.createdAt, credential });
 // A record created now that expires after now and within its lifetime.
 export const deadline = (created: number, expiry: number, now: number, ttl: number) =>
   time(now) && created === now && time(expiry) && expiry > now && expiry <= now + ttl;

@@ -7,7 +7,7 @@ import { describePg, pgEmptyDatabase } from "../../../../tests/support/pg.ts";
 import { FIXTURES } from "../../../../tests/support/pg_migrate_child.ts";
 import { transactionProcess } from "../../../../tests/support/transaction-process.ts";
 import { until } from "../../../../tests/support/until.ts";
-import { checksum, migrate, validateMigrations, type Migration } from "./migrate.ts";
+import { checksum, migrate, MIGRATIONS, validateMigrations, type Migration } from "./migrate.ts";
 import { openPg } from "./sql.ts";
 
 const recorded = async (sql: Bun.SQL) =>
@@ -20,6 +20,17 @@ test("a migration list must run 1, 2, 3… with names starting with their versio
   expect(() => validateMigrations([FIXTURES[1]!, FIXTURES[0]!])).toThrow("version 2 at position 1");
   expect(() => validateMigrations([FIXTURES[0]!, FIXTURES[2]!])).toThrow("version 3 at position 2");
   expect(() => validateMigrations([{ ...FIXTURES[0]!, name: "0002_one" }])).toThrow('name "0002_one"');
+});
+
+// Shipped migrations are append-only (D7): a kept database records each file's checksum, and a boot refuses an edited
+// file, so an in-place edit (a comment counts) would stop every pilot server's boot. Pinned here so CI fails first. A new
+// migration adds its line; an existing line never changes.
+test("shipped migrations keep their checksums", () => {
+  expect(MIGRATIONS.map(m => [m.name, checksum(m)])).toEqual([
+    ["0001_init", "0608ca7efd3ccc27a69189776a99aeb9de5ba20ebf410c79c7b08a3a2b840fa1"],
+    ["0002_posts_author_root", "9659b2bf7ee83ee72f81db01951b90cc660644283dff75d580f73b4e9cdee9e4"],
+    ["0003_users_idp_checked_at", "3e9f4091dc82eb874b8426a707af243820d13b6b219ea8becbd95475a1522134"],
+  ]);
 });
 
 describePg("migrate", () => {
@@ -108,5 +119,20 @@ describePg("migrate", () => {
       await b.close({ timeout: 0 });
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+// #930: 0003 starts every user's IdP clock at the upgrade, unlinked ones included (pg twin of the SQLite open's stamp, db.ts).
+describePg("0003_users_idp_checked_at", () => {
+  test("stamps every row, with an issuer or without", async () => {
+    await using db = await pgEmptyDatabase();
+    const v3 = MIGRATIONS.findIndex(m => m.version === 3);
+    await migrate(db.sql, MIGRATIONS.slice(0, v3));
+    await db.sql`INSERT INTO users (email, created_at, idp_issuer, idp_subject) VALUES ('linked@example.com', 1, 'https://idp.example', 's-1'), ('dev@example.com', 1, NULL, NULL)`;
+    const before = Date.now();
+    await migrate(db.sql, MIGRATIONS.slice(0, v3 + 1));
+    const rows = await db.sql`SELECT email, idp_checked_at FROM users ORDER BY email` as { email: string; idp_checked_at: string | number | null }[];
+    expect(Number(rows[0]!.idp_checked_at)).toBeGreaterThanOrEqual(before);
+    expect(Number(rows[1]!.idp_checked_at)).toBeGreaterThanOrEqual(before);
   });
 });

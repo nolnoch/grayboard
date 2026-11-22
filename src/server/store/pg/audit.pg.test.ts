@@ -20,6 +20,7 @@ const audit = makePgAudit();
 const repo = {
   audit, now: () => T0,
   post: () => { throw new Error("writeAudit posted: the row left the body's transaction"); },
+  postKeyed: () => { throw new Error("writeAudit posted: the row left the body's transaction"); },
 } as unknown as Repo;
 
 const countAction = async (p: PgPair, action: string) => (await p.db.sql`SELECT count(*)::int AS n FROM access_log WHERE action = ${action}`)[0].n as number;

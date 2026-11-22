@@ -12,12 +12,13 @@ const checked = <T>(result: OAuthResult<T>): T => {
 };
 
 // Trusted test-only issuance through the same atomic consent/code lifecycle as the AS, in one queued body (#807 P1b-4f).
-export function issueOAuth(repo: Repo, resource: string, email = "alice@example.com", scopes = ["grayboard:tools"], now = Date.now(), clientId = "test-native") {
-  return seed(repo, tx => issueNow(repo, tx, resource, email, scopes, now, clientId));
+// `grantId` seeds the grant's id (a '-'-leading one, #1583); random by default.
+export function issueOAuth(repo: Repo, resource: string, email = "alice@example.com", scopes = ["grayboard:tools"], now = Date.now(), clientId = "test-native", grantId = random()) {
+  return seed(repo, tx => issueNow(repo, tx, resource, email, scopes, now, clientId, grantId));
 }
 export type IssuedOAuth = Awaited<ReturnType<typeof issueOAuth>>;
 
-async function issueNow(repo: Repo, tx: Tx, resource: string, email: string, scopes: string[], now: number, clientId: string) {
+async function issueNow(repo: Repo, tx: Tx, resource: string, email: string, scopes: string[], now: number, clientId: string, grantId: string) {
   // A service principal (#270) has no sign-in, so upsertByEmail refuses its name: issue to the existing row, an
   // in-process shortcut for tests that don't exercise the client-credentials grant at /oauth/token itself.
   const existing = await repo.users.findByEmail(tx, email);
@@ -30,7 +31,7 @@ async function issueNow(repo: Repo, tx: Tx, resource: string, email: string, sco
   checked(await repo.oauth.bindRequestSession(tx, request.requestHash, request.browserHash, sessionHash, now));
   const code = { ...binding, codeHash: hashToken(random()), userId: user.id, createdAt: now, expiresAt: now + OAUTH_TTL.code };
   checked(await repo.oauth.decideRequest(tx, { requestHash: request.requestHash, browserHash: request.browserHash, csrfHash: request.csrfHash, sessionHash, approve: true, code }, now));
-  const token = random(), refreshToken = random(), grantId = random();
+  const token = random(), refreshToken = random();
   const tokens = { ...binding, accessHash: hashToken(token), refreshHash: hashToken(refreshToken), accessExpiresAt: now + OAUTH_TTL.access, refreshExpiresAt: now + OAUTH_TTL.refresh };
   checked(await repo.oauth.redeemCode(tx, { ...binding, codeHash: code.codeHash, grantId, grantExpiresAt: now + OAUTH_TTL.grant, tokens }, now));
   const authed: AuthedUser = { user_id: user.id, user_email: user.email, kind: user.kind, session_id: 0 };

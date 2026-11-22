@@ -7,7 +7,7 @@ import { Controller as CoreController } from "../src/core/controller.js";
 import { Diagnostics, failureCode, failureMessage as failureMessageWith } from "../src/core/diagnostics.js";
 const failureMessage = (error: unknown) => failureMessageWith(error, "explicitly enroll again");
 import { observeEvents } from "../src/core/events.js";
-import { Wire, LAUNCHER_META, SUGGESTED_META, LeaseUnavailable, ServerUnreachable, SubscriberError } from "../src/core/wire.js";
+import { Wire, LAUNCHER_META, SUGGESTED_META, LeaseUnavailable, ServerBusy, ServerUnreachable, SubscriberError } from "../src/core/wire.js";
 import { Approval, METADATA, enrollmentHash, type OpenCodeEnrollment as Enrollment } from "../src/approval.js";
 import { AccessExpired, Refusal, type Item } from "../src/core/model.js";
 import { NEW_RUN, SIGN_IN, type StaticMode } from "../src/binding.js";
@@ -1451,7 +1451,7 @@ test.each([["rate_limited"], ["internal_error"]])("static mode retries an auto-e
   const s = await staticRuntime("service", undefined, undefined, () => failures-- > 0 ? { content: [{ type: "text", text: `error: ${code}` }], structuredContent: { code }, isError: true } : undefined);
   try {
     await s.r.controller.observe("session.created", { sessionID: "R" });
-    expect(rootRecord(s.r.controller, "R")).toMatchObject({ state: "retrying", operation: "enroll", code: "server_unreachable" });
+    expect(rootRecord(s.r.controller, "R")).toMatchObject({ state: "retrying", operation: "enroll", code, message: `Server answered ${code}; retrying auto-enroll (1/8)` });
     await until(() => s.r.controller.enrollment("R"), 5000, "the retry enrolls R");
     expect(s.asked).toHaveLength(2);
   } finally { await s.restore(); }
@@ -1463,6 +1463,16 @@ test("static mode retries an auto-enroll whose whoami met an HTTP 429", async ()
   try {
     await s.r.controller.observe("session.created", { sessionID: "R" });
     expect(rootRecord(s.r.controller, "R")).toMatchObject({ state: "retrying" });
+    await until(() => s.r.controller.enrollment("R"), 5000, "the retry enrolls R");
+  } finally { await s.restore(); }
+});
+// #1553: a connect still refused at capacity reaches auto-enroll as ServerBusy: retried as an outage, recorded as server_busy.
+test("static mode retries an auto-enroll whose whoami found the server at capacity, recorded as server_busy", async () => {
+  let failures = 1;
+  const s = await staticRuntime("service", undefined, undefined, () => { if (failures-- > 0) throw new ServerBusy(800); });
+  try {
+    await s.r.controller.observe("session.created", { sessionID: "R" });
+    expect(rootRecord(s.r.controller, "R")).toMatchObject({ state: "retrying", operation: "enroll", code: "server_busy", message: "Server at capacity; retrying auto-enroll (1/8)" });
     await until(() => s.r.controller.enrollment("R"), 5000, "the retry enrolls R");
   } finally { await s.restore(); }
 });
@@ -1703,6 +1713,15 @@ test("static mode: retries run out on whoami 503s record the outage and a new ru
     await retriesSettled(s.r.controller);
     expect(s.asked).toHaveLength(9);
     expect(rootRecord(s.r.controller, "R")).toMatchObject({ state: "unenrolled", operation: "enroll", code: "server_unreachable", message: "Auto-enroll gave up after 8 retries (server_unreachable); once the server answers, the launcher must start a new run" });
+  } finally { await s.restore(); }
+});
+test("static mode: retries run out on a server at capacity record server_busy (#1553)", async () => {
+  const s = await staticRuntime("service", undefined, undefined, () => { throw new ServerBusy(800); });
+  (s.r.controller as unknown as { enrollRetryFirstMs: number }).enrollRetryFirstMs = 1;
+  try {
+    await s.r.controller.observe("session.created", { sessionID: "R" });
+    await retriesSettled(s.r.controller);
+    expect(rootRecord(s.r.controller, "R")).toMatchObject({ state: "unenrolled", operation: "enroll", code: "server_busy", message: "Auto-enroll gave up after 8 retries (server_busy); once the server answers, the launcher must start a new run" });
   } finally { await s.restore(); }
 });
 // #1250 re-verify I-A: an isError result with no structuredContent is never parsed as whoami's JSON answer.

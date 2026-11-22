@@ -214,6 +214,31 @@ test("the deadline's timer is cleared when the operation settles", async () => {
   }
 });
 
+test("the wait on an abandoned request clears its timer once the request settles", async () => {
+  // A wide deadline: the released delete must come back inside settled()'s wait, even on a loaded runner.
+  const blobs = store({ timeoutMs: 1000 });
+  const sha = sha256Hex(bytes("settled"));
+  await blobs.put(sha, bytes("settled"));
+  const release = s3.hang("DELETE");
+  await expect(blobs.delete(sha)).rejects.toThrow("no answer in 1000 ms");
+  const set = spyOn(globalThis, "setTimeout");
+  const cleared = spyOn(globalThis, "clearTimeout");
+  try {
+    // The put waits in settled() on the abandoned delete, which settles inside that wait.
+    const put = blobs.put(sha, bytes("settled"));
+    release();
+    await put;
+    // The store's own timers (settled()'s wait and the put's deadline) are the ones armed for timeoutMs.
+    const timers = set.mock.calls.flatMap((c, i) => c[1] === 1000 ? [set.mock.results[i]!.value] : []);
+    expect(timers.length).toBe(2);
+    const clearedTimers = new Set(cleared.mock.calls.map(c => c[0]));
+    expect(timers.filter(t => !clearedTimers.has(t as ReturnType<typeof setTimeout>))).toEqual([]);
+  } finally {
+    set.mockRestore();
+    cleared.mockRestore();
+  }
+});
+
 // Bun fills an omitted S3Client option from S3_*/AWS_* env, read as the process starts: so a child, with a hostile env.
 test("explicit options beat a hostile S3_*/AWS_* environment", async () => {
   s3.allow("AKIASTATIC", null);

@@ -127,6 +127,14 @@ function basics(it: It): void {
     expect(sorted(await h.hosted.children(h.read, "r1"))).toEqual(["c1", "c2"]);
     expect((await h.hosted.children(h.read, "r1")).find(r => r.session_id === "c2")?.parked_at).toBe(T0 + 5);
     expect(await h.hosted.children(h.read, "c1")).toEqual([]);
+    // getMany (#1572): the rows that exist, parked ones too, each once however often its ID repeats; none for no IDs.
+    const many = async (ids: string[], r: Read = h.read) => (await h.hosted.getMany(r, ids)).map(cols).sort((x, y) => x!.session_id < y!.session_id ? -1 : 1);
+    expect(await many(["r1", "c2", "nope", "r1", "c2"])).toEqual([await get(h, "c2"), await get(h, "r1")]);
+    expect(await many(["nope"])).toEqual([]);
+    expect(await many([])).toEqual([]);
+    // On the body's Tx it sees the body's own write.
+    const before = (await get(h, "c1"))!;
+    expect(await h.write(async tx => { await h.hosted.update(tx, "c1", { bind_gen: 7 }); return many(["c1"], tx); })).toEqual([{ ...before, bind_gen: 7 }]);
   });
 }
 
@@ -515,13 +523,15 @@ function seams(it: It): void {
       ["forgetLost", () => h.hosted.forgetLost(kept, "r", lost.alias)], ["heartbeat", () => h.hosted.heartbeat(kept, T0 + 9)],
       ["setRoot", () => h.hosted.setRoot(kept, "c", "r")], ["reopenId", () => h.hosted.reopenId(kept, "c")],
       ["restateWritesAs", () => h.hosted.restateWritesAs(kept, "r", lost.alias)], ["declareLauncher", () => h.hosted.declareLauncher(kept, "r")],
-      ["get", () => h.hosted.get(kept, "r")], ["owned", () => h.hosted.owned(kept, "r")], ["all", () => h.hosted.all(kept)],
+      ["get", () => h.hosted.get(kept, "r")], ["getMany", () => h.hosted.getMany(kept, ["r", "c"])], ["owned", () => h.hosted.owned(kept, "r")], ["all", () => h.hosted.all(kept)],
       ["counts", () => h.hosted.counts(kept, u)], ["ofOwnership", () => h.hosted.ofOwnership(kept, r.ownership_id)],
       ["children", () => h.hosted.children(kept, "r")], ["roots", () => h.hosted.roots(kept, u)], ["expired", () => h.hosted.expired(kept, T0 + 9)],
       ["idle", () => h.hosted.idle(kept, T0 + 9)], ["disabled", () => h.hosted.disabled(kept)], ["lost", () => h.hosted.lost(kept, "r", "agent")],
       ["aliveAt", () => h.hosted.aliveAt(kept)], ["launcher", () => h.hosted.launcher(kept, "r")], ["holds", () => h.hosted.holds(kept)],
     ];
     for (const [name, call] of calls) expect(`${name}: ${await failure(call)}`).toMatch(new RegExp(`^${name}: .*${settled.source}`));
+    // No IDs, no statement: an empty getMany answers even on the finished handle (#1572).
+    expect(await h.hosted.getMany(kept, [])).toEqual([]);
     expect(await get(h, "r")).toEqual(r);
     expect(await get(h, "c")).toEqual(c);
     expect(await get(h, "r2")).toBeUndefined();

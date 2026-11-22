@@ -140,7 +140,8 @@ jobs:
 
   # The server suite on Postgres (#807 P3 C11b): TestServer.open() clones a
   # database per server from the migrated template. The files already green on
-  # Postgres (less mcp_subscriptions, a load flake candidate); C11c/C11d widen this to ./src/server ./tests/integration
+  # Postgres (less mcp_subscriptions, a load flake candidate), with every tests/integration file that starts a TestServer,
+  # the Stage 3 pilot gate service_invoke among them (#1523); C11c/C11d widen this to ./src/server ./tests/integration
   # ./tests/conformance. Non-required until C11d.
   test-pg:
     needs: scope
@@ -282,33 +283,56 @@ jobs:
             tests/conformance/identity.test.ts
             tests/conformance/queue.test.ts
             tests/integration/action_pins.test.ts
+            tests/integration/alias_cap.test.ts
+            tests/integration/alias_visibility.test.ts
+            tests/integration/audit_origin.test.ts
+            tests/integration/auth_limit.test.ts
+            tests/integration/authz_await.test.ts
+            tests/integration/authz_decision.test.ts
             tests/integration/backup_script.test.ts
             tests/integration/binding.test.ts
+            tests/integration/binding_server.test.ts
             tests/integration/board_create_taken.test.ts
             tests/integration/board_drain_gate.test.ts
             tests/integration/build_scratch.test.ts
             tests/integration/ci_sources.test.ts
+            tests/integration/claim_holder_visibility.test.ts
             tests/integration/claude_plugin_package.test.ts
             tests/integration/claude_records.test.ts
+            tests/integration/close_windows.test.ts
             tests/integration/concurrent_open.test.ts
+            tests/integration/delegation.test.ts
+            tests/integration/delegation_grant.test.ts
+            tests/integration/delegation_limits.test.ts
             tests/integration/deploy_check.test.ts
             tests/integration/doc_links.test.ts
             tests/integration/drain_gate.test.ts
             tests/integration/factory.test.ts
             tests/integration/factory_isolation.test.ts
+            tests/integration/hello_limit.test.ts
+            tests/integration/hosted_alias_lost.test.ts
             tests/integration/hosted_ci.test.ts
             tests/integration/hosted_context_off.test.ts
             tests/integration/hosted_core_bundle.test.ts
             tests/integration/hosted_core_login.test.ts
+            tests/integration/hosted_core_proxy.test.ts
             tests/integration/hosted_core_snapshot.test.ts
             tests/integration/hosted_core_sync.test.ts
+            tests/integration/hosted_core_wire.test.ts
             tests/integration/hosted_evidence.test.ts
             tests/integration/hosted_facts.test.ts
             tests/integration/hosted_generic_source.test.ts
             tests/integration/hosted_matrix.test.ts
             tests/integration/hosted_other_user.test.ts
+            tests/integration/hosted_read_marks.test.ts
             tests/integration/hosted_schema_leak.test.ts
             tests/integration/hosted_session_end.test.ts
+            tests/integration/hosted_tools.test.ts
+            tests/integration/hosted_wake_grant.test.ts
+            tests/integration/http_mcp.test.ts
+            tests/integration/http_mcp_throttle.test.ts
+            tests/integration/http_routes.test.ts
+            tests/integration/hub.test.ts
             tests/integration/ids.test.ts
             tests/integration/install.test.ts
             tests/integration/legacy_handle_case.test.ts
@@ -326,17 +350,32 @@ jobs:
             tests/integration/pg_board_races.pg.test.ts
             tests/integration/pg_session_races.pg.test.ts
             tests/integration/pg_team_board_race.pg.test.ts
+            tests/integration/plugin_parity.test.ts
+            tests/integration/repo_clock.test.ts
             tests/integration/retention_upgrade.test.ts
+            tests/integration/role_bindings.test.ts
             tests/integration/rust_fixtures.test.ts
+            tests/integration/rust_listen_capacity.test.ts
             tests/integration/rust_responses.test.ts
             tests/integration/rust_sdk.test.ts
             tests/integration/rust_sdk_version.test.ts
+            tests/integration/server_stop.test.ts
+            tests/integration/service_credentials.test.ts
+            tests/integration/service_invoke.test.ts
+            tests/integration/service_principals.test.ts
+            tests/integration/session_end.test.ts
             tests/integration/session_key.test.ts
             tests/integration/signed_in_local.test.ts
             tests/integration/slack.test.ts
+            tests/integration/slack_org.test.ts
+            tests/integration/slack_shutdown.test.ts
+            tests/integration/stop_quiesce.test.ts
             tests/integration/tail.test.ts
+            tests/integration/team_alias.test.ts
+            tests/integration/team_confinement.test.ts
             tests/integration/upgrade.test.ts
             tests/integration/upgrade_install.test.ts
+            tests/integration/write_dedup.test.ts
           )
           bun test --timeout 30000 --parallel "${files[@]/#/./}"
 

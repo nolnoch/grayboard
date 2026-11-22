@@ -10,6 +10,7 @@ import type { Repo } from "./db.ts";
 import type { Read, Tx } from "./store/tx.ts";
 import { AUTHORS, B, BOARDS, D, E, ENG_ID, HANDLES, openBoardParity, SCOPES, TOKENS, TOOLS_ID, W, WADE_ID } from "../../tests/support/board_parity.ts";
 import { principalCanSee, serverAccess } from "../../tests/support/sync_access.ts";
+import { NO_MEMBER_AUTHORITY } from "./store/identity.ts";
 
 let repo: Repo;
 let db: CoreDb;
@@ -106,7 +107,7 @@ test("its reads go on the handle it's given: a body sees its own membership, not
   const a = boardAccess(repo), sync = serverAccess(repo, db);
   const eng = BOARDS[1]!, dan = `${D}/be`;
   const rolled = repo.write(async tx => {
-    await repo.teams.addMember(tx, (await repo.teams.findByName(tx, "eng"))!.id, (await repo.users.findByEmail(tx, D))!.id);
+    await repo.teams.addMember(tx, (await repo.teams.findByName(tx, "eng"))!.id, (await repo.users.findByEmail(tx, D))!.id, NO_MEMBER_AUTHORITY);
     expect([sync.canSee(dan, eng), await a.canSee(tx, dan, eng), sorted(await a.canSeeMany(tx, [dan], eng)), sorted(await a.visibleTo(tx, dan, BOARDS))]).toEqual([true, true, [dan], ["eng", "general"]]);
     expect(await a.checkCreate(tx, dan, "team:eng")).toBeNull();
     expect((await a.seesAliasScopes(tx, dan, [{ scope_kind: "team", scope_ref: "eng" }])).get(scopeKey({ scope_kind: "team", scope_ref: "eng" }))).toBe(true);

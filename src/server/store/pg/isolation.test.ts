@@ -1,4 +1,4 @@
-// #807 P3 C1: the Postgres store stands alone. db.ts (the SQLite store) and bun:sqlite go at P5, so no module
+// #807 P3 C1: the Postgres store stands alone. db.ts (the SQLite store) and bun:sqlite go when the SQLite server store is deleted (#808), so no module
 // under store/pg/ may reach either, directly or through the relative modules it imports (store/tx.ts, for
 // example, reaches bun:sqlite through core/sqlite.ts). Type-only imports are erased at build and don't count.
 import { expect, test } from "bun:test";

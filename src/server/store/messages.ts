@@ -70,8 +70,10 @@ export interface MessagesStore {
   sentPending(r: Read, senders: string[], since: number): Promise<MessageRow[]>;
   // Records reader's ack of a message that exists; a repeat, or an absent message, writes nothing.
   ack(tx: Tx, reader: string, id: number): Promise<void>;
-  // Stamps delivered_at on a direct message handed to its recipient's harness; the first stamp stands.
-  markDelivered(tx: Tx, id: number, at: number): Promise<void>;
+  // A receipt's write (#1510 chunk 5): of `ids`, the direct messages to one of `recipients`, each stamped delivered_at
+  // (unless `at` is null: given up, not handed; the first stamp stands), locked in id order (messages.prune's lock
+  // order). Returns each such recipient's highest id, the point its direct cursor moves to; a missing id is skipped.
+  deliver(tx: Tx, recipients: string[], ids: number[], at: number | null): Promise<Map<string, number>>;
   // Deletes a direct message from sender that's past the recipient's cursor
   // and has no reply, with its acks and attachments; anything else writes
   // nothing and says why (RetractResult). Audited as message.retracted in the

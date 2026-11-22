@@ -20,6 +20,7 @@ import { stubAuthRead } from "../../tests/support/auth_stub.ts";
 import { scratchDbPath } from "../../tests/support/scratch_db.ts";
 import { seed } from "../../tests/support/seed.ts";
 import { until } from "../../tests/support/until.ts";
+import { gateCount } from "./metrics.ts";
 const meta = { "ai.opencode/sessionID": "resource-root" };
 
 let store: ReturnType<typeof openDatabase>, application: ReturnType<typeof createApplication>;
@@ -119,6 +120,36 @@ test("receipt capacity is structured and release then bind false reopens under a
   expect((await client.readResource({ uri: "grayboard://inbox" })).contents).toHaveLength(1);
   expect(await store.repo.aliases.find(store.repo.read, `${grant.authed.user_email}/be`)).toEqual(alias);
   await expect(hosted.delivery.pending(principal, sessionContext(principal, meta), first.capability)).rejects.toHaveProperty("code", "not_found");
+});
+
+// #1537 C5, C7: a subscriber exchange's open, renew, inbox read (pending), receipt and bind reuse its selection's verdict
+// (hosted.ts withPrior) instead of running a second gate body: on SQLite each counts one prior body (`skipped`: its body
+// is exclusive) and no gate body under its method. Mutation: mcp-resources.ts passing no verdict to one of them (that
+// method's gate count reads 1, its prior 0).
+test("a subscriber's open, renew, inbox read, receipt and bind run a prior on the exchange's verdict, not a second gate body", async () => {
+  const methods = ["open", "renew", "pending", "receipt", "bind"] as const;
+  const at = () => Object.fromEntries(methods.map(m => [m, { gate: gateCount("gate", "skipped", m), prior: gateCount("prior", "skipped", m) }]));
+  const headers = new Headers(), client = await connect("2026-07-28", "subscriber", undefined, headers);
+  const before = at();
+  const lease = JSON.parse(((await client.callTool({ name: "delivery_open", arguments: {} })).content as { text: string }[])[0]!.text);
+  headers.set("X-Grayboard-Lease", lease.capability);
+  expect((await client.callTool({ name: "delivery_renew", arguments: {} })).isError).not.toBe(true);
+  await seed(store.repo, () => {
+    createBoard(store.db, "alice@example.com/be", "verdict", "the subscriber's verdict reuse");
+    subscribe(store.db, "alice@example.com/be", "verdict", "push");
+    post(store.db, "alice@example.com/sender", "verdict", "one");
+  });
+  const inbox = JSON.parse(((await client.readResource({ uri: "grayboard://inbox" })).contents[0] as { text: string }).text) as { items: { id: string }[] };
+  expect(inbox.items).toHaveLength(1);
+  expect((await client.callTool({ name: "delivery_receipt", arguments: { ids: inbox.items.map(i => i.id) } })).isError).not.toBe(true);
+  expect((await client.callTool({ name: "bind", arguments: { name: "qa", create: true } })).isError).not.toBe(true);
+  const after = at();
+  expect(Object.fromEntries(methods.map(m => [m, { gate: after[m]!.gate - before[m]!.gate, prior: after[m]!.prior - before[m]!.prior }])))
+    .toEqual(Object.fromEntries(methods.map(m => [m, { gate: 0, prior: 1 }])));
+  // The native role's bind tool the same (mcp.ts).
+  const native = await connect("2026-07-28", "native"), bound = at();
+  expect((await native.callTool({ name: "bind", arguments: { name: "qa2", create: true } })).isError).not.toBe(true);
+  expect({ gate: at().bind!.gate - bound.bind!.gate, prior: at().bind!.prior - bound.bind!.prior }).toEqual({ gate: 0, prior: 1 });
 });
 
 test("subscriber known suggestions stay account scoped and reject malformed extra fields without getters", async () => {

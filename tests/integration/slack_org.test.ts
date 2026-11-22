@@ -461,10 +461,10 @@ test("#807: a Slack user's dm_thread runs inside a write-queue transaction", asy
 // Holds the write queue as the first repo.post named `what` is made, so that write queues behind the holder; each
 // such post's return (true: it ran at once) is pushed to `ran`.
 // Holds the write queue as `handle`'s drain reads `postId` among its pushes, before the drain can queue anything for
-// it; logs every repo.boards.acknowledge.
+// it; logs every repo.boards.acknowledge and acknowledgeMany (a receipt's batch, #1510 chunk 5).
 function holdAtPushRead(handle: string, postId: number): { acks: string[]; holder: () => ReturnType<typeof holdQueue> | undefined; restore: () => void } {
   const boards = srv.app.repo.boards;
-  const { pendingPushes, acknowledge } = boards;
+  const { pendingPushes, acknowledge, acknowledgeMany } = boards;
   const acks: string[] = [];
   let holder: ReturnType<typeof holdQueue> | undefined;
   boards.pendingPushes = async (r, h) => {
@@ -473,7 +473,8 @@ function holdAtPushRead(handle: string, postId: number): { acks: string[]; holde
     return rows;
   };
   boards.acknowledge = (tx, h, ref) => { acks.push(h); return acknowledge.call(boards, tx, h, ref); };
-  return { acks, holder: () => holder, restore: () => { boards.pendingPushes = pendingPushes; boards.acknowledge = acknowledge; holder?.release(); } };
+  boards.acknowledgeMany = (tx, h, refs, receiver) => { acks.push(h); return acknowledgeMany.call(boards, tx, h, refs, receiver); };
+  return { acks, holder: () => holder, restore: () => { boards.pendingPushes = pendingPushes; boards.acknowledge = acknowledge; boards.acknowledgeMany = acknowledgeMany; holder?.release(); } };
 }
 
 // The human's hello replay (application.replay, which slack.ts attach calls after its hello commits) drains outside
@@ -866,12 +867,12 @@ test("#807 P3 C7: the owed bridge notice reports the stop written before its loc
 });
 
 // #807 P1c-14b: the link's newest-message read (where the new human's cursor starts) and the Slack receipt's
-// message read run on their body's Tx.
+// message stamp (one set-based `deliver`, #1510) run on their body's Tx.
 test("#807 P1c-14b: link and the Slack receipt read messages on their body's Tx", async () => {
   const repo = srv.app.repo;
   const checks: { op: string; inTxn: boolean; handle: "pool" | "tx" }[] = [];
   const txn = txSpy(srv);
-  const spies = (["history", "getById"] as const).map((name) => {
+  const spies = (["history", "deliver"] as const).map((name) => {
     const original = repo.messages[name].bind(repo.messages) as (...a: unknown[]) => unknown;
     return spyOn(repo.messages, name).mockImplementation(((r: unknown, ...rest: unknown[]) => {
       if (new Error().stack?.includes("/slack.ts:")) checks.push({ op: name, inTxn: txn.open, handle: r === repo.read ? "pool" : "tx" });
@@ -883,9 +884,9 @@ test("#807 P1c-14b: link and the Slack receipt read messages on their body's Tx"
     await link(alice);
     const be = await hosted("alice@example.com", "be");
     await be.call<SendResult>("dm_send", { to: "human", body: "receipt check" });
-    await until(() => checks.some((c) => c.op === "getById"));
+    await until(() => checks.some((c) => c.op === "deliver"));
   } finally { for (const spy of spies) spy.mockRestore(); txn.restore(); }
-  expect(checks).toEqual([{ op: "history", inTxn: true, handle: "tx" }, { op: "getById", inTxn: true, handle: "tx" }]);
+  expect(checks).toEqual([{ op: "history", inTxn: true, handle: "tx" }, { op: "deliver", inTxn: true, handle: "tx" }]);
 });
 
 test("thread replies while unlinked don't flood in at relink", async () => {

@@ -14,6 +14,7 @@ import { AppSession } from "../../tests/support/app_session.ts";
 import { scratchDbPath } from "../../tests/support/scratch_db.ts";
 import { queueFor } from "./store/queue.ts";
 import { MissingParent } from "./store/errors.ts";
+import { NO_MEMBER_AUTHORITY } from "./store/identity.ts";
 
 let store: ReturnType<typeof openDatabase>;
 let application: ReturnType<typeof createApplication>;
@@ -92,7 +93,7 @@ test("a receipt stamps delivered_at once; a cursor-only delivery shows delivered
   expect((await a.thread(sent.message_id))[0]!.delivered_at).toBe(stamp);
   expect((await b.inbox()).unanswered[0]).toMatchObject({ id: sent.message_id, delivered_at: stamp });
   // A repeated receipt keeps the first stamp.
-  await seed(store.repo, tx => store.repo.messages.markDelivered(tx, sent.message_id, stamp + 60_000));
+  await seed(store.repo, tx => store.repo.messages.deliver(tx, ["bob@example.com/fe"], [sent.message_id], stamp + 60_000));
   await b.ack([sent.message_id]);
   expect((await a.history())[0]!.delivered_at).toBe(stamp);
 
@@ -455,7 +456,7 @@ test("unbound hosted reads never use the human address and still list and read b
     await application.call(tx, owner, "board_create", { name: "e2e", purpose: "fixture" });
     await application.call(tx, owner, "board_post", { board: "e2e", body: "hello" });
     const team = await store.repo.teams.create(tx, "private", bob.user_id);
-    await store.repo.teams.addMember(tx, team.id, bob.user_id);
+    await store.repo.teams.addMember(tx, team.id, bob.user_id, NO_MEMBER_AUTHORITY);
   });
   const bobBe = (await connect(bob, "be", { key: "bob-secret" })).session;
   await seed(store.repo, tx => application.call(tx, bobBe, "board_create", { name: "secret", purpose: "fixture", team: "private" }));
@@ -758,6 +759,18 @@ test("#807 P3 B1c: close's touch commits or rolls back with its body, and from a
     await until(() => seen(late.id) > 0, 2000, "the queued close touch");
     expect(errors.mock.calls.filter(c => String(c[0]).includes("last-seen touch"))).toEqual([]);
   } finally { errors.mockRestore(); }
+});
+
+// #1527 L1: a queued close touch carries its writer's ID key beside its root's, so two sessions of one writer ID under
+// different roots (or none) touch its row in arrival order. Mutation: the touch's keys without `id:<writer>`.
+test("#1510: a queued close touch is keyed by its writer's root and its writer ID", async () => {
+  const keyed = spyOn(store.repo, "writeKeyed");
+  try {
+    const conn = await connect(alice, "keyed-close", { key: "alice-keyed-close" });
+    application.close(conn.session);
+    await until(() => keyed.mock.calls.length > 0, 2000, "the queued close touch");
+    expect(keyed.mock.calls.map(c => c[0])).toEqual([[`root:${conn.id}`, `id:${conn.id}`]]);
+  } finally { keyed.mockRestore(); }
 });
 
 test("#807: a rolled-back attachHuman leaves the earlier bridge connection in place", async () => {

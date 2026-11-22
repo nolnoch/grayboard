@@ -27,13 +27,14 @@ import type { Principal } from "../../../core/resolver.ts";
 import { AuthorityLost, LastOwner, PrincipalTaken } from "../errors.ts";
 import {
   DEV_SESSION_LABEL, TEAM_POLICIES,
-  type IdentityGroups, type IdpSignIn, type MemberAuthority, type MemberRemoval, type PrincipalRow, type RoleAuthority, type RoleBinding, type RoleRevoke,
+  type IdentityGroups, type IdpSignIn, type MemberAuthority, type PrincipalRow, type RoleAuthority, type RoleBinding, type RoleRevoke,
   type Session, type Team, type TeamMember, type TeamPolicy, type User,
 } from "../identity.ts";
 import type { Read, Tx } from "../tx_base.ts";
 import { insertAudit } from "./audit_row.ts";
 import { principalTaken, SERVICE_NAME_CONSTRAINTS, uniqueViolation } from "./errors.ts";
 import type { PgHostedEnds } from "./hosted_port.ts";
+import { endSignIns } from "./oauth.ts";
 import { int8, int8OrNull } from "./sql.ts";
 import { pgOf, type PgFragment, type PgSql } from "./tx.ts";
 
@@ -50,7 +51,7 @@ const strOrNull = (v: unknown) => v as string | null;
 const toUser = (r: Row): User => ({
   id: int8(r.id), email: str(r.email), display_name: strOrNull(r.display_name), created_at: int8(r.created_at),
   disabled_at: int8OrNull(r.disabled_at), idp_issuer: strOrNull(r.idp_issuer), idp_subject: strOrNull(r.idp_subject),
-  kind: r.kind as User["kind"],
+  idp_checked_at: int8OrNull(r.idp_checked_at), kind: r.kind as User["kind"],
 });
 const toSession = (r: Row): Session => ({
   id: int8(r.id), user_id: int8(r.user_id), token_hash: str(r.token_hash), created_at: int8(r.created_at),
@@ -68,7 +69,7 @@ const toBinding = (r: Row): RoleBinding => ({
 });
 
 // db.ts USER_SQL: the kind is the service principal's, read with the row.
-const userFrom = (sql: PgSql) => sql.fragment`SELECT u.id, u.email, u.display_name, u.created_at, u.disabled_at, u.idp_issuer, u.idp_subject,
+const userFrom = (sql: PgSql) => sql.fragment`SELECT u.id, u.email, u.display_name, u.created_at, u.disabled_at, u.idp_issuer, u.idp_subject, u.idp_checked_at,
   CASE WHEN p.id IS NULL THEN 'user' ELSE 'service' END AS kind
   FROM users u LEFT JOIN principals p ON p.user_id = u.id AND p.kind = 'service'`;
 // db.ts BINDING_SQL.
@@ -101,7 +102,6 @@ const teamAuthority = (sql: PgSql, by: MemberAuthority, teamId: number): PgFragm
   authority(sql, by.authority, by.byUser, () => sql.fragment`(SELECT id FROM principals WHERE kind = 'team' AND team_id = ${teamId})`);
 const authorityHolds = async (sql: PgSql, by: MemberAuthority, teamId: number): Promise<boolean> =>
   (await sql`SELECT ${teamAuthority(sql, by, teamId)} AS ok`)[0]!.ok === true;
-const NO_AUTHORITY: MemberRemoval = { byUser: null, authority: "none", actor: null };
 
 const bindingDetail = (b: RoleBinding) => ({
   binding: b.id, role: b.role, principal: b.principal, principal_id: b.principal_id, scope: b.scope, scope_id: b.scope_id,
@@ -113,7 +113,7 @@ class LostLink extends Error {}
 
 export function makePgIdentity({ now, hosted }: { now: () => number; hosted: PgHostedEnds }): PgIdentity {
   // What a disable and a revoke-all both end (db.ts setDisabled, revokeAllForUser): the CLI sessions, the OAuth grants,
-  // then the hosted sessions, and the unredeemed codes; a disable also the browser sessions. The users row is already
+  // then the hosted sessions, the browser sessions (a live one consents without the IdP, #1552) and the unredeemed codes. The users row is already
   // locked (see the header), so each statement here sees every row a concurrent mint for the user committed.
   const revokeUser = async (tx: Tx, userId: number, reason: "revoked" | "disabled", at: number) => {
     const sql = pgOf(tx);
@@ -122,7 +122,7 @@ export function makePgIdentity({ now, hosted }: { now: () => number; hosted: PgH
     await sql`UPDATE oauth_grants SET revoked_at = ${at} WHERE user_id = ${userId} AND revoked_at IS NULL`;
     // After the grants' revoke, as revokeGrant orders its own end (hosted_port.ts: the lock order).
     await hosted.endForUser(tx, userId, reason, at);
-    if (reason === "disabled") await sql`DELETE FROM oauth_browsers WHERE user_id = ${userId}`;
+    await sql`DELETE FROM oauth_browsers WHERE user_id = ${userId}`;
     await sql`DELETE FROM oauth_codes WHERE user_id = ${userId} AND grant_id IS NULL`;
   };
 
@@ -147,16 +147,18 @@ export function makePgIdentity({ now, hosted }: { now: () => number; hosted: PgH
   // concurrent sign-in linked first.
   async function signInAttempt(tx: Tx, issuer: string, subject: string, email: string, displayName: string | null): Promise<IdpSignIn> {
     const sql = pgOf(tx);
+    // Each verified sign-in restamps the user's IdP clock (#930), which the reauth fallback reads.
+    const at = now();
     // Conditional on the row still being unlinked and enabled (D3): another sign-in may have linked it, or an admin
     // disabled it, since the read. Zero rows takes the lost-link path, whose re-read decides as a serial run would.
-    const link = async (id: number) => (await sql`UPDATE users SET idp_issuer = ${issuer}, idp_subject = ${subject}, display_name = ${displayName}
+    const link = async (id: number) => (await sql`UPDATE users SET idp_issuer = ${issuer}, idp_subject = ${subject}, display_name = ${displayName}, idp_checked_at = ${at}
       WHERE id = ${id} AND idp_subject IS NULL AND (idp_issuer IS NULL OR idp_issuer = ${issuer}) AND disabled_at IS NULL RETURNING id`).length === 1;
     // 1. This IdP account's user.
     const bySubject = await first(sql`${userFrom(sql)} WHERE u.idp_issuer = ${issuer} AND u.idp_subject = ${subject}`, toUser);
     if (bySubject) {
       if (bySubject.email !== email) return { status: "email_changed", user: bySubject };
-      await sql`UPDATE users SET display_name = ${displayName} WHERE id = ${bySubject.id}`;
-      return { status: "ok", user: { ...bySubject, display_name: displayName }, linked: false };
+      await sql`UPDATE users SET display_name = ${displayName}, idp_checked_at = ${at} WHERE id = ${bySubject.id}`;
+      return { status: "ok", user: { ...bySubject, display_name: displayName, idp_checked_at: at }, linked: false };
     }
     const byEmail = await userByEmail(sql, email);
     if (byEmail?.kind === "service") return { status: "service", user: byEmail };
@@ -167,12 +169,12 @@ export function makePgIdentity({ now, hosted }: { now: () => number; hosted: PgH
       // A disabled account isn't bound to whoever tried (security audit F-13).
       if (byEmail.disabled_at !== null) return { status: "ok", user: byEmail, linked: false };
       // 4 and 5.
-      if (await link(byEmail.id)) return { status: "ok", user: { ...byEmail, idp_issuer: issuer, idp_subject: subject, display_name: displayName }, linked: true };
+      if (await link(byEmail.id)) return { status: "ok", user: { ...byEmail, idp_issuer: issuer, idp_subject: subject, display_name: displayName, idp_checked_at: at }, linked: true };
       throw new LostLink();
     }
     // 6. A new user, created with both.
     const user = await upsertUser(tx, email, displayName);
-    if (await link(user.id)) return { status: "ok", user: { ...user, idp_issuer: issuer, idp_subject: subject }, linked: false };
+    if (await link(user.id)) return { status: "ok", user: { ...user, idp_issuer: issuer, idp_subject: subject, idp_checked_at: at }, linked: false };
     throw new LostLink();
   }
 
@@ -232,10 +234,14 @@ export function makePgIdentity({ now, hosted }: { now: () => number; hosted: PgH
         throw new Error(`sign-in for ${email} kept losing its link to concurrent sign-ins`);
       },
       async clearSubject(tx, userId) {
-        await pgOf(tx)`UPDATE users SET idp_issuer = NULL, idp_subject = NULL WHERE id = ${userId}`;
+        await pgOf(tx)`UPDATE users SET idp_issuer = NULL, idp_subject = NULL, idp_checked_at = COALESCE(idp_checked_at, 0) WHERE id = ${userId}`;
+      },
+      async stampIdpChecked(tx, userId) {
+        await pgOf(tx)`UPDATE users SET idp_checked_at = ${now()} WHERE id = ${userId}`;
       },
       findByEmail: (r, email) => userByEmail(pgOf(r), email),
       findById: (r, userId) => userById(pgOf(r), userId),
+      lockById: (tx, userId) => first(pgOf(tx)`${userFrom(pgOf(tx))} WHERE u.id = ${userId} FOR UPDATE OF u`, toUser),
       // The UPDATE is the users row's lock: it waits for a mint holding FOR SHARE, and a mint after it waits, then finds
       // the user disabled. Re-enabling revives nothing the disable revoked.
       async setDisabled(tx, userId, disabled) {
@@ -257,6 +263,18 @@ export function makePgIdentity({ now, hosted }: { now: () => number; hosted: PgH
       findById: (r, sessionId) => first(pgOf(r)`SELECT * FROM sessions WHERE id = ${sessionId}`, toSession),
       async revoke(tx, sessionId) {
         await pgOf(tx)`UPDATE sessions SET revoked_at = ${now()} WHERE id = ${sessionId}`;
+      },
+      async listLive(r, userId, usedAfter, limit) {
+        return (await pgOf(r)`SELECT * FROM sessions WHERE user_id = ${userId} AND revoked_at IS NULL AND last_used_at > ${usedAfter}
+          ORDER BY last_used_at DESC, id DESC LIMIT ${limit}`).map(toSession);
+      },
+      // The users row first, as revokeUserGrant (pg/oauth.ts) and for the same consent race (#1552).
+      async revokeOwn(tx, userId, sessionId) {
+        const sql = pgOf(tx);
+        await sql`SELECT 1 FROM users WHERE id = ${userId} FOR NO KEY UPDATE`;
+        if (!(await sql`UPDATE sessions SET revoked_at = ${now()} WHERE id = ${sessionId} AND user_id = ${userId} AND revoked_at IS NULL RETURNING id`).length) return false;
+        await endSignIns(sql, userId);
+        return true;
       },
       // Writes no users row, so it locks it: FOR NO KEY UPDATE conflicts with a mint's FOR SHARE (a plain FK insert's
       // KEY SHARE would not), so a CLI session, grant or code minted concurrently is either committed and revoked here
@@ -316,7 +334,7 @@ export function makePgIdentity({ now, hosted }: { now: () => number; hosted: PgH
       // conditional on the actor's authority: an owner revoked after the route's decision adds no one, and one revoked
       // after this commits finds the new member in its last-owner count. Zero rows is an existing member or the
       // authority gone; under the lock a second statement reads the same bindings and says which.
-      async addMember(tx, teamId, userId, by = NO_AUTHORITY) {
+      async addMember(tx, teamId, userId, by) {
         const sql = pgOf(tx);
         await roleLock(sql);
         const added = (await sql`INSERT INTO team_members (team_id, user_id, joined_at)
@@ -330,7 +348,7 @@ export function makePgIdentity({ now, hosted }: { now: () => number; hosted: PgH
       // who is no longer a member. The actor's authority is read once under it, before any write: the revoke may
       // delete the very binding it rests on (an owner removing themselves), so a re-check after it would refuse what
       // the decision allowed. Only lock holders change bindings, so the read stays true until commit.
-      async removeMember(tx, teamId, userId, by = NO_AUTHORITY) {
+      async removeMember(tx, teamId, userId, by) {
         const sql = pgOf(tx);
         await roleLock(sql);
         if (!(await authorityHolds(sql, by, teamId))) throw new AuthorityLost();

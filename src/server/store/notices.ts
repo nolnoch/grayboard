@@ -11,7 +11,13 @@
 // facts (a synchronous body's Tx, which refuses the hook, or a failed read) is the observer's to handle.
 //
 // Backend-neutral: it imports nothing at runtime but tx_base.ts. The backend says where a notice waits for the commit
-// (`defer`): SQLite on its connection's commit frames (core/sqlite.ts afterCommit), Postgres on the Tx it's given.
+// (`defer`): SQLite on its connection's commit frames (core/sqlite.ts afterCommit), Postgres on the Tx it's given. And
+// whether a transaction may queue one at all (`refuse`, #1510): Postgres refuses a keyed body's (store/pg/tx.ts
+// refuseKeyed, docs/future/postgres-server.md D4), since a notice's listeners run in the committing body's context
+// while other keyed bodies run. A wrapped op is refused before it runs, so its statements are never sent. `refuse` gets
+// the op's name (undefined for a bare `changed`), the refusal's text and the row the notice names (null: any): a reviewed
+// keyed caller may opt in to one op's notices for its own root's row (store/pg/tx.ts refuseKeyedNotice, #1510 chunk 4's
+// renew).
 import { isThenable, transactionOf, type Tx } from "./tx_base.ts";
 
 type Observer = {
@@ -24,15 +30,15 @@ type Reads = { pending: Set<string>; facts: Map<string, unknown> };
 export type Notices = {
   // Tells the observers after `tx`'s transaction commits that `id` (or, null, any row) changed.
   changed(tx: Tx, id: string | null): void;
-  // `fn`, telling the observers `null` once it has fulfilled.
-  change<A extends [Tx, ...unknown[]], R>(fn: (...args: A) => R): (...args: A) => R;
+  // `fn`, telling the observers `null` once it has fulfilled. `op`: its name in a refusal.
+  change<A extends [Tx, ...unknown[]], R>(fn: (...args: A) => R, op?: string): (...args: A) => R;
   // `fn`, reading the row `id` names's facts before its commit and telling the observers once it has fulfilled.
-  marks<A extends [Tx, ...unknown[]], R>(fn: (...args: A) => R, id: (...args: A) => string): (...args: A) => R;
+  marks<A extends [Tx, ...unknown[]], R>(fn: (...args: A) => R, id: (...args: A) => string, op?: string): (...args: A) => R;
   // RepoHosted.subscribe (db.ts).
   subscribe<F>(fn: (changed: string | null, facts?: F) => void, read?: (tx: Tx, id: string) => Promise<F>): () => void;
 };
 
-export function makeNotices(defer: (tx: Tx, effect: () => void) => void): Notices {
+export function makeNotices(defer: (tx: Tx, effect: () => void) => void, refuse: (tx: Tx, op: string | undefined, label: string, id: string | null) => void = () => {}): Notices {
   const observers = new Set<Observer>();
   // Per transaction, per observer; dropped with the transaction's root Tx. The facts read are cleared after its notices flush.
   const byTxn = new WeakMap<object, Map<Observer, Reads>>();
@@ -43,7 +49,8 @@ export function makeNotices(defer: (tx: Tx, effect: () => void) => void): Notice
     if (!r) m.set(o, r = { pending: new Set(), facts: new Map() });
     return r;
   };
-  const changed = (tx: Tx, id: string | null) => {
+  // Queues the notice; a wrapped op's was refused or allowed by name before it ran.
+  const notify = (tx: Tx, id: string | null) => {
     const txn = transactionOf(tx);
     defer(tx, () => {
       const reads = txn && byTxn.get(txn);
@@ -84,9 +91,15 @@ export function makeNotices(defer: (tx: Tx, effect: () => void) => void): Notice
     return Promise.resolve(value).then(v => { notify(); return v; }) as R;
   };
   return {
-    changed,
-    change: fn => (...args) => then(fn(...args), () => changed(args[0], null)),
-    marks: (fn, id) => (...args) => then(fn(...args), () => { const at = id(...args); readFacts(args[0], at); changed(args[0], at); }),
+    changed(tx, id) { refuse(tx, undefined, "a hosted change notice", id); notify(tx, id); },
+    change: (fn, op) => (...args) => {
+      refuse(args[0], op, `${op ?? (fn.name || "a write")} (it queues a change notice)`, null);
+      return then(fn(...args), () => notify(args[0], null));
+    },
+    marks: (fn, id, op) => (...args) => {
+      refuse(args[0], op, `${op ?? (fn.name || "a write")} (it queues a change notice)`, id(...args));
+      return then(fn(...args), () => { const at = id(...args); readFacts(args[0], at); notify(args[0], at); });
+    },
     subscribe(fn, read) {
       const o: Observer = { fn: fn as Observer["fn"], read };
       observers.add(o);

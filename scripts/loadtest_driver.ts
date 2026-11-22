@@ -19,6 +19,8 @@
 // blamed on the server.
 import { monitorEventLoopDelay } from "node:perf_hooks";
 import { HostedSession, HostedToolError } from "../tests/support/hosted_session.ts";
+import { errorClass } from "./loadtest_errors.ts";
+import { LeaseUnavailable } from "../adapters/hosted-core/src/wire.ts";
 
 // service: one of the service's workers (its run token, its queue board as `board`), which sends no scheduled traffic.
 export type DriverSession = { index: number; email: string; token: string; name: string; address: string; board: string; service?: true };
@@ -58,6 +60,9 @@ export type DriverWindow = {
 export type ReadProof = { ok: number; named: number; content: number };
 export type DriverFinal = {
   type: "final"; driver: number; sentDm: string[]; recvDm: string[]; posts: number; boardRecv: number; misdelivered: number; misdeliveredFirst: string[];
+  // Leases lost outside churn and close (#1537): each session whose inbox read, renew or receipt answered that its lease
+  // is gone (LeaseUnavailable: the server's "no live delivery lease" not_found, or unbound), and the first few by session.
+  lapsed: number; lapsedFirst: string[];
   svcSent: string[]; svcGot: string[]; svcDone: string[]; svcPosts: number[]; laneEcho: number; svcReads: Record<string, ReadProof>; errors: Record<string, number>;
   mentSent: string[]; mentGot: string[];
 };
@@ -86,15 +91,8 @@ function observe(op: string, seconds: number, failed: boolean) {
   h.count++; h.sum += seconds; if (failed) h.errors++;
 }
 
-function errorCode(e: unknown): string {
-  if (e instanceof HostedToolError) return `${e.tool}:${e.code ?? "refused"}`;
-  const m = e instanceof Error ? e.message : String(e);
-  const status = /\b(4\d\d|5\d\d)\b/.exec(m)?.[1];
-  return status ? `http_${status}` : (e instanceof Error ? e.name : "error");
-}
-
 function noteError(op: string, e: unknown) {
-  const code = `${op}/${errorCode(e)}`;
+  const code = `${op}/${errorClass(e)}`;
   errors[code] = (errors[code] ?? 0) + 1;
   totalErrors[code] = (totalErrors[code] ?? 0) + 1;
   if (firstErrors.length < 5) firstErrors.push(`${code}: ${e instanceof Error ? e.message : String(e)}`.slice(0, 400));
@@ -115,6 +113,25 @@ async function timed<T>(op: string, fn: () => Promise<T>): Promise<T | undefined
   } finally { inflight--; }
 }
 
+// A lease operation (the inbox read, renew, receipt), timed as any op, that also notes a lapse: the server closed the
+// session's lease without the driver releasing it (expired, or changed under it). Close releases only after the loop and
+// its last drain have finished, so no deliberate close reaches here.
+export function leaseOp<T>(l: { spec: { index: number; name: string }; lapsed?: boolean }, op: string, fn: () => Promise<T>): Promise<T | undefined> {
+  return timed(op, async () => {
+    try { return await fn(); }
+    catch (e) {
+      if (e instanceof LeaseUnavailable && !l.lapsed) {
+        l.lapsed = true; lapsed++;
+        if (lapsedFirst.length < 5) lapsedFirst.push(`session ${l.spec.index} (${l.spec.name}) at ${op}: ${e.code}`);
+      }
+      throw e;
+    }
+  });
+}
+
+// The lapses noted so far (the final report's).
+export const lapses = () => ({ lapsed, lapsedFirst: [...lapsedFirst] });
+
 type Live = {
   spec: DriverSession;
   s: HostedSession;
@@ -130,6 +147,8 @@ type Live = {
   reads: number;
   invoked: Map<number, number>;
   doneThread?: number;
+  // Its lease answered LeaseUnavailable: counted once, since the driver never reopens a lease (a churned session is a new Live).
+  lapsed?: boolean;
   // A board_read whose turn came before the session had a thread to read: it runs once one exists.
   owedRead?: boolean;
 };
@@ -142,6 +161,8 @@ const mentSent = new Set<string>(), mentGot = new Set<string>();
 let posts = 0, boardRecv = 0, misdelivered = 0, laneEcho = 0;
 const svcReads: Record<string, ReadProof> = Object.fromEntries(PROOF_OPS.map(op => [op, { ok: 0, named: 0, content: 0 }]));
 const misdeliveredFirst: string[] = [];
+let lapsed = 0;
+const lapsedFirst: string[] = [];
 let sending = true;
 
 let svcBoard: string | null = null;
@@ -160,7 +181,7 @@ function postIdOf(event: unknown): number | undefined {
 // One inbox pass, as the controller makes it: read, then per item a renew and its receipt. A lane answers an
 // invocation before its receipt, as a worker finishes the job before it acks the delivery.
 async function drain(l: Live) {
-  const read = await timed("inbox", () => l.s.subscriber.read("grayboard://inbox"));
+  const read = await leaseOp(l, "inbox", () => l.s.subscriber.read("grayboard://inbox"));
   // A failed read leaves the items on the server: try again shortly rather than at the next renewal.
   if (read === undefined) { await Bun.sleep(250); l.dirty = true; return; }
   const items = itemsOf(read);
@@ -203,9 +224,9 @@ async function drain(l: Live) {
         observe("post_e2e", (Date.now() - Number(m[5])) / 1000, false);
       }
     }
-    await timed("renew", () => l.s.subscriber.call("delivery_renew"));
+    await leaseOp(l, "renew", () => l.s.subscriber.call("delivery_renew"));
     let receipted = false;
-    await timed("receipt", async () => { await l.s.receipt([item.id]); receipted = true; });
+    await leaseOp(l, "receipt", async () => { await l.s.receipt([item.id]); receipted = true; });
     if (receipted && answered !== undefined) l.doneThread = answered;
   }
   if (items.length === 100) l.dirty = true;
@@ -217,7 +238,7 @@ async function deliveryLoop(l: Live) {
   while (!l.stop) {
     if (l.dirty) { l.dirty = false; await drain(l); }
     if (Date.now() >= renewal) {
-      await timed("renew", () => l.s.subscriber.call("delivery_renew"));
+      await leaseOp(l, "renew", () => l.s.subscriber.call("delivery_renew"));
       renewal = Date.now() + RENEW_MS; l.dirty = true;
     }
     if (l.dirty || l.stop) continue;
@@ -238,10 +259,22 @@ async function open(spec: DriverSession, url: string): Promise<Live> {
   }
 }
 
+// An open that fails once its bind may have committed (connect binds, then any later step: a 429, a timeout) ends the
+// session, best effort, so its root doesn't hold its name with no lease to lapse until the idle sweep: the run's
+// `holding` gate would count it after close (#1535 audit).
 async function openOnce(spec: DriverSession, url: string): Promise<Live> {
   const s = new HostedSession(url, spec.token, spec.name, { receipt: "manual" });
+  try { return await opened(spec, s); }
+  catch (e) {
+    await s.subscriber.call("session_end").catch(() => {});
+    await s.close().catch(() => s.drop());
+    throw e;
+  }
+}
+
+async function opened(spec: DriverSession, s: HostedSession): Promise<Live> {
   const l: Live = { spec, s, dirty: true, stop: false, nextSend: 0, seq: 0, reads: spec.index % SVC_READS.length, invoked: new Map() };
-  try { await s.connect(); } catch (e) { await s.drop(); throw e; }
+  await s.connect();
   // board_create subscribes its creator; whoever loses the race subscribes. A worker's board is the service's queue.
   try { await s.call("board_create", { name: spec.board, purpose: "load test", ...(spec.service ? { kind: "queue" } : {}) }); }
   catch (e) {
@@ -287,6 +320,24 @@ async function catalog(l: Live, board: string, op: "catalog" | "catalog_connect"
     if (cursor !== undefined) seen.add(cursor);
   } while (cursor);
   proved(counted, op, uris.includes(`grayboard://boards/${board}`), true);
+}
+
+// The driver's op mix (#1539): smooth weighted round robin over the shares, not a random draw per op, so over any
+// window of draws each op's count stays under 2 from its share (1.4 at the test's shares, 1.52 at the full profile's).
+// A 14 s small fleet makes ~36 draws a driver, and random draws left a 0.1-share op with no sample in the clean steady
+// windows often enough to fail CI. The service's ops are in the mix only with a service board; dm_send takes the rest.
+type MixOp = "board_post" | "svc_invoke" | "peer_list" | "svc_read" | "dm_send";
+export function opMix(config: Pick<DriverConfig, "postShare" | "svcShare" | "peerShare" | "readShare" | "svcBoard">): () => MixOp {
+  const shares: [MixOp, number][] = [["board_post", config.postShare]];
+  if (config.svcBoard) shares.push(["svc_invoke", config.svcShare], ["peer_list", config.peerShare], ["svc_read", config.readShare]);
+  shares.push(["dm_send", Math.max(0, 1 - shares.reduce((a, [, w]) => a + w, 0))]);
+  const mix = shares.filter(([, w]) => w > 0), total = mix.reduce((a, [, w]) => a + w, 0), current = mix.map(() => 0);
+  return () => {
+    let best = 0;
+    for (let i = 0; i < mix.length; i++) { current[i]! += mix[i]![1]; if (current[i]! > current[best]!) best = i; }
+    current[best]! -= total;
+    return mix[best]![0];
+  };
 }
 
 // One read of the service's board, the next of SVC_READS in this session's turn. board_read waits for a thread to read:
@@ -369,11 +420,14 @@ async function main() {
     const opened = await Promise.all(wave.map(spec => timed("connect", () => open(spec, config.url))));
     for (const l of opened) if (l) live.set(l.spec.index, l);
   }
-  emit({ type: "ready", driver: config.driver, live: live.size, want: config.sessions.length });
+  // The connect phase's failures by class (#1532), so the coordinator can say why a session didn't connect.
+  const connectErrors = Object.fromEntries(Object.entries(totalErrors).filter(([k]) => k.startsWith("connect/")));
+  emit({ type: "ready", driver: config.driver, live: live.size, want: config.sessions.length, connectErrors });
 
   // Agent traffic on a wall-clock schedule: an op fires when due, whether or not the last returned.
   const start = Date.now();
   for (const l of live.values()) l.nextSend = start + Math.random() * config.periodMs;
+  const nextOp = opMix(config);
   const tick = setInterval(() => {
     if (!sending) return;
     const now = Date.now();
@@ -381,11 +435,11 @@ async function main() {
       if (l.stop || l.spec.service || now < l.nextSend) continue;
       l.nextSend += config.periodMs * (0.5 + Math.random());
       if (l.nextSend < now) l.nextSend = now + config.periodMs * Math.random();
-      const seq = ++l.seq, r = Math.random();
-      if (r < config.postShare) {
+      const seq = ++l.seq, op = nextOp();
+      if (op === "board_post") {
         posts++;
         void timed("board_post", () => l.s.call("board_post", { board: l.spec.board, body: `lt|post|${l.spec.index}|${seq}|${l.spec.board}|${Date.now()}` }));
-      } else if (svcBoard && r < config.postShare + config.svcShare) {
+      } else if (op === "svc_invoke") {
         const id = `${l.spec.index}:${seq}`, board = svcBoard;
         // Sometimes the invocation names another user's session, which mention resolution judges on the service board.
         let mention = "";
@@ -402,10 +456,10 @@ async function main() {
           l.invoked.set(seq, res.post_id);
           return res;
         });
-      } else if (svcBoard && r < config.postShare + config.svcShare + config.peerShare) {
+      } else if (op === "peer_list") {
         void timed("peer_list", () => l.s.call("peer_list", {}));
-      } else if (svcBoard && r < config.postShare + config.svcShare + config.peerShare + config.readShare) {
-        svcRead(l, svcBoard);
+      } else if (op === "svc_read") {
+        svcRead(l, svcBoard!);
       } else {
         let to = Math.floor(Math.random() * (config.addresses.length - 1));
         if (to >= l.spec.index) to++;
@@ -452,7 +506,7 @@ async function main() {
       await Promise.all([...live.values()].map(l => timed("close", () => close(l))));
       live.clear();
       const f: DriverFinal = {
-        type: "final", driver: config.driver, sentDm: [...sentDm], recvDm: [...recvDm], posts, boardRecv, misdelivered, misdeliveredFirst,
+        type: "final", driver: config.driver, sentDm: [...sentDm], recvDm: [...recvDm], posts, boardRecv, misdelivered, misdeliveredFirst, lapsed, lapsedFirst,
         svcSent: [...svcSent], svcGot: [...svcGot], svcDone: [...svcDone], svcPosts, laneEcho, svcReads, errors: totalErrors,
         mentSent: [...mentSent], mentGot: [...mentGot],
       };
