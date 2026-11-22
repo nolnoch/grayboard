@@ -1371,9 +1371,9 @@ function registerNativeTools(server: McpServer, application: Application, hosted
   });
   // The definitions local serves too (src/core/tools.ts), with files named by uploaded IDs (#385).
   for (const { name, config } of NATIVE_BOARD_TOOLS) {
-    server.registerTool(name, config, name === "board_post"
-      // board_post's keyed path (#1537 PR 6): hosted.boardPost.
-      ? (args, ctx) => runAs(ctx, name, (context, told) => hosted.boardPost(context.principal, context.sessionContext, args, told, context.verdict, context.request.signal))
+    server.registerTool(name, config, name === "board_post" || name === "board_read"
+      // board_post's and board_read's keyed paths (#1537 PR 6, #1604): hosted.boardPost, hosted.boardRead.
+      ? (args, ctx) => runAs(ctx, name, (context, told) => hosted[name === "board_post" ? "boardPost" : "boardRead"](context.principal, context.sessionContext, args, told, context.verdict, context.request.signal))
       : (args, ctx) => run(ctx, name, (session, tx) => application.call(tx, session, name, args)));
   }
   const dm = NATIVE_DM_TOOLS;

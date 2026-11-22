@@ -1162,6 +1162,17 @@ export function createHostedSessions(application: Application, options: { now?: 
         fn: (session, tx, plan) => application.postKeyed(tx, session, plan, args),
       });
     },
+    // The board_read tool: `run`, with a keyed body first on Postgres (#1604 step 2b, D4), under the reader's root and
+    // the board: its read point, outbox and queue take credits are the reader's rows on that board, which board_post
+    // (the board's key), receipt (the root's) and every exclusive writer serialize with.
+    async boardRead(p: OAuthPrincipal, context: SessionContext, args: Record<string, unknown>, told?: (notice: string) => void, prior?: Verdict, signal?: AbortSignal) {
+      return runTool(p, context, "board_read", (session, tx) => application.call(tx, session, "board_read", args), told, prior, signal, {
+        plan: session => application.readPlan(session, args),
+        keys: plan => [`board:${plan.board}`],
+        write: repo.writeKeyedPost?.bind(repo),
+        fn: (session, tx, plan) => application.readKeyed(tx, session, plan, args),
+      });
+    },
     async transfer<T>(p: OAuthPrincipal, context: SessionContext, fn: (session: ApplicationSession, guard: (r: Read) => Promise<void>) => Promise<T>): Promise<T> {
       return withGate(p, context, false, async row => {
         const root = row ? await rootOf(repo.read, row) : undefined;

@@ -467,6 +467,8 @@ export function makePgBoards({ clock }: { clock: () => number }): BoardsStore {
       const h = param(sql, handle);
       const maxId = posts.reduce((m, p) => Math.max(m, p.id), 0);
       if (maxId > 0) {
+        // A keyed board_read holds the board's key (#1604): its outbox and read point writes serialize with board_post's.
+        refuseKeyed(tx, "boards.read's outbox and read point", `board:${board}`);
         // What this read showed no longer needs pushing; what it skipped (a pending push it filters out, a post
         // outside the thread) still does. Outbox before the cursor: the header's lock order (core runs the reverse).
         // core: what it delivers is credited to `receiver`, else the session holding `handle` now (#1461); a read by a
@@ -475,7 +477,7 @@ export function makePgBoards({ clock }: { clock: () => number }): BoardsStore {
         const fresh: Row[] = await sql`UPDATE outbox SET delivered_at = ${clock()}, session_id = ${credited(sql, handle, receiver)}
           WHERE handle = ${handle} AND delivered_at IS NULL AND post_id = ANY(${posts.map(p => p.id)}::int8[]) AND ${held} RETURNING post_id`;
         if (fresh.length > 0 && (await sql`SELECT 1 FROM boards WHERE name = ${board} AND kind = 'queue'`).length > 0) {
-          // board_read runs exclusive; a tripwire should a keyed caller ever reach this without the board's key.
+          // A keyed board_read holds the board's key (checked above); a tripwire should another keyed caller reach this.
           refuseKeyed(tx, "boards.read's queue take credit (a claim_events write)", queueBoardKey(`queue:${board}:${fresh[0]!.post_id}`));
           await creditQueueTakes(sql, handle, board, fresh.map(x => int8(x.post_id)), receiver);
         }
