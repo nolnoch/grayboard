@@ -20,6 +20,10 @@ export function failureDiagnostic(source: FailureSource, error?: unknown, catego
 
 const errorClass = /^([A-Z][A-Za-z0-9]{0,55})?(Error|Exception)$/;
 const errorCode = /^(SQLITE_[A-Z_]{1,48}|E[A-Z]{2,15}|ERR_POSTGRES_[A-Z_]{1,40})$/;
+// S3's own error codes (InternalError, AccessDenied, NoSuchBucket), only on the classes that carry one (#1608): Bun's
+// S3Error and the attachment store's S3StoreError. Letters and digits, bounded; on any other class it's dropped.
+const s3Classes = new Set(["S3Error", "S3StoreError"]);
+const s3ErrorCode = /^[A-Z][A-Za-z0-9]{1,47}$/;
 // A Postgres SQLSTATE, which Bun.SQL puts in `errno` (a Node system errno is a number).
 const sqlstate = /^[0-9A-Z]{5}$/;
 
@@ -37,7 +41,7 @@ export function errorDiagnostic(error: unknown): { class?: string; code?: string
     const errno = Object.getOwnPropertyDescriptor(error, "errno")?.value;
     return {
       class: typeof name === "string" && errorClass.test(name) ? name : "[unrecognized]",
-      ...(typeof code === "string" && errorCode.test(code) ? { code } : {}),
+      ...(typeof code === "string" && (errorCode.test(code) || (typeof name === "string" && s3Classes.has(name) && s3ErrorCode.test(code))) ? { code } : {}),
       ...(typeof errno === "string" && sqlstate.test(errno) ? { sqlstate: errno } : {}),
     };
   } catch { return { class: "[unrecognized]" }; }
