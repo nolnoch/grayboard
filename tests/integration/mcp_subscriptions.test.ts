@@ -356,17 +356,22 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: a resource read q
   await call(c, "board_create", { name: "e2e", purpose: "fixtures" });
   c.headers.set("User-Agent", "alice-1408");
   type Body = (tx: unknown) => unknown;
-  const hosted = app.repo.hosted as unknown as Record<"write", (fn: Body, ...rest: unknown[]) => unknown>, write = hosted.write;
+  type Writers = Record<"write" | "writeKeyed", (...args: unknown[]) => unknown>;
+  const hosted = app.repo.hosted as unknown as Writers, write = hosted.write, writeKeyed = hosted.writeKeyed;
   let arm = false, holding = false, aliceQueued = false, release!: () => void;
   const gate = new Promise<void>(r => { release = r; });
-  hosted.write = (fn: Body, ...rest: unknown[]) => {
+  // The first body after arming is held, exclusive (hosted.write) or keyed (hosted.writeKeyed, Postgres's tool bodies
+  // since #1575): either way an exclusive body arriving behind it waits for its release.
+  const wrap = (call: (fn: Body) => unknown) => (fn: Body) => {
     const hold = arm && !holding;
     if (hold) holding = true;
-    const out = write.call(app.repo.hosted, hold ? async (tx: unknown) => { await gate; return fn(tx); } : fn, ...rest);
+    const out = call(hold ? async (tx: unknown) => { await gate; return fn(tx); } : fn);
     // Queued behind bob's hold by the call above (the queue enqueues synchronously): only now may bob release.
     if (!hold && holding && requestOrigin()?.ua === "alice-1408") aliceQueued = true;
     return out;
   };
+  hosted.write = (fn: unknown, ...rest: unknown[]) => wrap(f => write.call(app.repo.hosted, f, ...rest))(fn as Body);
+  if (writeKeyed) hosted.writeKeyed = (keys: unknown, fn: unknown, ...rest: unknown[]) => wrap(f => writeKeyed.call(app.repo.hosted, keys, f, ...rest))(fn as Body);
   const pause = armPause("hosted:tool:in-gate");
   const read = c.client.readResource({ uri: boardUri }).then(r => JSON.stringify(r), (error: unknown) => String(error));
   let bob: Promise<unknown> | undefined;
@@ -382,7 +387,7 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: a resource read q
     await bob;
     expect(await read).toContain("e2e");
   } finally {
-    hosted.write = write; release(); pause.restore();
+    hosted.write = write; if (writeKeyed) hosted.writeKeyed = writeKeyed; release(); pause.restore();
     await Promise.allSettled([read, bob]);
   }
 });
