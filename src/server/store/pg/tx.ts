@@ -157,6 +157,8 @@ function probeCheck(txn: Txn, text: string): void {
 // sends on that transaction is checked as it's built (probeCheck), and refuseKeyed's refusals become the probe's. The
 // first refusal rejects the probe, ProbeWrite, before anything it refused was sent, even if fn caught it and went on.
 // Not nested; the probe ends when fn settles, so the caller's later statements write.
+// Whether `h` is a Postgres body's Tx inside a readsOnly probe (Repo.probing, #1604).
+export const probing = (h: Read): boolean => h instanceof PgTx && h.txn.probe !== undefined;
 export async function readsOnly<T>(tx: Tx, fn: () => Promise<T>): Promise<T> {
   if (!(tx instanceof PgTx)) throw new Error("readsOnly needs a Postgres body's Tx");
   tx.assertLive();

@@ -130,16 +130,18 @@ export function statementTotals(site: QueueSite): { bodies: number; statements: 
 // place of that gate body (withPrior: a native tool call's `tool`, and since #1537 C5/C7 the subscriber's renew,
 // receipt, pending, open and bind); renew and receipt have one each, their own. The `tool` site is a keyed tool body
 // (#1537 PR 5 hosted.ts dmSend, PR 6 boardPost), its method the tool (dm_send, board_post): `skipped` there is SQLite,
-// the keyed path turned off, or a call whose plan says exclusive (application.sendPlan, postPlan).
+// the keyed path turned off, or a call whose plan says exclusive (application.sendPlan, postPlan). The read tools'
+// keyed bodies count there too (#1604 hosted.ts KEYED_READS: `miss` a probe that would have written or refused), and
+// every other tool's exclusive body as `skipped` under `other`, so no tool body runs exclusive uncounted.
 export const GATE_SITES = ["gate", "prior", "renew", "receipt", "tool"] as const;
 export const GATE_OUTCOMES = ["keyed", "miss", "skipped"] as const;
-export const GATE_METHODS = ["selection", "tool", "transfer", "whoami", "end", "open", "bind", "unbind", "owning", "renew", "receipt", "pending", "release", "control", "dm_send", "board_post"] as const;
+export const GATE_METHODS = ["selection", "tool", "transfer", "whoami", "end", "open", "bind", "unbind", "owning", "renew", "receipt", "pending", "release", "control", "dm_send", "board_post", "peer_list", "board_list", "claim_list", "dm_history", "other"] as const;
 export type GateSite = typeof GATE_SITES[number];
 export type GateOutcome = typeof GATE_OUTCOMES[number];
 export type GateMethod = typeof GATE_METHODS[number];
 export const PRIOR_METHODS = ["tool", "renew", "receipt", "pending", "open", "bind"] as const satisfies readonly GateMethod[];
 const SITE_METHOD: Record<"renew" | "receipt", GateMethod> = { renew: "renew", receipt: "receipt" };
-export const TOOL_METHODS = ["dm_send", "board_post"] as const satisfies readonly GateMethod[];
+export const TOOL_METHODS = ["dm_send", "board_post", "peer_list", "board_list", "claim_list", "dm_history", "other"] as const satisfies readonly GateMethod[];
 const gateKey = (site: GateSite, method: GateMethod, outcome: GateOutcome) => `${site}:${method}:${outcome}`;
 // Every series present from the start, so a rate() over a fresh process starts at zero.
 const gateFast = new Map<string, number>([

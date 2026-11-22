@@ -24,7 +24,7 @@ import { DEFAULT_AUTH_FAIL_LIMIT, DEFAULT_HELLO_LIMIT } from "./rate_limit.ts";
 import { DEFAULT_TRUSTED_PROXIES } from "./client_addr.ts";
 import { createOAuthServer } from "./oauth.ts";
 import { hashToken } from "./auth.ts";
-import { gateCount, refusalCount, statementTotals } from "./metrics.ts";
+import { gateCount, type GateMethod, refusalCount, statementTotals } from "./metrics.ts";
 import { GRAYBOARD_EFFORT_META, GRAYBOARD_LAUNCHER_META, GRAYBOARD_MODEL_META } from "../shared/session_meta.ts";
 import { issueOAuth } from "../../tests/helpers/oauth.ts";
 import { hostedPause } from "../../tests/support/hosted-pause.ts";
@@ -1784,9 +1784,11 @@ describePg("control and owning reuse the exchange's verdict (#1537 C5, C7) (Post
 // (D5's conservative key). A keyed send is held right after its INSERT (its id allocated, its row and FK locks taken)
 // by a gate on messages.insert, with the timer's bodies deferred meanwhile (an exclusive one queued behind a held keyed
 // body would hold every later body behind it); every wait has a deadline. Results and mutation killers: p1537/c5/result.md.
+// The keyed write tools' gate counts (dm_send, board_post): every other tool's exclusive body counts `other` (#1604).
+const writeGate = (o: "keyed" | "miss" | "skipped") => gateCount("tool", o, "dm_send") + gateCount("tool", o, "board_post");
 const toolDelta = () => {
-  const at = { keyed: gateCount("tool", "keyed"), miss: gateCount("tool", "miss"), skipped: gateCount("tool", "skipped") };
-  return () => ({ keyed: gateCount("tool", "keyed") - at.keyed, miss: gateCount("tool", "miss") - at.miss, skipped: gateCount("tool", "skipped") - at.skipped });
+  const at = { keyed: writeGate("keyed"), miss: writeGate("miss"), skipped: writeGate("skipped") };
+  return () => ({ keyed: writeGate("keyed") - at.keyed, miss: writeGate("miss") - at.miss, skipped: writeGate("skipped") - at.skipped });
 };
 const keyedTx = (tx: unknown) => (tx as { txn?: { keys?: ReadonlySet<string> } }).txn?.keys !== undefined;
 // Bodies queued under a call's own sites (its gate body, its tool body), not a timer's.
@@ -3204,5 +3206,82 @@ describePg("the backstop reconcile (Postgres)", () => {
         none: [new Map()],
       });
     } finally { for (const f of off) f(); }
+  });
+});
+
+// #1604 (D4): the read tools' bodies keyed on their root in a read-only probe (hosted.ts KEYED_READS). Each runs beside
+// a keyed dm_send held after its insert on another root, so none takes the exclusive body (which would queue behind
+// the held send and time out). Mutation: KEYED_READS emptied (each read queues exclusive, the wait fails).
+describePg("keyed read tools (Postgres)", () => {
+  const readCalls: Array<[string, Record<string, unknown>]> = [
+    ["peer_list", {}], ["board_list", {}], ["claim_list", {}], ["dm_history", {}],
+  ];
+  const callOf = (x: LeaseInstance, p: OAuthPrincipal, source: string, name: string, args: Record<string, unknown>) =>
+    x.hosted.run(p, ctx(p, source), name, (session, tx) =>
+      name === "dm_history" ? x.application.history(tx, session, args)
+        : name === "dm_inbox" ? x.application.inbox(tx, session, undefined)
+          : x.application.call(tx, session, name, args));
+
+  test("each read tool runs keyed beside a held keyed send on another root", async () => {
+    await using db = await pgDatabase({ max: 2 });
+    await using x = await leaseInstance(db.url);
+    const p = await leasePrincipal(x, db.sql);
+    for (const [s, n] of [["root-s1", "s1"], ["root-r1", "r1"], ["root-rd", "rd"]]) await bound(x, p, s!, n!);
+    await dm(x, p, "root-s1", `${ME}/rd`, "before");
+    const sends = holdSends(x);
+    sends.hold = gate(); x.state.defer = gate();
+    const held = dm(x, p, "root-s1", `${ME}/r1`, "held");
+    try {
+      await until(() => sends.held === 1, 10_000, "s1's send held after its insert");
+      const before = x.state.exclusive.length;
+      for (const [name, args] of readCalls) {
+        const at = gateCount("tool", "keyed", name as GateMethod);
+        const r = await Promise.race([callOf(x, p, "root-rd", name, args), Bun.sleep(8_000).then(() => { throw new Error(`${name} did not finish beside the held send`); })]);
+        expect(r).toBeDefined();
+        expect(gateCount("tool", "keyed", name as GateMethod) - at).toBe(1);
+      }
+      expect(x.state.exclusive.slice(before).filter(b => b.site === "tool")).toEqual([]);
+    } finally { sends.hold.open(); x.state.defer.open(); }
+    await held;
+    // The keyed peer_list sees the same peers as the exclusive one.
+    const keyedPeers = await callOf(x, p, "root-rd", "peer_list", {});
+    await using y = await leaseInstance(db.url, { keyedTools: false, side: "b" });
+    expect(await callOf(y, p, "root-rd", "peer_list", {})).toEqual(keyedPeers);
+  });
+
+  // A refusal in the probe is a miss: the exclusive body refuses the same way. A write tool counts `other`.
+  test("a refused read misses into the exclusive body; a write tool counts as other", async () => {
+    await using db = await pgDatabase({ max: 2 });
+    await using x = await leaseInstance(db.url);
+    const p = await leasePrincipal(x, db.sql);
+    await bound(x, p, "root-rd", "rd");
+    const miss = gateCount("tool", "miss", "peer_list"), keyed = gateCount("tool", "keyed", "peer_list");
+    const refused = await callOf(x, p, "root-rd", "peer_list", { match: { bogus: 1 } }).then(() => undefined, (e: Error) => e.message);
+    expect(refused).toBeDefined();
+    expect({ miss: gateCount("tool", "miss", "peer_list") - miss, keyed: gateCount("tool", "keyed", "peer_list") - keyed }).toEqual({ miss: 1, keyed: 0 });
+    // The exclusive path (keyed tools off) refuses with the same text.
+    await using y = await leaseInstance(db.url, { keyedTools: false, side: "b" });
+    expect(await callOf(y, p, "root-rd", "peer_list", { match: { bogus: 1 } }).then(() => undefined, (e: Error) => e.message)).toBe(refused);
+    const other = gateCount("tool", "skipped", "other");
+    await callOf(x, p, "root-rd", "peer_status", { text: "busy" });
+    expect(gateCount("tool", "skipped", "other") - other).toBe(1);
+  });
+
+  // A keyed claim_list re-arms the claim expiry timer after its body, as the exclusive body's afterCommit does: a claim
+  // whose expiry moved under the timer (another process, here SQL) lapses on time. Mutation: armClaims' call dropped.
+  test("a keyed claim_list re-arms the claim expiry timer", async () => {
+    await using db = await pgDatabase({ max: 2 });
+    await using x = await leaseInstance(db.url);
+    const p = await leasePrincipal(x, db.sql);
+    await bound(x, p, "root-rd", "rd");
+    // A board claim: only those are on the timer (nextExpiry); a boardless claim lapses lazily on read.
+    await callOf(x, p, "root-rd", "board_create", { name: "b1", purpose: "claims" });
+    await callOf(x, p, "root-rd", "claim_take", { key: "soon", ttl_minutes: 60, board: "b1" });
+    // Already due by the instance's clock: a re-armed timer sweeps it at once; the hour-long arm never would.
+    await db.sql`UPDATE claims SET expires_at = ${x.clock - 1} WHERE key = 'soon'`;
+    const keyed = gateCount("tool", "keyed", "claim_list");
+    await callOf(x, p, "root-rd", "claim_list", {});
+    expect(gateCount("tool", "keyed", "claim_list") - keyed).toBe(1);
+    await until(async () => (await claimRows(db.sql)).length === 0, 10_000, "the moved claim lapsed after the keyed claim_list re-armed the timer");
   });
 });

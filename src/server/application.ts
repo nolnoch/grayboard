@@ -128,6 +128,8 @@ export type UnbindResult = { alias: string; released: boolean; held: string[]; l
  * ID is routing, not a capability (#229).
  */
 export const UNBOUND_READS = new Set(["board_list", "board_read", "peer_list", "claim_list"]);
+// The board tools that change nothing (#1604): board_read is not one (it advances the reader's cursor and outbox).
+export const PURE_READS: ReadonlySet<string> = new Set(["board_list", "peer_list", "claim_list"]);
 const UNBOUND_ERROR = "no bus name yet. Call bind(name) to resume a name (see the candidates in your instructions, or peer_list), or bind(name, create: true) for a new one.";
 
 // Only sessions registered by this application may execute operations.
@@ -1637,9 +1639,16 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     },
     async call(tx: Tx, session: ApplicationSession, tool: string, args: Record<string, unknown>, publish?: (result: unknown) => void) {
       await valid(session, UNBOUND_READS.has(tool), tx);
-      // Armed on a refusal too: a call can commit work (an expiring claim) before it throws (#385 item 15f).
+      // Armed on a refusal too: a call can commit work (an expiring claim) before it throws (#385 item 15f). A pure
+      // read in a keyed read-only probe (#1604 hosted.ts KEYED_READS) registers none, since the probe refuses an
+      // afterCommit: its caller arms after the body commits (armClaims).
       try { return await handleCall(hub, tx, session, tool, args, publish); }
-      finally { tx.afterCommit(() => expiry.arm()); }
+      finally { if (!(PURE_READS.has(tool) && repo.probing?.(tx))) tx.afterCommit(() => expiry.arm()); }
+    },
+    // The claim expiry timer re-armed from the store's next expiry, after a commit and outside any body: a keyed read's
+    // in place of the afterCommit its probe can't register (#1604).
+    armClaims() {
+      expiry.arm();
     },
     // The server's one BoardAccess: HTTP's claim calls judge boards with it, as the hub's tools do (#807 P3 B5b3c).
     access: hub.access,
@@ -2342,7 +2351,9 @@ async function handleCall(hub: Hub, tx: Tx, session: ApplicationSession, tool: s
   for (const board of new Set(outcome.boards ?? [])) hub.boardChanged(trackedCommit(hub, tx, "call board change"), board);
   // The transitional adapter publishes its answer before the resulting deliveries.
   if (publish) tx.afterCommit(() => publish(outcome.result));
-  wake(hub, trackedCommit(hub, tx, "call wake"), outcome.wake);
+  // Only when there is someone to wake: an empty wake would register an afterCommit, which a read tool's keyed probe
+  // refuses (#1604 hosted.ts KEYED_READS).
+  if (outcome.wake.length) wake(hub, trackedCommit(hub, tx, "call wake"), outcome.wake);
   return outcome.result;
 }
 

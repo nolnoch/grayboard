@@ -243,6 +243,9 @@ export interface Repo {
   // fn swallowed it. Postgres only (store/pg/tx.ts readsOnly): absent on SQLite, whose one writer has nothing to gain
   // from a keyed body, so the hosted gate's keyed fast path is Postgres's.
   readsOnly?<T>(tx: Tx, fn: () => Promise<T>): Promise<T>;
+  // Whether `h` is a body's Tx inside a readsOnly probe (#1604): code that would register an afterCommit a probe refuses
+  // asks first. Postgres only, beside readsOnly.
+  probing?(h: Read): boolean;
   // writeKeyed whose body may register afterCommit effects and pass `committed`, and queue the change notices of the ops
   // `notices` names (store/notices.ts, by op name: `hosted.update`); every other notice still refuses (D4, #1510 chunk
   // 4). Postgres only, for the reviewed callers D4 lists (delivery's renew and receipt); absent on SQLite.
