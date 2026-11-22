@@ -470,7 +470,8 @@ test(`server: a database ${FROM} wrote opens and reads back`, async () => {
   // #927: ownership moves into role bindings once, on the first open. Bob is made an explicit owner and alice a
   // creator from before roles (a null role), the two rows the seed reads, by hand on whatever the release wrote (a
   // release from before team_members.role gets the column as this tree's open would add it).
-  const roles = teams;
+  // A release with role_bindings already ran the seed, so these rows reach no binding.
+  const roles = teams && !("role_bindings" in schema(dbPath));
   if (roles) {
     const d = new Database(dbPath);
     try {
@@ -480,11 +481,16 @@ test(`server: a database ${FROM} wrote opens and reads back`, async () => {
     } finally { d.close(); }
   }
   const before = schema(dbPath);
+  // A release with users.idp_issuer already stamped what it would (#928 D3); this tree's open adds Google's to a user
+  // with a subject only, so a dev-auth user it wrote keeps its null.
+  const written = "idp_issuer" in (before.users ?? {}) ? identities(dbPath) : undefined;
 
   srv = await TestServer.open({ dbPath, blobDir: join(dir, "old", "blobs"), hostedRequestLimit: { burst: 10_000, perSec: 10_000 } });
-  // #928 D3: every user the release wrote (a v1.0.0 one with no idp_subject, or a post-F-13 one) is stamped with
-  // Google's issuer, and the old index is gone.
-  expect(identities(dbPath).map(u => u.idp_issuer)).toEqual(identities(dbPath).map(() => GOOGLE_ISSUER));
+  // #928 D3: on a release from before the column, every user it wrote (a v1.0.0 one with no idp_subject, or a
+  // post-F-13 one) is stamped with Google's issuer; and the old index is gone.
+  const stamped = new Map(written?.map(u => [u.email, u.idp_subject !== null ? GOOGLE_ISSUER : u.idp_issuer])
+    ?? identities(dbPath).map(u => [u.email, GOOGLE_ISSUER]));
+  expect(identities(dbPath).map(u => u.idp_issuer)).toEqual(identities(dbPath).map(u => stamped.get(u.email) ?? null));
   expect(userIndexes(dbPath)).toEqual(["idx_users_idp_identity"]);
   // The old sign-ins still hold.
   for (const token of [alice, bob]) expect((await srv.api(token, "GET", "/api/whoami")).status).toBe(200);
@@ -509,7 +515,7 @@ test(`server: a database ${FROM} wrote opens and reads back`, async () => {
   await srv.stop();
   srv = await TestServer.open({ dbPath, blobDir: join(dir, "old", "blobs") });
   expect((await srv.app.repo.users.findByEmail(srv.app.repo.read, "bob@example.com"))).toMatchObject({ idp_issuer: null, idp_subject: null });
-  expect((await srv.app.repo.users.findByEmail(srv.app.repo.read, "alice@example.com"))).toMatchObject({ idp_issuer: GOOGLE_ISSUER });
+  expect((await srv.app.repo.users.findByEmail(srv.app.repo.read, "alice@example.com"))).toMatchObject({ idp_issuer: stamped.get("alice@example.com") });
   // The ownership seed runs once, with the table: a binding revoked after it isn't seeded back by a later open, though
   // team_members.role still says owner.
   if (roles) {
