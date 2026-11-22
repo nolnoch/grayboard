@@ -1641,8 +1641,9 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     async receiptBoards(tx: Tx, session: ApplicationSession, refs: PendingRef[]) {
       await valid(session, false, tx);
       const receiver = receiverOf(session);
+      // One batch per address (#1510 chunk 5), where a loop ran one acknowledge per ref and address.
+      if (refs.length) for (const a of session.addresses) await repo.boards.acknowledgeMany(tx, a, refs, receiver);
       for (const r of refs) {
-        for (const a of session.addresses) await repo.boards.acknowledge(tx, a, r, receiver);
         tx.afterCommit(() => {
           session.inflight.delete(pendingKey(r));
           session.boardDrain?.acked.add(ackKey(r));

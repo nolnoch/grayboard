@@ -20,7 +20,7 @@
 import { expect, test } from "bun:test";
 import { CoreError } from "../../core/errors.ts";
 import { MissingPost } from "./errors.ts";
-import type { BoardsStore, NewPost, PostTarget } from "./boards.ts";
+import type { BoardsStore, NewPost, PendingRef, PostTarget } from "./boards.ts";
 import type { Read, Tx } from "./tx_base.ts";
 
 // One store, fresh per row.
@@ -994,7 +994,7 @@ function queue(it: It): void {
   // that committed first. Nothing is marked: the outbox row stays undelivered and S1's, the take stays S1's, the
   // subscription's cursor and notified_id stay put (a digest's too), and the rotation is unchanged; S2 receives it
   // later and is credited. Mutation: acknowledge or read ignoring `receiver` marks it and credits S2 (OPS's holder).
-  for (const via of ["acknowledge", "read"] as const) {
+  for (const via of ["acknowledge", "acknowledgeMany", "read"] as const) {
     it(`a ${via} by a receiver that no longer holds the address marks nothing; its holder's credits it`, async h => {
       await board(h, "jobs", { kind: "queue" });
       await board(h, "hall");
@@ -1018,6 +1018,8 @@ function queue(it: It): void {
         if (via === "acknowledge") {
           await h.boards.acknowledge(tx, OPS, { kind: "push", post_id: p }, receiver);
           await h.boards.acknowledge(tx, OPS, { kind: "digest", board: "hall", latest_id: d }, receiver);
+        } else if (via === "acknowledgeMany") {
+          await h.boards.acknowledgeMany(tx, OPS, [{ kind: "push", post_id: p }, { kind: "digest", board: "hall", latest_id: d }], receiver);
         } else {
           await h.boards.read(tx, "jobs", OPS, {}, receiver);
         }
@@ -1033,7 +1035,45 @@ function queue(it: It): void {
       expect(await h.outboxSessions()).toEqual([{ handle: OPS, post_id: p, session_id: S2 }]);
       expect(await h.takeSessions()).toEqual([{ key: `queue:jobs:${p}`, handle: OPS, session_id: S2 }]);
       expect((await h.subscription("jobs", OPS))?.cursor).toBe(p);
-      if (via === "acknowledge") expect((await h.subscription("hall", OPS))?.notified_id).toBe(d);
+      if (via !== "read") expect((await h.subscription("hall", OPS))?.notified_id).toBe(d);
+    });
+  }
+
+  // #1510 chunk 5: acknowledgeMany over a mixed batch leaves what acknowledging each ref in turn leaves: a queue push's
+  // first delivery credits its take, a repeat restamps, subscription pushes move each board's cursor to its highest,
+  // a digest moves notified_id, and a duplicated or missing ref changes nothing more.
+  for (const via of ["acknowledge", "acknowledgeMany"] as const) {
+    it(`a mixed batch through ${via}: credits, cursors and digests as per-ref acknowledge leaves them`, async h => {
+      await board(h, "jobs", { kind: "queue" });
+      await board(h, "hall");
+      await board(h, "news");
+      await h.alias(OPS);
+      await h.session(S1, ME);
+      await h.hold(OPS, S1, T0);
+      await sub(h, OPS, "jobs", "push");
+      await sub(h, OPS, "hall", "push");
+      await sub(h, OPS, "news", "digest");
+      const q = await write(h, np("jobs", QA, "job", T0 + 10));
+      const h1 = await write(h, np("hall", QA, "a", T0 + 11));
+      const h2 = await write(h, np("hall", QA, "b", T0 + 12));
+      const d = await write(h, np("news", QA, "n", T0 + 13));
+      await h.claim({ key: `queue:jobs:${q}`, holder: OPS, board: "jobs", at: T0 + 20 });
+      await h.claimEvent({ key: `queue:jobs:${q}`, handle: OPS, event: "take", board: "jobs", at: T0 + 20 });
+      for (const p of [q, h1, h2]) await h.push(OPS, p);
+      // h1 was delivered before: the batch's ack of it is a repeat.
+      await h.write(tx => h.boards.acknowledge(tx, OPS, { kind: "push", post_id: h1 }, S1));
+      const refs: PendingRef[] = [{ kind: "push", post_id: h2 }, { kind: "digest", board: "news", latest_id: d },
+        { kind: "push", post_id: q }, { kind: "push", post_id: h1 }, { kind: "push", post_id: h2 }, { kind: "push", post_id: d + 1000 }];
+      await h.write(async tx => {
+        if (via === "acknowledgeMany") await h.boards.acknowledgeMany(tx, OPS, refs, S1);
+        else for (const r of refs) await h.boards.acknowledge(tx, OPS, r, S1);
+      });
+      expect((await h.outboxRows()).map(r => [r.post_id, r.delivered])).toEqual([[q, true], [h1, true], [h2, true]]);
+      expect(await h.outboxSessions()).toEqual([q, h1, h2].map(post_id => ({ handle: OPS, post_id, session_id: S1 })));
+      expect(await h.takeSessions()).toEqual([{ key: `queue:jobs:${q}`, handle: OPS, session_id: S1 }]);
+      expect(await h.subscription("jobs", OPS)).toEqual({ mode: "push", cursor: q, notified_id: q });
+      expect(await h.subscription("hall", OPS)).toEqual({ mode: "push", cursor: h2, notified_id: h2 });
+      expect(await h.subscription("news", OPS)).toEqual({ mode: "digest", cursor: 0, notified_id: d });
     });
   }
 

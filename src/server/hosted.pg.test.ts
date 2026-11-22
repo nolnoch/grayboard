@@ -1081,10 +1081,10 @@ async function leaseInstance(url: string, opts: { keyed?: false; keyedTools?: fa
     if (keyedTx(tx) && first && ids.length) await holdHere(`receipt ${ids[0]}`);
     return out;
   };
-  const acknowledge = repo.boards.acknowledge;
-  repo.boards.acknowledge = async (tx, handle, ref, receiver) => {
+  const acknowledgeMany = repo.boards.acknowledgeMany;
+  repo.boards.acknowledgeMany = async (tx, handle, refs, receiver) => {
     if (keyedTx(tx) && currentSite() === "receipt") await holdHere(`ack ${handle}`);
-    return acknowledge(tx, handle, ref, receiver);
+    return acknowledgeMany(tx, handle, refs, receiver);
   };
   const writeKeyedEffects = repo.writeKeyedEffects!;
   repo.writeKeyedEffects = (async (keys: readonly string[], notices: readonly string[], fn: (tx: Tx) => Promise<unknown>, committed?: (v: unknown) => unknown) => {

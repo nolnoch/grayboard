@@ -318,7 +318,7 @@ test("#807 P1c-15b: core helpers inside hosted bodies run on that body's Tx, out
     expect(pulled.filter(c => c.op === "coreOn")).toEqual([]);
     expect(pulled.some(c => c.op === "boards.get" && c.handle === "tx" && c.inTxn)).toBe(true);
     expect(pulled.some(c => c.op === "boards.pendingPushes" && c.handle === "pool" && !c.inTxn)).toBe(true);
-    expect(pulled.some(c => c.op === "boards.acknowledge" && c.handle === "tx" && c.inTxn)).toBe(true);
+    expect(pulled.some(c => c.op === "boards.acknowledgeMany" && c.handle === "tx" && c.inTxn)).toBe(true);
     // #1214 item 4: the catalog and a snapshot (resources list/read) read boards through repo.boards alone, on the
     // handle they're given (here a body's Tx), and reach coreOn zero times.
     const resources = checks.length;

@@ -461,10 +461,10 @@ test("#807: a Slack user's dm_thread runs inside a write-queue transaction", asy
 // Holds the write queue as the first repo.post named `what` is made, so that write queues behind the holder; each
 // such post's return (true: it ran at once) is pushed to `ran`.
 // Holds the write queue as `handle`'s drain reads `postId` among its pushes, before the drain can queue anything for
-// it; logs every repo.boards.acknowledge.
+// it; logs every repo.boards.acknowledge and acknowledgeMany (a receipt's batch, #1510 chunk 5).
 function holdAtPushRead(handle: string, postId: number): { acks: string[]; holder: () => ReturnType<typeof holdQueue> | undefined; restore: () => void } {
   const boards = srv.app.repo.boards;
-  const { pendingPushes, acknowledge } = boards;
+  const { pendingPushes, acknowledge, acknowledgeMany } = boards;
   const acks: string[] = [];
   let holder: ReturnType<typeof holdQueue> | undefined;
   boards.pendingPushes = async (r, h) => {
@@ -473,7 +473,8 @@ function holdAtPushRead(handle: string, postId: number): { acks: string[]; holde
     return rows;
   };
   boards.acknowledge = (tx, h, ref) => { acks.push(h); return acknowledge.call(boards, tx, h, ref); };
-  return { acks, holder: () => holder, restore: () => { boards.pendingPushes = pendingPushes; boards.acknowledge = acknowledge; holder?.release(); } };
+  boards.acknowledgeMany = (tx, h, refs, receiver) => { acks.push(h); return acknowledgeMany.call(boards, tx, h, refs, receiver); };
+  return { acks, holder: () => holder, restore: () => { boards.pendingPushes = pendingPushes; boards.acknowledge = acknowledge; boards.acknowledgeMany = acknowledgeMany; holder?.release(); } };
 }
 
 // The human's hello replay (application.replay, which slack.ts attach calls after its hello commits) drains outside
