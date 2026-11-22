@@ -93,7 +93,8 @@ pub enum Error {
     /// Admission refused the request eight times in a row; `retry_after` is the server's last hint.
     #[error("rate limited; retry after {retry_after:?}")]
     RateLimited { retry_after: Duration },
-    /// The server is at request, exchange or listen capacity (a plain-text 429). Not retried.
+    /// The server is at listen capacity, or another held cap (a plain-text 429). Not retried. The request and exchange
+    /// caps answer `rate_limited` instead and end as `RateLimited` (#1536).
     #[error("server at capacity: {0}")]
     Capacity(String),
     /// A JSON-RPC error. `data_code` is the server's domain code (`error.data.code`), when it sent one.

@@ -31,6 +31,7 @@ import { mintSessionKey } from "../../src/core/bindings.ts";
 import { adapterChildren, grayboardChildren, grayboardChildPids, grayboardDescendants, processDescendants, sigkill, STOP_READING } from "./procs.ts";
 import { until } from "./until.ts";
 import { hostedCarryScenario, hostedRefreshLogoutScenario, hostedStaticScenario, loginNotice, named, withHosted, type HostedHarness } from "./hosted_harness.ts";
+import { NO_MEMBER_AUTHORITY } from "../../src/server/store/identity.ts";
 
 const ADAPTER = join(ROOT, "adapters/pi/grayboard.ts");
 const PI_PKG = join(ROOT, "node_modules/@earendil-works/pi-coding-agent/package.json");
@@ -1236,8 +1237,8 @@ export async function hostedPeer(srv: HostedServer, dir: string): Promise<Peer> 
   await seed(repo, async tx => {
     const alice = await repo.users.upsertByEmail(tx, "alice@example.com", null), bob = (await repo.users.findByEmail(tx, "bob@example.com"))!;
     const team = (await repo.teams.findByName(tx, "peers")) ?? await repo.teams.create(tx, "peers", alice.id);
-    await repo.teams.addMember(tx, team.id, alice.id);
-    await repo.teams.addMember(tx, team.id, bob.id);
+    await repo.teams.addMember(tx, team.id, alice.id, NO_MEMBER_AUTHORITY);
+    await repo.teams.addMember(tx, team.id, bob.id, NO_MEMBER_AUTHORITY);
     await repo.teams.setPolicy(tx, team.id, "collaborative");
   });
   return { dir: home, reports, call, close: () => proxy.close() };

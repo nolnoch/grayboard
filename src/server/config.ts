@@ -15,7 +15,11 @@ import { DEFAULT_RETENTION_DAYS, parseRetentionDays } from "../core/boards.ts";
 import { DELEGATE_LIMIT, DELEGATE_OPEN_CAP } from "../core/delegation.ts";
 import { ALIAS_SCOPE_CAP } from "./alias_cap.ts";
 import { GOOGLE_ISSUER } from "./idp_google.ts";
+import { parseDirectoryCredential, type GoogleDirectoryConfig } from "./idp_google_directory.ts";
+import { keycloakRealm, type KeycloakDirectoryConfig } from "./idp_keycloak_directory.ts";
+import { oktaOrgUrl, parseOktaDirectoryKey, type OktaDirectoryConfig } from "./idp_okta_directory.ts";
 import { describeCredentials, type AwsCredentialSpec } from "./aws_credentials.ts";
+import type { RecheckConfig } from "./idp_recheck.ts";
 
 export type McpLimits = Record<"listen" | "legacy" | "post", { global: number; perUser: number }>;
 export const DEFAULT_MCP_LIMITS: McpLimits = { listen: { global: 128, perUser: 32 }, legacy: { global: 256, perUser: 32 }, post: { global: 256, perUser: 64 } };
@@ -75,6 +79,21 @@ export type Config = {
   devAuth: boolean;
   // Days a CLI session token may go unused before it's refused (security audit F-14); 0 never.
   cliTokenIdleDays?: number;
+  // Days a user's grants and CLI tokens keep working after the IdP last vouched for them (#930); 0 never.
+  idpReauthDays?: number;
+  // The IdP re-check for providers with a directory check (#930 A2): hours between checks, hours a refresh fails open
+  // through an IdP outage before answering 503, and automatic disables an hour before they stop.
+  idpRecheck?: { recheckHours: number; maxStaleHours: number; disableLimit: number };
+  // Google's directory check (#930 A2b, idp_google_directory.ts): a service account's key, and the admin it
+  // impersonates under domain-wide delegation. Unset, Google users stay on the GRAYBOARD_IDP_REAUTH_DAYS clock.
+  googleDirectory?: GoogleDirectoryConfig;
+  // Keycloak's directory check (#1555, idp_keycloak_directory.ts) for the oidc provider when its issuer is a Keycloak
+  // realm: a confidential client whose service account reads users through the admin REST API. Unset, oidc users stay
+  // on the GRAYBOARD_IDP_REAUTH_DAYS clock.
+  keycloakDirectory?: KeycloakDirectoryConfig;
+  // Okta's directory check (#1563, idp_okta_directory.ts): an API service app's client id and private key. Unset, Okta
+  // users stay on the GRAYBOARD_IDP_REAUTH_DAYS clock.
+  oktaDirectory?: OktaDirectoryConfig;
   // Emails allowed to run admin commands. Empty means nobody can.
   admins: string[];
   oauthClients?: OAuthClient[];
@@ -122,7 +141,8 @@ export type Config = {
 // Docker and Kubernetes convention, so a secret needn't sit in the process environment's source.
 export const FILE_SECRETS = [
   "GRAYBOARD_DATABASE_URL", "GOOGLE_OAUTH_CLIENT_SECRET", "GRAYBOARD_MCP_GOOGLE_CLIENT_SECRET",
-  "GRAYBOARD_OKTA_CLIENT_SECRET", "GRAYBOARD_OIDC_CLIENT_SECRET", "SLACK_APP_TOKEN", "SLACK_BOT_TOKEN",
+  "GRAYBOARD_OKTA_CLIENT_SECRET", "GRAYBOARD_OIDC_CLIENT_SECRET", "SLACK_APP_TOKEN", "SLACK_BOT_TOKEN", "GRAYBOARD_GOOGLE_DIRECTORY_KEY",
+  "GRAYBOARD_KEYCLOAK_DIRECTORY_CLIENT_SECRET", "GRAYBOARD_OKTA_DIRECTORY_KEY",
 ] as const;
 
 // Resolves each NAME_FILE into env.NAME before anything reads it. Both set (to different values) is refused: which
@@ -197,11 +217,16 @@ export function loadConfig(): Config {
     idps,
     ...(okta ? { okta } : {}),
     ...(oidc ? { oidc } : {}),
+    ...googleDirectoryConfig(google),
+    ...keycloakDirectoryConfig(oidc),
+    ...oktaDirectoryConfig(okta),
     publicUrl: publicUrl.replace(/\/$/, ""),
     messageRetentionDays: retentionDays("GRAYBOARD_MESSAGE_RETENTION_DAYS", process.env.GRAYBOARD_MESSAGE_RETENTION_DAYS, DEFAULT_RETENTION_DAYS),
     auditRetentionDays:   retentionDays("GRAYBOARD_AUDIT_RETENTION_DAYS",   process.env.GRAYBOARD_AUDIT_RETENTION_DAYS,   90),
     devAuth,
     cliTokenIdleDays: idleDays(process.env.GRAYBOARD_CLI_TOKEN_IDLE_DAYS),
+    idpReauthDays: reauthDays(process.env.GRAYBOARD_IDP_REAUTH_DAYS),
+    idpRecheck: parseRecheck(process.env),
     admins: parseList(process.env.GRAYBOARD_ADMINS),
     oauthClients: parseOAuthClients(process.env.GRAYBOARD_OAUTH_CLIENTS),
     oauthCimdClients: parseCimdClients(process.env.GRAYBOARD_OAUTH_CIMD_CLIENTS),
@@ -615,6 +640,125 @@ function idleDays(raw: string | undefined): number {
     throw new Error(`GRAYBOARD_CLI_TOKEN_IDLE_DAYS must be a whole number of days from 0 (never expire) to 3650, not "${raw}"`);
   }
   return Number(raw);
+}
+
+// IdP re-auth days (#930): as the idle days, unset is the default and 0 is never.
+export const DEFAULT_IDP_REAUTH_DAYS = 30;
+function reauthDays(raw: string | undefined): number {
+  if (raw === undefined || raw === "") return DEFAULT_IDP_REAUTH_DAYS;
+  if (!/^(0|[1-9][0-9]*)$/.test(raw) || Number(raw) > 3650) {
+    throw new Error(`GRAYBOARD_IDP_REAUTH_DAYS must be a whole number of days from 0 (never) to 3650, not "${raw}"`);
+  }
+  return Number(raw);
+}
+
+export const DEFAULT_IDP_RECHECK_HOURS = 24;
+export const DEFAULT_IDP_RECHECK_MAX_STALE_HOURS = 72;
+export const DEFAULT_IDP_DISABLE_LIMIT = 5;
+
+// The IdP re-check's knobs (#930 A2): whole numbers, the stale bound at least the interval (a check is due before
+// its failure can count against the bound), the limit at least 1 (0 would make the first disable trip the breaker).
+function parseRecheck(env: Record<string, string | undefined>): NonNullable<Config["idpRecheck"]> {
+  const whole = (name: string, fallback: number, min: number, max: number): number => {
+    const raw = env[name];
+    if (raw === undefined || raw === "") return fallback;
+    if (!/^(0|[1-9][0-9]*)$/.test(raw) || Number(raw) < min || Number(raw) > max) throw new Error(`${name} must be a whole number from ${min} to ${max}, not "${raw}"`);
+    return Number(raw);
+  };
+  const recheckHours = whole("GRAYBOARD_IDP_RECHECK_HOURS", DEFAULT_IDP_RECHECK_HOURS, 1, 8760);
+  const maxStaleHours = whole("GRAYBOARD_IDP_RECHECK_MAX_STALE_HOURS", DEFAULT_IDP_RECHECK_MAX_STALE_HOURS, 1, 87600);
+  if (maxStaleHours < recheckHours) throw new Error(`GRAYBOARD_IDP_RECHECK_MAX_STALE_HOURS (${maxStaleHours}) must be at least GRAYBOARD_IDP_RECHECK_HOURS (${recheckHours})`);
+  return { recheckHours, maxStaleHours, disableLimit: whole("GRAYBOARD_IDP_DISABLE_LIMIT", DEFAULT_IDP_DISABLE_LIMIT, 1, 10000) };
+}
+
+// The re-check's whole configuration, defaults filled in.
+export function recheckConfig(config: Pick<Config, "idpRecheck" | "idpReauthDays">): RecheckConfig {
+  return {
+    recheckHours: DEFAULT_IDP_RECHECK_HOURS, maxStaleHours: DEFAULT_IDP_RECHECK_MAX_STALE_HOURS, disableLimit: DEFAULT_IDP_DISABLE_LIMIT,
+    ...config.idpRecheck, reauthDays: config.idpReauthDays ?? DEFAULT_IDP_REAUTH_DAYS,
+  };
+}
+
+// The startup line for #930: which sign-in providers have a directory check (Google with a directory key, oidc with
+// Keycloak's, Okta with a service app), and which the server can't ask about a user's status, so their users re-authenticate every
+// GRAYBOARD_IDP_REAUTH_DAYS.
+export function describeReauth(config: Pick<Config, "idps" | "idpReauthDays" | "idpRecheck" | "googleDirectory" | "keycloakDirectory" | "oktaDirectory">): string {
+  const days = config.idpReauthDays ?? DEFAULT_IDP_REAUTH_DAYS;
+  const idps = config.idps ?? ["google"];
+  const checked = idps.filter(id => (id === "google" && config.googleDirectory) || (id === "oidc" && config.keycloakDirectory) || (id === "okta" && config.oktaDirectory));
+  const unchecked = idps.filter(id => !checked.includes(id));
+  const recheck = checked.length ? `directory check every ${recheckConfig(config).recheckHours} h (${checked.join(", ")})` : "";
+  if (!unchecked.length) return recheck;
+  const clock = days > 0 ? `sign-in every ${days} days (no directory check: ${unchecked.join(", ")})` : `off (GRAYBOARD_IDP_REAUTH_DAYS=0; no directory check: ${unchecked.join(", ")})`;
+  return recheck ? `${recheck}; ${clock}` : clock;
+}
+
+// Half a configuration is a mistake, not "off": an admin without a credential, or a credential with no Google provider
+// to use it. The credential is a key or external_account configuration (GRAYBOARD_GOOGLE_DIRECTORY_KEY) or, on GKE with
+// Workload Identity, the bound service account's email (GRAYBOARD_GOOGLE_DIRECTORY_SERVICE_ACCOUNT) (#1565).
+function googleDirectoryConfig(google: boolean): { googleDirectory?: GoogleDirectoryConfig } {
+  const raw = process.env.GRAYBOARD_GOOGLE_DIRECTORY_KEY || undefined;
+  const serviceAccount = process.env.GRAYBOARD_GOOGLE_DIRECTORY_SERVICE_ACCOUNT || undefined;
+  const admin = process.env.GRAYBOARD_GOOGLE_DIRECTORY_ADMIN;
+  if (!raw && !serviceAccount) {
+    if (admin) throw new Error("GRAYBOARD_GOOGLE_DIRECTORY_ADMIN is set without GRAYBOARD_GOOGLE_DIRECTORY_KEY or GRAYBOARD_GOOGLE_DIRECTORY_SERVICE_ACCOUNT");
+    return {};
+  }
+  const set = raw ? "GRAYBOARD_GOOGLE_DIRECTORY_KEY" : "GRAYBOARD_GOOGLE_DIRECTORY_SERVICE_ACCOUNT";
+  if (!google) throw new Error(`${set} is set but GRAYBOARD_IDPS doesn't list google`);
+  return { googleDirectory: parseDirectoryCredential(raw, serviceAccount, admin) };
+}
+
+const KEYCLOAK_VARS = ["GRAYBOARD_KEYCLOAK_DIRECTORY_CLIENT_ID", "GRAYBOARD_KEYCLOAK_DIRECTORY_CLIENT_SECRET"] as const;
+
+// Keycloak's directory check: the checker client's pair, both or neither, and only for an oidc provider whose issuer
+// is a Keycloak realm URL. GRAYBOARD_KEYCLOAK_DIRECTORY_URL, optional, is Keycloak's base as this server reaches it
+// (the part before /realms/): a deployment that keeps /admin off its public hostname names an internal one, and
+// http is allowed there. Its default is the issuer's own base.
+function keycloakDirectoryConfig(oidc: OidcConfig | undefined): { keycloakDirectory?: KeycloakDirectoryConfig } {
+  const set = [...KEYCLOAK_VARS, "GRAYBOARD_KEYCLOAK_DIRECTORY_URL"].filter(name => process.env[name] !== undefined);
+  if (!set.length) return {};
+  for (const name of KEYCLOAK_VARS) if (!process.env[name]) throw new Error(`${set.join(", ")} set, so ${name} is required too`);
+  if (!oidc) throw new Error(`${set.join(", ")} set but GRAYBOARD_IDPS doesn't list oidc: the Keycloak directory check is for the oidc provider`);
+  const clientId = process.env.GRAYBOARD_KEYCLOAK_DIRECTORY_CLIENT_ID!;
+  const clientSecret = process.env.GRAYBOARD_KEYCLOAK_DIRECTORY_CLIENT_SECRET!;
+  if (!CREDENTIAL.test(clientId) || !CREDENTIAL.test(clientSecret))
+    throw new Error("GRAYBOARD_KEYCLOAK_DIRECTORY_CLIENT_ID and GRAYBOARD_KEYCLOAK_DIRECTORY_CLIENT_SECRET must be nonempty credentials without whitespace");
+  const realm = keycloakRealm(oidc.issuer);
+  if (!realm) throw new Error("GRAYBOARD_OIDC_ISSUER is not a Keycloak realm URL (https://host/realms/<realm>), which the Keycloak directory check needs");
+  const raw = process.env.GRAYBOARD_KEYCLOAK_DIRECTORY_URL;
+  if (raw === undefined) return { keycloakDirectory: { ...realm, clientId, clientSecret } };
+  let url: URL | undefined;
+  try { url = new URL(raw); } catch { /* refused below */ }
+  if (!url || !(url.protocol === "https:" || url.protocol === "http:") || /[?#]/.test(raw) || raw.endsWith("/") || url.username || url.password || url.pathname.includes("/realms/"))
+    throw new Error("GRAYBOARD_KEYCLOAK_DIRECTORY_URL must be an http(s) URL with no query, fragment, credentials or trailing slash: Keycloak's base, the part of a realm URL before /realms/");
+  return { keycloakDirectory: { baseUrl: raw, realm: realm.realm, clientId, clientSecret } };
+}
+
+const OKTA_DIRECTORY_VARS = ["GRAYBOARD_OKTA_DIRECTORY_CLIENT_ID", "GRAYBOARD_OKTA_DIRECTORY_KEY"] as const;
+
+// Okta's directory check: the service app's id and key, both or neither, and only with okta listed. The org URL is
+// GRAYBOARD_OKTA_ISSUER's origin, or GRAYBOARD_OKTA_DIRECTORY_URL (an org whose issuer is on a custom domain names its
+// okta.com domain there); GRAYBOARD_OKTA_DIRECTORY_KEY_ID, optional, is the key's id for a PEM key.
+function oktaDirectoryConfig(okta: OktaConfig | undefined): { oktaDirectory?: OktaDirectoryConfig } {
+  const optional = ["GRAYBOARD_OKTA_DIRECTORY_KEY_ID", "GRAYBOARD_OKTA_DIRECTORY_URL"];
+  const set = [...OKTA_DIRECTORY_VARS, ...optional].filter(name => process.env[name] !== undefined);
+  if (!set.length) return {};
+  for (const name of OKTA_DIRECTORY_VARS) if (!process.env[name]) throw new Error(`${set.join(", ")} set, so ${name} is required too`);
+  if (!okta) throw new Error(`${set.join(", ")} set but GRAYBOARD_IDPS doesn't list okta`);
+  const clientId = process.env.GRAYBOARD_OKTA_DIRECTORY_CLIENT_ID!;
+  if (!CREDENTIAL.test(clientId)) throw new Error("GRAYBOARD_OKTA_DIRECTORY_CLIENT_ID must be a nonempty client id without whitespace");
+  const key = parseOktaDirectoryKey(process.env.GRAYBOARD_OKTA_DIRECTORY_KEY!, process.env.GRAYBOARD_OKTA_DIRECTORY_KEY_ID);
+  const raw = process.env.GRAYBOARD_OKTA_DIRECTORY_URL;
+  let orgUrl: string | null;
+  if (raw === undefined) {
+    orgUrl = oktaOrgUrl(okta.issuer);
+    if (!orgUrl) throw new Error("GRAYBOARD_OKTA_ISSUER is not an Okta authorization server URL (https://<org>, or https://<org>/oauth2/<id>), which the Okta directory check needs");
+  } else {
+    orgUrl = oktaOrgUrl(raw);
+    if (!orgUrl || orgUrl !== raw) throw new Error("GRAYBOARD_OKTA_DIRECTORY_URL must be the org's https origin, such as https://example.okta.com, with no path or trailing slash");
+  }
+  return { oktaDirectory: { orgUrl, clientId, ...key } };
 }
 
 // Port 0 (an ephemeral port, what tests use) through 65535. Gated to plain digits so

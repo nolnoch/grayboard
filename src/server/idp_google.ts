@@ -1,5 +1,6 @@
 import { createRemoteJWKSet, jwtVerify, type JWTVerifyGetKey } from "jose";
 import { DomainRefused, type IdentityProvider } from "./idp.ts";
+import { googleDirectoryStatus, type GoogleDirectoryConfig, type GoogleDirectoryOptions } from "./idp_google_directory.ts";
 
 const GOOGLE_JWKS_URL = "https://www.googleapis.com/oauth2/v3/certs";
 const GOOGLE_ISSUERS  = ["accounts.google.com", "https://accounts.google.com"];
@@ -74,9 +75,13 @@ export async function exchangeGoogleCode(
 
 // Google behind the AS: the client pair the AS selected (mcpGoogle, else the
 // primary), a nonce on every exchange, `hd` on the authorize URL. The exchange
-// refuses an email outside the org domain (DomainRefused).
-export function googleProvider(google: { clientId: string; clientSecret: string; orgDomain: string }): IdentityProvider {
+// refuses an email outside the org domain (DomainRefused). directory: the service account its status check asks the
+// Directory API with (#930 A2b); without one it has no status, and its users stay on the re-auth clock.
+export function googleProvider(
+  google: { clientId: string; clientSecret: string; orgDomain: string }, directory?: GoogleDirectoryConfig, directoryOptions?: GoogleDirectoryOptions,
+): IdentityProvider {
   return {
+    ...(directory ? { status: googleDirectoryStatus(directory, directoryOptions) } : {}),
     id: "google",
     label: "Google",
     issuer: GOOGLE_ISSUER,

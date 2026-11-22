@@ -12,6 +12,7 @@ import { authorize } from "./policy.ts";
 import { openDatabase, type Repo } from "./db.ts";
 import { scratchDbPath } from "../../tests/support/scratch_db.ts";
 import { seed } from "../../tests/support/seed.ts";
+import { NO_MEMBER_AUTHORITY } from "./store/identity.ts";
 
 const person = (email: string, name: string) => ({ scope_kind: "person" as const, scope_ref: email, name });
 const team = (ref: string, name: string) => ({ scope_kind: "team" as const, scope_ref: ref, name });
@@ -41,11 +42,11 @@ beforeEach(async () => {
     const bob = await repo.users.upsertByEmail(tx, "bob@example.com", null);
     const eve = await repo.users.upsertByEmail(tx, "eve@example.com", null);
     const eng = await repo.teams.create(tx, "eng", wade.id);
-    await repo.teams.addMember(tx, eng.id, wade.id);
-    await repo.teams.addMember(tx, eng.id, bob.id);
+    await repo.teams.addMember(tx, eng.id, wade.id, NO_MEMBER_AUTHORITY);
+    await repo.teams.addMember(tx, eng.id, bob.id, NO_MEMBER_AUTHORITY);
     const ops = await repo.teams.create(tx, "ops", eve.id);
-    await repo.teams.addMember(tx, ops.id, eve.id);
-    await repo.teams.addMember(tx, ops.id, wade.id);
+    await repo.teams.addMember(tx, ops.id, eve.id, NO_MEMBER_AUTHORITY);
+    await repo.teams.addMember(tx, ops.id, wade.id, NO_MEMBER_AUTHORITY);
     for (const [email, name] of [["wade@example.com", "be"], ["bob@example.com", "be"], ["bob@example.com", "qa"], ["eve@example.com", "be"]] as const) {
       await repo.aliases.create(tx, person(email, name), email);
     }
@@ -223,6 +224,6 @@ test("scope.act: a user acts in its own person scope and its teams' scopes, a se
   expect(await may({ kind: "service", name: "ci" }, "team", "eng")).toBe("ci is a service; it acts only in its own scope");
   expect(await may({ kind: "service", name: "ci" }, "service", "ci")).toBeNull();
   expect(await may({ kind: "team", name: "eng" }, "team", "eng")).toBe("eng is a team, not a user");
-  await seed(repo, async (tx) => repo.teams.removeMember(tx, (await repo.teams.findByName(tx, "eng"))!.id, (await repo.users.findByEmail(tx, "bob@example.com"))!.id));
+  await seed(repo, async (tx) => repo.teams.removeMember(tx, (await repo.teams.findByName(tx, "eng"))!.id, (await repo.users.findByEmail(tx, "bob@example.com"))!.id, NO_MEMBER_AUTHORITY));
   expect(await may(bob, "team", "eng")).toBe("bob@example.com isn't a member of team eng");
 });

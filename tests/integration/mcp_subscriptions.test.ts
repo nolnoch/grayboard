@@ -15,6 +15,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { requestOrigin } from "../../src/server/request_context.ts";
+import { NO_MEMBER_AUTHORITY } from "../../src/server/store/identity.ts";
 
 let srv: TestServer, app: TestServer["app"], base: string, clock: number;
 const clients: Client[] = [];
@@ -416,7 +417,7 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: private membershi
   const grant = await issue();
   const team = await seed(app.repo, async (tx) => {
     const t = await app.repo.teams.create(tx, "private", grant.authed.user_id);
-    await app.repo.teams.addMember(tx, t.id, grant.authed.user_id);
+    await app.repo.teams.addMember(tx, t.id, grant.authed.user_id, NO_MEMBER_AUTHORITY);
     return t;
   });
   const c = await connect(grant.token, version);
@@ -424,7 +425,7 @@ for (const version of MCP_PROTOCOL_VERSIONS) test(`${version}: private membershi
   await expect(watch(other, "grayboard://boards/private")).rejects.toThrow();
   await watch(c, "grayboard://boards/private");
   await until(() => app.mcp.activeWatches === 1);
-  await seed(app.repo, (tx) => app.repo.teams.removeMember(tx, team.id, grant.authed.user_id));
+  await seed(app.repo, (tx) => app.repo.teams.removeMember(tx, team.id, grant.authed.user_id, NO_MEMBER_AUTHORITY));
   await until(() => app.mcp.activeWatches === 0);
   expect(c.hints).toEqual([]); expect(other.hints).toEqual([]);
   await call(c, "board_create", { name: "e2e", purpose: "fixtures" });

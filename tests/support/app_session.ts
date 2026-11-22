@@ -62,7 +62,7 @@ export type AppConnected = IdentityInfo & { id: string; bind?: BindResult };
 // `token` as an API request resolves it; connect() it. The caller closes it.
 // The token is read now; connect() rejects when it didn't authenticate.
 export function signedIn(app: Pick<StartedServer, "application" | "repo" | "touches">, token: string, identity: string | null, opts: AppSessionOptions = {}): AppSession {
-  return new AppSession(app.application, app.repo, verifySessionToken(token, app.repo, app.touches, 0), identity, opts);
+  return new AppSession(app.application, app.repo, verifySessionToken(token, app.repo, app.touches, 0, 0), identity, opts);
 }
 
 // The ApplicationError `p` (a connect, a bind, a call) is refused with.

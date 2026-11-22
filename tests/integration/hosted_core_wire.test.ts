@@ -3,7 +3,7 @@
 // revision, the server's own status and body for a refusal at initialize, and
 // a scope refusal classified for a new sign-in.
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { abortOf, ConnectRefused, DELIVERY_META, EFFORT_META, InsufficientScope, LAUNCHER_META, LISTEN_CAPACITY, listenCapacity, MODEL_META, NativeWire, SERVER_TEXT_LIMIT, SUGGESTED_META, Wire, type WireOptions } from "../../adapters/hosted-core/src/wire.ts";
+import { abortOf, ConnectRefused, DELIVERY_META, EFFORT_META, InsufficientScope, LAUNCHER_META, LISTEN_CAPACITY, listenCapacity, MODEL_META, NativeWire, SERVER_TEXT_LIMIT, ServerBusy, SUGGESTED_META, Wire, type WireOptions } from "../../adapters/hosted-core/src/wire.ts";
 import { GRAYBOARD_DELIVERY_META, GRAYBOARD_EFFORT_META, GRAYBOARD_LAUNCHER_META, GRAYBOARD_MODEL_META, GRAYBOARD_SESSION_META, GRAYBOARD_SUGGESTED_META } from "../../src/shared/session_meta.ts";
 import { issueOAuth } from "../helpers/oauth.ts";
 import { DEFAULT_MCP_LIMITS } from "../../src/server/config.ts";
@@ -225,3 +225,47 @@ test("a listen past the per-user listen cap is the refusal listenCapacity matche
     return subscription;
   }, 5000, "the freed slot admits the second listen");
 });
+
+// #1536: a connect refused by the request cap retries and connects once a slot frees. The plain-text 429 it used to get
+// reached the SDK's `server/discover` probe as a legacy server, a causeless ERA_NEGOTIATION_FAILED nothing retried.
+test("a connect past the per-user request cap retries the server's rate_limited 429 and connects", async () => {
+  await srv.stop();
+  srv = await TestServer.open({ hostedRequestLimit: { burst: 10_000, perSec: 10_000 }, mcpLimits: { ...DEFAULT_MCP_LIMITS, post: { global: 256, perUser: 1 } } });
+  const token = await issue();
+  // Hold the user's one POST slot: the server reserves it once the headers authenticate, and keeps it while the body is unread.
+  const url = new URL(srv.base);
+  const held = await Bun.connect({ hostname: url.hostname, port: Number(url.port), socket: { data() {} } });
+  held.write(`POST /mcp HTTP/1.1\r\nHost: ${url.host}\r\nAuthorization: Bearer ${token}\r\nContent-Type: application/json\r\nContent-Length: 1000\r\n\r\n{`);
+  await until(() => srv.app.mcp.activePosts === 1, 5000, "the held POST takes the user's slot");
+  const refused = await fetch(`${srv.base}/mcp`, { method: "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: "{}" });
+  expect(refused.status).toBe(429);
+  const body = await refused.json() as { jsonrpc: string; id: null; error: { data: { code: string; retry_after_ms: number } } };
+  expect(body).toMatchObject({ jsonrpc: "2.0", id: null, error: { data: { code: "rate_limited" } } });
+  expect(body.error.data.retry_after_ms).toBeGreaterThanOrEqual(500);
+  expect(body.error.data.retry_after_ms).toBeLessThan(1500);
+  expect(refused.headers.get("Retry-After")).toMatch(/^[12]$/);
+  const wire = subscriber(token);
+  const connecting = wire.connect();
+  await until(() => wire.admissionRetryAfterMs !== undefined, 5000, "the wire is refused and waits to retry");
+  held.end();
+  await connecting;
+  expect(await wire.call("whoami")).toBeTruthy();
+});
+
+// #1536: a cap that stays full fails the connect as ServerBusy, an outage the controller retries, whether the wire's
+// eight tries run out or a timeout (the SDK's or the wire's own signal) ends the waits first; never the causeless
+// ERA_NEGOTIATION_FAILED the last 429 would read as.
+test("a connect the request cap refuses on every try fails as ServerBusy", async () => {
+  await srv.stop();
+  srv = await TestServer.open({ hostedRequestLimit: { burst: 10_000, perSec: 10_000 }, mcpLimits: { ...DEFAULT_MCP_LIMITS, post: { global: 256, perUser: 1 } } });
+  const token = await issue();
+  const url = new URL(srv.base);
+  const held = await Bun.connect({ hostname: url.hostname, port: Number(url.port), socket: { data() {} } });
+  try {
+    held.write(`POST /mcp HTTP/1.1\r\nHost: ${url.host}\r\nAuthorization: Bearer ${token}\r\nContent-Type: application/json\r\nContent-Length: 1000\r\n\r\n{`);
+    await until(() => srv.app.mcp.activePosts === 1, 5000, "the held POST takes the user's slot");
+    const error = await subscriber(token).connect().then(() => undefined, (e: unknown) => e);
+    expect(error).toBeInstanceOf(ServerBusy);
+    expect((error as ServerBusy).retryAfterMs).toBeGreaterThanOrEqual(500);
+  } finally { held.end(); }
+}, 30_000);

@@ -17,6 +17,7 @@ import { scratchDbPath } from "./scratch_db.ts";
 import { seed } from "./seed.ts";
 import { serverAccess } from "./sync_access.ts";
 import { grantOwner } from "./roles.ts";
+import { NO_MEMBER_AUTHORITY } from "../../src/server/store/identity.ts";
 
 export const person = (email: string, name: string) => ({ scope_kind: "person" as const, scope_ref: email, name });
 export const team = (ref: string, name: string) => ({ scope_kind: "team" as const, scope_ref: ref, name });
@@ -57,14 +58,14 @@ export async function openBoardParity(): Promise<{ repo: Repo; db: CoreDb }> {
     const [wade, bob, eve] = [await repo.users.upsertByEmail(tx, W, null), await repo.users.upsertByEmail(tx, B, null), await repo.users.upsertByEmail(tx, E, null)];
     await repo.users.upsertByEmail(tx, D, null);
     const eng = await repo.teams.create(tx, "eng", wade.id);
-    await repo.teams.addMember(tx, eng.id, wade.id);
+    await repo.teams.addMember(tx, eng.id, wade.id, NO_MEMBER_AUTHORITY);
     await grantOwner(repo, tx, "eng", W);
-    await repo.teams.addMember(tx, eng.id, bob.id);
+    await repo.teams.addMember(tx, eng.id, bob.id, NO_MEMBER_AUTHORITY);
     await repo.teams.setPolicy(tx, eng.id, "collaborative");
     const ops = await repo.teams.create(tx, "ops", eve.id);
-    await repo.teams.addMember(tx, ops.id, eve.id);
+    await repo.teams.addMember(tx, ops.id, eve.id, NO_MEMBER_AUTHORITY);
     await grantOwner(repo, tx, "ops", E);
-    await repo.teams.addMember(tx, ops.id, wade.id);
+    await repo.teams.addMember(tx, ops.id, wade.id, NO_MEMBER_AUTHORITY);
     await repo.teams.setPolicy(tx, ops.id, "delegating");
     for (const [email, name] of [[W, "be"], [B, "be"], [B, "qa"], [B, "human"], [E, "be"], [D, "be"], [D, "human"]] as const) await repo.aliases.create(tx, person(email, name), email);
     await repo.aliases.create(tx, team("eng", "deploy"), W);

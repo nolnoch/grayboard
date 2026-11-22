@@ -13,6 +13,7 @@ import type { Tx } from "../tx_base.ts";
 import { noHosted } from "./hosted_port.ts";
 import { makePgIdentity, ROLE_WRITE_LOCK, type PgIdentity } from "./identity.ts";
 import { pgOf, TxAborted } from "./tx.ts";
+import { NO_MEMBER_AUTHORITY } from "../identity.ts";
 
 const G = "https://accounts.google.com", OKTA = "https://example.okta.com";
 const A = "a@example.com", B = "b@example.com", C = "c@example.com", D = "d@example.com";
@@ -41,7 +42,7 @@ const users = (p: Pair, ...emails: string[]) => p.a.write(async tx => {
 async function team(p: Pair, members: User[], owners: number) {
   return p.a.write(async tx => {
     const t = await p.g.teams.create(tx, "eng", members[0]!.id);
-    for (const u of members) await p.g.teams.addMember(tx, t.id, u.id);
+    for (const u of members) await p.g.teams.addMember(tx, t.id, u.id, NO_MEMBER_AUTHORITY);
     for (const u of members.slice(0, owners)) await grantRole(p.g, tx, spec(u.email, "team_owner", "eng"), NONE(members[0]!));
     return t;
   });
@@ -184,7 +185,7 @@ describePg("identity races (Postgres)", () => {
     const held = (tx: Tx) => pgOf(tx)`SELECT 1 FROM pg_locks
       WHERE locktype = 'advisory' AND pid = pg_backend_pid() AND granted AND ((classid::int8 << 32) | objid::int8) = ${ROLE_WRITE_LOCK.toString()}::int8`;
     const revoke = (tx: Tx) => caught(() => p.g.roles.revoke(tx, { holder: A, role: "team_owner", scope: "eng", byUser: null, authority: "none", actor: D }));
-    const remove = (tx: Tx) => caught(() => p.g.teams.removeMember(tx, t.id, a!.id));
+    const remove = (tx: Tx) => caught(() => p.g.teams.removeMember(tx, t.id, a!.id, NO_MEMBER_AUTHORITY));
     for (const call of [revoke, remove]) {
       const direct = await p.a.write(async tx => ({ e: await call(tx), locks: (await held(tx)).length }));
       expect(direct).toMatchObject({ locks: 1 });
@@ -233,6 +234,33 @@ describePg("identity races (Postgres)", () => {
       tx => p.g.users.signIn(tx, G, "s-hire", "gone@example.com", null));
     expect(r.b).toMatchObject({ ok: true, value: { status: "ok", linked: false, user: { id: u!.id, idp_subject: null, disabled_at: expect.any(Number) } } });
     expect(await p.g.users.findById(p.a.read, u!.id)).toMatchObject({ idp_issuer: null, idp_subject: null, disabled_at: expect.any(Number) });
+    expect(r.waited).toBe(true);
+  });
+
+  // #1247: the link guard's issuer half. Another IdP's issuer lands on the unlinked row, its subject still null (a
+  // pre-F-13 row's shape), between the sign-in's read and its link. `idp_subject IS NULL` still holds on the committed
+  // row, so only `idp_issuer IS NULL OR idp_issuer = ?` refuses the link; the re-read answers issuer_mismatch.
+  test("T-C3-5d another issuer set on the row between the sign-in's read and its link: issuer_mismatch, the row keeps that issuer unlinked", async () => {
+    await using p = await pair();
+    const [u] = await users(p, "moved@example.com");
+    const r = await race(p,
+      async tx => { await pgOf(tx)`UPDATE users SET idp_issuer = ${OKTA} WHERE id = ${u!.id}`; },
+      tx => p.g.users.signIn(tx, G, "s-late", "moved@example.com", null));
+    expect(r.b).toMatchObject({ ok: true, value: { status: "issuer_mismatch", issuer: OKTA, user: { id: u!.id, idp_issuer: OKTA, idp_subject: null } } });
+    expect(await p.g.users.findById(p.a.read, u!.id)).toMatchObject({ idp_issuer: OKTA, idp_subject: null });
+    expect(r.waited).toBe(true);
+  });
+
+  // #930: the IdP re-check's disable re-reads the user with lockById. A sign-in's restamp holding the row makes it
+  // wait and then read the restamped clock, so the check sees the IdP vouched again and disables nobody; a plain read
+  // wouldn't wait and would read the old clock.
+  test("lockById waits for a restamp holding the users row, then reads its clock", async () => {
+    await using p = await pair();
+    const [u] = await users(p, "stamp@example.com");
+    await p.a.write(async tx => { await pgOf(tx)`UPDATE users SET idp_checked_at = 1 WHERE id = ${u!.id}`; });
+    const r = await race(p, tx => p.g.users.stampIdpChecked(tx, u!.id), tx => p.g.users.lockById(tx, u!.id));
+    expect(r.b).toMatchObject({ ok: true, value: { id: u!.id } });
+    expect((r.b as { value: User }).value.idp_checked_at).not.toBe(1);
     expect(r.waited).toBe(true);
   });
 

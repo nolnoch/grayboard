@@ -13,11 +13,14 @@ import { UploadGate } from "./uploads.ts";
 import { startRetentionJobs } from "./retention.ts";
 import { createTouchQueue } from "./auth.ts";
 import { writeAudit } from "./audit.ts";
-import type { Config } from "./config.ts";
+import { checkIdpConfig, recheckConfig, type Config } from "./config.ts";
+import { defaultProviders } from "./idp.ts";
+import { createIdpRecheck } from "./idp_recheck.ts";
 import { SlackBridge } from "./slack.ts";
 import { serveMetrics, startLagSampler, type Gauges } from "./metrics.ts";
 import { testPauseAsync } from "../shared/testpause.ts";
 import { settleAll } from "./settle.ts";
+import { atSite } from "./store/queue.ts";
 
 export type StartOptions = ApplicationOptions & {
   hostname?: string;
@@ -68,10 +71,10 @@ export function startServer(config: Config, opts: StartOptions = {}) {
   // Dev sign-in mints tokens for any email; they must not outlive it (#805 F-04). A
   // server started without dev auth revokes them, so a re-enable doesn't revive them.
   // Queued first (#807 P3 A4), so it commits before any other startup write and any request.
-  const devRevoked = config.devAuth ? Promise.resolve() : repo.write(async tx => {
+  const devRevoked = config.devAuth ? Promise.resolve() : atSite("startup", () => repo.write(async tx => {
     const revoked = await repo.sessions.revokeDev(tx);
     if (revoked > 0) writeAudit(repo, tx, "auth.dev_sessions_revoked", null, null, { count: revoked });
-  });
+  }));
   // The background passes running when stop() began (a revalidate tick, the retention pass, a claim expiry sweep), by
   // name: stop() waits for them too, or one resumes from an await onto a closed database (#1489). None starts once
   // `stopping` is set. Declared before the application, whose startup ends may start background work.
@@ -103,8 +106,15 @@ export function startServer(config: Config, opts: StartOptions = {}) {
   // The deferred session-touch queue this server owns; stop() cancels it
   // before closing the db (a fired-after-close touch is an unhandled crash).
   const touches = createTouchQueue();
-  const oauth = createOAuthServer(repo, config, opts.oauth);
-  const mcp = createHostedMcp(application, oauth, { trustedOrigin: new URL(config.publicUrl).origin, now: opts.now, limits: config.mcpLimits, caps: config.hostedCaps, ...(config.hostedIdleSeconds ? { idleSeconds: config.hostedIdleSeconds } : {}) });
+  // The IdP re-check (#930 A2) over the providers the AS signs in with, shared by refresh and CLI-token auth: one
+  // process-wide record of which providers answered positive, one breaker, one in-flight call per user.
+  if (!opts.oauth?.providers) checkIdpConfig(config);
+  const providers = opts.oauth?.providers ?? defaultProviders(config);
+  const recheck = createIdpRecheck(repo, providers, recheckConfig(config), {
+    disconnectUser, userChanged: id => slack?.userChanged(id), background: (what, run) => background(what, () => run()),
+  }, opts.oauth?.now ?? (() => repo.now()));
+  const oauth = createOAuthServer(repo, config, { ...opts.oauth, providers, recheck });
+  const mcp = createHostedMcp(application, oauth, { trustedOrigin: new URL(config.publicUrl).origin, stopping: () => stopping, now: opts.now, limits: config.mcpLimits, caps: config.hostedCaps, ...(config.hostedIdleSeconds ? { idleSeconds: config.hostedIdleSeconds } : {}) });
   const mcpPath = new URL(oauth.resource).pathname;
 
   // A Slack outage or bad token mustn't take the bus down: log and run without it.
@@ -173,7 +183,7 @@ export function startServer(config: Config, opts: StartOptions = {}) {
           }
         }
       }
-      if (await Promise.race([repo.write(() => {}).then(() => {}, () => {}), expired]) === "expired") fail(`the queued writes never finished within ${ms} ms`);
+      if (await Promise.race([atSite("startup", () => repo.write(() => {})).then(() => {}, () => {}), expired]) === "expired") fail(`the queued writes never finished within ${ms} ms`);
     } finally { clearTimeout(timer); }
   }
 
@@ -187,12 +197,12 @@ export function startServer(config: Config, opts: StartOptions = {}) {
     const limited = authGate.refuse(caller, path);
     if (limited) return limited;
 
-    const response = await oauth.fetch(req, { key: caller.key, site: caller.site });
+    const response = await atSite("oauth", () => oauth.fetch(req, { key: caller.key, site: caller.site }));
     if (response) return response;
     // The OAuth byte routes charge a refused bearer as /mcp does (#401).
     // The AS routes above authenticate clients by secret, not bearer, and
     // stay under the OAuth limiters alone.
-    const attachmentResponse = attachments.fetch(req);
+    const attachmentResponse = atSite("attachments", () => attachments.fetch(req));
     if (attachmentResponse) return attachmentResponse.then(res => authGate.chargeRefusedToken(caller, req, path, res));
     if (path === "/mcp" || path === mcpPath) return mcp.fetch(req, caller.ip ?? "unknown").then(res => authGate.chargeRefusedToken(caller, req, path, res));
 
@@ -203,7 +213,7 @@ export function startServer(config: Config, opts: StartOptions = {}) {
       if (!isJsonRequest(req)) return Response.json({ code: "unsupported_media_type", message: "sign-in takes Content-Type: application/json" }, { status: 415 });
       authGate.charge(caller, req, path, "sign-in");
     }
-    return handleHttp(req, repo, application.access, config, touches, wake, slack, { disconnectUser, accessChanged }, caller.ip, application.boardsChanged, url).then((res) => authGate.chargeRefusedToken(caller, req, path, res));
+    return atSite("admin", () => handleHttp(req, repo, application.access, config, touches, wake, slack, { disconnectUser, accessChanged, recheck }, caller.ip, application.boardsChanged, url)).then((res) => authGate.chargeRefusedToken(caller, req, path, res));
   }
 
   // Every value an O(1) getter (vision P13): no row count, no walk over sessions.

@@ -7,7 +7,7 @@ import { describePg, pgEmptyDatabase } from "../../../../tests/support/pg.ts";
 import { FIXTURES } from "../../../../tests/support/pg_migrate_child.ts";
 import { transactionProcess } from "../../../../tests/support/transaction-process.ts";
 import { until } from "../../../../tests/support/until.ts";
-import { checksum, migrate, validateMigrations, type Migration } from "./migrate.ts";
+import { checksum, migrate, MIGRATIONS, validateMigrations, type Migration } from "./migrate.ts";
 import { openPg } from "./sql.ts";
 
 const recorded = async (sql: Bun.SQL) =>
@@ -108,5 +108,20 @@ describePg("migrate", () => {
       await b.close({ timeout: 0 });
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+// #930: 0003 starts every user's IdP clock at the upgrade, unlinked ones included (pg twin of the SQLite open's stamp, db.ts).
+describePg("0003_users_idp_checked_at", () => {
+  test("stamps every row, with an issuer or without", async () => {
+    await using db = await pgEmptyDatabase();
+    const v3 = MIGRATIONS.findIndex(m => m.version === 3);
+    await migrate(db.sql, MIGRATIONS.slice(0, v3));
+    await db.sql`INSERT INTO users (email, created_at, idp_issuer, idp_subject) VALUES ('linked@example.com', 1, 'https://idp.example', 's-1'), ('dev@example.com', 1, NULL, NULL)`;
+    const before = Date.now();
+    await migrate(db.sql, MIGRATIONS.slice(0, v3 + 1));
+    const rows = await db.sql`SELECT email, idp_checked_at FROM users ORDER BY email` as { email: string; idp_checked_at: string | number | null }[];
+    expect(Number(rows[0]!.idp_checked_at)).toBeGreaterThanOrEqual(before);
+    expect(Number(rows[1]!.idp_checked_at)).toBeGreaterThanOrEqual(before);
   });
 });

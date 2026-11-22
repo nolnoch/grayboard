@@ -1,4 +1,4 @@
-// The seven revoking transactions that end hosted sessions (#807 P3 C10d2-a made each an async savepoint body, since a
+// The eight revoking transactions that end hosted sessions (#807 P3 C10d2-a made each an async savepoint body, since a
 // released child's ID now ends through the server's composed end): OAuth's redeemCode and rotateRefresh replays,
 // revokeToken, revokePreBuiltinGrants and revokeServiceCredential, users.setDisabled and sessions.revokeAllForUser.
 // Each pins, on SQLite, the order of the rows it writes (access_log, the child's bounce, binding events) and that a
@@ -142,6 +142,11 @@ const CASES: Case[] = [
     revoked: i => grantRevoked(i.grantId),
   },
   {
+    name: "revokeUserGrant",
+    run: (tx, i) => database.repo.oauth.revokeUserGrant(tx, i.userId, i.grantId, now),
+    revoked: i => grantRevoked(i.grantId),
+  },
+  {
     name: "users.setDisabled",
     run: (tx, i) => database.repo.users.setDisabled(tx, i.userId, true),
     revoked: i => disabled(i.userId) && grantRevoked(i.grantId),
@@ -163,6 +168,7 @@ const EXPECTED: Record<string, ReturnType<typeof snapshot>> = {
   "revokeToken (refresh)": rows(["hosted.child_released root", "id.ended child", "oauth.revoked grant"], "revoked"),
   "revokePreBuiltinGrants": rows(["hosted.child_released root", "id.ended child", "oauth.builtin_client_grant_revoked grant"], "revoked"),
   "revokeServiceCredential": rows(["hosted.child_released root", "id.ended child"], "revoked"),
+  "revokeUserGrant": rows(["hosted.child_released root", "id.ended child"], "revoked"),
   "users.setDisabled": rows(["hosted.child_released root", "id.ended child"], "disabled"),
   "sessions.revokeAllForUser": rows(["hosted.child_released root", "id.ended child"], "revoked"),
 };
