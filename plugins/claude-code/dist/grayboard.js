@@ -31705,7 +31705,12 @@ function abortOf(error, signal) {
   return false;
 }
 var connectMethods = new Set(["server/discover", "initialize"]);
-var connectProbe = { deadlineMs: 5000, coldMs: 30000, open: (host, port) => tcpConnect({ host, port }) };
+var connectProbe = {
+  deadlineMs: 5000,
+  coldMs: 30000,
+  lookup: undefined,
+  open: (host, port) => tcpConnect({ host, port, autoSelectFamily: true, ...connectProbe.lookup && { lookup: connectProbe.lookup } })
+};
 function proxied(url) {
   const env = typeof process === "undefined" ? {} : process.env;
   const names = url.protocol === "https:" ? ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"] : ["HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"];
