@@ -1485,9 +1485,10 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
     // A board_post's plan for a keyed body (#1537 PR 6, D4), read on the pool, or undefined when it runs exclusive
     // (`call` as ever): a Slack-bridge human's session, a closed or read-only one, a delegate's rows in flight; a post
     // with files or `attachments` (the upload binding and quota stay exclusive in v1); one whose body names an `@id:`
-    // (until the mention sort of #808 pair 9); one on a service's board (its invocation decision); one on a queue
-    // board (its claim_events rotation, id order); one by a human address; and one the pool refuses (the exclusive body
-    // gives the refusal and writes its row).
+    // (until the mention sort of #808 pair 9); an invocation the pool denies (the exclusive body records the deny and
+    // charges its limiter once); one by a human address; and one the pool refuses (the exclusive body gives the refusal
+    // and writes its row). A queue board's post and reply, and an allowed invocation, plan their board (#1594): their
+    // claim rows are the board's queue keys, which `board:<name>` serializes; the body decides the invocation again.
     async postPlan(session: ApplicationSession, args: Record<string, unknown>): Promise<PostPlan | undefined> {
       if (session.human || session.readOnly || !session.active || hub.delegateRows !== undefined) return undefined;
       if (args.attachments !== undefined) return undefined;
@@ -1498,9 +1499,9 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
       try {
         childState(session, "board_post");
         const actor = await serverBoardActor(repo, hub.access, repo.read, "board_post", args, { addresses: session.addresses, asAddresses: asAddresses(session), ownScope: session.authed.user_email });
-        if (await invocation(repo, repo.read, actor, args.board)) return undefined;
+        const inv = await invocation(repo, repo.read, actor, args.board);
+        if (inv && !inv.d.allow) return undefined;
         const b = await readableBoard(repo, hub.access, repo.read, actor, args.board);
-        if ((b.kind ?? "broadcast") === "queue") return undefined;
         if (await repo.aliases.isHuman(repo.read, actor)) return undefined;
         return { board: b.name };
       } catch (error) {
@@ -2347,12 +2348,11 @@ async function handleCall(hub: Hub, tx: Tx, session: ApplicationSession, tool: s
 
 // board_post, deduplicated (#254): a repeat replays the first post's result,
 // and a queue board gets no second work item. `keyed`: the plan a keyed body runs under (application.postKeyed): any
-// case postPlan leaves exclusive, met here on the body's own reads, throws KeyedSendMiss before the post's insert, and
-// a registry read (`ctx.online`, a queue's lane order) does too: the body reads no in-memory state the exclusive
-// bodies change at their commits (D4).
+// case postPlan leaves exclusive, met here on the body's own reads, throws KeyedSendMiss before the post's insert. A
+// registry read (`ctx.online`) passes only on a queue board, whose lane order prefers a live lane (#1594, D4): one
+// synchronous read, a preference the claim TTL repairs, as dm_send's holder read is; anywhere else it misses.
 async function handleBoardPost(hub: Hub, tx: Tx, session: ApplicationSession, me: string, args: Record<string, unknown>, ctx: ToolContext, publish?: (result: unknown) => void, keyed?: PostPlan): Promise<unknown> {
   const { repo } = hub;
-  if (keyed) ctx = { ...ctx, online: () => { throw new KeyedSendMiss("it reads the registry"); } };
   const { resend, ...postArgs } = args;
   let out: DedupOutcome<Written<BoardPostResult> & { wake: string[] }>;
   try {
@@ -2368,7 +2368,9 @@ async function handleBoardPost(hub: Hub, tx: Tx, session: ApplicationSession, me
     // A post on a service's board is an invocation (#270 D6), decided here for the acting address's principal: a deny
     // is recorded after the rollback and answers as a missing board; an allow is recorded with the post it carries.
     const inv = await invocation(repo, tx, me, postArgs.board);
-    if (keyed && inv) throw new KeyedSendMiss("it posts on a service's board");
+    // Decided again on the body's own transaction (principle 11): a deny here misses before its row is deferred, and
+    // the exclusive body records it and charges the limiter once (#1594). An allow is recorded with the post below.
+    if (keyed && inv && !inv.d.allow) throw new KeyedSendMiss("its invocation was denied in the body");
     if (inv && !inv.d.allow) {
       rowAfterRollback(session, tx, w => recordDecision(repo, w, sessionActor(session, me), inv.req, inv.d));
       throw hiddenBoard(inv);
@@ -2377,9 +2379,10 @@ async function handleBoardPost(hub: Hub, tx: Tx, session: ApplicationSession, me
     const { board, gate } = await postGateOn(repo, hub.access, tx, me, postArgs.board, parentId);
     if (keyed) {
       if (board.name !== keyed.board) throw new KeyedSendMiss("its board resolved differently in the body");
-      if (gate.human || gate.announcement || (board.kind ?? "broadcast") === "queue") throw new KeyedSendMiss("its post needs the exclusive body");
+      if (gate.human || gate.announcement) throw new KeyedSendMiss("its post needs the exclusive body");
       if (ids.length || postArgs.attachments !== undefined) throw new KeyedSendMiss("it carries files");
       if (idMention(postArgs.body)) throw new KeyedSendMiss("it names an @id:");
+      if ((board.kind ?? "broadcast") !== "queue") ctx = { ...ctx, online: () => { throw new KeyedSendMiss("it reads the registry"); } };
     }
     // Core's order (#1225): the gate, then the body and mode checks, then the uploads, so a call with several faults
     // is refused for the same one in both modes. serverPost runs the same checks again; they hold, so they pass.
