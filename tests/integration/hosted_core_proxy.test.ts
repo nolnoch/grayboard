@@ -7,7 +7,7 @@
 // own OAuth issuance would.
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
-import { createServer, Socket, type AddressInfo, type Server } from "node:net";
+import { createServer, getDefaultAutoSelectFamily, setDefaultAutoSelectFamily, Socket, type AddressInfo, type Server } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Client, SdkError, SdkErrorCode, type AuthProvider, type CallToolResult } from "@modelcontextprotocol/client";
@@ -791,5 +791,97 @@ test("a call cut off after its request left reports its outcome unknown and is s
     Object.assign(connectProbe, probe0);
     proxyVars.forEach((n, i) => { if (proxyEnv[i] === undefined) delete process.env[n]; else process.env[n] = proxyEnv[i]; });
     resetter.close();
+  }
+});
+
+// #1585: the probe's connect races a host's addresses as fetch does, so a dual-stack host whose IPv6 route blackholes
+// (or is missing) still connects over IPv4, even where the process turned the runtime's default off.
+test("the connect probe falls back to IPv4 when a host's IPv6 address doesn't connect (#1585)", async () => {
+  const server = createServer(socket => socket.end());
+  const port = await new Promise<number>(resolve => server.listen(0, "127.0.0.1", () => resolve((server.address() as AddressInfo).port)));
+  const probe0 = { ...connectProbe };
+  const default0 = getDefaultAutoSelectFamily();
+  // The IPv6 discard prefix (RFC 6666) first: dropped where IPv6 routes, unreachable where it doesn't.
+  connectProbe.lookup = ((_host: string, options: { all?: boolean }, callback: (...args: unknown[]) => void) => {
+    const addresses = [{ address: "100::1", family: 6 }, { address: "127.0.0.1", family: 4 }];
+    if (options.all) callback(null, addresses); else callback(null, addresses[0]!.address, addresses[0]!.family);
+  }) as typeof connectProbe.lookup;
+  setDefaultAutoSelectFamily(false);
+  const socket = connectProbe.open("dual-stack.test", port);
+  try {
+    const outcome = await new Promise<string>(resolve => {
+      const timer = setTimeout(() => resolve("no connect within 4 s"), 4_000);
+      socket.once("connect", () => { clearTimeout(timer); resolve(`connected to ${socket.remoteAddress}`); });
+      socket.once("error", error => { clearTimeout(timer); resolve(`error: ${error.message}`); });
+    });
+    expect(outcome).toBe("connected to 127.0.0.1");
+  } finally {
+    socket.destroy();
+    setDefaultAutoSelectFamily(default0);
+    Object.assign(connectProbe, probe0);
+    server.close();
+  }
+});
+
+// #1585: a tool call probes only on a wire with no answer within coldMs, never behind a proxy (a direct connect proves
+// nothing there), and an abort mid-probe ends it at once: the socket destroyed, the call aborted, not unreachable, and
+// its request never sent.
+test("the connect probe runs only on a cold wire and never behind a proxy; an abort mid-probe destroys its socket (#1585)", async () => {
+  const { token } = await issue();
+  const p = proxy({ token: async () => token });
+  const probe0 = { ...connectProbe }, fetch0 = globalThis.fetch;
+  const proxyVars = ["HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy"], proxyEnv = proxyVars.map(n => process.env[n]);
+  for (const n of proxyVars) delete process.env[n];
+  const sockets: Socket[] = [];
+  connectProbe.open = (host, port) => { const socket = probe0.open(host, port); sockets.push(socket); return socket; };
+  let whoamis = 0;
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    if (input instanceof Request && input.method === "POST" && (await input.clone().text()).includes(`"name":"whoami"`)) whoamis++;
+    return fetch0(input, init);
+  }) as typeof fetch;
+  const whoami = async (signal?: AbortSignal) => JSON.parse(textOf(await p.call("whoami", {}, "pi-root", signal))) as { primary: string };
+  try {
+    expect((await p.call("bind", { name: "proxy-probe", create: true }, "pi-root")).isError).toBeUndefined();
+    // Warm: the wire answered within coldMs, so no probe.
+    connectProbe.coldMs = 60_000;
+    expect((await whoami()).primary).toBe("alice@example.com/proxy-probe");
+    expect(sockets.length).toBe(0);
+    // Cold: one probe, which passes.
+    connectProbe.coldMs = 0;
+    expect((await whoami()).primary).toBe("alice@example.com/proxy-probe");
+    expect(sockets.length).toBe(1);
+    // Behind a proxy (the loopback server is exempt, so the request itself goes direct): no probe, under either spelling.
+    process.env.NO_PROXY = process.env.no_proxy = "127.0.0.1,localhost";
+    for (const name of ["HTTP_PROXY", "all_proxy"]) {
+      process.env[name] = "http://127.0.0.1:1";
+      expect((await whoami()).primary).toBe("alice@example.com/proxy-probe");
+      delete process.env[name];
+    }
+    expect(sockets.length).toBe(1);
+    for (const n of ["NO_PROXY", "no_proxy"]) delete process.env[n];
+
+    // An abort mid-probe: the connect never completes, and the deadline is far off.
+    connectProbe.deadlineMs = 30_000;
+    let held: Socket | undefined;
+    connectProbe.open = () => (held = new Socket());
+    const before = whoamis, started = performance.now();
+    const controller = new AbortController();
+    const call = whoami(controller.signal).then(() => undefined, (error: unknown) => error);
+    await until(() => held, 5_000, "the probe to open its socket");
+    controller.abort();
+    const aborted = await call;
+    expect(aborted).toBeInstanceOf(CallAborted);
+    expect(aborted).not.toBeInstanceOf(ServerUnreachable);
+    await until(() => held!.destroyed, 2_000, "the probe to destroy its socket");
+    expect(performance.now() - started).toBeLessThan(connectProbe.deadlineMs);
+    expect(whoamis).toBe(before);
+    // The wire is untouched: the next call, warm, goes straight out.
+    connectProbe.coldMs = 60_000;
+    expect((await whoami()).primary).toBe("alice@example.com/proxy-probe");
+    expect(whoamis).toBe(before + 1);
+  } finally {
+    globalThis.fetch = fetch0;
+    Object.assign(connectProbe, probe0);
+    proxyVars.forEach((n, i) => { if (proxyEnv[i] === undefined) delete process.env[n]; else process.env[n] = proxyEnv[i]; });
   }
 });

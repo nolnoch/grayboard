@@ -1,7 +1,7 @@
 import { Client, InsufficientScopeError, SdkError, SdkErrorCode, SdkHttpError, StreamableHTTPClientTransport, type AuthProvider, type CallToolResult, type Tool } from "@modelcontextprotocol/client";
 import type { Delivery, SessionFacts } from "./port.js";
 import { setTimeout as sleep } from "node:timers/promises";
-import { connect as tcpConnect, type Socket } from "node:net";
+import { connect as tcpConnect, type LookupFunction, type Socket } from "node:net";
 
 export const DELIVERY_META = "io.github.nolnoch.grayboard/delivery";
 export const LAUNCHER_META = "io.github.nolnoch.grayboard/launcher";
@@ -179,8 +179,14 @@ const connectMethods = new Set(["server/discover", "initialize"]);
 // or the call unsent. Only its own deadline fails the call: a connect error (refused, unresolvable) falls through to
 // the request, whose fetch classifies it as unsent itself, so a fetch that resolves or routes differently from a
 // direct connect (a test's stub, a host's shim) still decides. Skipped behind a proxy, where a direct connect proves
-// nothing. Tests shorten the deadline, or replace `open` with a socket that never connects.
-export const connectProbe = { deadlineMs: 5_000, coldMs: 30_000, open: (host: string, port: number): Socket => tcpConnect({ host, port }) };
+// nothing. The connect races a host's addresses (Happy Eyeballs, `autoSelectFamily`) as fetch does, so a dual-stack
+// host whose IPv6 route blackholes still connects over IPv4 instead of failing at the deadline (#1585); both runtimes
+// default it on, but a process can turn the default off, so it's set here. Tests shorten the deadline, replace `open`
+// with a socket that never connects, or give `lookup` a resolver of their own.
+export const connectProbe = {
+  deadlineMs: 5_000, coldMs: 30_000, lookup: undefined as LookupFunction | undefined,
+  open: (host: string, port: number): Socket => tcpConnect({ host, port, autoSelectFamily: true, ...(connectProbe.lookup && { lookup: connectProbe.lookup }) }),
+};
 function proxied(url: URL): boolean {
   const env = typeof process === "undefined" ? {} : process.env;
   const names = url.protocol === "https:" ? ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"] : ["HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"];
