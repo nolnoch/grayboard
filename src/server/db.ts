@@ -1786,8 +1786,18 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       async ack(tx, reader, id) {
         sqliteOf(tx).run("INSERT OR IGNORE INTO dm_acks (reader, message_id, acked_at) SELECT ?, id, ? FROM messages WHERE id = ?", [reader, clock(), id]);
       },
-      async markDelivered(tx, id, at) {
-        sqliteOf(tx).run("UPDATE messages SET delivered_at = ? WHERE id = ? AND delivered_at IS NULL", [at, id]);
+      async deliver(tx, recipients, ids, at) {
+        const db = sqliteOf(tx);
+        const mine = db.query<{ id: number; recipient: string }, [string, string]>(
+          `SELECT id, recipient FROM messages WHERE id IN (SELECT value FROM json_each(?)) AND recipient_type = 'user'
+             AND recipient IN (SELECT value FROM json_each(?)) ORDER BY id`,
+        ).all(JSON.stringify(ids), JSON.stringify(recipients));
+        if (at !== null && mine.length) {
+          db.run("UPDATE messages SET delivered_at = ? WHERE id IN (SELECT value FROM json_each(?)) AND delivered_at IS NULL", [at, JSON.stringify(mine.map(m => m.id))]);
+        }
+        const last = new Map<string, number>();
+        for (const m of mine) last.set(m.recipient, Math.max(last.get(m.recipient) ?? 0, m.id));
+        return last;
       },
       async retract(tx, sender, id, by) {
         const db = sqliteOf(tx);

@@ -1051,7 +1051,7 @@ describePg("a first contact's creating entry is released on every exit (Postgres
 
 // #1510 chunk 4: delivery's renew and receipt keyed by their root on Postgres (delivery.ts keyedOr, D4). Each runs its
 // reads in a probe, then writes only the session's own rows; anything else misses into today's exclusive body. A keyed
-// renew is held at its lease UPDATE and a keyed receipt at its first markDelivered or board acknowledge (`state.hold`);
+// renew is held at its lease UPDATE and a keyed receipt at its delivery stamp or first board acknowledge (`state.hold`);
 // `state.entry`, while set, holds a renew or receipt after its gate, before its keyed body queues, so two of one root
 // can both be past their gates. Every wait has a deadline. Without GRAYBOARD_TEST_PG_URL it skips.
 async function leaseInstance(url: string, opts: { keyed?: false; keyedTools?: false; side?: string } = {}) {
@@ -1072,12 +1072,14 @@ async function leaseInstance(url: string, opts: { keyed?: false; keyedTools?: fa
     if (keyedTx(tx) && currentSite() === "renew") await holdHere(`renew ${id}`);
     return update(tx, id, patch);
   }) as typeof store.update;
-  const markDelivered = repo.messages.markDelivered;
-  repo.messages.markDelivered = async (tx, id, at) => {
-    if (currentSite() === "receipt") state.marked.push(id);
-    await markDelivered(tx, id, at);
-    // After its first row lock, so a held receipt holds that message's row.
-    if (keyedTx(tx) && currentSite() === "receipt" && state.marked.length === 1) await holdHere(`receipt ${id}`);
+  const deliver = repo.messages.deliver;
+  repo.messages.deliver = async (tx, recipients, ids, at) => {
+    const first = currentSite() === "receipt" && !state.marked.length;
+    if (currentSite() === "receipt") state.marked.push(...ids);
+    const out = await deliver(tx, recipients, ids, at);
+    // After its stamp's row locks, so a held receipt holds those messages' rows.
+    if (keyedTx(tx) && first && ids.length) await holdHere(`receipt ${ids[0]}`);
+    return out;
   };
   const acknowledge = repo.boards.acknowledge;
   repo.boards.acknowledge = async (tx, handle, ref, receiver) => {

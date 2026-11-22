@@ -273,11 +273,11 @@ describePg("session end races (Postgres)", () => {
   });
 
   // unreadFor's lock mode. Mutation: FOR SHARE instead of FOR KEY SHARE (it conflicts with a delivery stamp's NO KEY
-  // UPDATE, so every end would wait on any in-flight markDelivered of its mail).
+  // UPDATE, so every end would wait on any in-flight delivery stamp of its mail).
   test("a held delivery stamp on the ID's unread mail doesn't make the end wait; the message still bounces", async () => {
     await using p = await pgPair();
     const { repo, mail } = await world(p);
-    const r = await race(p, tx => repo.messages.markDelivered(tx, mail, T0 + 5), end(repo));
+    const r = await race(p, tx => repo.messages.deliver(tx, [R], [mail], T0 + 5), end(repo));
     committed(r.a);
     expect(outcome(r.b)).toMatchObject({ ended: true });
     expect((await mailTo(p, BBE)).map(m => m.kind)).toEqual(["bounce"]);
