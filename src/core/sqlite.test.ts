@@ -199,3 +199,24 @@ test("BUS_TEST_BUSY_TIMEOUT_MS only raises the busy timeout, capped at 60 s", ()
   expect(busyTimeoutMs("20000")).toBe(20000);
   expect(busyTimeoutMs("999999")).toBe(60000);
 });
+
+// #1623: the knob reaches the connections a child opens, the writer (openSqlite) and the reader (openReader). The
+// constant is read at module load, so only a fresh process shows it. Mutation: dropping either PRAGMA fails it.
+test("a child started with BUS_TEST_BUSY_TIMEOUT_MS opens its connections with that busy timeout", () => {
+  dir = mkdtempSync(join(tmpdir(), "gb-sqlite-"));
+  const script = `
+    import { openReader, openSqlite } from ${JSON.stringify(join(import.meta.dir, "sqlite.ts"))};
+    const path = process.argv[1];
+    const db = openSqlite(path, "PRAGMA journal_mode = WAL;", () => {});
+    const reader = openReader(path);
+    console.log(JSON.stringify([db.prepare("PRAGMA busy_timeout").get(), reader.prepare("PRAGMA busy_timeout").get()]));
+    reader.close(); db.close();`;
+  const timeouts = (env: Record<string, string>) => {
+    const child = Bun.spawnSync([process.execPath, "-e", script, join(dir, "a.db")], { env: { ...process.env, BUS_TEST_BUSY_TIMEOUT_MS: "", ...env }, stderr: "pipe" });
+    expect(child.stderr.toString()).toBe("");
+    expect(child.exitCode).toBe(0);
+    return JSON.parse(child.stdout.toString());
+  };
+  expect(timeouts({ BUS_TEST_BUSY_TIMEOUT_MS: "20000" })).toEqual([{ timeout: 20000 }, { timeout: 20000 }]);
+  expect(timeouts({})).toEqual([{ timeout: 5000 }, { timeout: 5000 }]);
+});
