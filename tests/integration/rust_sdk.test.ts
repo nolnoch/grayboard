@@ -17,6 +17,7 @@ import { afterEach, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
 import { HostedSession } from "../support/hosted_session.ts";
 import { hostedServer, type HostedServer } from "../support/hosted_oauth.ts";
+import { rows as repoRows } from "../support/repo_sql.ts";
 import { until } from "../support/until.ts";
 
 const example = process.env.GRAYBOARD_RUST_EXAMPLE;
@@ -37,8 +38,8 @@ async function roundtrip(auth: "credentials" | "static") {
   expect(existsSync(example!)).toBe(true);
   srv = await hostedServer({ admins: [ROOT] }, EMAIL);
   const s = srv;
-  const db = s.app.db;
-  const rows = <T>(sql: string, ...args: (string | number)[]) => db.query(sql).all(...args) as T[];
+  // Through repo_sql, so the run asserts the same rows on a SQLite or a Postgres server (GRAYBOARD_TEST_BACKEND).
+  const rows = <T>(sql: string, ...args: (string | number)[]) => repoRows<T>(s, sql, ...args);
   const root = await s.login(ROOT);
   await s.login(EMAIL);
   const admin = async (path: string, body: unknown, status = 201) => {
@@ -81,12 +82,12 @@ async function roundtrip(auth: "credentials" | "static") {
   // Post only once the Rust session is subscribed and holds an open lease, so the item reaches it through its stream.
   // Its session ID arrived under the generic key (the credential's source) and its grant is the example's credential.
   // An example that exited early (a missing variable, a refused token) fails here with its exit code and stderr.
-  await until(() => run.exitCode !== null || rows(`SELECT 1 FROM subscriptions WHERE board = 'work' AND handle = ? AND mode = 'push'`, RUST).length === 1
-    && rows(`SELECT 1 FROM hosted_sessions WHERE source_session_id = ? AND client_id = ? AND lease_deadline IS NOT NULL`, SESSION, rust.client_id).length === 1, 30_000, "the Rust session subscribed with an open lease");
+  await until(async () => run.exitCode !== null || (await rows(`SELECT 1 FROM subscriptions WHERE board = 'work' AND handle = ? AND mode = 'push'`, RUST)).length === 1
+    && (await rows(`SELECT 1 FROM hosted_sessions WHERE source_session_id = ? AND client_id = ? AND lease_deadline IS NOT NULL`, SESSION, rust.client_id)).length === 1, 30_000, "the Rust session subscribed with an open lease");
   if (run.exitCode !== null) { const [code, out, err] = await output; expect({ code, out, err }).toBeUndefined(); }
   const posted = await invoker.call<{ post_id: number }>("board_post", { board: "work", body: "work item" });
   const key = `queue:work:${posted.post_id}`;
-  expect(rows(`SELECT holder FROM claims WHERE key = ?`, key)).toEqual([{ holder: RUST }]);
+  expect(await rows(`SELECT holder FROM claims WHERE key = ?`, key)).toEqual([{ holder: RUST }]);
   const sent = await svcPeer.call<{ message_id: number }>("dm_send", { to: RUST, body: "a direct message" });
 
   const [code, out, err] = await output;
@@ -98,17 +99,17 @@ async function roundtrip(auth: "credentials" | "static") {
   expect(out).not.toContain(rust.client_secret);
 
   // The reply is in the item's thread, written as the service's name, and released the queue claim.
-  expect(rows(`SELECT author, body FROM posts WHERE parent_id = ?`, posted.post_id)).toEqual([{ author: RUST, body: "done" }]);
-  expect(rows(`SELECT holder FROM claims WHERE key = ?`, key)).toEqual([]);
+  expect(await rows(`SELECT author, body FROM posts WHERE parent_id = ?`, posted.post_id)).toEqual([{ author: RUST, body: "done" }]);
+  expect(await rows(`SELECT holder FROM claims WHERE key = ?`, key)).toEqual([]);
   // The DM was acked by its reader.
-  expect(rows(`SELECT reader FROM dm_acks WHERE message_id = ?`, sent.message_id)).toEqual([{ reader: RUST }]);
+  expect(await rows(`SELECT reader FROM dm_acks WHERE message_id = ?`, sent.message_id)).toEqual([{ reader: RUST }]);
   // The session ended: its hosted row is gone.
-  expect(rows(`SELECT 1 FROM hosted_sessions WHERE source_session_id = ?`, SESSION)).toEqual([]);
+  expect(await rows(`SELECT 1 FROM hosted_sessions WHERE source_session_id = ?`, SESSION)).toEqual([]);
   // With its credential the example minted one run token and revoked it at the end; with a static token it revokes
   // nothing (the launcher holds the token). The other credential's token is untouched either way.
   const tokens = (clientId: string) => rows<{ revoked: number }>(`SELECT t.revoked_at IS NOT NULL AS revoked FROM oauth_tokens t JOIN service_credentials c ON c.grant_id = t.grant_id WHERE c.client_id = ?`, clientId);
-  expect(tokens(rust.client_id)).toEqual([{ revoked: auth === "credentials" ? 1 : 0 }]);
-  expect(tokens(other.client_id)).toEqual([{ revoked: 0 }]);
+  expect(await tokens(rust.client_id)).toEqual([{ revoked: auth === "credentials" ? 1 : 0 }]);
+  expect(await tokens(other.client_id)).toEqual([{ revoked: 0 }]);
 }
 
 test.skipIf(!example)("the Rust roundtrip example mints its own token as a service and works a queue item and a DM from its delivery stream", () => roundtrip("credentials"), 90_000);
