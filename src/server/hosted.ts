@@ -1013,7 +1013,9 @@ export function createHostedSessions(application: Application, options: { now?: 
       plan: (session: ApplicationSession) => Promise<P | undefined>; keys: (plan: P) => string[];
       write: (<V>(keys: readonly string[], fn: (tx: Tx) => Promise<V>) => Promise<V>) | undefined;
       fn: (session: ApplicationSession, tx: Tx, plan: P) => Promise<T>;
-    }): Promise<T> {
+    },
+    // A pure read under a write tool's name (the board snapshot resource, `readResource`): KEYED_READS's path.
+    pure?: true): Promise<T> {
     const toolMethod: GateMethod = (TOOL_METHODS as readonly string[]).includes(tool) ? tool as GateMethod : "other";
     const body = async (row: HostedSession | undefined) => {
       const taken = told ? await takeLost(p, row, "agent") : [];
@@ -1054,7 +1056,7 @@ export function createHostedSessions(application: Application, options: { now?: 
             countGate("tool", "miss", toolMethod);
           }
         } else if (keyed) countGate("tool", "skipped", toolMethod);
-        else if (KEYED_READS.has(tool) && keyedFast && keyedTools && row && root) {
+        else if ((KEYED_READS.has(tool) || pure) && keyedFast && keyedTools && row && root) {
           // A read tool's body keyed on its root (#1604, D4): the fence locks the row and root as the exclusive body's
           // does, then `fn` runs in a read-only probe. A write it would make (a cursor, an afterCommit effect) refuses
           // before its statement and the call runs the exclusive body, as does a refusal (its refusal rows, deferred
@@ -1142,6 +1144,12 @@ export function createHostedSessions(application: Application, options: { now?: 
     // fires while they wait in the write queue; the end-of-call touch and refusal rows always run.
     async run<T>(p: OAuthPrincipal, context: SessionContext, tool: string, fn: (session: ApplicationSession, tx: Tx) => T | Promise<T>, told?: (notice: string) => void, prior?: Verdict, signal?: AbortSignal): Promise<T> {
       return runTool(p, context, tool, fn, told, prior, signal);
+    },
+    // A board's snapshot resource (`mcp-resources.ts` resources/read): `run` under board_read's name and gate, its body
+    // keyed on the root in a read-only probe on Postgres (#1604), as the read tools' are. The snapshot writes nothing
+    // (no cursor, no outbox); a write it ever made would refuse in the probe and run the exclusive body.
+    async readResource<T>(p: OAuthPrincipal, context: SessionContext, fn: (session: ApplicationSession, tx: Tx) => T | Promise<T>): Promise<T> {
+      return runTool(p, context, "board_read", fn, undefined, undefined, undefined, undefined, true);
     },
     // The dm_send tool: `run`, with a keyed body first on Postgres (#1537 PR 5, docs/future/postgres-server.md D4).
     async dmSend(p: OAuthPrincipal, context: SessionContext, to: string, body: string, options: Parameters<Application["send"]>[4] = {}, told?: (notice: string) => void, prior?: Verdict, signal?: AbortSignal) {
