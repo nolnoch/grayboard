@@ -50,6 +50,12 @@ export const MCP_PROTOCOL_VERSIONS = ["2026-07-28", "2025-11-25", "2025-06-18"];
 class EndpointClosedError extends Error { override name = "EndpointClosedError"; }
 // A request the closing endpoint refused before dispatch (closedError): a server cut, whatever its signal says.
 class RequestClosedError extends Error { override name = "RequestClosedError"; constructor() { super("MCP request is closed"); } }
+// The listener's idle timeout (app.ts `idleTimeout`): Bun closes a connection silent this long. A handler that hasn't
+// answered is silent, so the request deadline below fires first and the cut is the server's, logged as such (#1591).
+export const IDLE_TIMEOUT_S = 75;
+const REQUEST_DEADLINE_MS = (IDLE_TIMEOUT_S - 5) * 1000;
+// The reason a request's signal carries when its deadline passed before its handler answered (#1591).
+class RequestDeadlineError extends Error { override name = "RequestDeadlineError"; constructor() { super("MCP request passed the server's deadline"); } }
 type CallToolResult = z.infer<typeof CallToolResultSchema>;
 const id = z.number().int().positive();
 const ids = z.array(id);
@@ -85,7 +91,7 @@ type Bound = { row: HostedSession | undefined; root?: HostedSession };
 // notice that carried its facts into `bound`, so a raced re-read keeps those halves and takes its own for the rest (#1486).
 type Live = { context: Context; rows: Set<string>; bound: Bound; rechecking?: Context; noted?: Map<string, number>; uris: Map<string, string | null>; watches: string[]; stream?: OwnedStream; handler?: McpHttpHandler; legacy?: Legacy; stopped: boolean; hint(uri: string): void; stop(): void };
 
-export function createHostedMcp(application: Application, oauth: Pick<ReturnType<typeof createOAuthServer>, "authenticate" | "isAuthorized" | "peekAuthorized" | "isGrantActive" | "issuer" | "resource">, opts: { trustedOrigin: string; now?: () => number; limits?: McpLimits; caps?: HostedCaps; idleSeconds?: number; streamRecheckMs?: number; stopping?: () => boolean }) {
+export function createHostedMcp(application: Application, oauth: Pick<ReturnType<typeof createOAuthServer>, "authenticate" | "isAuthorized" | "peekAuthorized" | "isGrantActive" | "issuer" | "resource">, opts: { trustedOrigin: string; now?: () => number; limits?: McpLimits; caps?: HostedCaps; idleSeconds?: number; streamRecheckMs?: number; stopping?: () => boolean; requestDeadlineMs?: number }) {
   const now = opts.now ?? Date.now;
   const trustedOrigin = new URL(opts.trustedOrigin).origin;
   let closed = false, posts = 0, busListeners = 0;
@@ -129,8 +135,8 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
   // In-flight handlers (a listen stream's ends when its response starts): kept above the POST cap it contains.
   const exchangeCap = Math.max(512, 2 * limits.post.global);
   const bodyReads = new Set<Promise<unknown>>();
-  async function readBody(request: Request) {
-    const reading = readMcpBody(request, shutdown.signal);
+  async function readBody(request: Request, signal: AbortSignal) {
+    const reading = readMcpBody(request, shutdown.signal, signal);
     bodyReads.add(reading);
     try { return await reading; } finally { bodyReads.delete(reading); }
   }
@@ -174,16 +180,21 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
   const delivery = createDelivery(hosted, { isAuthorized: (principal, r) => oauth.isAuthorized(principal, r), now, caps: caps.leases });
   type Exchange = { request: Request; address: string; protocol: string; principal?: number; identity?: string; session?: string; tool?: string; logged?: boolean; failure?: ApplicationError; meta?: unknown; id?: string | number | null; method?: unknown; call?: unknown; refusal?: Response; context?: Context; legacy?: Legacy; lost?: boolean; closedAtFactory?: boolean };
   const exchanges = new AsyncLocalStorage<Exchange>();
+  const deadlineHit = (exchange: Exchange | undefined) => exchange?.request.signal.reason instanceof RequestDeadlineError;
+  const deadlineMs = opts.requestDeadlineMs ?? REQUEST_DEADLINE_MS;
   const refusalLogs = new RateLimiter({ burst: 1, perSec: 0.1 }, { start() {}, end() {} }, now, 4096);
   // A request its client abandoned (#1535: it aborted while the request waited, in the write queue or in `select`) is
   // the client's timeout, i.e. server latency, not a server failure: its own line and category, at warn. A request the
   // server cut (#1541) is neither: the endpoint closing, or the app stopping, which cuts every connection before it
   // closes the endpoint (app.ts stop, the only close outside unit tests), so an abort is a cut once `stopping` holds.
+  // A request whose deadline passed (#1591) is a server cut too, `cut: "deadline"`: its signal's first abort decides,
+  // so a client that gave up before the deadline is still client_aborted.
   const report = (error: unknown, source: FailureSource = "hosted-sdk", exchange = exchanges.getStore()) => {
     if (error instanceof ApplicationError || error instanceof CoreError || exchange?.failure || exchange?.refusal || exchange?.logged) return;
     if (exchange) exchange.logged = true;
-    if (error instanceof RequestClosedError || error instanceof RequestAbortedError && opts.stopping?.()) {
-      console.warn(`[grayboard] hosted MCP request cut by server: ${JSON.stringify({ principal: exchange?.principal, identity: exchange?.identity, session: exchange?.session, tool: exchange?.tool, protocol: exchange?.protocol, ...failureDiagnostic(source, error, "server_cut") })}`);
+    const deadline = error instanceof RequestDeadlineError || error instanceof RequestAbortedError && deadlineHit(exchange);
+    if (deadline || error instanceof RequestClosedError || error instanceof RequestAbortedError && opts.stopping?.()) {
+      console.warn(`[grayboard] hosted MCP request cut by server: ${JSON.stringify({ principal: exchange?.principal, identity: exchange?.identity, session: exchange?.session, tool: exchange?.tool, protocol: exchange?.protocol, ...failureDiagnostic(source, error, "server_cut"), ...(deadline ? { cut: "deadline" } : {}) })}`);
       return;
     }
     if (error instanceof RequestAbortedError) {
@@ -394,6 +405,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
   }
   // A closing endpoint's error (a server cut, #1541), else the client's abort (#1535), logged as client_aborted. The close
   // decides when both hold: a shutdown aborts the request's signal as it closes the endpoint.
+  const deadlineRefusal = () => new Response("MCP request passed the server's deadline; its write may have committed", { status: 503 });
   const closedError = (request: Request) => closed || !request.signal.aborted ? new RequestClosedError() : new RequestAbortedError();
   function binding(context: Context): Binding {
     return { user: context.principal.authed.user_id, email: context.principal.authed.user_email, grant: context.principal.grantId, role: context.role, identity: context.session.identityFull };
@@ -1093,9 +1105,15 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
       let finishRequest!: () => void;
       const pendingRequest = new Promise<void>(resolve => { finishRequest = resolve; });
       pendingRequests.add(pendingRequest);
+      // The handler's deadline (#1591): armed once the body is read and disarmed once the response starts, so it bounds
+      // only the silent wait the listener's idle timeout would otherwise cut; an upload or a stream is never silent.
+      const deadline = new AbortController();
+      const signal = AbortSignal.any([original.signal, deadline.signal]);
+      let timer: ReturnType<typeof setTimeout> | undefined;
       try {
-        const body = post ? await readBody(original) : { request: original, parsedBody: undefined };
+        const body = post ? await readBody(original, signal) : { request: new Request(original.url, { method: original.method, headers: original.headers, signal }), parsedBody: undefined };
         if (body instanceof Response) { releasePost(); return body; }
+        timer = setTimeout(() => deadline.abort(new RequestDeadlineError()), deadlineMs);
         const req = body.request;
         const parsed = body.parsedBody as { id?: string | number | null; method?: unknown; params?: { _meta?: unknown; name?: unknown } } | undefined;
         return await exchanges.run({ ...boundary, request: req, meta: parsed?.params?._meta, id: parsed?.id, method: parsed?.method, call: parsed?.method === "tools/call" ? parsed.params?.name : undefined }, async () => {
@@ -1216,6 +1234,13 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
               if (dispatched) report(new EndpointClosedError(), "hosted-sdk");
               response = new Response(dispatched ? "MCP endpoint closed during the call" : "MCP endpoint is closed", { status: 503 });
             }
+            // A call its deadline unwound: the SDK answers it 499, or the factory's check 500. 503, as a close's cut, says
+            // its write may have committed.
+            if (!closed && deadlineHit(exchange) && (response.status === 499 || response.status === 500)) {
+              report(new RequestDeadlineError(), "hosted-sdk");
+              await response.body?.cancel();
+              response = deadlineRefusal();
+            }
             const done = () => { releaseListen?.(); releasePost(); };
             return wrap(response, exchange.context, live, done);
           } catch (error) {
@@ -1229,6 +1254,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
             if (exchange.refusal && !closed && !req.signal.aborted) return exchange.refusal;
             // A call in flight when the endpoint closes gets the same answer as one arriving after (#1336).
             if (closed) return new Response("MCP endpoint is closed", { status: 503 });
+            if (deadlineHit(exchange)) { report(new RequestDeadlineError(), "hosted-fetch"); return deadlineRefusal(); }
             if (error instanceof ApplicationError && error.code !== "internal" || error instanceof CoreError) {
               const badRequest = error instanceof ApplicationError && error.code === "bad_request";
               return Response.json({ code: badRequest ? "bad_request" : "not_found", message: badRequest ? "invalid resource request" : "resource not found" }, { status: badRequest ? 400 : 404 });
@@ -1237,7 +1263,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
           }
         });
       } catch (error) { report(error, "hosted-fetch", boundary); releasePost(); return Response.json({ code: "internal", message: "internal error" }, { status: 500 }); }
-      finally { pendingRequests.delete(pendingRequest); finishRequest(); }
+      finally { clearTimeout(timer); pendingRequests.delete(pendingRequest); finishRequest(); }
     },
     async close() {
       closed = true;

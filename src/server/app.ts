@@ -6,7 +6,7 @@ import { handleHttp, isJsonRequest, signInRoute } from "./http.ts";
 import { AuthGate, type Caller } from "./auth_gate.ts";
 import { userAgent } from "./audit.ts";
 import { inRequest } from "./request_context.ts";
-import { createHostedMcp } from "./mcp.ts";
+import { createHostedMcp, IDLE_TIMEOUT_S } from "./mcp.ts";
 import { createMcpAttachments } from "./mcp-attachments.ts";
 import { createOAuthServer, type OAuthOptions } from "./oauth.ts";
 import { UploadGate } from "./uploads.ts";
@@ -233,7 +233,7 @@ export function startServer(config: Config, opts: StartOptions = {}) {
   const server = Bun.serve({
     hostname: opts.hostname,
     port: config.httpPort,
-    idleTimeout: 75,
+    idleTimeout: IDLE_TIMEOUT_S,
     // The largest body is an attachment upload (src/server/http.ts); the
     // margin covers a JSON request carrying a full message body.
     maxRequestBodySize: repo.attachmentLimits.file + MAX_BODY_BYTES,

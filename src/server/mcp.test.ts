@@ -26,6 +26,7 @@ import { sessionEndPort } from "./session_end.ts";
 import { scratchDbPath } from "../../tests/support/scratch_db.ts";
 import { seed } from "../../tests/support/seed.ts";
 import { until } from "../../tests/support/until.ts";
+import { holdWrites } from "../../tests/support/write_hold.ts";
 import { TEST_BACKEND } from "../../tests/support/server.ts";
 import { drained, execOn, pgText, row, rows } from "../../tests/support/repo_sql.ts";
 import { NO_MEMBER_AUTHORITY } from "./store/identity.ts";
@@ -136,7 +137,7 @@ test("legacy identity headers cannot select or create names; explicit bind retai
   expect(hosted.activeContexts).toBe(0);
 });
 
-async function connect(version = "2026-07-28", intercept?: (response: Response, request: Request) => Promise<void>, headers?: Headers, observeRequest?: (request: Request) => void, routing: Record<string, unknown> = meta) {
+async function connect(version = "2026-07-28", intercept?: (response: Response, request: Request) => Promise<void>, headers?: Headers, observeRequest?: (request: Request) => void, routing: Record<string, unknown> = meta, rewrite?: (request: Request) => Request) {
   const client = new Client({ name: "unit", version: "1" }, {
     supportedProtocolVersions: [version], versionNegotiation: { mode: version === "2026-07-28" ? { pin: version } : "legacy" },
   });
@@ -152,7 +153,7 @@ async function connect(version = "2026-07-28", intercept?: (response: Response, 
       }
       headers?.forEach((value, key) => request.headers.set(key, value));
       observeRequest?.(request);
-      const response = await hosted.fetch(request);
+      const response = await hosted.fetch(rewrite ? rewrite(request) : request);
       await intercept?.(response, request);
       return response;
     },
@@ -2238,4 +2239,96 @@ test("#1216: a team removal stops a legacy stream on the tick whose board check 
   expect(failures()).toEqual([]);
   abort.abort(); await get.body?.cancel().catch(() => {});
   await raw.delete();
+});
+
+// #1591: the request deadline, set short here. It bounds only a handler's silent wait, as Bun's idle timeout would.
+async function deadlined(ms: number) {
+  await hosted.close();
+  hosted = createHostedMcp(application, oauth, { trustedOrigin: "https://grayboard.example.com:443", requestDeadlineMs: ms });
+}
+const cutLines = () => {
+  const lines: string[] = [];
+  const said = spyOn(console, "error").mockImplementation((...args: unknown[]) => { lines.push(args.join(" ")); });
+  const warned = spyOn(console, "warn").mockImplementation((...args: unknown[]) => { lines.push(args.join(" ")); });
+  return { lines, restore() { said.mockRestore(); warned.mockRestore(); } };
+};
+
+// A call held in the write queue past its deadline is the server's cut (a line Bun's idle cut would have made
+// client_aborted), answered 503, and its write never runs. Mutation: report() without the deadline arm logs client_aborted.
+test("a call past its request deadline in the write queue logs server_cut with cut deadline and answers 503 (#1591)", async () => {
+  await deadlined(300);
+  const statuses: number[] = [];
+  let target = false;
+  const client = await connect(undefined, async response => { if (target) statuses.push(response.status); });
+  const log = cutLines();
+  const hold = holdWrites(store.repo);
+  try {
+    await until(() => hold.started, 5_000, "the write hold runs");
+    target = true;
+    const settled = await client.callTool({ name: "board_create", arguments: { name: "late", purpose: "deadline" } }).then(r => ({ result: r }), (error: unknown) => ({ error }));
+    expect("error" in settled).toBe(true);
+  } finally {
+    hold.release();
+    await hold.done;
+    log.restore();
+  }
+  expect(statuses).toEqual([503]);
+  expect(log.lines.filter(l => l.includes("hosted MCP failed") || l.includes("hosted MCP client aborted"))).toEqual([]);
+  const cut = log.lines.filter(l => l.includes("hosted MCP request cut by server"));
+  expect(cut).toHaveLength(1);
+  expect(cut[0]).toContain('"category":"server_cut"');
+  expect(cut[0]).toContain('"cut":"deadline"');
+  await drained(store.repo);
+  expect(await rows(store.repo, "SELECT name FROM boards WHERE name = 'late'")).toEqual([]);
+});
+
+// The deadline starts once the body is read: a body that keeps arriving past it is never cut. Mutation: arming the timer
+// before readBody cuts this call.
+test("a POST whose body keeps streaming past the deadline isn't cut (#1591)", async () => {
+  await deadlined(200);
+  const dribble = (request: Request) => {
+    if (request.method !== "POST" || !request.body) return request;
+    const source = request.body;
+    const body = new ReadableStream<Uint8Array>({
+      async start(controller) {
+        const bytes = new Uint8Array(await new Response(source).arrayBuffer());
+        const step = Math.ceil(bytes.length / 6);
+        for (let i = 0; i < bytes.length; i += step) { controller.enqueue(bytes.subarray(i, i + step)); await Bun.sleep(100); }
+        controller.close();
+      },
+    });
+    return new Request(request.url, { method: request.method, headers: request.headers, body, signal: request.signal, duplex: "half" } as RequestInit);
+  };
+  let slow = false;
+  const client = await connect(undefined, undefined, undefined, undefined, meta, request => slow ? dribble(request) : request);
+  const log = cutLines();
+  try {
+    slow = true;
+    const started = performance.now();
+    const result = await client.callTool({ name: "board_create", arguments: { name: "slow", purpose: "a slow upload" } });
+    expect(performance.now() - started).toBeGreaterThan(400);
+    expect(result.isError).not.toBe(true);
+  } finally { log.restore(); }
+  expect(log.lines.filter(l => l.includes("hosted MCP"))).toEqual([]);
+});
+
+// The deadline is disarmed once the response starts: a listen stream outlives it and still delivers. Mutation: clearing
+// the timer only when the stream ends cuts the listen at the deadline.
+test("a listen stream outlives the request deadline and still delivers (#1591)", async () => {
+  await deadlined(200);
+  const client = await connect();
+  expect((await client.callTool({ name: "board_create", arguments: { name: "stream", purpose: "deadline" } })).isError).not.toBe(true);
+  const hints: string[] = [];
+  client.setNotificationHandler("notifications/resources/updated", n => { hints.push(n.params.uri); });
+  const log = cutLines();
+  try {
+    const listen = await client.listen({ resourceSubscriptions: ["grayboard://boards/stream"] });
+    await untilHosted(() => hosted.activeListens === 1);
+    await Bun.sleep(600); // three deadlines: the time passing is what's under test
+    expect(hosted.activeListens).toBe(1);
+    expect((await client.callTool({ name: "board_post", arguments: { board: "stream", body: "after the deadline" } })).isError).not.toBe(true);
+    await until(() => hints.includes("grayboard://boards/stream"), 5_000, "the post's hint on the listen");
+    await listen.close();
+  } finally { log.restore(); }
+  expect(log.lines.filter(l => l.includes("hosted MCP"))).toEqual([]);
 });
