@@ -114,7 +114,7 @@ export function startServer(config: Config, opts: StartOptions = {}) {
     disconnectUser, userChanged: id => slack?.userChanged(id), background: (what, run) => background(what, () => run()),
   }, opts.oauth?.now ?? (() => repo.now()));
   const oauth = createOAuthServer(repo, config, { ...opts.oauth, providers, recheck });
-  const mcp = createHostedMcp(application, oauth, { trustedOrigin: new URL(config.publicUrl).origin, now: opts.now, limits: config.mcpLimits, caps: config.hostedCaps, ...(config.hostedIdleSeconds ? { idleSeconds: config.hostedIdleSeconds } : {}) });
+  const mcp = createHostedMcp(application, oauth, { trustedOrigin: new URL(config.publicUrl).origin, stopping: () => stopping, now: opts.now, limits: config.mcpLimits, caps: config.hostedCaps, ...(config.hostedIdleSeconds ? { idleSeconds: config.hostedIdleSeconds } : {}) });
   const mcpPath = new URL(oauth.resource).pathname;
 
   // A Slack outage or bad token mustn't take the bus down: log and run without it.
