@@ -283,15 +283,18 @@ test("hosted entry point uses frozen package commands and retains no private sta
   }
 });
 
-// #1482: test-pg names its files explicitly, so a new pg-only test (`*.pg.test.ts`, which skips without a Postgres URL)
-// must be listed there too, or only the root job's incidental Postgres URL ever runs it.
-// The converse too: bun test given several ./ paths skips a missing one silently, so a renamed listed file would drop out.
-test("test-pg lists every *.pg.test.ts in the tree, and every file it lists exists", () => {
+// #1482, #1408: test-pg finds its files under fixed roots rather than listing them, so a new pg-only test
+// (`*.pg.test.ts`, which skips without a Postgres URL) runs there only if it lives under one of those roots.
+test("test-pg finds every *.pg.test.ts in the tree", () => {
   const step = (Bun.YAML.parse(read(".github/workflows/test.yml")) as any).jobs["test-pg"]?.steps.find((s: any) => s.name === "Test on Postgres");
   expect(step, "test-pg's 'Test on Postgres' step not found").toBeDefined();
-  const listed = new Set((step.run as string).split("\n").map(line => line.trim()).filter(line => line.endsWith(".test.ts")));
+  const find = (step.run as string).split("\n").map(line => line.trim()).find(line => line.includes("find "));
+  expect(find, "test-pg's step has no find line").toBeDefined();
+  expect(find, "test-pg excludes a file").not.toContain("!");
+  const roots = [...find!.matchAll(/\.\/([\w/.-]+)/g)].map(m => m[1]!.replace(/\/$/, "") + "/");
+  expect(roots.length).toBeGreaterThan(0);
+  for (const r of roots) expect(existsSync(resolve(root, r)), `test-pg root ${r} is missing`).toBe(true);
   const present = [...new Bun.Glob("{src,tests,adapters,plugins}/**/*.pg.test.ts").scanSync({ cwd: root })].filter(path => !path.includes("node_modules/")).sort();
   expect(present.length).toBeGreaterThan(0);
-  expect(present.filter(path => !listed.has(path))).toEqual([]);
-  expect([...listed].filter(path => !existsSync(resolve(root, path)))).toEqual([]);
+  expect(present.filter(path => !roots.some(r => path.startsWith(r)))).toEqual([]);
 });
