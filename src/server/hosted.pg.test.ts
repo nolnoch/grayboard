@@ -1572,22 +1572,26 @@ describePg("keyed renew and receipt (Postgres)", () => {
 });
 
 describePg("keyed renew and receipt rows (Postgres)", () => {
-  // One script on two databases: keyed (receipts of DMs and a broadcast push, renews) with misses (a queue board's
-  // push, whose first ack credits its take; a stale capability's renew and receipt, each refused and audited once by
-  // the exclusive body), and the same with the keyed path off. Mutations: keyedOr letting a queue board's receipt run
-  // keyed (the store's backstop refuses it: the receipt rejects); the miss path skipping the exclusive body (the
-  // rows differ); a stale capability counted as the request's in the keyed body (audited twice or not at all).
+  // One script on two databases: keyed (receipts of DMs, a broadcast push, a queue board's push whose first ack credits
+  // its take (#1595), one receipt of a DM and pushes on a broadcast board and two queue boards, the invoker's receipt of
+  // a lane's reply, renews) with misses (a stale capability's renew and receipt, each refused and audited once by the
+  // exclusive body), and the same with the keyed path off. Mutations: the miss path skipping the exclusive body (the
+  // rows differ); a stale capability counted as the request's in the keyed body (audited twice or not at all). A skipped
+  // or misdirected take credit is not caught here: the lane is bound when the take is logged, so the credit rewrites the
+  // same session; `boards.pg.test.ts` kills that one by binding the holder after the take.
   test("miss-then-exclusive writes the same rows as the exclusive bodies alone", async () => {
+    let lastFe = "";
     const script = async (x: LeaseInstance, sql: Awaited<ReturnType<typeof pgDatabase>>["sql"]) => {
       const p = await leasePrincipal(x, sql);
       const tool = (source: string, name: string, args: Record<string, unknown>) =>
         x.hosted.run(p, ctx(p, source), name, (session, tx) => x.application.call(tx, session, name, args));
-      await x.hosted.bind(p, ctx(p, "root-s"), { name: "ops", create: true });
+      const ops = await leased(x, p, "root-s", "ops");
       await tool("root-s", "board_create", { name: "b1", purpose: "broadcast" });
       await tool("root-s", "board_create", { name: "q1", purpose: "queue", kind: "queue" });
-      const { c, lease } = await leased(x, p, "root-a", "fe");
-      await tool("root-a", "board_subscribe", { board: "b1", mode: "push" });
-      await tool("root-a", "board_subscribe", { board: "q1", mode: "push" });
+      await tool("root-s", "board_create", { name: "q2", purpose: "queue", kind: "queue" });
+      const { c, lease, id: fe } = await leased(x, p, "root-a", "fe");
+      lastFe = fe;
+      for (const board of ["b1", "q1", "q2"]) await tool("root-a", "board_subscribe", { board, mode: "push" });
       // A fixed key, so the sender's ID is the same in both runs.
       const sender = new AppSession(x.application, x.repo, p.authed, "be", { push: false, key: "rows-sender-key" });
       await sender.connect();
@@ -1604,6 +1608,18 @@ describePg("keyed renew and receipt rows (Postgres)", () => {
         await x.delivery.receipt(p, c, lease.capability, [items[1]!.id, items[0]!.id]); x.advance(10);
         await x.delivery.receipt(p, c, lease.capability, [items[2]!.id]); x.advance(10);
         await x.delivery.receipt(p, c, lease.capability, [items[3]!.id]); x.advance(10);
+        // One receipt of a DM and pushes on b1, q1 and q2.
+        await sender.send(`${ME}/fe`, "three"); x.advance(10);
+        for (const board of ["b1", "q1", "q2"]) { await tool("root-s", "board_post", { board, body: `mixed ${board}` }); x.advance(10); }
+        const mixed = await x.delivery.pending(p, c, lease.capability);
+        expect(mixed.map(i => i.id.split(":")[0])).toEqual(["direct", "push", "push", "push"]);
+        await x.delivery.receipt(p, c, lease.capability, mixed.map(i => i.id)); x.advance(10);
+        // fe answers q1's first job: a thread push to ops, whose receipt is the invoker's.
+        const job = (items[3]!.event as { item: { post: { id: number } } }).item.post.id;
+        await tool("root-a", "board_post", { board: "q1", body: "done", parent_id: job }); x.advance(10);
+        const answered = await x.delivery.pending(p, ops.c, ops.lease.capability);
+        expect(answered).toHaveLength(1);
+        await x.delivery.receipt(p, ops.c, ops.lease.capability, answered.map(i => i.id)); x.advance(10);
         await x.delivery.renew(p, c, lease.capability); x.advance(10);
         await expect(x.delivery.renew(p, c, "no-such-capability")).rejects.toHaveProperty("code", "not_found"); x.advance(10);
         await expect(x.delivery.receipt(p, c, lease.capability, ["direct:999999"])).rejects.toHaveProperty("code", "not_found"); x.advance(10);
@@ -1627,12 +1643,18 @@ describePg("keyed renew and receipt rows (Postgres)", () => {
     await using refDb = await pgDatabase({ max: 2 });
     let fastRows: Record<string, string[]>, refRows: Record<string, string[]>, fast: Awaited<ReturnType<typeof script>>, ref: Awaited<ReturnType<typeof script>>;
     { await using x = await leaseInstance(fastDb.url, { side: "fast" }); fast = await script(x, fastDb.sql); fastRows = await dump(fastDb.sql); }
+    const fastFe = lastFe;
     { await using x = await leaseInstance(refDb.url, { side: "ref", keyed: false }); ref = await script(x, refDb.sql); refRows = await dump(refDb.sql); }
-    expect(fast).toEqual({ renew: { keyed: 2, miss: 1, skipped: 0 }, receipt: { keyed: 2, miss: 2, skipped: 0 } });
-    expect(ref).toEqual({ renew: { keyed: 0, miss: 0, skipped: 3 }, receipt: { keyed: 0, miss: 0, skipped: 4 } });
+    expect(fast).toEqual({ renew: { keyed: 2, miss: 1, skipped: 0 }, receipt: { keyed: 5, miss: 1, skipped: 0 } });
+    expect(ref).toEqual({ renew: { keyed: 0, miss: 0, skipped: 3 }, receipt: { keyed: 0, miss: 0, skipped: 6 } });
     expect(fastRows).toEqual(refRows);
-    // The rows the receipts wrote: both DMs delivered, the take credited, two stale-capability audits.
+    // The rows the receipts wrote: every DM delivered, both boards' takes credited to fe's session, every push to fe and
+    // the reply to ops delivered, two stale-capability audits.
     expect(fastRows.messages!.every(r => !r.includes('"delivered_at":null'))).toBe(true);
+    const takes = fastRows.claim_events!.filter(r => r.includes('"event":"take"'));
+    expect(takes).toHaveLength(3);
+    expect(takes.every(r => r.includes(`"session_id":"${fastFe}"`))).toBe(true);
+    expect(fastRows.outbox!.every(r => !r.includes('"delivered_at":null'))).toBe(true);
     expect(fastRows.access_log!.filter(r => r.includes("hosted.stale_capability"))).toHaveLength(2);
   });
 });
@@ -2702,6 +2724,265 @@ describePg("keyed board_post rows (Postgres)", () => {
     expect(fastRows.access_log!.filter(r => r.includes('"request.replayed"'))).toHaveLength(1);
     expect(fastRows.claim_events).toHaveLength(2);
     expect(fastRows.claims).toEqual([]);
+  });
+});
+
+// #1595 (docs/future/postgres-server.md D4): a receipt of a queue board's push runs keyed on `root:<root>` plus
+// `board:<name>` for each queue board among its pushes, planned before the body from the lease's issued items and a
+// board-kind cache; the probe misses on a queue board the plan left out. Every wait has a deadline.
+const takeCredit = async (sql: Awaited<ReturnType<typeof pgDatabase>>["sql"], board: string, job: number) =>
+  (await sql`SELECT session_id FROM claim_events WHERE key = ${`queue:${board}:${job}`} AND event = 'take'`).map((r: { session_id: string | null }) => r.session_id);
+const deliveredTo = async (sql: Awaited<ReturnType<typeof pgDatabase>>["sql"], handle: string, post: number) =>
+  (await sql`SELECT delivered_at FROM outbox WHERE handle = ${handle} AND post_id = ${post}`).map((r: { delivered_at: unknown }) => r.delivered_at !== null);
+// Pool reads of a board outside any write body (the receipt plan's kind read on a board's first sighting among them); `gateFirst`, while set, holds the next such read until it opens.
+function countBoardReads(x: LeaseInstance) {
+  const reads = { n: 0, gateFirst: undefined as Gate | undefined, reached: false };
+  const get = x.repo.boards.get;
+  x.repo.boards.get = (async (r: Parameters<typeof get>[0], name: string) => {
+    if (r === x.repo.read && currentSite() === undefined) {
+      reads.n++;
+      const g = reads.gateFirst;
+      if (g) { reads.gateFirst = undefined; reads.reached = true; await g.wait; }
+    }
+    return get(r, name);
+  }) as typeof get;
+  return reads;
+}
+const within = <T>(q: Promise<T>, ms: number, what: string) => Promise.race([q, new Promise<never>((_, rej) => setTimeout(() => rej(new Error(`deadline: ${what}`)), ms))]);
+
+describePg("keyed queue receipt (#1595) (Postgres)", () => {
+  // The lane's receipt of its rotated push, and the invoker's receipt of the lane's reply (a thread push on the same
+  // queue board: reason thread, no take of the invoker's to credit), each run keyed. Mutations: the probe's queue-board
+  // miss left in (miss 1); the plan omitted, keys root only (the probe misses: miss 1); the plan and the probe check both
+  // dropped (the store refuses the credit: the receipt rejects); the plan keeping only `subscription` pushes or the
+  // claim holder's (the invoker's receipt misses).
+  test("a lane's receipt of a queue push and the invoker's receipt of its reply run keyed", async () => {
+    await using db = await pgDatabase({ max: 2 });
+    await using x = await leaseInstance(db.url);
+    const p = await leasePrincipal(x, db.sql);
+    const s1 = await leased(x, p, "root-s1", "s1"), l = await leased(x, p, "root-l", "lane");
+    await boardTool(x, p, "root-s1", "board_create", { name: "q1", purpose: "queue", kind: "queue" });
+    await boardTool(x, p, "root-l", "board_subscribe", { board: "q1", mode: "push" });
+    const job = postId(await post(x, p, "root-s1", { board: "q1", body: "job" }));
+    expect((await x.delivery.pending(p, l.c, l.lease.capability)).map(i => i.id)).toEqual([`push:${job}`]);
+    const d = renewDelta("receipt");
+    await x.delivery.receipt(p, l.c, l.lease.capability, [`push:${job}`]);
+    expect(d()).toEqual({ keyed: 1, miss: 0, skipped: 0 });
+    expect(await deliveredTo(db.sql, `${ME}/lane`, job)).toEqual([true]);
+    expect(await takeCredit(db.sql, "q1", job)).toEqual([l.id]);
+    const reply = postId(await post(x, p, "root-l", { board: "q1", body: "done", parent_id: job }));
+    expect((await x.delivery.pending(p, s1.c, s1.lease.capability)).map(i => i.id)).toEqual([`push:${reply}`]);
+    await x.delivery.receipt(p, s1.c, s1.lease.capability, [`push:${reply}`]);
+    expect(d()).toEqual({ keyed: 2, miss: 0, skipped: 0 });
+    expect(await deliveredTo(db.sql, `${ME}/s1`, reply)).toEqual([true]);
+  });
+
+  // A pending that issues the receipt's id after the plan (testPause `delivery:receipt:planned`) puts an unplanned queue
+  // board in the body's records: the probe misses and the exclusive body acknowledges it. Mutations: the probe check
+  // judging boards re-derived from the records instead of the planned set (keyed without the key: the store refuses,
+  // the receipt rejects); the probe check dropped (the same).
+  test("a queue push issued after the receipt's plan misses, and the exclusive body acknowledges it", async () => {
+    await using db = await pgDatabase({ max: 2 });
+    await using x = await leaseInstance(db.url);
+    const p = await leasePrincipal(x, db.sql);
+    await bound(x, p, "root-s1", "s1");
+    const l = await leased(x, p, "root-l", "lane");
+    await boardTool(x, p, "root-s1", "board_create", { name: "q1", purpose: "queue", kind: "queue" });
+    await boardTool(x, p, "root-l", "board_subscribe", { board: "q1", mode: "push" });
+    const job = postId(await post(x, p, "root-s1", { board: "q1", body: "job" }));
+    const d = renewDelta("receipt");
+    await hostedPause("delivery:receipt:planned", () => x.delivery.receipt(p, l.c, l.lease.capability, [`push:${job}`]), async () => {
+      expect((await x.delivery.pending(p, l.c, l.lease.capability)).map(i => i.id)).toEqual([`push:${job}`]);
+    });
+    expect(d()).toEqual({ keyed: 0, miss: 1, skipped: 0 });
+    expect(await deliveredTo(db.sql, `${ME}/lane`, job)).toEqual([true]);
+    expect(await takeCredit(db.sql, "q1", job)).toEqual([l.id]);
+  });
+
+  // A receipt planned q1 for an id another receipt of the root acknowledged before its body: held but unused, it runs
+  // keyed and writes nothing for the id. The first receipt is stopped in its plan's pool read of q1. Mutation: the
+  // probe treating a planned board missing from the records as a miss (miss 1).
+  test("a receipt over-keyed by an id acknowledged since its plan runs keyed", async () => {
+    await using db = await pgDatabase({ max: 2 });
+    await using x = await leaseInstance(db.url);
+    const p = await leasePrincipal(x, db.sql);
+    await bound(x, p, "root-s1", "s1");
+    const l = await leased(x, p, "root-l", "lane");
+    await boardTool(x, p, "root-s1", "board_create", { name: "q1", purpose: "queue", kind: "queue" });
+    await boardTool(x, p, "root-l", "board_subscribe", { board: "q1", mode: "push" });
+    const job = postId(await post(x, p, "root-s1", { board: "q1", body: "job" }));
+    await x.delivery.pending(p, l.c, l.lease.capability);
+    const reads = countBoardReads(x);
+    const first = gate();
+    reads.gateFirst = first;
+    const d = renewDelta("receipt");
+    const planned = x.delivery.receipt(p, l.c, l.lease.capability, [`push:${job}`]);
+    try {
+      await until(() => reads.reached, 10_000, "the first receipt in its plan's read of q1");
+      await x.delivery.receipt(p, l.c, l.lease.capability, [`push:${job}`]);
+    } finally { first.open(); }
+    await planned;
+    expect(d()).toEqual({ keyed: 2, miss: 0, skipped: 0 });
+    expect(await deliveredTo(db.sql, `${ME}/lane`, job)).toEqual([true]);
+  });
+
+  // The receipt waits for a keyed post held on its queue board, and runs beside one held on another board. Mutation: the
+  // key spelled other than `board:<name>` in the plan and the refusal alike (e.g. `queue:<name>`: the receipt enters
+  // beside the q1 post).
+  test("a keyed queue receipt waits for a post on its board and runs beside one on another", async () => {
+    await using db = await pgDatabase({ max: 2 });
+    await using x = await leaseInstance(db.url);
+    const p = await leasePrincipal(x, db.sql);
+    await bound(x, p, "root-s1", "s1");
+    const l = await leased(x, p, "root-l", "lane");
+    await boardTool(x, p, "root-s1", "board_create", { name: "q1", purpose: "queue", kind: "queue" });
+    await boardTool(x, p, "root-s1", "board_create", { name: "q2", purpose: "queue", kind: "queue" });
+    await boardTool(x, p, "root-l", "board_subscribe", { board: "q1", mode: "push" });
+    const job1 = postId(await post(x, p, "root-s1", { board: "q1", body: "one" })), job2 = postId(await post(x, p, "root-s1", { board: "q1", body: "two" }));
+    await x.delivery.pending(p, l.c, l.lease.capability);
+    const posts = holdPosts(x);
+    const d = renewDelta("receipt");
+    x.state.defer = gate();
+    const pending: Promise<unknown>[] = [];
+    try {
+      posts.hold = gate();
+      pending.push(post(x, p, "root-s1", { board: "q2", body: "elsewhere" }));
+      await until(() => posts.held === 1, 10_000, "a post on q2 held");
+      await within(x.delivery.receipt(p, l.c, l.lease.capability, [`push:${job1}`]), 10_000, "the q1 receipt beside the held q2 post");
+      posts.hold.open();
+      await Promise.all(pending);
+      posts.hold = gate();
+      pending.push(post(x, p, "root-s1", { board: "q1", body: "busy" }));
+      await until(() => posts.held === 1, 10_000, "a post on q1 held");
+      const r = x.delivery.receipt(p, l.c, l.lease.capability, [`push:${job2}`]);
+      pending.push(r);
+      await until(() => x.q.waitingAt("receipt") === 1, 10_000, "the receipt queued on board:q1");
+      expect(await deliveredTo(db.sql, `${ME}/lane`, job2)).toEqual([false]);
+      posts.hold.open();
+      await Promise.all(pending);
+    } finally { posts.hold?.open(); x.state.defer?.open(); await Promise.allSettled(pending); }
+    expect(d()).toEqual({ keyed: 2, miss: 0, skipped: 0 });
+    expect(await deliveredTo(db.sql, `${ME}/lane`, job2)).toEqual([true]);
+  });
+
+  // One receipt of a DM and pushes on a broadcast board and two queue boards holds both queue boards' keys: it waits for
+  // a post held on q2 and credits both takes. Mutations: the plan keying only the first queue board (miss 1); the keys
+  // given to the probe but not to writeKeyedEffects (the store refuses: the receipt rejects).
+  test("a receipt of pushes on two queue boards holds both boards' keys", async () => {
+    await using db = await pgDatabase({ max: 2 });
+    await using x = await leaseInstance(db.url);
+    const p = await leasePrincipal(x, db.sql);
+    await bound(x, p, "root-s1", "s1");
+    const l = await leased(x, p, "root-l", "lane");
+    for (const [name, kind] of [["q1", "queue"], ["q2", "queue"], ["b1", "broadcast"]] as const) {
+      await boardTool(x, p, "root-s1", "board_create", { name, purpose: "p", kind });
+      await boardTool(x, p, "root-l", "board_subscribe", { board: name, mode: "push" });
+    }
+    const j1 = postId(await post(x, p, "root-s1", { board: "q1", body: "one" })), j2 = postId(await post(x, p, "root-s1", { board: "q2", body: "two" }));
+    const news = postId(await post(x, p, "root-s1", { board: "b1", body: "news" }));
+    await dm(x, p, "root-s1", `${ME}/lane`, "hello");
+    const items = await x.delivery.pending(p, l.c, l.lease.capability);
+    expect(items.map(i => i.id.split(":")[0]).sort()).toEqual(["direct", "push", "push", "push"]);
+    const posts = holdPosts(x);
+    const d = renewDelta("receipt");
+    x.state.defer = gate();
+    const pending: Promise<unknown>[] = [];
+    try {
+      posts.hold = gate();
+      pending.push(post(x, p, "root-s1", { board: "q2", body: "busy" }));
+      await until(() => posts.held === 1, 10_000, "a post on q2 held");
+      pending.push(x.delivery.receipt(p, l.c, l.lease.capability, items.map(i => i.id)));
+      await until(() => x.q.waitingAt("receipt") === 1, 10_000, "the receipt queued on board:q2");
+      posts.hold.open();
+      await Promise.all(pending);
+    } finally { posts.hold?.open(); x.state.defer?.open(); await Promise.allSettled(pending); }
+    expect(d()).toEqual({ keyed: 1, miss: 0, skipped: 0 });
+    expect([await takeCredit(db.sql, "q1", j1), await takeCredit(db.sql, "q2", j2)]).toEqual([[l.id], [l.id]]);
+    for (const job of [j1, j2, news]) expect(await deliveredTo(db.sql, `${ME}/lane`, job)).toEqual([true]);
+  });
+
+  // Two lanes' receipts of pushes on q1 and q2, in crossed orders, both queued behind posts held on q1 and q2: each holds
+  // both boards' keys, so the scheduler runs them one after the other and the crossed order never meets a lock; this
+  // checks that each receipt holds both keys (one dropped, its probe misses) and that both commit once the posts go.
+  test("crossed receipts of two queue boards each hold both board keys and commit after the posts", async () => {
+    await using db = await pgDatabase({ max: 2 });
+    await using x = await leaseInstance(db.url);
+    const p = await leasePrincipal(x, db.sql);
+    await bound(x, p, "root-s1", "s1"); await bound(x, p, "root-s2", "s2");
+    const la = await leased(x, p, "root-a", "la"), lb = await leased(x, p, "root-b", "lb");
+    for (const name of ["q1", "q2"]) {
+      await boardTool(x, p, "root-s1", "board_create", { name, purpose: "p", kind: "queue" });
+      for (const s of ["root-a", "root-b"]) await boardTool(x, p, s, "board_subscribe", { board: name, mode: "push" });
+    }
+    for (const name of ["q1", "q2"]) for (const body of ["one", "two"]) await post(x, p, "root-s1", { board: name, body });
+    const ia = await x.delivery.pending(p, la.c, la.lease.capability), ib = await x.delivery.pending(p, lb.c, lb.lease.capability);
+    const byBoard = (items: typeof ia) => items.map(i => ({ id: i.id, board: (i.event as { item: { post: { board: string } } }).item.post.board }));
+    expect([byBoard(ia).map(i => i.board).sort(), byBoard(ib).map(i => i.board).sort()]).toEqual([["q1", "q2"], ["q1", "q2"]]);
+    const order = (items: typeof ia, first: string) => byBoard(items).sort((a, b) => (a.board === first ? -1 : 0) - (b.board === first ? -1 : 0)).map(i => i.id);
+    const posts = holdPosts(x);
+    const d = renewDelta("receipt");
+    x.state.defer = gate();
+    const pending: Promise<unknown>[] = [];
+    try {
+      posts.hold = gate();
+      pending.push(post(x, p, "root-s1", { board: "q1", body: "busy 1" }), post(x, p, "root-s2", { board: "q2", body: "busy 2" }));
+      await until(() => posts.held === 2, 10_000, "posts held on q1 and q2");
+      const receipts = [x.delivery.receipt(p, la.c, la.lease.capability, order(ia, "q1")), x.delivery.receipt(p, lb.c, lb.lease.capability, order(ib, "q2"))];
+      pending.push(...receipts);
+      await until(() => x.q.waitingAt("receipt") === 2, 10_000, "both receipts queued");
+      posts.hold.open();
+      await within(Promise.all(pending), 15_000, "the crossed receipts committed");
+    } finally { posts.hold?.open(); x.state.defer?.open(); await Promise.allSettled(pending); }
+    expect(d()).toEqual({ keyed: 2, miss: 0, skipped: 0 });
+  });
+
+  // writeKeyedEffects takes one root and any distinct board keys, at most 101, and no board key beside a notice; a
+  // malformed set rejects before the body runs. Mutation: the key-shape check dropped (the body runs).
+  test("writeKeyedEffects takes exactly one root and distinct board keys", async () => {
+    await using db = await pgDatabase({ max: 2 });
+    await using x = await leaseInstance(db.url);
+    let ran = 0;
+    const body = async () => { ran++; };
+    const many = ["root:a", ...Array.from({ length: 101 }, (_, i) => `board:q${i}`)];
+    for (const [keys, notices] of [[["board:q1"], []], [["root:a", "dm:x"], []], [["root:a", "root:b"], []], [many, []], [["root:a", "board:q1", "board:q1"], []], [["root:a", "board:q1"], ["hosted.update"]], [["root:a", "board:"], []]] as Array<[string[], string[]]>) {
+      await expect(x.repo.writeKeyedEffects!(keys, notices, body)).rejects.toThrow("writeKeyedEffects: a keyed body names one root");
+    }
+    expect(ran).toBe(0);
+    await x.repo.writeKeyedEffects!(["root:a", "board:q1", "board:q2"], [], body);
+    await x.repo.writeKeyedEffects!(many.slice(0, 101), [], body);
+    expect(ran).toBe(2);
+  });
+
+  // A keyed receipt of one queue push sends the exclusive body's statements (16 in 16 round trips: the probe's reads are
+  // the exclusive body's, and a held board needs no kind read), pinned; a second receipt on the same board reads no
+  // board from the pool (the kind cache). Mutations: the kind cache dropped (a pool read per
+  // receipt); a statement added per ref in the probe (the count moves).
+  test("a keyed queue receipt's statements are pinned, and a board's kind is read from the pool once", async () => {
+    const measure = async (opts: { keyed?: false }) => {
+      await using db = await pgDatabase({ max: 2 });
+      await using x = await leaseInstance(db.url, opts);
+      const p = await leasePrincipal(x, db.sql);
+      await bound(x, p, "root-s1", "s1");
+      const l = await leased(x, p, "root-l", "lane");
+      await boardTool(x, p, "root-s1", "board_create", { name: "q1", purpose: "queue", kind: "queue" });
+      await boardTool(x, p, "root-l", "board_subscribe", { board: "q1", mode: "push" });
+      const reads = countBoardReads(x);
+      let n = 0;
+      const one = async () => {
+        const job = postId(await post(x, p, "root-s1", { board: "q1", body: `job ${++n}` }));
+        expect((await x.delivery.pending(p, l.c, l.lease.capability)).map(i => i.id)).toEqual([`push:${job}`]);
+        const at = statementTotals("receipt"), before = reads.n, d = renewDelta("receipt");
+        await x.delivery.receipt(p, l.c, l.lease.capability, [`push:${job}`]);
+        const now = statementTotals("receipt");
+        return { counts: d(), bodies: now.bodies - at.bodies, statements: now.statements - at.statements, roundTrips: now.roundTrips - at.roundTrips, poolReads: reads.n - before };
+      };
+      return { first: await one(), second: await one() };
+    };
+    const keyed = await measure({}), ref = await measure({ keyed: false });
+    expect([keyed.first.counts, keyed.second.counts]).toEqual([{ keyed: 1, miss: 0, skipped: 0 }, { keyed: 1, miss: 0, skipped: 0 }]);
+    expect([keyed.first.poolReads, keyed.second.poolReads, ref.first.poolReads, ref.second.poolReads]).toEqual([1, 0, 0, 0]);
+    const shape = (m: { bodies: number; statements: number; roundTrips: number }) => ({ bodies: m.bodies, statements: m.statements, roundTrips: m.roundTrips });
+    expect({ keyed: shape(keyed.second), ref: shape(ref.second) }).toEqual({ keyed: { bodies: 1, statements: 16, roundTrips: 16 }, ref: { bodies: 1, statements: 16, roundTrips: 16 } });
   });
 });
 

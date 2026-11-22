@@ -93,8 +93,14 @@ export async function makePgRepo(url: string, opts: PgRepoOptions): Promise<PgRe
   // writeKeyedEffects, the named opt-in for the reviewed callers D4 lists (delivery's renew and receipt).
   const writeKeyed = ((keys: readonly string[], fn: (tx: Tx) => Promise<unknown>, committed?: (value: unknown) => unknown) => t.writeKeyed(keys, fn, committed)) as Repo["writeKeyed"];
   // The notices a keyed body may opt in to are fixed here, not by the caller (#1510 chunk 4 audit L1): renew's lease
-  // columns' `hosted.update`, and refuseKeyedNotice allows it only for a row of the body's own root key.
+  // columns' `hosted.update`, and refuseKeyedNotice allows it only for a row of the body's own root key. The keys are
+  // checked here too: exactly one root and any distinct `board:<name>` keys (receipt's queue boards, #1595), at most
+  // 101 (receipt's 100 ids), and no board key beside a notice (renew holds none).
   const writeKeyedEffects = ((keys: readonly string[], notices: readonly string[], fn: (tx: Tx) => Promise<unknown>, committed?: (value: unknown) => unknown) => {
+    const roots = keys.filter(k => k.startsWith("root:") && k.length > 5), boards = keys.filter(k => k.startsWith("board:") && k.length > 6);
+    if (roots.length !== 1 || roots.length + boards.length !== keys.length || new Set(boards).size !== boards.length || keys.length > 101 || (boards.length && notices.length)) {
+      return Promise.reject(new Error(`writeKeyedEffects: a keyed body names one root and any distinct board:<name> keys (none with a notice); got ${keys.join(", ")} (docs/future/postgres-server.md D4)`));
+    }
     const other = notices.find(n => !KEYED_NOTICE_OPS.has(n));
     if (other !== undefined) return Promise.reject(new Error(`writeKeyedEffects: a keyed body may not queue ${other}'s notices; only ${[...KEYED_NOTICE_OPS].join(", ")} (docs/future/postgres-server.md D4)`));
     return t.writeKeyed(keys, fn, committed, { effects: true, notices });

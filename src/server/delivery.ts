@@ -1,11 +1,12 @@
 import { randomBytes } from "node:crypto";
 import { DEFAULT_HOSTED_CAPS, type HostedCaps } from "./config.ts";
 import { refOf, type PendingRef } from "../core/boards.ts";
-import { testPause, testPauseAsync } from "../shared/testpause.ts";
+import { testPause, testPauseAsync, testPaused } from "../shared/testpause.ts";
 import { ApplicationError, type ApplicationSession, type DeliveryEvent, type IdentityInfo } from "./application.ts";
 import type { OAuthPrincipal } from "./oauth.ts";
 import type { HostedSessions, SessionContext, Verdict } from "./hosted.ts";
 import type { HostedSession } from "./hosted-types.ts";
+import type { Board } from "./store/boards.ts";
 import { ProbeWrite, type Read, type Tx } from "./store/tx.ts";
 import { atSite } from "./store/queue.ts";
 import { hostedFailure } from "./hosted-diagnostics.ts";
@@ -56,15 +57,15 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
   // writer has nothing to gain, and its Repo has neither the probe nor the opt-in.
   const { readsOnly, writeKeyedEffects } = application.repo;
   const keyedOn = options.keyed !== false && readsOnly !== undefined && writeKeyedEffects !== undefined;
-  // A keyed attempt at `site` under `root`'s key, then the exclusive body on a miss. `probe`: the body's reads, in a
+  // A keyed attempt at `site` under `root`'s key and `keys` (receipt's `board:<name>` keys, #1595), then the exclusive body on a miss. `probe`: the body's reads, in a
   // read-only probe (ProbeWrite before any write); `write`: its writes. Inside the body a ProbeWrite, an ApplicationError
   // (a stale capability among them: the exclusive body refuses it again and audits it once, outside) or a KeyedMiss is a
   // miss: the body throws, so it rolls back, and its effects and `committed` never run. Any other failure is the request's.
-  async function keyedOr<P, T, R>(site: "renew" | "receipt", root: string, notices: readonly string[], probe: (tx: Tx) => Promise<P>, write: (tx: Tx, read: P) => Promise<T>,
+  async function keyedOr<P, T, R>(site: "renew" | "receipt", root: string, keys: readonly string[], notices: readonly string[], probe: (tx: Tx) => Promise<P>, write: (tx: Tx, read: P) => Promise<T>,
     committed: (value: T) => R, exclusive: () => Promise<Awaited<R>>): Promise<Awaited<R>> {
     if (!keyedOn) { countGate(site, "skipped"); return exclusive(); }
     try {
-      const out = await atSite(site, () => writeKeyedEffects!([`root:${root}`], notices, async tx => {
+      const out = await atSite(site, () => writeKeyedEffects!([`root:${root}`, ...keys], notices, async tx => {
         let read: P;
         try { read = await readsOnly!(tx, () => probe(tx)); }
         catch (error) { throw error instanceof ProbeWrite || error instanceof ApplicationError ? new KeyedMiss() : error; }
@@ -81,6 +82,38 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
   }
   const ttl = hosted.leaseTtl, now = options.now ?? hosted.now, caps = options.caps ?? DEFAULT_HOSTED_CAPS.leases;
   const leases = new Map<string, Lease>();
+  // A board's kind by name, for receipt's plan (#1595). Never stale only because a board's kind is fixed at its create
+  // (no store write changes `boards.kind`; archive sets only archived_at) and a board is never deleted, so a name is
+  // never reused for another kind. A change that adds either must drop this cache (docs/future/postgres-server.md D4).
+  // Bounded: cleared when full (boards are few).
+  const boardKinds = new Map<string, Board["kind"]>();
+  const BOARD_KINDS_MAX = 4096;
+  // The queue boards a keyed receipt of `ids` holds `board:<name>` for (#1595), planned before its body from the lease's
+  // issued items (in memory, no authorization) and the kind cache; a board's first sighting reads the pool. The body's
+  // probe decides again on its own Tx and misses on a queue board this left out (a concurrent pending issued it after
+  // the plan), so the plan only has to be right in the common case. Ids the reads refuse (not an array, too many,
+  // duplicates, no lease) plan nothing: the probe refuses them, a miss. A board the pool doesn't find is held anyway.
+  async function planReceiptBoards(capability: string, ids: unknown): Promise<string[]> {
+    if (!Array.isArray(ids) || ids.length > 100 || new Set(ids).size !== ids.length) return [];
+    const lease = leases.get(capability);
+    if (!lease) return [];
+    const pushed = new Set<string>();
+    for (const id of ids) {
+      const issued = lease.issued.get(id);
+      if (issued?.ref?.kind === "push") pushed.add(boardOf(issued.item)!);
+    }
+    // Split before the await: a concurrent plan may cache one of `unknown` meanwhile, which must not count it twice.
+    const unknown = [...pushed].filter(b => !boardKinds.has(b)), queue = [...pushed].filter(b => boardKinds.get(b) === "queue");
+    const found = await Promise.all(unknown.map(b => application.repo.boards.get(pool, b)));
+    unknown.forEach((b, i) => {
+      const board = found[i];
+      if (!board) { queue.push(b); return; }
+      if (boardKinds.size >= BOARD_KINDS_MAX) boardKinds.clear();
+      boardKinds.set(b, board.kind);
+      if (board.kind === "queue") queue.push(b);
+    });
+    return queue.sort();
+  }
   // A session holds at most one lease (a reopen finishes the previous first): looked up and counted without a
   // scan (#805).
   const bySession = new Map<string, Lease>(), perUser = new Map<number, number>();
@@ -254,7 +287,7 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
         // which delivery's and the streams' listeners need: a lease row's deadline is what `deliver()` and a live's
         // stamp judge). Any difference from the gate's row (its ownership, generation, grant or root), a lease that
         // no longer matches it, or a stale capability is a miss: the exclusive body then renews or refuses.
-        const { lease } = await keyedOr("renew", row.session_id, ["hosted.update"], async tx => {
+        const { lease } = await keyedOr("renew", row.session_id, [], ["hosted.update"], async tx => {
           const fresh = await store.lock(tx, row.session_id);
           if (!fresh || fresh.session_id !== row.session_id || fresh.root_session_id !== null || fresh.ownership_id !== row.ownership_id ||
             fresh.bind_gen !== row.bind_gen || fresh.grant_id !== row.grant_id) throw new KeyedMiss();
@@ -348,15 +381,20 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
         };
         // Keyed (D4): the reads in a probe (pending's lost-ack repair, a write, is a miss there), then the session's own
         // rows: each direct message's delivered_at and its address's cursor, in id order (handleAck), then each board
-        // item's outbox and subscription rows, and receiptBoards' in-memory effects. A row other than the gate's root
-        // (or one whose ownership, generation, grant or root changed since it), an item on a queue board (its first ack
-        // credits the take: a claim_events write), or a stale capability is a miss.
-        await keyedOr("receipt", root.session_id, [], async tx => {
+        // item's outbox row, a queue push's take credit (claim_events) and a push subscription's row, and receiptBoards'
+        // in-memory effects. It holds `board:<name>` for each queue board among its pushes (#1595), planned here; the
+        // probe judges the boards again on its Tx and misses on a queue board the plan left out (`held`, never re-derived
+        // from the records). A row other than the gate's root (or one whose ownership, generation, grant or root changed
+        // since it), such a board, or a stale capability is a miss.
+        const held = keyedOn ? await planReceiptBoards(capability, ids) : [];
+        if (testPaused("delivery:receipt:planned")) await testPauseAsync("delivery:receipt:planned");
+        const heldSet = new Set(held);
+        await keyedOr("receipt", root.session_id, held.map(b => `board:${b}`), [], async tx => {
           const row = "id" in context && context.id === root.session_id ? await store.lock(tx, context.id) : undefined;
           if (!row || row.root_session_id !== null || row.ownership_id !== root.ownership_id || row.bind_gen !== root.bind_gen || row.grant_id !== root.grant_id) throw new KeyedMiss();
           const read = await reads(tx, row);
           for (const board of new Set(read.records.filter(r => r.ref?.kind === "push").map(r => boardOf(r.item)!))) {
-            if ((await application.repo.boards.get(tx, board))?.kind === "queue") throw new KeyedMiss();
+            if (!heldSet.has(board) && (await application.repo.boards.get(tx, board))?.kind === "queue") throw new KeyedMiss();
           }
           return read;
         }, writes, committed, () => atSite("receipt", () => store.write(async tx => {
