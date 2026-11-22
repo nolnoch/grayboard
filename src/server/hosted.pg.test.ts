@@ -23,6 +23,7 @@ import { atSite, currentSite, RequestAbortedError } from "./store/queue.ts";
 import { DEFAULT_AUTH_FAIL_LIMIT, DEFAULT_HELLO_LIMIT } from "./rate_limit.ts";
 import { DEFAULT_TRUSTED_PROXIES } from "./client_addr.ts";
 import { createOAuthServer } from "./oauth.ts";
+import { createResources } from "./resources.ts";
 import { hashToken } from "./auth.ts";
 import { gateCount, type GateMethod, refusalCount, statementTotals } from "./metrics.ts";
 import { GRAYBOARD_EFFORT_META, GRAYBOARD_LAUNCHER_META, GRAYBOARD_MODEL_META } from "../shared/session_meta.ts";
@@ -3243,14 +3244,17 @@ describePg("keyed read tools (Postgres)", () => {
       expect(x.state.exclusive.slice(before).filter(b => b.site === "tool")).toEqual([]);
     } finally { sends.hold.open(); x.state.defer.open(); }
     await held;
-    // The keyed peer_list sees the same peers as the exclusive one.
-    const keyedPeers = await callOf(x, p, "root-rd", "peer_list", {});
+    // Each keyed read returns what the exclusive body returns.
+    const keyedResults = [];
+    for (const [name, args] of readCalls) keyedResults.push(await callOf(x, p, "root-rd", name, args));
     await using y = await leaseInstance(db.url, { keyedTools: false, side: "b" });
-    expect(await callOf(y, p, "root-rd", "peer_list", {})).toEqual(keyedPeers);
+    const exclusiveResults = [];
+    for (const [name, args] of readCalls) exclusiveResults.push(await callOf(y, p, "root-rd", name, args));
+    expect(exclusiveResults).toEqual(keyedResults);
   });
 
-  // A refusal in the probe is a miss: the exclusive body refuses the same way. A write tool counts `other`.
-  test("a refused read misses into the exclusive body; a write tool counts as other", async () => {
+  // A refusal in the probe is a miss: the exclusive body refuses the same way. A write tool counts `skipped` by name.
+  test("a refused read misses into the exclusive body; a write tool counts as skipped under its name", async () => {
     await using db = await pgDatabase({ max: 2 });
     await using x = await leaseInstance(db.url);
     const p = await leasePrincipal(x, db.sql);
@@ -3262,9 +3266,25 @@ describePg("keyed read tools (Postgres)", () => {
     // The exclusive path (keyed tools off) refuses with the same text.
     await using y = await leaseInstance(db.url, { keyedTools: false, side: "b" });
     expect(await callOf(y, p, "root-rd", "peer_list", { match: { bogus: 1 } }).then(() => undefined, (e: Error) => e.message)).toBe(refused);
-    const other = gateCount("tool", "skipped", "other");
+    const status = gateCount("tool", "skipped", "peer_status");
     await callOf(x, p, "root-rd", "peer_status", { text: "busy" });
-    expect(gateCount("tool", "skipped", "other") - other).toBe(1);
+    expect(gateCount("tool", "skipped", "peer_status") - status).toBe(1);
+  });
+
+  // The resource catalog (mcp-resources.ts resources/list) runs as a keyed board_list: its session checks and catalog
+  // read on the body's Tx write nothing. Mutation: a write in resources.list (or KEYED_READS emptied) counts a miss.
+  test("the resource catalog's board_list runs keyed", async () => {
+    await using db = await pgDatabase({ max: 2 });
+    await using x = await leaseInstance(db.url);
+    const p = await leasePrincipal(x, db.sql);
+    await bound(x, p, "root-rd", "rd");
+    await callOf(x, p, "root-rd", "board_create", { name: "b1", purpose: "catalog" });
+    const resources = createResources(x.application, { isCurrent: () => true, isAuthorized: () => true });
+    const at = { keyed: gateCount("tool", "keyed", "board_list"), miss: gateCount("tool", "miss", "board_list") };
+    const page = await x.hosted.run(p, ctx(p, "root-rd"), "board_list", (session, tx) => resources.list(tx, session, undefined));
+    expect(page.resources.map(r => r.board.name)).toContain("b1");
+    expect({ keyed: gateCount("tool", "keyed", "board_list") - at.keyed, miss: gateCount("tool", "miss", "board_list") - at.miss }).toEqual({ keyed: 1, miss: 0 });
+    resources.close();
   });
 
   // A keyed claim_list re-arms the claim expiry timer after its body, as the exclusive body's afterCommit does: a claim

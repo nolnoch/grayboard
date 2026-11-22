@@ -132,16 +132,19 @@ export function statementTotals(site: QueueSite): { bodies: number; statements: 
 // (#1537 PR 5 hosted.ts dmSend, PR 6 boardPost), its method the tool (dm_send, board_post): `skipped` there is SQLite,
 // the keyed path turned off, or a call whose plan says exclusive (application.sendPlan, postPlan). The read tools'
 // keyed bodies count there too (#1604 hosted.ts KEYED_READS: `miss` a probe that would have written or refused), and
-// every other tool's exclusive body as `skipped` under `other`, so no tool body runs exclusive uncounted.
+// every other tool's exclusive body as `skipped` under its own name (`other` for a name outside TOOL_METHODS), so no
+// tool body runs exclusive uncounted and a loadtest names which tools still take the world lock.
 export const GATE_SITES = ["gate", "prior", "renew", "receipt", "tool"] as const;
 export const GATE_OUTCOMES = ["keyed", "miss", "skipped"] as const;
-export const GATE_METHODS = ["selection", "tool", "transfer", "whoami", "end", "open", "bind", "unbind", "owning", "renew", "receipt", "pending", "release", "control", "dm_send", "board_post", "peer_list", "board_list", "claim_list", "dm_history", "other"] as const;
+export const GATE_METHODS = ["selection", "tool", "transfer", "whoami", "end", "open", "bind", "unbind", "owning", "renew", "receipt", "pending", "release", "control", "dm_send", "board_post", "peer_list", "board_list", "claim_list", "dm_history", "board_create", "board_archive", "board_read", "board_subscribe", "peer_status", "claim_take", "claim_release", "claim_watch", "delegate", "dm_thread", "dm_inbox", "dm_ack", "dm_retract", "other"] as const;
 export type GateSite = typeof GATE_SITES[number];
 export type GateOutcome = typeof GATE_OUTCOMES[number];
 export type GateMethod = typeof GATE_METHODS[number];
 export const PRIOR_METHODS = ["tool", "renew", "receipt", "pending", "open", "bind"] as const satisfies readonly GateMethod[];
 const SITE_METHOD: Record<"renew" | "receipt", GateMethod> = { renew: "renew", receipt: "receipt" };
-export const TOOL_METHODS = ["dm_send", "board_post", "peer_list", "board_list", "claim_list", "dm_history", "other"] as const satisfies readonly GateMethod[];
+// The native tools that run a tool body (hosted.ts runTool; whoami, bind and unbind have their own sites), and `other`
+// for any name outside them.
+export const TOOL_METHODS = ["dm_send", "board_post", "peer_list", "board_list", "claim_list", "dm_history", "board_create", "board_archive", "board_read", "board_subscribe", "peer_status", "claim_take", "claim_release", "claim_watch", "delegate", "dm_thread", "dm_inbox", "dm_ack", "dm_retract", "other"] as const satisfies readonly GateMethod[];
 const gateKey = (site: GateSite, method: GateMethod, outcome: GateOutcome) => `${site}:${method}:${outcome}`;
 // Every series present from the start, so a rate() over a fresh process starts at zero.
 const gateFast = new Map<string, number>([
