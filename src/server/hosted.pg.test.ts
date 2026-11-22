@@ -1575,9 +1575,10 @@ describePg("keyed renew and receipt rows (Postgres)", () => {
   // One script on two databases: keyed (receipts of DMs, a broadcast push, a queue board's push whose first ack credits
   // its take (#1595), one receipt of a DM and pushes on a broadcast board and two queue boards, the invoker's receipt of
   // a lane's reply, renews) with misses (a stale capability's renew and receipt, each refused and audited once by the
-  // exclusive body), and the same with the keyed path off. Mutations: the keyed path skipping the take credit or
-  // crediting another session (claim_events differ); the miss path skipping the exclusive body (the rows differ); a
-  // stale capability counted as the request's in the keyed body (audited twice or not at all).
+  // exclusive body), and the same with the keyed path off. Mutations: the miss path skipping the exclusive body (the
+  // rows differ); a stale capability counted as the request's in the keyed body (audited twice or not at all). A skipped
+  // or misdirected take credit is not caught here: the lane is bound when the take is logged, so the credit rewrites the
+  // same session; `boards.pg.test.ts` kills that one by binding the holder after the take.
   test("miss-then-exclusive writes the same rows as the exclusive bodies alone", async () => {
     let lastFe = "";
     const script = async (x: LeaseInstance, sql: Awaited<ReturnType<typeof pgDatabase>>["sql"]) => {
@@ -2900,8 +2901,9 @@ describePg("keyed queue receipt (#1595) (Postgres)", () => {
   });
 
   // Two lanes' receipts of pushes on q1 and q2, in crossed orders, both queued behind posts held on q1 and q2: each holds
-  // both boards' keys, so they never overlap, and both commit with no deadlock once the posts go.
-  test("crossed receipts of two queue boards held behind posts on both commit with no deadlock", async () => {
+  // both boards' keys, so the scheduler runs them one after the other and the crossed order never meets a lock; this
+  // checks that each receipt holds both keys (one dropped, its probe misses) and that both commit once the posts go.
+  test("crossed receipts of two queue boards each hold both board keys and commit after the posts", async () => {
     await using db = await pgDatabase({ max: 2 });
     await using x = await leaseInstance(db.url);
     const p = await leasePrincipal(x, db.sql);
