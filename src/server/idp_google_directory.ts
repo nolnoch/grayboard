@@ -38,9 +38,10 @@ const CLOUD_PLATFORM_SCOPE = "https://www.googleapis.com/auth/cloud-platform";
 
 // The re-check audits a failure by its error's name (auth.idp_check_failed's error_class), so each kind an operator
 // acts on differently has its own: the credential refused (fix the key, the federation, the role or the delegation),
-// the directory refusing the lookup, anything else (an outage, a quota answer, a malformed body).
+// the directory refusing the lookup, a 404 for the subject (google_user_not_found: Google doesn't document it as "no
+// such user", so it isn't read as a deletion; #1601), anything else (an outage, a quota answer, a malformed body).
 class DirectoryError extends Error {
-  constructor(name: "google_token_refused" | "google_directory_refused" | "google_directory_error", message: string) { super(message); this.name = name; }
+  constructor(name: "google_token_refused" | "google_directory_refused" | "google_user_not_found" | "google_directory_error", message: string) { super(message); this.name = name; }
 }
 
 const VAR = "GRAYBOARD_GOOGLE_DIRECTORY_KEY";
@@ -126,10 +127,11 @@ function parseExternalAccount(k: Record<string, unknown>): Extract<GoogleDirecto
   return { kind: "federated", serviceAccount, audience: k.audience, subjectTokenType: k.subject_token_type, tokenUrl: tokenUrl.href, source };
 }
 
-// status(subject, signal): "inactive" when the directory says the user is suspended or archived, or answers 404 (no
-// such user; Google doesn't document the status, so the re-check's prior-positive guard is what makes a wrong 404
-// harmless). Anything else throws: a refused credential (401/403), a quota answer, a 5xx, a malformed body, a subject
-// that isn't a Google user id (Google's `sub` is always digits; refusing anything else keeps `.` and `..` out of the path).
+// status(subject, signal): "inactive" when the directory says the user is suspended or archived. Anything else throws:
+// a 404 (google_user_not_found: undocumented, and a wrong subject mapping, base or proxy answers it too, so it stays
+// transient until a live org confirms it means deleted, #1601), a refused credential (401/403), a quota answer, a 5xx,
+// a malformed body, a subject that isn't a Google user id (Google's `sub` is always digits; refusing anything else
+// keeps `.` and `..` out of the path).
 export function googleDirectoryStatus(config: GoogleDirectoryConfig, options: GoogleDirectoryOptions = {}) {
   const send = options.fetch ?? fetch;
   const now = options.now ?? Date.now;
@@ -250,7 +252,7 @@ export function googleDirectoryStatus(config: GoogleDirectoryConfig, options: Go
     const res = await send(`${apiBase}/admin/directory/v1/users/${encodeURIComponent(subject)}?fields=suspended,archived`, {
       signal, headers: { Authorization: `Bearer ${token}` },
     });
-    if (res.status === 404) return "inactive";
+    if (res.status === 404) throw new DirectoryError("google_user_not_found", "Google Directory users.get failed (404)");
     if (res.status === 401) tokens.drop();
     if (res.status === 401 || res.status === 403) throw refused(new DirectoryError("google_directory_refused", `Google Directory users.get failed (${res.status}): ${(await res.text()).slice(0, 200)}`));
     if (!res.ok) throw new DirectoryError("google_directory_error", `Google Directory users.get failed (${res.status})`);
