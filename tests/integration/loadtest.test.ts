@@ -129,6 +129,8 @@ describe("loadtest sizing", () => {
   test("--env overrides parse, and a malformed one is refused", () => {
     expect(options(["--env", "A=1", "--env", "B=x=y"]).env).toEqual({ A: "1", B: "x=y" });
     expect(() => options(["--env", "nope"])).toThrow(/KEY=VALUE/);
+    expect({ full: options([]).mentionShare, quick: options(["--quick"]).mentionShare }).toEqual({ full: 0.25, quick: 0.5 });
+    expect(() => options(["--mention-share", "1.5"])).toThrow(/--mention-share/);
   });
 
   test("parseMetrics reads labels, escapes and +Inf", () => {
@@ -239,7 +241,7 @@ describe("loadtest pilot gate (#1537)", () => {
   const stop = (share: number) => queueStats({ wait: new Map(), hold: new Map(), keyed: new Map(), worldStop: share * 50, gate: new Map(), gateMethod: new Map(), statements: new Map(), roundTrips: new Map() }, 50);
   const base = (gate: string[] = ["--gate", "pilot"]): JudgeInput => ({
     o: options([...argv, ...gate]), windows: [win(10, false), ...[20, 30, 40, 50, 60].map(t => win(t))], connected: 300, connectErrors: {},
-    finals: [{ type: "final", driver: 0, sentDm: ["0:1", "1:1"], recvDm: ["0:1", "1:1"], posts: 3, boardRecv: 5, misdelivered: 0, misdeliveredFirst: [], lapsed: 0, lapsedFirst: [], svcSent: [], svcGot: [], svcDone: [], svcPosts: [], laneEcho: 0, svcReads: {}, errors: {} }],
+    finals: [{ type: "final", driver: 0, sentDm: ["0:1", "1:1"], recvDm: ["0:1", "1:1"], posts: 3, boardRecv: 5, misdelivered: 0, misdeliveredFirst: [], lapsed: 0, lapsedFirst: [], svcSent: [], svcGot: [], svcDone: [], svcPosts: [], laneEcho: 0, svcReads: {}, errors: {}, mentSent: [], mentGot: [] }],
     refusedAll: {}, drained: { leases: 0, listens: 0, posts: 0, holding: 0, watches: 0, exchanges: 0 }, queueSteady: stop(0.5),
   });
   // Every tool's calls over the steady period, as the run sums them from the server's exposition: 2,500 dm_send calls,
@@ -361,7 +363,7 @@ async function run(extra: string[]): Promise<{ code: number; out: string; summar
   try {
     // runCli kills the whole process group on timeout: the coordinator, its drivers and the server.
     const { code, out, err } = await runCli([join(ROOT, "scripts/loadtest.ts"),
-      "--sessions", "8", "--service-workers", "2", "--svc-share", "0.2", "--peer-share", "0.1", "--read-share", "0.3", "--users", "2", "--drivers", "2", "--duration", "14", "--warmup", "2", "--window", "2",
+      "--sessions", "8", "--service-workers", "2", "--svc-share", "0.2", "--peer-share", "0.1", "--read-share", "0.3", "--mention-share", "0.5", "--users", "2", "--drivers", "2", "--duration", "14", "--warmup", "2", "--window", "2",
       "--period", "1", "--boards", "2", "--post-share", "0.2", "--churn", "0.5", "--churn-every", "5", "--grace", "1",
       "--out", dir, ...extra], { bin: process.execPath, cwd: ROOT, env: { PATH: process.env.PATH ?? "" }, timeoutMs: 60_000 });
     let summary: any;
@@ -406,6 +408,9 @@ describe("loadtest run", () => {
       expect({ op, ok: p.ok > 0, named: p.named, content: op === "snapshot" ? p.content > 0 : p.content }).toEqual({ op, ok: true, named: p.ok, content: op === "snapshot" ? true : p.ok });
     }
     expect(svc.reads.catalog_connect.named).toBe(svc.reads.catalog_connect.ok);
+    // Mention resolution on the service board (#1518): some invocations named another user's session, which was told.
+    expect(svc.mentions.sent, r.out).toBeGreaterThan(0);
+    expect({ received: svc.mentions.received >= svc.mentions.sent, lost: svc.mentions.lost }).toEqual({ received: true, lost: 0 });
   }, 90_000);
 
   test("with no invocations the reads still rotate: board_list, the snapshot and the catalog each run and see the board", async () => {
