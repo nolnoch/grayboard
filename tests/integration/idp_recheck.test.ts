@@ -282,7 +282,7 @@ test("an outage within a long stale bound doesn't send a covered user to the fal
 });
 
 // #930 A2b: the real Google provider, its directory check pointed at a scripted Google, through the same refresh path.
-test("Google's directory check: an active answer confirms it, a suspended one disables; a refused key is transient and classed", async () => {
+test("Google's directory check: an active answer confirms it, a suspended one disables; a 404 or a refused key is transient and classed", async () => {
   const pair = await generateKeyPair("RS256", { extractable: true });
   const key = { kind: "key" as const, clientEmail: "sa@p.iam.gserviceaccount.com", privateKey: await exportPKCS8(pair.privateKey) };
   let tokenStatus = 200;
@@ -308,15 +308,23 @@ test("Google's directory check: an active answer confirms it, a suspended one di
   expect((await refresh(a.refreshToken)).status).toBe(400);
   expect((await user(A))!.disabled_at).not.toBeNull();
   expect((await accessAudits(srv, "auth.idp_disabled")).map(x => x.detail)).toEqual([{ provider: "google", issuer: GOOGLE_ISSUER, reason: "inactive" }]);
+  // #1600: a 404 (Bob's subject isn't in the directory) is a failed check even after an active answer confirmed the
+  // provider: he keeps working within the stale bound and isn't disabled.
+  await link(B, "444", 25);
+  const rotated = await refresh(b.refreshToken);
+  expect(rotated.status).toBe(200);
+  const bNext = ((await rotated.json()) as { refresh_token: string }).refresh_token;
+  expect((await user(B))!.disabled_at).toBeNull();
+  expect((await accessAudits(srv, "auth.idp_check_failed")).map(x => x.detail.error_class)).toEqual(["google_user_not_found"]);
   // A refused key: Bob is due, the check fails, he keeps working within the stale bound, and the class names the key.
   tokenStatus = 400;
   clock += 2 * HOUR;
   await exec(srv, "UPDATE users SET idp_checked_at = ? WHERE email = ?", clock - 25 * HOUR, B);
   const warn = console.warn;
   console.warn = () => {};
-  try { expect((await refresh(b.refreshToken)).status).toBe(200); } finally { console.warn = warn; }
+  try { expect((await refresh(bNext)).status).toBe(200); } finally { console.warn = warn; }
   expect((await user(B))!.disabled_at).toBeNull();
-  expect((await accessAudits(srv, "auth.idp_check_failed")).map(x => x.detail.error_class)).toEqual(["google_token_refused"]);
+  expect((await accessAudits(srv, "auth.idp_check_failed")).map(x => x.detail.error_class)).toEqual(["google_user_not_found", "google_token_refused"]);
 });
 
 // #1555: the oidc provider with Keycloak's directory check, pointed at a scripted Keycloak, through the same refresh path.
