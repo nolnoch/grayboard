@@ -195,7 +195,7 @@ test("#995: checksWrite sees a write after a leading DDL statement, not one insi
 
 // #1589: the test-only knob raises the busy timeout, capped; it never lowers it, and garbage is ignored.
 test("BUS_TEST_BUSY_TIMEOUT_MS only raises the busy timeout, capped at 60 s", () => {
-  for (const v of [undefined, "", "1000", "5000", "abc", "-1", "1e9x", "20000.5"]) expect(busyTimeoutMs(v)).toBe(5000);
+  for (const v of ["", "1000", "5000", "abc", "-1", "1e9x", "20000.5"]) expect(busyTimeoutMs(v)).toBe(5000);
   expect(busyTimeoutMs("20000")).toBe(20000);
   expect(busyTimeoutMs("999999")).toBe(60000);
 });

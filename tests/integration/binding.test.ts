@@ -64,8 +64,10 @@ function cellsEqual(value: string): string[] {
 // A CLI process whose stderr is read as it runs, for a test pause.
 const spawnCli = (args: string[], extra: Record<string, string>) => spawnBusCli(dir, args, extra);
 
-// #1589: a paused overlap's waiter outwaits a slow commit under load (20 s, inside the tests' 30 s timeout).
-const pauseEnv = (point: string) => ({ ...busPauseEnv(dir, point), BUS_TEST_BUSY_TIMEOUT_MS: "20000" });
+const pauseEnv = (point: string) => busPauseEnv(dir, point);
+// #1589: an overlap waiter queued behind a paused holder outwaits a slow commit under load (20 s, inside
+// the tests' 30 s timeout). Only waiters get it: a test that needs the busy timeout to run out keeps 5 s.
+const waiterEnv = (point: string) => ({ ...pauseEnv(point), BUS_TEST_BUSY_TIMEOUT_MS: "20000" });
 const release = (point: string) => releasePause(dir, point);
 
 test("1, 3, 14, 18: an unbound session acts as its ID, offers its default with its mail, and binds", async () => {
@@ -618,7 +620,7 @@ test("12: the human declaration and a bind of the same name: neither order lets 
   // The declaration holds its transaction while a bind starts: the bind waits, then is refused.
   // Each waiter opens first and parks just before its transaction; "pause released" is logged
   // right before its BEGIN IMMEDIATE, so a run where the two didn't overlap can't pass.
-  const s = await session(undefined, { extra: pauseEnv("bind:before-txn") });
+  const s = await session(undefined, { extra: waiterEnv("bind:before-txn") });
   await stop((await session("alex")).c);
   const bind = s.c.callTool({ name: "bind", arguments: { name: "alex" } });
   await until(() => s.stderr().includes("test pause hit: bind:before-txn"));
@@ -633,7 +635,7 @@ test("12: the human declaration and a bind of the same name: neither order lets 
   // A bind holds its transaction while a declaration starts: the declaration waits, then is refused.
   const t = await session(undefined, { extra: pauseEnv("bind:in-txn") });
   await stop((await session("sam")).c);
-  const human2 = spawnCli(["human", "sam"], pauseEnv("human:before-txn"));
+  const human2 = spawnCli(["human", "sam"], waiterEnv("human:before-txn"));
   await until(() => human2.stderr().includes("test pause hit: human:before-txn"));
   const bind2 = t.c.callTool({ name: "bind", arguments: { name: "sam" } });
   await until(() => t.stderr().includes("test pause hit: bind:in-txn"));
