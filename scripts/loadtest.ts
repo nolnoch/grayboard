@@ -239,7 +239,7 @@ export function queueCumulative(s: Sample[]): QueueCum {
       const k = `${x.labels.site}:${x.labels.outcome}`;
       q.gate.set(k, (q.gate.get(k) ?? 0) + x.value);
       // The prior site's as `prior.<method>` (#1537 C5/C7: the subscriber calls' verdict reuse); the tool site's as
-      // `tool.<method>` (dm_send, board_post: #1573), whose `tool` line sums them.
+      // `tool.<method>` (the tool's name: #1573, #1604), whose `tool` line sums them.
       if ((x.labels.site === "gate" || x.labels.site === "prior" || x.labels.site === "tool") && x.labels.method) q.gateMethod.set(`${x.labels.site === "gate" ? "" : `${x.labels.site}.`}${x.labels.method}:${x.labels.outcome}`, x.value);
       continue;
     }

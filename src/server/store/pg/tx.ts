@@ -153,6 +153,9 @@ function probeCheck(txn: Txn, text: string): void {
   if (!PROBE_READ.test(text) || PROBE_ADVISORY.test(text)) probeRefusal(txn, `the statement "${text.trim().split(/\s+/).slice(0, 3).join(" ")} …"`);
 }
 
+// Whether `h` is a Postgres body's Tx inside a readsOnly probe (Repo.probing, #1604).
+export const probing = (h: Read): boolean => h instanceof PgTx && h.txn.probe !== undefined;
+
 // Runs fn with `tx`'s transaction in a read-only probe (#1510, docs/future/postgres-server.md D4): every statement it
 // sends on that transaction is checked as it's built (probeCheck), and refuseKeyed's refusals become the probe's. The
 // first refusal rejects the probe, ProbeWrite, before anything it refused was sent, even if fn caught it and went on.

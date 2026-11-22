@@ -32,7 +32,7 @@ import { makePgOAuth } from "./store/pg/oauth.ts";
 import { makePgSessionEnd } from "./store/pg/session_end.ts";
 import { makePgSlack } from "./store/pg/slack.ts";
 import { openPg } from "./store/pg/sql.ts";
-import { makePgTransactions, refuseKeyedNotice } from "./store/pg/tx.ts";
+import { makePgTransactions, probing, refuseKeyedNotice } from "./store/pg/tx.ts";
 import type { Tx } from "./store/tx.ts";
 import type { WriteQueue } from "./store/queue.ts";
 import { makePgWriteReceipts } from "./store/pg/write_receipts.ts";
@@ -149,6 +149,7 @@ export async function makePgRepo(url: string, opts: PgRepoOptions): Promise<PgRe
     post: t.post,
     postKeyed: t.postKeyed,
     readsOnly: t.readsOnly,
+    probing,
     writeKeyedEffects,
     writeKeyedSend,
     writeKeyedPost,

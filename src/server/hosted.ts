@@ -10,7 +10,7 @@ import { normalizeAliasName } from "../core/addresses.ts";
 import { CoreError } from "../core/errors.ts";
 import { cleanFact } from "../core/text.ts";
 import { HUMAN_NAME, normalizeIdentityName } from "../shared/addressing.ts";
-import { ApplicationError, KeyedSendMiss, UNBOUND_READS, type Application, type ApplicationSession, type BuildFacts, type DeliverySink, type IdentityInfo, type RefusalRow } from "./application.ts";
+import { ApplicationError, KeyedSendMiss, PURE_READS, UNBOUND_READS, type Application, type ApplicationSession, type BuildFacts, type DeliverySink, type IdentityInfo, type RefusalRow } from "./application.ts";
 import type { AuthedUser } from "./auth.ts";
 import type { OAuthPrincipal } from "./oauth.ts";
 import { BUILTIN_CLIENT_IDS, OPENCODE_CLIENT, harnessFor } from "./oauth-config.ts";
@@ -20,7 +20,7 @@ import type { HostedEnd, HostedLost, HostedSession, LostReader } from "./hosted-
 import { writeAudit, type AuditAction } from "./audit.ts";
 import { hostedFailure } from "./hosted-diagnostics.ts";
 import { decidePure, recordDecision, type PureRequest } from "./policy.ts";
-import { countGate, countRefusal, type GateMethod } from "./metrics.ts";
+import { countGate, countRefusal, type GateMethod, TOOL_METHODS } from "./metrics.ts";
 import { isTx, ProbeWrite, type Read, type Tx } from "./store/tx.ts";
 import { abandonable, atSite, RequestAbortedError } from "./store/queue.ts";
 
@@ -193,6 +193,10 @@ const shortOf = (email: string) => (address: string) => address.startsWith(`${em
 const LOST_ALL = "It has no bus name now, so it only reads: bind(name) to take another.";
 const quietSink: DeliverySink = { deliver() {}, closed() {} };
 const writeReads = new Set([...UNBOUND_READS, "whoami", "dm_history", "dm_thread", "dm_inbox"]);
+// The tools whose body runs keyed on its root in a read-only probe on Postgres (#1604, runTool): those that read and
+// write nothing in the common case: the board tools' PURE_READS, and dm_history. board_read is not one (it advances the
+// reader's cursor and outbox), nor dm_inbox and dm_thread, whose recursive CTE the probe can't tell from a write.
+const KEYED_READS: ReadonlySet<string> = new Set([...PURE_READS, "dm_history"]);
 // How often the sweep timer records the server's liveness; after a crash the
 // restart credit can overshoot the real downtime by at most this (#423).
 const HEARTBEAT_MS = 1000;
@@ -211,7 +215,8 @@ const RECONCILE_EVERY = 120;
 // of the idle window, so the idle sweep sees a row at most that much older than its last call.
 const TOUCH_EVERY_MS = 5_000;
 // `keyedGate: false` turns the gate's keyed fast path off (#1510): tests' reference for what the exclusive body writes.
-// `keyedTools: false` the same for keyed tool bodies (dm_send's, #1537 PR 5).
+// `keyedTools: false` the same for keyed tool bodies (dm_send's, #1537 PR 5). The read tools' keyed bodies (#1604) also
+// need the gate's fast path, so `keyedGate: false` turns them off too.
 export function createHostedSessions(application: Application, options: { now?: () => number; idleSeconds?: number; caps?: HostedCaps["sessions"]; keyedGate?: false; keyedTools?: false; isAuthorized(principal: OAuthPrincipal, r?: Read): boolean | Promise<boolean> }) {
   const repo = application.repo, store = repo.hosted;
   const now = options.now ?? Date.now;
@@ -1009,7 +1014,7 @@ export function createHostedSessions(application: Application, options: { now?: 
       write: (<V>(keys: readonly string[], fn: (tx: Tx) => Promise<V>) => Promise<V>) | undefined;
       fn: (session: ApplicationSession, tx: Tx, plan: P) => Promise<T>;
     }): Promise<T> {
-    const toolMethod = tool as GateMethod;
+    const toolMethod: GateMethod = (TOOL_METHODS as readonly string[]).includes(tool) ? tool as GateMethod : "other";
     const body = async (row: HostedSession | undefined) => {
       const taken = told ? await takeLost(p, row, "agent") : [];
       if (taken.length) told!(await lostNotice(p, row!, taken));
@@ -1049,6 +1054,30 @@ export function createHostedSessions(application: Application, options: { now?: 
             countGate("tool", "miss", toolMethod);
           }
         } else if (keyed) countGate("tool", "skipped", toolMethod);
+        else if (KEYED_READS.has(tool) && keyedFast && keyedTools && row && root) {
+          // A read tool's body keyed on its root (#1604, D4): the fence locks the row and root as the exclusive body's
+          // does, then `fn` runs in a read-only probe. A write it would make (a cursor, an afterCommit effect) refuses
+          // before its statement and the call runs the exclusive body, as does a refusal (its refusal rows, deferred
+          // in memory, are dropped and the exclusive body writes them as before). Sound against bind, renew and end on the same root:
+          // they hold `root:<id>` or run exclusive.
+          const readsOnly = repo.readsOnly!;
+          const attempt = refusalRows();
+          selected.session.afterRollback = attempt.defer;
+          try {
+            const value = await abandonable(signal, () => atSite("tool", () => store.writeKeyed([`root:${root.session_id}`], async tx => {
+              await fence(tx, p, row, root);
+              return readsOnly(tx, async () => fn(selected.session, tx));
+            })));
+            countGate("tool", "keyed", toolMethod);
+            // What `call`'s afterCommit would have done (every call re-reads the next claim expiry). The resource
+          // catalog's board_list, which never went through `call`, re-arms too: one pool read.
+            if (PURE_READS.has(tool)) application.armClaims();
+            return value;
+          } catch (error) {
+            if (!(error instanceof ProbeWrite || error instanceof ApplicationError || error instanceof CoreError)) throw error;
+          } finally { selected.session.afterRollback = late.defer; }
+          countGate("tool", "miss", toolMethod);
+        } else countGate("tool", "skipped", toolMethod);
         return await abandonable(signal, () => atSite("tool", () => store.write<T>(async tx => {
           await fence(tx, p, row, root);
           const value = await fn(selected.session, tx);
