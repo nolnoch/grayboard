@@ -303,7 +303,7 @@ export function makePgIdentity({ now, hosted }: { now: () => number; hosted: PgH
         const name = p.kind === "id"
           ? (await first(sql`SELECT principal FROM ids WHERE id = ${p.address}`, row => strOrNull(row.principal)))
           : p.kind === "alias" ? p.scope : p.name;
-        const row = name ? await principalByName(sql, name) : undefined;
+        const row = name ? await memoized(r, `principal ${name}`, q => principalByName(q, name)) : undefined;
         // team:x names a team, never a service; a person scope (an email) is only a user's.
         if (!row || (p.kind === "team" && row.kind !== "team")) return null;
         if (p.kind === "alias" && (p.scopeKind === "person") !== (row.kind === "user")) return null;

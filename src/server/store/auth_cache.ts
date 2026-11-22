@@ -83,7 +83,7 @@ export function makeAuthCache(source: AuthGenerationSource, reads: AuthReads): A
   const heldUser = (g: string, userId: number) => g === userGeneration ? users.get(userId) : undefined;
   // The read may await (#807 P3 A7u2; pause auth:user:read): a commit meanwhile (a disable) moves the generation, so
   // the fill check stores nothing and the next lookup reads again. The answer stands, linearized before that commit.
-  // Inside the caller's own transaction (generation undefined) it reads on the caller's Tx, uncached. The handle is
+  // Inside the caller's own transaction (generation undefined) it reads on the caller's Tx, uncached (a keyed Postgres body's identity memo aside, #1618). The handle is
   // resolved first, so a kept Tx is refused on a hit too.
   const cachedUser = async (r: Read, userId: number): Promise<User | undefined> => {
     reads.check(r);

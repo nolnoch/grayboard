@@ -93,6 +93,23 @@ describePg("identity memo (Postgres, #1618)", () => {
     expect(await after(tx => pgOf(tx)`SELECT 1 FROM principals WHERE false FOR KEY SHARE`)).toEqual({ fresh: true, sent: 1 });
   });
 
+  test("an advisory lock drops the memo", async () => {
+    expect(await after(tx => pgOf(tx)`SELECT pg_advisory_xact_lock(1618)`)).toEqual({ fresh: true, sent: 1 });
+  });
+
+  test("a read in flight across a forget doesn't cross-fill its other key", async () => {
+    // Mutation: the memoGen check in memoized dropped (the stale row fills user@<email>: 0 sent).
+    await using p = await pair();
+    const u = await seed(p);
+    const sent = await keyed(p, async tx => {
+      const inFlight = p.g.users.findById(tx, u.id);
+      await pgOf(tx)`UPDATE boards SET purpose = purpose WHERE false`;
+      await inFlight;
+      return (await counted(tx, () => p.g.users.findByEmail(tx, A)))[1];
+    });
+    expect(sent).toBe(1);
+  });
+
   test("a savepoint's rollback drops the memo", async () => {
     expect(await after(tx => tx.savepoint(async () => { throw new Error("undo"); }).catch(() => {}))).toEqual({ fresh: true, sent: 1 });
   });
