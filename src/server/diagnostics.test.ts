@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import { expect, test } from "bun:test";
 import { SQL } from "bun";
 import { diagnosticOrigin, errorDiagnostic, failureDiagnostic, type FailureSource } from "./diagnostics.ts";
+import { S3StoreError } from "./s3_blobs.ts";
 import { TxAborted } from "./store/pg/tx.ts";
 
 const thrown = (fn: () => unknown) => { try { fn(); } catch (e) { return e; } throw new Error("did not throw"); };
@@ -29,6 +30,12 @@ test("error diagnostics carry only the class and an allowlisted code, from data 
   expect(errorDiagnostic(Object.assign(new Error(), { name: "Bearer secret", code: "Bearer secret" }))).toEqual({ class: "[unrecognized]" });
   expect(errorDiagnostic(Object.assign(new Error(), { name: "secretvalue", code: "SQLITE_BUSY secret" }))).toEqual({ class: "[unrecognized]" });
   expect(errorDiagnostic(Object.assign(new Error(), { code: 13 }))).toEqual({ class: "Error" });
+  // #1608: S3's codes only on the S3 classes, bounded.
+  expect(errorDiagnostic(new S3StoreError("S3 put on s3://b/: InternalError: secret", "InternalError"))).toEqual({ class: "S3StoreError", code: "InternalError" });
+  expect(errorDiagnostic(Object.assign(new Error("x"), { name: "S3Error", code: "NoSuchBucket" }))).toEqual({ class: "S3Error", code: "NoSuchBucket" });
+  expect(errorDiagnostic(Object.assign(new Error(), { code: "InternalError" }))).toEqual({ class: "Error" });
+  expect(errorDiagnostic(new S3StoreError("x", "Bearer secret"))).toEqual({ class: "S3StoreError" });
+  expect(errorDiagnostic(new S3StoreError("x", "A".repeat(49)))).toEqual({ class: "S3StoreError" });
   let reads = 0;
   const getters = new Error();
   for (const key of ["name", "code", "message", "stack", "cause"]) Object.defineProperty(getters, key, { get() { reads++; return "ENOENT"; } });

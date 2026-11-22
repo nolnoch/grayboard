@@ -38,6 +38,15 @@ export type S3BlobOptions = {
 
 // Bun throws an Error named S3Error with S3's code; NoSuchKey is the only answer that means the bytes are gone. A 403
 // is not: without s3:ListBucket, S3 answers AccessDenied for a missing key, and that is a permissions fault.
+// An S3 refusal with S3's error code as data (#1608): hosted diagnostics log the code (`errorDiagnostic`), never the
+// message, so a pod's log line says which S3 fault it was (InternalError, AccessDenied, NoSuchBucket).
+export class S3StoreError extends Error {
+  constructor(message: string, readonly code: string) {
+    super(message);
+    this.name = "S3StoreError";
+  }
+}
+
 const s3Code = (e: unknown): string | undefined => (e instanceof Error && e.name === "S3Error" ? (e as { code?: string }).code : undefined);
 
 export class S3Blobs implements BlobStore {
@@ -138,7 +147,7 @@ export class S3Blobs implements BlobStore {
   private fail(what: string, e: unknown): Error {
     const code = s3Code(e);
     if (code === undefined) return e as Error;
-    return new Error(`S3 ${what} on ${this.describe()}: ${code}: ${(e as Error).message}`);
+    return new S3StoreError(`S3 ${what} on ${this.describe()}: ${code}: ${(e as Error).message}`, code);
   }
 
   async put(sha256: string, data: Uint8Array): Promise<void> {

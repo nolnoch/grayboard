@@ -7,12 +7,15 @@ import type { createOAuthServer } from "./oauth.ts";
 import type { UploadGate } from "./uploads.ts";
 import { permitsOrigin } from "./origin.ts";
 import { countRefusal } from "./metrics.ts";
+import { hostedFailure } from "./hosted-diagnostics.ts";
 import { testPauseAsync } from "../shared/testpause.ts";
 
 class Refusal extends Error {
   constructor(readonly response: Response) { super("attachment request refused"); }
 }
 
+const OPERATION = { POST: "attachments.upload", GET: "attachments.download", DELETE: "attachments.release" } as const;
+const failed = (req: Request, cause: unknown) => hostedFailure(OPERATION[req.method as keyof typeof OPERATION] ?? "attachments.upload", cause);
 const error = (code: string, message: string, status: number) => Response.json({ code, message }, { status });
 const privateResponse = (response: Response) => {
   response.headers.set("Cache-Control", "private, no-store");
@@ -97,6 +100,9 @@ export function createMcpAttachments(repo: Repo, oauth: Pick<ReturnType<typeof c
       if (cause instanceof ApplicationError) return error(cause.code, cause.message, cause.code === "unauthenticated" ? 401 : 403);
       if (req.signal.aborted && cause === req.signal.reason) return error("cancelled", "request cancelled", 499);
       // Cancellation is not evidence that a simultaneous storage fault was auth failure.
+      // The client gets a bare 500; the operator's log gets a line (#1608). Hosted diagnostics carry no message or
+      // stack (#386): an auth read's SQL error or a blob path can carry private values. The cause is in access_log.
+      failed(req, cause);
       return error("internal", "internal error", 500);
     }
   }
@@ -115,7 +121,8 @@ export function createMcpAttachments(repo: Repo, oauth: Pick<ReturnType<typeof c
           // Refusals before quota/body reading still own the original source.
           if (response.status >= 400 && req.method === "POST" && req.body) await req.body.cancel();
           return privateResponse(response);
-        } catch {
+        } catch (cause) {
+          failed(req, cause);
           return privateResponse(error("internal", "internal error", 500));
         }
       })();
