@@ -9,6 +9,8 @@ import type { Repo, User } from "./db.ts";
 import type { Tx } from "./store/tx.ts";
 import { googleProvider } from "./idp_google.ts";
 import { oidcProvider } from "./idp_oidc.ts";
+import { keycloakDirectoryStatus } from "./idp_keycloak_directory.ts";
+import { oktaDirectoryStatus } from "./idp_okta_directory.ts";
 
 // issuer: half of the stored key, the provider's constant, never a token's `iss`.
 export type UpstreamIdentity = { issuer: string; subject: string; email: string; displayName: string | null };
@@ -27,6 +29,11 @@ export type IdentityProvider = {
   // nonce, verified email, domain), with the email lowercased. Verification
   // lives here so no caller can skip it.
   exchange(i: ExchangeInput): Promise<UpstreamIdentity>;
+  // The directory's word on a subject this provider signed in (#930 A2, idp_recheck.ts). "inactive" only for an
+  // answer that the person is suspended, deprovisioned or gone; it throws on anything else (network, 5xx, 429, our
+  // own credential refused with 401/403, the signal's abort). Absent: the provider has no directory check, and its
+  // users re-authenticate every GRAYBOARD_IDP_REAUTH_DAYS instead.
+  status?(subject: string, signal: AbortSignal): Promise<"active" | "inactive">;
 };
 
 // A provider's refusal of a verified identity whose email is outside the org's domains (D5). The AS
@@ -37,19 +44,21 @@ export const callbackPath = (p: Pick<IdentityProvider, "id">) => `/oauth/${p.id}
 
 // The providers a server signs in with when OAuthOptions.providers doesn't inject any, built from Config alone in
 // GRAYBOARD_IDPS's order (#928 D6): Google with the client pair the AS uses (mcpGoogle, else the primary), Okta and
-// oidc (#1418) as the generic OIDC provider. loadConfig has checked the list (checkIdpConfig); nothing is fetched here (D2).
+// oidc (#1418) as the generic OIDC provider, with Okta's (#1563) and Keycloak's (#1555) directory checks when configured. loadConfig has checked the list (checkIdpConfig); nothing is fetched here (D2).
 export function defaultProviders(config: Config): IdentityProvider[] {
   return (config.idps ?? ["google"]).map(id => {
     if (id === "okta") {
       if (!config.okta) throw new Error("GRAYBOARD_IDPS lists okta without its configuration");
-      return oidcProvider({ id: "okta", label: "Okta", ...config.okta });
+      const provider = oidcProvider({ id: "okta", label: "Okta", ...config.okta });
+      return config.oktaDirectory ? { ...provider, status: oktaDirectoryStatus(config.oktaDirectory) } : provider;
     }
     if (id === "oidc") {
       if (!config.oidc) throw new Error("GRAYBOARD_IDPS lists oidc without its configuration");
-      return oidcProvider({ id: "oidc", ...config.oidc });
+      const provider = oidcProvider({ id: "oidc", ...config.oidc });
+      return config.keycloakDirectory ? { ...provider, status: keycloakDirectoryStatus(config.keycloakDirectory) } : provider;
     }
     const googleClient = config.mcpGoogle ?? { clientId: config.googleClientId, clientSecret: config.googleClientSecret };
-    return googleProvider({ ...googleClient, orgDomain: config.orgDomain });
+    return googleProvider({ ...googleClient, orgDomain: config.orgDomain }, config.googleDirectory);
   });
 }
 

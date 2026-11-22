@@ -99,6 +99,23 @@ export async function makePgRepo(url: string, opts: PgRepoOptions): Promise<PgRe
     if (other !== undefined) return Promise.reject(new Error(`writeKeyedEffects: a keyed body may not queue ${other}'s notices; only ${[...KEYED_NOTICE_OPS].join(", ")} (docs/future/postgres-server.md D4)`));
     return t.writeKeyed(keys, fn, committed, { effects: true, notices });
   }) as NonNullable<Repo["writeKeyedEffects"]>;
+  // dm_send's keyed body (#1537 PR 5, D4): effects on (deliverSend's afterCommit), no notice, no `committed`. The keys
+  // are checked here, not trusted to the caller: a root and exactly one recipient stream.
+  const writeKeyedSend = (<T>(keys: readonly string[], fn: (tx: Tx) => Promise<T>): Promise<T> => {
+    const streams = keys.filter(k => k.startsWith("dm:") && k.length > 3);
+    if (!keys.some(k => k.startsWith("root:") && k.length > 5) || streams.length !== 1) {
+      return Promise.reject(new Error(`writeKeyedSend: a keyed send names a root and exactly one recipient stream (dm:<address>); got ${keys.join(", ")} (docs/future/postgres-server.md D4)`));
+    }
+    return t.writeKeyed(keys, fn, undefined, { effects: true });
+  }) as NonNullable<Repo["writeKeyedSend"]>;
+  // board_post's keyed body (#1537 PR 6, D4): writeKeyedSend's terms, one root and one board, and no other key.
+  const writeKeyedPost = (<T>(keys: readonly string[], fn: (tx: Tx) => Promise<T>): Promise<T> => {
+    const roots = keys.filter(k => k.startsWith("root:") && k.length > 5), boards = keys.filter(k => k.startsWith("board:") && k.length > 6);
+    if (roots.length !== 1 || boards.length !== 1 || keys.length !== 2) {
+      return Promise.reject(new Error(`writeKeyedPost: a keyed post names one root and one board (board:<name>); got ${keys.join(", ")} (docs/future/postgres-server.md D4)`));
+    }
+    return t.writeKeyed(keys, fn, undefined, { effects: true });
+  }) as NonNullable<Repo["writeKeyedPost"]>;
   // The end a released hosted child's ID ends through, made from the finished Repo on first use, as db.ts openDatabase does.
   let port: SessionEndPort | undefined;
   const hosted = makePgHosted({ sessionEnd: deferredSessionEnd(() => port ??= sessionEndPort(opts.humanReach ?? "team")(repo)) });
@@ -127,6 +144,8 @@ export async function makePgRepo(url: string, opts: PgRepoOptions): Promise<PgRe
     postKeyed: t.postKeyed,
     readsOnly: t.readsOnly,
     writeKeyedEffects,
+    writeKeyedSend,
+    writeKeyedPost,
     writeQueue: t.queue,
     read: t.read,
     authRead: auth.authRead,
@@ -136,7 +155,7 @@ export async function makePgRepo(url: string, opts: PgRepoOptions): Promise<PgRe
     // The revokes notify, as on SQLite (db.ts makeRepo): a credential's add, rotate and mint only add authority.
     oauth: { ...oauth, findActiveAccess: auth.findActiveAccess, redeemCode: change(oauth.redeemCode, "oauth.redeemCode"), rotateRefresh: change(oauth.rotateRefresh, "oauth.rotateRefresh"),
       revokeToken: change(oauth.revokeToken, "oauth.revokeToken"), revokeServiceCredential: change(oauth.revokeServiceCredential, "oauth.revokeServiceCredential"),
-      revokeServiceSecret: change(oauth.revokeServiceSecret, "oauth.revokeServiceSecret") },
+      revokeServiceSecret: change(oauth.revokeServiceSecret, "oauth.revokeServiceSecret"), revokeUserGrant: change(oauth.revokeUserGrant, "oauth.revokeUserGrant") },
     hosted: repoHosted,
     users: { ...identity.users, isDisabled: auth.isDisabled, active: auth.active, setDisabled: change(identity.users.setDisabled, "users.setDisabled") },
     sessions: { ...identity.sessions, revokeAllForUser: change(identity.sessions.revokeAllForUser, "sessions.revokeAllForUser") },

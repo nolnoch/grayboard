@@ -10,6 +10,7 @@ import { boardAccess } from "./access.ts";
 import { testPauseAsync } from "../shared/testpause.ts";
 import { visibleBoards } from "./board_reads.ts";
 import { decidePure, recordDecision, type Actor, type PureRequest } from "./policy.ts";
+import { atSite } from "./store/queue.ts";
 
 // The read request for attachment `idText`, judged by policy.ts decidePure(): `handle` may read it on a post on a board it can see,
 // on a direct message it sent or received, or its own unsent upload. A
@@ -76,12 +77,12 @@ export async function storeUpload(
   try {
     // The guard and the audit row are one awaited write (#965): a failed audit row fails the upload, which is
     // released, rather than keeping bytes no `attachment.uploaded` row records.
-    await repo.write(async w => {
+    await atSite("attachments", () => repo.write(async w => {
       await guard?.(w);
       writeAudit(repo, w, "attachment.uploaded", email, `attachment:${row.id}`, {
         identity: handle, filename: row.filename, type: row.type, size: row.size, sha256: row.sha256, ...detail,
       });
-    });
+    }));
     return row;
   } catch (error) {
     // Only this upload, and only while unbound; concurrent sends keep their bytes. Unguarded: the release is the
@@ -121,16 +122,16 @@ async function storeFile(repo: Repo, uploader: string, file: AttachmentFile, quo
   let unnamed = false;
   try {
     return await withBlob(sha256, async () => {
-      const added = await repo.write(async (tx) => {
+      const added = await atSite("attachments", () => repo.write(async (tx) => {
         await guard?.(tx);
         return repo.attachments.insertUpload(tx, { sha256, filename: file.filename, type: file.type, size: file.data.length, uploader, quota, now });
-      });
+      }));
       unnamed = added.pruned;
       try {
         // Put even when the catalog knew this sha256: it heals bytes a crash lost.
         await repo.blobs.put(sha256, file.data);
       } catch (e) {
-        await repo.write((tx) => repo.attachments.remove(tx, added.row.id));
+        await atSite("attachments", () => repo.write((tx) => repo.attachments.remove(tx, added.row.id)));
         unnamed = true;
         throw e;
       }
@@ -143,10 +144,10 @@ async function storeFile(repo: Repo, uploader: string, file: AttachmentFile, quo
 
 // One of `from`'s unsent uploads dropped, its bytes swept; null if it isn't theirs or a message or post carries it.
 async function releaseFile(repo: Repo, id: number, from: Uploader, guard?: Guard): Promise<AttachmentRow | null> {
-  const row = await repo.write(async (tx) => {
+  const row = await atSite("attachments", () => repo.write(async (tx) => {
     await guard?.(tx);
     return (await repo.attachments.dropUnsent(tx, [id], from))[0] ?? null;
-  });
+  }));
   if (row) await sweepStoredBlobs(repo);
   return row;
 }
@@ -170,7 +171,7 @@ export async function sweepStoredBlobs(repo: Repo, stopped: () => boolean = () =
       await withBlob(sha256, async () => {
         if (await repo.attachments.named(repo.read, sha256)) return;
         await repo.blobs.delete(sha256);
-        swept += await repo.write((tx) => repo.attachments.dropBlobEntry(tx, sha256));
+        swept += await atSite("attachments", () => repo.write((tx) => repo.attachments.dropBlobEntry(tx, sha256)));
       });
     } catch (e) {
       console.error(`[grayboard] blob sweep: ${sha256}: ${(e as Error).message}`);

@@ -1,7 +1,7 @@
 import { afterEach, expect, test } from "bun:test";
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { countGate, countRefusal, forgetToolSeries, gateCount, lagSamplerUsers, lagWindow, LATENCY_BUCKETS, observeTool, queueStatementsBody, render, startLagSampler, statementTotals } from "./metrics.ts";
+import { countGate, countRefusal, forgetToolSeries, gateCount, lagSamplerUsers, PRIOR_METHODS, lagWindow, LATENCY_BUCKETS, observeTool, queueStatementsBody, render, startLagSampler, statementTotals } from "./metrics.ts";
 import { DEFAULT_MCP_LIMITS, parseMetricsAddr } from "./config.ts";
 import { TestServer } from "../../tests/support/server.ts";
 import { until } from "../../tests/support/until.ts";
@@ -62,6 +62,17 @@ test("statements and round trips per body render as per-site histograms; the gat
   expect(sample(text, 'grayboard_hosted_gate_bodies_total{site="prior",method="tool",outcome="miss"}')).toBe(prior + 1);
   // Every method's series is present from the start.
   expect(sample(text, 'grayboard_hosted_gate_bodies_total{site="gate",method="pending",outcome="miss"}')).toBeGreaterThanOrEqual(0);
+});
+
+// #1537 C5/C7: the prior site carries the call that reused its exchange's verdict, each of its methods present from the
+// start. Mutation: countGate ignoring `method` for the prior site (renew's prior counts as tool's).
+test("the prior counter carries its method: a tool call's, and the subscriber's renew, receipt, pending, open and bind", () => {
+  const at = Object.fromEntries(PRIOR_METHODS.map(m => [m, gateCount("prior", "keyed", m)]));
+  for (const m of PRIOR_METHODS) countGate("prior", "keyed", m);
+  expect(Object.fromEntries(PRIOR_METHODS.map(m => [m, gateCount("prior", "keyed", m) - at[m]!]))).toEqual({ tool: 1, renew: 1, receipt: 1, pending: 1, open: 1, bind: 1 });
+  const text = render();
+  for (const m of PRIOR_METHODS) expect(sample(text, `grayboard_hosted_gate_bodies_total{site="prior",method="${m}",outcome="keyed"}`)).toBe(at[m]! + 1);
+  expect(sample(text, 'grayboard_hosted_gate_bodies_total{site="prior",method="bind",outcome="skipped"}')).toBeGreaterThanOrEqual(0);
 });
 
 // A capacity refusal that doesn't count itself reads zero on the dashboard while clients are refused.

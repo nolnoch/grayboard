@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import type { Read, Tx } from "./store/tx.ts";
 
 // All times are epoch milliseconds; capability inputs are SHA-256 hex digests, never secrets.
@@ -14,6 +15,14 @@ export type OAuthRequest = OAuthAuthorization & {
 };
 export type OAuthBrowserSession = { sessionHash: string; userId: number; createdAt: number; expiresAt: number };
 export type OAuthCode = OAuthAuthorization & { codeHash: string; userId: number; createdAt: number; expiresAt: number };
+// A new grant's id: 32 random bytes as base64url (43 characters), redrawn while it starts with '-', which a command
+// line reads as an option (#1583). Ids already issued keep that shape and may start with '-'; the CLI accepts them.
+export function newGrantId(draw: () => Buffer = () => randomBytes(32)): string {
+  for (;;) {
+    const id = draw().toString("base64url");
+    if (id[0] !== "-") return id;
+  }
+}
 export type OAuthGrant = OAuthBinding & {
   id: string; userId: number; createdAt: number; expiresAt: number; revokedAt: number | null;
 };
@@ -46,6 +55,11 @@ export const SERVICE_TOKEN_MIN_SECONDS = 60;
 export type OAuthTokenPair = OAuthBinding & {
   accessHash: string; refreshHash: string; accessExpiresAt: number; refreshExpiresAt: number;
 };
+// One live grant as the per-grant list shows it (#930): last used is its newest token's mint (a refresh or a run
+// token), the grant's creation when it has none left. `credential`: a service credential's grant, listed read-only.
+export type GrantSummary = { id: string; clientId: string; createdAt: number; expiresAt: number; lastUsedAt: number; credential: boolean };
+// The most grants one list returns, newest use first: a user consents once per harness and machine, so far fewer.
+export const GRANT_LIST_MAX = 500;
 export type OAuthFailure = { status: "invalid" | "not_found" | "replay" | "capacity" };
 export type OAuthResult<T> = { status: "ok"; value: T } | OAuthFailure;
 // Writes take the body's `Tx`, reads a `Read` (#807 D2): the caller's `Tx` inside a write body, `repo.read` outside one.
@@ -69,12 +83,22 @@ export interface OAuthStore {
   redeemLoginCode(tx: Tx, input: OAuthAuthorization & { codeHash: string; tokenHash: string; label: string | null }, now: number): Promise<OAuthResult<{ sessionId: number; userId: number }>>;
   // Resolves original scopes for an omitted refresh scope; rotation rechecks everything atomically.
   findRefreshGrant(r: Read, refreshHash: string, clientId: string, resource: string, now: number): Promise<OAuthGrant | undefined>;
+  // The user behind an unspent, unrevoked, unexpired refresh token of a live grant bound to the client and resource,
+  // else undefined (#930): the IdP re-check runs only for a token rotation could spend, so a replay still reaches
+  // rotateRefresh's family revocation.
+  findRefreshUser(r: Read, refreshHash: string, clientId: string, resource: string, now: number): Promise<number | undefined>;
   // input.scopes requests nonempty canonical access scopes within the original grant; tokens.scopes must match.
   // Requested TTLs are validated then clamped to the persisted absolute grant deadline; use returned deadlines.
   rotateRefresh(tx: Tx, input: OAuthBinding & { refreshHash: string; tokens: OAuthTokenPair }, now: number): Promise<OAuthResult<{ grant: OAuthGrant; tokens: OAuthTokenPair }>>;
   revokeToken(tx: Tx, tokenHash: string, clientId: string, now: number): Promise<void>;
   findActiveAccess(r: Read, tokenHash: string, resource: string, requiredScopes: string[], now: number): Promise<OAuthAccess | undefined>;
   isGrantActive(r: Read, grantId: string, now: number): Promise<boolean>;
+  // The user's live grants (unrevoked, unexpired), newest use first, at most GRANT_LIST_MAX (#930).
+  listGrants(r: Read, userId: number, now: number): Promise<GrantSummary[]>;
+  // Revokes one of the user's live grants, ending its hosted sessions in this transaction (#930): not_found unless
+  // the grant is userId's and live; invalid for a service credential's grant, whose own revoke keeps
+  // service.credential_revoked. The caller audits (it knows the actor).
+  revokeUserGrant(tx: Tx, userId: number, grantId: string, now: number): Promise<OAuthResult<{ clientId: string }>>;
   // Once per database and `key` (#429: builtin_clients; #928: builtin_clients_cli): revokes every unrevoked
   // grant, and drops every unredeemed code, under `clientIds`, audits each grant, then records the cutover under
   // `key` so grants those clients issue later survive restarts. Returns the grants revoked; 0 after the first run.

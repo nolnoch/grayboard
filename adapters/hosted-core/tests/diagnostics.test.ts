@@ -5,7 +5,7 @@
 import { expect, test } from "bun:test";
 import { Diagnostics, failureCode, failureMessage, logFields, type RecordStatus } from "../src/diagnostics.js";
 import { DeliveryHeldElsewhere, RefreshInProgress, ServerOutdated } from "../src/model.js";
-import { subscriberError } from "../src/wire.js";
+import { ServerBusy, ServerUnreachable, subscriberError } from "../src/wire.js";
 
 test("failureCode and failureMessage name a delivery held elsewhere, an outdated server and a busy refresh", () => {
   const hint = "run /grayboard resume";
@@ -14,6 +14,17 @@ test("failureCode and failureMessage name a delivery held elsewhere, an outdated
     ["server_outdated", "this grayboard server predates the pi adapter; update the server"],
     ["refresh_in_progress", "token refresh in progress in another pi process; run /grayboard resume"],
   ]);
+});
+
+// #1553: a server at capacity is still an outage to retry (a ServerUnreachable), but reported as what it is.
+test("failureCode and failureMessage tell a busy server from an unreachable one", () => {
+  const hint = "run /grayboard resume";
+  expect([new ServerBusy(800), new ServerUnreachable(new Error("down"))].map(e => [failureCode(e), failureMessage(e, hint)])).toEqual([
+    ["server_busy", "Server at capacity; run /grayboard resume"],
+    ["server_unreachable", "Server unreachable; run /grayboard resume"],
+  ]);
+  // A warning that prints the raw error says capacity too; a hint no wait can use reads as one second.
+  expect([new ServerBusy(800).message, new ServerBusy(800).retryAfterMs, new ServerBusy(Number.NaN).retryAfterMs, new ServerBusy(-5).retryAfterMs]).toEqual(["Server at capacity", 800, 1000, 1000]);
 });
 
 test("login, login link, logout, refresh and tool-proxy records keep their operation and code, emitted and persisted", async () => {

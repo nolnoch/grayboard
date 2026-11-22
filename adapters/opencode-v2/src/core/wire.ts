@@ -3,6 +3,7 @@
 import { Client, InsufficientScopeError, SdkError, SdkErrorCode, SdkHttpError, StreamableHTTPClientTransport, type AuthProvider, type CallToolResult, type Tool } from "@modelcontextprotocol/client";
 import type { Delivery, SessionFacts } from "./port.js";
 import { setTimeout as sleep } from "node:timers/promises";
+import { connect as tcpConnect, type LookupFunction, type Socket } from "node:net";
 
 export const DELIVERY_META = "io.github.nolnoch.grayboard/delivery";
 export const LAUNCHER_META = "io.github.nolnoch.grayboard/launcher";
@@ -69,6 +70,21 @@ export class ConnectRefused extends SubscriberError {
 export class ServerUnreachable extends Error {
   constructor(cause: unknown) { super("Server unreachable", { cause }); }
 }
+// A connect (`server/discover`, `initialize`) still refused `rate_limited` when
+// its retries or its timeout ran out (#1536): the server is up but at capacity. A ServerUnreachable,
+// so every outage path retries it rather than reading the SDK's causeless
+// version-negotiation failure the 429 would otherwise become.
+// Its own message, so every warning that prints the raw error says capacity, not unreachable (#1553); a hint that
+// isn't a positive finite number reads as one second, so no caller's wait floor can collapse to zero.
+export class ServerBusy extends ServerUnreachable {
+  readonly retryAfterMs: number;
+  constructor(retryAfterMs: number) {
+    const ms = Number.isFinite(retryAfterMs) && retryAfterMs > 0 ? retryAfterMs : 1000;
+    super(new Error(`server at capacity (rate_limited); retry after ${ms} ms`));
+    this.retryAfterMs = ms;
+    this.message = "Server at capacity";
+  }
+}
 // A tool call's request left, then the transport failed (a reset, a gateway
 // 502-504, a stream cut short, a timeout): the server may have run it, so the
 // agent checks before calling again (#1345, the Rust SDK's OutcomeUnknown). A
@@ -79,6 +95,10 @@ export class OutcomeUnknown extends ServerUnreachable {
     this.message = "Server unreachable mid-call; it may have taken effect, so check (dm_history, board_read, claim_list) before calling it again";
   }
 }
+// The connect probe (#1347) found the endpoint not accepting connections, so the call never left. A
+// ServerUnreachable, but not proof the shared connection is broken: calls in flight on a pooled socket may still
+// land, so the proxy keeps it, as it does after a request timeout.
+export class ConnectProbeFailed extends ServerUnreachable {}
 // The server closed the inbox stream: an outage, or a refusal (expired
 // access, rebind, revocation) the reconnect will classify. Never itself
 // proof of an outage (#423).
@@ -99,9 +119,9 @@ function scopeRefusal(error: unknown): boolean {
   }
   return false;
 }
-const networkCodes = new Set(["ECONNREFUSED", "ConnectionRefused", "ECONNRESET", "ETIMEDOUT", "EHOSTUNREACH", "ENETUNREACH", "ENOTFOUND", "EAI_AGAIN", "FailedToOpenSocket"]);
+const networkCodes = new Set(["ECONNREFUSED", "ConnectionRefused", "ECONNRESET", "ETIMEDOUT", "EHOSTUNREACH", "ENETUNREACH", "ENOTFOUND", "EAI_AGAIN", "FailedToOpenSocket", "UND_ERR_CONNECT_TIMEOUT"]);
 // A failure to open the socket: no request left, so even a write is safe to call again.
-const connectCodes = new Set(["ECONNREFUSED", "ConnectionRefused", "EHOSTUNREACH", "ENETUNREACH", "ENOTFOUND", "EAI_AGAIN", "FailedToOpenSocket"]);
+const connectCodes = new Set(["ECONNREFUSED", "ConnectionRefused", "EHOSTUNREACH", "ENETUNREACH", "ENOTFOUND", "EAI_AGAIN", "FailedToOpenSocket", "UND_ERR_CONNECT_TIMEOUT"]);
 const gatewayStatuses = new Set([502, 503, 504]);
 // Walks the cause chain: the SDK rethrows fetch failures from requests, but
 // wraps them during connect (SdkError EraNegotiationFailed {cause}).
@@ -118,7 +138,7 @@ export function unreachable(error: unknown): boolean {
 
 // The server's listen cap refused a listen (`src/server/mcp.ts` `reserve`): a plain-text 429 with this exact body and
 // no `rate_limited` data, so the fetch wrapper hands it back unretried and the SDK raises it as an SdkHttpError. Only
-// this body: another plain 429 (request or exchange capacity) is no listen-slot race (#1394).
+// this body: another plain 429 is no listen-slot race (#1394).
 export const LISTEN_CAPACITY = "MCP listen capacity reached";
 export function listenCapacity(error: unknown): boolean {
   for (let e = error, depth = 0; e && depth < 8; e = (e as { cause?: unknown }).cause, depth++) {
@@ -129,9 +149,9 @@ export function listenCapacity(error: unknown): boolean {
 
 // A tool call's raw failure, before reachable() classifies it: an outage
 // after its request may have left (anything but a socket that never opened)
-// is OutcomeUnknown. A ServerUnreachable already is the credential's (a
-// refresh before the request, or after a 401 or 429 the server refused it
-// with), so nothing ran and it stays as it is.
+// is OutcomeUnknown. A ServerUnreachable already is from before the request
+// left (the credential's refresh, a 401 or 429 the server refused it with, or
+// the connect probe), so nothing ran and it stays as it is.
 function outcome(error: unknown): unknown {
   for (let e = error, depth = 0; e && depth < 8; e = (e as { cause?: unknown }).cause, depth++) {
     if (e instanceof ServerUnreachable) return error;
@@ -153,6 +173,47 @@ export function abortOf(error: unknown, signal: AbortSignal): boolean {
 }
 
 const connectMethods = new Set(["server/discover", "initialize"]);
+
+// The connect probe (#1347). Neither runtime's fetch takes a connect deadline (Bun's has none; Node's undici gives up
+// at 10 s, after the SDK's 10 s request timeout), so a blackholed endpoint would fail a call as a request timeout,
+// OutcomeUnknown, though nothing left. Before a tool call on a wire with no recent answer, a plain TCP connect to the
+// endpoint under a deadline shorter than the request's (the Rust SDK's CONNECT_TIMEOUT) proves the server reachable
+// or the call unsent. Only its own deadline fails the call: a connect error (refused, unresolvable) falls through to
+// the request, whose fetch classifies it as unsent itself, so a fetch that resolves or routes differently from a
+// direct connect (a test's stub, a host's shim) still decides. Skipped behind a proxy, where a direct connect proves
+// nothing. The connect races a host's addresses (Happy Eyeballs, `autoSelectFamily`) as fetch does, so a dual-stack
+// host whose IPv6 route blackholes still connects over IPv4 instead of failing at the deadline (#1585); both runtimes
+// default it on, but a process can turn the default off, so it's set here. Tests shorten the deadline, replace `open`
+// with a socket that never connects, or give `lookup` a resolver of their own.
+export const connectProbe = {
+  deadlineMs: 5_000, coldMs: 30_000, lookup: undefined as LookupFunction | undefined,
+  open: (host: string, port: number): Socket => tcpConnect({ host, port, autoSelectFamily: true, ...(connectProbe.lookup && { lookup: connectProbe.lookup }) }),
+};
+function proxied(url: URL): boolean {
+  const env = typeof process === "undefined" ? {} : process.env;
+  const names = url.protocol === "https:" ? ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"] : ["HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"];
+  return names.some(n => !!env[n]);
+}
+function probe(url: URL, signal: AbortSignal): Promise<void> {
+  const host = url.hostname.replace(/^\[(.*)\]$/, "$1");
+  const port = Number(url.port || (url.protocol === "https:" ? 443 : 80));
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) { reject(signal.reason); return; }
+    const socket = connectProbe.open(host, port);
+    const done = (error?: unknown) => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", onAbort);
+      socket.destroy();
+      if (error === undefined) resolve(); else reject(error);
+    };
+    const ms = connectProbe.deadlineMs;
+    const timer = setTimeout(() => done(Object.assign(new Error(`connect to ${host}:${port} timed out after ${ms} ms`), { code: "ETIMEDOUT" })), ms);
+    const onAbort = () => done(signal.reason);
+    signal.addEventListener("abort", onAbort, { once: true });
+    socket.once("connect", () => done());
+    socket.once("error", () => done());
+  });
+}
 async function methodOf(request: Request): Promise<string | undefined> {
   if (request.method !== "POST") return;
   const message = await request.clone().json().catch(() => undefined) as { method?: unknown } | undefined;
@@ -166,6 +227,10 @@ abstract class Connection {
   admissionRetryAfterMs?: number;
   readonly connect: () => Promise<void>;
   private refusal?: ConnectRefused;
+  private busy?: ServerBusy;
+  // When this wire last had an answer, for the connect probe; only the native role probes, as only its calls classify OutcomeUnknown.
+  private answeredAt = -Infinity;
+  protected probes = false;
   protected constructor(protected readonly wireOptions: WireOptions, authProvider: AuthProvider, readonly signal: AbortSignal, beforeRetry?: () => Promise<void>) {
     this.client = new Client(wireOptions.client, { versionNegotiation: { mode: { pin: "2026-07-28" } } });
     const endpoint = new URL(wireOptions.url);
@@ -178,22 +243,35 @@ abstract class Connection {
         this.decorate(outgoing);
         const signal = AbortSignal.any([request.signal, this.signal]);
         const method = await methodOf(request);
+        const connecting = method !== undefined && connectMethods.has(method);
+        if (this.probes && method === "tools/call" && performance.now() - this.answeredAt >= connectProbe.coldMs && !proxied(endpoint)) {
+          // An abort stays itself (a stop, or the caller's); the deadline means the request never left.
+          try { await probe(endpoint, signal); } catch (error) { throw signal.aborted ? error : new ConnectProbeFailed(error); }
+        }
         for (let attempt = 0; ; attempt++) {
           if (attempt) {
-            await beforeRetry?.();
-            const token = await authProvider.token();
-            if (token) outgoing.set("Authorization", `Bearer ${token}`); else outgoing.delete("Authorization");
+            // A guard's refusal or a credential's failure between tries is its own error, not the capacity wait's.
+            try {
+              await beforeRetry?.();
+              const token = await authProvider.token();
+              if (token) outgoing.set("Authorization", `Bearer ${token}`); else outgoing.delete("Authorization");
+            } catch (error) { if (connecting) this.busy = undefined; throw error; }
           }
           signal.throwIfAborted();
           const response = await fetch(request.clone(), { headers: outgoing, redirect: "error", signal });
-          if (method && connectMethods.has(method) && !response.ok && ![401, 403, 429].includes(response.status) && !gatewayStatuses.has(response.status)) {
+          this.answeredAt = performance.now();
+          if (connecting && !response.ok && ![401, 403, 429].includes(response.status) && !gatewayStatuses.has(response.status)) {
             this.refusal = new ConnectRefused(response.status, (await response.clone().text().catch(() => "")).slice(0, 4096));
           }
-          if (response.status !== 429) return response;
-          const body = await response.clone().json().catch(() => undefined) as { error?: { data?: { code?: string; retry_after_ms?: number } } } | undefined;
+          const body = response.status === 429 ? await response.clone().json().catch(() => undefined) as { error?: { data?: { code?: string; retry_after_ms?: number } } } | undefined : undefined;
           const data = body?.error?.data;
-          if (data?.code !== "rate_limited" || typeof data.retry_after_ms !== "number" || !Number.isFinite(data.retry_after_ms) || data.retry_after_ms <= 0) return response;
+          if (data?.code !== "rate_limited" || typeof data.retry_after_ms !== "number" || !Number.isFinite(data.retry_after_ms) || data.retry_after_ms <= 0) {
+            if (connecting) this.busy = undefined;
+            return response;
+          }
           this.admissionRetryAfterMs = data.retry_after_ms;
+          // Recorded on every refusal, not only the last: a wire whose own timeout fires mid-wait still fails as busy.
+          if (connecting) this.busy = new ServerBusy(data.retry_after_ms);
           if (attempt === 7) return response;
           await response.body?.cancel().catch(() => {});
           await sleep(Math.ceil(data.retry_after_ms), undefined, { signal });
@@ -207,7 +285,8 @@ abstract class Connection {
     };
     this.connect = async () => {
       try { await this.reachable(this.client.connect(transport, { signal, timeout: 10_000 })); }
-      catch (error) { throw this.refusal ?? error; }
+      // This wire's own timeout (AbortSignal.timeout) aborting a capacity wait is still the server's capacity; a stop is not.
+      catch (error) { throw this.refusal ?? (!this.signal.aborted || (this.signal.reason as { name?: unknown } | undefined)?.name === "TimeoutError" ? this.busy : undefined) ?? error; }
     };
   }
   // Role headers and the `_meta` every request carries unless it names its own.
@@ -305,6 +384,7 @@ export class Wire extends Connection {
 export class NativeWire extends Connection {
   constructor(options: WireOptions, authProvider: AuthProvider, signal: AbortSignal, readonly sessionID?: string, beforeRetry?: () => Promise<void>) {
     super(options, authProvider, signal, beforeRetry);
+    this.probes = true;
   }
   protected decorate() {}
   protected meta() { return { ...(this.sessionID === undefined ? {} : { [this.wireOptions.sessionKey]: this.sessionID, ...this.facts(this.sessionID) }), ...this.declaration() }; }
@@ -321,7 +401,7 @@ export class NativeWire extends Connection {
   }
   // The server's result untouched: content, structuredContent, isError, _meta.
   // Called on a connected wire, so an outage here may have come after the
-  // request left: OutcomeUnknown unless the socket never opened.
+  // request left: OutcomeUnknown unless the socket never opened (or the connect probe failed, so it never tried).
   async callTool(name: string, args: Record<string, unknown>, sessionID: string, signal?: AbortSignal): Promise<CallToolResult> {
     const call = this.client.callTool({ name, arguments: args, _meta: { [this.wireOptions.sessionKey]: sessionID, ...this.declaration(), ...this.facts(sessionID) } }, this.options(signal));
     return this.reachable(call.catch(error => { throw this.signal.aborted ? error : outcome(error); }));

@@ -44,6 +44,7 @@ import { claimsContract } from "./store/claims.contract.ts";
 import { sqliteClaimsBackend } from "./store/claims.contract.sqlite.ts";
 import { boardsContract } from "./store/boards.contract.ts";
 import { sqliteBoardsBackend } from "./store/boards.contract.sqlite.ts";
+import { NO_MEMBER_AUTHORITY } from "./store/identity.ts";
 
 const person = (email: string, name: string) => ({ scope_kind: "person" as const, scope_ref: email, name });
 
@@ -117,6 +118,42 @@ test("an existing pre-OAuth database opens additively without losing old data", 
     expect(reopened.db.query("SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'oauth_%'").all()).toHaveLength(5);
   } finally {
     reopened.db.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// #930: the column arrives with every user's IdP clock started at the upgrade, so no one is stale on day one, and a row
+// with no issuer (one unlink-idp cleared, which would otherwise read as exempt) is on the clock too; a later open never
+// re-stamps.
+test("opening a database from before users.idp_checked_at stamps every row once", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "gb-idp-clock-"));
+  const path = join(dir, "db.sqlite");
+  const opts = { blobDir: join(dir, "blobs") };
+  const old = openDatabase(path, opts);
+  await seed(old.repo, async tx => {
+    await old.repo.users.upsertByEmail(tx, "linked@example.com", null);
+    await old.repo.users.upsertByEmail(tx, "dev@example.com", null);
+    old.db.run("UPDATE users SET idp_issuer = 'https://idp.example', idp_subject = 's-1' WHERE email = 'linked@example.com'");
+    old.db.exec("ALTER TABLE users DROP COLUMN idp_checked_at");
+  });
+  old.db.close();
+  const before = Date.now();
+  const reopened = openDatabase(path, opts);
+  const clocks = (db: Database) => db.query<{ email: string; idp_checked_at: number | null }, []>("SELECT email, idp_checked_at FROM users ORDER BY email").all();
+  try {
+    const [unlinked, linked] = clocks(reopened.db);
+    expect(unlinked!.idp_checked_at!).toBeGreaterThanOrEqual(before);
+    expect(linked!.idp_checked_at!).toBeGreaterThanOrEqual(before);
+    await seed(reopened.repo, () => reopened.db.run("UPDATE users SET idp_checked_at = NULL WHERE email = 'dev@example.com'"));
+    await seed(reopened.repo, () => reopened.db.run("UPDATE users SET idp_checked_at = 1 WHERE email = 'linked@example.com'"));
+  } finally {
+    reopened.db.close();
+  }
+  const again = openDatabase(path, opts);
+  try {
+    expect(clocks(again.db).map(r => r.idp_checked_at)).toEqual([null, 1]);
+  } finally {
+    again.db.close();
     rmSync(dir, { recursive: true, force: true });
   }
 });
@@ -355,7 +392,7 @@ test("schema: team ownership is seeded into role bindings once, from team_member
   await seed(first.repo, async tx => {
     const u = await Promise.all(["a", "b", "c", "d"].map(n => first.repo.users.upsertByEmail(tx, `${n}@example.com`, null)));
     const eng = await first.repo.teams.create(tx, "eng", u[0]!.id), ops = await first.repo.teams.create(tx, "ops", u[1]!.id), qa = await first.repo.teams.create(tx, "qa", u[2]!.id);
-    for (const [t, m] of [[eng, 0], [eng, 1], [eng, 3], [ops, 1], [ops, 2], [qa, 3]] as const) await first.repo.teams.addMember(tx, t.id, u[m]!.id);
+    for (const [t, m] of [[eng, 0], [eng, 1], [eng, 3], [ops, 1], [ops, 2], [qa, 3]] as const) await first.repo.teams.addMember(tx, t.id, u[m]!.id, NO_MEMBER_AUTHORITY);
   });
   // As a pre-#927 server left them: eng's creator a with a null role, d an explicit owner, b a member; ops's creator
   // b demoted to member and c its owner; qa's creator c gone, d a member.
@@ -605,6 +642,8 @@ test("#807 P1c-7: the users store runs on the handle it's given", async () => {
   await expect(repo.users.signIn(kept, GOOGLE_ISSUER, "s-1", "c@example.com", null)).rejects.toThrow(settled);
   await expect(repo.users.clearSubject(kept, u.id)).rejects.toThrow(settled);
   await expect(repo.users.setDisabled(kept, u.id, true)).rejects.toThrow(settled);
+  await expect(repo.users.stampIdpChecked(kept, u.id)).rejects.toThrow(settled);
+  await expect(repo.users.lockById(kept, u.id)).rejects.toThrow(settled);
   await expect(repo.users.setDisabled({} as Tx, u.id, true)).rejects.toThrow("not a SQLite store handle");
   expect((await repo.users.findByEmail(repo.read, "b@example.com"))).toBeUndefined();
   expect((await repo.users.findByEmail(repo.read, "c@example.com"))).toBeUndefined();
@@ -648,6 +687,7 @@ test("#807 P1c-8: the OAuth store runs on the handle it's given", async () => {
   await expect(o.findBrowserSession(kept, "s", 1)).rejects.toThrow(settled);
   await expect(o.findCodeScopes(kept, "c", "c", "r", "u", 1)).rejects.toThrow(settled);
   await expect(o.findRefreshGrant(kept, "h", "c", "r", 1)).rejects.toThrow(settled);
+  await expect(o.findRefreshUser(kept, "h", "c", "r", 1)).rejects.toThrow(settled);
   await expect(o.findActiveAccess(kept, "h", "r", [], 1)).rejects.toThrow(settled);
   await expect(o.isGrantActive(kept, "g", 1)).rejects.toThrow(settled);
   await expect(o.revokeToken({} as Tx, "t", "c", 1)).rejects.toThrow("not a SQLite store handle");
@@ -706,16 +746,16 @@ test("#807 P1c-10: team writes run on the handle they're given", async () => {
   const { kept, t, a, b } = await seed(repo, async tx => {
     const a = await repo.users.upsertByEmail(tx, "a@example.com", null), b = await repo.users.upsertByEmail(tx, "b@example.com", null);
     const t = await repo.teams.create(tx, "ops", a.id);
-    await repo.teams.addMember(tx, t.id, a.id);
+    await repo.teams.addMember(tx, t.id, a.id, NO_MEMBER_AUTHORITY);
     await grantOwner(repo, tx, "ops", "a@example.com");
     return { kept: tx, t, a, b };
   });
   const settled = /used after its transaction settled/;
   await expect(repo.teams.create(kept, "dev", a.id)).rejects.toThrow(settled);
-  await expect(repo.teams.addMember(kept, t.id, b.id)).rejects.toThrow(settled);
-  await expect(repo.teams.removeMember(kept, t.id, a.id)).rejects.toThrow(settled);
+  await expect(repo.teams.addMember(kept, t.id, b.id, NO_MEMBER_AUTHORITY)).rejects.toThrow(settled);
+  await expect(repo.teams.removeMember(kept, t.id, a.id, NO_MEMBER_AUTHORITY)).rejects.toThrow(settled);
   await expect(repo.teams.setPolicy(kept, t.id, "collaborative")).rejects.toThrow(settled);
-  await expect(repo.teams.addMember({} as Tx, t.id, b.id)).rejects.toThrow("not a SQLite store handle");
+  await expect(repo.teams.addMember({} as Tx, t.id, b.id, NO_MEMBER_AUTHORITY)).rejects.toThrow("not a SQLite store handle");
   expect((await repo.teams.findByName(repo.read, "dev"))).toBeUndefined();
   expect((await repo.teams.listMembers(repo.read, t.id))).toEqual([{ user_id: a.id, email: "a@example.com", role: "owner" }]);
   expect((await repo.teams.findByName(repo.read, "ops"))?.policy).toBe("open");
@@ -935,7 +975,7 @@ test("#807 P3 B5b1: a team follow refuses an alias that can't see the team board
     await repo.users.upsertByEmail(tx, "b@example.com", null);
     await repo.aliases.create(tx, person("b@example.com", "be"), "b@example.com");
     const team = await repo.teams.create(tx, "crew", a.id);
-    await repo.teams.addMember(tx, team.id, a.id);
+    await repo.teams.addMember(tx, team.id, a.id, NO_MEMBER_AUTHORITY);
     return team;
   });
   await expect(seed(repo, tx => onTeamJoined(repo, tx, team, "b@example.com"))).rejects.toThrow("no such board #crew; see board_list");

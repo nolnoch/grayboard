@@ -8,6 +8,7 @@ import { authorize, type HumanReach } from "./policy.ts";
 import { openDatabase, type Repo } from "./db.ts";
 import { scratchDbPath } from "../../tests/support/scratch_db.ts";
 import { seed } from "../../tests/support/seed.ts";
+import { NO_MEMBER_AUTHORITY } from "./store/identity.ts";
 
 const FROM = "wade@example.com/fe";
 
@@ -37,8 +38,8 @@ describe("human.reach", () => {
       const bob = await repo.users.upsertByEmail(tx, "bob@example.com", null);
       await repo.users.upsertByEmail(tx, "eve@example.com", null);
       const eng = await repo.teams.create(tx, "eng", wade.id);
-      await repo.teams.addMember(tx, eng.id, wade.id);
-      await repo.teams.addMember(tx, eng.id, bob.id);
+      await repo.teams.addMember(tx, eng.id, wade.id, NO_MEMBER_AUTHORITY);
+      await repo.teams.addMember(tx, eng.id, bob.id, NO_MEMBER_AUTHORITY);
       await repo.teams.create(tx, "ops", wade.id);
     });
   });

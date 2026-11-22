@@ -8,7 +8,7 @@ import { AccessExpired, Refusal, RefreshInProgress, same, type AccessReason, typ
 import type { ApprovalPort, CredentialPort, Enrollment, HostPort } from "../src/port.js";
 import { resolveRoot } from "../src/sessions.js";
 import { SdkError, SdkErrorCode, SdkHttpError } from "@modelcontextprotocol/client";
-import { LeaseUnavailable, OutcomeUnknown, ServerUnreachable, SubscriberError, subscriberError, Wire, type WireOptions } from "../src/wire.js";
+import { LeaseUnavailable, OutcomeUnknown, ServerBusy, ServerUnreachable, SubscriberError, subscriberError, Wire, type WireOptions } from "../src/wire.js";
 
 type Mode = "adapter" | "approval";
 type Row = { held: string[]; ownership: number; generation: number; capability?: string };
@@ -25,7 +25,7 @@ function runtime(mode: Mode, options: { rotates?: boolean } = {}) {
   // Holds the server took (#453), per session: the subscriber whoami reports them, and the next delivery_open
   // takes the reported ones, as the server does.
   const lost = new Map<string, { alias: string; reason: string; reported: boolean }[]>();
-  let ownership = 0, grant = 1, failReceipt = 0, renews = 0, receipts = 0, refreshBusy = 0, leaseLostAfter = Infinity, signedOut = false;
+  let ownership = 0, grant = 1, failReceipt = 0, renews = 0, receipts = 0, refreshBusy = 0, serverBusy = 0, busyRetryMs = 0, leaseLostAfter = Infinity, signedOut = false;
   let receiptFault: { at: number; error: () => Error; then?: () => void } | undefined, receiptsLost = false;
   // Whether the fake server's delivery_open lists `context` (#854); an older server's doesn't.
   let takesContext = true;
@@ -77,6 +77,7 @@ function runtime(mode: Mode, options: { rotates?: boolean } = {}) {
         await new Promise<never>((_, reject) => this.signal.addEventListener("abort", () => reject(this.signal.reason), { once: true }));
       }
       if (this.beforeRetry && refreshBusy > 0) { refreshBusy--; throw new Error("Version negotiation probe failed", { cause: new RefreshInProgress("pi") }); }
+      if (this.beforeRetry && serverBusy > 0) { serverBusy--; throw new ServerBusy(busyRetryMs); }
       try { await this.auth.token(); } catch (error) {
         if (onRefused) { const hook = onRefused; onRefused = undefined; hook(); }
         throw new Error("Version negotiation probe failed", { cause: error });
@@ -215,6 +216,8 @@ function runtime(mode: Mode, options: { rotates?: boolean } = {}) {
     },
     failReceipt: (n: number) => { failReceipt = n; },
     refreshBusy: (n: number) => { refreshBusy = n; },
+    // The run loop's next `n` connects fail as a server at capacity, hinting `ms` (#1553).
+    serverBusy: (n: number, ms: number) => { serverBusy = n; busyRetryMs = ms; },
     // token() refuses with AccessExpired(reason) until called again without one.
     expireAccess: (reason?: AccessReason) => { accessFault = reason; },
     // check() refuses with the access fault too, as a host whose check reads the token's expiry.
@@ -1244,6 +1247,40 @@ test.each(modes)("a refresh another process holds is retried like an outage, pas
     expect(r.root(c)).toMatchObject({ state: "active", failure: { operation: "reopen", code: "refresh_in_progress" } });
     expect(r.admits.map(a => a.item)).toEqual(["direct:1"]);
   } finally { await c.close(); await r.controller.close(); }
+});
+
+// #1553: a server at capacity is retried as an outage, but its record says so (code server_busy), and its retry hint
+// floors the outage backoff under the same 8 s cap.
+test.each(modes)("a busy server is retried as an outage, recorded as server_busy, its hint flooring the backoff (%s)", async mode => {
+  const r = runtime(mode);
+  const waits: number[] = [], records: unknown[] = [];
+  const c: Controller = r.make({ wait: async ms => { waits.push(ms); records.push(r.root(c)); } });
+  try {
+    r.serverBusy(5, 3000);
+    r.batches.set("R", [r.item("direct:1")]);
+    await c.enroll("R", ["be"], true);
+    await until(() => r.batches.get("R")?.length === 0, 10_000);
+    expect(waits).toEqual([3000, 3000, 3000, 4000, 8000]);
+    for (const record of records) expect(record).toMatchObject({ state: "retrying", operation: "reopen", code: "server_busy", message: "Server at capacity; retrying, approval retained" });
+    expect(r.root(c)).toMatchObject({ state: "active", failure: { operation: "reopen", code: "server_busy" } });
+  } finally { await c.close(); await r.controller.close(); }
+});
+
+test.each(modes)("a resume that finds the server at capacity retries, recorded as server_busy (#1553, %s)", async mode => {
+  const r = runtime(mode);
+  await r.controller.enroll("R", ["be"], true);
+  await until(() => r.root(r.controller)?.state === "active");
+  await r.controller.close();
+  r.rows.delete("R");
+  const busy = Promise.reject(new ServerBusy(800));
+  busy.catch(() => {});
+  r.holdPrepare(busy);
+  const restarted: Controller = r.make({ wait: async () => { r.holdPrepare(Promise.resolve()); } });
+  try {
+    await restarted.resume("R");
+    expect(r.root(restarted)).toMatchObject({ state: "retrying", operation: "restore", code: "server_busy", message: mode === "approval" ? "Server at capacity at restore; retrying, approval retained" : "Server at capacity at resume; retrying" });
+    await until(() => r.root(restarted)?.state === "active");
+  } finally { await restarted.close(); }
 });
 
 // #472: a host that rotates its own access token (OpenCode's native grant)

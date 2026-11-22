@@ -17,6 +17,7 @@ import { ATTACHMENT_LIMITS_CAPABILITY, DEFAULT_ATTACHMENT_LIMITS } from "../../s
 import { OAUTH_TTL } from "../../src/server/oauth-types.ts";
 import { scratchDbPath } from "../support/scratch_db.ts";
 import { seed } from "../support/seed.ts";
+import { NO_MEMBER_AUTHORITY } from "../../src/server/store/identity.ts";
 
 let app: ReturnType<typeof startServer>;
 let base: string, dir: string, clock: number;
@@ -206,7 +207,7 @@ test("board catalog pages are visible/bounded; private reads recheck membership 
   const bob = await issue("bob@example.com");
   const team = await seed(app.repo, async (tx) => {
     const t = await app.repo.teams.create(tx, "private", alice);
-    await app.repo.teams.addMember(tx, t.id, alice);
+    await app.repo.teams.addMember(tx, t.id, alice, NO_MEMBER_AUTHORITY);
     return t;
   });
   const native = await connect(grant.token);
@@ -226,7 +227,7 @@ test("board catalog pages are visible/bounded; private reads recheck membership 
   expect(peers.peers.find((p: { handle: string }) => p.handle === "alice@example.com/be")).toMatchObject({ online: false });
   expect(await read(native.client, "grayboard://boards/private")).toHaveProperty("posts");
   expect(app.db.query("SELECT * FROM subscriptions WHERE handle=?").all("alice@example.com/be")).toEqual(before);
-  await seed(app.repo, (tx) => app.repo.teams.removeMember(tx, team.id, alice));
+  await seed(app.repo, (tx) => app.repo.teams.removeMember(tx, team.id, alice, NO_MEMBER_AUTHORITY));
   await expect(read(native.client, "grayboard://boards/private")).rejects.toThrow("resource not found");
   expect((await native.client.listResources({ cursor: "page101" })).resources).toEqual([]);
   expect(app.mcp.activeLeases).toBe(0);
@@ -253,8 +254,8 @@ test("wire board receipts bind the issued snapshot and reject removed private-bo
   const bob = await issue("bob@example.com");
   const team = await seed(app.repo, async (tx) => {
     const t = await app.repo.teams.create(tx, "private", alice.authed.user_id);
-    await app.repo.teams.addMember(tx, t.id, alice.authed.user_id);
-    await app.repo.teams.addMember(tx, t.id, bob.authed.user_id);
+    await app.repo.teams.addMember(tx, t.id, alice.authed.user_id, NO_MEMBER_AUTHORITY);
+    await app.repo.teams.addMember(tx, t.id, bob.authed.user_id, NO_MEMBER_AUTHORITY);
     return t;
   });
   const sender = await connect(alice.token);
@@ -278,7 +279,7 @@ test("wire board receipts bind the issued snapshot and reject removed private-bo
   value(await call(sender.client, "board_post", { board: "private", body: "@bob@example.com/be private" }));
   const privateItem = (await read(sub.client, "grayboard://inbox")).items.find((i: { event: { kind: string; item?: { kind: string; post?: { board: string } } } }) => i.event.kind === "board" && i.event.item?.kind === "push" && i.event.item.post?.board === "private");
   expect(privateItem).toMatchObject({ actionable: true, event: { kind: "board", item: { kind: "push" } } });
-  await seed(app.repo, (tx) => app.repo.teams.removeMember(tx, team.id, bob.authed.user_id));
+  await seed(app.repo, (tx) => app.repo.teams.removeMember(tx, team.id, bob.authed.user_id, NO_MEMBER_AUTHORITY));
   expect((await call(sub.client, "delivery_receipt", { ids: [privateItem.id] })).isError).toBe(true);
   expect((await read(sub.client, "grayboard://inbox")).items.map((i: { id: string }) => i.id)).not.toContain(privateItem.id);
 });

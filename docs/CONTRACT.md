@@ -63,6 +63,7 @@ flowchart TD
 | The server's application sessions: request context, bind, the server's binding-event sources, address set, revalidation | `docs/server-sessions.md` |
 | The server's operations: delegation, DM send, write dedup, `call` | `docs/server-operations.md` |
 | The server's access policy: authorization seam, role bindings and admin, teams, attachment uploads and reads, retained HTTP routes | `docs/server-access.md` |
+| Ending access: logout, per-grant list and revoke, what revoke and disable end, the IdP re-auth clock | `docs/server-offboarding.md` |
 | The server's service principals: the principal's rows and admin routes, credentials' admin side, service boards' access and `service.invoke` | `docs/server-services.md` |
 | The server's rate limits: binds, authentication failures, the refused-token memo | `docs/server-rate-limits.md` |
 | Build, verified install, deploy files, metrics, backups, plugin distribution | `docs/server-deploy.md` |

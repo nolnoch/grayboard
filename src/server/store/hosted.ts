@@ -13,6 +13,9 @@ export type HostedPatch = Partial<Pick<HostedSession, "grant_id" | "bind_gen" | 
 export interface HostedStore {
   // The store's reads all return promises, on the caller's handle (#807 P3 A7h1).
   get(r: Read, id: string): Promise<HostedSession | undefined>;
+  // The rows of `ids` that exist, parked ones too, in one statement whatever the count (#1572: the backstop reconcile's
+  // read of every watched row); in no particular order, each once however often its ID repeats. No IDs, no statement.
+  getMany(r: Read, ids: readonly string[]): Promise<HostedSession[]>;
   // Lock order (#807 P3 C8, amended by the C8a audit): grant (`grantLive`), then a root's row, then a child's, then the
   // capacity lock, which is taken last and held the shortest. `lock(child)` locks its root first, so a body that locks
   // a child has its root too. register locks its root before the child; a parked child's wake locks it (settle) before

@@ -2,7 +2,8 @@ import { describe, test, expect, beforeEach, afterEach } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { checkIdpConfig, describeBlobs, describeStore, FILE_SECRETS, loadConfig } from "./config.ts";
+import { generateKeyPairSync } from "node:crypto";
+import { checkIdpConfig, describeBlobs, describeReauth, describeStore, FILE_SECRETS, loadConfig } from "./config.ts";
 
 const KEYS = [
   "GRAYBOARD_DEV_AUTH", "GRAYBOARD_DB_PATH", "GRAYBOARD_DATABASE_URL", "GRAYBOARD_PUBLIC_URL", "GRAYBOARD_ORG_DOMAIN",
@@ -15,7 +16,9 @@ const KEYS = [
   "GRAYBOARD_HELLO_BURST", "GRAYBOARD_HELLO_PER_SEC",
   "GRAYBOARD_HOSTED_REQUEST_BURST", "GRAYBOARD_HOSTED_REQUEST_PER_SEC", "GRAYBOARD_HOSTED_SUBSCRIBER_BURST", "GRAYBOARD_HOSTED_SUBSCRIBER_PER_SEC",
   "GRAYBOARD_OAUTH_BURST", "GRAYBOARD_OAUTH_PER_SEC", "GRAYBOARD_OAUTH_GLOBAL_BURST", "GRAYBOARD_OAUTH_GLOBAL_PER_SEC",
-  "GRAYBOARD_AUTH_FAIL_BURST", "GRAYBOARD_AUTH_FAIL_PER_SEC", "GRAYBOARD_TRUSTED_PROXIES", "GRAYBOARD_HOSTED_IDLE_SECONDS", "GRAYBOARD_CLI_TOKEN_IDLE_DAYS",
+  "GRAYBOARD_AUTH_FAIL_BURST", "GRAYBOARD_AUTH_FAIL_PER_SEC", "GRAYBOARD_TRUSTED_PROXIES", "GRAYBOARD_HOSTED_IDLE_SECONDS", "GRAYBOARD_CLI_TOKEN_IDLE_DAYS", "GRAYBOARD_IDP_REAUTH_DAYS", "GRAYBOARD_IDP_RECHECK_HOURS", "GRAYBOARD_IDP_RECHECK_MAX_STALE_HOURS", "GRAYBOARD_IDP_DISABLE_LIMIT", "GRAYBOARD_GOOGLE_DIRECTORY_KEY", "GRAYBOARD_GOOGLE_DIRECTORY_ADMIN",
+  "GRAYBOARD_KEYCLOAK_DIRECTORY_CLIENT_ID", "GRAYBOARD_KEYCLOAK_DIRECTORY_CLIENT_SECRET", "GRAYBOARD_KEYCLOAK_DIRECTORY_URL",
+  "GRAYBOARD_GOOGLE_DIRECTORY_SERVICE_ACCOUNT", "GRAYBOARD_OKTA_DIRECTORY_CLIENT_ID", "GRAYBOARD_OKTA_DIRECTORY_KEY", "GRAYBOARD_OKTA_DIRECTORY_KEY_ID", "GRAYBOARD_OKTA_DIRECTORY_URL",
   "GRAYBOARD_DELEGATE_BURST", "GRAYBOARD_DELEGATE_PER_SEC", "GRAYBOARD_DELEGATE_OPEN_CAP", "GRAYBOARD_ALIAS_SCOPE_CAP",
   ...["LISTEN", "LEGACY", "POST"].flatMap(kind => [`GRAYBOARD_MCP_${kind}_GLOBAL`, `GRAYBOARD_MCP_${kind}_PER_USER`]),
   "GRAYBOARD_HOSTED_SESSIONS_GLOBAL", "GRAYBOARD_HOSTED_SESSIONS_PER_USER", "GRAYBOARD_DELIVERY_LEASES_GLOBAL", "GRAYBOARD_DELIVERY_LEASES_PER_USER",
@@ -706,6 +709,226 @@ describe("loadConfig", () => {
       process.env.GRAYBOARD_CLI_TOKEN_IDLE_DAYS = bad;
       expect(() => loadConfig()).toThrow(/GRAYBOARD_CLI_TOKEN_IDLE_DAYS must be a whole number of days/);
     }
+  });
+
+  test("IdP re-auth days default to 30; 0 means never; else plain digits up to 3650 (#930)", () => {
+    process.env.GRAYBOARD_DEV_AUTH = "1";
+    expect(loadConfig().idpReauthDays).toBe(30);
+    for (const [raw, days] of [["", 30], ["0", 0], ["1", 1], ["3650", 3650]] as const) {
+      process.env.GRAYBOARD_IDP_REAUTH_DAYS = raw;
+      expect(loadConfig().idpReauthDays).toBe(days);
+    }
+    for (const bad of [" 7", "07", "1e2", "1.5", "-1", "3651", "never"]) {
+      process.env.GRAYBOARD_IDP_REAUTH_DAYS = bad;
+      expect(() => loadConfig()).toThrow(/GRAYBOARD_IDP_REAUTH_DAYS must be a whole number of days/);
+    }
+  });
+
+  test("the IdP re-check defaults to 24 h, 72 h stale and 5 disables an hour; the stale bound is at least the interval (#930 A2)", () => {
+    process.env.GRAYBOARD_DEV_AUTH = "1";
+    expect(loadConfig().idpRecheck).toEqual({ recheckHours: 24, maxStaleHours: 72, disableLimit: 5 });
+    process.env.GRAYBOARD_IDP_RECHECK_HOURS = "6";
+    process.env.GRAYBOARD_IDP_RECHECK_MAX_STALE_HOURS = "6";
+    process.env.GRAYBOARD_IDP_DISABLE_LIMIT = "20";
+    expect(loadConfig().idpRecheck).toEqual({ recheckHours: 6, maxStaleHours: 6, disableLimit: 20 });
+    process.env.GRAYBOARD_IDP_RECHECK_MAX_STALE_HOURS = "5";
+    expect(() => loadConfig()).toThrow(/GRAYBOARD_IDP_RECHECK_MAX_STALE_HOURS \(5\) must be at least GRAYBOARD_IDP_RECHECK_HOURS \(6\)/);
+    process.env.GRAYBOARD_IDP_RECHECK_MAX_STALE_HOURS = "";
+    for (const [name, bad] of [["GRAYBOARD_IDP_RECHECK_HOURS", "0"], ["GRAYBOARD_IDP_RECHECK_HOURS", "06"], ["GRAYBOARD_IDP_DISABLE_LIMIT", "0"], ["GRAYBOARD_IDP_DISABLE_LIMIT", "1.5"]] as const) {
+      const was = process.env[name];
+      process.env[name] = bad;
+      expect(() => loadConfig()).toThrow(new RegExp(`${name} must be a whole number`));
+      process.env[name] = was;
+    }
+  });
+
+  test("the startup line names the re-auth window and every provider with no directory check (#930)", () => {
+    expect(describeReauth({})).toBe("sign-in every 30 days (no directory check: google)");
+    expect(describeReauth({ idps: ["google", "oidc"], idpReauthDays: 7 })).toBe("sign-in every 7 days (no directory check: google, oidc)");
+    expect(describeReauth({ idps: ["oidc"], idpReauthDays: 0 })).toBe("off (GRAYBOARD_IDP_REAUTH_DAYS=0; no directory check: oidc)");
+  });
+
+  test("with a Google directory key the startup line names Google's check, and the clock only for the rest (#930 A2b)", () => {
+    const dir = { kind: "key" as const, clientEmail: "sa@p.iam.gserviceaccount.com", privateKey: "k" };
+    expect(describeReauth({ googleDirectory: dir })).toBe("directory check every 24 h (google)");
+    expect(describeReauth({ idps: ["okta", "google"], googleDirectory: dir, idpRecheck: { recheckHours: 6, maxStaleHours: 72, disableLimit: 5 } }))
+      .toBe("directory check every 6 h (google); sign-in every 30 days (no directory check: okta)");
+    expect(describeReauth({ idps: ["google", "okta"], googleDirectory: dir, idpReauthDays: 0 }))
+      .toBe("directory check every 24 h (google); off (GRAYBOARD_IDP_REAUTH_DAYS=0; no directory check: okta)");
+    const kc = { baseUrl: "https://sso.example.com", realm: "eng", clientId: "c", clientSecret: "s" };
+    expect(describeReauth({ idps: ["oidc", "google"], keycloakDirectory: kc }))
+      .toBe("directory check every 24 h (oidc); sign-in every 30 days (no directory check: google)");
+    expect(describeReauth({ idps: ["google", "oidc"], googleDirectory: dir, keycloakDirectory: kc })).toBe("directory check every 24 h (google, oidc)");
+    const ok = { orgUrl: "https://example.okta.com", clientId: "0oa1", privateKey: "k", alg: "RS256" };
+    expect(describeReauth({ idps: ["okta", "google"], oktaDirectory: ok })).toBe("directory check every 24 h (okta); sign-in every 30 days (no directory check: google)");
+    expect(describeReauth({ idps: ["okta", "oidc"], oktaDirectory: ok, keycloakDirectory: kc })).toBe("directory check every 24 h (okta, oidc)");
+  });
+
+  test("GRAYBOARD_GOOGLE_DIRECTORY_KEY turns on Google's directory check; half a configuration refuses to start (#930 A2b)", () => {
+    primary();
+    const pem = generateKeyPairSync("rsa", { modulusLength: 2048 }).privateKey.export({ type: "pkcs8", format: "pem" }) as string;
+    const key = JSON.stringify({ type: "service_account", client_email: "sa@p.iam.gserviceaccount.com", private_key: pem });
+    expect(loadConfig().googleDirectory).toBeUndefined();
+    process.env.GRAYBOARD_GOOGLE_DIRECTORY_ADMIN = "admin@example.com";
+    expect(message()).toBe("GRAYBOARD_GOOGLE_DIRECTORY_ADMIN is set without GRAYBOARD_GOOGLE_DIRECTORY_KEY or GRAYBOARD_GOOGLE_DIRECTORY_SERVICE_ACCOUNT");
+    process.env.GRAYBOARD_GOOGLE_DIRECTORY_KEY = key;
+    expect(loadConfig().googleDirectory).toEqual({ kind: "key", clientEmail: "sa@p.iam.gserviceaccount.com", privateKey: pem, admin: "admin@example.com" });
+    delete process.env.GRAYBOARD_GOOGLE_DIRECTORY_ADMIN;
+    expect(loadConfig().googleDirectory).toEqual({ kind: "key", clientEmail: "sa@p.iam.gserviceaccount.com", privateKey: pem });
+    process.env.GRAYBOARD_GOOGLE_DIRECTORY_KEY = "{";
+    expect(message()).toMatch(/GRAYBOARD_GOOGLE_DIRECTORY_KEY is not JSON/);
+    // A key with no Google provider to use it.
+    process.env.GRAYBOARD_GOOGLE_DIRECTORY_KEY = key;
+    process.env.GRAYBOARD_IDPS = "okta";
+    okta();
+    expect(message()).toBe("GRAYBOARD_GOOGLE_DIRECTORY_KEY is set but GRAYBOARD_IDPS doesn't list google");
+    // The key from a file, as every secret can be.
+    process.env.GRAYBOARD_IDPS = "okta, google";
+    const d = mkdtempSync(join(tmpdir(), "gb-secrets-"));
+    try {
+      writeFileSync(join(d, "key.json"), `${key}\n`);
+      delete process.env.GRAYBOARD_GOOGLE_DIRECTORY_KEY;
+      process.env.GRAYBOARD_GOOGLE_DIRECTORY_KEY_FILE = join(d, "key.json");
+      expect(loadConfig().googleDirectory).toMatchObject({ kind: "key", clientEmail: "sa@p.iam.gserviceaccount.com" });
+    } finally { rmSync(d, { recursive: true, force: true }); }
+  });
+
+  test("GRAYBOARD_GOOGLE_DIRECTORY_SERVICE_ACCOUNT alone is GKE Workload Identity; with a key it's refused (#1565)", () => {
+    primary();
+    process.env.GRAYBOARD_GOOGLE_DIRECTORY_SERVICE_ACCOUNT = "checker@p.iam.gserviceaccount.com";
+    expect(loadConfig().googleDirectory).toEqual({ kind: "metadata", serviceAccount: "checker@p.iam.gserviceaccount.com" });
+    process.env.GRAYBOARD_GOOGLE_DIRECTORY_ADMIN = "admin@example.com";
+    expect(loadConfig().googleDirectory).toEqual({ kind: "metadata", serviceAccount: "checker@p.iam.gserviceaccount.com", admin: "admin@example.com" });
+    process.env.GRAYBOARD_GOOGLE_DIRECTORY_KEY = "{}";
+    expect(message()).toBe("set one of GRAYBOARD_GOOGLE_DIRECTORY_KEY and GRAYBOARD_GOOGLE_DIRECTORY_SERVICE_ACCOUNT, not both");
+    delete process.env.GRAYBOARD_GOOGLE_DIRECTORY_KEY;
+    process.env.GRAYBOARD_GOOGLE_DIRECTORY_SERVICE_ACCOUNT = "not an email";
+    expect(message()).toMatch(/GRAYBOARD_GOOGLE_DIRECTORY_SERVICE_ACCOUNT must be a service account's email/);
+    process.env.GRAYBOARD_GOOGLE_DIRECTORY_SERVICE_ACCOUNT = "checker@p.iam.gserviceaccount.com";
+    process.env.GRAYBOARD_IDPS = "okta";
+    okta();
+    expect(message()).toBe("GRAYBOARD_GOOGLE_DIRECTORY_SERVICE_ACCOUNT is set but GRAYBOARD_IDPS doesn't list google");
+  });
+
+  test("an external_account GRAYBOARD_GOOGLE_DIRECTORY_KEY is Workload Identity Federation (#1565)", () => {
+    primary();
+    process.env.GRAYBOARD_GOOGLE_DIRECTORY_KEY = JSON.stringify({
+      type: "external_account", audience: "//iam.googleapis.com/projects/1/locations/global/workloadIdentityPools/p/providers/x",
+      subject_token_type: "urn:ietf:params:oauth:token-type:jwt", token_url: "https://sts.googleapis.com/v1/token",
+      service_account_impersonation_url: "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/checker@p.iam.gserviceaccount.com:generateAccessToken",
+      credential_source: { file: "/var/run/secrets/token" },
+    });
+    expect(loadConfig().googleDirectory).toMatchObject({ kind: "federated", serviceAccount: "checker@p.iam.gserviceaccount.com", source: { file: "/var/run/secrets/token" } });
+  });
+
+  test("the Keycloak directory pair turns on oidc's directory check against the issuer's realm, or the URL named (#1555)", () => {
+    process.env.GRAYBOARD_IDPS = "oidc";
+    oidc();
+    expect(loadConfig().keycloakDirectory).toBeUndefined();
+    process.env.GRAYBOARD_KEYCLOAK_DIRECTORY_CLIENT_ID = "grayboard-directory";
+    process.env.GRAYBOARD_KEYCLOAK_DIRECTORY_CLIENT_SECRET = "dir-private";
+    expect(loadConfig().keycloakDirectory).toEqual({ baseUrl: "https://sso.example.com", realm: "eng", clientId: "grayboard-directory", clientSecret: "dir-private" });
+    // In-cluster, plain http: the public hostname keeps /admin off.
+    for (const url of ["http://keycloak.auth.svc:8080", "https://kc.internal/auth"]) {
+      process.env.GRAYBOARD_KEYCLOAK_DIRECTORY_URL = url;
+      expect(loadConfig().keycloakDirectory).toMatchObject({ baseUrl: url, realm: "eng" });
+    }
+    for (const url of ["keycloak:8080", "ftp://kc", "http://kc/", "http://kc?x", "http://u:p@kc", "http://kc/realms/eng", ""]) {
+      process.env.GRAYBOARD_KEYCLOAK_DIRECTORY_URL = url;
+      expect(message()).toMatch(/^GRAYBOARD_KEYCLOAK_DIRECTORY_URL must be an http\(s\) URL/);
+    }
+    delete process.env.GRAYBOARD_KEYCLOAK_DIRECTORY_URL;
+    // The secret from a file, as every secret can be.
+    const d = mkdtempSync(join(tmpdir(), "gb-secrets-"));
+    try {
+      writeFileSync(join(d, "secret"), "dir-file-secret\n");
+      delete process.env.GRAYBOARD_KEYCLOAK_DIRECTORY_CLIENT_SECRET;
+      process.env.GRAYBOARD_KEYCLOAK_DIRECTORY_CLIENT_SECRET_FILE = join(d, "secret");
+      expect(loadConfig().keycloakDirectory?.clientSecret).toBe("dir-file-secret");
+    } finally { rmSync(d, { recursive: true, force: true }); }
+  });
+
+  test("half a Keycloak directory configuration, or one with nothing to check, refuses to start (#1555)", () => {
+    process.env.GRAYBOARD_IDPS = "oidc";
+    oidc();
+    process.env.GRAYBOARD_KEYCLOAK_DIRECTORY_CLIENT_ID = "grayboard-directory";
+    expect(message()).toBe("GRAYBOARD_KEYCLOAK_DIRECTORY_CLIENT_ID set, so GRAYBOARD_KEYCLOAK_DIRECTORY_CLIENT_SECRET is required too");
+    delete process.env.GRAYBOARD_KEYCLOAK_DIRECTORY_CLIENT_ID;
+    process.env.GRAYBOARD_KEYCLOAK_DIRECTORY_URL = "http://kc:8080";
+    expect(message()).toMatch(/^GRAYBOARD_KEYCLOAK_DIRECTORY_URL set, so GRAYBOARD_KEYCLOAK_DIRECTORY_CLIENT_ID is required too/);
+    delete process.env.GRAYBOARD_KEYCLOAK_DIRECTORY_URL;
+    process.env.GRAYBOARD_KEYCLOAK_DIRECTORY_CLIENT_ID = "grayboard-directory";
+    process.env.GRAYBOARD_KEYCLOAK_DIRECTORY_CLIENT_SECRET = "has space";
+    expect(message()).toMatch(/must be nonempty credentials without whitespace/);
+    expect(message()).not.toContain("has space");
+    process.env.GRAYBOARD_KEYCLOAK_DIRECTORY_CLIENT_SECRET = "dir-private";
+    // An issuer that isn't a Keycloak realm.
+    process.env.GRAYBOARD_OIDC_ISSUER = "https://login.example.com/oauth2/default";
+    expect(message()).toMatch(/^GRAYBOARD_OIDC_ISSUER is not a Keycloak realm URL/);
+    // No oidc provider to check.
+    for (const k of ["GRAYBOARD_OIDC_ISSUER", "GRAYBOARD_OIDC_CLIENT_ID", "GRAYBOARD_OIDC_ALLOWED_DOMAINS"]) delete process.env[k];
+    process.env.GRAYBOARD_IDPS = "okta";
+    okta();
+    expect(message()).toMatch(/set but GRAYBOARD_IDPS doesn't list oidc/);
+  });
+
+  test("the Okta directory pair turns on okta's directory check against the issuer's org, or the URL named (#1563)", () => {
+    process.env.GRAYBOARD_IDPS = "okta";
+    okta();
+    const rsa = generateKeyPairSync("rsa", { modulusLength: 2048 }).privateKey;
+    const pem = rsa.export({ type: "pkcs8", format: "pem" }) as string;
+    expect(loadConfig().oktaDirectory).toBeUndefined();
+    process.env.GRAYBOARD_OKTA_DIRECTORY_CLIENT_ID = "0oa1checker";
+    process.env.GRAYBOARD_OKTA_DIRECTORY_KEY = JSON.stringify({ ...rsa.export({ format: "jwk" }), kid: "kid-1" });
+    expect(loadConfig().oktaDirectory).toEqual({ orgUrl: "https://example.okta.com", clientId: "0oa1checker", privateKey: pem, alg: "RS256", keyId: "kid-1" });
+    // A custom authorization server's issuer: the org is its origin.
+    process.env.GRAYBOARD_OKTA_ISSUER = "https://example.okta.com/oauth2/default";
+    expect(loadConfig().oktaDirectory?.orgUrl).toBe("https://example.okta.com");
+    // An issuer on a custom domain names the okta.com domain for the API.
+    process.env.GRAYBOARD_OKTA_ISSUER = "https://login.example.com/oauth2/default";
+    process.env.GRAYBOARD_OKTA_DIRECTORY_URL = "https://example.okta.com";
+    expect(loadConfig().oktaDirectory?.orgUrl).toBe("https://example.okta.com");
+    for (const url of ["http://example.okta.com", "https://example.okta.com/", "https://example.okta.com/oauth2/default", "example.okta.com", ""]) {
+      process.env.GRAYBOARD_OKTA_DIRECTORY_URL = url;
+      expect(message()).toMatch(/^GRAYBOARD_OKTA_DIRECTORY_URL must be the org's https origin/);
+    }
+    delete process.env.GRAYBOARD_OKTA_DIRECTORY_URL;
+    // The key from a file, as every secret can be, with its id named.
+    const d = mkdtempSync(join(tmpdir(), "gb-secrets-"));
+    try {
+      writeFileSync(join(d, "key.pem"), pem);
+      delete process.env.GRAYBOARD_OKTA_DIRECTORY_KEY;
+      process.env.GRAYBOARD_OKTA_DIRECTORY_KEY_FILE = join(d, "key.pem");
+      process.env.GRAYBOARD_OKTA_DIRECTORY_KEY_ID = "kid-2";
+      expect(loadConfig().oktaDirectory).toMatchObject({ privateKey: pem, keyId: "kid-2" });
+    } finally { rmSync(d, { recursive: true, force: true }); }
+  });
+
+  test("half an Okta directory configuration, or one with nothing to check, refuses to start (#1563)", () => {
+    process.env.GRAYBOARD_IDPS = "okta";
+    okta();
+    const pem = generateKeyPairSync("rsa", { modulusLength: 2048 }).privateKey.export({ type: "pkcs8", format: "pem" }) as string;
+    process.env.GRAYBOARD_OKTA_DIRECTORY_CLIENT_ID = "0oa1checker";
+    expect(message()).toBe("GRAYBOARD_OKTA_DIRECTORY_CLIENT_ID set, so GRAYBOARD_OKTA_DIRECTORY_KEY is required too");
+    delete process.env.GRAYBOARD_OKTA_DIRECTORY_CLIENT_ID;
+    process.env.GRAYBOARD_OKTA_DIRECTORY_KEY_ID = "kid";
+    expect(message()).toMatch(/^GRAYBOARD_OKTA_DIRECTORY_KEY_ID set, so GRAYBOARD_OKTA_DIRECTORY_CLIENT_ID is required too/);
+    delete process.env.GRAYBOARD_OKTA_DIRECTORY_KEY_ID;
+    process.env.GRAYBOARD_OKTA_DIRECTORY_CLIENT_ID = "has space";
+    process.env.GRAYBOARD_OKTA_DIRECTORY_KEY = pem;
+    expect(message()).toMatch(/^GRAYBOARD_OKTA_DIRECTORY_CLIENT_ID must be a nonempty client id/);
+    process.env.GRAYBOARD_OKTA_DIRECTORY_CLIENT_ID = "0oa1checker";
+    process.env.GRAYBOARD_OKTA_DIRECTORY_KEY = "-----BEGIN RSA PUBLIC KEY-----";
+    expect(message()).toMatch(/^GRAYBOARD_OKTA_DIRECTORY_KEY is not a JSON Web Key or a PEM private key/);
+    process.env.GRAYBOARD_OKTA_DIRECTORY_KEY = pem;
+    // An issuer that isn't an Okta authorization server.
+    process.env.GRAYBOARD_OKTA_ISSUER = "https://example.okta.com/realms/eng";
+    expect(message()).toMatch(/^GRAYBOARD_OKTA_ISSUER is not an Okta authorization server URL/);
+    // No okta provider to check.
+    for (const k of ["GRAYBOARD_OKTA_ISSUER", "GRAYBOARD_OKTA_CLIENT_ID", "GRAYBOARD_OKTA_CLIENT_SECRET", "GRAYBOARD_OKTA_ALLOWED_DOMAINS"]) delete process.env[k];
+    process.env.GRAYBOARD_IDPS = "google";
+    primary();
+    expect(message()).toMatch(/set but GRAYBOARD_IDPS doesn't list okta$/);
   });
 
   test("the hello limit defaults to 60 and 1/s; set, the burst is a whole number up to 10000 and the rate at least 0.1/s", () => {

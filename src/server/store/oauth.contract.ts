@@ -31,7 +31,7 @@ export type Row = Record<string, unknown>;
 export type OAuthHarness = {
   oauth: OAuthStore;
   users: Pick<UsersStore, "upsertByEmail">;
-  sessions: Pick<SessionsStore, "create" | "revoke" | "findById" | "findByTokenHash">;
+  sessions: Pick<SessionsStore, "create" | "revoke" | "revokeOwn" | "findById" | "findByTokenHash">;
   services: Pick<ServicesStore, "create">;
   write<T>(fn: (tx: Tx) => Promise<T>): Promise<T>;
   read: Read;
@@ -106,6 +106,7 @@ export function oauthContract(backend: OAuthBackend): void {
   loginCodes(it);
   cutover(it);
   serviceCredentials(it);
+  userGrants(it);
 }
 
 type It = (name: string, fn: (h: OAuthHarness) => Promise<void>, timeout?: number) => void;
@@ -324,6 +325,11 @@ function refresh(it: It): void {
     expect(await h.oauth.findRefreshGrant(h.read, input.tokens.refreshHash, "foreign", binding.resource, start)).toBeUndefined();
     expect(await h.oauth.findRefreshGrant(h.read, input.tokens.refreshHash, binding.clientId, "wrong", start)).toBeUndefined();
     expect(await h.oauth.findRefreshGrant(h.read, input.tokens.accessHash, binding.clientId, binding.resource, start)).toBeUndefined();
+    // findRefreshUser (#930): the same bindings, and only while the token is unspent.
+    expect(await h.oauth.findRefreshUser(h.read, input.tokens.refreshHash, binding.clientId, binding.resource, start)).toBe(w.userId);
+    expect(await h.oauth.findRefreshUser(h.read, input.tokens.refreshHash, "foreign", binding.resource, start)).toBeUndefined();
+    expect(await h.oauth.findRefreshUser(h.read, input.tokens.refreshHash, binding.clientId, "wrong", start)).toBeUndefined();
+    expect(await h.oauth.findRefreshUser(h.read, input.tokens.accessHash, binding.clientId, binding.resource, start)).toBeUndefined();
     for (const change of [{ clientId: "foreign" }, { resource: "wrong" }, { scopes: ["grayboard:delivery"] }, { tokens: { ...next.tokens, resource: "wrong" } },
       { tokens: { ...next.tokens, refreshHash: next.refreshHash } }, { tokens: { ...next.tokens, accessHash: next.refreshHash } }, { refreshHash: "raw-refresh" }]) {
       expect(await status(h.write(tx => h.oauth.rotateRefresh(tx, { ...next, ...change }, start + 1)))).toBe("invalid");
@@ -336,6 +342,10 @@ function refresh(it: It): void {
     const rotated = await h.write(tx => h.oauth.rotateRefresh(tx, next, start + 1));
     expect(rotated).toMatchObject({ status: "ok", value: { grant: { id: input.grantId }, tokens: next.tokens } });
     expect((await h.rows("oauth_tokens")).find(t => t.hash === input.tokens.refreshHash)).toMatchObject({ spent_at: start + 1, revoked_at: null });
+    // A spent token still finds its grant (a replay resolves its scopes), but no user to re-check.
+    expect(await h.oauth.findRefreshGrant(h.read, input.tokens.refreshHash, binding.clientId, binding.resource, start + 1)).toBeDefined();
+    expect(await h.oauth.findRefreshUser(h.read, input.tokens.refreshHash, binding.clientId, binding.resource, start + 1)).toBeUndefined();
+    expect(await h.oauth.findRefreshUser(h.read, next.tokens.refreshHash, binding.clientId, binding.resource, start + 1)).toBe(w.userId);
     const newest = { ...binding, refreshHash: next.tokens.refreshHash, tokens: pair(binding, start + 2) };
     expect(await status(h.write(tx => h.oauth.rotateRefresh(tx, newest, start + 2)))).toBe("ok");
     expect(await status(h.write(tx => h.oauth.rotateRefresh(tx, { ...next, clientId: "foreign" }, start + 3)))).toBe("invalid");
@@ -514,16 +524,21 @@ function access(it: It): void {
     expect(await o.findBrowserSession(h.read, w.sessionHash, start)).toBeUndefined();
   });
 
-  it("revoke-all revokes OAuth grants; a single session revoke and browser logout don't", async h => {
+  it("revoke-all revokes OAuth grants and ends browser sessions; a single session revoke and browser logout don't revoke grants", async h => {
     const w = await world(h);
     const input = await w.issue();
+    // A second browser session, so the revoke-all below has one to end (#1552); the logout ends only its own.
+    const live = sha("live-browser");
+    expect(await status(h.write(tx => h.oauth.createBrowserSession(tx, { sessionHash: live, userId: w.userId, createdAt: start, expiresAt: start + 1000 }, start)))).toBe("ok");
     const s = await h.write(tx => h.sessions.create(tx, w.userId, sha("old-token"), null));
     await h.write(tx => h.sessions.revoke(tx, s.id));
     await h.write(tx => h.oauth.revokeBrowserSession(tx, w.sessionHash));
     expect(await h.oauth.findBrowserSession(h.read, w.sessionHash, start)).toBeUndefined();
     expect(await h.oauth.isGrantActive(h.read, input.grantId, start)).toBe(true);
+    expect(await h.oauth.findBrowserSession(h.read, live, start)).toBeDefined();
     await h.revokeAllForUser(w.userId);
     expect(await h.oauth.isGrantActive(h.read, input.grantId, start)).toBe(false);
+    expect(await h.oauth.findBrowserSession(h.read, live, start)).toBeUndefined();
   });
 
   // The serial half of the disable race (postgres-server.md D3; C4b's T-C4-8 is the concurrent half): each write that
@@ -848,5 +863,99 @@ function serviceCredentials(it: It): void {
     await h.write(tx => h.oauth.cleanup(tx, start + 600_000));
     expect(await h.rows("oauth_tokens")).toEqual([]);
     expect((await h.rows("service_credential_secrets")).map(s => s.id)).toEqual([second.value.secretId]);
+  });
+}
+
+// The per-grant list and revoke (#930).
+function userGrants(it: It): void {
+  async function two(h: OAuthHarness) {
+    const a = await world(h, "a");
+    const b = await world(h, "b");
+    return { userId: a.userId, a: await a.issue(), b: await b.issue() };
+  }
+
+  it("listGrants lists the user's live grants newest use first, a credential's grant flagged, and nothing of another user's", async h => {
+    const { userId, a, b } = await two(h);
+    const svc = await h.write(tx => h.services.create(tx, "ingest"));
+    expect(await status(h.write(tx => h.oauth.addServiceCredential(tx, credential(svc.id), start)))).toBe("ok");
+    // Same last use: the grant id breaks the tie.
+    expect(await h.oauth.listGrants(h.read, userId, start)).toEqual([
+      { id: a.grantId, clientId: binding.clientId, createdAt: start, expiresAt: start + OAUTH_TTL.grant, lastUsedAt: start, credential: false },
+      { id: b.grantId, clientId: binding.clientId, createdAt: start, expiresAt: start + OAUTH_TTL.grant, lastUsedAt: start, credential: false },
+    ]);
+    // A rotation of b's refresh token makes it the newest use.
+    expect(await status(h.write(tx => h.oauth.rotateRefresh(tx, { ...binding, refreshHash: b.tokens.refreshHash, tokens: pair(binding, start + 5) }, start + 5)))).toBe("ok");
+    expect((await h.oauth.listGrants(h.read, userId, start + 5)).map(g => [g.id, g.lastUsedAt])).toEqual([[b.grantId, start + 5], [a.grantId, start]]);
+    // A grant with no token left lists its creation as its last use.
+    expect(await h.oauth.listGrants(h.read, svc.id, start + 5)).toEqual([
+      { id: credential(svc.id).grantId, clientId: SVC_CLIENT, createdAt: start, expiresAt: credential(svc.id).expiresAt, lastUsedAt: start, credential: true }]);
+    expect(await status(h.write(tx => h.oauth.revokeUserGrant(tx, userId, a.grantId, start + 6)))).toBe("ok");
+    expect((await h.oauth.listGrants(h.read, userId, start + 6)).map(g => g.id)).toEqual([b.grantId]);
+    expect(await h.oauth.listGrants(h.read, userId, start + OAUTH_TTL.grant)).toEqual([]);
+    expect(await h.oauth.listGrants(h.read, userId + 1000, start)).toEqual([]);
+    expect(await h.oauth.listGrants(h.read, 1.5, start)).toEqual([]);
+    expect(await h.oauth.listGrants(h.read, userId, -1)).toEqual([]);
+  });
+
+  it("revokeUserGrant revokes one of the user's grants and its tokens, leaves the others, refuses a credential's, another user's and a bad input", async h => {
+    const { userId, a, b } = await two(h);
+    const svc = await h.write(tx => h.services.create(tx, "ingest"));
+    expect(await status(h.write(tx => h.oauth.addServiceCredential(tx, credential(svc.id), start)))).toBe("ok");
+    const revoke = (uid: number, grantId: string, now = start + 1) => h.write(tx => h.oauth.revokeUserGrant(tx, uid, grantId, now));
+    for (const [uid, gid, now] of [[1.5, a.grantId, start + 1], [userId, "", start + 1], [userId, 5 as unknown as string, start + 1], [userId, a.grantId, -1]] as const) {
+      expect(await status(revoke(uid, gid, now))).toBe("invalid");
+    }
+    expect(await status(revoke(userId + 1000, a.grantId))).toBe("not_found");
+    expect(await status(revoke(userId, "grant_unknown0123456789"))).toBe("not_found");
+    // A credential's grant: its owner's revoke is refused, so its own revoke keeps service.credential_revoked.
+    expect(await status(revoke(svc.id, credential(svc.id).grantId))).toBe("invalid");
+    expect(await status(revoke(userId, credential(svc.id).grantId))).toBe("not_found");
+    expect(await h.oauth.isGrantActive(h.read, credential(svc.id).grantId, start + 1)).toBe(true);
+    for (const g of [a, b]) expect(await h.oauth.isGrantActive(h.read, g.grantId, start + 1)).toBe(true);
+
+    expect(await revoke(userId, a.grantId)).toEqual({ status: "ok", value: { clientId: binding.clientId } });
+    expect(await h.oauth.isGrantActive(h.read, a.grantId, start + 1)).toBe(false);
+    expect(await h.oauth.findActiveAccess(h.read, a.tokens.accessHash, binding.resource, [], start + 1)).toBeUndefined();
+    expect(await status(h.write(tx => h.oauth.rotateRefresh(tx, { ...binding, refreshHash: a.tokens.refreshHash, tokens: pair(binding, start + 2) }, start + 2)))).not.toBe("ok");
+    // The other grant still serves and refreshes.
+    expect((await h.oauth.findActiveAccess(h.read, b.tokens.accessHash, binding.resource, [], start + 2))?.grantId).toBe(b.grantId);
+    expect(await status(h.write(tx => h.oauth.rotateRefresh(tx, { ...binding, refreshHash: b.tokens.refreshHash, tokens: pair(binding, start + 2) }, start + 2)))).toBe("ok");
+    // A second revoke finds nothing live; an expired grant is not revocable either.
+    expect(await status(revoke(userId, a.grantId, start + 3))).toBe("not_found");
+    expect(await status(revoke(userId, b.grantId, start + OAUTH_TTL.grant))).toBe("not_found");
+    // The caller audits: the store writes no row of its own.
+    expect(await h.audits("auth.grant_revoked")).toEqual([]);
+  });
+
+  // A live browser session consents without the IdP, so the lost device could mint a replacement (#1552).
+  it("revokeUserGrant and sessions.revokeOwn end the user's browser sessions and unspent codes, not another user's or a spent code", async h => {
+    const a = await world(h, "a");
+    const issued = await a.issue();
+    const pending = await world(h, "p");
+    await pending.issueCode();
+    // A consent bound before the revoke and decided after it.
+    const late = await world(h, "l");
+    await h.write(async tx => {
+      expect(await status(h.oauth.createRequest(tx, late.request, start))).toBe("ok");
+      expect(await status(h.oauth.bindRequestSession(tx, late.request.requestHash, late.request.browserHash, late.sessionHash, start))).toBe("ok");
+    });
+    const other = (await h.write(tx => h.users.upsertByEmail(tx, "other@example.com", null))).id;
+    expect(await status(h.write(tx => h.oauth.createBrowserSession(tx, { sessionHash: sha("other-browser"), userId: other, createdAt: start, expiresAt: start + 1000 }, start)))).toBe("ok");
+    expect(await h.rows("oauth_browsers")).toHaveLength(4);
+
+    expect(await status(h.write(tx => h.oauth.revokeUserGrant(tx, a.userId, issued.grantId, start + 1)))).toBe("ok");
+    expect((await h.rows("oauth_browsers")).map(r => r.user_id)).toEqual([other]);
+    // The spent code stays, so a replay still reaches its grant; the unspent one is gone.
+    expect((await h.rows("oauth_codes")).map(r => r.hash)).toEqual([a.code.codeHash]);
+    expect(await status(h.write(tx => h.oauth.redeemCode(tx, pending.redemption(), start + 1)))).not.toBe("ok");
+    expect(await status(h.write(tx => h.oauth.decideRequest(tx, late.decision(), start + 1)))).not.toBe("ok");
+
+    // A CLI token's revoke does the same; a refused one ends nothing.
+    const cli = await h.write(tx => h.sessions.create(tx, a.userId, sha("cli-token"), "laptop"));
+    expect(await status(h.write(tx => h.oauth.createBrowserSession(tx, { sessionHash: sha("again"), userId: a.userId, createdAt: start + 2, expiresAt: start + 1000 }, start + 2)))).toBe("ok");
+    expect(await h.write(tx => h.sessions.revokeOwn(tx, other, cli.id))).toBe(false);
+    expect(await h.rows("oauth_browsers")).toHaveLength(2);
+    expect(await h.write(tx => h.sessions.revokeOwn(tx, a.userId, cli.id))).toBe(true);
+    expect((await h.rows("oauth_browsers")).map(r => r.user_id)).toEqual([other]);
   });
 }

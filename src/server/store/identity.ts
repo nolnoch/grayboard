@@ -12,7 +12,7 @@ import type { Read, Tx } from "./tx_base.ts";
 // Neither: a dev-auth user, or one an admin unlinked.
 // A user row (#270 D1): a person, or a service whose `email` holds its name (never an email: it has no "@"). The kind
 // is its principal row's, read with the row (USER_SQL): there's no users.kind column.
-export type User     = { id: number; email: string; display_name: string | null; created_at: number; disabled_at: number | null; idp_issuer: string | null; idp_subject: string | null; kind: "user" | "service" };
+export type User     = { id: number; email: string; display_name: string | null; created_at: number; disabled_at: number | null; idp_issuer: string | null; idp_subject: string | null; idp_checked_at: number | null; kind: "user" | "service" };
 // What an IdP sign-in resolved to (security audit F-13, #928 D4). `linked`: the
 // user had no subject yet and now has this one. Refusals: `subject_mismatch`,
 // the email's user belongs to another account at the same IdP (the email was
@@ -56,11 +56,13 @@ export type InvokeBinding = { id: number; team: string | null };
 // team_owner binding on the binding's scope or an org_admin binding.
 export type RoleAuthority = "none" | "org_admin" | "owner_or_admin";
 // Who changes a team's membership and the authority the write re-checks, as a grant's `byUser` and `authority`
-// (owner_or_admin: their team_owner binding on the team, or org_admin). Omitted, "none": a team's creator joining it,
-// a member leaving it, a fixture.
+// (owner_or_admin: their team_owner binding on the team, or org_admin). Required, as a grant's is (#1247), so a route
+// that forgets it can't skip the re-check: a caller with no actor to check passes NO_MEMBER_AUTHORITY.
 export type MemberAuthority = { byUser: number | null; authority: RoleAuthority };
 // A removal's authority, and its role.revoked row's actor and the fields its detail carries beside the binding.
 export type MemberRemoval = MemberAuthority & { actor: string | null; audit?: AuditFields };
+// "none", explicitly: a team's creator joining it, a member leaving it, a fixture.
+export const NO_MEMBER_AUTHORITY: MemberRemoval = Object.freeze({ byUser: null, authority: "none", actor: null });
 // A JSON value, as an audit row's detail stores it: fields a caller adds beside the binding (`audit`) are JSON,
 // never a value that serializes to something else or to nothing (a Date, a function, a bigint).
 export type JsonValue = string | number | boolean | null | readonly JsonValue[] | { readonly [k: string]: JsonValue | undefined };
@@ -88,11 +90,17 @@ export interface UsersStore {
   upsertByEmail(tx: Tx, email: string, displayName: string | null): Promise<User>;
   // An IdP sign-in: matches (issuer, subject) first, then the email (F-13, #928 D4).
   signIn(tx: Tx, issuer: string, subject: string, email: string, displayName: string | null): Promise<IdpSignIn>;
-  // Forgets a user's IdP issuer and subject, so the next sign-in with the email, from any IdP, links its account.
+  // Forgets a user's IdP issuer and subject, so the next sign-in with the email, from any IdP, links its account. The
+  // IdP clock stays, and a missing one starts at 0: with no issuer, a null clock would read as exempt (#930).
   clearSubject(tx: Tx, userId: number): Promise<void>;
+  // Starts the user's IdP clock now (#930): a dev login, the one sign-in with no IdP to stamp it.
+  stampIdpChecked(tx: Tx, userId: number): Promise<void>;
   findByEmail(r: Read, email: string): Promise<User | undefined>;
   // Uncached: a fresh read on the caller's handle.
   findById(r: Read, userId: number): Promise<User | undefined>;
+  // findById inside a write, holding the users row until it commits (Postgres FOR UPDATE; SQLite's one writer
+  // already serializes): a check-then-write on the row sees no concurrent change between the two (#930).
+  lockById(tx: Tx, userId: number): Promise<User | undefined>;
   // findById(r, id)?.disabled_at != null, cached on authGeneration (#853); inside the caller's own transaction it
   // reads on its Tx, uncached.
   isDisabled(r: Read, userId: number): Promise<boolean>;
@@ -106,6 +114,12 @@ export interface SessionsStore {
   findById(r: Read, sessionId: number): Promise<Session | undefined>;
   revoke(tx: Tx, sessionId: number): Promise<void>;
   revokeAllForUser(tx: Tx, userId: number): Promise<void>;
+  // The user's unrevoked sessions used after `usedAfter` (the idle cutoff; 0 for all), newest use first, at most
+  // `limit` (#930's per-grant list).
+  listLive(r: Read, userId: number, usedAfter: number, limit: number): Promise<Session[]>;
+  // Revokes one of the user's live sessions in one conditional statement; false when it isn't theirs or is already
+  // revoked, so of two concurrent revokes one answers true (#930).
+  revokeOwn(tx: Tx, userId: number, sessionId: number): Promise<boolean>;
   // Revokes every live dev-auth session (`grayboard login --dev`); returns how many.
   revokeDev(tx: Tx): Promise<number>;
   touch(tx: Tx, sessionId: number, now: number): Promise<void>;
@@ -127,12 +141,12 @@ export interface TeamsStore {
   // Adds a member; an existing member is left as is (false). Ownership is a role binding (#927): roles.grant.
   // Conditional on `by`'s authority as roles.grant is, serialized with every role-binding write: rejects with
   // AuthorityLost, adding no one, when it no longer holds.
-  addMember(tx: Tx, teamId: number, userId: number, by?: MemberAuthority): Promise<boolean>;
+  addMember(tx: Tx, teamId: number, userId: number, by: MemberAuthority): Promise<boolean>;
   // Removes a member, revoking their team_owner binding first through the roles revoke (its role.revoked row with
   // `by`'s actor and audit fields), which rejects with LastOwner rather than leave a team with members and no owner
   // (security audit F-02). Rejects with AuthorityLost, before any write, when `by`'s authority no longer holds. The
   // revoked binding, or null.
-  removeMember(tx: Tx, teamId: number, userId: number, by?: MemberRemoval): Promise<RoleBinding | null>;
+  removeMember(tx: Tx, teamId: number, userId: number, by: MemberRemoval): Promise<RoleBinding | null>;
   // The roster, each member's role read from the team's team_owner bindings. Both in user id order.
   listMembers(r: Read, teamId: number): Promise<TeamMember[]>;
   listMemberUserIds(r: Read, teamId: number): Promise<number[]>;
@@ -180,7 +194,7 @@ export interface ServicesStore {
   // Services with principal ids above `after`, in id order, at most `limit`, each with its owners' names.
   list(r: Read, after: number, limit: number): Promise<ServiceRow[]>;
   // The services this user owns whose every owner is now disabled: what disabling them left without an
-  // accountable owner (#930 replaces them).
+  // accountable owner; an admin grants the replacement (no automatic pick).
   orphanedBy(r: Read, userId: number): Promise<string[]>;
 }
 

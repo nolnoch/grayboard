@@ -73,14 +73,17 @@ export function dedupWrite<W extends Written>(
   return parent.savepoint(async (tx): Promise<DedupOutcome<W>> => {
     const receipts = repo.writeReceipts;
     const key = { session: call.session, sender: call.sender, fp };
-    // Bounds one session's rows by what it wrote in the window, so a receipt the claim meets is inside it.
-    await receipts.pruneSession(tx, call.session, since);
+    // Bounds one session's rows by what it wrote in the window, so a receipt the claim meets is inside it. The first
+    // claim is sent beside it (#1537 C6: one round trip on Postgres): a connection runs its statements in the order
+    // they're sent, and each store function sends its one statement before its first await, so the claim still runs
+    // after the prune, as SQLite's synchronous statements do.
+    const [, claimed] = await Promise.all([receipts.pruneSession(tx, call.session, since), call.resend ? false : receipts.claim(tx, key, call.tool, now)]);
     // A lost claim reads the receipt that beat it. A pass that neither claims nor answers saw another transaction
     // change that receipt in between (pruned it, replaced a stale one first, or committed one already outside the
     // window after this call's prune), which a single writer never allows; three passes bound it.
     for (let pass = 0; !call.resend; pass++) {
       if (pass === 3) throw new Error(`write receipt for ${call.tool} by ${call.sender} kept changing under this call; retry it`);
-      if (await receipts.claim(tx, key, call.tool, now)) break;
+      if (pass === 0 ? claimed : await receipts.claim(tx, key, call.tool, now)) break;
       const hit = await receipts.find(tx, call.session, call.sender, fp, since);
       if (!hit) {
         // A receipt committed after the prune can already be outside the window (a long transaction, a skewed

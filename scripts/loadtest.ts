@@ -213,7 +213,8 @@ function refusalsTotal(s: Sample[]): Record<string, number> {
 export type CumHist = { le: number[]; cum: number[]; sum: number; count: number };
 // `keyed`: bodies that ran keyed, per site; `worldStop`: seconds in which an exclusive body waited or ran (chunk 2);
 // `gate`: keyed requests by `<site>:<outcome>` (grayboard_hosted_gate_bodies_total, summed over its methods; gate and
-// prior, chunk 3; renew and receipt, chunk 4); `gateMethod`: the gate site's by `<method>:<outcome>` (#1537 PR 0).
+// prior, chunk 3; renew and receipt, chunk 4); `gateMethod`: the gate site's by `<method>:<outcome>` (#1537 PR 0),
+// the prior site's by `prior.<method>:<outcome>` and the tool site's by `tool.<method>:<outcome>` (#1573).
 // `statements`, `roundTrips`: per site, Postgres statements and round trips summed over the bodies counted
 // (grayboard_write_queue_statements and _round_trips, #1537 PR 0); `count` is the bodies.
 export type StmtCum = { sum: number; count: number };
@@ -235,7 +236,9 @@ export function queueCumulative(s: Sample[]): QueueCum {
     if (x.name === "grayboard_hosted_gate_bodies_total") {
       const k = `${x.labels.site}:${x.labels.outcome}`;
       q.gate.set(k, (q.gate.get(k) ?? 0) + x.value);
-      if (x.labels.site === "gate" && x.labels.method) q.gateMethod.set(`${x.labels.method}:${x.labels.outcome}`, x.value);
+      // The prior site's as `prior.<method>` (#1537 C5/C7: the subscriber calls' verdict reuse); the tool site's as
+      // `tool.<method>` (dm_send, board_post: #1573), whose `tool` line sums them.
+      if ((x.labels.site === "gate" || x.labels.site === "prior" || x.labels.site === "tool") && x.labels.method) q.gateMethod.set(`${x.labels.site === "gate" ? "" : `${x.labels.site}.`}${x.labels.method}:${x.labels.outcome}`, x.value);
       continue;
     }
     const st = /^grayboard_write_queue_(statements|round_trips)_(sum|count)$/.exec(x.name);

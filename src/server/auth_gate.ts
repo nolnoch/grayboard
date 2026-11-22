@@ -33,8 +33,9 @@ export const SITE_LIMIT_FACTOR = 4;
 export const UNKNOWN_PEER_KEY = "unknown";
 
 // How long a refused token is answered from memory. A refused token stays
-// refused, except a disabled user's after an admin re-enables them: this
-// bounds how long that user waits.
+// refused, except a disabled user's after an admin re-enables them, or a CLI
+// token due IdP re-auth after its user signs in again (#930): this bounds how
+// long that user waits.
 export const REFUSED_TOKEN_TTL_MS = 60_000;
 
 // The most refused tokens remembered; past it the oldest is forgotten, and

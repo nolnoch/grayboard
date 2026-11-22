@@ -6,6 +6,7 @@ import { UNBOUND_TTL_MS } from "../shared/attachments.ts";
 import { WRITE_DEDUP_WINDOW_MS } from "../shared/dedup.ts";
 import { logReclaimed, RECLAIM_PAGES_PER_RUN } from "../core/sqlite.ts";
 import { testPauseAsync } from "../shared/testpause.ts";
+import { atSite } from "./store/queue.ts";
 
 export { RECLAIM_PAGES_PER_RUN };
 
@@ -53,19 +54,19 @@ export async function runRetention(repo: Repo, config: Config, now = Date.now(),
   };
   const cutoff = now - config.messageRetentionDays * 86_400_000;
   // Board posts share the message retention window.
-  await step("messages", () => repo.write(tx => pruneMessages(repo, tx, cutoff)));
+  await step("messages", () => atSite("retention", () => repo.write(tx => pruneMessages(repo, tx, cutoff))));
   await testPauseAsync("retention:between");
-  await step("posts", () => repo.write((tx: Tx) => repo.boards.prunePosts(tx, cutoff), boards => {
+  await step("posts", () => atSite("retention", () => repo.write((tx: Tx) => repo.boards.prunePosts(tx, cutoff), boards => {
     if (boards.length) {
       try { void Promise.resolve(onBoardsChanged?.(boards)).catch(() => {}); } catch {}
     }
-  }));
+  })));
   // Ended sessions' rows share it too (#328): a keyed one leaves a
   // tombstone, so its key coming back is audited as reused.
-  await step("ended sessions", () => repo.write(tx => repo.sessionEnd.pruneEnded(tx, cutoff, now)));
-  await step("audit", () => repo.write((tx) => pruneAudit(repo, tx, now - config.auditRetentionDays * 86_400_000)));
-  await step("unbound uploads", () => repo.write(tx => repo.attachments.pruneUnbound(tx, now - UNBOUND_TTL_MS)));
-  await step("write receipts", () => repo.write(tx => repo.writeReceipts.prune(tx, now - WRITE_DEDUP_WINDOW_MS)));
+  await step("ended sessions", () => atSite("retention", () => repo.write(tx => repo.sessionEnd.pruneEnded(tx, cutoff, now))));
+  await step("audit", () => atSite("retention", () => repo.write((tx) => pruneAudit(repo, tx, now - config.auditRetentionDays * 86_400_000))));
+  await step("unbound uploads", () => atSite("retention", () => repo.write(tx => repo.attachments.pruneUnbound(tx, now - UNBOUND_TTL_MS))));
+  await step("write receipts", () => atSite("retention", () => repo.write(tx => repo.writeReceipts.prune(tx, now - WRITE_DEDUP_WINDOW_MS))));
   if (stopped()) return;
   // Also finishes any sweep a crash or a failed delete left.
   const swept = await sweepStoredBlobs(repo, stopped);
@@ -73,7 +74,7 @@ export async function runRetention(repo: Repo, config: Config, now = Date.now(),
   if (stopped()) return;
   try {
     // As the queue's holder: no other write is mid-transaction while the pages go.
-    await repo.write(() => reclaimFreePages(repo));
+    await atSite("retention", () => repo.write(() => reclaimFreePages(repo)));
   } catch (e) {
     console.error("[grayboard] retention: reclaiming free pages failed:", e);
   }

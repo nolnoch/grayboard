@@ -807,3 +807,101 @@ test("HTTP native: a call whose factory meets the close answers 503, not 500 (#1
     await closing;
   }
 });
+
+// #1541: the endpoint closes while the factory's authenticate awaits, and the request's signal fires too (a shutdown
+// cuts the connection as it closes the endpoint). The close decides: the endpoint-closed error, never a client abort.
+test("HTTP native: a factory meeting the close and an aborted signal is a server cut, not a client abort (#1541)", async () => {
+  const issued = await issueOAuth(app.repo, app.oauth.resource, "carol@example.com", ["grayboard:tools", "grayboard:delivery"], Date.now(), OPENCODE_CLIENT);
+  const abort = new AbortController(), statuses: number[] = [], lines: string[] = [];
+  let target = false;
+  const client = new Client({ name: "http-test", version: "1" }, { supportedProtocolVersions: ["2026-07-28"], versionNegotiation: { mode: { pin: "2026-07-28" } } });
+  clients.push(client);
+  await client.connect(new StreamableHTTPClientTransport(new URL(`${base}/mcp`), {
+    requestInit: { headers: { Authorization: `Bearer ${issued.token}` } },
+    fetch: async (input, init) => {
+      const req = await withMeta(new Request(input, init), OPENCODE_SESSION_META, "factory-cut");
+      if (!target) return fetch(req);
+      const r = await app.mcp.fetch(new Request(req, { signal: abort.signal }), "127.0.0.1");
+      statuses.push(r.status);
+      return r;
+    },
+  }));
+  const said = spyOn(console, "error").mockImplementation((...args: unknown[]) => { lines.push(args.join(" ")); });
+  const warned = spyOn(console, "warn").mockImplementation((...args: unknown[]) => { lines.push(args.join(" ")); });
+  const authenticate = app.oauth.authenticate;
+  let seen = 0;
+  let closing: Promise<void> | undefined;
+  app.oauth.authenticate = async (...args) => {
+    const result = await authenticate.apply(app.oauth, args);
+    if (target && ++seen === 3) { closing = app.mcp.close(); abort.abort(); }
+    return result;
+  };
+  try {
+    target = true;
+    const settled = await client.callTool({ name: "whoami", arguments: {} }).then(r => ({ result: r }), (error: unknown) => ({ error }));
+    expect(seen).toBe(3);
+    expect("error" in settled).toBe(true);
+  } finally {
+    app.oauth.authenticate = authenticate;
+    said.mockRestore(); warned.mockRestore();
+    await closing;
+  }
+  expect(statuses).toEqual([503]);
+  expect(lines.filter(l => l.includes("hosted MCP failed") || l.includes("hosted MCP client aborted"))).toEqual([]);
+  const cut = lines.filter(l => l.includes("hosted MCP request cut by server"));
+  expect(cut).toHaveLength(1);
+  expect(cut[0]).toContain('"category":"server_cut"');
+  expect(cut[0]).toContain('"class":"RequestClosedError"');
+});
+
+// #1541: a forced shutdown. app.stop() sets `stopping` and cuts every connection (server.stop(true)) before it closes
+// hosted MCP, so a request waiting in the write queue can see its signal fire while `closed` is still false. It is the
+// server's cut, not the client's abort. The close is held until the line is logged, so the cut lands while the endpoint
+// still reads open, as a real shutdown's does. Mutation: report()'s RequestAbortedError arm without `opts.stopping?.()` fails it.
+test("HTTP native: a request the shutdown cuts while it waits in the write queue logs server_cut, not client_aborted (#1541)", async () => {
+  const issued = await issueOAuth(app.repo, app.oauth.resource, "carol@example.com", ["grayboard:tools", "grayboard:delivery"], Date.now(), OPENCODE_CLIENT);
+  const abort = new AbortController();
+  let target = false;
+  const client = new Client({ name: "http-test", version: "1" }, { supportedProtocolVersions: ["2026-07-28"], versionNegotiation: { mode: { pin: "2026-07-28" } } });
+  clients.push(client);
+  await client.connect(new StreamableHTTPClientTransport(new URL(`${base}/mcp`), {
+    requestInit: { headers: { Authorization: `Bearer ${issued.token}` } },
+    fetch: async (input, init) => {
+      const req = await withMeta(new Request(input, init), OPENCODE_SESSION_META, "stop-cut");
+      return target ? app.mcp.fetch(new Request(req, { signal: abort.signal }), "127.0.0.1") : fetch(req);
+    },
+  }));
+  await bindFixture(client, "stop-cut");
+  const q = writeQueue();
+  const lines: string[] = [];
+  const said = spyOn(console, "error").mockImplementation((...args: unknown[]) => { lines.push(args.join(" ")); });
+  const warned = spyOn(console, "warn").mockImplementation((...args: unknown[]) => { lines.push(args.join(" ")); });
+  let release: (() => void) | undefined, open: (() => void) | undefined;
+  const holder = q.run(() => new Promise<void>(r => { release = r; }));
+  const gate = new Promise<void>(r => { open = r; });
+  const close = app.mcp.close;
+  app.mcp.close = async () => { await gate; return close.call(app.mcp); };
+  let stopped: Promise<void> | undefined;
+  try {
+    target = true;
+    const call = client.callTool({ name: "whoami", arguments: {} }).then(r => ({ result: r }), (error: unknown) => ({ error }));
+    await until(() => q.waitingAt("gate") === 1, 10_000, "whoami's selection queued behind the holder");
+    // The listener's cut, in process: the request's signal fires as stop() begins, before hosted MCP closes.
+    stopped = app.stop();
+    abort.abort();
+    await call;
+    await until(() => lines.some(l => l.includes("hosted MCP request cut by server") || l.includes("hosted MCP client aborted")), 10_000, "the cut's log line");
+  } finally {
+    open?.();
+    release?.();
+    await holder;
+    await stopped?.catch(() => {});
+    app.mcp.close = close;
+    said.mockRestore(); warned.mockRestore();
+  }
+  expect(lines.filter(l => l.includes("hosted MCP failed") || l.includes("hosted MCP client aborted"))).toEqual([]);
+  const cut = lines.filter(l => l.includes("hosted MCP request cut by server"));
+  expect(cut).toHaveLength(1);
+  expect(cut[0]).toContain('"category":"server_cut"');
+  expect(cut[0]).toContain('"class":"RequestAbortedError"');
+});
