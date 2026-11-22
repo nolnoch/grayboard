@@ -2501,7 +2501,8 @@ describePg("keyed board_post (Postgres)", () => {
   // writing the deny's row and charging the deny limiter once. Twenty such calls (the first planned for real, the
   // rest stubbed to plan anyway) write twenty deny rows, under the limiter's burst of 30 only if each charges once.
   // Mutations: the keyed body recording the deny before it misses (a charge per attempt: the limiter stops the rows at
-  // 15); the miss turned into a plain Error (the call fails as a fault).
+  // 15); the miss turned into a plain Error (the call fails as a fault). Deleting the body's explicit deny miss fails no
+  // test: the hidden-board refusal after it misses too and drops the deferred row. The line states the intent.
   test("an invocation revoked between plan and body misses, and the exclusive body refuses it with one deny row", async () => {
     await using db = await pgDatabase({ max: 2 });
     await using x = await leaseInstance(db.url);
