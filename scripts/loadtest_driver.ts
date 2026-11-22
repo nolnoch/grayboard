@@ -307,10 +307,10 @@ async function catalog(l: Live, board: string, op: "catalog" | "catalog_connect"
   proved(counted, op, uris.includes(`grayboard://boards/${board}`), true);
 }
 
-// The driver's op mix (#1539): smooth weighted round robin over the shares, not a random draw per op, so over any window of
-// draws each op's count is within 1.5 of its share. A 14 s small fleet makes ~36 draws a driver, and random draws left a
-// 0.1-share op with no sample in the clean steady windows often enough to fail CI. The service's ops are in the mix only
-// with a service board; dm_send takes the rest.
+// The driver's op mix (#1539): smooth weighted round robin over the shares, not a random draw per op, so over any
+// window of draws each op's count stays under 2 from its share (1.4 at the test's shares, 1.52 at the full profile's).
+// A 14 s small fleet makes ~36 draws a driver, and random draws left a 0.1-share op with no sample in the clean steady
+// windows often enough to fail CI. The service's ops are in the mix only with a service board; dm_send takes the rest.
 type MixOp = "board_post" | "svc_invoke" | "peer_list" | "svc_read" | "dm_send";
 export function opMix(config: Pick<DriverConfig, "postShare" | "svcShare" | "peerShare" | "readShare" | "svcBoard">): () => MixOp {
   const shares: [MixOp, number][] = [["board_post", config.postShare]];

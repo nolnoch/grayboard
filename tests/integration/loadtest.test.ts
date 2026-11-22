@@ -34,7 +34,9 @@ describe("loadtest sizing", () => {
     }
     // Without a service board its ops leave the mix and dm_send takes their share.
     const plain = opMix({ postShare: 0.25, svcShare: 0.2, peerShare: 0.1, readShare: 0.3, svcBoard: null });
-    expect(new Set(Array.from({ length: 40 }, () => plain()))).toEqual(new Set(["board_post", "dm_send"]));
+    const plainDraws = Array.from({ length: 40 }, () => plain());
+    expect({ board_post: plainDraws.filter(d => d === "board_post").length, dm_send: plainDraws.filter(d => d === "dm_send").length })
+      .toEqual({ board_post: 10, dm_send: 30 });
   });
 
   test("the full profile fits both default per-user request buckets; the quick one raises the subscriber one", () => {
