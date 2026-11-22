@@ -61,9 +61,9 @@
 import { CoreError } from "../../../core/errors.ts";
 import type { Post } from "../../../shared/notifications.ts";
 import { testPauseAsync } from "../../../shared/testpause.ts";
-import type { Board, BoardSummary, BoardsStore, DigestRow, PushRow, SubMode, ThreadFacts, WhoRow } from "../boards.ts";
+import type { Board, BoardSummary, BoardsStore, DigestRow, PendingRef, PushRow, SubMode, ThreadFacts, WhoRow } from "../boards.ts";
 import { MissingPost } from "../errors.ts";
-import type { Read } from "../tx_base.ts";
+import type { Read, Tx } from "../tx_base.ts";
 import { bindLocked, dropAttachments, lockUnsent, withAttachments } from "./attachment_rows.ts";
 import { foreignKeyViolation } from "./errors.ts";
 import { int8, int8OrNull } from "./sql.ts";
@@ -147,6 +147,65 @@ async function creditQueueTakes(sql: PgSql, handle: string, board: string, postI
     WHERE id IN (SELECT MAX(ce.id) FROM claim_events ce WHERE ce.key = ANY(${postIds.map(id => `queue:${board}:${id}`)}::text[])
       AND ce.handle = ${handle} AND ce.event = 'take'
       AND EXISTS (SELECT 1 FROM claims c WHERE c.key = ce.key AND c.holder = ${handle}) GROUP BY ce.key)`;
+}
+// boards.acknowledgeMany on Postgres; acknowledge is one ref of it (#1510 chunk 5).
+async function acknowledgeMany(tx: Tx, handle: string, refs: PendingRef[], receiver: string | undefined, now: number): Promise<void> {
+  const sql = pgOf(tx);
+  // core: with `receiver`, only while `handle` is still its address (#1466). Each marking statement carries the
+  // check in its WHERE, so it is judged with the mark, not by a read before it.
+  const held = heldBy(sql, handle, receiver);
+  const pushIds = [...new Set(refs.flatMap(r => r.kind === "push" ? [r.post_id] : []))];
+  const rows: Row[] = pushIds.length ? await sql`SELECT o.post_id, o.reason, p.board, b.kind FROM outbox o JOIN posts p ON p.id = o.post_id
+    JOIN boards b ON b.name = p.board WHERE o.handle = ${handle} AND o.post_id = ANY(${pushIds}::int8[])` : [];
+  if (rows.length) {
+    const ids = rows.map(r => int8(r.post_id));
+    // core: credited to `receiver`, else the session holding `handle` now, on its first delivery (#1461). The update
+    // itself decides "first": its WHERE is re-checked on the newest row version after the row lock, so of two
+    // concurrent acks only one matches (the SELECT above is unlocked and would let both credit). The repeat stamp
+    // touches only a row already delivered, so a hold that moves back between the two never marks without crediting.
+    const first = new Set((await sql`UPDATE outbox SET delivered_at = ${now}, session_id = ${credited(sql, handle, receiver)}
+      WHERE handle = ${handle} AND post_id IN (SELECT post_id FROM outbox WHERE handle = ${handle} AND post_id = ANY(${ids}::int8[])
+          AND delivered_at IS NULL AND ${held} ORDER BY post_id FOR NO KEY UPDATE)
+        AND delivered_at IS NULL AND ${held} RETURNING post_id`).map((r: Row) => int8(r.post_id)));
+    const rest = ids.filter(id => !first.has(id));
+    let again = new Set<number>();
+    if (rest.length) {
+      // A test forces a hold moving back here (#1472): the repeat's `delivered_at IS NOT NULL` then keeps it unmarked.
+      await testPauseAsync("boards:acknowledge:repeat");
+      again = new Set((await sql`UPDATE outbox SET delivered_at = ${now}
+        WHERE handle = ${handle} AND post_id IN (SELECT post_id FROM outbox WHERE handle = ${handle} AND post_id = ANY(${rest}::int8[])
+            AND delivered_at IS NOT NULL AND ${held} ORDER BY post_id FOR NO KEY UPDATE)
+          AND delivered_at IS NOT NULL AND ${held} RETURNING post_id`).map((r: Row) => int8(r.post_id)));
+    }
+    // A queue post's first delivery credits its take, per board. A claim_events write on the board's queue key: a
+    // keyed body must hold `board:<board>` (D4, #1595), as every other keyed writer of the board's queue keys does
+    // (claimQueuePost, ackQueue). Keyed receipt plans the key and misses on a queue board it doesn't hold before it
+    // gets here; this is the backstop.
+    const credits = new Map<string, number[]>();
+    for (const r of rows) {
+      const id = int8(r.post_id);
+      if (r.kind !== "queue" || !first.has(id)) continue;
+      refuseKeyed(tx, "boards.acknowledge's queue take credit (a claim_events write)", queueBoardKey(`queue:${r.board as string}:${id}`));
+      credits.set(r.board as string, [...(credits.get(r.board as string) ?? []), id]);
+    }
+    for (const [board, posts] of [...credits].sort(([x], [y]) => x < y ? -1 : x > y ? 1 : 0)) await creditQueueTakes(sql, handle, board, posts, receiver);
+    // Push-mode subscribers have now seen it in full: count it as read. As core, a push neither stamp marked moves no
+    // cursor when a receiver is named (its hold moved away).
+    const read = new Map<string, number>();
+    for (const r of rows) {
+      const id = int8(r.post_id);
+      if (r.reason !== "subscription" || (receiver !== undefined && !first.has(id) && !again.has(id))) continue;
+      read.set(r.board as string, Math.max(read.get(r.board as string) ?? 0, id));
+    }
+    for (const [board, id] of [...read].sort(([x], [y]) => x < y ? -1 : x > y ? 1 : 0)) {
+      await sql`UPDATE subscriptions SET cursor = GREATEST(cursor, ${id}::int8), notified_id = GREATEST(notified_id, ${id}::int8)
+        WHERE board = ${board} AND handle = ${handle} AND mode = 'push' AND ${held}`;
+    }
+  }
+  for (const ref of refs) {
+    if (ref.kind !== "digest") continue;
+    await sql`UPDATE subscriptions SET notified_id = GREATEST(notified_id, ${ref.latest_id}::int8) WHERE board = ${ref.board} AND handle = ${handle} AND ${held}`;
+  }
 }
 // core primaryHoldSql: session `id`'s oldest hold (HOLD_ORDER), or NULL.
 const primaryHold = (sql: PgSql, id: PgFragment) =>
@@ -278,43 +337,12 @@ export function makePgBoards({ clock }: { clock: () => number }): BoardsStore {
     },
     // Core acknowledge; each GREATEST re-evaluates after the row lock (header).
     async acknowledge(tx, handle, ref, receiver) {
-      const sql = pgOf(tx);
-      // core: with `receiver`, only while `handle` is still its address (#1466). Each marking statement carries the
-      // check in its WHERE, so it is judged with the mark, not by a read before it.
-      const held = heldBy(sql, handle, receiver);
-      if (ref.kind === "digest") {
-        await sql`UPDATE subscriptions SET notified_id = GREATEST(notified_id, ${ref.latest_id}::int8) WHERE board = ${ref.board} AND handle = ${handle} AND ${held}`;
-        return;
-      }
-      const [row] = await sql`SELECT o.reason, p.board, b.kind FROM outbox o JOIN posts p ON p.id = o.post_id
-        JOIN boards b ON b.name = p.board WHERE o.handle = ${handle} AND o.post_id = ${ref.post_id}`;
-      if (!row) return;
-      // core: credited to `receiver`, else the session holding `handle` now, on its first delivery (#1461). The update
-      // itself decides "first": its WHERE is re-checked on the newest row version after the row lock, so of two
-      // concurrent acks only one matches (the SELECT above is unlocked and would let both credit). The repeat stamp
-      // touches only a row already delivered, so a hold that moves back between the two never marks without crediting.
-      const now = clock();
-      const first: Row[] = await sql`UPDATE outbox SET delivered_at = ${now}, session_id = ${credited(sql, handle, receiver)}
-        WHERE handle = ${handle} AND post_id = ${ref.post_id} AND delivered_at IS NULL AND ${held} RETURNING post_id`;
-      if (first.length === 0) {
-        // A test forces a hold moving back here (#1472): the repeat's `delivered_at IS NOT NULL` then keeps it unmarked.
-        await testPauseAsync("boards:acknowledge:repeat");
-        const again: Row[] = await sql`UPDATE outbox SET delivered_at = ${now}
-          WHERE handle = ${handle} AND post_id = ${ref.post_id} AND delivered_at IS NOT NULL AND ${held} RETURNING post_id`;
-        if (again.length === 0 && receiver !== undefined) return;
-      } else if (row.kind === "queue") {
-        // A claim_events write on this board's queue key: a keyed body must hold `board:<board>` (D4, #1595), as every
-        // other keyed writer of the board's queue keys does (claimQueuePost, ackQueue). Keyed receipt plans the key and
-        // misses on a queue board it doesn't hold before it gets here; this is the backstop.
-        refuseKeyed(tx, "boards.acknowledge's queue take credit (a claim_events write)", queueBoardKey(`queue:${row.board as string}:${ref.post_id}`));
-        await creditQueueTakes(sql, handle, row.board as string, [ref.post_id], receiver);
-      }
-      // Push-mode subscribers have now seen it in full: count it as read.
-      if (row.reason === "subscription") {
-        await sql`UPDATE subscriptions SET cursor = GREATEST(cursor, ${ref.post_id}::int8), notified_id = GREATEST(notified_id, ${ref.post_id}::int8)
-          WHERE board = ${row.board as string} AND handle = ${handle} AND mode = 'push' AND ${held}`;
-      }
+      await acknowledgeMany(tx, handle, [ref], receiver, clock());
     },
+    // Set-based (#1510 chunk 5): one read and up to two outbox stamps for every push in the batch, then one statement per
+    // board's push subscription, where a loop ran three per push. The outbox rows lock in post id order; the
+    // subscriptions after them, by board (the header's outbox-before-subscriptions order).
+    acknowledgeMany: (tx, handle, refs, receiver) => acknowledgeMany(tx, handle, refs, receiver, clock()),
 
     async ensure(tx, name, purpose, scope, createdBy) {
       const board = normalizeBoard(name);
