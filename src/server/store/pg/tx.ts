@@ -60,6 +60,7 @@ type Txn = {
   readonly notices?: ReadonlySet<string>;
   failed?: { error: unknown; frames: object[] }; probe?: { refused?: ProbeWrite };
   sent: number; flights: number; inflight: number;
+  memo?: Map<string, Promise<unknown>>; memoGen: number;
 };
 
 // A statement sent on `txn`'s connection, counted into its body's metrics (#1537 PR 0): one more statement, and one
@@ -189,6 +190,58 @@ function undone(txn: Txn, marker: object): void {
   if (txn.failed?.frames.includes(marker)) txn.failed = undefined;
 }
 
+// The identity memo (#1618, docs/future/postgres-server.md D4): inside a keyed body, a store read wrapped in `memoized`
+// sends its statement once and answers the body's later calls for the same key from that read. Under READ COMMITTED a
+// re-read could see a commit that landed mid-body (a disable, a team change); the memo pins the first read for the
+// rest of the body instead. No re-read here is protected by a lock, so a re-read guaranteed nothing more: the body acts
+// on the state as of its first read, as an exclusive body does. What a re-read does guarantee, the memo keeps: the
+// body's own writes, a lock it takes and a ROLLBACK TO each drop the whole memo (forget), so the next read is sent.
+// Keyed bodies only: an exclusive body runs alone in this process, and the auth-table writers (sign-in, a disable,
+// role changes) are exclusive bodies (G5), so they never read through it.
+//
+// stale: a statement after which no memo entry stands: one that isn't a plain SELECT (a write, a data-modifying WITH,
+// DDL) or takes a row lock, naming a memoized table; any advisory lock. Judged on the statement's text, as the probe
+// is, so a store function that forgot to invalidate can't serve a stale row; a write to an unrelated table (the
+// outbox's acknowledge) leaves the memo. Tables: those the memoized reads read, and those whose writes cascade into
+// them (teams → team_members).
+const MEMO_TABLES = /\b(users|principals|teams|team_members|boards)\b/i;
+const ROW_LOCK = /\bfor\s+(update|share|no\s+key\s+update|key\s+share)\b/i;
+const stale = (text: string) => PROBE_ADVISORY.test(text) || ((!PROBE_READ.test(text) || ROW_LOCK.test(text)) && MEMO_TABLES.test(text));
+function forget(txn: Txn): void {
+  if (!txn.memo) return;
+  txn.memo.clear();
+  txn.memoGen++;
+}
+
+// A store read through `r`'s body memo (above), keyed by `key`; `also`, the other keys the same row answers (a user by
+// id and by email). The handle is checked first (pgOf), so a settled Tx is refused on a hit too. Outside a keyed body
+// (a Read, an exclusive body, SQLite) it's the plain read. The read in flight is shared, so two tasks of one body send
+// one statement; a miss (undefined) or a failure is not kept. Each caller gets its own shallow copy of a row: the rows
+// are flat, and no caller sees another's edits.
+export function memoized<T>(r: Read, key: string, read: (sql: PgSql) => Promise<T>, also?: (value: T) => readonly string[]): Promise<T> {
+  const sql = pgOf(r);
+  const txn = r instanceof PgTx ? r.txn : undefined;
+  const memo = txn?.memo;
+  if (!memo) return read(sql);
+  let held = memo.get(key) as Promise<T> | undefined;
+  if (!held) {
+    const gen = txn!.memoGen;
+    const p = read(sql);
+    held = p;
+    memo.set(key, p);
+    const drop = () => { if (memo.get(key) === p) memo.delete(key); };
+    p.then(v => {
+      if (v === undefined) return drop();
+      if (txn!.memoGen !== gen) return;
+      for (const k of also?.(v) ?? []) if (!memo.has(k)) memo.set(k, p);
+    }, drop);
+  }
+  return held.then(copyRow);
+}
+// The statements `tx`'s transaction has sent so far (a test's count of round trips saved); undefined off Postgres.
+export const sentOf = (tx: Read): number | undefined => (tx instanceof PgTx ? tx.txn.sent : undefined);
+const copyRow = <T>(v: T): T => (typeof v === "object" && v !== null && !Array.isArray(v) ? { ...v } : v);
+
 class PgRead extends BaseRead {
   constructor(readonly store: Store) { super(); }
 }
@@ -231,6 +284,7 @@ class PgTx extends BaseTx {
           // undo, which clears a failure it undid.
           const aborted = TxAborted.wrap(error, txn);
           if (!txn.ended) {
+            forget(txn);
             await counted(txn, conn.unsafe(`ROLLBACK TO ${name}`).execute()).then(() => {
               undone(txn, marker);
               return counted(txn, conn.unsafe(`RELEASE ${name}`).execute());
@@ -246,6 +300,7 @@ class PgTx extends BaseTx {
         if (!open) return;
         open = false;
         if (!end()) return;
+        forget(txn);
         const back = counted(txn, conn.unsafe(`ROLLBACK TO ${name}`).execute());
         const released = counted(txn, conn.unsafe(`RELEASE ${name}`).execute());
         // A SAVEPOINT that failed (25P02: the transaction was already aborted) fails the two after it: the cause is
@@ -322,6 +377,7 @@ function fragment(q: SQL.Query<unknown>): PgFragment {
 // statements are counted (counted); none for the read pool.
 function statements(conn: SQL, check: (text: string) => void, txn?: Txn): PgSql {
   const send = <Q extends PromiseLike<unknown>>(q: Q): Q => txn ? counted(txn, q) : q;
+  if (txn) { const inner = check; check = text => { inner(text); if (txn.memo?.size && stale(text)) forget(txn); }; }
   const sql = ((first: unknown, ...rest: unknown[]) => {
     if (isTemplate(first)) { check(statementText(first, rest)); return send(conn(first, ...rest).execute()); }
     if (typeof first === "string") return fragment(conn(first));
@@ -437,7 +493,7 @@ export function makePgTransactions(url: string, { ownAuthCommit, writers = DEFAU
       let box: { v: T };
       try {
         box = await writePool.begin("isolation level read committed, read write", async conn => {
-          txn = { conn, stack: [], n: 0, ended: false, sent: 0, flights: 0, inflight: 0, ...(held ? { keys: held, effects, ...(notices ? { notices } : {}) } : {}) };
+          txn = { conn, stack: [], n: 0, ended: false, sent: 0, flights: 0, inflight: 0, memoGen: 0, ...(held ? { keys: held, effects, memo: new Map(), ...(notices ? { notices } : {}) } : {}) };
           root = new PgTx(store, txn);
           store.open.set(token, root);
           try {

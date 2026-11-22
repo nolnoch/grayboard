@@ -68,7 +68,7 @@ import { bindLocked, dropAttachments, lockUnsent, withAttachments } from "./atta
 import { foreignKeyViolation } from "./errors.ts";
 import { int8, int8OrNull } from "./sql.ts";
 import { insertClaimEvent, queueBoardKey } from "./claims.ts";
-import { pgOf, refuseKeyed, type PgFragment, type PgSql } from "./tx.ts";
+import { memoized, pgOf, refuseKeyed, type PgFragment, type PgSql } from "./tx.ts";
 
 type Row = Record<string, unknown>;
 
@@ -277,11 +277,11 @@ async function authorAddresses(r: Read, author: string, authorId: string | null)
 
 export function makePgBoards({ clock }: { clock: () => number }): BoardsStore {
   return {
-    async get(r, name) {
-      const sql = pgOf(r);
+    // Memoized in a keyed body (tx.ts memoized, #1618).
+    get: (r, name) => memoized(r, `board ${name}`, async sql => {
       const [row] = await sql`SELECT ${boardCols(sql)} FROM boards b WHERE b.name = ${name}`;
       return row ? toBoard(row) : undefined;
-    },
+    }),
     // board_post's gate read (header, P5): the board as get reads it, FOR KEY SHARE until the body ends.
     async lockForPost(tx, name) {
       const sql = pgOf(tx);
