@@ -153,7 +153,7 @@ export function registerHostedResources(server: McpServer, context: {
         return json(params.uri, { items: await delivery.pending(principal, sessionContext, leaseCapability(checked), 100, context.current(ctx).verdict) });
       }
       const read = boardRead(params.uri);
-      return json(params.uri, await hosted.run(principal, sessionContext, "board_read", (session, tx) => resources.read(tx, session, read.uri, read.options)));
+      return json(params.uri, await hosted.readResource(principal, sessionContext, (session, tx) => resources.read(tx, session, read.uri, read.options)));
     } catch (error) {
       if (role === "subscriber") throw resourceError(error);
       if (error instanceof CoreError || error instanceof ApplicationError && error.code === "not_found") throw new ResourceNotFoundError(params.uri, "resource not found");
