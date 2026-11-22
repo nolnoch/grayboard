@@ -49,7 +49,7 @@ export function queueBoardKey(key: string): string | undefined {
 // ID, else null. recentEvents reads one key's claim_events newest by id, so a key's ids must commit in allocation
 // order (#1510, D4): a keyed body may write one only for a queue key `queue:<board>:<post id>` while it holds
 // `board:<board>` (board_post's keyed body, #1594), which every writer of that board's queue keys either holds or is
-// exclusive; any other key refuses in a keyed body. The needed key comes from the key, which is what recentEvents
+// exclusive (a keyed receipt's take credit, pg/boards.ts acknowledge, holds it too: #1595); any other key refuses in a keyed body. The needed key comes from the key, which is what recentEvents
 // orders by, not from `c.board`.
 export async function insertClaimEvent(
   tx: Tx, event: ClaimEvent, handle: string, c: Partial<Claim> & { key: string }, at: number, heldBy?: string,

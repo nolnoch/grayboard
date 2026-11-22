@@ -144,6 +144,8 @@ describe("Tests item 4: the pilot gate", () => {
     const bob = await srv.hosted(B, "fe");
     sessions.push(bob);
     const keyed = gateCount("tool", "keyed", "board_post");
+    // Both receipts of the round trip (the lane's of the invocation, bob's of the reply) run keyed on Postgres (#1595).
+    const receipts = { keyed: gateCount("receipt", "keyed"), miss: gateCount("receipt", "miss") };
     const p = await post(bob, "jobs", "job 1");
     // On Postgres the invocation and the lane's reply below run keyed on the board (#1594); SQLite has no keyed body.
     expect(gateCount("tool", "keyed", "board_post") - keyed).toBe(TEST_BACKEND === "pg" ? 1 : 0);
@@ -152,6 +154,7 @@ describe("Tests item 4: the pilot gate", () => {
     expect(item.actionable).toBe(true);
     expect(item.event).toMatchObject({ item: { post: { other_user: true } } });
     expect((item.event as { item: { post: { ungranted?: true } } }).item.post.ungranted).toBeUndefined();
+    await w1.receipt([item.id]);
     expect(await invokes()).toEqual([expect.objectContaining({ actor: B, target: `service:${SVC}`, detail: expect.objectContaining({
       address: `${B}/fe`, allow: true, rule: "role.service_invoke", binding: bindings.bob, role: "service_invoke", scope: SVC, principal: B, principal_kind: "user", board: "jobs", post_id: p.post_id,
     }) })]);
@@ -163,6 +166,7 @@ describe("Tests item 4: the pilot gate", () => {
     expect(reply.actionable).toBe(true);
     expect(reply.event).toMatchObject({ item: { post: { other_user: true } } });
     expect((reply.event as { item: { post: { ungranted?: true } } }).item.post.ungranted).toBeUndefined();
+    expect({ keyed: gateCount("receipt", "keyed") - receipts.keyed, miss: gateCount("receipt", "miss") - receipts.miss }).toEqual({ keyed: TEST_BACKEND === "pg" ? 2 : 0, miss: 0 });
     // The service's own post is service.own, recorded.
     expect((await invokes()).at(-1)).toMatchObject({ actor: SVC, detail: { address: `${SVC}/w-1`, allow: true, rule: "service.own" } });
   });

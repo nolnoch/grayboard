@@ -20,8 +20,8 @@
 //     the key's holder. The post lock keeps a sweep's order posts, then outbox, as a prune's is: a push reset (an
 //     outbox UPDATE, no FK check) would otherwise hold the row a prune's outbox delete waits on while the sweep's next
 //     post write waits on the prune's batch, a deadlock (c10e2 audit 1).
-//   - Lock order across tables: posts, then outbox, then claim_events (a delivered queue push's take, #1461), then
-//     subscriptions. forget, read and acknowledge each write a
+//   - Lock order across tables: posts, then outbox, then claim_events (a delivered queue push's take, #1461; a keyed
+//     receipt holds the board's key for it, #1595), then subscriptions. forget, read and acknowledge each write a
 //     handle's outbox rows before its subscriptions, so a handle's forget racing its read waits rather than deadlocks
 //     (c10e2 audit 2); prunePosts locks posts first and touches no subscription.
 //   - acknowledge's and read's GREATEST is re-evaluated on the newest row version after the row lock, so a cursor or
@@ -33,7 +33,8 @@
 //   exclusive bodies or keyed ones holding `board:<name>` (insertPost refuses a keyed body without it), so a board's
 //   ids commit in allocation order, and a subscriber's cursor is per board. A queue board's rotation and ack
 //   (claimQueuePost, claims ackQueue, their claim_events rows) refuse a keyed body without the same key (#1594), so two
-//   posts on one queue board pick their lanes one at a time, the second seeing the first's take.
+//   posts on one queue board pick their lanes one at a time, the second seeing the first's take. acknowledge's take
+//   credit refuses the same way (keyed receipt holds `board:<name>` for each queue board among its pushes, #1595).
 // - A Read is the autocommit pool: each statement is its own snapshot. So a read whose parts must agree is one
 //   statement (§7 Q10): pendingDigests joins each digest's latest post where core reads it after with getPost(...)!,
 //   which a prune committing between the two would turn into a crash; threadFacts reads root, authors, the parent's
@@ -302,9 +303,10 @@ export function makePgBoards({ clock }: { clock: () => number }): BoardsStore {
           WHERE handle = ${handle} AND post_id = ${ref.post_id} AND delivered_at IS NOT NULL AND ${held} RETURNING post_id`;
         if (again.length === 0 && receiver !== undefined) return;
       } else if (row.kind === "queue") {
-        // A claim_events write: exclusive bodies only (D4, #1510 chunk 4). Keyed receipt misses on a queue board before
-        // it gets here; this is the backstop.
-        refuseKeyed(tx, "boards.acknowledge's queue take credit (a claim_events write)");
+        // A claim_events write on this board's queue key: a keyed body must hold `board:<board>` (D4, #1595), as every
+        // other keyed writer of the board's queue keys does (claimQueuePost, ackQueue). Keyed receipt plans the key and
+        // misses on a queue board it doesn't hold before it gets here; this is the backstop.
+        refuseKeyed(tx, "boards.acknowledge's queue take credit (a claim_events write)", queueBoardKey(`queue:${row.board as string}:${ref.post_id}`));
         await creditQueueTakes(sql, handle, row.board as string, [ref.post_id], receiver);
       }
       // Push-mode subscribers have now seen it in full: count it as read.
@@ -473,6 +475,8 @@ export function makePgBoards({ clock }: { clock: () => number }): BoardsStore {
         const fresh: Row[] = await sql`UPDATE outbox SET delivered_at = ${clock()}, session_id = ${credited(sql, handle, receiver)}
           WHERE handle = ${handle} AND delivered_at IS NULL AND post_id = ANY(${posts.map(p => p.id)}::int8[]) AND ${held} RETURNING post_id`;
         if (fresh.length > 0 && (await sql`SELECT 1 FROM boards WHERE name = ${board} AND kind = 'queue'`).length > 0) {
+          // board_read runs exclusive; a tripwire should a keyed caller ever reach this without the board's key.
+          refuseKeyed(tx, "boards.read's queue take credit (a claim_events write)", queueBoardKey(`queue:${board}:${fresh[0]!.post_id}`));
           await creditQueueTakes(sql, handle, board, fresh.map(x => int8(x.post_id)), receiver);
         }
         await sql`UPDATE subscriptions SET cursor = GREATEST(cursor, ${maxId}::int8) WHERE board = ${board} AND handle = ${handle} AND ${held}`;

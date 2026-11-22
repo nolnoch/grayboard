@@ -194,17 +194,28 @@ describePg("boards store races (Postgres)", () => {
     expect(r.waited).toBe(true);
   });
 
-  // #1510 chunk 4: a queue post's first acknowledge credits its take (a claim_events write), which a keyed body may not
-  // do: the store refuses it (keyed receipt misses on a queue board before it gets here; this is the backstop) and the
-  // body rolls back. A broadcast post's acknowledge is keyed receipt's own. Mutation: the refusal dropped (the keyed
-  // acknowledge commits).
-  test("a queue post's first acknowledge refuses in a keyed body (its queue take credit); a broadcast post's runs keyed", async () => {
+  // #1595: a queue post's first acknowledge credits its take (a claim_events write on `queue:hall:<post>`), which a keyed
+  // body may do only while it holds `board:hall`, as every keyed writer of that board's queue keys does: without it (root
+  // only, or another board's key) the store refuses and the body rolls back; with it the ack commits and credits the
+  // take to FE's holder. A broadcast post's acknowledge needs no board key. Mutations: the refusal dropped (the root-only
+  // call commits); its needed key taken from anything but the post's board (the board:other call commits).
+  test("a queue post's first acknowledge needs its board's key in a keyed body (its take credit); a broadcast post's runs on the root alone", async () => {
     await using p = await pgPair();
     const root = await hall(p, "queue");
-    await p.a.write(tx => bs.insertOutbox(tx, root, [[FE, { reason: "subscription", wake: true }]]));
-    const e = await caught(() => p.a.writeKeyed(["root:a"], tx => bs.acknowledge(tx, FE, { kind: "push", post_id: root })));
-    expect((e as Error).message).toContain("boards.acknowledge's queue take credit (a claim_events write) refused in a keyed write body (keys root:a)");
-    expect((await p.db.sql`SELECT delivered_at FROM outbox`)[0].delivered_at).toBeNull();
+    await p.a.write(tx => bs.claimQueuePost(tx, "hall", root, FE, T0, { note: "queue post", push: true }));
+    // FE's holder from here on: the take was logged with none, and the credit names S1.
+    await p.db.sql`INSERT INTO alias_holds (address, id, bound_at) VALUES (${FE}, 'S1', 1)`;
+    const ack = (keys: string[]) => p.a.writeKeyed(keys, tx => bs.acknowledge(tx, FE, { kind: "push", post_id: root }));
+    const state = async () => ({
+      delivered: (await p.db.sql`SELECT delivered_at FROM outbox WHERE handle = ${FE} AND post_id = ${root}`)[0].delivered_at !== null,
+      credited: (await p.db.sql`SELECT session_id FROM claim_events WHERE key = ${`queue:hall:${root}`} AND event = 'take'`)[0].session_id,
+    });
+    const e = await caught(() => ack(["root:a"]));
+    expect((e as Error).message).toContain("boards.acknowledge's queue take credit (a claim_events write) refused in a keyed write body (keys root:a) without the key board:hall");
+    expect(await caught(() => ack(["root:a", "board:other"]))).toBeInstanceOf(Error);
+    expect(await state()).toEqual({ delivered: false, credited: null });
+    await ack(["root:a", "board:hall"]);
+    expect(await state()).toEqual({ delivered: true, credited: "S1" });
     await p.a.write(tx => bs.create(tx, { name: "news", purpose: "p", scope: null, kind: "broadcast", createdBy: BE, now: T0 }));
     const post = (await p.a.write(tx => bs.insertPost(tx, np("item", T0, null, "news")))).id;
     await p.a.write(tx => bs.insertOutbox(tx, post, [[FE, { reason: "subscription", wake: true }]]));
