@@ -307,6 +307,13 @@ describe("loadtest pilot gate (#1537)", () => {
   // Each item failing alone fails the gate on that item only. Mutations: the lease check's tag dropped; the world stop
   // gated on `>=` (70% fails) or not at all; the client edge left at 0.1 s; the server's `le1` read as `fast`.
   test("each item fails alone, and fails the gate", () => {
+    // The service on, its one invocation proven and answered: only the mention accounting can fail.
+    const svcOn = (i: JudgeInput) => {
+      i.o = { ...i.o, serviceWorkers: 2, svcShare: 0.05, peerShare: 0, readShare: 0, mentionShare: 0.25 };
+      i.audit = { teamAllowed: new Set([1]), rules: {}, boardScope: "service:loadsvc", boardKind: "queue" } as JudgeInput["audit"];
+      Object.assign(i.finals[0]!, { svcSent: ["0:1"], svcGot: ["0:1"], svcDone: ["0:1"], svcPosts: [1] });
+      for (const w of i.windows) { w.client.svc_invoke = hist(10, 10, 10); w.client.svc_reply = hist(10, 10, 10); }
+    };
     const cases: [string, (i: JudgeInput) => void, string, RegExp][] = [
       ["connect", i => { i.connected = 299; }, "connect", /^only 299 of 300 sessions connected$/],
       ["dms", i => { i.finals[0]!.recvDm = ["0:1"]; }, "dms", /^1 of 2 DMs never reached their recipient \(e\.g\. 1:1\)$/],
@@ -320,6 +327,9 @@ describe("loadtest pilot gate (#1537)", () => {
       ["world stop", i => { i.queueSteady = stop(0.71); }, "stop", /^steady world stop 71\.0%; want ≤ 70\.0%$/],
       ["world stop unmeasured", i => { i.queueSteady = null; }, "stop", /^no steady write-queue sample: world stop unmeasured$/],
       ["other", i => { i.windows[2]!.clientErrors = { "dm_send/x": 1 }; }, "other", /^client errors: \{"dm_send\/x":1\}$/],
+      // Mention accounting (#1518), with the service on: a mention lost, and invocations none of which mentioned anyone.
+      ["mention lost", i => { svcOn(i); Object.assign(i.finals[0]!, { mentSent: ["0:1"], mentGot: [] }); }, "other", /^1 of 1 invocations' @mentions never reached the session they named \(e\.g\. 0:1\)$/],
+      ["no mention", i => { svcOn(i); Object.assign(i.finals[0]!, { mentSent: [], mentGot: [] }); }, "other", /^none of 1 invocations @mentioned a session \(--mention-share 0\.25\)$/],
     ];
     for (const [name, mutate, item, text] of cases) {
       const i = base();
@@ -408,7 +418,7 @@ describe("loadtest run", () => {
       expect({ op, ok: p.ok > 0, named: p.named, content: op === "snapshot" ? p.content > 0 : p.content }).toEqual({ op, ok: true, named: p.ok, content: op === "snapshot" ? true : p.ok });
     }
     expect(svc.reads.catalog_connect.named).toBe(svc.reads.catalog_connect.ok);
-    // Mention resolution on the service board (#1518): some invocations named another user's session, which was told.
+    // Mention resolution on the service board (#1518): some invocations named another user session, which was told.
     expect(svc.mentions.sent, r.out).toBeGreaterThan(0);
     expect({ received: svc.mentions.received >= svc.mentions.sent, lost: svc.mentions.lost }).toEqual({ received: true, lost: 0 });
   }, 90_000);

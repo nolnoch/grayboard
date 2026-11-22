@@ -48,7 +48,7 @@
 // the service's board through R5's other canSee sites (#1511), in turn: board_list, board_read (a thread of its own
 // answered invocations), the snapshot (resources/read) and the catalog (resources/list, also read by every session as
 // it connects, timed and proved as catalog_connect, its latency not gated).
-// At --mention-share an invocation also @mentions another user's session (#1518): mention resolution judges visibility on
+// At --mention-share an invocation also @mentions another user session (#1518): mention resolution judges visibility on
 // the service board (R5's last canSee site); the post still goes to a lane, the named session is told, and every such
 // mention must reach it (its delivery timed as mention_e2e, reported, not gated).
 // Each is its own op, and each result must show the board (every board_read thread its invocation and reply, some
@@ -87,7 +87,7 @@ export type Options = {
   // The service's workers (of `sessions`), the teams its invokers hold service_invoke through, and the shares of a
   // user's ops that invoke it and list peers.
   serviceWorkers: number; teams: number; svcShare: number; peerShare: number;
-  // The share of a user's ops that read the service's board, and of its invocations that @mention another user's session.
+  // The share of a user's ops that read the service's board, and of its invocations that @mention another user session.
   readShare: number; mentionShare: number;
   // A Postgres cluster URL; absent runs the server on a SQLite file.
   pg?: string;
@@ -617,7 +617,7 @@ export function judge(input: JudgeInput) {
     if (unproven.length) fail(`${unproven.length} of ${svcPosts.length} invocations have no authz.decision row allowing service.invoke through a team's binding (e.g. posts ${unproven.slice(0, 5).join(", ")}; service.invoke rows by rule ${JSON.stringify(audit!.rules)})`);
     if (audit!.boardScope !== `service:${SERVICE}` || audit!.boardKind !== "queue") fail(`${SVC_BOARD} is scope ${audit!.boardScope}, kind ${audit!.boardKind}; want service:${SERVICE}, queue`);
   }
-  // Mention accounting (#1518): every invocation that @mentioned another user's session reached that session.
+  // Mention accounting (#1518): every invocation that @mentioned another user session reached that session.
   const mentSent = new Set(finals.flatMap(f => f.mentSent)), mentGot = new Set(finals.flatMap(f => f.mentGot));
   const mentLost = [...mentSent].filter(id => !mentGot.has(id));
   if (o.serviceWorkers && o.svcShare > 0 && o.mentionShare > 0) {

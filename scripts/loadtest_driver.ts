@@ -38,7 +38,7 @@ export type DriverConfig = {
   peerShare: number;
   // The share of a user's ops that read the service's board (board_list, board_read, snapshot, catalog in turn).
   readShare: number;
-  // The share of invocations that also @mention another user's session (R5's mention resolution on the service board).
+  // The share of invocations that also @mention another user session (R5's mention resolution on the service board).
   mentionShare: number;
   burst: number;
 };
@@ -54,7 +54,7 @@ export type DriverWindow = {
 // svcSent, those whose post returned; svcGot, those a lane read; svcDone, those whose reply its invoker read.
 // svcPosts: the invocations' post ids, which the coordinator matches to the server's authz.decision rows.
 // laneEcho: replies a lane read (it subscribes the board it answers on).
-// mentSent: invocations that @mentioned another user's session ("invoker:seq"); mentGot, those the named session read.
+// mentSent: invocations that @mentioned another user session ("invoker:seq"); mentGot, those the named session read.
 // svcReads: per read op, the calls that returned (ok), those whose result named the service's board (named), and those
 // that also carried its posts (content: a board_read's thread holds the invocation and its reply; a snapshot, any post).
 export type ReadProof = { ok: number; named: number; content: number };
@@ -74,7 +74,7 @@ export const PROOF_OPS = [...SVC_READS, "catalog_connect"] as const;
 const RENEW_MS = 10_000;
 // Body marker: lt|<kind>|<sender index>|<seq>|<to: the target index, or the board>|<sent at ms>. An invocation (svc)
 // goes to the service's board; its reply (done) carries the invocation's sender, seq and sent-at, to the invoker. An
-// invocation that @mentions another user's session also carries lt|ment|<sender>|<seq>|<that session's index>|<sent at>:
+// invocation that @mentions another user session also carries lt|ment|<sender>|<seq>|<that session's index>|<sent at>:
 // the lane takes it as work, and the named session is told (boards.md §3 Service boards), not misdelivered to.
 const MARK = /lt\|(dm|post|svc|done|ment)\|(\d+)\|(\d+)\|([\w-]+)\|(\d+)/g;
 
@@ -441,7 +441,7 @@ async function main() {
         void timed("board_post", () => l.s.call("board_post", { board: l.spec.board, body: `lt|post|${l.spec.index}|${seq}|${l.spec.board}|${Date.now()}` }));
       } else if (op === "svc_invoke") {
         const id = `${l.spec.index}:${seq}`, board = svcBoard;
-        // Sometimes the invocation names another user's session, which mention resolution judges on the service board.
+        // Sometimes the invocation names another user session, which mention resolution judges on the service board.
         let mention = "";
         if (config.addresses.length > 1 && Math.random() < config.mentionShare) {
           let to = Math.floor(Math.random() * (config.addresses.length - 1));
@@ -449,7 +449,9 @@ async function main() {
           mention = ` @${config.addresses[to]!} lt|ment|${l.spec.index}|${seq}|${to}|${Date.now()}`;
         }
         void timed("svc_invoke", async () => {
-          const res = await l.s.call<{ post_id: number }>("board_post", { board, body: `lt|svc|${l.spec.index}|${seq}|${board}|${Date.now()}${mention}` });
+          const res = await l.s.call<{ post_id: number; unresolved?: string[] }>("board_post", { board, body: `lt|svc|${l.spec.index}|${seq}|${board}|${Date.now()}${mention}` });
+          // A mention that didn't resolve at post time is a resolution failure, not a lost delivery.
+          if (res.unresolved?.length) noteError("svc_invoke", new Error(`unresolved mention: ${res.unresolved.join(", ")}`));
           svcSent.add(id);
           if (mention) mentSent.add(id);
           svcPosts.push(res.post_id);
