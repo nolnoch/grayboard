@@ -1523,6 +1523,35 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
       try { return await handleCall(hub, tx, session, "board_post", args, undefined, plan); }
       finally { tx.afterCommit(() => expiry.arm()); }
     },
+    // A board_read's plan for a keyed body (#1604 step 2b, D4), read on the pool, or undefined when it runs exclusive:
+    // the sessions postPlan leaves exclusive (a principal's read writes nothing, so it gains nothing here), a session
+    // whose addresses aren't its own holds (no `receiverOf`: a tools-only session's writes_as is another root's hold,
+    // whose receipt marks the same outbox and subscription rows under that root's key alone), and a read the pool
+    // refuses (the exclusive body gives the refusal and writes its row). The board is the one the body's read point
+    // and outbox writes are on; pg/boards.ts read refuses them without `board:<name>`.
+    async readPlan(session: ApplicationSession, args: Record<string, unknown>): Promise<PostPlan | undefined> {
+      if (session.human || session.readOnly || !session.active || hub.delegateRows !== undefined || receiverOf(session) === undefined) return undefined;
+      if (typeof args.board !== "string") return undefined;
+      try {
+        childState(session, "board_read");
+        const actor = await serverBoardActor(repo, hub.access, repo.read, "board_read", args, { addresses: session.addresses, asAddresses: asAddresses(session), ownScope: session.authed.user_email });
+        return { board: (await readableBoard(repo, hub.access, repo.read, actor, args.board)).name };
+      } catch (error) {
+        if (error instanceof ApplicationError || error instanceof CoreError) return undefined;
+        throw error;
+      }
+    },
+    // `call` for board_read in a keyed body under `plan` (hosted.ts boardRead): postKeyed's checks, then the read.
+    async readKeyed(tx: Tx, session: ApplicationSession, plan: PostPlan, args: Record<string, unknown>) {
+      stillOpen(session);
+      if (session.human || session.readOnly || hub.delegateRows !== undefined || receiverOf(session) === undefined) throw new KeyedSendMiss("the session's state needs the exclusive body");
+      const disabled = await repo.users.isDisabled(tx, session.authed.user_id);
+      await testPauseAsync("valid:user:read");
+      stillOpen(session);
+      if (disabled) throw new KeyedSendMiss("its user is disabled");
+      try { return await handleCall(hub, tx, session, "board_read", args, undefined, plan); }
+      finally { tx.afterCommit(() => expiry.arm()); }
+    },
     async delegate(tx: Tx, session: ApplicationSession, request: Omit<DelegateRequest, "type" | "req_id">) {
       await valid(session, false, tx);
       return handleDelegate(hub, tx, session, request);
@@ -2318,7 +2347,7 @@ async function handleCall(hub: Hub, tx: Tx, session: ApplicationSession, tool: s
   }
   const { as: _as, ...rest } = args;
   if (tool === "board_post") return handleBoardPost(hub, tx, session, actor, rest, ctx, publish, keyed);
-  if (keyed) throw new KeyedSendMiss(`${tool} has no keyed body`);
+  if (keyed && tool !== "board_read") throw new KeyedSendMiss(`${tool} has no keyed body`);
   // A claim announced on a service's board is a post there too (#270 D6): decided as board_post's is.
   const inv = tool === "claim_take" ? await invocation(repo, tx, actor, rest.board) : null;
   if (inv && !inv.d.allow) {
@@ -2331,11 +2360,23 @@ async function handleCall(hub: Hub, tx: Tx, session: ApplicationSession, tool: s
     const a = inv && as === actor && inv.req.board === board ? inv : await invocation(repo, sp, as, board);
     if (a?.d.allow) recordDecision(repo, sp, sessionActor(session, as), a.req, a.d, { post_id: postId });
   };
+  // A keyed board_read's board, resolved on its own Tx, is the one it holds `board:<name>` for, or it misses (#1604): a
+  // backstop, since readableBoard returns the input's own row; a board that turned unreadable since the plan refuses
+  // here, and the exclusive body gives that refusal.
+  if (keyed) {
+    let b: { name: string };
+    try { b = await readableBoard(repo, hub.access, tx, actor, rest.board as string); }
+    catch (e) { if (e instanceof CoreError) throw coreRefusal(e); throw e; }
+    if (b.name !== keyed.board) throw new KeyedSendMiss(`#${String(rest.board)} resolves to #${b.name} now, not the planned #${keyed.board}`);
+  }
   let outcome;
   const receiver = receiverOf(session);
   try { outcome = await callBoardTool(repo, hub.access, tx, actor, tool, rest, { ...ctx, ...(session.readOnly ? { principal: userOf(session) } : {}), ...(receiver ? { receiver } : {}), announced }); }
   catch (e) {
     if (e instanceof CoreError) throw coreRefusal(e);
+    // A keyed body's fault (a store's refuseKeyed, a deadlock) fails the call as board_post's does, not a refusal the
+    // caller would answer with the exclusive body.
+    if (keyed) throw e;
     console.error(`[grayboard] ${tool} failed:`, e);
     return fail("internal", `${tool} failed`);
   }

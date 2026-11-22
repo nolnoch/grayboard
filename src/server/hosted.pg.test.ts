@@ -15,7 +15,7 @@ import { until } from "../../tests/support/until.ts";
 import { createApplication, KeyedSendMiss } from "./application.ts";
 import { writeAudit } from "./audit.ts";
 import { createDelivery } from "./delivery.ts";
-import { createHostedSessions, sessionContext } from "./hosted.ts";
+import { createHostedSessions, sessionContext, type SessionContext } from "./hosted.ts";
 import { OPENCODE_CLIENT, OPENCODE_SESSION_META } from "./oauth-config.ts";
 import type { OAuthPrincipal } from "./oauth.ts";
 import { makePgRepo, type PgRepo } from "./pg_repo.ts";
@@ -3303,5 +3303,85 @@ describePg("keyed read tools (Postgres)", () => {
     await callOf(x, p, "root-rd", "claim_list", {});
     expect(gateCount("tool", "keyed", "claim_list") - keyed).toBe(1);
     await until(async () => (await claimRows(db.sql)).length === 0, 10_000, "the moved claim lapsed after the keyed claim_list re-armed the timer");
+  });
+});
+
+// #1604 step 2b (D4): board_read's body keyed on the reader's root and the board (hosted.ts boardRead). Its read point,
+// outbox and queue take credit are the reader's rows on that board: board_post holds the board's key, so a held post
+// keeps a read of another board from waiting on it (the second half, a read of the post's own board waiting, holds under
+// either body). Mutation: boardRead's keyed spec dropped (each read runs exclusive and waits behind the held post on
+// the other board too).
+describePg("keyed board_read (Postgres)", () => {
+  const read = (x: LeaseInstance, p: OAuthPrincipal, source: string, board: string) =>
+    x.hosted.boardRead(p, ctx(p, source), { board }) as Promise<{ posts: Array<{ id: number; body: string }>; unread_remaining: number }>;
+
+  test("a read runs keyed beside a held post on another board, and after one on its own board", async () => {
+    await using db = await pgDatabase({ max: 2 });
+    await using x = await leaseInstance(db.url);
+    const p = await leasePrincipal(x, db.sql);
+    for (const [s, n] of [["root-s1", "s1"], ["root-rd", "rd"]]) await bound(x, p, s!, n!);
+    for (const b of ["b1", "b2"]) await boardTool(x, p, "root-s1", "board_create", { name: b, purpose: "reads" });
+    await boardTool(x, p, "root-rd", "board_subscribe", { board: "b1", mode: "push" });
+    const ids = [postId(await post(x, p, "root-s1", { board: "b1", body: "one" })), postId(await post(x, p, "root-s1", { board: "b1", body: "two" }))];
+    const posts = holdPosts(x);
+    posts.hold = gate(); x.state.defer = gate();
+    const held = post(x, p, "root-s1", { board: "b2", body: "held" });
+    let readB2: Promise<unknown> | undefined;
+    try {
+      await until(() => posts.held === 1, 10_000, "the post on b2 held after its insert");
+      const keyed = gateCount("tool", "keyed", "board_read");
+      const r = await Promise.race([read(x, p, "root-rd", "b1"), Bun.sleep(8_000).then(() => { throw new Error("the read of b1 did not finish beside the held post on b2"); })]);
+      expect(r.posts.map(q => q.body)).toEqual(["one", "two"]);
+      expect(gateCount("tool", "keyed", "board_read") - keyed).toBe(1);
+      // The reader's rows on b1 moved: the outbox credited, the read point past both posts.
+      expect((await db.sql`SELECT post_id FROM outbox WHERE handle = ${`${ME}/rd`} AND delivered_at IS NULL`).length).toBe(0);
+      expect(Number((await db.sql`SELECT cursor FROM subscriptions WHERE board = 'b1' AND handle = ${`${ME}/rd`}`)[0].cursor)).toBe(Math.max(...ids));
+      // A read of b2 waits for the held post on b2's key.
+      let done = false;
+      readB2 = read(x, p, "root-rd", "b2").then(v => { done = true; return v; });
+      await Bun.sleep(300);
+      expect(done).toBe(false);
+    } finally { posts.hold.open(); x.state.defer.open(); }
+    await held;
+    expect(((await readB2) as { posts: Array<{ body: string }> }).posts.map(q => q.body)).toEqual(["held"]);
+  });
+
+  // A queue board's read takes its items as the exclusive body does: the same claims and claim events.
+  test("a queue board's read takes its items as the exclusive body does", async () => {
+    const run = async (keyedTools: boolean) => {
+      await using db = await pgDatabase({ max: 2 });
+      await using x = await leaseInstance(db.url, keyedTools ? {} : { keyedTools: false });
+      const p = await leasePrincipal(x, db.sql);
+      for (const [s, n] of [["root-s1", "s1"], ["root-rd", "rd"]]) await bound(x, p, s!, n!);
+      await boardTool(x, p, "root-s1", "board_create", { name: "q1", purpose: "queue", kind: "queue" });
+      await boardTool(x, p, "root-rd", "board_subscribe", { board: "q1", mode: "push" });
+      await post(x, p, "root-s1", { board: "q1", body: "work" });
+      const at = { keyed: gateCount("tool", "keyed", "board_read"), skipped: gateCount("tool", "skipped", "board_read") };
+      const r = await read(x, p, "root-rd", "q1");
+      const gates = { keyed: gateCount("tool", "keyed", "board_read") - at.keyed, skipped: gateCount("tool", "skipped", "board_read") - at.skipped };
+      return { body: r.posts.map(q => q.body), gates, claims: await claimRows(db.sql), events: await claimEvents(db.sql) };
+    };
+    const keyed = await run(true), exclusive = await run(false);
+    expect(keyed.gates).toEqual({ keyed: 1, skipped: 0 });
+    expect(exclusive.gates).toEqual({ keyed: 0, skipped: 1 });
+    expect(keyed.events.some((e: { handle: string }) => e.handle === `${ME}/rd`)).toBe(true);
+    expect({ body: keyed.body, claims: keyed.claims, events: keyed.events }).toEqual({ body: exclusive.body, claims: exclusive.claims, events: exclusive.events });
+  });
+
+  // A tools-only session's writes_as is another root's hold: its read's outbox and read point rows are the ones that
+  // root's receipt marks under its root key alone, so the read runs exclusive (readPlan: no receiverOf). Mutation:
+  // readPlan's receiverOf check dropped (the read runs keyed).
+  test("a tools-only session's read runs exclusive", async () => {
+    await using db = await pgDatabase({ max: 2 });
+    await using x = await leaseInstance(db.url);
+    const p = await leasePrincipal(x, db.sql);
+    for (const [s, n] of [["root-s1", "s1"], ["root-rd", "rd"]]) await bound(x, p, s!, n!);
+    await boardTool(x, p, "root-s1", "board_create", { name: "b1", purpose: "reads" });
+    await boardTool(x, p, "root-rd", "board_subscribe", { board: "b1", mode: "push" });
+    await post(x, p, "root-s1", { board: "b1", body: "one" });
+    const at = { keyed: gateCount("tool", "keyed", "board_read"), skipped: gateCount("tool", "skipped", "board_read") };
+    const r = await x.hosted.boardRead(p, { ...ctx(p, "root-tools"), writesAs: "rd" } as SessionContext, { board: "b1" }) as { posts: Array<{ body: string }> };
+    expect(r.posts.map(q => q.body)).toEqual(["one"]);
+    expect({ keyed: gateCount("tool", "keyed", "board_read") - at.keyed, skipped: gateCount("tool", "skipped", "board_read") - at.skipped }).toEqual({ keyed: 0, skipped: 1 });
   });
 });
