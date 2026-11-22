@@ -2606,13 +2606,10 @@ async function handleThread(r: Read, session: ApplicationSession, messageId: num
 
 // A receipt: the harness was handed these ids. Each stamps its delivery time
 // once (unless `at` is null: given up, not handed) and moves its recipient
-// address's cursor; only your own direct messages count (S8). In id order, whatever order the caller gave (#1510
-// scope pair 4): markDelivered's row locks then come in messages.prune's by-id order, so the two never deadlock.
+// address's cursor; only your own direct messages count (S8). The stamps lock in id order, whatever order the caller
+// gave (#1510 scope pair 4), messages.prune's by-id order, so the two never deadlock. Set-based (#1510 chunk 5): one
+// read and one stamp for the batch, then a cursor move per recipient address, where a loop ran three per id.
 async function handleAck(tx: Tx, session: ApplicationSession, messageIds: number[], repo: Repo, at: number | null): Promise<void> {
-  for (const msgId of [...messageIds].sort((a, b) => a - b)) {
-    const msg = await repo.messages.getById(tx, msgId);
-    if (!msg || msg.recipient_type !== "user" || !session.addresses.includes(msg.recipient)) continue;
-    if (at !== null) await repo.messages.markDelivered(tx, msgId, at);
-    await repo.cursors.advance(tx, msg.recipient, "direct", msg.recipient, msgId);
-  }
+  const last = await repo.messages.deliver(tx, [...session.addresses], [...messageIds].sort((a, b) => a - b), at);
+  for (const [recipient, id] of [...last].sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)) await repo.cursors.advance(tx, recipient, "direct", recipient, id);
 }

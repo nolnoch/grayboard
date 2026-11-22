@@ -257,7 +257,7 @@ test("#807 P1c-14b: messages reads inside hosted bodies run on that body's Tx", 
   } finally { restore(); }
 });
 
-// #807 P1c-14b: a lease's pull reads on the pool; its receipt's unread check and the ack it records read on the receipt body's Tx.
+// #807 P1c-14b: a lease's pull reads on the pool; its receipt's unread check reads on the receipt body's Tx (the stamp is one set-based `deliver`, #1510, with no per-message read).
 test("#807 P1c-14b: a delivery receipt's messages reads run on its body's Tx", async () => {
   const { checks, restore } = spyMessageReads();
   const a = context("p14-lease"), b = context("p14-sender");
@@ -273,7 +273,8 @@ test("#807 P1c-14b: a delivery receipt's messages reads run on its body's Tx", a
     const received = checks.length;
     await delivery.receipt(principal, a, lease.capability, items.map(i => i.id));
     const ops = checks.slice(received).map(c => `${c.op}:${c.handle}`);
-    expect(ops).toEqual(expect.arrayContaining(["unreadSince:tx", "getById:tx"]));
+    expect(ops).toContain("unreadSince:tx");
+    expect(ops).not.toContain("getById:tx");
     expect(checks.filter(c => c.inTxn !== (c.handle === "tx"))).toEqual([]);
   } finally { restore(); }
 });

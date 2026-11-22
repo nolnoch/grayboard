@@ -1051,7 +1051,7 @@ describePg("a first contact's creating entry is released on every exit (Postgres
 
 // #1510 chunk 4: delivery's renew and receipt keyed by their root on Postgres (delivery.ts keyedOr, D4). Each runs its
 // reads in a probe, then writes only the session's own rows; anything else misses into today's exclusive body. A keyed
-// renew is held at its lease UPDATE and a keyed receipt at its first markDelivered or board acknowledge (`state.hold`);
+// renew is held at its lease UPDATE and a keyed receipt at its delivery stamp or first board acknowledge (`state.hold`);
 // `state.entry`, while set, holds a renew or receipt after its gate, before its keyed body queues, so two of one root
 // can both be past their gates. Every wait has a deadline. Without GRAYBOARD_TEST_PG_URL it skips.
 async function leaseInstance(url: string, opts: { keyed?: false; keyedTools?: false; side?: string } = {}) {
@@ -1072,12 +1072,14 @@ async function leaseInstance(url: string, opts: { keyed?: false; keyedTools?: fa
     if (keyedTx(tx) && currentSite() === "renew") await holdHere(`renew ${id}`);
     return update(tx, id, patch);
   }) as typeof store.update;
-  const markDelivered = repo.messages.markDelivered;
-  repo.messages.markDelivered = async (tx, id, at) => {
-    if (currentSite() === "receipt") state.marked.push(id);
-    await markDelivered(tx, id, at);
-    // After its first row lock, so a held receipt holds that message's row.
-    if (keyedTx(tx) && currentSite() === "receipt" && state.marked.length === 1) await holdHere(`receipt ${id}`);
+  const deliver = repo.messages.deliver;
+  repo.messages.deliver = async (tx, recipients, ids, at) => {
+    const first = currentSite() === "receipt" && !state.marked.length;
+    if (currentSite() === "receipt") state.marked.push(...ids);
+    const out = await deliver(tx, recipients, ids, at);
+    // After its stamp's row locks, so a held receipt holds those messages' rows.
+    if (keyedTx(tx) && first && ids.length) await holdHere(`receipt ${ids[0]}`);
+    return out;
   };
   const acknowledge = repo.boards.acknowledge;
   repo.boards.acknowledge = async (tx, handle, ref, receiver) => {
@@ -1289,7 +1291,7 @@ describePg("keyed renew and receipt (Postgres)", () => {
     expect((await db.sql`SELECT lease_deadline FROM hosted_sessions WHERE session_id = ${id}`)[0].lease_deadline).toBeNull();
   });
 
-  // The same for a keyed receipt held at its first mark: the probe's lock holds another instance's unbind until the
+  // The same for a keyed receipt held at its delivery stamp: the probe's lock holds another instance's unbind until the
   // receipt commits. Mutation: the receipt probe's store.lock as store.get (the unbind commits beside the receipt).
   test("another instance's unbind waits for a keyed receipt held after its probe", async () => {
     await using db = await pgDatabase({ max: 4 });
@@ -1304,7 +1306,7 @@ describePg("keyed renew and receipt (Postgres)", () => {
       const items = await a.delivery.pending(p, c, lease.capability);
       a.state.marked = []; a.state.hold = gate();
       const receipt = a.delivery.receipt(p, c, lease.capability, items.map(i => i.id));
-      await until(() => a.state.held === 1, 10_000, "the receipt held after its first mark");
+      await until(() => a.state.held === 1, 10_000, "the receipt held after its delivery stamp");
       let done = false;
       const unbound = b.hosted.unbind(p, c, { name: "fe" }).finally(() => { done = true; });
       try {
@@ -1494,7 +1496,7 @@ describePg("keyed renew and receipt (Postgres)", () => {
       x.state.hold = gate();
       const d = renewDelta("receipt");
       const receipt = x.delivery.receipt(p, c, lease.capability, items.map(i => i.id));
-      await until(() => x.state.held === 1, 10_000, "the receipt held after its first mark");
+      await until(() => x.state.held === 1, 10_000, "the receipt held after its delivery stamp");
       const before = x.q.waiting;
       const sent = sender.send(`${ME}/fe`, "two");
       await until(() => x.q.waiting > before, 10_000, "the send queued");
@@ -1529,10 +1531,11 @@ describePg("keyed renew and receipt (Postgres)", () => {
   });
 
   // The deadlock pairs (scope pairs 4 and 5), forced across two instances, since on one the scheduler never runs a
-  // prune or an end beside a keyed receipt. A's receipt of reversed ids is held after its first mark; B's prune of
-  // those messages, then B's end of the root, wait on its locks and finish after it, with no 40P01. Mutation: handleAck
-  // without its sort (the receipt holds the newest message, the prune locks the oldest and waits on it, and the
-  // receipt's next mark waits on the prune: 40P01).
+  // prune or an end beside a keyed receipt. A's receipt of reversed ids is held after its delivery stamp; B's prune
+  // of those messages, then B's end of the root, wait on its locks and finish after it, with no 40P01. The stamp locks
+  // its rows in one statement (messages.deliver's ORDER BY id, #1510 chunk 5), so the hold comes after every row lock:
+  // this test pins the waits, not the lock order. Dropping that ORDER BY fails no test, since a primary-key index scan
+  // of `id = ANY(…)` visits the ids in order anyway; the clause keeps the order from depending on the plan.
   test("another instance's prune and end of the root wait for a held keyed receipt, with no deadlock", async () => {
     await using db = await pgDatabase({ max: 4 });
     await using a = await leaseInstance(db.url, { side: "a" });
@@ -1547,7 +1550,7 @@ describePg("keyed renew and receipt (Postgres)", () => {
       a.state.marked = [];
       a.state.hold = gate();
       const receipt = a.delivery.receipt(p, c, lease.capability, items.map(i => i.id).reverse());
-      await until(() => a.state.held === 1, 10_000, "the receipt held after its first mark");
+      await until(() => a.state.held === 1, 10_000, "the receipt held after its delivery stamp");
       const prune = atSite("other", () => b.repo.write(tx => b.repo.messages.prune(tx, a.clock + 1)));
       await until(async () => await lockWaiters(db.sql) >= 1, 10_000, "the prune waits on the receipt's row lock");
       a.state.hold.open();

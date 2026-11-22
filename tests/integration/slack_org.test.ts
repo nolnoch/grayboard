@@ -866,12 +866,12 @@ test("#807 P3 C7: the owed bridge notice reports the stop written before its loc
 });
 
 // #807 P1c-14b: the link's newest-message read (where the new human's cursor starts) and the Slack receipt's
-// message read run on their body's Tx.
+// message stamp (one set-based `deliver`, #1510) run on their body's Tx.
 test("#807 P1c-14b: link and the Slack receipt read messages on their body's Tx", async () => {
   const repo = srv.app.repo;
   const checks: { op: string; inTxn: boolean; handle: "pool" | "tx" }[] = [];
   const txn = txSpy(srv);
-  const spies = (["history", "getById"] as const).map((name) => {
+  const spies = (["history", "deliver"] as const).map((name) => {
     const original = repo.messages[name].bind(repo.messages) as (...a: unknown[]) => unknown;
     return spyOn(repo.messages, name).mockImplementation(((r: unknown, ...rest: unknown[]) => {
       if (new Error().stack?.includes("/slack.ts:")) checks.push({ op: name, inTxn: txn.open, handle: r === repo.read ? "pool" : "tx" });
@@ -883,9 +883,9 @@ test("#807 P1c-14b: link and the Slack receipt read messages on their body's Tx"
     await link(alice);
     const be = await hosted("alice@example.com", "be");
     await be.call<SendResult>("dm_send", { to: "human", body: "receipt check" });
-    await until(() => checks.some((c) => c.op === "getById"));
+    await until(() => checks.some((c) => c.op === "deliver"));
   } finally { for (const spy of spies) spy.mockRestore(); txn.restore(); }
-  expect(checks).toEqual([{ op: "history", inTxn: true, handle: "tx" }, { op: "getById", inTxn: true, handle: "tx" }]);
+  expect(checks).toEqual([{ op: "history", inTxn: true, handle: "tx" }, { op: "deliver", inTxn: true, handle: "tx" }]);
 });
 
 test("thread replies while unlinked don't flood in at relink", async () => {

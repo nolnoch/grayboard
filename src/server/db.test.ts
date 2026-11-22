@@ -825,7 +825,7 @@ test("#807 P1c-14a: the messages writes run on the Tx they're given", async () =
   const m = repo.messages;
   await expect(m.insert(kept, peer, "user", id, "late", null)).rejects.toThrow(settled);
   await expect(m.ack(kept, id, first.id)).rejects.toThrow(settled);
-  await expect(m.markDelivered(kept, first.id, 1)).rejects.toThrow(settled);
+  await expect(m.deliver(kept, [id], [first.id], 1)).rejects.toThrow(settled);
   await expect(m.retract(kept, peer, second.id, { actor: null, session: null })).rejects.toThrow(settled);
   await expect(m.prune(kept, Date.now() + 1)).rejects.toThrow(settled);
   await expect(m.ack({} as Tx, id, first.id)).rejects.toThrow("not a SQLite store handle");
@@ -834,7 +834,7 @@ test("#807 P1c-14a: the messages writes run on the Tx they're given", async () =
   await expect(seed(repo, async tx => {
     await m.insert(tx, peer, "user", id, "rolled back", null);
     await m.ack(tx, id, first.id);
-    await m.markDelivered(tx, first.id, 1234);
+    await m.deliver(tx, [id], [first.id], 1234);
     expect(await m.retract(tx, peer, second.id, { actor: null, session: null })).toBe("retracted");
     throw new Error("rolled back");
   })).rejects.toThrow("rolled back");

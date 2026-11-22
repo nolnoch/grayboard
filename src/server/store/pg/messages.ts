@@ -169,8 +169,20 @@ export function makePgMessages({ clock, attachmentLimits }: { clock: () => numbe
         SELECT ${reader}, m.id, ${clock()} FROM messages m WHERE m.id = ${id} FOR KEY SHARE OF m
         ON CONFLICT DO NOTHING`;
     },
-    async markDelivered(tx, id, at) {
-      await pgOf(tx)`UPDATE messages SET delivered_at = ${at} WHERE id = ${id} AND delivered_at IS NULL`;
+    async deliver(tx, recipients, ids, at) {
+      if (!ids.length || !recipients.length) return new Map();
+      const sql = pgOf(tx);
+      const mine = await sql`SELECT id, recipient, delivered_at FROM messages
+        WHERE id = ANY(${ids}::int8[]) AND recipient_type = 'user' AND recipient = ANY(${recipients}::text[])`;
+      const unstamped = mine.filter((m: Row) => m.delivered_at === null).map((m: Row) => int8(m.id));
+      // The rows a stamp writes, locked by id first (prune's order), as the old per-id UPDATEs in id order were;
+      // FOR NO KEY UPDATE is the UPDATE's own lock, so an end's FOR KEY SHARE (unreadFor) doesn't wait on it.
+      if (at !== null && unstamped.length) await sql`UPDATE messages SET delivered_at = ${at}
+        WHERE id IN (SELECT id FROM messages WHERE id = ANY(${unstamped}::int8[]) AND delivered_at IS NULL ORDER BY id FOR NO KEY UPDATE)
+          AND delivered_at IS NULL`;
+      const last = new Map<string, number>();
+      for (const m of mine) last.set(m.recipient as string, Math.max(last.get(m.recipient as string) ?? 0, int8(m.id)));
+      return last;
     },
     async retract(tx, sender, id, by): Promise<RetractResult> {
       const sql = pgOf(tx);
