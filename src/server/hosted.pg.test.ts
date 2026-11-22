@@ -30,6 +30,8 @@ import { issueOAuth } from "../../tests/helpers/oauth.ts";
 import { hostedPause } from "../../tests/support/hosted-pause.ts";
 import { isTx, type Tx } from "./store/tx_base.ts";
 import { pgOf } from "./store/pg/tx.ts";
+import { insertClaimEvent } from "./store/pg/claims.ts";
+import { accessAudits } from "../../tests/support/audit.ts";
 
 // Above the pool's 5 s lock_timeout (pg/tx.ts), so a broken lock fails on its own error, not on Bun's timeout.
 setDefaultTimeout(30_000);
@@ -2145,6 +2147,22 @@ function holdPosts(x: LeaseInstance, at: "insert" | "outbox" = "insert") {
 }
 const subscribe = (x: LeaseInstance, handle: string, board: string, mode: "push" | "digest" | "off" = "push") =>
   seed(x.repo, tx => x.repo.boards.setSubscription(tx, handle, board, mode));
+// Service `svc`'s queue board `name` (scope `service:<svc>`, as a service's session creates it); `grant`: ME's user
+// holds service_invoke on svc.
+async function serviceBoard(sql: Awaited<ReturnType<typeof pgDatabase>>["sql"], name: string, svc = "svc", grant = true) {
+  await sql`INSERT INTO principals (kind, name, created_at) VALUES ('service', ${svc}, 0) ON CONFLICT DO NOTHING`;
+  await sql`INSERT INTO boards (name, purpose, scope, kind, created_by, created_at) VALUES (${name}, 'service', ${`service:${svc}`}, 'queue', ${`${ME}/s1`}, 0)`;
+  if (grant) {
+    await sql`INSERT INTO role_bindings (principal_id, role, scope_id, granted_by, granted_at)
+      SELECT h.id, 'service_invoke', s.id, NULL, 0 FROM principals h, principals s
+      WHERE h.kind = 'user' AND h.name = ${ME} AND s.kind = 'service' AND s.name = ${svc} ON CONFLICT DO NOTHING`;
+  }
+}
+const claimRows = async (sql: Awaited<ReturnType<typeof pgDatabase>>["sql"]) =>
+  (await sql`SELECT key, holder FROM claims ORDER BY key`).map((r: { key: string; holder: string }) => ({ key: r.key, holder: r.holder }));
+const claimEvents = async (sql: Awaited<ReturnType<typeof pgDatabase>>["sql"], notes = false) =>
+  (await sql`SELECT key, handle, event, note FROM claim_events ORDER BY id`).map((r: { key: string; handle: string; event: string; note: string | null }) =>
+    ({ key: r.key, handle: r.handle, event: r.event, ...(notes ? { note: r.note } : {}) }));
 
 describePg("keyed board_post (Postgres)", () => {
   // Two posts on one board (from different roots) run one at a time on its key; a post on another board enters beside
@@ -2343,32 +2361,33 @@ describePg("keyed board_post (Postgres)", () => {
     expect((await db.sql`SELECT board FROM posts`).map((r: { board: string }) => r.board)).toEqual(["b1"]);
   });
 
-  // A queue board's post planned keyed anyway (the plan stubbed) misses in the body, before the insert, and the
-  // exclusive body posts and rotates it; so does the lane's reply, which acks its claim (a thread post, not the queue
-  // branch, but a claim_events write all the same). Mutation: handleBoardPost's queue check dropped (claim_events'
-  // refuseKeyed fails the call as a fault), or narrowed to the queue branch (the reply fails).
-  test("a queue board's post and its lane's reply miss in the body, and the exclusive body rotates and acks", async () => {
+  // A queue board's top-level post and its lane's reply run keyed on the board (#1594): the post rotates (the lane's
+  // claim and its take event), the reply acks (the claim deleted, a release noted "ack"). Mutations: postPlan's queue
+  // exit restored (skipped, not keyed); handleBoardPost's queue miss restored (a miss); insertClaimEvent refusing every
+  // keyed body (the post fails as a fault).
+  test("a queue board's post and its lane's reply run keyed: the post rotates to the lane, the reply acks", async () => {
     await using db = await pgDatabase({ max: 2 });
     await using x = await leaseInstance(db.url);
     const p = await leasePrincipal(x, db.sql);
     await bound(x, p, "root-s1", "s1"); await bound(x, p, "root-l", "lane");
     await boardTool(x, p, "root-s1", "board_create", { name: "q1", purpose: "queue", kind: "queue" });
     await boardTool(x, p, "root-l", "board_subscribe", { board: "q1", mode: "push" });
-    expect(await x.application.postPlan((await x.application.attachHuman(p.authed, { deliver() {}, closed() {} })).session, { board: "q1", body: "x" })).toBeUndefined();
-    x.application.postPlan = async () => ({ board: "q1" });
     const d = toolDelta();
     const job = postId(await post(x, p, "root-s1", { board: "q1", body: "job" }));
-    expect(d()).toEqual({ keyed: 0, miss: 1, skipped: 0 });
-    const events = async () => (await db.sql`SELECT count(*)::int AS n FROM claim_events`)[0].n;
-    expect(await events()).toBe(1);
+    expect(d()).toEqual({ keyed: 1, miss: 0, skipped: 0 });
+    expect(await claimRows(db.sql)).toEqual([{ key: `queue:q1:${job}`, holder: `${ME}/lane` }]);
+    expect(await claimEvents(db.sql)).toEqual([{ key: `queue:q1:${job}`, handle: `${ME}/lane`, event: "take" }]);
     await post(x, p, "root-l", { board: "q1", body: "done", parent_id: job });
-    expect(d()).toEqual({ keyed: 0, miss: 2, skipped: 0 });
-    expect(await events()).toBeGreaterThan(1);
+    expect(d()).toEqual({ keyed: 2, miss: 0, skipped: 0 });
+    expect(await claimRows(db.sql)).toEqual([]);
+    expect((await claimEvents(db.sql, true)).at(-1)).toEqual({ key: `queue:q1:${job}`, handle: `${ME}/lane`, event: "release", note: "ack" });
   });
 
-  // The plan leaves each exclusive case out: a Slack-bridge human's session, files, `attachments`, an `@id:` mention, a
-  // queue board (a reply there too: a lane's reply acks its claim), a service's board, a human address, a missing board. Mutations: each of postPlan's checks dropped
-  // (that case plans a board).
+  // The plan leaves each exclusive case out: a Slack-bridge human's session, files, `attachments`, an `@id:` mention,
+  // an invocation the pool denies, a human address, a missing board. A queue board's post and reply plan their board,
+  // and so does an allowed invocation (#1594). Mutations: each of postPlan's checks dropped (that case plans a board).
+  // postPlan's deny exit is a backstop this can't isolate: a principal the invocation denies can't see the board either
+  // (readableBoard refuses it as missing, so the plan is undefined without the exit), and the body misses on a deny.
   test("postPlan has no plan for the exclusive cases", async () => {
     await using db = await pgDatabase({ max: 2 });
     await using x = await leaseInstance(db.url);
@@ -2376,7 +2395,8 @@ describePg("keyed board_post (Postgres)", () => {
     await bound(x, p, "root-s1", "s1"); await bound(x, p, "root-h", "hum");
     await boardTool(x, p, "root-s1", "board_create", { name: "b1", purpose: "one" });
     await boardTool(x, p, "root-s1", "board_create", { name: "q1", purpose: "queue", kind: "queue" });
-    await db.sql`INSERT INTO boards (name, purpose, scope, created_by, created_at) VALUES ('svc-b', 'service', 'service:svc', ${`${ME}/s1`}, 0)`;
+    await serviceBoard(db.sql, "svc-ok", "svc-ok");
+    await serviceBoard(db.sql, "svc-b", "svc", false);
     await db.sql`UPDATE aliases SET human = true WHERE name = 'hum'`;
     const { session: human } = await x.application.attachHuman(p.authed, { deliver() {}, closed() {} });
     const agent = new AppSession(x.application, x.repo, p.authed, "s1", { push: false });
@@ -2387,16 +2407,182 @@ describePg("keyed board_post (Postgres)", () => {
       const plan = (args: Record<string, unknown>, s = agent.session) => x.application.postPlan(s, args);
       expect(await plan({ board: "b1", body: "ok @s1" })).toEqual({ board: "b1" });
       expect(await plan({ board: "b1", body: "ok", attachment_ids: [] })).toEqual({ board: "b1" });
+      expect(await plan({ board: "q1", body: "job" })).toEqual({ board: "q1" });
+      expect(await plan({ board: "q1", body: "done", parent_id: 1 })).toEqual({ board: "q1" });
+      expect(await plan({ board: "svc-ok", body: "invoke" })).toEqual({ board: "svc-ok" });
       expect(await plan({ board: "b1", body: "ok" }, human)).toBeUndefined();
+      expect(await plan({ board: "q1", body: "job" }, human)).toBeUndefined();
       expect(await plan({ board: "b1", body: "files", attachment_ids: [1] })).toBeUndefined();
       expect(await plan({ board: "b1", body: "files", attachments: [] })).toBeUndefined();
       expect(await plan({ board: "b1", body: `hi @${agent.id}` })).toBeUndefined();
-      expect(await plan({ board: "q1", body: "job" })).toBeUndefined();
-      expect(await plan({ board: "q1", body: "done", parent_id: 1 })).toBeUndefined();
       expect(await plan({ board: "svc-b", body: "invoke" })).toBeUndefined();
       expect(await plan({ board: "b1", body: "as a human" }, hum.session)).toBeUndefined();
       expect(await plan({ board: "nowhere", body: "missing" })).toBeUndefined();
     } finally { agent.close(); hum.close(); }
+  });
+
+  // The lane order reads live presence inside the keyed body (#1594, D4: a synchronous registry read, only a
+  // preference): of two lanes never woken, `la` sorts first by name but holds no lease, `lb` is live, and the keyed
+  // post goes to lb. Mutations: `ctx.online` left throwing on a queue board (a miss, not keyed); `online` passed as
+  // undefined (la gets it).
+  test("a keyed queue post's lane order prefers a live lane", async () => {
+    await using db = await pgDatabase({ max: 2 });
+    await using x = await leaseInstance(db.url);
+    const p = await leasePrincipal(x, db.sql);
+    await bound(x, p, "root-s1", "s1"); await bound(x, p, "root-a", "la");
+    const lb = await leased(x, p, "root-b", "lb");
+    await boardTool(x, p, "root-s1", "board_create", { name: "q1", purpose: "queue", kind: "queue" });
+    await boardTool(x, p, "root-a", "board_subscribe", { board: "q1", mode: "push" });
+    await boardTool(x, p, "root-b", "board_subscribe", { board: "q1", mode: "push" });
+    expect(lb.lease).toBeDefined();
+    const d = toolDelta();
+    const job = postId(await post(x, p, "root-s1", { board: "q1", body: "job" }));
+    expect(d()).toEqual({ keyed: 1, miss: 0, skipped: 0 });
+    expect(await claimRows(db.sql)).toEqual([{ key: `queue:q1:${job}`, holder: `${ME}/lb` }]);
+  });
+
+  // Two posts on one queue board serialize on its key and rotate: the second waits for the first's commit and sees its
+  // take, so the two go to different lanes; a post on another queue board enters beside them. Mutation: the board key
+  // made per post (hosted.ts boardPost's keys, with refuseKeyed's key check relaxed to the board: prefix so the store
+  // lets it through): the second post enters beside the first.
+  test("two posts on one queue board run one at a time and rotate; a post on another queue board overlaps them", async () => {
+    await using db = await pgDatabase({ max: 2 });
+    await using x = await leaseInstance(db.url);
+    const p = await leasePrincipal(x, db.sql);
+    for (const [s, n] of [["root-s1", "s1"], ["root-s2", "s2"], ["root-s3", "s3"], ["root-a", "la"], ["root-b", "lb"]]) await bound(x, p, s!, n!);
+    await boardTool(x, p, "root-s1", "board_create", { name: "q1", purpose: "queue", kind: "queue" });
+    await boardTool(x, p, "root-s1", "board_create", { name: "q2", purpose: "queue", kind: "queue" });
+    await boardTool(x, p, "root-a", "board_subscribe", { board: "q1", mode: "push" });
+    await boardTool(x, p, "root-b", "board_subscribe", { board: "q1", mode: "push" });
+    const posts = holdPosts(x);
+    const d = toolDelta();
+    posts.hold = gate(); x.state.defer = gate();
+    const first = post(x, p, "root-s1", { board: "q1", body: "one" });
+    await until(() => posts.held === 1, 10_000, "s1's post on q1 held after its insert");
+    const second = post(x, p, "root-s2", { board: "q1", body: "two" });
+    try {
+      await until(() => callWaiting(x) === 1 || posts.held > 1, 10_000, "s2's post on q1 queued");
+      expect(posts.held).toBe(1);
+      const other = post(x, p, "root-s3", { board: "q2", body: "three" });
+      await until(() => posts.held === 2, 10_000, "s3's post on q2 entered beside s1's on q1");
+      posts.hold.open();
+      await Promise.all([first, second, other]);
+    } finally { posts.hold.open(); x.state.defer?.open(); }
+    expect(posts.entered).toEqual([`${ME}/s1 > #q1`, `${ME}/s3 > #q2`, `${ME}/s2 > #q1`]);
+    const held = await db.sql`SELECT p.body, c.holder FROM claims c JOIN posts p ON c.key = 'queue:q1:' || p.id ORDER BY p.id`;
+    expect(held.map((r: { body: string; holder: string }) => [r.body, r.holder])).toEqual([["one", `${ME}/la`], ["two", `${ME}/lb`]]);
+    expect(d()).toEqual({ keyed: 3, miss: 0, skipped: 0 });
+  });
+
+  // An invocation the pool allowed but whose binding is revoked before the body (principle 11: the body decides it
+  // again on its own transaction) misses with nothing written, and the exclusive body refuses it as a missing board,
+  // writing the deny's row and charging the deny limiter once. Twenty such calls (the first planned for real, the
+  // rest stubbed to plan anyway) write twenty deny rows, under the limiter's burst of 30 only if each charges once.
+  // Mutations: the keyed body recording the deny before it misses (a charge per attempt: the limiter stops the rows at
+  // 15); the miss turned into a plain Error (the call fails as a fault).
+  test("an invocation revoked between plan and body misses, and the exclusive body refuses it with one deny row", async () => {
+    await using db = await pgDatabase({ max: 2 });
+    await using x = await leaseInstance(db.url);
+    const p = await leasePrincipal(x, db.sql);
+    await bound(x, p, "root-s1", "s1");
+    await serviceBoard(db.sql, "svc-b");
+    const plan = x.application.postPlan;
+    let planned = 0;
+    x.application.postPlan = async (...a) => {
+      const out = await plan(...a);
+      if (out) { planned++; await db.sql`DELETE FROM role_bindings WHERE role = 'service_invoke'`; }
+      return out ?? { board: "svc-b" };
+    };
+    const d = toolDelta();
+    for (let i = 0; i < 20; i++) await expect(post(x, p, "root-s1", { board: "svc-b", body: `invoke ${i}` })).rejects.toThrow("no such board #svc-b; see board_list");
+    expect(planned).toBe(1);
+    expect(d()).toEqual({ keyed: 0, miss: 20, skipped: 0 });
+    const rows = (await accessAudits(x.repo, "authz.decision")).filter(r => r.detail.verb === "service.invoke");
+    expect(rows).toHaveLength(20);
+    expect(rows.every(r => r.detail.allow === false && r.target === "service:svc")).toBe(true);
+    expect((await db.sql`SELECT count(*)::int AS n FROM posts`)[0].n).toBe(0);
+  });
+
+  // An allowed invocation runs keyed and records one allow row naming its post. A miss forced after that row (the
+  // hosted.write audit, the keyed body's last write) rolls it back with the post, and the exclusive retry writes it
+  // once: two posts, two allow rows, each naming its own. Mutation: the allow recorded outside the body's transaction
+  // (on repo.read: the post guard refuses it inside a body, failing the call; without that guard the missed attempt's
+  // row would survive, three rows).
+  test("an allowed invocation runs keyed with one allow row naming its post, and a miss after it writes the row once", async () => {
+    await using db = await pgDatabase({ max: 2 });
+    await using x = await leaseInstance(db.url);
+    const p = await leasePrincipal(x, db.sql);
+    await bound(x, p, "root-s1", "s1");
+    await serviceBoard(db.sql, "svc-b");
+    const d = toolDelta();
+    const first = postId(await post(x, p, "root-s1", { board: "svc-b", body: "invoke" }));
+    expect(d()).toEqual({ keyed: 1, miss: 0, skipped: 0 });
+    const write = x.repo.audit.write;
+    let armed = true;
+    x.repo.audit.write = ((tx: Tx, row: Parameters<typeof write>[1]) => {
+      if (armed && keyedTx(tx) && row.action === "hosted.write") { armed = false; throw new KeyedSendMiss("forced after the decision row"); }
+      return write(tx, row);
+    }) as typeof write;
+    const second = postId(await post(x, p, "root-s1", { board: "svc-b", body: "again" }));
+    expect(armed).toBe(false);
+    expect(d()).toEqual({ keyed: 1, miss: 1, skipped: 0 });
+    const rows = (await accessAudits(x.repo, "authz.decision")).filter(r => r.detail.verb === "service.invoke");
+    expect(rows.map(r => [r.detail.allow, r.detail.post_id])).toEqual([[true, first], [true, second]]);
+    expect((await db.sql`SELECT count(*)::int AS n FROM posts`)[0].n).toBe(2);
+  });
+
+  // The store's backstop (D4): a claim_events insert in a keyed body needs the board key its claim key names, not its
+  // row's `board`; a non-queue key refuses every keyed body; claimQueuePost and claims.ackQueue check the same before
+  // their first statement. Mutations: insertClaimEvent's needs taken from `c.board` (the mismatched row passes under
+  // board:q2); either backstop dropped (claimQueuePost answers false for the missing post, ackQueue deletes nothing,
+  // and neither throws).
+  test("a keyed claim_events insert, rotation or ack needs the board key of its queue claim's key", async () => {
+    await using db = await pgDatabase({ max: 2 });
+    await using x = await leaseInstance(db.url);
+    const event = (key: string, board: string) => (tx: Tx) => insertClaimEvent(tx, "take", `${ME}/lane`, { key, board }, x.clock);
+    await expect(x.repo.writeKeyedPost!(["root:a", "board:q2"], event("queue:q1:1", "q2"))).rejects.toThrow("without the key board:q1");
+    await expect(x.repo.writeKeyedPost!(["root:a", "board:q1"], event("ticket:ENG-142", "q1"))).rejects.toThrow("claim_events insert");
+    await expect(x.repo.writeKeyedPost!(["root:a", "board:q1"], event("queue:q1", "q1"))).rejects.toThrow("claim_events insert");
+    await expect(x.repo.writeKeyedPost!(["root:a", "board:q2"], tx => x.repo.boards.claimQueuePost(tx, "q1", 1, `${ME}/lane`, x.clock, { note: "n", push: true }))).rejects.toThrow("without the key board:q1");
+    await expect(x.repo.writeKeyedPost!(["root:a", "board:q2"], tx => x.repo.claims.ackQueue(tx, [`${ME}/lane`], "queue:q1:1", x.clock))).rejects.toThrow("without the key board:q1");
+    expect(await claimEvents(db.sql)).toEqual([]);
+    await x.repo.writeKeyedPost!(["root:a", "board:q1"], event("queue:q1:1", "q2"));
+    expect(await claimEvents(db.sql)).toEqual([{ key: "queue:q1:1", handle: `${ME}/lane`, event: "take" }]);
+  });
+
+  // Statements pinned for a rotated queue post (one push lane, after a warm post: 34 statements in 31 round trips) and
+  // for an allowed invocation on a service's queue board with no service lane (31 in 27), keyed and with keyed tool
+  // bodies off: keying adds and removes none. A later cut changes them on purpose.
+  test("a rotated queue post and an invocation run keyed with the exclusive body's statement counts", async () => {
+    const measure = async (opts: { keyedTools?: false }) => {
+      await using db = await pgDatabase({ max: 2 });
+      await using x = await leaseInstance(db.url, opts);
+      const p = await leasePrincipal(x, db.sql);
+      await bound(x, p, "root-s1", "s1"); await bound(x, p, "root-l", "lane");
+      await boardTool(x, p, "root-s1", "board_create", { name: "q1", purpose: "queue", kind: "queue" });
+      await boardTool(x, p, "root-l", "board_subscribe", { board: "q1", mode: "push" });
+      await serviceBoard(db.sql, "svc-b");
+      await post(x, p, "root-s1", { board: "q1", body: "warm" });
+      const one = async (args: Record<string, unknown>) => {
+        const at = statementTotals("tool"), d = toolDelta();
+        await post(x, p, "root-s1", args);
+        const now = statementTotals("tool");
+        return { counts: d(), bodies: now.bodies - at.bodies, statements: now.statements - at.statements, roundTrips: now.roundTrips - at.roundTrips };
+      };
+      const rotated = await one({ board: "q1", body: "job" });
+      const invoked = await one({ board: "svc-b", body: "invoke" });
+      expect((await claimRows(db.sql)).map((r: { holder: string }) => r.holder)).toEqual([`${ME}/lane`, `${ME}/lane`]);
+      return { rotated, invoked };
+    };
+    const keyed = await measure({}), ref = await measure({ keyedTools: false });
+    const shape = (m: { counts: unknown; bodies: number; statements: number; roundTrips: number }) => ({ bodies: m.bodies, statements: m.statements, roundTrips: m.roundTrips });
+    expect(keyed.rotated.counts).toEqual({ keyed: 1, miss: 0, skipped: 0 });
+    expect(keyed.invoked.counts).toEqual({ keyed: 1, miss: 0, skipped: 0 });
+    expect(ref.rotated.counts).toEqual({ keyed: 0, miss: 0, skipped: 1 });
+    expect(shape(keyed.rotated)).toEqual(shape(ref.rotated));
+    expect(shape(keyed.invoked)).toEqual(shape(ref.invoked));
+    expect(shape(keyed.rotated)).toEqual({ bodies: 1, statements: 34, roundTrips: 31 });
+    expect(shape(keyed.invoked)).toEqual({ bodies: 1, statements: 31, roundTrips: 27 });
   });
 
   // The enforcement (D4): a keyed body without the board's key refuses boards.insertPost before any statement;
@@ -2446,11 +2632,11 @@ describePg("keyed board_post (Postgres)", () => {
 
 describePg("keyed board_post rows (Postgres)", () => {
   // One script on two databases, keyed tool bodies on and off: keyed posts (plain, a replay, a resend, a reply, a
-  // mention), skips (a queue board's post, an `@id:` mention, files, a missing board, a service's board whose deny the
-  // exclusive body records once, a human address) and misses (an archived board's refusal; a disabled user, whose
+  // mention, a queue board's post and its lane's ack, an allowed invocation, #1594), skips (an `@id:` mention, files, a
+  // missing board, a service's board whose deny the exclusive body records once, a human address) and misses (an archived board's refusal; a disabled user, whose
   // session the exclusive body terminates). Every row matches, post ids included (no keyed attempt allocated one).
   // Mutations: runTool's miss path skipping the exclusive body (the refusals and rows differ); the keyed attempt's
-  // refusal rows flushed as well as the exclusive body's.
+  // refusal rows flushed as well as the exclusive body's; a keyed ack skipping its release event (claim_events differ).
   test("keyed posts and miss-then-exclusive write the same rows as the exclusive bodies alone", async () => {
     const script = async (x: LeaseInstance, sql: Awaited<ReturnType<typeof pgDatabase>>["sql"]) => {
       const p = await leasePrincipal(x, sql);
@@ -2462,6 +2648,7 @@ describePg("keyed board_post rows (Postgres)", () => {
       await boardTool(x, p, "root-r1", "board_subscribe", { board: "q1", mode: "push" });
       await boardTool(x, p, "root-s1", "board_archive", { board: "b2" });
       await sql`INSERT INTO boards (name, purpose, scope, created_by, created_at) VALUES ('svc-b', 'service', 'service:svc', ${`${ME}/s1`}, 0)`;
+      await serviceBoard(sql, "svc-ok", "svc-ok");
       await sql`UPDATE aliases SET human = true WHERE name = 'hum'`;
       const d = toolDelta();
       const outcome = (q: Promise<unknown>) => q.then(r => JSON.stringify(r), (e: { code?: string; message?: string }) => `refused ${e.code}: ${e.message}`)
@@ -2475,6 +2662,9 @@ describePg("keyed board_post rows (Postgres)", () => {
       await step(post(x, p, "root-s2", { board: "b1", body: "a reply", parent_id: parent }));
       await step(post(x, p, "root-s2", { board: "b1", body: "look @r1" }));
       await step(post(x, p, "root-s1", { board: "q1", body: "job" }));
+      const job = Number((await sql`SELECT id FROM posts WHERE board = 'q1'`)[0].id);
+      await step(post(x, p, "root-r1", { board: "q1", body: "done", parent_id: job }));
+      await step(post(x, p, "root-s1", { board: "svc-ok", body: "invoke allowed" }));
       await step(post(x, p, "root-s1", { board: "b1", body: `hi @${idOf(p, "root-r1")}` }));
       await step(post(x, p, "root-s1", { board: "b1", body: "with files", attachment_ids: [999] }));
       await step(post(x, p, "root-s1", { board: "nowhere", body: "missing" }));
@@ -2489,7 +2679,7 @@ describePg("keyed board_post rows (Postgres)", () => {
     };
     const dump = async (sql: Awaited<ReturnType<typeof pgDatabase>>["sql"]) => {
       const out: Record<string, string[]> = {};
-      for (const [table, drop] of [["posts", []], ["outbox", []], ["subscriptions", []], ["claim_events", ["id"]], ["write_receipts", ["at"]], ["access_log", ["id"]], ["hosted_sessions", []], ["boards", []], ["alias_holds", ["bound_at"]]] as const) {
+      for (const [table, drop] of [["posts", []], ["outbox", []], ["subscriptions", []], ["claims", []], ["claim_events", ["id"]], ["write_receipts", ["at"]], ["access_log", ["id"]], ["hosted_sessions", []], ["boards", []], ["alias_holds", ["bound_at"]]] as const) {
         const rows: Array<Record<string, unknown>> = await sql.unsafe(`SELECT * FROM ${table}`);
         out[table] = rows.map(r => JSON.stringify(Object.fromEntries(Object.entries(r).filter(([k]) => !(drop as readonly string[]).includes(k)).sort(([a], [b]) => a < b ? -1 : 1)), (_k, v) => typeof v === "bigint" ? String(v) : v)
           .replace(/\d{4}-\d\d-\d\dT[\d:.]+Z/g, "<time>").replace(/-?\d+[smhd] ago/g, "<ago>")).sort();
@@ -2502,14 +2692,15 @@ describePg("keyed board_post rows (Postgres)", () => {
     { await using x = await leaseInstance(fastDb.url, { side: "fast" }); fast = await script(x, fastDb.sql); fastRows = await dump(fastDb.sql); }
     { await using x = await leaseInstance(refDb.url, { side: "ref", keyedTools: false }); ref = await script(x, refDb.sql); refRows = await dump(refDb.sql); }
     expect(fast.out).toEqual(ref.out);
-    expect(fast.counts).toEqual({ keyed: 5, miss: 2, skipped: 6 });
-    expect(ref.counts).toEqual({ keyed: 0, miss: 0, skipped: 13 });
+    expect(fast.counts).toEqual({ keyed: 8, miss: 2, skipped: 5 });
+    expect(ref.counts).toEqual({ keyed: 0, miss: 0, skipped: 15 });
     expect(fast.out.at(-1)).toMatch(/^refused/);
     expect(fast.out.at(-2)).toMatch(/^refused/);
     expect(fastRows).toEqual(refRows);
-    expect(fastRows.access_log!.filter(r => r.includes('"authz.decision"'))).toHaveLength(1);
+    expect(fastRows.access_log!.filter(r => r.includes('"authz.decision"'))).toHaveLength(2);
     expect(fastRows.access_log!.filter(r => r.includes('"request.replayed"'))).toHaveLength(1);
-    expect(fastRows.claim_events).toHaveLength(1);
+    expect(fastRows.claim_events).toHaveLength(2);
+    expect(fastRows.claims).toEqual([]);
   });
 });
 

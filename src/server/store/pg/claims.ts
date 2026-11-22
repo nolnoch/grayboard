@@ -37,14 +37,24 @@ const rowCols = (sql: PgSql) => sql.fragment`key, holder, note, board, acquired_
 // core expireClaims' order: lapse order, by key within a tie (JS string order, as core sorts).
 const lapseOrder = (a: ClaimRow, b: ClaimRow) => a.expires_at - b.expires_at || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0);
 
+// The board key (`board:<board>`) a keyed body needs to write queue claim `queue:<board>:<post id>`'s rows, or undefined
+// for any other key (refuseKeyed then refuses every keyed body). redeliveryFacts' parse (pg/boards.ts).
+export function queueBoardKey(key: string): string | undefined {
+  const m = /^queue:([^:]+):(\d+)$/.exec(key);
+  return m ? `board:${m[1]}` : undefined;
+}
+
 // One claim_events row on the caller's handle (core logEvent); pg/boards.ts's claimQueuePost writes its take event
 // through it too. session_id: core logEvent's rule (#1351), the alias's holder, else the handle when it is a session
-// ID, else null. Refused in a keyed body (#1510, D4): recentEvents reads claim_events newest by id, so their ids must
-// commit in allocation order, which only exclusive bodies give.
+// ID, else null. recentEvents reads one key's claim_events newest by id, so a key's ids must commit in allocation
+// order (#1510, D4): a keyed body may write one only for a queue key `queue:<board>:<post id>` while it holds
+// `board:<board>` (board_post's keyed body, #1594), which every writer of that board's queue keys either holds or is
+// exclusive; any other key refuses in a keyed body. The needed key comes from the key, which is what recentEvents
+// orders by, not from `c.board`.
 export async function insertClaimEvent(
   tx: Tx, event: ClaimEvent, handle: string, c: Partial<Claim> & { key: string }, at: number, heldBy?: string,
 ): Promise<void> {
-  refuseKeyed(tx, "claim_events insert");
+  refuseKeyed(tx, "claim_events insert", queueBoardKey(c.key));
   const sql = pgOf(tx);
   await sql`INSERT INTO claim_events (key, handle, event, note, board, expires_at, held_by, at, session_id)
     VALUES (${c.key}, ${handle}, ${event}, ${c.note ?? null}, ${c.board ?? null}, ${c.expires_at ?? null}::int8, ${heldBy ?? null}, ${at},
@@ -131,6 +141,8 @@ export function makePgClaims({ clock }: { clock: () => number }): ClaimsStore {
     // core ackQueueClaim with its read and its delete made one statement: the row is deleted only while one of
     // `addresses` holds it, lapsed or not, so a takeover committed while this waited leaves the new holder's claim.
     async ackQueue(tx, addresses, key, now) {
+      // A keyed body acks only under its board's key (#1594; insertClaimEvent's rule, checked before the delete).
+      refuseKeyed(tx, "claims.ackQueue", queueBoardKey(key));
       const sql = pgOf(tx);
       const [row] = await sql`DELETE FROM claims WHERE key = ${key} AND holder = ANY(${addresses}::text[]) RETURNING ${rowCols(sql)}`;
       if (!row) return false;

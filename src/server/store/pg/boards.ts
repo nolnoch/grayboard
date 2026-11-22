@@ -31,7 +31,9 @@
 //   Accepted (PS D4): two posts picking the same lane, a subscribe's tip missing an uncommitted post, and ids that
 //   commit out of order behind a reader's cursor; the write queue rules them out until Stage 4 (#808): posts are
 //   exclusive bodies or keyed ones holding `board:<name>` (insertPost refuses a keyed body without it), so a board's
-//   ids commit in allocation order, and a subscriber's cursor is per board.
+//   ids commit in allocation order, and a subscriber's cursor is per board. A queue board's rotation and ack
+//   (claimQueuePost, claims ackQueue, their claim_events rows) refuse a keyed body without the same key (#1594), so two
+//   posts on one queue board pick their lanes one at a time, the second seeing the first's take.
 // - A Read is the autocommit pool: each statement is its own snapshot. So a read whose parts must agree is one
 //   statement (§7 Q10): pendingDigests joins each digest's latest post where core reads it after with getPost(...)!,
 //   which a prune committing between the two would turn into a crash; threadFacts reads root, authors, the parent's
@@ -64,7 +66,7 @@ import type { Read } from "../tx_base.ts";
 import { bindLocked, dropAttachments, lockUnsent, withAttachments } from "./attachment_rows.ts";
 import { foreignKeyViolation } from "./errors.ts";
 import { int8, int8OrNull } from "./sql.ts";
-import { insertClaimEvent } from "./claims.ts";
+import { insertClaimEvent, queueBoardKey } from "./claims.ts";
 import { pgOf, refuseKeyed, type PgFragment, type PgSql } from "./tx.ts";
 
 type Row = Record<string, unknown>;
@@ -551,6 +553,8 @@ export function makePgBoards({ clock }: { clock: () => number }): BoardsStore {
     // (written or reset, undelivered and waking) only when the lane holds the key after it, in a later statement that
     // sees a winner's committed row.
     async claimQueuePost(tx, board, postId, lane, now, { note, push }) {
+      // A keyed body rotates only under the board's key (#1594; insertClaimEvent's rule, checked before any statement).
+      refuseKeyed(tx, "boards.claimQueuePost", queueBoardKey(`queue:${board}:${postId}`));
       const sql = pgOf(tx);
       if ((await sql`SELECT 1 FROM posts WHERE id = ${postId} FOR KEY SHARE`).length === 0) return false;
       const key = `queue:${board}:${postId}`;

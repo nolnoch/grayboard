@@ -11,7 +11,8 @@ import type { DeliveryEvent } from "../../src/server/application.ts";
 import { AppSession } from "../support/app_session.ts";
 import { accessAudits } from "../support/audit.ts";
 import { HostedSession, HostedToolError, type InboxItem } from "../support/hosted_session.ts";
-import { TestServer, testSqlite } from "../support/server.ts";
+import { TEST_BACKEND, TestServer, testSqlite } from "../support/server.ts";
+import { gateCount } from "../../src/server/metrics.ts";
 import { serverAccess } from "../support/sync_access.ts";
 import { row, rows as sqlRows } from "../support/repo_sql.ts";
 
@@ -142,7 +143,10 @@ describe("Tests item 4: the pilot gate", () => {
     const { w1, bindings } = await cast();
     const bob = await srv.hosted(B, "fe");
     sessions.push(bob);
+    const keyed = gateCount("tool", "keyed", "board_post");
     const p = await post(bob, "jobs", "job 1");
+    // On Postgres the invocation and the lane's reply below run keyed on the board (#1594); SQLite has no keyed body.
+    expect(gateCount("tool", "keyed", "board_post") - keyed).toBe(TEST_BACKEND === "pg" ? 1 : 0);
     expect(await holderOf("jobs", p.post_id)).toBe(`${SVC}/w-1`);
     const item = await w1.next(push("job 1"));
     expect(item.actionable).toBe(true);
@@ -153,6 +157,7 @@ describe("Tests item 4: the pilot gate", () => {
     }) })]);
     // The reply acks it and wakes bob, granted.
     await post(w1, "jobs", "done 1", { parent_id: p.post_id });
+    expect(gateCount("tool", "keyed", "board_post") - keyed).toBe(TEST_BACKEND === "pg" ? 2 : 0);
     expect(await holderOf("jobs", p.post_id)).toBeUndefined();
     const reply = await bob.next(push("done 1"));
     expect(reply.actionable).toBe(true);
