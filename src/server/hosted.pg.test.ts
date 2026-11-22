@@ -3287,6 +3287,27 @@ describePg("keyed read tools (Postgres)", () => {
     resources.close();
   });
 
+  // A board's snapshot resource (mcp-resources.ts resources/read, hosted.readResource) runs keyed under board_read's
+  // gate: its session check and snapshot read write nothing, so the subscriber's read point stays where it was.
+  // Mutation: readResource's pure flag dropped (the read runs exclusive, counted skipped).
+  test("a board's snapshot resource runs keyed", async () => {
+    await using db = await pgDatabase({ max: 2 });
+    await using x = await leaseInstance(db.url);
+    const p = await leasePrincipal(x, db.sql);
+    for (const [s, n] of [["root-s1", "s1"], ["root-rd", "rd"]]) await bound(x, p, s!, n!);
+    await callOf(x, p, "root-s1", "board_create", { name: "b1", purpose: "snapshot" });
+    await callOf(x, p, "root-rd", "board_subscribe", { board: "b1", mode: "push" });
+    await callOf(x, p, "root-s1", "board_post", { board: "b1", body: "one" });
+    const resources = createResources(x.application, { isCurrent: () => true, isAuthorized: () => true });
+    const at = { keyed: gateCount("tool", "keyed", "board_read"), miss: gateCount("tool", "miss", "board_read"), skipped: gateCount("tool", "skipped", "board_read") };
+    const snap = await x.hosted.readResource(p, ctx(p, "root-rd"), (session, tx) => resources.read(tx, session, "grayboard://boards/b1"));
+    expect(snap.posts.map(q => q.body)).toEqual(["one"]);
+    expect({ keyed: gateCount("tool", "keyed", "board_read") - at.keyed, miss: gateCount("tool", "miss", "board_read") - at.miss, skipped: gateCount("tool", "skipped", "board_read") - at.skipped })
+      .toEqual({ keyed: 1, miss: 0, skipped: 0 });
+    expect(Number((await db.sql`SELECT cursor FROM subscriptions WHERE board = 'b1' AND handle = ${`${ME}/rd`}`)[0].cursor)).toBe(0);
+    resources.close();
+  });
+
   // A keyed claim_list re-arms the claim expiry timer after its body, as the exclusive body's afterCommit does: a claim
   // whose expiry moved under the timer (another process, here SQL) lapses on time. Mutation: armClaims' call dropped.
   test("a keyed claim_list re-arms the claim expiry timer", async () => {
