@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { openDatabase } from "./db.ts";
 import { createOAuthServer } from "./oauth.ts";
 import { createMcpAttachments } from "./mcp-attachments.ts";
+import { S3StoreError } from "./s3_blobs.ts";
 import { queueFor } from "./store/queue.ts";
 import { UploadGate } from "./uploads.ts";
 import { createApplication } from "./application.ts";
@@ -365,11 +366,11 @@ test("a storage fault's 500 logs exactly one diagnostic line without its message
   });
   const put = store.repo.blobs.put;
   try {
-    store.repo.blobs.put = async () => { throw new Error("S3 put on s3://bucket/p/: secret InternalError"); };
+    store.repo.blobs.put = async () => { throw new S3StoreError("S3 put on s3://bucket/p/: InternalError: secret", "InternalError"); };
     const response = await send();
     expect(response.status).toBe(500);
     expect(await response.text()).not.toContain("InternalError");
-    expect(lines).toEqual(['[grayboard] {"operation":"attachments.upload","category":"failure","level":"error","class":"Error"}']);
+    expect(lines).toEqual(['[grayboard] {"operation":"attachments.upload","category":"failure","level":"error","class":"S3StoreError","code":"InternalError"}']);
     lines.length = 0;
     store.repo.blobs.put = put;
     const id = await uploaded();

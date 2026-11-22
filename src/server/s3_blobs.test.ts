@@ -11,7 +11,8 @@ import type { Config } from "./config.ts";
 import { openDatabase } from "./db.ts";
 import { startServer } from "./app.ts";
 import { openBlobs, openRepo } from "./open_repo.ts";
-import { CHECK_KEY, S3Blobs } from "./s3_blobs.ts";
+import { CHECK_KEY, S3Blobs, S3StoreError } from "./s3_blobs.ts";
+import { errorDiagnostic } from "./diagnostics.ts";
 import { startFakeS3, type FakeS3 } from "../../tests/support/fake_s3.ts";
 import { startFakeSts, type FakeSts } from "../../tests/support/fake_sts.ts";
 import { scratchDbPath } from "../../tests/support/scratch_db.ts";
@@ -80,8 +81,13 @@ test("only NoSuchKey is BlobMissing: a 403 (a role without s3:ListBucket answers
   const err = await blobs.get(sha).then(() => null, (e: unknown) => e);
   expect(err).not.toBeInstanceOf(BlobMissing);
   expect((err as Error).message).toBe(`S3 get on s3://${s3.bucket}/: AccessDenied: Access Denied`);
+  // #1608: the code is data, for the hosted diagnostic line.
+  expect(err).toBeInstanceOf(S3StoreError);
+  expect((err as S3StoreError).code).toBe("AccessDenied");
   s3.fail({ method: "GET", status: 500, code: "InternalError" });
-  expect(await blobs.get(sha).then(() => null, (e: unknown) => e)).not.toBeInstanceOf(BlobMissing);
+  const internal = await blobs.get(sha).then(() => null, (e: unknown) => e);
+  expect(internal).not.toBeInstanceOf(BlobMissing);
+  expect(errorDiagnostic(internal)).toEqual({ class: "S3StoreError", code: "InternalError" });
 });
 
 test("keys the store didn't send never reach S3: the fake refuses them, and the error carries no secret", async () => {
