@@ -27,7 +27,9 @@
 // --out), exits 1 on any miss and 2 when the run itself broke.
 //
 // Pilot gate (#1537, `--gate pilot`; the default `--gate latency` is the bar above): "doesn't fall over, with headroom" at
-// a realistic database round trip, run as `--sessions 300 --period 6 --pg … --pg-latency 0.25` at W = 8. Every check
+// a realistic database round trip, run as `--sessions 300 --period 6 --pg … --pg-latency 0.25 --env GRAYBOARD_DATABASE_WRITERS=16`, at W = 16, the
+// writer count the pilot runs (it fails at the default W = 8, #1537; the server's env drops an exported GRAYBOARD_*,
+// so W goes through --env). Every check
 // above stays, except that each "≥ 99% at ≤ 100 ms" (per window, per tool, all tools pooled, each client op) becomes
 // p99 ≤ 1 s on the same histogram (≥ 99% at or under the 1 s bucket edge), and the steady world stop must be ≤ 70%. The
 // lapsed-leases item also fails on any lease the drivers saw lapse outside churn and close (a lease op answering

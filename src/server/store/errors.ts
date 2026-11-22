@@ -1,5 +1,5 @@
 // Store refusals shared by the SQLite store (db.ts) and the Postgres store (store/pg/), so the Postgres store never
-// imports db.ts, which imports bun:sqlite and goes at P5 (#807).
+// imports db.ts, which imports bun:sqlite and goes when the SQLite server store is deleted (#808).
 import { CoreError, notAPostText } from "../../core/errors.ts";
 
 // A revoke that would leave a team with members and no owner, or a service with no owner at all (#270 D1: every
