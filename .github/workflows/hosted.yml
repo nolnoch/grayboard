@@ -66,7 +66,9 @@ jobs:
           name: ${{ matrix.suite }}-${{ github.run_id }}-${{ github.run_attempt }}${{ inputs.rep && format('-{0}', inputs.rep) || '' }}
           # A hosted suite's evidence only (never its fixture HOME or auth
           # store); claude-hosted's and rust-sdk's whole run dir, as e2e.yml
-          # uploads it (rust-sdk's token is seeded in-process, never written).
+          # uploads it (rust-sdk's service credential and run token reach the
+          # example only through its env and are never written to the run dir;
+          # the token is minted via client_credentials since #929).
           path: |
             ${{ runner.temp }}/hosted-run/evidence
             ${{ !startsWith(matrix.suite, 'hosted-') && format('{0}/hosted-run', runner.temp) || '' }}
