@@ -3,7 +3,7 @@ import pkg from "../../package.json" with { type: "json" };
 import { describeBlobs, describeReauth, describeStore, loadConfig } from "./config.ts";
 import { pgTlsMode } from "./store/pg/sql.ts";
 import { startServer } from "./app.ts";
-import { openRepo } from "./open_repo.ts";
+import { DatabaseOpenError, openRepo } from "./open_repo.ts";
 import { BUILTIN_CLIENT_IDS } from "./oauth-config.ts";
 
 // Before loadConfig, which refuses to run without the server's env.
@@ -18,7 +18,10 @@ let repo;
 try {
   repo = await openRepo(config);
 } catch (e) {
-  console.error(`grayboard server: startup failed: opening ${describeStore(config.store)}: ${(e as Error).stack ?? e}`);
+  // Only the database half names the store (#1609): an attachment store's or STS's refusal names itself.
+  const where = e instanceof DatabaseOpenError ? `opening ${describeStore(config.store)}: ` : "";
+  const cause = e instanceof DatabaseOpenError ? e.cause : e;
+  console.error(`grayboard server: startup failed: ${where}${(cause as Error)?.stack ?? cause}`);
   process.exit(1);
 }
 const { server, stop, metrics, ready } = startServer(config, { repo });
