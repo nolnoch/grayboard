@@ -732,7 +732,7 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
   // `r`: the Tx of the body the check runs in (hosted's in-body checks, #998), read uncached; else the pool.
   type Found = { access: OAuthAccess; email: string; kind: AuthedUser["kind"] };
   // On the pool, a token and user both held under one generation answer from the caches alone (#1627), as the same
-  // authRead would on a hit, without its async task and pin; anything less reads in full. In a body (`r` given) never.
+  // authRead would on a hit, without its async task and pin; anything less reads in full. Never for `r` a body's Tx (#998); the peek is undefined in one anyway.
   function activeAccess(accessHash: string, r: Read = repo.read): Promise<Found | undefined> {
     if (r === repo.read) {
       const hit = peekFound(accessHash);
