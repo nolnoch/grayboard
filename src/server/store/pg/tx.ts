@@ -359,13 +359,16 @@ export interface PgSql {
 
 const isTemplate = (v: unknown): v is TemplateStringsArray => Array.isArray(v) && Object.hasOwn(v, "raw");
 
-// A statement's text for the probe: its literal pieces, with each `sql.fragment` value's own text (fragmentText) in
-// its place; any other value is a gap.
-const fragmentText = new WeakMap<object, string>();
-const statementText = (strings: readonly string[], values: readonly unknown[]) =>
+// A statement's text for the probe: its literal pieces, with each `sql.fragment` value's own text in its place; any
+// other value is a gap. Built only when something reads it (#1627): a probe's check, or a memo's staleness test. Built
+// on every statement, it was 3% of the event loop at #912's load, and a per-site cache cost more (Object.isFrozen).
+// A fragment keeps its pieces, so its text too is built only when a statement holding it is judged.
+const fragmentParts = new WeakMap<object, { strings: readonly string[]; values: readonly unknown[] }>();
+const statementText = (strings: readonly string[], values: readonly unknown[]): string =>
   strings.map((piece, i) => {
-    const v = values[i];
-    return i < values.length ? `${piece} ${typeof v === "object" && v !== null ? fragmentText.get(v) ?? "" : ""} ` : piece;
+    if (i >= values.length) return piece;
+    const f = typeof values[i] === "object" && values[i] !== null ? fragmentParts.get(values[i] as object) : undefined;
+    return `${piece} ${f ? statementText(f.strings, f.values) : ""} `;
   }).join("");
 
 // Bun nests a fragment by its Query class; its own `then` stops it being sent alone (Bun would run it as a statement).
@@ -373,20 +376,28 @@ function fragment(q: SQL.Query<unknown>): PgFragment {
   return Object.defineProperty(q, "then", { value() { throw new Error("a PgSql fragment awaited: it goes inside a statement (pgOf)"); } }) as unknown as PgFragment;
 }
 
-// `check` gets the statement's text (a template's literal pieces), before it's sent. `txn`: a body's transaction, whose
-// statements are counted (counted); none for the read pool.
-function statements(conn: SQL, check: (text: string) => void, txn?: Txn): PgSql {
+// `check` gets the statement's text (a template's literal pieces) as a thunk, before it's sent: it builds the text only
+// if it needs it. `txn`: a body's transaction, whose statements are counted (counted); none for the read pool.
+function statements(conn: SQL, check: (text: () => string) => void, txn?: Txn): PgSql {
   const send = <Q extends PromiseLike<unknown>>(q: Q): Q => txn ? counted(txn, q) : q;
-  if (txn) { const inner = check; check = text => { inner(text); if (txn.memo?.size && stale(text)) forget(txn); }; }
+  if (txn) {
+    const inner = check;
+    check = text => {
+      let built: string | undefined;
+      const once = () => built ??= text();
+      inner(once);
+      if (txn.memo?.size && stale(once())) forget(txn);
+    };
+  }
   const sql = ((first: unknown, ...rest: unknown[]) => {
-    if (isTemplate(first)) { check(statementText(first, rest)); return send(conn(first, ...rest).execute()); }
+    if (isTemplate(first)) { check(() => statementText(first, rest)); return send(conn(first, ...rest).execute()); }
     if (typeof first === "string") return fragment(conn(first));
     return (conn as unknown as (...a: unknown[]) => unknown)(first, ...rest);
   }) as PgSql;
-  sql.unsafe = (text, values) => { check(text); return send(conn.unsafe(text, values).execute()); };
+  sql.unsafe = (text, values) => { check(() => text); return send(conn.unsafe(text, values).execute()); };
   sql.fragment = (strings, ...values) => {
     const f = fragment(conn(strings, ...values));
-    fragmentText.set(f, statementText(strings, values));
+    fragmentParts.set(f, { strings, values });
     return f;
   };
   return sql;
@@ -398,7 +409,7 @@ function statements(conn: SQL, check: (text: string) => void, txn?: Txn): PgSql 
 // per body (openOf): another body's open transaction doesn't refuse this caller's read. Checked here and again as each
 // statement is sent. The refusals read as SQLite's. A Tx's statement in a readsOnly probe is checked too (probeCheck).
 export function pgOf(r: Read): PgSql {
-  if (r instanceof PgTx) { r.assertLive(); return statements(r.txn.conn, text => { r.assertLive(); probeCheck(r.txn, text); }, r.txn); }
+  if (r instanceof PgTx) { r.assertLive(); return statements(r.txn.conn, text => { r.assertLive(); if (r.txn.probe) probeCheck(r.txn, text()); }, r.txn); }
   if (!(r instanceof PgRead)) throw new Error("not a Postgres store handle");
   const { store } = r;
   const check = () => { if (openOf(store)) throw new Error(READ_REFUSAL); };

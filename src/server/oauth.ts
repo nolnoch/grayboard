@@ -731,8 +731,22 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
   // authGeneration (#853), so the hot path skips the token-grant-user join, and share one read of it (#881).
   // `r`: the Tx of the body the check runs in (hosted's in-body checks, #998), read uncached; else the pool.
   type Found = { access: OAuthAccess; email: string; kind: AuthedUser["kind"] };
+  // On the pool, a token and user both held under one generation answer from the caches alone (#1627), as the same
+  // authRead would on a hit, without its async task and pin; anything less reads in full. Never for `r` a body's Tx (#998); the peek is undefined in one anyway.
   function activeAccess(accessHash: string, r: Read = repo.read): Promise<Found | undefined> {
+    if (r === repo.read) {
+      const hit = peekFound(accessHash);
+      if (hit) return Promise.resolve(hit);
+    }
     return repo.authRead(async () => withUser(r, await repo.oauth.findActiveAccess(r, accessHash, resource, [], now())));
+  }
+  function peekFound(accessHash: string): Found | undefined {
+    let peek: AuthPeek | undefined;
+    try { peek = repo.authPeek(); } catch { return undefined; }
+    const access = peek?.access(accessHash, resource, now());
+    if (!peek || !access) return undefined;
+    const u = peek.user(access.userId);
+    return u && u.disabled_at === null ? { access, email: u.email, kind: u.kind } : undefined;
   }
   async function withUser(r: Read, access: OAuthAccess | undefined): Promise<Found | undefined> {
     if (!access) return undefined;

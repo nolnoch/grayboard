@@ -268,7 +268,8 @@ export interface Repo {
   // body (#881): one authorization's token and user reads share it, across its awaits (#807 P3 A7c). Inside the
   // caller's own transaction, nested, or with no generation to read, it's plain fn().
   authRead<T>(fn: () => T | Promise<T>): Promise<T>;
-  // The auth cache's hits, synchronously, for the stream timer's phase A (#807 P3 A7d): a live access token by hash,
+  // The auth cache's hits, synchronously, for the stream timer's phase A (#807 P3 A7d) and a pooled request's
+  // authentication (oauth.ts activeAccess, #1627): a live access token by hash,
   // and a user by id (#807 P3 A7u2), as the caches hold them under the current generation, else undefined (a miss:
   // the caller reads in full, async).
   // Only live tokens are cached, so a miss is never a refusal. Undefined itself when there's no generation to key on

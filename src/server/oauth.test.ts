@@ -1481,6 +1481,37 @@ test("#881: one authorization reads the auth generation once, and a write betwee
   } finally { counting.close(); counted.db.close(); }
 });
 
+// #1627: on the pool, a token and user both held under one generation answer authenticate from the caches alone: no
+// authRead body, no store read. A miss of either, a body's check (`r` given), or a commit since reads in full.
+test("#1627: a pooled authenticate whose token and user are cached runs no authRead and reads nothing; anything less reads in full", async () => {
+  const { token } = await issueOAuth(storage.repo, service.resource, "fast@example.com", ["grayboard:tools"], clock, "native");
+  const bearer = () => new Request(base + "/mcp", { headers: { Authorization: `Bearer ${token}` } });
+  const repo = storage.repo, authRead = repo.authRead, find = repo.oauth.findActiveAccess, active = repo.users.active;
+  let bodies = 0, reads = 0;
+  repo.authRead = fn => (bodies++, authRead(fn));
+  repo.oauth.findActiveAccess = (...args) => (reads++, find(...args));
+  repo.users.active = (...args) => (reads++, active(...args));
+  try {
+    const p = await service.authenticate(bearer());
+    if (p instanceof Response) throw new Error(`authenticate refused: ${p.status}`);
+    expect([bodies, reads]).toEqual([1, 2]); // cold: the full path fills both caches
+    for (let i = 0; i < 5; i++) expect(await service.authenticate(bearer())).toEqual(p);
+    expect([bodies, reads]).toEqual([1, 2]); // warm: answered from the caches
+    // A body's check never takes the fast path (#998): activeAccess skips it for a given `r`, and authPeek is undefined
+    // inside the caller's own transaction anyway.
+    await repo.write(async tx => { expect(await service.authenticate(bearer(), ["grayboard:tools"], tx)).toEqual(p); });
+    expect(bodies).toBe(2);
+    // A commit moves the generation: the next check reads in full and refuses the disabled user.
+    await seed(repo, tx => repo.users.setDisabled(tx, p.authed.user_id, true));
+    const refused = await service.authenticate(bearer());
+    expect(refused instanceof Response && refused.status).toBe(401);
+    expect(bodies).toBe(3);
+    // Held under the current generation as disabled: still the full path, which refuses again.
+    expect(((await service.authenticate(bearer())) as Response).status).toBe(401);
+    expect(bodies).toBe(4);
+  } finally { repo.authRead = authRead; repo.oauth.findActiveAccess = find; repo.users.active = active; }
+});
+
 // ── #928 step 3: CLI login through the AS (docs/server-oauth.md §2, CLI login) ──────────────────────────────────
 
 // An authorize URL as `grayboard login` builds it: grayboard-cli's login scope and no resource (open question 4).
