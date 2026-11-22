@@ -257,6 +257,7 @@ jobs:
             src/server/store/pg/identity.contract.pg.test.ts
             src/server/store/pg/identity.pg.test.ts
             src/server/store/pg/isolation.test.ts
+            src/server/store/pg/memo.pg.test.ts
             src/server/store/pg/messages.contract.pg.test.ts
             src/server/store/pg/messages.pg.test.ts
             src/server/store/pg/migrate.test.ts

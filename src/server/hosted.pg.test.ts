@@ -2580,8 +2580,9 @@ describePg("keyed board_post (Postgres)", () => {
   });
 
   // Statements pinned for a rotated queue post (one push lane, after a warm post: 34 statements in 31 round trips) and
-  // for an allowed invocation on a service's queue board with no service lane (31 in 27), keyed and with keyed tool
-  // bodies off: keying adds and removes none. A later cut changes them on purpose.
+  // for an allowed invocation on a service's queue board with no service lane (31 in 27), with keyed tool bodies off.
+  // Keyed, the identity memo (#1618) answers the repeated identity reads: 30 in 27 and 26 in 22. A later cut changes them on
+  // purpose. Mutation: no memo (the counts equal again).
   test("a rotated queue post and an invocation run keyed with the exclusive body's statement counts", async () => {
     const measure = async (opts: { keyedTools?: false }) => {
       await using db = await pgDatabase({ max: 2 });
@@ -2608,10 +2609,8 @@ describePg("keyed board_post (Postgres)", () => {
     expect(keyed.rotated.counts).toEqual({ keyed: 1, miss: 0, skipped: 0 });
     expect(keyed.invoked.counts).toEqual({ keyed: 1, miss: 0, skipped: 0 });
     expect(ref.rotated.counts).toEqual({ keyed: 0, miss: 0, skipped: 1 });
-    expect(shape(keyed.rotated)).toEqual(shape(ref.rotated));
-    expect(shape(keyed.invoked)).toEqual(shape(ref.invoked));
-    expect(shape(keyed.rotated)).toEqual({ bodies: 1, statements: 34, roundTrips: 31 });
-    expect(shape(keyed.invoked)).toEqual({ bodies: 1, statements: 31, roundTrips: 27 });
+    expect({ rotated: shape(ref.rotated), invoked: shape(ref.invoked) }).toEqual({ rotated: { bodies: 1, statements: 34, roundTrips: 31 }, invoked: { bodies: 1, statements: 31, roundTrips: 27 } });
+    expect({ rotated: shape(keyed.rotated), invoked: shape(keyed.invoked) }).toEqual({ rotated: { bodies: 1, statements: 30, roundTrips: 27 }, invoked: { bodies: 1, statements: 26, roundTrips: 22 } });
   });
 
   // The enforcement (D4): a keyed body without the board's key refuses boards.insertPost before any statement;
@@ -2637,8 +2636,8 @@ describePg("keyed board_post (Postgres)", () => {
 
   // A normal exchange: the selection's verdict, then board_post reusing it (withPrior), keyed in its tool body. The
   // body's statements are pinned so a later cut changes them on purpose: a top-level post with one push subscriber
-  // besides its author (isAuthorized stubbed), 31 statements in 28 round trips, the exclusive body's count for the same
-  // post (measured with keyedTools off): keying adds and removes none.
+  // besides its author (isAuthorized stubbed), 26 statements in 23 round trips: the exclusive body's count for the same
+  // post (measured with keyedTools off) less the identity reads the keyed body's memo answers (#1618).
   test("board_post in a normal exchange runs keyed, counted by method, with a pinned statement count", async () => {
     await using db = await pgDatabase({ max: 2 });
     await using x = await leaseInstance(db.url);
@@ -2655,7 +2654,7 @@ describePg("keyed board_post (Postgres)", () => {
     expect(d()).toEqual({ keyed: 1, miss: 0, skipped: 0 });
     expect(gateCount("tool", "keyed", "board_post") - method).toBe(1);
     expect(gateCount("prior", "keyed", "tool") - prior).toBe(1);
-    expect({ bodies: now.bodies - at.bodies, statements: now.statements - at.statements, roundTrips: now.roundTrips - at.roundTrips }).toEqual({ bodies: 1, statements: 31, roundTrips: 28 });
+    expect({ bodies: now.bodies - at.bodies, statements: now.statements - at.statements, roundTrips: now.roundTrips - at.roundTrips }).toEqual({ bodies: 1, statements: 26, roundTrips: 23 });
   });
 });
 
@@ -2959,8 +2958,9 @@ describePg("keyed queue receipt (#1595) (Postgres)", () => {
     expect(ran).toBe(2);
   });
 
-  // A keyed receipt of one queue push sends the exclusive body's statements (16 in 16 round trips: the probe's reads are
-  // the exclusive body's, and a held board needs no kind read), pinned; a second receipt on the same board reads no
+  // A keyed receipt of one queue push sends the exclusive body's statements less the two its identity memo answers
+  // (#1618): 14 in 14 round trips against 16 (the probe's reads are the exclusive body's, and a held board needs no kind
+  // read), pinned; a second receipt on the same board reads no
   // board from the pool (the kind cache). Mutations: the kind cache dropped (a pool read per
   // receipt); a statement added per ref in the probe (the count moves).
   test("a keyed queue receipt's statements are pinned, and a board's kind is read from the pool once", async () => {
@@ -2988,7 +2988,7 @@ describePg("keyed queue receipt (#1595) (Postgres)", () => {
     expect([keyed.first.counts, keyed.second.counts]).toEqual([{ keyed: 1, miss: 0, skipped: 0 }, { keyed: 1, miss: 0, skipped: 0 }]);
     expect([keyed.first.poolReads, keyed.second.poolReads, ref.first.poolReads, ref.second.poolReads]).toEqual([1, 0, 0, 0]);
     const shape = (m: { bodies: number; statements: number; roundTrips: number }) => ({ bodies: m.bodies, statements: m.statements, roundTrips: m.roundTrips });
-    expect({ keyed: shape(keyed.second), ref: shape(ref.second) }).toEqual({ keyed: { bodies: 1, statements: 16, roundTrips: 16 }, ref: { bodies: 1, statements: 16, roundTrips: 16 } });
+    expect({ keyed: shape(keyed.second), ref: shape(ref.second) }).toEqual({ keyed: { bodies: 1, statements: 14, roundTrips: 14 }, ref: { bodies: 1, statements: 16, roundTrips: 16 } });
   });
 });
 

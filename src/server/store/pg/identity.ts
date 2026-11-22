@@ -36,7 +36,7 @@ import { principalTaken, SERVICE_NAME_CONSTRAINTS, uniqueViolation } from "./err
 import type { PgHostedEnds } from "./hosted_port.ts";
 import { endSignIns } from "./oauth.ts";
 import { int8, int8OrNull } from "./sql.ts";
-import { pgOf, type PgFragment, type PgSql } from "./tx.ts";
+import { memoized, pgOf, type PgFragment, type PgSql } from "./tx.ts";
 
 // pg_advisory_xact_lock's key for every role-binding write (#807 P3 C3 decision 1). One key serializes role writes
 // server-wide, which their rate allows; keyed by org if that ever runs hot. Advisory keys are per database.
@@ -207,14 +207,15 @@ export function makePgIdentity({ now, hosted }: { now: () => number; hosted: PgH
     });
 
   // Whether two users share a team, of one of these policies when given.
-  const sharePolicy = async (r: Read, userA: number, userB: number, policies?: readonly TeamPolicy[]): Promise<boolean> => {
-    const sql = pgOf(r);
-    const rows = await sql`SELECT 1 FROM team_members a
-      JOIN team_members b ON b.team_id = a.team_id AND b.user_id = ${userB}
-      ${policies ? sql.fragment`JOIN teams t ON t.id = a.team_id AND t.policy = ANY(${policies})` : sql.fragment``}
-      WHERE a.user_id = ${userA} LIMIT 1`;
-    return rows.length > 0;
-  };
+  // Memoized in a keyed body (tx.ts memoized, #1618).
+  const sharePolicy = (r: Read, userA: number, userB: number, policies?: readonly TeamPolicy[]): Promise<boolean> =>
+    memoized(r, `share ${userA} ${userB} ${policies?.join(",") ?? "*"}`, async sql => {
+      const rows = await sql`SELECT 1 FROM team_members a
+        JOIN team_members b ON b.team_id = a.team_id AND b.user_id = ${userB}
+        ${policies ? sql.fragment`JOIN teams t ON t.id = a.team_id AND t.policy = ANY(${policies})` : sql.fragment``}
+        WHERE a.user_id = ${userA} LIMIT 1`;
+      return rows.length > 0;
+    });
 
   return {
     users: {
@@ -239,8 +240,9 @@ export function makePgIdentity({ now, hosted }: { now: () => number; hosted: PgH
       async stampIdpChecked(tx, userId) {
         await pgOf(tx)`UPDATE users SET idp_checked_at = ${now()} WHERE id = ${userId}`;
       },
-      findByEmail: (r, email) => userByEmail(pgOf(r), email),
-      findById: (r, userId) => userById(pgOf(r), userId),
+      // Memoized in a keyed body (tx.ts memoized, #1618): a user answers both its keys.
+      findByEmail: (r, email) => memoized(r, `user@${email}`, sql => userByEmail(sql, email), u => u ? [`user#${u.id}`] : []),
+      findById: (r, userId) => memoized(r, `user#${userId}`, sql => userById(sql, userId), u => u ? [`user@${u.email}`] : []),
       lockById: (tx, userId) => first(pgOf(tx)`${userFrom(pgOf(tx))} WHERE u.id = ${userId} FOR UPDATE OF u`, toUser),
       // The UPDATE is the users row's lock: it waits for a mint holding FOR SHARE, and a mint after it waits, then finds
       // the user disabled. Re-enabling revives nothing the disable revoked.
@@ -292,7 +294,7 @@ export function makePgIdentity({ now, hosted }: { now: () => number; hosted: PgH
     },
 
     principals: {
-      findByName: (r, name) => principalByName(pgOf(r), name),
+      findByName: (r, name) => memoized(r, `principal ${name}`, sql => principalByName(sql, name)),
       // db.ts principalOf.
       async of(r, address): Promise<Principal | null> {
         const sql = pgOf(r);
@@ -301,7 +303,7 @@ export function makePgIdentity({ now, hosted }: { now: () => number; hosted: PgH
         const name = p.kind === "id"
           ? (await first(sql`SELECT principal FROM ids WHERE id = ${p.address}`, row => strOrNull(row.principal)))
           : p.kind === "alias" ? p.scope : p.name;
-        const row = name ? await principalByName(sql, name) : undefined;
+        const row = name ? await memoized(r, `principal ${name}`, q => principalByName(q, name)) : undefined;
         // team:x names a team, never a service; a person scope (an email) is only a user's.
         if (!row || (p.kind === "team" && row.kind !== "team")) return null;
         if (p.kind === "alias" && (p.scopeKind === "person") !== (row.kind === "user")) return null;
