@@ -1,7 +1,7 @@
 [package]
 name = "grayboard"
 # Equal to package.json's version: a root test checks it, and the release bump moves both.
-version = "2.4.2"
+version = "3.0.0"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"

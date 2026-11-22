@@ -363,7 +363,7 @@ Each user's first sign-in ties their grayboard account to that provider's accoun
 
 ## Hosted MCP over HTTP
 
-Use a server built from this source checkout for the hosted endpoint; the release installer above does not establish that a downloaded binary includes it. On the target platform, `bun install` then `bun run build` produces `dist/grayboard-server` and `dist/grayboard`; install those binaries in the service's configured locations, or use the source-mode service described in [step 2](#2-install-the-server).
+The release's `grayboard-server` serves the hosted endpoint, so a server the installer above set up has it: `curl <server url>/.well-known/oauth-protected-resource/mcp` answers with its metadata. To run your own build instead, `bun install` then `bun run build` on the target platform produces `dist/grayboard-server` and `dist/grayboard`; install those in the service's configured locations, or use the source-mode service described in [step 2](#2-install-the-server).
 
 **Google.** The Web application client from [Configure](#3-configure) serves hosted MCP too. Set `GRAYBOARD_PUBLIC_URL` to your canonical HTTPS issuer, such as `https://grayboard.example.com`, and configure the reverse proxy to serve any path prefix it carries.
 
