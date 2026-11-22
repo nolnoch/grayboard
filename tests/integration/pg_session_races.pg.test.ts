@@ -20,6 +20,7 @@ import { describePg } from "../support/pg.ts";
 import { blockedOrSettled, committed, gate, holdCall, outcome, raceRequest, settle, type Settled } from "../support/pg_race.ts";
 import { pgServers } from "../support/pg_server.ts";
 import type { TestServer } from "../support/server.ts";
+import { NO_MEMBER_AUTHORITY } from "../../src/server/store/identity.ts";
 
 // Above the pool's 5 s lock_timeout (pg/tx.ts), so a wait a broken lock leaves fails 55P03 or 40P01, not on Bun's timeout.
 setDefaultTimeout(30_000);
@@ -138,8 +139,8 @@ describePg("writes_as against bind through the server (Postgres, C10a Q4)", () =
     const [aw, ab] = [await authedOf(w.srv, tw), await authedOf(w.srv, tb)];
     await w.repo.write(async tx => {
       const t = await w.repo.teams.create(tx, "ops", aw.user_id);
-      await w.repo.teams.addMember(tx, t.id, aw.user_id);
-      await w.repo.teams.addMember(tx, t.id, ab.user_id);
+      await w.repo.teams.addMember(tx, t.id, aw.user_id, NO_MEMBER_AUTHORITY);
+      await w.repo.teams.addMember(tx, t.id, ab.user_id, NO_MEMBER_AUTHORITY);
     });
     await w.sql`INSERT INTO aliases (address, scope_kind, scope_ref, name, created_at, last_seen) VALUES (${LEAD}, 'team', 'ops', 'lead', 0, 0)`;
     return { tw, tb, aw, ab };

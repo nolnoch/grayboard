@@ -17,6 +17,7 @@ import { scratchDbPath } from "../../tests/support/scratch_db.ts";
 import { seed, seedSync } from "../../tests/support/seed.ts";
 import { grantOwner } from "../../tests/support/roles.ts";
 import { authorizeNow as oracle } from "../../tests/support/sync_access.ts";
+import { NO_MEMBER_AUTHORITY } from "./store/identity.ts";
 
 type Fixture = { repo: Repo; db: CoreDb; a: User; b: User; c: User; d: User; svc: User; eng: Team; ops: Team; x: Team; id: string };
 
@@ -35,17 +36,17 @@ async function fixture(): Promise<Fixture> {
       await repo.users.upsertByEmail(tx, "d@example.com", null),
     ];
     const eng = await repo.teams.create(tx, "eng", a.id);
-    await repo.teams.addMember(tx, eng.id, a.id);
+    await repo.teams.addMember(tx, eng.id, a.id, NO_MEMBER_AUTHORITY);
     await grantOwner(repo, tx, "eng", "a@example.com");
-    await repo.teams.addMember(tx, eng.id, b.id);
+    await repo.teams.addMember(tx, eng.id, b.id, NO_MEMBER_AUTHORITY);
     await repo.teams.setPolicy(tx, eng.id, "collaborative");
     const ops = await repo.teams.create(tx, "ops", a.id);
-    await repo.teams.addMember(tx, ops.id, a.id);
+    await repo.teams.addMember(tx, ops.id, a.id, NO_MEMBER_AUTHORITY);
     await grantOwner(repo, tx, "ops", "a@example.com");
-    await repo.teams.addMember(tx, ops.id, c.id);
+    await repo.teams.addMember(tx, ops.id, c.id, NO_MEMBER_AUTHORITY);
     await repo.teams.setPolicy(tx, ops.id, "delegating");
     const x = await repo.teams.create(tx, "x", d.id);
-    await repo.teams.addMember(tx, x.id, d.id);
+    await repo.teams.addMember(tx, x.id, d.id, NO_MEMBER_AUTHORITY);
     await grantOwner(repo, tx, "x", "d@example.com");
     await repo.aliases.create(tx, { scope_kind: "person", scope_ref: "a@example.com", name: "x" }, "a@example.com");
     await repo.aliases.create(tx, { scope_kind: "team", scope_ref: "eng", name: "bot" }, "a@example.com");
@@ -256,13 +257,13 @@ describe("policy drivers agree", () => {
   test("the oracle and authorize see a body's own uncommitted write, and neither its rollback", async () => {
     const req: AuthzRequest = { verb: "delegate.to", from_user: "b@example.com", to_user: "c@example.com" };
     const inside = await f.repo.write(async tx => {
-      await f.repo.teams.addMember(tx, f.ops.id, f.b.id);
+      await f.repo.teams.addMember(tx, f.ops.id, f.b.id, NO_MEMBER_AUTHORITY);
       return [oracle(f.repo, f.db, {}, req), await authorize(f.repo, tx, {}, req)];
     });
     expect(inside.map(d => d.allow)).toEqual([true, true]);
 
     const rolledBack = f.repo.write(async tx => {
-      await f.repo.teams.removeMember(tx, f.ops.id, f.b.id);
+      await f.repo.teams.removeMember(tx, f.ops.id, f.b.id, NO_MEMBER_AUTHORITY);
       expect([oracle(f.repo, f.db, {}, req).allow, (await authorize(f.repo, tx, {}, req)).allow]).toEqual([false, false]);
       throw new Error("roll back");
     });

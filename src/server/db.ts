@@ -47,10 +47,10 @@ import type { WriteReceipt, WriteReceiptsStore } from "./store/write_receipts.ts
 import { AUDIT_WRITE_ON_READ, type AccessLogRow, type AuditStore } from "./store/audit.ts";
 import type { SlackLink, SlackProgress, SlackStore, SlackThread } from "./store/slack.ts";
 import { jsonTextSafe, textSafeOrNull } from "./store/json_safe.ts";
-import { DEV_SESSION_LABEL, TEAM_POLICIES, type User, type IdpSignIn, type Session, type PrincipalRow, type Team, type TeamPolicy, type TeamMember, type RoleBinding, type InvokeBinding, type RoleAuthority, type RoleRevoke, type MemberAuthority, type MemberRemoval, type ServiceRow, type UsersStore, type SessionsStore, type PrincipalsStore, type TeamsStore, type RolesStore, type ServicesStore } from "./store/identity.ts";
+import { DEV_SESSION_LABEL, TEAM_POLICIES, type User, type IdpSignIn, type Session, type PrincipalRow, type Team, type TeamPolicy, type TeamMember, type RoleBinding, type InvokeBinding, type RoleAuthority, type RoleRevoke, type MemberAuthority, type ServiceRow, type UsersStore, type SessionsStore, type PrincipalsStore, type TeamsStore, type RolesStore, type ServicesStore } from "./store/identity.ts";
 // The identity groups' row types and interfaces live in store/identity.ts for the Postgres store (#807 P3 C3a);
 // re-exported for every importer.
-export { DEV_SESSION_LABEL, TEAM_POLICIES } from "./store/identity.ts";
+export { DEV_SESSION_LABEL, NO_MEMBER_AUTHORITY, TEAM_POLICIES } from "./store/identity.ts";
 export type { User, IdpSignIn, Session, PrincipalRow, Team, TeamPolicy, TeamRole, TeamMember, RoleBinding, InvokeBinding, RoleAuthority, RoleGrant, RoleRevoke, MemberAuthority, MemberRemoval, RoleFilter, ServiceRow, UsersStore, SessionsStore, PrincipalsStore, TeamsStore, RolesStore, ServicesStore, JsonValue, AuditFields, IdentityGroups } from "./store/identity.ts";
 // The aliases and messages groups' row types and interfaces live in store/aliases.ts and store/messages.ts (#807 P3 C5a).
 export type { Alias, AliasTarget, AliasesStore, AliasScopeRow } from "./store/aliases.ts";
@@ -1002,7 +1002,6 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
     const auth = teamAuthority(by, teamId);
     return !!db.query<{ ok: number }, (number | null)[]>(`SELECT ${auth.sql} AS ok`).get(...auth.args)!.ok;
   };
-  const NO_AUTHORITY: MemberRemoval = { byUser: null, authority: "none", actor: null };
   const bindingDetail = (b: RoleBinding) => ({
     binding: b.id, role: b.role, principal: b.principal, principal_id: b.principal_id, scope: b.scope, scope_id: b.scope_id,
     granted_by: b.granted_by, granter: b.granter, granted_at: b.granted_at,
@@ -1510,7 +1509,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       async listForUser(r, userId) { return teamsOf(sqliteOf(r), userId); },
       // Conditional on the actor's authority in its own statement, as roles.grant is; zero rows is an existing member
       // or the authority gone, and a second read says which. SQLite's single writer serializes both with any revoke.
-      async addMember(tx, teamId, userId, by = NO_AUTHORITY) {
+      async addMember(tx, teamId, userId, by) {
         const db = sqliteOf(tx);
         const auth = teamAuthority(by, teamId);
         const added = db.run(
@@ -1522,7 +1521,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       },
       // The authority is read once, before any write: the revoke below may delete the very binding it rests on (an
       // owner removing themselves), so a re-check after it would refuse what the decision allowed.
-      async removeMember(tx, teamId, userId, by = NO_AUTHORITY) {
+      async removeMember(tx, teamId, userId, by) {
         const db = sqliteOf(tx);
         return db.transaction(() => {
           if (!authorityHolds(db, by, teamId)) throw new AuthorityLost();

@@ -56,11 +56,13 @@ export type InvokeBinding = { id: number; team: string | null };
 // team_owner binding on the binding's scope or an org_admin binding.
 export type RoleAuthority = "none" | "org_admin" | "owner_or_admin";
 // Who changes a team's membership and the authority the write re-checks, as a grant's `byUser` and `authority`
-// (owner_or_admin: their team_owner binding on the team, or org_admin). Omitted, "none": a team's creator joining it,
-// a member leaving it, a fixture.
+// (owner_or_admin: their team_owner binding on the team, or org_admin). Required, as a grant's is (#1247), so a route
+// that forgets it can't skip the re-check: a caller with no actor to check passes NO_MEMBER_AUTHORITY.
 export type MemberAuthority = { byUser: number | null; authority: RoleAuthority };
 // A removal's authority, and its role.revoked row's actor and the fields its detail carries beside the binding.
 export type MemberRemoval = MemberAuthority & { actor: string | null; audit?: AuditFields };
+// "none", explicitly: a team's creator joining it, a member leaving it, a fixture.
+export const NO_MEMBER_AUTHORITY: MemberRemoval = Object.freeze({ byUser: null, authority: "none", actor: null });
 // A JSON value, as an audit row's detail stores it: fields a caller adds beside the binding (`audit`) are JSON,
 // never a value that serializes to something else or to nothing (a Date, a function, a bigint).
 export type JsonValue = string | number | boolean | null | readonly JsonValue[] | { readonly [k: string]: JsonValue | undefined };
@@ -139,12 +141,12 @@ export interface TeamsStore {
   // Adds a member; an existing member is left as is (false). Ownership is a role binding (#927): roles.grant.
   // Conditional on `by`'s authority as roles.grant is, serialized with every role-binding write: rejects with
   // AuthorityLost, adding no one, when it no longer holds.
-  addMember(tx: Tx, teamId: number, userId: number, by?: MemberAuthority): Promise<boolean>;
+  addMember(tx: Tx, teamId: number, userId: number, by: MemberAuthority): Promise<boolean>;
   // Removes a member, revoking their team_owner binding first through the roles revoke (its role.revoked row with
   // `by`'s actor and audit fields), which rejects with LastOwner rather than leave a team with members and no owner
   // (security audit F-02). Rejects with AuthorityLost, before any write, when `by`'s authority no longer holds. The
   // revoked binding, or null.
-  removeMember(tx: Tx, teamId: number, userId: number, by?: MemberRemoval): Promise<RoleBinding | null>;
+  removeMember(tx: Tx, teamId: number, userId: number, by: MemberRemoval): Promise<RoleBinding | null>;
   // The roster, each member's role read from the team's team_owner bindings. Both in user id order.
   listMembers(r: Read, teamId: number): Promise<TeamMember[]>;
   listMemberUserIds(r: Read, teamId: number): Promise<number[]>;

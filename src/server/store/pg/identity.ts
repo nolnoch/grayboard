@@ -27,7 +27,7 @@ import type { Principal } from "../../../core/resolver.ts";
 import { AuthorityLost, LastOwner, PrincipalTaken } from "../errors.ts";
 import {
   DEV_SESSION_LABEL, TEAM_POLICIES,
-  type IdentityGroups, type IdpSignIn, type MemberAuthority, type MemberRemoval, type PrincipalRow, type RoleAuthority, type RoleBinding, type RoleRevoke,
+  type IdentityGroups, type IdpSignIn, type MemberAuthority, type PrincipalRow, type RoleAuthority, type RoleBinding, type RoleRevoke,
   type Session, type Team, type TeamMember, type TeamPolicy, type User,
 } from "../identity.ts";
 import type { Read, Tx } from "../tx_base.ts";
@@ -102,7 +102,6 @@ const teamAuthority = (sql: PgSql, by: MemberAuthority, teamId: number): PgFragm
   authority(sql, by.authority, by.byUser, () => sql.fragment`(SELECT id FROM principals WHERE kind = 'team' AND team_id = ${teamId})`);
 const authorityHolds = async (sql: PgSql, by: MemberAuthority, teamId: number): Promise<boolean> =>
   (await sql`SELECT ${teamAuthority(sql, by, teamId)} AS ok`)[0]!.ok === true;
-const NO_AUTHORITY: MemberRemoval = { byUser: null, authority: "none", actor: null };
 
 const bindingDetail = (b: RoleBinding) => ({
   binding: b.id, role: b.role, principal: b.principal, principal_id: b.principal_id, scope: b.scope, scope_id: b.scope_id,
@@ -335,7 +334,7 @@ export function makePgIdentity({ now, hosted }: { now: () => number; hosted: PgH
       // conditional on the actor's authority: an owner revoked after the route's decision adds no one, and one revoked
       // after this commits finds the new member in its last-owner count. Zero rows is an existing member or the
       // authority gone; under the lock a second statement reads the same bindings and says which.
-      async addMember(tx, teamId, userId, by = NO_AUTHORITY) {
+      async addMember(tx, teamId, userId, by) {
         const sql = pgOf(tx);
         await roleLock(sql);
         const added = (await sql`INSERT INTO team_members (team_id, user_id, joined_at)
@@ -349,7 +348,7 @@ export function makePgIdentity({ now, hosted }: { now: () => number; hosted: PgH
       // who is no longer a member. The actor's authority is read once under it, before any write: the revoke may
       // delete the very binding it rests on (an owner removing themselves), so a re-check after it would refuse what
       // the decision allowed. Only lock holders change bindings, so the read stays true until commit.
-      async removeMember(tx, teamId, userId, by = NO_AUTHORITY) {
+      async removeMember(tx, teamId, userId, by) {
         const sql = pgOf(tx);
         await roleLock(sql);
         if (!(await authorityHolds(sql, by, teamId))) throw new AuthorityLost();

@@ -14,6 +14,7 @@ import { AppSession } from "../../tests/support/app_session.ts";
 import { scratchDbPath } from "../../tests/support/scratch_db.ts";
 import { queueFor } from "./store/queue.ts";
 import { MissingParent } from "./store/errors.ts";
+import { NO_MEMBER_AUTHORITY } from "./store/identity.ts";
 
 let store: ReturnType<typeof openDatabase>;
 let application: ReturnType<typeof createApplication>;
@@ -455,7 +456,7 @@ test("unbound hosted reads never use the human address and still list and read b
     await application.call(tx, owner, "board_create", { name: "e2e", purpose: "fixture" });
     await application.call(tx, owner, "board_post", { board: "e2e", body: "hello" });
     const team = await store.repo.teams.create(tx, "private", bob.user_id);
-    await store.repo.teams.addMember(tx, team.id, bob.user_id);
+    await store.repo.teams.addMember(tx, team.id, bob.user_id, NO_MEMBER_AUTHORITY);
   });
   const bobBe = (await connect(bob, "be", { key: "bob-secret" })).session;
   await seed(store.repo, tx => application.call(tx, bobBe, "board_create", { name: "secret", purpose: "fixture", team: "private" }));

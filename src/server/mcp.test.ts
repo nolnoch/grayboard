@@ -28,6 +28,7 @@ import { seed } from "../../tests/support/seed.ts";
 import { until } from "../../tests/support/until.ts";
 import { TEST_BACKEND } from "../../tests/support/server.ts";
 import { drained, execOn, pgText, row, rows } from "../../tests/support/repo_sql.ts";
+import { NO_MEMBER_AUTHORITY } from "./store/identity.ts";
 const meta = { "ai.opencode/sessionID": "test-root" };
 const issuedOAuth = (repo: Parameters<typeof issueOAuth>[0], resource: string, email = "alice@example.com", scopes = ["grayboard:tools"]) => issueOAuth(repo, resource, email, scopes, Date.now(), OPENCODE_CLIENT);
 
@@ -181,7 +182,7 @@ async function unboundReader(mapped: boolean) {
   expect((await owner.callTool({ name: "board_post", arguments: { board: "general", body: "open hello" } })).isError).not.toBe(true);
   await seed(store.repo, async (tx) => {
     const team = await store.repo.teams.create(tx, "private", user.user_id);
-    await store.repo.teams.addMember(tx, team.id, user.user_id);
+    await store.repo.teams.addMember(tx, team.id, user.user_id, NO_MEMBER_AUTHORITY);
   });
   expect((await owner.callTool({ name: "board_create", arguments: { name: "secret", purpose: "team only", team: "private" } })).isError).not.toBe(true);
   expect((await owner.callTool({ name: "board_post", arguments: { board: "secret", body: "team hello" } })).isError).not.toBe(true);
@@ -2048,12 +2049,12 @@ async function teamFixture() {
   const bob = await issueOAuth(store.repo, oauth.resource, "bob@example.com", ["grayboard:tools"], clock.time.now, OPENCODE_CLIENT);
   const team = await seed(store.repo, async tx => {
     const t = await store.repo.teams.create(tx, "private", grant.authed.user_id);
-    await store.repo.teams.addMember(tx, t.id, grant.authed.user_id);
-    await store.repo.teams.addMember(tx, t.id, bob.authed.user_id);
+    await store.repo.teams.addMember(tx, t.id, grant.authed.user_id, NO_MEMBER_AUTHORITY);
+    await store.repo.teams.addMember(tx, t.id, bob.authed.user_id, NO_MEMBER_AUTHORITY);
     return t;
   });
-  const remove = () => seed(store.repo, tx => store.repo.teams.removeMember(tx, team.id, grant.authed.user_id));
-  const readd = () => seed(store.repo, tx => store.repo.teams.addMember(tx, team.id, grant.authed.user_id));
+  const remove = () => seed(store.repo, tx => store.repo.teams.removeMember(tx, team.id, grant.authed.user_id, NO_MEMBER_AUTHORITY));
+  const readd = () => seed(store.repo, tx => store.repo.teams.addMember(tx, team.id, grant.authed.user_id, NO_MEMBER_AUTHORITY));
   return { ...clock, grant, bob, remove, readd };
 }
 const boardChecked = "mcp:board:checked";

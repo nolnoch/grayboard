@@ -2,7 +2,7 @@ import pkg from "../../package.json" with { type: "json" };
 import { randomBytes } from "node:crypto";
 import { mcpResource, SERVICE_CLIENT_PREFIX } from "./oauth-config.ts";
 import { CREDENTIAL_NO_EXPIRY, CREDENTIAL_SOURCES, DEFAULT_SERVICE_TOKEN_LIMITS, GRANT_LIST_MAX, OAUTH_TTL, newGrantId, SERVICE_TOKEN_MIN_SECONDS, type CredentialSource } from "./oauth-types.ts";
-import { AuthorityLost, DEV_SESSION_LABEL, LastOwner, PrincipalTaken, TEAM_POLICIES, type Repo, type RoleFilter, type Team, type TeamPolicy, type User } from "./db.ts";
+import { AuthorityLost, DEV_SESSION_LABEL, LastOwner, NO_MEMBER_AUTHORITY, PrincipalTaken, TEAM_POLICIES, type Repo, type RoleFilter, type Team, type TeamPolicy, type User } from "./db.ts";
 import { DEFAULT_CLI_TOKEN_IDLE_DAYS, DEFAULT_IDP_REAUTH_DAYS, type Config } from "./config.ts";
 import {
   verifySessionToken, extractBearer, IdpUnavailable,
@@ -477,7 +477,7 @@ async function teamCreate(req: Request, authed: AuthedUser, repo: Repo): Promise
       if (e instanceof Refused) return e.response;
       throw e;
     }
-    await repo.teams.addMember(tx, team.id, authed.user_id);
+    await repo.teams.addMember(tx, team.id, authed.user_id, NO_MEMBER_AUTHORITY);
     await onTeamJoined(repo, tx, team, authed.user_email);
     writeAudit(repo, tx, "team.created", authed.user_email, name);
     writeAudit(repo, tx, "team.member_added", authed.user_email, name, { member: authed.user_email });
