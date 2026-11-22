@@ -801,22 +801,23 @@ test("the connect probe falls back to IPv4 when a host's IPv6 address doesn't co
   const port = await new Promise<number>(resolve => server.listen(0, "127.0.0.1", () => resolve((server.address() as AddressInfo).port)));
   const probe0 = { ...connectProbe };
   const default0 = getDefaultAutoSelectFamily();
-  // The IPv6 discard prefix (RFC 6666) first: dropped where IPv6 routes, unreachable where it doesn't.
-  connectProbe.lookup = ((_host: string, options: { all?: boolean }, callback: (...args: unknown[]) => void) => {
-    const addresses = [{ address: "100::1", family: 6 }, { address: "127.0.0.1", family: 4 }];
-    if (options.all) callback(null, addresses); else callback(null, addresses[0]!.address, addresses[0]!.family);
-  }) as typeof connectProbe.lookup;
-  setDefaultAutoSelectFamily(false);
-  const socket = connectProbe.open("dual-stack.test", port);
+  let socket: Socket | undefined;
   try {
+    // The IPv6 discard prefix (RFC 6666) first: dropped where IPv6 routes, unreachable where it doesn't.
+    connectProbe.lookup = ((_host: string, options: { all?: boolean }, callback: (...args: unknown[]) => void) => {
+      const addresses = [{ address: "100::1", family: 6 }, { address: "127.0.0.1", family: 4 }];
+      if (options.all) callback(null, addresses); else callback(null, addresses[0]!.address, addresses[0]!.family);
+    }) as typeof connectProbe.lookup;
+    setDefaultAutoSelectFamily(false);
+    socket = connectProbe.open("dual-stack.test", port);
     const outcome = await new Promise<string>(resolve => {
       const timer = setTimeout(() => resolve("no connect within 4 s"), 4_000);
-      socket.once("connect", () => { clearTimeout(timer); resolve(`connected to ${socket.remoteAddress}`); });
-      socket.once("error", error => { clearTimeout(timer); resolve(`error: ${error.message}`); });
+      socket!.once("connect", () => { clearTimeout(timer); resolve(`connected to ${socket!.remoteAddress}`); });
+      socket!.once("error", error => { clearTimeout(timer); resolve(`error: ${error.message}`); });
     });
     expect(outcome).toBe("connected to 127.0.0.1");
   } finally {
-    socket.destroy();
+    socket?.destroy();
     setDefaultAutoSelectFamily(default0);
     Object.assign(connectProbe, probe0);
     server.close();
@@ -870,6 +871,8 @@ test("the connect probe runs only on a cold wire and never behind a proxy; an ab
     await until(() => held, 5_000, "the probe to open its socket");
     controller.abort();
     const aborted = await call;
+    // The SDK's own cancel rejects the call first, so what the probe rejects with never reaches the caller (here or at
+    // the wire stop below); the probe's abort path is judged by its socket and by the request it never sent.
     expect(aborted).toBeInstanceOf(CallAborted);
     expect(aborted).not.toBeInstanceOf(ServerUnreachable);
     await until(() => held!.destroyed, 2_000, "the probe to destroy its socket");
@@ -879,6 +882,21 @@ test("the connect probe runs only on a cold wire and never behind a proxy; an ab
     connectProbe.coldMs = 60_000;
     expect((await whoami()).primary).toBe("alice@example.com/proxy-probe");
     expect(whoamis).toBe(before + 1);
+
+    // The wire's own stop mid-probe (the proxy closing, no caller abort to mask it): a stop, never unreachable.
+    const closing = proxy({ token: async () => token });
+    expect((await closing.call("whoami", {}, "pi-root")).isError).toBeUndefined();
+    connectProbe.coldMs = 0;
+    held = undefined;
+    const sent = whoamis;
+    const inFlight = closing.call("whoami", {}, "pi-root").then(() => undefined, (error: unknown) => error);
+    await until(() => held, 5_000, "the probe to open its socket");
+    await closing.close();
+    const stopped = await inFlight;
+    expect(stopped).toBeInstanceOf(Error);
+    expect(stopped).not.toBeInstanceOf(ServerUnreachable);
+    await until(() => held!.destroyed, 2_000, "the probe to destroy its socket");
+    expect(whoamis).toBe(sent);
   } finally {
     globalThis.fetch = fetch0;
     Object.assign(connectProbe, probe0);
