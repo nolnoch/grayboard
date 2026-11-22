@@ -913,9 +913,9 @@ describePg("readsOnly (Postgres read-only probe)", () => {
     expect(await rows(x.s.read)).toEqual(["a"]);
   });
 
-  // #1627: a call site's text is held once built, unless a fragment fills it. Mutations: holding the text of a site
-  // with a fragment value (the second call reads as the first's SELECT and passes); holding a plain site's text across
-  // different literal pieces (impossible for one site, so the plain site's repeat must stay judged by its own text).
+  // #1627: a statement's text is built lazily, each call from its own pieces and its fragments' own. Mutations: a text
+  // held per call site (the second call reads as the first's SELECT and passes); a fragment's text left out of its
+  // statement's (the DELETE reads as a gap and passes).
   test("one call site judged per call: a fragment's text isn't held from an earlier call, a plain site's repeat is", async () => {
     await using x = await scratch();
     await x.s.write(tx => put(tx, "a"));
