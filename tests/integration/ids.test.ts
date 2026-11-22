@@ -46,7 +46,8 @@ const endedAt = (id: string) => rows<{ ended_at: number | null }>(`SELECT ended_
 // A CLI process whose stderr is read as it runs, for a test pause.
 const spawnCli = (args: string[], extra: Record<string, string>) => spawnBusCli(dir, args, extra);
 
-const pauseEnv = (point: string) => busPauseEnv(dir, point);
+// #1589: a paused overlap's waiter outwaits a slow commit under load (20 s, inside the tests' 30 s timeout).
+const pauseEnv = (point: string) => ({ ...busPauseEnv(dir, point), BUS_TEST_BUSY_TIMEOUT_MS: "20000" });
 const release = (point: string) => releasePause(dir, point);
 
 // #284 AC 1, S13: with no name the session is a full participant as its ID,

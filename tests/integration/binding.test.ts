@@ -64,7 +64,8 @@ function cellsEqual(value: string): string[] {
 // A CLI process whose stderr is read as it runs, for a test pause.
 const spawnCli = (args: string[], extra: Record<string, string>) => spawnBusCli(dir, args, extra);
 
-const pauseEnv = (point: string) => busPauseEnv(dir, point);
+// #1589: a paused overlap's waiter outwaits a slow commit under load (20 s, inside the tests' 30 s timeout).
+const pauseEnv = (point: string) => ({ ...busPauseEnv(dir, point), BUS_TEST_BUSY_TIMEOUT_MS: "20000" });
 const release = (point: string) => releasePause(dir, point);
 
 test("1, 3, 14, 18: an unbound session acts as its ID, offers its default with its mail, and binds", async () => {
