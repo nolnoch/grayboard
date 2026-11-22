@@ -48,6 +48,8 @@ const ENDING_CALLS = new Set<unknown>(["session_end", "delivery_release"]);
 export const MCP_PROTOCOL_VERSIONS = ["2026-07-28", "2025-11-25", "2025-06-18"];
 // The failure log's class for a dispatched modern call the endpoint's close cut off (#1342): the SDK swallowed its error.
 class EndpointClosedError extends Error { override name = "EndpointClosedError"; }
+// A request the closing endpoint refused before dispatch (closedError): a server cut, whatever its signal says.
+class RequestClosedError extends Error { override name = "RequestClosedError"; constructor() { super("MCP request is closed"); } }
 type CallToolResult = z.infer<typeof CallToolResultSchema>;
 const id = z.number().int().positive();
 const ids = z.array(id);
@@ -83,7 +85,7 @@ type Bound = { row: HostedSession | undefined; root?: HostedSession };
 // notice that carried its facts into `bound`, so a raced re-read keeps those halves and takes its own for the rest (#1486).
 type Live = { context: Context; rows: Set<string>; bound: Bound; rechecking?: Context; noted?: Map<string, number>; uris: Map<string, string | null>; watches: string[]; stream?: OwnedStream; handler?: McpHttpHandler; legacy?: Legacy; stopped: boolean; hint(uri: string): void; stop(): void };
 
-export function createHostedMcp(application: Application, oauth: Pick<ReturnType<typeof createOAuthServer>, "authenticate" | "isAuthorized" | "peekAuthorized" | "isGrantActive" | "issuer" | "resource">, opts: { trustedOrigin: string; now?: () => number; limits?: McpLimits; caps?: HostedCaps; idleSeconds?: number; streamRecheckMs?: number }) {
+export function createHostedMcp(application: Application, oauth: Pick<ReturnType<typeof createOAuthServer>, "authenticate" | "isAuthorized" | "peekAuthorized" | "isGrantActive" | "issuer" | "resource">, opts: { trustedOrigin: string; now?: () => number; limits?: McpLimits; caps?: HostedCaps; idleSeconds?: number; streamRecheckMs?: number; stopping?: () => boolean }) {
   const now = opts.now ?? Date.now;
   const trustedOrigin = new URL(opts.trustedOrigin).origin;
   let closed = false, posts = 0, busListeners = 0;
@@ -174,10 +176,16 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
   const exchanges = new AsyncLocalStorage<Exchange>();
   const refusalLogs = new RateLimiter({ burst: 1, perSec: 0.1 }, { start() {}, end() {} }, now, 4096);
   // A request its client abandoned (#1535: it aborted while the request waited, in the write queue or in `select`) is
-  // the client's timeout, i.e. server latency, not a server failure: its own line and category, at warn.
+  // the client's timeout, i.e. server latency, not a server failure: its own line and category, at warn. A request the
+  // server cut (#1541) is neither: the endpoint closing, or the app stopping, which cuts every connection before it
+  // closes the endpoint (app.ts stop, the only close outside unit tests), so an abort is a cut once `stopping` holds.
   const report = (error: unknown, source: FailureSource = "hosted-sdk", exchange = exchanges.getStore()) => {
     if (error instanceof ApplicationError || error instanceof CoreError || exchange?.failure || exchange?.refusal || exchange?.logged) return;
     if (exchange) exchange.logged = true;
+    if (error instanceof RequestClosedError || error instanceof RequestAbortedError && opts.stopping?.()) {
+      console.warn(`[grayboard] hosted MCP request cut by server: ${JSON.stringify({ principal: exchange?.principal, identity: exchange?.identity, session: exchange?.session, tool: exchange?.tool, protocol: exchange?.protocol, ...failureDiagnostic(source, error, "server_cut") })}`);
+      return;
+    }
     if (error instanceof RequestAbortedError) {
       console.warn(`[grayboard] hosted MCP client aborted: ${JSON.stringify({ principal: exchange?.principal, identity: exchange?.identity, session: exchange?.session, tool: exchange?.tool, protocol: exchange?.protocol, ...failureDiagnostic(source, error, "client_aborted") })}`);
       return;
@@ -384,8 +392,9 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
       return context;
     } catch (error) { context.finish(); throw error; }
   }
-  // A closing endpoint's error, else the client's abort (#1535), logged as client_aborted rather than unexpected.
-  const closedError = (request: Request) => closed || !request.signal.aborted ? new Error("MCP request is closed") : new RequestAbortedError();
+  // A closing endpoint's error (a server cut, #1541), else the client's abort (#1535), logged as client_aborted. The close
+  // decides when both hold: a shutdown aborts the request's signal as it closes the endpoint.
+  const closedError = (request: Request) => closed || !request.signal.aborted ? new RequestClosedError() : new RequestAbortedError();
   function binding(context: Context): Binding {
     return { user: context.principal.authed.user_id, email: context.principal.authed.user_email, grant: context.principal.grantId, role: context.role, identity: context.session.identityFull };
   }
