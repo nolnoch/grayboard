@@ -1291,7 +1291,7 @@ describePg("keyed renew and receipt (Postgres)", () => {
     expect((await db.sql`SELECT lease_deadline FROM hosted_sessions WHERE session_id = ${id}`)[0].lease_deadline).toBeNull();
   });
 
-  // The same for a keyed receipt held at its first mark: the probe's lock holds another instance's unbind until the
+  // The same for a keyed receipt held at its delivery stamp: the probe's lock holds another instance's unbind until the
   // receipt commits. Mutation: the receipt probe's store.lock as store.get (the unbind commits beside the receipt).
   test("another instance's unbind waits for a keyed receipt held after its probe", async () => {
     await using db = await pgDatabase({ max: 4 });
@@ -1306,7 +1306,7 @@ describePg("keyed renew and receipt (Postgres)", () => {
       const items = await a.delivery.pending(p, c, lease.capability);
       a.state.marked = []; a.state.hold = gate();
       const receipt = a.delivery.receipt(p, c, lease.capability, items.map(i => i.id));
-      await until(() => a.state.held === 1, 10_000, "the receipt held after its first mark");
+      await until(() => a.state.held === 1, 10_000, "the receipt held after its delivery stamp");
       let done = false;
       const unbound = b.hosted.unbind(p, c, { name: "fe" }).finally(() => { done = true; });
       try {
@@ -1496,7 +1496,7 @@ describePg("keyed renew and receipt (Postgres)", () => {
       x.state.hold = gate();
       const d = renewDelta("receipt");
       const receipt = x.delivery.receipt(p, c, lease.capability, items.map(i => i.id));
-      await until(() => x.state.held === 1, 10_000, "the receipt held after its first mark");
+      await until(() => x.state.held === 1, 10_000, "the receipt held after its delivery stamp");
       const before = x.q.waiting;
       const sent = sender.send(`${ME}/fe`, "two");
       await until(() => x.q.waiting > before, 10_000, "the send queued");
@@ -1531,10 +1531,11 @@ describePg("keyed renew and receipt (Postgres)", () => {
   });
 
   // The deadlock pairs (scope pairs 4 and 5), forced across two instances, since on one the scheduler never runs a
-  // prune or an end beside a keyed receipt. A's receipt of reversed ids is held after its first mark; B's prune of
-  // those messages, then B's end of the root, wait on its locks and finish after it, with no 40P01. Mutation: handleAck
-  // without its sort (the receipt holds the newest message, the prune locks the oldest and waits on it, and the
-  // receipt's next mark waits on the prune: 40P01).
+  // prune or an end beside a keyed receipt. A's receipt of reversed ids is held after its delivery stamp; B's prune
+  // of those messages, then B's end of the root, wait on its locks and finish after it, with no 40P01. The stamp locks
+  // its rows in one statement (messages.deliver's ORDER BY id, #1510 chunk 5), so the hold comes after every row lock:
+  // this test pins the waits, not the lock order. Dropping that ORDER BY fails no test, since a primary-key index scan
+  // of `id = ANY(…)` visits the ids in order anyway; the clause keeps the order from depending on the plan.
   test("another instance's prune and end of the root wait for a held keyed receipt, with no deadlock", async () => {
     await using db = await pgDatabase({ max: 4 });
     await using a = await leaseInstance(db.url, { side: "a" });
@@ -1549,7 +1550,7 @@ describePg("keyed renew and receipt (Postgres)", () => {
       a.state.marked = [];
       a.state.hold = gate();
       const receipt = a.delivery.receipt(p, c, lease.capability, items.map(i => i.id).reverse());
-      await until(() => a.state.held === 1, 10_000, "the receipt held after its first mark");
+      await until(() => a.state.held === 1, 10_000, "the receipt held after its delivery stamp");
       const prune = atSite("other", () => b.repo.write(tx => b.repo.messages.prune(tx, a.clock + 1)));
       await until(async () => await lockWaiters(db.sql) >= 1, 10_000, "the prune waits on the receipt's row lock");
       a.state.hold.open();

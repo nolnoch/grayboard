@@ -380,7 +380,7 @@ export function createDelivery(hosted: HostedSessions, options: DeliveryOptions)
           records.length = 0;
         };
         // Keyed (D4): the reads in a probe (pending's lost-ack repair, a write, is a miss there), then the session's own
-        // rows: each direct message's delivered_at and its address's cursor, in id order (handleAck), then each board
+        // rows: the direct messages' delivered_at, locked in id order, then each address's cursor (handleAck), then each board
         // item's outbox row, a queue push's take credit (claim_events) and a push subscription's row, and receiptBoards'
         // in-memory effects. It holds `board:<name>` for each queue board among its pushes (#1595), planned here; the
         // probe judges the boards again on its Tx and misses on a queue board the plan left out (`held`, never re-derived
