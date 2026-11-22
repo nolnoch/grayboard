@@ -7,7 +7,7 @@ import { int8, int8OrNull, pgTlsMode, type AuditDetail, type JsonParam } from ".
 // The startup line's TLS mode reads Bun.SQL's internal sslMode (no connection is made): this pins it, so a Bun upgrade
 // that moves the field or renumbers the enum fails here rather than misreporting a deploy's TLS.
 test("pgTlsMode names the TLS mode Bun.SQL resolved, whichever parameter set it", () => {
-  // Bun.SQL applies these from the environment as a floor; a developer's shell may export one.
+  // Bun.SQL reads these from the environment; a developer's shell may export one.
   const saved = Object.fromEntries(["PGSSLMODE", "PG_SSLMODE", "TLS_DATABASE_URL", "TLS_POSTGRES_DATABASE_URL"].map(k => [k, process.env[k]]));
   for (const k of Object.keys(saved)) delete process.env[k];
   try {

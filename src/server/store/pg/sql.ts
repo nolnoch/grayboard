@@ -28,9 +28,11 @@ export function openPg(url: string, opts: PgOptions = {}): SQL {
   });
 }
 
-// The TLS mode Bun.SQL resolved from a URL, for the startup line: it reads `sslmode`, `ssl` and `tls` in any case, with
-// the environment's `PGSSLMODE` as a floor, and no TLS parameter in either means none at all. `options.sslMode` is Bun's internal enum (src/js/internal/sql/shared.ts), so
-// sql.test.ts pins it: a Bun upgrade that moves it fails there. `prefer` falls back to plaintext silently.
+// The TLS mode Bun.SQL resolved from a URL, for the startup line: it reads `sslmode`, `ssl` and `tls` in any case; the
+// environment's `PGSSLMODE` (or `PG_SSLMODE`) applies only when the URL sets none, `TLS_DATABASE_URL` or
+// `TLS_POSTGRES_DATABASE_URL` set forces TLS, and none of these means none at all. `options.sslMode` is Bun's internal
+// enum (src/js/internal/sql/shared.ts), so sql.test.ts pins it: a Bun upgrade that moves it fails there. `prefer` falls
+// back to plaintext silently.
 const PG_TLS_MODES = ["no TLS", "TLS if offered (prefer: may be plaintext)", "TLS, certificate unchecked (require)", "TLS, CA checked (verify-ca)", "TLS, verified (verify-full)"];
 export function pgTlsMode(url: string): string {
   try {
