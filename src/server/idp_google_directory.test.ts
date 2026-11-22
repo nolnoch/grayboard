@@ -61,10 +61,22 @@ test("under domain-wide delegation the assertion's sub is the admin it impersona
   expect((await jwtVerify(g.tokens()[0]!.assertion!, pub, { currentDate: new Date(1_000_000_000_000) })).payload.sub).toBe("admin@example.com");
 });
 
-test("suspended, archived and a 404 are inactive", async () => {
-  for (const reply of [{ status: 200, body: { suspended: true, archived: false } }, { status: 200, body: { suspended: false, archived: true } }, { status: 404, body: { error: { code: 404 } } }]) {
+test("suspended and archived are inactive", async () => {
+  for (const reply of [{ status: 200, body: { suspended: true, archived: false } }, { status: 200, body: { suspended: false, archived: true } }]) {
     const g = google({ user: () => reply });
     expect(await googleDirectoryStatus(parseDirectoryCredential(keyJson(), undefined, undefined), g.options)("1", signal())).toBe("inactive");
+  }
+});
+
+// #1600: Google doesn't document users.get's 404 as "no such user", so it is a failed check (transient), never a
+// disable, and it keeps the cached token (the token isn't what Google refused). #1601 makes it definite once confirmed.
+test("a users.get 404 throws google_user_not_found and keeps the token", async () => {
+  for (const reply of [{ status: 404, body: { error: { code: 404, message: "Resource Not Found: userKey" } } }, { status: 404 }, { status: 404, body: "<html>Not Found</html>" }]) {
+    const g = google({ user: () => reply });
+    const status = googleDirectoryStatus(parseDirectoryCredential(keyJson(), undefined, undefined), g.options);
+    expect((await failure(status("1", signal()))).name).toBe("google_user_not_found");
+    expect((await failure(status("2", signal()))).name).toBe("google_user_not_found");
+    expect(g.tokens()).toHaveLength(1);
   }
 });
 
