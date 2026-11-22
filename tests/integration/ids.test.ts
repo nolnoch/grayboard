@@ -47,6 +47,9 @@ const endedAt = (id: string) => rows<{ ended_at: number | null }>(`SELECT ended_
 const spawnCli = (args: string[], extra: Record<string, string>) => spawnBusCli(dir, args, extra);
 
 const pauseEnv = (point: string) => busPauseEnv(dir, point);
+// #1589: an overlap waiter queued behind a paused holder outwaits a slow commit under load (20 s, inside
+// the tests' 30 s timeout). Only waiters get it: a test that needs the busy timeout to run out keeps 5 s.
+const waiterEnv = (point: string) => ({ ...pauseEnv(point), BUS_TEST_BUSY_TIMEOUT_MS: "20000" });
 const release = (point: string) => releasePause(dir, point);
 
 // #284 AC 1, S13: with no name the session is a full participant as its ID,
@@ -268,7 +271,7 @@ test("race: a send that commits before the end's transaction is bounced to its s
 }, 30_000);
 
 test("race: a send that reaches the write lock after the end is refused with id_ended", async () => {
-  const be = await localSession(dir, "be", { extra: pauseEnv("send:before-txn") });
+  const be = await localSession(dir, "be", { extra: waiterEnv("send:before-txn") });
   const s = await session();
   const id = await sessionId(s);
   await sigkill(pidOfId(id));

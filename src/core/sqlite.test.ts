@@ -3,7 +3,7 @@ import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Database } from "bun:sqlite";
-import { checksWrite, journalModeWarning, openReader, openSqlite, routeReads, scriptStatements, STATEMENT_CACHE_SIZE } from "./sqlite.ts";
+import { busyTimeoutMs, checksWrite, journalModeWarning, openReader, openSqlite, routeReads, scriptStatements, STATEMENT_CACHE_SIZE } from "./sqlite.ts";
 
 let dir = "";
 afterEach(() => { if (dir) rmSync(dir, { recursive: true, force: true }); });
@@ -191,4 +191,11 @@ test("#995: checksWrite sees a write after a leading DDL statement, not one insi
   expect(scriptStatements("CREATE TRIGGER g AFTER INSERT ON t BEGIN UPDATE c SET n = 1;")).toBeNull();
   expect(checksWrite("CREATE TRIGGER g AFTER INSERT ON t BEGIN UPDATE c SET n = 1;")).toBe(true);
   expect(scriptStatements("CREATE TABLE a(x); ; CREATE TABLE b(y);")!.map(s => s.trim())).toEqual(["CREATE TABLE a(x)", "CREATE TABLE b(y)"]);
+});
+
+// #1589: the test-only knob raises the busy timeout, capped; it never lowers it, and garbage is ignored.
+test("BUS_TEST_BUSY_TIMEOUT_MS only raises the busy timeout, capped at 60 s", () => {
+  for (const v of ["", "1000", "5000", "abc", "-1", "1e9x", "20000.5"]) expect(busyTimeoutMs(v)).toBe(5000);
+  expect(busyTimeoutMs("20000")).toBe(20000);
+  expect(busyTimeoutMs("999999")).toBe(60000);
 });
