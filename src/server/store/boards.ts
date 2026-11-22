@@ -58,8 +58,8 @@ export interface BoardsStore {
   // marks, so a hold that moved in a transaction committed first is never credited for this receipt.
   acknowledge(tx: Tx, handle: string, ref: PendingRef, receiver?: string): Promise<void>;
   // acknowledge of each ref, as one batch (#1510 chunk 5): each ref ends as acknowledge alone would leave it. A backend
-  // may batch the statements: Postgres stamps the pushes' outbox rows in post id order, then each board's push
-  // subscription, then each digest.
+  // may batch the statements: Postgres stamps the pushes' outbox rows in post id order, then each queue board's take
+  // credit, then each board's push subscription, then each digest.
   acknowledgeMany(tx: Tx, handle: string, refs: PendingRef[], receiver?: string): Promise<void>;
 
   // ── a mode's bookkeeping (#807 P3 B5b1): the board writes outside the tools, unchecked ──

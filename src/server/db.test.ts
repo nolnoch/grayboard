@@ -593,7 +593,7 @@ test("#807 P1c-5: cursors, writeReceipts, bindings and boards refuse a handle fr
   const fe = "a@example.com/fe";
   for (const call of [
     () => b.get(foreign, "hall"), () => b.post(foreign, 1), () => b.catalogPage(foreign, ""), () => b.snapshotPage(foreign, "hall", {}),
-    () => b.pendingPushes(foreign, fe), () => b.pendingDigests(foreign, fe), () => b.acknowledge(fx, fe, { kind: "push", post_id: 1 }),
+    () => b.pendingPushes(foreign, fe), () => b.pendingDigests(foreign, fe), () => b.acknowledge(fx, fe, { kind: "push", post_id: 1 }), () => b.acknowledgeMany(fx, fe, []),
     () => b.ensure(fx, "hall", "p", null, fe), () => b.isSubscribed(foreign, fe, "hall"), () => b.setSubscription(fx, fe, "hall", "push"),
     () => b.unsubscribeScope(fx, fe, "team:x"), () => b.forget(fx, fe), () => b.prunePosts(fx, 0), () => b.views(foreign, [fe], null),
     () => b.openSummaries(foreign), () => b.roster(foreign, null), () => b.create(fx, { name: "x", purpose: "p", scope: null, kind: "broadcast", createdBy: fe, now: 1 }),

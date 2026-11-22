@@ -133,7 +133,7 @@ function handles(it: It): void {
     const b = h.boards;
     for (const call of [
       () => b.get(kept, "hall"), () => b.post(kept, root), () => b.catalogPage(kept, ""), () => b.snapshotPage(kept, "hall", {}),
-      () => b.pendingPushes(kept, FE), () => b.pendingDigests(kept, FE), () => b.acknowledge(kept, FE, { kind: "push", post_id: root }),
+      () => b.pendingPushes(kept, FE), () => b.pendingDigests(kept, FE), () => b.acknowledge(kept, FE, { kind: "push", post_id: root }), () => b.acknowledgeMany(kept, FE, []),
       () => b.ensure(kept, "x", "p", null, BE), () => b.isSubscribed(kept, FE, "hall"), () => b.setSubscription(kept, FE, "hall", "push"),
       () => b.unsubscribeScope(kept, FE, "team:x"), () => b.forget(kept, FE), () => b.prunePosts(kept, 0),
       () => b.views(kept, [FE], null), () => b.openSummaries(kept), () => b.roster(kept, null),
@@ -1045,33 +1045,41 @@ function queue(it: It): void {
   for (const via of ["acknowledge", "acknowledgeMany"] as const) {
     it(`a mixed batch through ${via}: credits, cursors and digests as per-ref acknowledge leaves them`, async h => {
       await board(h, "jobs", { kind: "queue" });
+      await board(h, "work", { kind: "queue" });
       await board(h, "hall");
       await board(h, "news");
       await h.alias(OPS);
       await h.session(S1, ME);
       await h.hold(OPS, S1, T0);
       await sub(h, OPS, "jobs", "push");
+      await sub(h, OPS, "work", "push");
       await sub(h, OPS, "hall", "push");
       await sub(h, OPS, "news", "digest");
       const q = await write(h, np("jobs", QA, "job", T0 + 10));
+      const w = await write(h, np("work", QA, "task", T0 + 10));
       const h1 = await write(h, np("hall", QA, "a", T0 + 11));
       const h2 = await write(h, np("hall", QA, "b", T0 + 12));
       const d = await write(h, np("news", QA, "n", T0 + 13));
       await h.claim({ key: `queue:jobs:${q}`, holder: OPS, board: "jobs", at: T0 + 20 });
       await h.claimEvent({ key: `queue:jobs:${q}`, handle: OPS, event: "take", board: "jobs", at: T0 + 20 });
-      for (const p of [q, h1, h2]) await h.push(OPS, p);
-      // h1 was delivered before: the batch's ack of it is a repeat.
+      await h.claim({ key: `queue:work:${w}`, holder: OPS, board: "work", at: T0 + 20 });
+      await h.claimEvent({ key: `queue:work:${w}`, handle: OPS, event: "take", board: "work", at: T0 + 20 });
+      for (const p of [q, w, h1, h2]) await h.push(OPS, p);
+      // h1 was delivered before: the batch's ack of it is a repeat. hall's refs run h2 then h1, so a cursor that took
+      // the last ref instead of the highest would end at h1; q is acked twice.
       await h.write(tx => h.boards.acknowledge(tx, OPS, { kind: "push", post_id: h1 }, S1));
       const refs: PendingRef[] = [{ kind: "push", post_id: h2 }, { kind: "digest", board: "news", latest_id: d },
-        { kind: "push", post_id: q }, { kind: "push", post_id: h1 }, { kind: "push", post_id: h2 }, { kind: "push", post_id: d + 1000 }];
+        { kind: "push", post_id: q }, { kind: "push", post_id: w }, { kind: "push", post_id: h1 }, { kind: "push", post_id: q },
+        { kind: "push", post_id: d + 1000 }];
       await h.write(async tx => {
         if (via === "acknowledgeMany") await h.boards.acknowledgeMany(tx, OPS, refs, S1);
         else for (const r of refs) await h.boards.acknowledge(tx, OPS, r, S1);
       });
-      expect((await h.outboxRows()).map(r => [r.post_id, r.delivered])).toEqual([[q, true], [h1, true], [h2, true]]);
-      expect(await h.outboxSessions()).toEqual([q, h1, h2].map(post_id => ({ handle: OPS, post_id, session_id: S1 })));
-      expect(await h.takeSessions()).toEqual([{ key: `queue:jobs:${q}`, handle: OPS, session_id: S1 }]);
+      expect((await h.outboxRows()).map(r => [r.post_id, r.delivered])).toEqual([[q, true], [w, true], [h1, true], [h2, true]]);
+      expect(await h.outboxSessions()).toEqual([q, w, h1, h2].map(post_id => ({ handle: OPS, post_id, session_id: S1 })));
+      expect(await h.takeSessions()).toEqual([{ key: `queue:jobs:${q}`, handle: OPS, session_id: S1 }, { key: `queue:work:${w}`, handle: OPS, session_id: S1 }]);
       expect(await h.subscription("jobs", OPS)).toEqual({ mode: "push", cursor: q, notified_id: q });
+      expect(await h.subscription("work", OPS)).toEqual({ mode: "push", cursor: w, notified_id: w });
       expect(await h.subscription("hall", OPS)).toEqual({ mode: "push", cursor: h2, notified_id: h2 });
       expect(await h.subscription("news", OPS)).toEqual({ mode: "digest", cursor: 0, notified_id: d });
     });

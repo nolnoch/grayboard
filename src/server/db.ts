@@ -1438,7 +1438,7 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
       pendingDigests: async (r, handle) => pendingDigests(sqliteOf(r), handle),
       acknowledge: async (tx, handle, ref, receiver) => acknowledge(sqliteOf(tx), handle, ref, receiver),
       // In process, so a loop costs no round trips.
-      acknowledgeMany: async (tx, handle, refs, receiver) => { for (const ref of refs) acknowledge(sqliteOf(tx), handle, ref, receiver); },
+      acknowledgeMany: async (tx, handle, refs, receiver) => { const db = sqliteOf(tx); for (const ref of refs) acknowledge(db, handle, ref, receiver); },
       ensure: async (tx, name, purpose, scope, createdBy) => ensureBoard(sqliteOf(tx), name, purpose, scope, createdBy),
       isSubscribed: async (r, handle, board) => isSubscribed(sqliteOf(r), handle, board),
       setSubscription: async (tx, handle, board, mode) => setSubscription(sqliteOf(tx), handle, board, mode),
