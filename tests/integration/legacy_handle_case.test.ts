@@ -9,18 +9,20 @@ import { join } from "node:path";
 import { busRows, pauseEnv, releasePause } from "../support/local_bus.ts";
 import { closeSessions, localSession, stopSession } from "../support/mcp.ts";
 import { until } from "../support/until.ts";
-import { latestRelease, releaseBinaries, type ReleaseBinaries } from "../support/releases.ts";
+import { releaseBinaries, type ReleaseBinaries } from "../support/releases.ts";
 
 // The last 1.x release: identities were case-sensitive until v2.0.0 (#181).
 const FROM = "v1.10.0";
 let rel: ReleaseBinaries;
-// The latest release: a v2 one, which normalizes `Gray` to `gray` at bind.
+// The last v2 release: it normalizes `Gray` to `gray` at bind but leaves the stranded `Gray` rows alone. v3.0.0 and
+// later move them at open (#216), so they can't stand in for it.
+const V2 = "v2.4.2";
 let v2: ReleaseBinaries;
 const dirs: string[] = [];
 
 beforeAll(async () => {
   rel = await releaseBinaries(FROM);
-  v2 = await releaseBinaries(await latestRelease());
+  v2 = await releaseBinaries(V2);
 }, 240_000);
 
 afterEach(async () => {
