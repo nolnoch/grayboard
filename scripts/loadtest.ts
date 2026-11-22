@@ -48,6 +48,9 @@
 // the service's board through R5's other canSee sites (#1511), in turn: board_list, board_read (a thread of its own
 // answered invocations), the snapshot (resources/read) and the catalog (resources/list, also read by every session as
 // it connects, timed and proved as catalog_connect, its latency not gated).
+// At --mention-share an invocation also @mentions another user session (#1518): mention resolution judges visibility on
+// the service board (R5's last canSee site); the post still goes to a lane, the named session is told, and every such
+// mention must reach it (its delivery timed as mention_e2e, reported, not gated).
 // Each is its own op, and each result must show the board (every board_read thread its invocation and reply, some
 // snapshot a post), or the run fails.
 //
@@ -84,8 +87,8 @@ export type Options = {
   // The service's workers (of `sessions`), the teams its invokers hold service_invoke through, and the shares of a
   // user's ops that invoke it and list peers.
   serviceWorkers: number; teams: number; svcShare: number; peerShare: number;
-  // The share of a user's ops that read the service's board.
-  readShare: number;
+  // The share of a user's ops that read the service's board, and of its invocations that @mention another user session.
+  readShare: number; mentionShare: number;
   // A Postgres cluster URL; absent runs the server on a SQLite file.
   pg?: string;
   // Milliseconds added to each direction between the server and Postgres (a delay proxy); absent, none.
@@ -100,7 +103,7 @@ export function options(argv: string[]): Options {
       quick: { type: "boolean" }, sessions: { type: "string" }, users: { type: "string" }, drivers: { type: "string" },
       duration: { type: "string" }, warmup: { type: "string" }, period: { type: "string" }, boards: { type: "string" },
       "post-share": { type: "string" }, burst: { type: "string" }, churn: { type: "string" }, "churn-every": { type: "string" },
-      "service-workers": { type: "string" }, teams: { type: "string" }, "svc-share": { type: "string" }, "peer-share": { type: "string" }, "read-share": { type: "string" },
+      "service-workers": { type: "string" }, teams: { type: "string" }, "svc-share": { type: "string" }, "peer-share": { type: "string" }, "read-share": { type: "string" }, "mention-share": { type: "string" },
       window: { type: "string" }, grace: { type: "string" }, server: { type: "string" }, out: { type: "string" }, "keep-db": { type: "boolean" }, pg: { type: "string" }, "pg-latency": { type: "string" },
       gate: { type: "string" },
       // Server env overrides, KEY=VALUE, applied after the caps the run computes.
@@ -123,7 +126,7 @@ export function options(argv: string[]): Options {
     postShare: n("post-share", 0.05, 0.2), burst: n("burst", 100, 20), churn: n("churn", 0.1, 0.25),
     churnEveryS: n("churn-every", 900, 20), windowS: n("window", 10, 5), graceS: n("grace", 15, 5),
     // Unset, the workers shrink to what a small fleet leaves after its users' sessions (defaultWorkers).
-    serviceWorkers: v["service-workers"] === undefined ? defaultWorkers(n("service-workers", 4, 2), n("sessions", 1000, 40), n("users", 100, 4)) : n("service-workers", 4, 2), teams: v.teams === undefined ? Math.min(n("teams", 10, 2), Math.max(1, n("users", 100, 4))) : n("teams", 10, 2), svcShare: n("svc-share", 0.05, 0.2), peerShare: n("peer-share", 0.02, 0.1), readShare: n("read-share", 0.02, 0.1),
+    serviceWorkers: v["service-workers"] === undefined ? defaultWorkers(n("service-workers", 4, 2), n("sessions", 1000, 40), n("users", 100, 4)) : n("service-workers", 4, 2), teams: v.teams === undefined ? Math.min(n("teams", 10, 2), Math.max(1, n("users", 100, 4))) : n("teams", 10, 2), svcShare: n("svc-share", 0.05, 0.2), peerShare: n("peer-share", 0.02, 0.1), readShare: n("read-share", 0.02, 0.1), mentionShare: n("mention-share", 0.25, 0.5),
     server: v.server ? [resolve(v.server)] : [process.execPath, join(ROOT, "src/server/main.ts")],
     out: v.out ? resolve(v.out) : join(ROOT, ".e2e-runs", `loadtest-${new Date().toISOString().replace(/[:.]/g, "-")}`),
     keepDb: v["keep-db"] === true,
@@ -143,6 +146,7 @@ export function options(argv: string[]): Options {
   if (!Number.isInteger(o.serviceWorkers) || userSessions(o) < Math.max(2, o.users)) throw new Error("--service-workers must be a whole number that leaves at least 2 sessions, and one per user, to the users");
   if (o.serviceWorkers && (!Number.isInteger(o.teams) || o.teams < 1 || o.teams > o.users)) throw new Error("--teams must be a whole number from 1 to --users");
   if (o.postShare + (o.serviceWorkers ? o.svcShare + o.peerShare + o.readShare : 0) > 1) throw new Error("--post-share, --svc-share, --peer-share and --read-share must sum to at most 1");
+  if (o.mentionShare > 1) throw new Error("--mention-share is a share of invocations, at most 1");
   if (o.pgLatencyMs !== undefined && !o.pg) throw new Error("--pg-latency needs --pg");
   if (v.gate !== undefined && v.gate !== "latency" && v.gate !== "pilot") throw new Error(`--gate is latency or pilot, not "${v.gate}"`);
   return o;
@@ -408,13 +412,15 @@ function bucket(prefix: string, d: RateLimit, rate: number): Record<string, stri
 // Hosted requests per second per user, per bucket, at hosted-core's cadence. Tool calls: the agent's
 // op every period. Delivery upkeep (role=subscriber): a renew and a read every 10 s, and up to three
 // requests per delivery (a read on its hint, a renew, a receipt; #845). A DM reaches one session; a
-// post reaches its board's other subscribers; an invocation's reply reaches its invoker; a peer_list or a read reaches no one.
+// post reaches its board's other subscribers; an invocation's reply reaches its invoker, and its mention, if any, the
+// session it names; a peer_list or a read reaches no one.
 export function perUserRate(o: Options): { tools: number; subscriber: number; total: number } {
   const subscribers = Math.max(0, userSessions(o) / o.boards - 1);
   const perUser = userSessions(o) / o.users;
   const tools = perUser / o.periodS;
   const peers = o.serviceWorkers ? o.peerShare + o.readShare : 0;
-  const subscriber = perUser * (0.2 + (1 / o.periodS) * 3 * ((1 - o.postShare - peers) + o.postShare * subscribers));
+  const mentions = o.serviceWorkers ? o.svcShare * o.mentionShare : 0;
+  const subscriber = perUser * (0.2 + (1 / o.periodS) * 3 * ((1 - o.postShare - peers) + o.postShare * subscribers + mentions));
   return { tools, subscriber, total: tools + subscriber };
 }
 
@@ -611,6 +617,13 @@ export function judge(input: JudgeInput) {
     if (unproven.length) fail(`${unproven.length} of ${svcPosts.length} invocations have no authz.decision row allowing service.invoke through a team's binding (e.g. posts ${unproven.slice(0, 5).join(", ")}; service.invoke rows by rule ${JSON.stringify(audit!.rules)})`);
     if (audit!.boardScope !== `service:${SERVICE}` || audit!.boardKind !== "queue") fail(`${SVC_BOARD} is scope ${audit!.boardScope}, kind ${audit!.boardKind}; want service:${SERVICE}, queue`);
   }
+  // Mention accounting (#1518): every invocation that @mentioned another user session reached that session.
+  const mentSent = new Set(finals.flatMap(f => f.mentSent)), mentGot = new Set(finals.flatMap(f => f.mentGot));
+  const mentLost = [...mentSent].filter(id => !mentGot.has(id));
+  if (o.serviceWorkers && o.svcShare > 0 && o.mentionShare > 0) {
+    if (svcSent.size && !mentSent.size) fail(`none of ${svcSent.size} invocations @mentioned a session (--mention-share ${o.mentionShare})`);
+    if (mentLost.length) fail(`${mentLost.length} of ${mentSent.size} invocations' @mentions never reached the session they named (e.g. ${mentLost.slice(0, 5).join(", ")})`);
+  }
   // Proof the reads saw the service's board (#1511): every result named it, and the reads of its posts returned some (a
   // board_read's thread, every time: the invocation and its reply; a snapshot, once invocations have put posts there).
   const svcReads: Record<string, ReadProof> = Object.fromEntries(PROOF_OPS.map(op => [op, finals.reduce((a, f) => {
@@ -644,7 +657,7 @@ export function judge(input: JudgeInput) {
   }
   return {
     tagged, failures: tagged.map(f => f.text), steady, clean, toolSteady, toolPool, clientSteady, erroredAll, sent, recv, lost, lapsed, lapsedFirst, misdelivered, posts, boardRecv,
-    svcSent, svcGot, svcDone, svcLost, svcReads, laneEchoes, heapSlope, meanRss, steadyS, rssGrowth,
+    svcSent, svcGot, svcDone, svcLost, mentSent, mentGot, mentLost, svcReads, laneEchoes, heapSlope, meanRss, steadyS, rssGrowth,
   };
 }
 export type Verdict = ReturnType<typeof judge>;
@@ -678,7 +691,7 @@ async function main() {
   const pgAdmin = o.pg ? openPg(o.pg, { max: 1, applicationName: "gb-loadtest-admin" }) : undefined;
   const pgDbUrl = o.pg ? (() => { const u = new URL(o.pg!); u.pathname = `/${pgName}`; return u.toString(); })() : undefined;
   const log = (s: string) => { console.log(s); appendFileSync(join(o.out, "run.log"), s + "\n"); };
-  log(`loadtest: ${o.sessions} sessions, ${o.users} users, ${o.drivers} drivers, ${o.durationS}s (${o.warmupS}s warm-up), op every ${o.periodS}s, ${o.boards} boards (~${Math.round(o.sessions / o.boards)} subscribers each), post share ${o.postShare}, burst ${o.burst}, churn ${o.churn} every ${o.churnEveryS}s, ${o.serviceWorkers ? `${o.serviceWorkers} service workers, ${o.teams} invoker teams, svc share ${o.svcShare}, peer_list share ${o.peerShare}, read share ${o.readShare}` : "no service"}; ${cpus().length} CPUs, load ${loadavg().map(x => x.toFixed(2)).join(" ")}`);
+  log(`loadtest: ${o.sessions} sessions, ${o.users} users, ${o.drivers} drivers, ${o.durationS}s (${o.warmupS}s warm-up), op every ${o.periodS}s, ${o.boards} boards (~${Math.round(o.sessions / o.boards)} subscribers each), post share ${o.postShare}, burst ${o.burst}, churn ${o.churn} every ${o.churnEveryS}s, ${o.serviceWorkers ? `${o.serviceWorkers} service workers, ${o.teams} invoker teams, svc share ${o.svcShare}, peer_list share ${o.peerShare}, read share ${o.readShare}, mention share ${o.mentionShare}` : "no service"}; ${cpus().length} CPUs, load ${loadavg().map(x => x.toFixed(2)).join(" ")}`);
   log(`run dir: ${o.out}`);
 
   const caps = capsEnv(o);
@@ -747,7 +760,7 @@ async function main() {
       const config: DriverConfig = {
         driver: k, url: `${server.base}/mcp`, sessions: specs.filter(s => s.index % o.drivers === k), addresses,
         periodMs: o.periodS * 1000, postShare: o.postShare, burst: Math.max(1, Math.ceil(o.burst / o.drivers)),
-        svcBoard: o.serviceWorkers ? SVC_BOARD : null, svcShare: o.svcShare, peerShare: o.peerShare, readShare: o.readShare,
+        svcBoard: o.serviceWorkers ? SVC_BOARD : null, svcShare: o.svcShare, peerShare: o.peerShare, readShare: o.readShare, mentionShare: o.mentionShare,
       };
       const proc = Bun.spawn([process.execPath, join(ROOT, "scripts/loadtest_driver.ts")], {
         cwd: ROOT, stdin: "pipe", stdout: "pipe", stderr: Bun.file(join(o.out, `driver-${k}.stderr`)),
@@ -891,7 +904,7 @@ async function main() {
     const refusedAll = Object.fromEntries(Object.entries(refusalsTotal(after)).filter(([, n]) => n > 0));
     const v = judge({ o, windows, connected, connectErrors, finals: drivers.map(d => d.final!), refusedAll, drained, audit, queueSteady });
     failures.push(...v.failures);
-    const { steady, clean, toolSteady, toolPool, clientSteady, erroredAll, sent, recv, lost, misdelivered, posts, boardRecv, svcSent, svcGot, svcDone, svcLost, svcReads, laneEchoes, heapSlope, meanRss, steadyS, rssGrowth } = v;
+    const { steady, clean, toolSteady, toolPool, clientSteady, erroredAll, sent, recv, lost, misdelivered, posts, boardRecv, svcSent, svcGot, svcDone, svcLost, mentSent, mentGot, mentLost, svcReads, laneEchoes, heapSlope, meanRss, steadyS, rssGrowth } = v;
     // Every undelivered id ("sender:seq", the body's `lt|dm|<sender>|<seq>|...`), for classifying against a --keep-db database (#942).
     // Written even when empty, so a reused --out dir never keeps an earlier run's list.
     writeFileSync(join(o.out, "lost-dms.json"), JSON.stringify(lost) + "\n");
@@ -903,7 +916,7 @@ async function main() {
       toolSteadyAll: toolPool.count ? { count: toolPool.count, fastShare: toolPool.fast / toolPool.count } : null,
       clientSteady: Object.fromEntries(Object.entries(clientSteady).map(([op, h]) => [op, { count: h.count, fastShare: fastShare(h), p99Le: p99Edge(h), mean: h.sum / Math.max(1, h.count), errors: h.errors }])),
       dms: { sent: sent.size, received: recv.size, lost: lost.length }, lapsedLeases: { count: v.lapsed, first: v.lapsedFirst }, misdelivered, posts, boardDeliveries: boardRecv,
-      service: o.serviceWorkers ? { name: SERVICE, board: SVC_BOARD, workers: o.serviceWorkers, teams: o.teams, invocations: svcSent.size, reachedLane: svcGot.size, replied: svcDone.size, lost: svcLost.length, laneEchoes, teamAllowed: audit!.teamAllowed.size, rules: audit!.rules, boardScope: audit!.boardScope, reads: svcReads } : null,
+      service: o.serviceWorkers ? { name: SERVICE, board: SVC_BOARD, workers: o.serviceWorkers, teams: o.teams, invocations: svcSent.size, reachedLane: svcGot.size, replied: svcDone.size, lost: svcLost.length, mentions: { sent: mentSent.size, received: mentGot.size, lost: mentLost.length }, laneEchoes, teamAllowed: audit!.teamAllowed.size, rules: audit!.rules, boardScope: audit!.boardScope, reads: svcReads } : null,
       rss: { meanMB: meanRss / 2 ** 20, growthMB: rssGrowth / 2 ** 20, gated: o.rssGate }, heapGrowthMB: heapSlope * steadyS / 2 ** 20,
       lag: { windows: lagP99.length, p99Max: Math.max(0, ...lagP99), p99Median: lagP99.sort((a, b) => a - b)[Math.floor(lagP99.length / 2)] ?? null },
       drained, hostedRowsAfter: rows, refusals: refusedAll, clientErrors: erroredAll, queueSteady, pgLatencyMs: o.pgLatencyMs ?? null, failures,
