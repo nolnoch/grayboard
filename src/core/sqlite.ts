@@ -1,6 +1,11 @@
 import { Database, SQLiteError } from "bun:sqlite";
 
-const BUSY_TIMEOUT_MS = 5000;
+// Test-only (#1589): BUS_TEST_BUSY_TIMEOUT_MS raises the wait for forced-overlap children under load; it can't lower it.
+export function busyTimeoutMs(value = process.env.BUS_TEST_BUSY_TIMEOUT_MS): number {
+  const n = Number(value);
+  return Number.isInteger(n) && n > 5000 ? Math.min(n, 60_000) : 5000;
+}
+const BUSY_TIMEOUT_MS = busyTimeoutMs();
 
 type CommitEffect = () => void | Promise<void>;
 const effects = new WeakMap<Database, CommitEffect[][]>();

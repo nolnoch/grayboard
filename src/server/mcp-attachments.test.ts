@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { openDatabase } from "./db.ts";
 import { createOAuthServer } from "./oauth.ts";
 import { createMcpAttachments } from "./mcp-attachments.ts";
+import { S3StoreError } from "./s3_blobs.ts";
 import { queueFor } from "./store/queue.ts";
 import { UploadGate } from "./uploads.ts";
 import { createApplication } from "./application.ts";
@@ -353,6 +354,34 @@ test("unexpected storage and authorization faults remain redacted 500", async ()
   expect(count()).toBe(0);
   stubAuthRead(store.repo, "findActiveAccess", () => () => { throw new Error("private SQL"); });
   expect((await send()).status).toBe(500);
+});
+
+// #1608: the client's 500 stays bare; stderr gets one hosted diagnostic line (#386: class and code only, never the
+// message). Refusals log nothing. Other lines (a timer's) pass through to stderr and aren't counted.
+test("a storage fault's 500 logs exactly one diagnostic line without its message; a refusal logs none", async () => {
+  const lines: string[] = [];
+  const original = console.error.bind(console);
+  const log = spyOn(console, "error").mockImplementation((message: unknown, ...rest: unknown[]) => {
+    if (String(message).includes('"operation":"attachments.')) lines.push(String(message)); else original(message, ...rest);
+  });
+  const put = store.repo.blobs.put;
+  try {
+    store.repo.blobs.put = async () => { throw new S3StoreError("S3 put on s3://bucket/p/: InternalError: secret", "InternalError"); };
+    const response = await send();
+    expect(response.status).toBe(500);
+    expect(await response.text()).not.toContain("InternalError");
+    expect(lines).toEqual(['[grayboard] {"operation":"attachments.upload","category":"failure","level":"error","class":"S3StoreError","code":"InternalError"}']);
+    lines.length = 0;
+    store.repo.blobs.put = put;
+    const id = await uploaded();
+    store.repo.blobs.get = async () => { throw new Error("secret /blob/path"); };
+    expect((await send(request("GET", `/hosted/mcp/attachments/${id}?identity=be`))).status).toBe(500);
+    expect(lines).toEqual(['[grayboard] {"operation":"attachments.download","category":"failure","level":"error","class":"Error"}']);
+    lines.length = 0;
+    expect((await send(request("POST", undefined, bytes, "not-a-token"))).status).toBe(401);
+    expect((await send(request("GET", "/hosted/mcp/attachments/999?identity=be"))).status).toBe(404);
+    expect(lines).toEqual([]);
+  } finally { log.mockRestore(); }
 });
 
 test("shutdown cancels quota and body waiters and settles before caller closes DB", async () => {

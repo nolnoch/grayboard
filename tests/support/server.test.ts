@@ -7,6 +7,7 @@ import { join } from "node:path";
 import * as pgRepo from "../../src/server/pg_repo.ts";
 import { describePg, pgDatabase, PG_URL, pgUrl } from "./pg.ts";
 import { ServerProcess, TestServer } from "./server.ts";
+import { startFakeSts } from "./fake_sts.ts";
 
 const ROOT = join(import.meta.dir, "../..");
 
@@ -46,6 +47,39 @@ test("a server opened with an injected repo can't be restarted onto its placehol
     await expect(TestServer.open({}, { reuse: srv })).rejects.toThrow("a server opened with an injected repo can't be reused");
   } finally {
     await donor.stop();
+  }
+});
+
+// #1609: a startup the attachment store's STS exchange refuses (403) names the attachment store, never the database.
+// The store is S3 by web identity against a loopback STS; its S3 endpoint is never reached.
+async function stsRefusedStartup(store: { dbPath: string } | { url: string }): Promise<string> {
+  const sts = startFakeSts();
+  const dir = mkdtempSync(join(tmpdir(), "gb-sts-startup-"));
+  try {
+    sts.refuse({ status: 403, code: "AccessDenied", message: "Not authorized to perform sts:AssumeRoleWithWebIdentity" });
+    writeFileSync(join(dir, "token"), "projected-token");
+    const env = {
+      GRAYBOARD_BLOB_DIR: "", GRAYBOARD_BLOB_S3_BUCKET: "gb-attachments", GRAYBOARD_BLOB_S3_REGION: "us-east-1", GRAYBOARD_BLOB_S3_ENDPOINT: "http://127.0.0.1:1",
+      AWS_WEB_IDENTITY_TOKEN_FILE: join(dir, "token"), AWS_ROLE_ARN: "arn:aws:iam::123456789012:role/grayboard", AWS_ENDPOINT_URL_STS: sts.endpoint,
+    };
+    const message = await ServerProcess.start([process.execPath, join(ROOT, "src/server/main.ts")], store, env).then(() => "listened", (e: Error) => e.message);
+    expect(sts.requests).toHaveLength(1);
+    return message;
+  } finally {
+    sts.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test("#1609: on sqlite, an STS refusal at startup names the attachment store, not the database", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "gb-sts-sqlite-"));
+  try {
+    const message = await stsRefusedStartup({ dbPath: join(dir, "bus.db") });
+    expect(message).toContain("grayboard server: startup failed: Error: attachment store s3://gb-attachments/");
+    expect(message).toContain("HTTP 403 AccessDenied");
+    expect(message).not.toContain("opening ");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
   }
 });
 
@@ -175,5 +209,9 @@ testSqlite("file only", () => { console.log("RAN file only"); });
     expect(refused).toContain("grayboard server: database not reachable (ERR_POSTGRES_CONNECTION_REFUSED");
     expect(refused).toContain("startup failed: opening postgres 127.0.0.1:1/grayboard: Error: the database did not answer within 1 s");
     expect(refused).not.toContain("s3cret");
+    // #1609: an attachment store refused before the database opens doesn't read as a database problem.
+    const sts = await stsRefusedStartup({ url: db.url });
+    expect(sts).toContain("grayboard server: startup failed: Error: attachment store s3://gb-attachments/");
+    expect(sts).not.toContain("opening postgres");
   });
 });
