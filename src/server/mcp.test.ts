@@ -2255,11 +2255,11 @@ const cutLines = () => {
 
 // A call held in the write queue past its deadline is the server's cut (a line Bun's idle cut would have made
 // client_aborted), answered 503, and its write never runs. Mutation: report() without the deadline arm logs client_aborted.
-test("a call past its request deadline in the write queue logs server_cut with cut deadline and answers 503 (#1591)", async () => {
-  await deadlined(300);
-  const statuses: number[] = [];
+for (const version of ["2026-07-28", "2025-11-25"]) test(`${version}: a call past its request deadline in the write queue logs server_cut with cut deadline and answers 503 (#1591)`, async () => {
+  await deadlined(1000);
+  const statuses: string[] = [];
   let target = false;
-  const client = await connect(undefined, async response => { if (target) statuses.push(response.status); });
+  const client = await connect(version, async (response, request) => { if (target) statuses.push(`${request.method} ${response.status}`); });
   const log = cutLines();
   const hold = holdWrites(store.repo);
   try {
@@ -2272,12 +2272,13 @@ test("a call past its request deadline in the write queue logs server_cut with c
     await hold.done;
     log.restore();
   }
-  expect(statuses).toEqual([503]);
+  // The legacy client's GET stream, opened as the hold began, waits behind it too and is cut the same way.
+  expect(statuses.filter(s => s.startsWith("POST"))).toEqual(["POST 503"]);
+  expect(statuses.every(s => s.endsWith(" 503"))).toBe(true);
   expect(log.lines.filter(l => l.includes("hosted MCP failed") || l.includes("hosted MCP client aborted"))).toEqual([]);
   const cut = log.lines.filter(l => l.includes("hosted MCP request cut by server"));
-  expect(cut).toHaveLength(1);
-  expect(cut[0]).toContain('"category":"server_cut"');
-  expect(cut[0]).toContain('"cut":"deadline"');
+  expect(cut).toHaveLength(statuses.length);
+  for (const line of cut) { expect(line).toContain('"category":"server_cut"'); expect(line).toContain('"cut":"deadline"'); }
   await drained(store.repo);
   expect(await rows(store.repo, "SELECT name FROM boards WHERE name = 'late'")).toEqual([]);
 });
@@ -2285,7 +2286,7 @@ test("a call past its request deadline in the write queue logs server_cut with c
 // The deadline starts once the body is read: a body that keeps arriving past it is never cut. Mutation: arming the timer
 // before readBody cuts this call.
 test("a POST whose body keeps streaming past the deadline isn't cut (#1591)", async () => {
-  await deadlined(200);
+  await deadlined(1000);
   const dribble = (request: Request) => {
     if (request.method !== "POST" || !request.body) return request;
     const source = request.body;
@@ -2293,7 +2294,7 @@ test("a POST whose body keeps streaming past the deadline isn't cut (#1591)", as
       async start(controller) {
         const bytes = new Uint8Array(await new Response(source).arrayBuffer());
         const step = Math.ceil(bytes.length / 6);
-        for (let i = 0; i < bytes.length; i += step) { controller.enqueue(bytes.subarray(i, i + step)); await Bun.sleep(100); }
+        for (let i = 0; i < bytes.length; i += step) { controller.enqueue(bytes.subarray(i, i + step)); await Bun.sleep(300); }
         controller.close();
       },
     });
@@ -2306,7 +2307,7 @@ test("a POST whose body keeps streaming past the deadline isn't cut (#1591)", as
     slow = true;
     const started = performance.now();
     const result = await client.callTool({ name: "board_create", arguments: { name: "slow", purpose: "a slow upload" } });
-    expect(performance.now() - started).toBeGreaterThan(400);
+    expect(performance.now() - started).toBeGreaterThan(1500);
     expect(result.isError).not.toBe(true);
   } finally { log.restore(); }
   expect(log.lines.filter(l => l.includes("hosted MCP"))).toEqual([]);
@@ -2315,7 +2316,7 @@ test("a POST whose body keeps streaming past the deadline isn't cut (#1591)", as
 // The deadline is disarmed once the response starts: a listen stream outlives it and still delivers. Mutation: clearing
 // the timer only when the stream ends cuts the listen at the deadline.
 test("a listen stream outlives the request deadline and still delivers (#1591)", async () => {
-  await deadlined(200);
+  await deadlined(1000);
   const client = await connect();
   expect((await client.callTool({ name: "board_create", arguments: { name: "stream", purpose: "deadline" } })).isError).not.toBe(true);
   const hints: string[] = [];
@@ -2324,7 +2325,7 @@ test("a listen stream outlives the request deadline and still delivers (#1591)",
   try {
     const listen = await client.listen({ resourceSubscriptions: ["grayboard://boards/stream"] });
     await untilHosted(() => hosted.activeListens === 1);
-    await Bun.sleep(600); // three deadlines: the time passing is what's under test
+    await Bun.sleep(2500); // past two deadlines: the time passing is what's under test
     expect(hosted.activeListens).toBe(1);
     expect((await client.callTool({ name: "board_post", arguments: { board: "stream", body: "after the deadline" } })).isError).not.toBe(true);
     await until(() => hints.includes("grayboard://boards/stream"), 5_000, "the post's hint on the listen");

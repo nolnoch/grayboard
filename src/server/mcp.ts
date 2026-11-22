@@ -178,7 +178,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
   } });
   const hosted = createHostedSessions(application, { now, caps: caps.sessions, ...(opts.idleSeconds ? { idleSeconds: opts.idleSeconds } : {}), isAuthorized: (principal, r) => oauth.isAuthorized(principal, r) });
   const delivery = createDelivery(hosted, { isAuthorized: (principal, r) => oauth.isAuthorized(principal, r), now, caps: caps.leases });
-  type Exchange = { request: Request; address: string; protocol: string; principal?: number; identity?: string; session?: string; tool?: string; logged?: boolean; failure?: ApplicationError; meta?: unknown; id?: string | number | null; method?: unknown; call?: unknown; refusal?: Response; context?: Context; legacy?: Legacy; lost?: boolean; closedAtFactory?: boolean };
+  type Exchange = { request: Request; address: string; protocol: string; principal?: number; identity?: string; session?: string; tool?: string; logged?: boolean; failure?: ApplicationError; meta?: unknown; id?: string | number | null; method?: unknown; call?: unknown; refusal?: Response; context?: Context; legacy?: Legacy; lost?: boolean; closedAtFactory?: boolean; cutAtFactory?: boolean };
   const exchanges = new AsyncLocalStorage<Exchange>();
   const deadlineHit = (exchange: Exchange | undefined) => exchange?.request.signal.reason instanceof RequestDeadlineError;
   const deadlineMs = opts.requestDeadlineMs ?? REQUEST_DEADLINE_MS;
@@ -802,9 +802,9 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     try {
     const exchange = exchanges.getStore()!;
     if (exchange.context) {
-      if (closed || exchange.request.signal.aborted) { exchange.closedAtFactory = closed; throw closedError(exchange.request); }
+      if (closed || exchange.request.signal.aborted) { exchange.closedAtFactory = closed; exchange.cutAtFactory = true; throw closedError(exchange.request); }
       const principal = await oauth.authenticate(exchange.request, roleScopes(exchange.context.role));
-      if (closed || exchange.request.signal.aborted) { exchange.closedAtFactory = closed; throw closedError(exchange.request); }
+      if (closed || exchange.request.signal.aborted) { exchange.closedAtFactory = closed; exchange.cutAtFactory = true; throw closedError(exchange.request); }
       if (principal instanceof Response) refuse(principal);
     }
     const context = exchange.context ??= await select(exchange.request);
@@ -1077,6 +1077,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
     get dormantLegacySessions() { return legacyDormant.size; },
     get activePosts() { return posts; },
     async fetch(original: Request, address = "unknown"): Promise<Response> {
+      const arrived = performance.now();
       const boundary: Exchange = { request: original, address, protocol: MCP_PROTOCOL_VERSIONS.includes(original.headers.get("Mcp-Protocol-Version") ?? "") ? original.headers.get("Mcp-Protocol-Version")! : "unspecified" };
       if (closed) return new Response("MCP endpoint is closed", { status: 503 });
       if (!permitsOrigin(original.headers.get("Origin"), trustedOrigin)) { logRefusal("origin", boundary); return Response.json({ code: "forbidden", message: "invalid origin" }, { status: 403 }); }
@@ -1111,9 +1112,12 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
       const signal = AbortSignal.any([original.signal, deadline.signal]);
       let timer: ReturnType<typeof setTimeout> | undefined;
       try {
+        // The idle timer runs from the request's last bytes; for a body already in by the time it is read, that is its
+        // arrival, so the wait before the read (authentication, admission) counts against the deadline too.
+        const reading = performance.now();
         const body = post ? await readBody(original, signal) : { request: new Request(original.url, { method: original.method, headers: original.headers, signal }), parsedBody: undefined };
         if (body instanceof Response) { releasePost(); return body; }
-        timer = setTimeout(() => deadline.abort(new RequestDeadlineError()), deadlineMs);
+        timer = setTimeout(() => deadline.abort(new RequestDeadlineError()), Math.max(0, deadlineMs - (reading - arrived)));
         const req = body.request;
         const parsed = body.parsedBody as { id?: string | number | null; method?: unknown; params?: { _meta?: unknown; name?: unknown } } | undefined;
         return await exchanges.run({ ...boundary, request: req, meta: parsed?.params?._meta, id: parsed?.id, method: parsed?.method, call: parsed?.method === "tools/call" ? parsed.params?.name : undefined }, async () => {
@@ -1236,7 +1240,7 @@ export function createHostedMcp(application: Application, oauth: Pick<ReturnType
             }
             // A call its deadline unwound: the SDK answers it 499, or the factory's check 500. 503, as a close's cut, says
             // its write may have committed.
-            if (!closed && deadlineHit(exchange) && (response.status === 499 || response.status === 500)) {
+            if (!closed && deadlineHit(exchange) && (response.status === 499 || response.status === 500 && exchange.cutAtFactory)) {
               report(new RequestDeadlineError(), "hosted-sdk");
               await response.body?.cancel();
               response = deadlineRefusal();
