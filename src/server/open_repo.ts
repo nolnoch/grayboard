@@ -24,6 +24,15 @@ export async function openBlobs(config: Pick<Config, "blobDir" | "blobS3">, opts
   return { blobs };
 }
 
+// A failure of the database half of the open (#1609): main.ts names the store only for this one, so a refused attachment
+// store or STS exchange (which names itself) doesn't read as a database problem. `cause` is the original error.
+export class DatabaseOpenError extends Error {
+  constructor(override readonly cause: unknown) {
+    super((cause as Error)?.message ?? String(cause), { cause });
+    this.name = "DatabaseOpenError";
+  }
+}
+
 // The server's store, opened from config (#807 P3 C11b): SQLite at once; Postgres waits for the database, migrates and starts its auth LISTEN
 // first (pg_repo.ts), so a migration failure fails the open and so the startup. `pool` labels and sizes a Postgres
 // Repo's connections (tests run many servers on one cluster).
@@ -31,8 +40,12 @@ export async function openRepo(config: Config, opts: { now?: () => number; pool?
   const humanReach = config.humanReach ?? "team";
   const blobs = await openBlobs(config);
   const limits = { attachmentLimits: config.attachmentLimits, attachmentUserQuota: config.attachmentUserQuota, ...(opts.now ? { now: opts.now } : {}) };
-  if (config.store.kind === "sqlite") return openDatabase(config.store.path, { ...blobs, sessionEnd: sessionEndPort(humanReach), ...limits }).repo;
-  // A managed database may still be resuming or failing over (#1418): wait for it before migrating.
-  await waitForPg(config.store.url, { seconds: config.databaseConnectSeconds ?? DEFAULT_CONNECT_SECONDS });
-  return makePgRepo(config.store.url, { ...blobs, humanReach, writers: config.databaseWriters ?? DEFAULT_DATABASE_WRITERS, ...limits, ...opts.pool });
+  try {
+    if (config.store.kind === "sqlite") return openDatabase(config.store.path, { ...blobs, sessionEnd: sessionEndPort(humanReach), ...limits }).repo;
+    // A managed database may still be resuming or failing over (#1418): wait for it before migrating.
+    await waitForPg(config.store.url, { seconds: config.databaseConnectSeconds ?? DEFAULT_CONNECT_SECONDS });
+    return await makePgRepo(config.store.url, { ...blobs, humanReach, writers: config.databaseWriters ?? DEFAULT_DATABASE_WRITERS, ...limits, ...opts.pool });
+  } catch (e) {
+    throw new DatabaseOpenError(e);
+  }
 }
