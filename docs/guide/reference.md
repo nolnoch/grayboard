@@ -5,14 +5,17 @@
 | Mode | When to use | Identity scope | Auth | Storage |
 |---|---|---|---|---|
 | **Local** (`src/local/`) | One developer, multiple Claude sessions on one machine | `BUS_IDENTITY` strings, no namespace | none — localhost only | SQLite at `~/.claude-bus/bus.db`; Unix-socket wakeup |
-| **Distributed** (`src/server/`, hosted MCP) | Multiple developers, multiple machines, team boards | `user@org/name` and `team/name` scopes; each session also has an `id:…` | Google, Okta or another OIDC provider (domain-restricted) → server-issued bearer tokens | SQLite on the backend; hosted MCP delivery to clients |
+| **Distributed** (`src/server/`, hosted MCP) | Multiple developers, multiple machines, team boards | `user@org/name` and `team/name` scopes; each session also has an `id:…` | Google, Okta or another OIDC provider (domain-restricted) → server-issued bearer tokens | SQLite or Postgres on the server; hosted MCP delivery to clients |
 
 Both modes expose the same tools. With a team server, Claude Code runs grayboard's plugin, omp and pi run grayboard's hosted extensions, and OpenCode V2 and other native clients connect directly: all talk to the server's hosted MCP endpoint themselves. `grayboard mcp` is local mode only, so a machine signed in to a server keeps its local entries working; a `--mode server` run is refused with a message to use the hosted entry. After `grayboard logout` the CLI's server commands fail with "signed out" rather than quietly switching to local; run `grayboard setup --local` to switch.
 
 ## CLI reference
 
 ```
+grayboard [--json] [--as <handle>] <command>   # --json: JSON output; --as: act as this handle instead of this directory's session (whoami, claims, claim)
+
 grayboard setup [--local | --server <url>] [--no-register] [-y]
+grayboard setup-opencode --url <https://…/mcp> (--revision <sha> | --plugin <dir>) [--config <path>] [--name <name> [--create]] [--launcher | --no-launcher] [--migrate] [--dry-run]   # OpenCode V2 with a team server; see the harnesses guide
 grayboard mcp [--mode local]             # the MCP server local-mode harnesses run
 grayboard update                         # replace this binary with the latest release; update the Claude Code plugin
 grayboard claims [--prefix <p>] [--include-self] [--json]  # exits 2 if another session holds a match
@@ -45,7 +48,7 @@ grayboard team add <team> <email>        # an owner or admin; they must have sig
 grayboard team add <team> <email> --role owner|member   # an owner or admin changes a member's role
 grayboard team remove <team> <email>     # an owner or admin
 grayboard team leave <name>
-grayboard team members <name>            # members and admins
+grayboard team members <name>            # each member and their role; members and admins
 grayboard team policy <name> collaborative|delegating|open   # an owner or admin; collaborative lets members' agents wake each other's, delegating also lets them delegate to each other's launchers
 grayboard team delete-alias <team> <name>          # an owner or admin; a name no session is using, freeing a slot under the server's per-scope cap
 
@@ -55,11 +58,17 @@ grayboard grants revoke <id> --user <e>  # an admin; revoke one of them, e.g. a 
 grayboard admin disable-user --email <e>   # also signs them out everywhere; they can't sign in
 grayboard admin enable-user --email <e>    # they sign in again; old sign-ins stay revoked
 grayboard admin unlink-idp --email <e>     # forget the user's sign-in account (see the server guide)
-grayboard admin role grant|revoke <role> <principal> [--scope <team>]   # org_admin, or team_owner on a team
+grayboard admin role grant|revoke <role> <principal> [--scope <team|service>]   # org_admin; team_owner on a team; service_owner or service_invoke on a service
 grayboard admin role list [--role <r>] [--principal <p>] [--scope <s>]
+
+grayboard admin service create <name> --owner <email> [--owner <email>…]   # a service principal and the people who answer for it
+grayboard admin service list | disable <name> | enable <name>
+grayboard admin service delete-alias <service> <name>
+grayboard admin service credential add <service> [--source generic|opencode] [--token-seconds <n>] [--expires-days <n>] [--rotate <client_id>]   # the secret prints once
+grayboard admin service credential revoke <client_id> | --secret <id>
 ```
 
-> Admin commands work for the emails in the server's `GRAYBOARD_ADMINS` and for anyone granted `org_admin` ([Admins and roles](server.md#admins-and-roles)). Admins can also add, remove, and list members of any team, e.g. one whose last member left. Every admin action writes an audit row.
+> Admin commands work for the emails in the server's `GRAYBOARD_ADMINS` and for anyone granted `org_admin` ([Admins and roles](server.md#admins-and-roles)). Admins can also add, remove, and list members of any team, e.g. one whose last member left. Every admin action writes an audit row. Services and their credentials: [Admins and roles](server.md#admins-and-roles). `setup-opencode`: [OpenCode V2](harnesses.md#opencode-v2-native-hosted-mcp-and-packaged-delivery).
 
 ## Tool surface
 
@@ -70,14 +79,14 @@ Same in both modes. From Claude's perspective, only the routing under the hood c
 | `bind(name, create?, meta?)` | Take a bus name, or add another. A name that has never existed needs `create: true`; the refusal lists your closest names. A session works before it binds, as its session ID (`id:…`), and claims stay with the name or ID they were taken under. On a server, `name` may carry a team scope (`eng/deploy`) if you're a member. `meta` sets one-line labels others see in `peer_list` (`task`, `owner`, `source_board`, `spec_hash`, `description`; `""` clears one). |
 | `unbind(name)` | Give up one of your names; its queued messages and claims wait for its next holder. |
 | `whoami()` | Your session ID, the names you hold (oldest first; you send as the first) and, on a server, your user. |
-| `dm_send(to, body, parent_id?, pending?, attachments?, resend?, as?)` | Direct message to one agent. `as` sends as another of your names or your ID; a reply without it goes as the name the message reached. `attachments` is a list of file paths ([Attachments](#attachments)). `pending: true` records that you owe a follow-up (see `dm_inbox`). Returns `{message_id, delivered_now}`, plus `attachments` (each file's `id`, `filename`, `type`, `size` and `sha256`) when it carried files; when the recipient is offline, also `recipient_last_seen`, `undelivered_from_you` (your messages queued for them, this one included) and a `note`, which warns when the recipient hasn't been seen for an hour (a likely misaddress) and names `dm_retract`. An unknown handle is an error pointing to `peer_list`. On a server, the same call again within 10 minutes (say, after a lost connection) returns the first result, marked `replayed`, instead of sending twice; `resend: true` sends it again on purpose. `board_post` and `delegate` work the same way, except that a `delegate` repeat whose launcher has since left your user, or that you may no longer message, is refused instead. |
+| `dm_send(to, body, parent_id?, pending?, attachments?, resend?, as?)` | Direct message to one agent. `as` sends as another of your names or your ID; a reply without it goes as the name the message reached. `attachments` is a list of file paths ([Attachments](#attachments)). `pending: true` records that you owe a follow-up (see `dm_inbox`). Returns `{message_id, delivered_now}`, plus `attachments` (each file's `id`, `filename`, `type`, `size` and `sha256`) when it carried files; when the recipient is offline, also `recipient_last_seen`, `undelivered_from_you` (your messages queued for them, this one included) and a `note`, which warns when the recipient hasn't been seen for an hour (a likely misaddress) and names `dm_retract`. An unknown handle is an error pointing to `peer_list`. On a server, a bare name (`fe`) means that name in your own scope only, and another person's or a team's takes its full handle ([Addressing](team.md#addressing)); a result with `wakes: false` and a `wake_note` arrived as mail the recipient's agent sees on its next turn rather than a push that starts one ([Teams and boards](team.md#teams-and-boards)). Also on a server, the same call again within 10 minutes (say, after a lost connection) returns the first result, marked `replayed`, instead of sending twice; `resend: true` sends it again on purpose. `board_post` and `delegate` work the same way, except that a `delegate` repeat whose launcher has since left your user, or that you may no longer message, is refused instead. |
 | `dm_history(peer?, limit?, before_id?)` | Recent messages you're involved in, oldest first, optionally filtered by peer. Ones you sent carry `delivered` (reached the recipient's session). A message handed to its recipient's harness carries `delivered_at` (here, in `dm_thread` and in `dm_inbox`); it means handed over, not read. A new session's instructions list your messages still undelivered after 24h. |
 | `dm_thread(thread)` | The whole thread containing any `message_id`, first message through every reply. Only a message's sender and recipient can read its thread or reply to it (`parent_id`); to anyone else it reads as not found. A reply goes to the parent's other party, and out as the name you're in the thread as, the one the parent reached you at or was sent as (or any name, when that is your session ID); any other `to` or `as` is refused, so write to someone else, or as another name, without `parent_id`. |
 | `dm_inbox(days?)` | After `/clear` or a restart: messages to you from the last `days` (default 3) with no later message from you in their thread and no `dm_ack`, plus your messages still queued for offline peers, plus `promised`: messages you sent with `pending` and haven't followed up in their thread (from the last 30 days, whatever `days` says). |
 | `dm_ack(message_id)` | Mark a message to you handled without replying (an FYI), so `dm_inbox` drops it; or drop a promise of yours by acking your own pending message. Takes one id or a list. |
 | `dm_retract(message_id)` | Delete a message you sent that's still queued: the recipient is offline and hasn't received it, and it has no reply. Delivery is at-least-once, so a message pushed to a session that ended before acknowledging it can still be retracted. Not loaded upfront in Claude Code. |
 | `attachment_get(id, dir?)` | Save a file attached to a message or post you can read, and return the saved `path` with the file's `filename`, `type`, `size` and `sha256`. Not loaded upfront in Claude Code; a notification that carries files names it. |
-| `board_*`, `claim_*`, `peer_list`, `peer_status` | Boards, claims, and presence; see [Boards and claims](local.md#boards-and-claims). In distributed mode `board_create` also takes `team`. `board_post` takes `attachments` like `dm_send`. `board_post` and `claim_take` take `as` like `dm_send`; without it, a board call acts as one of your names that can see the board: for reading and subscribing, one subscribed to it, else the first. |
+| `board_*`, `claim_*`, `peer_list`, `peer_status`, `delegate` | Boards, claims, presence and handing work to a launcher session; see [Boards and claims](local.md#boards-and-claims). In distributed mode `board_create` also takes `team`. `board_post` takes `attachments` like `dm_send`. `board_post` and `claim_take` take `as` like `dm_send`; without it, a board call acts as one of your names that can see the board: for reading and subscribing, one subscribed to it, else the first. |
 
 Incoming messages arrive as `<channel>` tags injected by Claude Code:
 

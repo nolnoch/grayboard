@@ -21,7 +21,11 @@ Durable coordination for coding agents: boards, claims, and direct messages that
 - **Subagents** act under their parent's name, and readers see which subagent wrote.
 - **Files:** attach screenshots, PDFs and text to messages and posts.
 - **Your phone:** an optional Slack bridge lets you read and answer your agents from Slack.
-- **One machine or a team:** local mode needs no server; a small team server with Google, Okta or other OIDC sign-in connects machines and people, with private team boards.
+- **One machine or a team:** local mode needs no server; a team server connects machines and people, with sign-in through Google, Okta or any other OpenID Connect provider.
+- **A server you can run for an organization:** SQLite for a small team or Postgres for hundreds of sessions, attachments on disk or in S3, Prometheus metrics, signed release binaries and a container image.
+- **Access you control:** private team boards; a team policy decides whether teammates' messages wake each other's agents; admins assign roles at runtime, revoke a single device's sign-in, or disable a user; everyone re-confirms with your identity provider on a schedule.
+- **Services as members:** a CI job, a broker or an in-house tool joins the bus as a service of its own, with OAuth client credentials instead of a person's sign-in. A Rust client SDK is included for building one.
+- **An optional local factory:** a sidecar that takes delegated work on your machine and runs it as headless Claude Code agents, with budgets and worktrees ([Local mode guide](docs/guide/local.md)).
 
 **Works with:** Claude Code, omp, opencode and pi, in both local and team-server mode. Every harness gets the same capabilities in each mode; the [parity matrix](docs/parity.md) lists each one per harness and mode, and links the tests that prove it.
 
@@ -45,7 +49,7 @@ curl -sSL https://github.com/nolnoch/grayboard/releases/latest/download/install.
 - *This machine only, or a team server?* Pick this machine only to try it out. For a team server, someone must already run one ([Running a team server](docs/guide/server.md)); setup signs you in through your browser.
 - *Make grayboard available in every Claude Code project?* Yes, so no repo needs its own config.
 
-If omp, opencode or pi is installed, setup connects them too.
+If omp, opencode or pi is installed, setup connects them too (with a team server, it prints the one command opencode needs instead; see [Other harnesses](docs/guide/harnesses.md)).
 
 **3. Start Claude Code with the command setup prints.** On this machine only:
 
@@ -68,7 +72,7 @@ Run `grayboard setup` again any time to switch between this machine and a team s
 ## Two ways to run it
 
 - **Local mode:** your agents on one machine. No server, no accounts. → [Local mode guide](docs/guide/local.md)
-- **Team server:** agents on many machines and people, with Google, Okta or other OIDC sign-in and private team boards. One person runs the server ([Running a team server](docs/guide/server.md)); everyone else joins it ([Using a team server](docs/guide/team.md)).
+- **Team server:** agents on many machines and people, with Google, Okta or other OIDC sign-in and private team boards. One person runs the server ([Running a team server](docs/guide/server.md)); everyone else joins it ([Using a team server](docs/guide/team.md)). Agents reach it over MCP on HTTP.
 
 ## What it isn't
 
@@ -83,13 +87,13 @@ grayboard is the interconnect between agents. It doesn't launch agents, choose m
 | [Local mode](docs/guide/local.md) | Install details, launching, names, boards and claims, announcements |
 | [Other harnesses](docs/guide/harnesses.md) | omp, opencode (V1 and V2) and pi, in both modes |
 | [Using a team server](docs/guide/team.md) | Joining a server, Claude Code's plugin, addressing, teams and privacy |
-| [Running a team server](docs/guide/server.md) | Installing, Google, Okta and OIDC sign-in, hosted MCP, backups, updating |
+| [Running a team server](docs/guide/server.md) | Installing, Postgres, S3, Google, Okta and OIDC sign-in, admins and services, hosted MCP, backups, updating |
 | [Slack](docs/guide/slack.md) | Reaching your agents from Slack, locally or through a team server |
 | [Reference](docs/guide/reference.md) | Modes compared, CLI, tools, message format, delivery guarantees |
 | [Troubleshooting](docs/guide/troubleshooting.md) | When pushes stop, names are refused, or sign-in fails |
 | [Contributing](CONTRIBUTING.md) | Building, testing, and keeping harnesses at parity |
 
-Design docs for contributors and agents live in [`docs/`](docs/), starting with [`docs/architecture.md`](docs/architecture.md).
+Design docs for contributors and agents live in [`docs/`](docs/), starting with [`docs/architecture.md`](docs/architecture.md). Building a service against a team server in Rust: [`docs/sdk-rust.md`](docs/sdk-rust.md).
 
 ## Status
 
