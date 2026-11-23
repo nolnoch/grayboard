@@ -2036,11 +2036,11 @@ describePg("keyed dm_send (Postgres)", () => {
   // A normal exchange: the selection's verdict, then dm_send reusing it (withPrior), keyed in its tool body: counted as
   // the tool site's dm_send keyed, the prior's tool keyed, and one keyed body at the queue's `tool` site. The body's
   // statements are pinned so a later cut changes them on purpose (#1537 C6 among them): to a same-user recipient with
-  // no live holder (isAuthorized stubbed, so fence's authorization reads nothing; fence takes no grant lock), 19
+  // no live holder (isAuthorized stubbed, so fence's authorization reads nothing; fence takes no grant lock), 18
   // statements in 13 round trips: BEGIN; fence's store.lock (the root probe, then the row FOR UPDATE; rootOf reuses
   // them); sendKeyed's disabled read; the recipient's alias find (memoized: aliasHidden and the wake reuse it); dedup's
-  // SAVEPOINT, prune and first claim (one flight); isHuman; the insert; lastSeen, its holder lookup and the
-  // undelivered count (one flight), then the holder's hosted row (#1640, presence.ts); the receipt upsert; RELEASE; the hosted.write audit and the auth-mark read (one flight); COMMIT.
+  // SAVEPOINT, prune and first claim (one flight); isHuman; the insert; lastSeen, its holder's sight (#1640,
+  // presence.ts) and the undelivered count (one flight); the receipt upsert; RELEASE; the hosted.write audit and the auth-mark read (one flight); COMMIT.
   test("dm_send in a normal exchange runs keyed, counted by method, with a pinned statement count", async () => {
     await using db = await pgDatabase({ max: 2 });
     await using x = await leaseInstance(db.url);
@@ -2055,7 +2055,7 @@ describePg("keyed dm_send (Postgres)", () => {
     expect(d()).toEqual({ keyed: 1, miss: 0, skipped: 0 });
     expect(gateCount("tool", "keyed", "dm_send") - method).toBe(1);
     expect(gateCount("prior", "keyed", "tool") - prior).toBe(1);
-    expect({ bodies: now.bodies - at.bodies, statements: now.statements - at.statements, roundTrips: now.roundTrips - at.roundTrips }).toEqual({ bodies: 1, statements: 19, roundTrips: 13 });
+    expect({ bodies: now.bodies - at.bodies, statements: now.statements - at.statements, roundTrips: now.roundTrips - at.roundTrips }).toEqual({ bodies: 1, statements: 18, roundTrips: 13 });
   });
 });
 

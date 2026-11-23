@@ -433,7 +433,7 @@ function lostHolds(it: It): void {
 
 function facts(it: It): void {
   // H7.
-  it("server liveness and the ids facts: aliveAt, setRoot, restateWritesAs, declareLauncher, launcher, reopenId, holds in (bound_at, address) order", async h => {
+  it("server liveness and the ids facts: aliveAt, setRoot, restateWritesAs, declareLauncher, launcher, reopenId, holds in (bound_at, address) order, heldSight", async h => {
     expect(await h.hosted.aliveAt(h.read)).toBeUndefined();
     await h.write(tx => h.hosted.heartbeat(tx, T0));
     expect(await h.hosted.aliveAt(h.read)).toBe(T0);
@@ -466,6 +466,10 @@ function facts(it: It): void {
     await h.seedHold("a/a", "t", T0 + 2);
     await h.seedHold("a/z", "t", T0 + 1);
     expect(await h.hosted.holds(h.read)).toEqual([{ id: "t", address: "a/z" }, { id: "t", address: "a/a" }, { id: "s", address: "a/b" }]);
+    // heldSight (#1640): a held name's holder's hosted row's last_seen_at, each once; a non-hosted holder's or an unheld name absent.
+    await root(h, "s", await h.seedUser(ME), { last_seen_at: T0 + 7 });
+    expect(await h.hosted.heldSight(h.read, ["a/b", "a/z", "a/none", "a/b"])).toEqual(new Map([["a/b", T0 + 7]]));
+    expect(await h.hosted.heldSight(h.read, [])).toEqual(new Map());
   });
 }
 
@@ -528,6 +532,7 @@ function seams(it: It): void {
       ["children", () => h.hosted.children(kept, "r")], ["roots", () => h.hosted.roots(kept, u)], ["expired", () => h.hosted.expired(kept, T0 + 9)],
       ["idle", () => h.hosted.idle(kept, T0 + 9)], ["disabled", () => h.hosted.disabled(kept)], ["lost", () => h.hosted.lost(kept, "r", "agent")],
       ["aliveAt", () => h.hosted.aliveAt(kept)], ["launcher", () => h.hosted.launcher(kept, "r")], ["holds", () => h.hosted.holds(kept)],
+      ["heldSight", () => h.hosted.heldSight(kept, ["a/b"])],
     ];
     for (const [name, call] of calls) expect(`${name}: ${await failure(call)}`).toMatch(new RegExp(`^${name}: .*${settled.source}`));
     // No IDs, no statement: an empty getMany answers even on the finished handle (#1572).

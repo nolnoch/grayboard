@@ -2649,6 +2649,9 @@ function makeHostedStore(db: Database, port: () => SessionEndPort): HostedStoreO
     declareLauncher: async (tx, id) => sqliteOf(tx).query("UPDATE ids SET launcher = 1 WHERE id = ? AND launcher IS NOT 1").run(id).changes > 0,
     launcher: async (r, id) => launcherOf(sqliteOf(r), id),
     holds: async (r) => sqliteOf(r).query<{ id: string; address: string }, []>(`SELECT id, address FROM alias_holds ${HOLD_ORDER}`).all(),
+    heldSight: async (r, addresses) => new Map(addresses.length ? sqliteOf(r).query<{ address: string; at: number }, [string]>(
+      "SELECT a.address, h.last_seen_at AS at FROM alias_holds a JOIN hosted_sessions h ON h.session_id = a.id WHERE a.address IN (SELECT value FROM json_each(?))")
+      .all(JSON.stringify([...new Set(addresses)])).map(x => [x.address, x.at]) : []),
   };
   return store;
 }

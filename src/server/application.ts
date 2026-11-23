@@ -1040,6 +1040,8 @@ export function createApplication(repo: Repo, opts: ApplicationOptions = {}) {
       if (hosted) {
         const row = await repo.hosted.get(sp, u.id);
         if (row) {
+          // The released name's last_seen is its holder's last request, never moved back, as end stamps it (#1640, docs/handles.md §3).
+          if (row.last_seen_at > ((await repo.bindings.lastSeen(sp, [u.address])).get(u.address) ?? 0)) await repo.bindings.touchAlias(sp, u.address, row.last_seen_at);
           // Its last hold gone, the root is unbound but owning: no lease, so the sweep doesn't expire it.
           await repo.hosted.update(sp, u.id, { bind_gen: row.bind_gen + 1, ...((await repo.bindings.holdsOf(sp, u.id)).length ? {} : { lease_deadline: null }) });
           if (row.lease_deadline !== null) writeAudit(repo, sp, "hosted.lease_closed", null, u.id, { reason: "revoked", ownership: row.ownership_id });

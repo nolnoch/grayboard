@@ -1128,3 +1128,19 @@ test("a held name's last_seen follows its holder's requests, after bind and afte
   const sent = await a.call<SendResult>("dm_send", { to: `${B}/fe`, body: "hi" });
   expect(sent).toMatchObject({ delivered_now: false, note: "Recipient offline; will be delivered on their next session." });
 });
+
+// #1640 item 3: a revoked name's last_seen is its holder's last request too, as at end (docs/handles.md §3).
+test("a team name revoked from a live holder keeps its holder's last request as its last_seen", async () => {
+  const bob = await srv.login(B);
+  await srv.login(A);
+  expect((await srv.api(bob, "POST", "/api/teams", { name: "eng" })).status).toBe(201);
+  expect((await srv.api(bob, "POST", "/api/teams/eng/add", { email: A })).status).toBe(200);
+  await srv.hosted(A, "eng/x");
+  const twoHoursAgo = Date.now() - 2 * 3_600_000;
+  await exec(srv, "UPDATE aliases SET last_seen = ? WHERE address = ?", twoHoursAgo, "eng/x");
+  const before = Date.now() - 60_000;
+  expect((await srv.api(bob, "POST", "/api/teams/eng/remove", { email: A })).status).toBe(200);
+  expect(await rows(srv, "SELECT count(*) AS n FROM alias_holds WHERE address = ?", "eng/x")).toEqual([{ n: 0 }]);
+  const [{ last_seen }] = await rows<{ last_seen: number }>(srv, "SELECT last_seen FROM aliases WHERE address = ?", "eng/x");
+  expect(Number(last_seen)).toBeGreaterThan(before);
+});

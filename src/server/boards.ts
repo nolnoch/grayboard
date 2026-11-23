@@ -236,7 +236,7 @@ async function who(
   } else {
     rows = await repo.boards.roster(tx, null);
   }
-  // A held row's last_seen is its holder's last request (#1640, presence.ts): the alias row moves only at bind and end.
+  // A held row's last_seen is its holder's last request (#1640, presence.ts): the alias row moves only at bind, unbind and end.
   const sight = await holderSight(repo, tx, rows.flatMap((r) => (r.id !== null ? [r.id] : [])));
   if (sight.size) rows = rows.map((r) => {
     const at = r.id !== null ? sight.get(r.id) : undefined;

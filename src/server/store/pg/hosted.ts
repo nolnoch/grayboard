@@ -241,7 +241,7 @@ export function makePgHosted({ sessionEnd }: { sessionEnd: PgSessionEndPort }): 
         await sql`INSERT INTO binding_events (session_id, name, event, at, detail) VALUES (${session}, ${address}, 'released', ${now}, ${reason})`;
       }
       // A released name's last_seen is its holder's last request, the row's, never moved back (#1640, docs/handles.md §3).
-      // After the delete, as unbind's touch; end is an exclusive body, so no bind's take holds an alias row meanwhile.
+      // After the delete, as unbind's touch; end is an exclusive body, so no bind's take holds an alias row meanwhile on one process.
       if (holds.length) await sql`UPDATE aliases SET last_seen = ${row.last_seen_at}::int8 WHERE address = ANY(${holds.map(h => h.address)}::text[]) AND last_seen < ${row.last_seen_at}::int8`;
       for (const child of children) if (child.root_session_id) {
         await audit(sql, session, "hosted.child_released", { child: child.session_id, reason }, now);
@@ -319,6 +319,11 @@ export function makePgHosted({ sessionEnd }: { sessionEnd: PgSessionEndPort }): 
       return row?.launcher === true;
     },
     // core HOLD_ORDER.
+    heldSight: async (r: Read, addresses: readonly string[]) => {
+      if (!addresses.length) return new Map<string, number>();
+      const rows: { address: string; at: unknown }[] = await pgOf(r)`SELECT a.address, h.last_seen_at AS at FROM alias_holds a JOIN hosted_sessions h ON h.session_id = a.id WHERE a.address = ANY(${[...new Set(addresses)]}::text[])`;
+      return new Map(rows.map(x => [x.address, int8(x.at)]));
+    },
     holds: async (r: Read) => (await pgOf(r)`SELECT id, address FROM alias_holds ORDER BY bound_at, address`)
       .map((h: Row) => ({ id: h.id as string, address: h.address as string })),
   };
