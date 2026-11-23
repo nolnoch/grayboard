@@ -15,6 +15,8 @@ import { runCli } from "../support/cli.ts";
 import { SdkError, SdkErrorCode, SdkHttpError } from "@modelcontextprotocol/client";
 import { ServerUnreachable } from "../../adapters/hosted-core/src/wire.ts";
 import { errorClass } from "../../scripts/loadtest_errors.ts";
+import { DASH_VIEWS, dedupBound, judgeDashboard, optionalViews, type DashResult, type DashRow } from "../../scripts/loadtest_dashboard.ts";
+import { ADMIN_ROW_WINDOW_MS } from "../../src/server/admin_api.ts";
 
 const ROOT = resolve(import.meta.dir, "../..");
 
@@ -227,7 +229,8 @@ describe("loadtest write-queue report (#1510)", () => {
 // #1537: the pilot gate, judged on synthetic windows. The base fleet passes the pilot bar and fails the latency one: every
 // tool call and client op is 80% at ≤ 100 ms and 100% at ≤ 1 s, and the world stop is 50%.
 describe("loadtest pilot gate (#1537)", () => {
-  const argv = ["--sessions", "300", "--users", "100", "--period", "6", "--duration", "60", "--warmup", "10", "--service-workers", "0"];
+  // The dashboard leg is judged on its own (below); these fleets run without it.
+  const argv = ["--sessions", "300", "--users", "100", "--period", "6", "--duration", "60", "--warmup", "10", "--service-workers", "0", "--dashboard-period", "0"];
   // n calls: `fast` at 0.05 s, up to `sec` at 0.5 s, the rest at 2 s, as the driver's cumulative buckets count them.
   const hist = (n: number, fast: number, sec: number): Hist => ({ buckets: BUCKETS.map(le => le < 0.05 ? 0 : le < 0.5 ? fast : le < 2.5 ? sec : n), count: n, sum: 0, errors: 0 });
   const CLIENT_OPS = ["inbox", "renew", "receipt", "dm_send", "board_post"];
@@ -346,6 +349,18 @@ describe("loadtest pilot gate (#1537)", () => {
 
   // The latency bar is the one the run always had: the same fleet fails on every 100 ms check, worded as before, and the
   // world stop isn't gated. Mutation: the edge picked from the pilot bar regardless of --gate.
+  test("a run with the dashboard leg on fails without its result, and its latency miss counts against the p99 item", () => {
+    const on = ["--gate", "pilot", "--dashboard-period", "1"];
+    expect(judge({ ...base(on) }).failures).toEqual(["dashboard: the leg never ran"]);
+    const views = Object.fromEntries(DASH_VIEWS.map(v => [v.view, { buckets: BUCKETS.map(le => le < 1 ? 0 : 20), count: 20, sum: 0, errors: 0 }]));
+    const slow: DashResult = { periodMs: 1000, polls: 60, requests: 0, errors: {}, firstErrors: [], firstAt: 0, lastAt: 59_000, skipped: {}, views };
+    const reads: DashRow[] = [{ action: "admin.read", target: "x", route: null, view: "thread", allow: null }];
+    // Every request at 1 s: within the pilot edge, past the latency bar's.
+    expect(judge({ ...base(on), dashboard: { result: slow, rows: reads } }).failures).toEqual([]);
+    const latency = judge({ ...base(["--dashboard-period", "1"]), dashboard: { result: slow, rows: reads } });
+    expect(latency.tagged.filter(f => f.text.startsWith("dashboard"))).toEqual([{ text: expect.stringMatching(/^dashboard: 0\.00% of 340 requests at ≤ 100 ms/), item: "p99" }]);
+  });
+
   test("the latency bar is unchanged", () => {
     const i = base([]);
     i.queueSteady = stop(0.99);
@@ -374,7 +389,7 @@ async function run(extra: string[]): Promise<{ code: number; out: string; summar
     // runCli kills the whole process group on timeout: the coordinator, its drivers and the server.
     const { code, out, err } = await runCli([join(ROOT, "scripts/loadtest.ts"),
       "--sessions", "8", "--service-workers", "2", "--svc-share", "0.2", "--peer-share", "0.1", "--read-share", "0.3", "--mention-share", "0.5", "--users", "2", "--drivers", "2", "--duration", "14", "--warmup", "2", "--window", "2",
-      "--period", "1", "--boards", "2", "--post-share", "0.2", "--churn", "0.5", "--churn-every", "5", "--grace", "1",
+      "--period", "1", "--boards", "2", "--post-share", "0.2", "--churn", "0.5", "--churn-every", "5", "--grace", "1", "--dashboard-period", "1",
       "--out", dir, ...extra], { bin: process.execPath, cwd: ROOT, env: { PATH: process.env.PATH ?? "" }, timeoutMs: 60_000 });
     let summary: any;
     try { summary = JSON.parse(readFileSync(join(dir, "summary.json"), "utf8")); } catch { summary = undefined; }
@@ -383,6 +398,77 @@ async function run(extra: string[]): Promise<{ code: number; out: string; summar
     rmSync(dir, { recursive: true, force: true });
   }
 }
+
+describe("loadtest dashboard leg (#1651)", () => {
+  // n requests: `fast` of them at 25 ms, the rest at 0.25 s.
+  const hist = (n: number, fast: number): Hist => ({ buckets: BUCKETS.map(le => le < 0.025 ? 0 : le < 0.25 ? fast : n), count: n, sum: 0, errors: 0 });
+  // 20 polls at 1 s, every view answered at 25 ms.
+  const result = (over: Partial<DashResult> = {}): DashResult => ({
+    periodMs: 1000, polls: 20, requests: 20 * DASH_VIEWS.length, errors: {}, firstErrors: [], firstAt: 0, lastAt: 19_000, skipped: {},
+    views: Object.fromEntries(DASH_VIEWS.map(v => [v.view, hist(20, 20)])),
+    ...over,
+  });
+  // One gate allow per route and target (role-bindings asked for three targets).
+  const gateRows = (n = 1): DashRow[] => [...new Set(DASH_VIEWS.map(v => `/api/admin/${v.route}`))].flatMap(route =>
+    (route.endsWith("role-bindings") ? ["a", "b", "c"] : ["t"]).flatMap(target => Array.from({ length: n }, () => ({ action: "authz.decision" as const, target, route, view: null, allow: true }))));
+  const reads = (n = 1): DashRow[] => ["thread", "conversation"].flatMap(view => Array.from({ length: n }, () => ({ action: "admin.read" as const, target: `${view}-target`, route: null, view, allow: null })));
+  const judged = (r: DashResult, rows: DashRow[] = [...gateRows(), ...reads()], optional?: Set<string>) => judgeDashboard(r, rows, 20_000, 0.1, "≤ 100 ms", tooSlow, optional).map(f => f.text);
+
+  test("a dashboard that kept its cadence, answered fast and wrote one row per key passes", () => {
+    expect(judged(result())).toEqual([]);
+  });
+
+  test("each miss fails alone: cadence, a view never answered, an error, the latency pool, a deny, a key over the bound", () => {
+    expect(judged(result({ polls: 15 }))).toEqual(["dashboard: 15 polls; want ≥ 80% of 20 (one per 1 s)"]);
+    const { thread: _, ...noThread } = result().views;
+    expect(judged(result({ views: noThread, skipped: { thread: 20 } }))).toEqual(["dashboard thread: no request answered (no target in 20 polls)"]);
+    expect(judged(result({ errors: { "users:500": 1 }, firstErrors: ["users: HTTP 500"] }))[0]).toMatch(/^dashboard errors: \{"users:500":1\} \(e\.g\. users: HTTP 500\)$/);
+    // 340 requests may hold 4 slow ones (1% rounded up); 5 fail the pool.
+    expect(judged(result({ views: { ...result().views, users: hist(20, 15) } }))[0]).toMatch(/^dashboard: 98\.53% of 340 requests at ≤ 100 ms/);
+    expect(judged(result({ views: { ...result().views, users: hist(20, 16) } }))).toEqual([]);
+    expect(judged(result(), [...gateRows(), ...reads(), { action: "authz.decision", target: null, route: "/api/admin/users", view: null, allow: false }])).toEqual(["dashboard: 1 gate denies for the dashboard admin (e.g. /api/admin/users)"]);
+    // One gate row per route and target per window: a second for the same key is over, one for another target isn't.
+    expect(judged(result(), [...gateRows(), ...reads(), { action: "authz.decision", target: "t", route: "/api/admin/users", view: null, allow: true }])[0]).toMatch(/gate \/api\/admin\/users t: 2 rows/);
+    expect(judged(result(), [...gateRows(), ...reads(), { action: "authz.decision", target: "u", route: "/api/admin/users", view: null, allow: true }])).toEqual([]);
+    expect(judged(result(), [...gateRows(), ...reads(2)])[0]).toMatch(/admin\.read thread thread-target: 2 rows/);
+    expect(judged(result(), gateRows())).toEqual(["dashboard: no admin.read row for the thread or conversation it opened"]);
+  });
+
+  // A run without the service has no team, and one without posts no thread: those views go unanswered by design
+  // (audit M1). Mutation: every view required whatever the mix.
+  test("a view the run's mix can't give a target may go unanswered; any other may not", () => {
+    const { team: _t, "team-bindings": _b, ...noTeam } = result().views;
+    const teamless = result({ views: noTeam, skipped: { team: 20, "team-bindings": 20 } });
+    expect(judged(teamless, undefined, optionalViews(false, true))).toEqual([]);
+    expect(judged(teamless, undefined, optionalViews(true, true))).toEqual(["dashboard team: no request answered (no target in 20 polls)", "dashboard team-bindings: no request answered (no target in 20 polls)"]);
+    const { thread: _r, ...noThread } = result().views;
+    expect(judged(result({ views: noThread, skipped: { thread: 20 } }), undefined, optionalViews(true, false))).toEqual([]);
+    expect([...optionalViews(false, false)].sort()).toEqual(["team", "team-bindings", "thread"]);
+  });
+
+  // Only the latency pool is the pilot's p99 item; a missed cadence is another check (audit L1).
+  test("a missed cadence is an untagged failure, the latency pool a p99 one", () => {
+    const tags = (r: DashResult) => judgeDashboard(r, [...gateRows(), ...reads()], 20_000, 0.1, "≤ 100 ms", tooSlow).map(f => f.item ?? "other");
+    expect(tags(result({ polls: 15 }))).toEqual(["other"]);
+    expect(tags(result({ views: { ...result().views, users: hist(20, 15) } }))).toEqual(["p99"]);
+  });
+
+  test("the dedup bound is one row per window the polling spans, plus its first", () => {
+    expect([dedupBound(0), dedupBound(ADMIN_ROW_WINDOW_MS - 1), dedupBound(ADMIN_ROW_WINDOW_MS), dedupBound(3.5 * ADMIN_ROW_WINDOW_MS)]).toEqual([1, 1, 2, 4]);
+    // An hour's run spans six windows: each route and target may write seven rows.
+    expect(judged(result({ lastAt: 60 * 60_000 }), [...gateRows(7), ...reads(7)])).toEqual([]);
+    expect(judged(result({ lastAt: 60 * 60_000 }), [...gateRows(8), ...reads()])[0]).toMatch(/over the dedup bound \(7 per route and target\)/);
+    // The span runs to the last poll's end: a last poll that started just short of a window and ended past it allows
+    // the row its late requests wrote (audit L3).
+    const lastAt = 2 * ADMIN_ROW_WINDOW_MS - 500;
+    expect(judged(result({ lastAt }), [...gateRows(3), ...reads()])[0]).toMatch(/over the dedup bound \(2 per route and target\)/);
+    expect(judged(result({ lastAt, lastEndAt: lastAt + 1000 }), [...gateRows(3), ...reads()])).toEqual([]);
+  });
+
+  test("the leg runs in every profile at the page's 10 s, and --dashboard-period 0 turns it off", () => {
+    expect([options([]).dashPeriodS, options(["--quick"]).dashPeriodS, options(["--dashboard-period", "0"]).dashPeriodS]).toEqual([10, 10, 0]);
+  });
+});
 
 describe("loadtest run", () => {
   test("a small fleet with churn passes every gate and drains to zero", async () => {
@@ -421,6 +507,13 @@ describe("loadtest run", () => {
     // Mention resolution on the service board (#1518): some invocations named another user session, which was told.
     expect(svc.mentions.sent, r.out).toBeGreaterThan(0);
     expect({ received: svc.mentions.received >= svc.mentions.sent, lost: svc.mentions.lost }).toEqual({ received: true, lost: 0 });
+    // The dashboard leg (#1651 D6) polled every view throughout, every answer a 200, and its polling wrote one gate row
+    // per route and target and one admin.read per content view: the run's span is inside one dedup window.
+    const dash = r.summary.dashboard;
+    expect(dash.polls, r.out).toBeGreaterThanOrEqual(10);
+    expect(dash.errors).toEqual({});
+    expect(Object.keys(dash.views).sort()).toEqual(DASH_VIEWS.map(v => v.view).sort());
+    expect(dash.rows).toEqual({ gate: DASH_VIEWS.length, adminRead: 2, bound: 1 });
   }, 90_000);
 
   test("with no invocations the reads still rotate: board_list, the snapshot and the catalog each run and see the board", async () => {
