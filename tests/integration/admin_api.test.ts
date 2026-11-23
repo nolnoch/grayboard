@@ -47,7 +47,7 @@ describe("gate", () => {
     expect((await srv.api(a, "GET", "/api/admin/claims")).status).toBe(403);
   });
 
-  test("a write route under /api/admin/ still writes its allow every time", async () => {
+  test("a non-dashboard route under /api/admin/ still writes its allow every time", async () => {
     const root = await srv.login(ROOT);
     for (let i = 0; i < 2; i++) expect((await srv.api(root, "GET", `/api/admin/roles`)).status).toBe(200);
     expect((await gateRows("/api/admin/roles")).length).toBe(2);
@@ -101,6 +101,17 @@ describe("reads", () => {
     expect(c.body.rows.map((m: { id: number; body: string }) => [m.id, m.body])).toEqual([[m2, "secret two"], [m1, "secret one"]]);
     expect((await srv.api(root, "GET", "/api/admin/conversation?a=fe&b=be")).status).toBe(200);
     expect((await audits("admin.read")).map(r => [r.target, r.detail.view])).toEqual([["be fe", "conversation"]]);
+  });
+
+  test("an empty conversation writes no admin.read, and a long pair's gate target is clipped", async () => {
+    const root = await srv.login(ROOT);
+    const long = "x".repeat(5000);
+    const r = await srv.api(root, "GET", `/api/admin/conversation?a=nobody&b=${long}`);
+    expect(r.status).toBe(200);
+    expect(r.body.rows).toEqual([]);
+    await drained(srv);
+    expect(await audits("admin.read")).toEqual([]);
+    for (const row of await audits("authz.decision")) expect(String(row.target ?? "").length).toBeLessThanOrEqual(256);
   });
 
   test("audit pages newest first under a filter with an (at, id) cursor", async () => {
