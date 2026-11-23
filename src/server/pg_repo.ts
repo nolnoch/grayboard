@@ -22,6 +22,7 @@ import { makePgBindings } from "./store/pg/bindings.ts";
 import { makePgBoards } from "./store/pg/boards.ts";
 import { makePgClaims } from "./store/pg/claims.ts";
 import { makePgCursors } from "./store/pg/cursors.ts";
+import { makePgAdmin } from "./store/pg/admin.ts";
 import { makePgDelegation } from "./store/pg/delegation.ts";
 import { makePgHosted } from "./store/pg/hosted.ts";
 import { deferredSessionEnd, makePgHostedEnds } from "./store/pg/hosted_port.ts";
@@ -183,6 +184,7 @@ export async function makePgRepo(url: string, opts: PgRepoOptions): Promise<PgRe
     coreOn() { throw new Error("coreOn on a Postgres Repo: core's helpers run SQLite statements"); },
     close,
     cursors: makePgCursors(),
+    admin: makePgAdmin(),
     audit: makePgAudit(),
     slack: makePgSlack({ clock }),
     writeReceipts: makePgWriteReceipts(),

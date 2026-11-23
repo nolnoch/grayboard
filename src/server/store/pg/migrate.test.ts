@@ -30,6 +30,7 @@ test("shipped migrations keep their checksums", () => {
     ["0001_init", "0608ca7efd3ccc27a69189776a99aeb9de5ba20ebf410c79c7b08a3a2b840fa1"],
     ["0002_posts_author_root", "9659b2bf7ee83ee72f81db01951b90cc660644283dff75d580f73b4e9cdee9e4"],
     ["0003_users_idp_checked_at", "3e9f4091dc82eb874b8426a707af243820d13b6b219ea8becbd95475a1522134"],
+    ["0004_admin_indexes", "37ca01efc2f42e831a3249cc0fb337ec12a19a03176a5015e093170b495887f8"],
   ]);
 });
 

@@ -43,6 +43,8 @@ import type { BindingsStore } from "./store/bindings.ts";
 import type { BoardsStore } from "./store/boards.ts";
 import type { ClaimsStore } from "./store/claims.ts";
 import type { CursorsStore } from "./store/cursors.ts";
+import type { AdminStore } from "./store/admin.ts";
+import { makeSqliteAdmin } from "./store/admin_sqlite.ts";
 import type { WriteReceipt, WriteReceiptsStore } from "./store/write_receipts.ts";
 import { AUDIT_WRITE_ON_READ, type AccessLogRow, type AuditStore } from "./store/audit.ts";
 import type { SlackLink, SlackProgress, SlackStore, SlackThread } from "./store/slack.ts";
@@ -76,6 +78,8 @@ export type { DelegationStore, ReadDelegationFacts } from "./store/delegation.ts
 const USER_SQL = `SELECT u.id, u.email, u.display_name, u.created_at, u.disabled_at, u.idp_issuer, u.idp_subject, u.idp_checked_at,
   CASE WHEN p.id IS NULL THEN 'user' ELSE 'service' END AS kind
   FROM users u LEFT JOIN principals p ON p.user_id = u.id AND p.kind = 'service'`;
+// The admin store's users page builds on it; its plan test explains that statement (store/admin_plan.test.ts).
+export const USER_SQL_FOR_TESTS = USER_SQL;
 // A user row by id, the auth cache's read (tests count it).
 export const USER_BY_ID_SQL = `${USER_SQL} WHERE u.id = ?`;
 // Only a direct message's sender and recipient can see it, its thread, or
@@ -319,6 +323,8 @@ export interface Repo {
   // it, or a process exiting first leaves them open.
   close(): Promise<void>;
   cursors: CursorsStore;
+  // The admin dashboard's paginated reads (store/admin.ts, #1651).
+  admin: AdminStore;
   audit: AuditStore;
   slack: SlackStore;
   writeReceipts: WriteReceiptsStore;
@@ -393,6 +399,7 @@ export function openDatabase(path: string, opts: OpenOptions): { db: Database; r
     const firstRoles = !d.prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'role_bindings'`).get();
     initSchema(d);
     initCoreSchema(d);
+    adminIndexes(d);
     migrateHostedHolds(d);
     recordChildRoots(d);
     sweepStaleLaunchers(d, (opts.now ?? Date.now)());
@@ -511,6 +518,15 @@ function sweepStaleLaunchers(db: Database, now: number): void {
       AND NOT EXISTS (SELECT 1 FROM hosted_sessions h WHERE h.session_id = ids.id AND h.root_session_id IS NULL)
       RETURNING id, principal`).all() as { id: string; principal: string | null }[];
   for (const { id, principal } of cleared) insertAudit(db, now, principal, "handle.launcher_set", id, JSON.stringify({ on: false, reason: "stale" }));
+}
+
+// The admin dashboard's keyset pages (#1651, store/admin.ts): the audit log by actor and by action alone, newest first,
+// and a board's thread roots. Server-only, so a local bus doesn't pay for them on every write. Runs after
+// initCoreSchema, which creates posts.
+function adminIndexes(db: Database): void {
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_access_log_actor ON access_log(actor, at);
+    CREATE INDEX IF NOT EXISTS idx_access_log_action ON access_log(action, at);
+    CREATE INDEX IF NOT EXISTS idx_posts_board_roots ON posts(board, id) WHERE parent_id IS NULL`);
 }
 
 function initSchema(db: Database): void {
@@ -1856,6 +1872,8 @@ function makeRepo(db: Database, blobs: BlobStore, attachmentLimits: AttachmentLi
 
     coreOn: (h) => sqliteOf(h),
     close: async () => { db.close(); },
+
+    admin: makeSqliteAdmin(USER_SQL),
 
     cursors: {
       async get(r, address, streamType, streamRef) {
