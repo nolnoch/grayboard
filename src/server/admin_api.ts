@@ -6,6 +6,7 @@
 import { ADMIN_PAGE_MAX, type AuditCursor, type AuditFilter } from "./store/admin.ts";
 import { writeAudit } from "./audit.ts";
 import type { Repo } from "./db.ts";
+import type { LagWindow } from "./metrics.ts";
 
 export const ADMIN_ROW_WINDOW_MS = 10 * 60_000;
 // The most (admin, route, target) keys remembered; past it, after a sweep, rows are written undeduplicated.
@@ -68,15 +69,32 @@ function auditFilter(url: URL): AuditFilter {
 // A DM pair in a fixed order, so (a, b) and (b, a) are one target.
 const pair = (a: string, b: string) => (a < b ? `${a} ${b}` : `${b} ${a}`);
 
+// The Overview's headline numbers (D6): in-process O(1) getters only, no store read, so `startServer` supplies them.
+export type AdminOverview = {
+  version: string; started_at: number; uptime_s: number;
+  // /healthz's verdict (its cached database probe and the lag gate): ok, or the code it fails with.
+  health: { ok: boolean; code: string | null };
+  lag: LagWindow | null; queue_waiters: number;
+  refusals: Record<string, number>;
+  gauges: { name: string; help: string; values: { value: number; labels?: Record<string, string> }[] }[];
+  slack: "up" | "down" | "off";
+};
+// What a read route may need beyond the store.
+export type AdminContext = { overview?: () => Promise<AdminOverview> };
+
 type Route = {
   // The target the gate's and admin.read's dedup key on: what the page is about, not where in it.
   target(url: URL): string;
   // The audited view's name, for a route that returns content.
   content?: string;
-  run(url: URL, repo: Repo): Promise<{ rows: unknown[]; next: unknown; read?: string | null }>;
+  run(url: URL, repo: Repo, ctx: AdminContext): Promise<{ rows: unknown[]; next: unknown; read?: string | null }>;
 };
 
 const ROUTES: Record<string, Route> = {
+  overview: { target: () => "", async run(_url, _repo, ctx) {
+    if (!ctx.overview) throw new BadParam("overview not served here");
+    return { rows: [await ctx.overview()], next: null };
+  } },
   users: { target: () => "", async run(url, repo) {
     const limit = limitOf(url);
     return page(await repo.admin.users(repo.read, int(url, "after"), limit), limit, u => u.id);
@@ -150,10 +168,10 @@ export function adminReadRoute(method: string, path: string, url: URL): { name: 
 
 // Serves a read route the gate allowed. A content route writes its admin.read row once per window, and only when it
 // returned content.
-export async function serveAdminRead(name: string, url: URL, repo: Repo, admin: string): Promise<Response> {
+export async function serveAdminRead(name: string, url: URL, repo: Repo, admin: string, ctx: AdminContext = {}): Promise<Response> {
   const route = ROUTES[name]!;
   let result: Awaited<ReturnType<Route["run"]>>;
-  try { result = await route.run(url, repo); }
+  try { result = await route.run(url, repo, ctx); }
   catch (e) {
     if (e instanceof BadParam) return Response.json({ code: "bad_request", message: e.message }, { status: 400 });
     throw e;

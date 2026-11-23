@@ -13,7 +13,7 @@ import { releaseStored, requestAttachment, storeUpload, type Guard } from "./att
 import type { Read, Tx } from "./store/tx.ts";
 import { UploadTimeout, readUploadBody, type UploadGate } from "./uploads.ts";
 import { writeAudit } from "./audit.ts";
-import { adminReadRoute, adminRows, serveAdminRead } from "./admin_api.ts";
+import { adminReadRoute, adminRows, serveAdminRead, type AdminContext } from "./admin_api.ts";
 import { isLoopbackIp } from "./client_addr.ts";
 import { DEFAULT_LAG_GATE, lagSampler, lagVerdict, lagWindows, type LagGate, type LagSampler, type LagWindow } from "./metrics.ts";
 import { ROLES, authorize, byAdmin, decidePure, isRole, recordDecision, type AuthzRequest, type Decision, type PureRequest } from "./policy.ts";
@@ -1065,6 +1065,8 @@ export type SessionHooks = {
   // The admin dashboard's OAuth bearer (#1651 D4, the OAuth server's authenticateAdmin): tried only on a GET dashboard
   // read route whose token isn't a CLI session's; absent, those routes take CLI tokens alone.
   adminBearer?: (req: Request) => Promise<AuthedUser | undefined>;
+  // The dashboard Overview's in-process numbers (#1651 D6); absent, /api/admin/overview answers 400.
+  adminOverview?: AdminContext["overview"];
 };
 
 export async function handleHttp(
@@ -1155,7 +1157,7 @@ export async function handleHttp(
       recordDecision(repo, repo.read, { user: authed.user_email }, req, decision, { route: path });
     }
     if (!decision.allow) return forbidden(decision.reason);
-    if (read) return serveAdminRead(read.name, url, repo, authed.user_email);
+    if (read) return serveAdminRead(read.name, url, repo, authed.user_email, { overview: sessions.adminOverview });
     gate = decision;
   }
   if (path === "/api/admin/roles"          && method === "GET")  return adminRoleList(url, repo, config);

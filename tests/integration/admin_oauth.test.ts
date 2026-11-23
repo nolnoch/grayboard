@@ -7,7 +7,7 @@ import { hostedServer, upstreamLeg, type HostedServer } from "../support/hosted_
 import { Browser, consentForm, submitConsent } from "../support/oauth_browser.ts";
 import { row } from "../support/repo_sql.ts";
 import { ADMIN_CLIENT_ID, ADMIN_SCOPE, ADMIN_TOKEN_TTL, OAUTH_SCOPES, parseOAuthClients } from "../../src/server/oauth-config.ts";
-import { ADMIN_CSP } from "../../src/server/admin_page.ts";
+import { ADMIN_CSP, adminPage } from "../../src/server/admin_page.ts";
 
 const ROOT = "root@example.com";
 let srv: HostedServer | undefined;
@@ -113,14 +113,52 @@ describe("/admin", () => {
     expect(ADMIN_CSP).toContain("default-src 'self'");
     expect(ADMIN_CSP).toContain("frame-ancestors 'none'");
     expect(ADMIN_CSP).not.toMatch(/unsafe-inline|unsafe-eval/);
-    for (const [method, path, status] of [["GET", "/admin", 200], ["GET", "/admin/", 200], ["GET", "/admin/callback?code=x&state=y", 200], ["GET", "/admin/nothing", 404], ["POST", "/admin", 405]] as const) {
+    for (const [method, path, status] of [["GET", "/admin", 200], ["GET", "/admin/", 200], ["GET", "/admin/callback?code=x&state=y", 200], ["GET", "/admin/app.js", 200],
+      ["GET", "/admin/app.css", 200], ["HEAD", "/admin/app.js", 200], ["GET", "/admin/nothing", 404], ["GET", "/admin/app.js.map", 404], ["GET", "/admin/admin/app.js", 404],
+      ["POST", "/admin", 405], ["POST", "/admin/app.js", 405]] as const) {
       const res = await fetch(srv.issuer + path, { method });
       expect([path, res.status]).toEqual([path, status]);
       expect(res.headers.get("Content-Security-Policy")).toBe(ADMIN_CSP);
       expect(res.headers.get("Referrer-Policy")).toBe("no-referrer");
       expect(res.headers.get("X-Frame-Options")).toBe("DENY");
+      expect(res.headers.get("X-Content-Type-Options")).toBe("nosniff");
     }
     // A path that only begins with the word is not the page's.
     expect((await fetch(srv.issuer + "/administrator")).headers.get("Content-Security-Policy")).toBeNull();
+  });
+
+  test("the page is static same-origin assets: no inline script or style, each asset with its type", async () => {
+    srv = await hostedServer({ admins: [ROOT] }, ROOT);
+    const html = await (await fetch(`${srv.issuer}/admin`)).text();
+    // One <script>, naming a same-origin src, with no body; no <style> block, style= attribute or on*= handler.
+    const scripts = [...html.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script>/gi)];
+    expect(scripts.map(([, attrs, body]) => [attrs!.trim(), body!.trim()])).toEqual([['type="module" src="/admin/app.js"', ""]]);
+    expect(html).not.toMatch(/<style\b|\sstyle\s*=|\son[a-z]+\s*=|javascript:/i);
+    expect(html).toContain('<link rel="stylesheet" href="/admin/app.css">');
+    for (const [path, type] of [["/admin/app.js", "text/javascript; charset=utf-8"], ["/admin/app.css", "text/css; charset=utf-8"], ["/admin", "text/html; charset=utf-8"]]) {
+      const res = await fetch(srv.issuer + path);
+      expect([path, res.headers.get("Content-Type")]).toEqual([path, type]);
+      expect((await res.text()).length).toBeGreaterThan(100);
+    }
+    // The script never parses markup or evaluates a string: every bus string reaches the DOM as text (R1).
+    const js = await (await fetch(`${srv.issuer}/admin/app.js`)).text();
+    expect(js).not.toMatch(/innerHTML|outerHTML|insertAdjacentHTML|document\.write|\beval\(|new Function|setTimeout\(\s*["'`]|setInterval\(\s*["'`]/);
+    // The stylesheet loads nothing: no @import, no url() (the CSP would refuse another origin's anyway).
+    const css = await (await fetch(`${srv.issuer}/admin/app.css`)).text();
+    expect(css).not.toMatch(/@import|url\(/i);
+  });
+
+  test("under a public URL with a path, the page names its assets under that path, kept or stripped by a proxy", async () => {
+    for (const path of ["/gb/admin", "/admin"]) {
+      const res = adminPage(new Request(`https://bus.example.com${path}`), path, "/gb")!;
+      expect(res.status).toBe(200);
+      const html = await res.text();
+      expect(html).toContain('src="/gb/admin/app.js"');
+      expect(html).toContain('href="/gb/admin/app.css"');
+    }
+    for (const path of ["/gb/admin/app.css", "/admin/app.css"]) {
+      const res = adminPage(new Request(`https://bus.example.com${path}`), path, "/gb")!;
+      expect([res.status, res.headers.get("Content-Type")]).toEqual([200, "text/css; charset=utf-8"]);
+    }
   });
 });

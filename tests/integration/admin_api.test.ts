@@ -6,6 +6,7 @@ import { TestServer } from "../support/server.ts";
 import { accessAudits } from "../support/audit.ts";
 import { drained, exec, row } from "../support/repo_sql.ts";
 import { AdminRows } from "../../src/server/admin_api.ts";
+import pkg from "../../package.json" with { type: "json" };
 
 const A = "alice@example.com";
 const ROOT = "root@example.com";
@@ -101,6 +102,27 @@ describe("reads", () => {
     expect(c.body.rows.map((m: { id: number; body: string }) => [m.id, m.body])).toEqual([[m2, "secret two"], [m1, "secret one"]]);
     expect((await srv.api(root, "GET", "/api/admin/conversation?a=fe&b=be")).status).toBe(200);
     expect((await audits("admin.read")).map(r => [r.target, r.detail.view])).toEqual([["be fe", "conversation"]]);
+  });
+
+  test("overview reports the in-process numbers, one page, and writes no row beyond the gate's", async () => {
+    const [a, root] = await Promise.all([srv.login(A), srv.login(ROOT)]);
+    expect((await srv.api(a, "GET", "/api/admin/overview")).status).toBe(403);
+    for (let i = 0; i < 2; i++) {
+      const r = await srv.api(root, "GET", "/api/admin/overview");
+      expect(r.status).toBe(200);
+      expect(r.body.next).toBeNull();
+      const o = r.body.rows[0];
+      expect(o.version).toBe(pkg.version);
+      expect(o.health).toEqual({ ok: true, code: null });
+      expect(o.slack).toBe("off");
+      expect(typeof o.uptime_s).toBe("number");
+      expect(typeof o.queue_waiters).toBe("number");
+      expect(Object.keys(o.refusals)).toContain("mcp_post");
+      expect(o.gauges.map((g: { name: string }) => g.name)).toContain("hosted_sessions_holding");
+    }
+    // The deny and the first allow, in either order: audit rows are written off the request path.
+    expect((await gateRows("/api/admin/overview")).map(r => [r.actor, r.detail.allow]).sort()).toEqual([[A, false], [ROOT, true]]);
+    expect(await audits("admin.read")).toEqual([]);
   });
 
   test("audit pages newest first under a filter with an (at, id) cursor", async () => {

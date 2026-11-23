@@ -3,7 +3,9 @@ import { MAX_BODY_BYTES } from "../core/boards.ts";
 import { openDatabase, type Repo } from "./db.ts";
 import { sessionEndPort } from "./session_end.ts";
 import { createApplication, type ApplicationOptions } from "./application.ts";
-import { handleHttp, isJsonRequest, signInRoute } from "./http.ts";
+import { handleHttp, healthz, isJsonRequest, signInRoute } from "./http.ts";
+import type { AdminOverview } from "./admin_api.ts";
+import pkg from "../../package.json" with { type: "json" };
 import { AuthGate, type Caller } from "./auth_gate.ts";
 import { userAgent } from "./audit.ts";
 import { inRequest } from "./request_context.ts";
@@ -18,7 +20,7 @@ import { checkIdpConfig, recheckConfig, type Config } from "./config.ts";
 import { defaultProviders } from "./idp.ts";
 import { createIdpRecheck } from "./idp_recheck.ts";
 import { SlackBridge } from "./slack.ts";
-import { serveMetrics, startLagSampler, type Gauges } from "./metrics.ts";
+import { lagWindow, queueWaitersNow, refusalCount, REFUSAL_KINDS, serveMetrics, startLagSampler, type Gauges } from "./metrics.ts";
 import { testPauseAsync } from "../shared/testpause.ts";
 import { settleAll } from "./settle.ts";
 import { atSite } from "./store/queue.ts";
@@ -218,7 +220,7 @@ export function startServer(config: Config, opts: StartOptions = {}) {
       if (!isJsonRequest(req)) return Response.json({ code: "unsupported_media_type", message: "sign-in takes Content-Type: application/json" }, { status: 415 });
       authGate.charge(caller, req, path, "sign-in");
     }
-    return atSite("admin", () => handleHttp(req, repo, application.access, config, touches, wake, slack, { disconnectUser, accessChanged, recheck, adminBearer: oauth.authenticateAdmin }, caller.ip, application.boardsChanged, url)).then((res) => authGate.chargeRefusedToken(caller, req, path, res));
+    return atSite("admin", () => handleHttp(req, repo, application.access, config, touches, wake, slack, { disconnectUser, accessChanged, recheck, adminBearer: oauth.authenticateAdmin, adminOverview }, caller.ip, application.boardsChanged, url)).then((res) => authGate.chargeRefusedToken(caller, req, path, res));
   }
 
   // Every value an O(1) getter (vision P13): no row count, no walk over sessions.
@@ -234,6 +236,20 @@ export function startServer(config: Config, opts: StartOptions = {}) {
       hosted_refusal_rows_lost: { help: "Refusal audit rows that failed to write.", values: [{ value: mcp.sessions.refusalRowsLost }] },
     };
   };
+
+  // The dashboard Overview (#1651 D6): the same O(1) getters, plus /healthz's cached verdict.
+  const startedAt = Date.now();
+  async function adminOverview(): Promise<AdminOverview> {
+    const health = await healthz(repo, performance.now(), config.healthzLag);
+    const code = health.ok ? null : ((await health.json()) as { code?: string }).code ?? String(health.status);
+    return {
+      version: pkg.version, started_at: startedAt, uptime_s: Math.round((Date.now() - startedAt) / 1000),
+      health: { ok: health.ok, code }, lag: lagWindow() ?? null, queue_waiters: queueWaitersNow(),
+      refusals: Object.fromEntries(REFUSAL_KINDS.map(k => [k, refusalCount(k)])),
+      gauges: Object.entries(gauges()).map(([name, g]) => ({ name, help: g.help, values: g.values })),
+      slack: !config.slack ? "off" : slack?.running ? "up" : "down",
+    };
+  }
 
   const server = Bun.serve({
     hostname: opts.hostname,

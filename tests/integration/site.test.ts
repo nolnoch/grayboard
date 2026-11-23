@@ -6,7 +6,7 @@
 import { expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { basename } from "node:path";
-import { PAGES, TOKENS, regenerated } from "../../scripts/site_tokens.ts";
+import { PAGES, STYLESHEETS, TOKENS, regenerated } from "../../scripts/site_tokens.ts";
 
 const root = new URL("../..", import.meta.url).pathname;
 const { version } = JSON.parse(readFileSync(`${root}package.json`, "utf8")) as { version: string };
@@ -28,5 +28,12 @@ for (const path of PAGES) {
   test(`${name}'s theme block matches tokens.json`, () => {
     const page = readFileSync(path, "utf8");
     expect(regenerated(page, tokens, name)).toBe(page);
+  });
+}
+
+for (const path of STYLESHEETS) {
+  test(`${basename(path)}'s theme block matches tokens.json`, () => {
+    const sheet = readFileSync(path, "utf8");
+    expect(regenerated(sheet, tokens, basename(path))).toBe(sheet);
   });
 }

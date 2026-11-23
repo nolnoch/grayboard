@@ -1,5 +1,5 @@
-// Regenerates the theme custom properties in every docs/site/*.html page from docs/site/tokens.json,
-// so the pages' colors never drift by hand. Dark-first: dark values on bare :root, light under
+// Regenerates the theme custom properties in every docs/site/*.html page, and in the admin dashboard's
+// stylesheet (STYLESHEETS), from docs/site/tokens.json, so their colors never drift by hand. Dark-first: dark values on bare :root, light under
 // prefers-color-scheme (unless the viewer chose dark) and under data-theme="light", dark again
 // under data-theme="dark", and .dark-scope for surfaces that stay dark in both themes.
 //
@@ -13,6 +13,8 @@ const SITE = join(root, "docs/site");
 /** Every page GitHub Pages serves from docs/site/. */
 export const PAGES = readdirSync(SITE).filter(f => f.endsWith(".html")).sort().map(f => join(SITE, f));
 export const TOKENS = join(root, "docs/site/tokens.json");
+/** Stylesheets outside docs/site/ that carry the same block: the admin dashboard's (#1651), served by grayboard-server. */
+export const STYLESHEETS = [join(root, "src/server/admin/app.css")];
 const BEGIN = "/* BEGIN generated tokens: bun scripts/site_tokens.ts writes this block from docs/site/tokens.json; do not edit. */";
 const END = "/* END generated tokens */";
 
@@ -47,7 +49,7 @@ export function regenerated(page: string, tokens: Tokens, name = "page"): string
 if (import.meta.main) {
   const tokens = JSON.parse(readFileSync(TOKENS, "utf8"));
   let stale = false;
-  for (const path of PAGES) {
+  for (const path of [...PAGES, ...STYLESHEETS]) {
     const name = path.slice(root.length + 1);
     const page = readFileSync(path, "utf8");
     const next = regenerated(page, tokens, name);
