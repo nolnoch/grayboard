@@ -58,15 +58,15 @@ export function makePgAdmin(): AdminStore {
       return (await pgOf(r)`SELECT id, key, handle, event, note, board, expires_at, held_by, at FROM claim_events
         WHERE key = ${key} AND id < ${before > 0 ? before : BIG} ORDER BY id DESC LIMIT ${adminLimit(limit)}`).map(toEvent);
     },
-    async threads(r, board, before, now, limit) {
+    async threads(r, board, before, limit) {
       return (await pgOf(r)`SELECT id, author, created_at FROM posts
-        WHERE board = ${board} AND parent_id IS NULL AND id < ${before > 0 ? before : BIG} AND (expires_at IS NULL OR expires_at > ${now})
+        WHERE board = ${board} AND parent_id IS NULL AND id < ${before > 0 ? before : BIG}
         ORDER BY id DESC LIMIT ${adminLimit(limit)}`).map(toThread);
     },
-    async thread(r, root, after, now, limit) {
+    async thread(r, root, after, limit) {
       return (await pgOf(r)`WITH RECURSIVE t(id) AS (SELECT id FROM posts WHERE id = ${root} UNION ALL SELECT p.id FROM posts p JOIN t ON p.parent_id = t.id)
         SELECT p.id, p.board, p.author, p.body, p.parent_id, p.created_at FROM posts p JOIN t ON t.id = p.id
-        WHERE p.id > ${after} AND (p.expires_at IS NULL OR p.expires_at > ${now}) ORDER BY p.id LIMIT ${adminLimit(limit)}`).map(toPost);
+        WHERE p.id > ${after} ORDER BY p.id LIMIT ${adminLimit(limit)}`).map(toPost);
     },
     async messages(r, before, limit) {
       return (await pgOf(r)`SELECT id, sender, recipient_type, recipient, parent_id, created_at, delivered_at, pending, kind FROM messages

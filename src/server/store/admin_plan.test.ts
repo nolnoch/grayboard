@@ -8,7 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDatabase, USER_SQL_FOR_TESTS } from "../db.ts";
 import { scratchDbPath } from "../../../tests/support/scratch_db.ts";
-import { ADMIN_SQL } from "./admin_sqlite.ts";
+import { ADMIN_SQL, USERS_PAGE } from "./admin_sqlite.ts";
 import { sqliteOf } from "./tx.ts";
 
 const plan = (sql: string) => {
@@ -21,7 +21,7 @@ const plan = (sql: string) => {
 
 const statements: [string, string][] = [
   ...Object.entries(ADMIN_SQL).filter(([k]) => k !== "thread"),
-  ["users", `${USER_SQL_FOR_TESTS} WHERE u.id > ? ORDER BY u.id LIMIT ?`],
+  ["users", `${USER_SQL_FOR_TESTS} ${USERS_PAGE}`],
 ];
 
 for (const [name, sql] of statements) {

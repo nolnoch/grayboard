@@ -116,40 +116,36 @@ function claims(it: It): void {
 }
 
 function boards(it: It): void {
-  const post = (h: AdminHarness, board: string, parent: number | null, at: number, expires: number | null = null) =>
-    h.insert("posts", { board, author: "be", body: `body ${at}`, parent_id: parent, created_at: at, expires_at: expires });
+  const post = (h: AdminHarness, board: string, parent: number | null, at: number) =>
+    h.insert("posts", { board, author: "be", body: `body ${at}`, parent_id: parent, created_at: at, expires_at: null });
 
-  it("threads: a board's unexpired roots newest first, replies and other boards left out, paged by id", async h => {
-    const now = T0 + 100;
+  it("threads: a board's roots newest first, replies and other boards left out, paged by id", async h => {
     for (const b of ["e2e", "other"]) await h.insert("boards", { name: b, purpose: "", scope: null, created_by: "test", created_at: T0 });
     const r1 = await post(h, "e2e", null, T0 + 1);
     await post(h, "e2e", r1, T0 + 2);
     await post(h, "other", null, T0 + 3);
     const r2 = await post(h, "e2e", null, T0 + 4);
-    await post(h, "e2e", null, T0 + 5, now); // expired at now
     const r3 = await post(h, "e2e", null, T0 + 6);
-    const first = await h.admin.threads(h.read, "e2e", 0, now, 2);
+    const first = await h.admin.threads(h.read, "e2e", 0, 2);
     expect(first).toEqual([{ id: r3, author: "be", created_at: T0 + 6 }, { id: r2, author: "be", created_at: T0 + 4 }]);
     // A root posted between two pages lands above the cursor: the next page neither repeats nor skips a row.
     await post(h, "e2e", null, T0 + 7);
-    const rest = await pages(first[1]!.id, before => h.admin.threads(h.read, "e2e", before, now, 2), t => t.id);
+    const rest = await pages(first[1]!.id, before => h.admin.threads(h.read, "e2e", before, 2), t => t.id);
     expect(rest.flat().map(t => t.id)).toEqual([r1]);
-    expect(await h.admin.threads(h.read, "nope", 0, now, 10)).toEqual([]);
+    expect(await h.admin.threads(h.read, "nope", 0, 10)).toEqual([]);
   });
   it("thread: the root and every reply below it, nested ones included, in id order, paged; another thread left out", async h => {
-    const now = T0 + 100;
     await h.insert("boards", { name: "e2e", purpose: "", scope: null, created_by: "test", created_at: T0 });
     const root = await post(h, "e2e", null, T0 + 1);
     const a = await post(h, "e2e", root, T0 + 2);
     const other = await post(h, "e2e", null, T0 + 3);
     const aa = await post(h, "e2e", a, T0 + 4);
     await post(h, "e2e", other, T0 + 5);
-    await post(h, "e2e", root, T0 + 6, now); // expired at now
     const b = await post(h, "e2e", root, T0 + 7);
-    const got = await pages(0, after => h.admin.thread(h.read, root, after, now, 2), p => p.id);
+    const got = await pages(0, after => h.admin.thread(h.read, root, after, 2), p => p.id);
     expect(got.map(p => p.map(x => x.id))).toEqual([[root, a], [aa, b]]);
     expect(got[1]![0]).toEqual({ id: aa, board: "e2e", author: "be", body: `body ${T0 + 4}`, parent_id: a, created_at: T0 + 4 });
-    expect(await h.admin.thread(h.read, b + 1000, 0, now, 10)).toEqual([]);
+    expect(await h.admin.thread(h.read, b + 1000, 0, 10)).toEqual([]);
   });
 }
 
@@ -175,11 +171,13 @@ function messages(it: It): void {
 function audit(it: It): void {
   it("audit: newest first by (at, id) under each filter, ties on at split across pages without a repeat or a gap", async h => {
     const rows: { id: number; at: number; actor: string; action: string; target: string }[] = [];
-    // Three rows share T0 + 5, so a page boundary falls inside the tie.
+    // Three rows share T0 + 5, so a page boundary falls inside the tie. The last two land after newer rows, as a
+    // row whose `at` was taken before the write queue ran does, so id order isn't (at, id) order.
     const spec = [
       [T0 + 1, "a@example.com", "auth.login", "t1"], [T0 + 5, "b@example.com", "admin.read", "t1"],
       [T0 + 5, "a@example.com", "admin.read", "t2"], [T0 + 5, "a@example.com", "auth.login", "t1"],
-      [T0 + 9, "b@example.com", "admin.read", "t1"],
+      [T0 + 9, "b@example.com", "admin.read", "t1"], [T0 + 3, "a@example.com", "admin.read", "t1"],
+      [T0 + 2, "b@example.com", "auth.login", "t2"],
     ] as const;
     for (const [at, actor, action, target] of spec) {
       const id = await h.insert("access_log", { at, actor, action, target, detail: JSON.stringify({ at }), ip: "10.0.0.1", ua: null, client_id: null });

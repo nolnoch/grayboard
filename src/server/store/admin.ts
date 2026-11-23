@@ -2,8 +2,8 @@
 // claims, threads, messages and the access log, which Repo (db.ts) composes and the Postgres store (pg/admin.ts)
 // implements. Type-only imports, so a module under pg/ may import it (pg/isolation.test.ts).
 //
-// Every read is one indexed range scan bounded by `limit` (clamped to 1..ADMIN_PAGE_MAX): no COUNT, no GROUP BY, no
-// read whose cost grows with the fleet. Each names its index. Nothing here writes: no read point, delivery or cursor
+// Every read is an indexed range bounded by `limit` (clamped to 1..ADMIN_PAGE_MAX), or by one thread's or one claim
+// key's history where its comment says so: no COUNT, no GROUP BY, no read whose cost grows with the fleet. Each names its index. Nothing here writes: no read point, delivery or cursor
 // moves. Only `thread` returns content (a post's body); the list rows are body-free, so a route can't serve content
 // without the audited read (D5). Reads the dashboard also uses that other groups already have: roles.list,
 // services.list, boards.catalogPage, messages.history (a conversation), teams.listMembers, aliases.listForScope and
@@ -57,12 +57,12 @@ export interface AdminStore {
   // The key's events with ids below `before` (0 for the newest), newest first (idx_claim_events_key; Postgres sorts
   // the key's rows by id, bounded by its history, which retention prunes).
   claimEvents(r: Read, key: string, before: number, limit: number): Promise<AdminClaimEvent[]>;
-  // The board's thread roots unexpired at `now` with ids below `before` (0 for the newest), newest first
+  // The board's thread roots with ids below `before` (0 for the newest), newest first
   // (idx_posts_board_roots, partial on parent_id IS NULL).
-  threads(r: Read, board: string, before: number, now: number, limit: number): Promise<AdminThread[]>;
-  // The thread under `root`, root included, unexpired at `now`, with ids above `after` (0 for the first), in id order:
+  threads(r: Read, board: string, before: number, limit: number): Promise<AdminThread[]>;
+  // The thread under `root`, root included, with ids above `after` (0 for the first), in id order:
   // one recursive walk on idx_posts_parent, bounded by the thread's size. Empty when the root is gone.
-  thread(r: Read, root: number, after: number, now: number, limit: number): Promise<AdminPost[]>;
+  thread(r: Read, root: number, after: number, limit: number): Promise<AdminPost[]>;
   // Messages with ids below `before` (0 for the newest), newest first (the messages primary key).
   messages(r: Read, before: number, limit: number): Promise<AdminMessage[]>;
   // access_log rows older than `before` by (at, id) (null for the newest), newest first, under `filter`.

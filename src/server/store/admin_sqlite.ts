@@ -13,17 +13,20 @@ const OLDER = "at <= ? AND (at < ? OR id < ?) ORDER BY at DESC, id DESC LIMIT ?"
 const AUDIT = "SELECT id, at, actor, action, target, detail, ip, ua, client_id FROM access_log";
 const BIG = Number.MAX_SAFE_INTEGER;
 
-// Every statement but users' (which prefixes db.ts USER_SQL), by read: what admin_plan.test.ts explains.
+// What follows db.ts USER_SQL in the users read; admin_plan.test.ts explains the two joined.
+export const USERS_PAGE = "WHERE u.id > ? ORDER BY u.id LIMIT ?";
+
+// Every statement but users', by read: what admin_plan.test.ts explains.
 export const ADMIN_SQL = {
   teams: "SELECT id, name, created_by, policy, created_at FROM teams WHERE id > ? ORDER BY id LIMIT ?",
   claims: "SELECT key, holder, note, board, acquired_at, expires_at FROM claims WHERE key > ? AND expires_at > ? ORDER BY key LIMIT ?",
   claimEvents: `SELECT id, key, handle, event, note, board, expires_at, held_by, at FROM claim_events INDEXED BY idx_claim_events_key
     WHERE key = ? AND id < ? ORDER BY id DESC LIMIT ?`,
   threads: `SELECT id, author, created_at FROM posts INDEXED BY idx_posts_board_roots
-    WHERE board = ? AND parent_id IS NULL AND id < ? AND (expires_at IS NULL OR expires_at > ?) ORDER BY id DESC LIMIT ?`,
+    WHERE board = ? AND parent_id IS NULL AND id < ? ORDER BY id DESC LIMIT ?`,
   thread: `WITH RECURSIVE t(id) AS (SELECT id FROM posts WHERE id = ? UNION ALL SELECT p.id FROM posts p JOIN t ON p.parent_id = t.id)
     SELECT p.id, p.board, p.author, p.body, p.parent_id, p.created_at FROM posts p JOIN t ON t.id = p.id
-    WHERE p.id > ? AND (p.expires_at IS NULL OR p.expires_at > ?) ORDER BY p.id LIMIT ?`,
+    WHERE p.id > ? ORDER BY p.id LIMIT ?`,
   messages: `SELECT id, sender, recipient_type, recipient, parent_id, created_at, delivered_at, pending, kind FROM messages
     WHERE id < ? ORDER BY id DESC LIMIT ?`,
   auditAll: `${AUDIT} INDEXED BY idx_audit_at WHERE ${OLDER}`,
@@ -38,7 +41,7 @@ type P = (string | number)[];
 export function makeSqliteAdmin(userSql: string): AdminStore {
   return {
     async users(r, after, limit) {
-      return sqliteOf(r).query<User, P>(`${userSql} WHERE u.id > ? ORDER BY u.id LIMIT ?`).all(after, adminLimit(limit));
+      return sqliteOf(r).query<User, P>(`${userSql} ${USERS_PAGE}`).all(after, adminLimit(limit));
     },
     async teams(r, after, limit) {
       return sqliteOf(r).query<Team, P>(ADMIN_SQL.teams).all(after, adminLimit(limit));
@@ -49,11 +52,11 @@ export function makeSqliteAdmin(userSql: string): AdminStore {
     async claimEvents(r, key, before, limit) {
       return sqliteOf(r).query<AdminClaimEvent, P>(ADMIN_SQL.claimEvents).all(key, before > 0 ? before : BIG, adminLimit(limit));
     },
-    async threads(r, board, before, now, limit) {
-      return sqliteOf(r).query<AdminThread, P>(ADMIN_SQL.threads).all(board, before > 0 ? before : BIG, now, adminLimit(limit));
+    async threads(r, board, before, limit) {
+      return sqliteOf(r).query<AdminThread, P>(ADMIN_SQL.threads).all(board, before > 0 ? before : BIG, adminLimit(limit));
     },
-    async thread(r, root, after, now, limit) {
-      return sqliteOf(r).query<AdminPost, P>(ADMIN_SQL.thread).all(root, after, now, adminLimit(limit));
+    async thread(r, root, after, limit) {
+      return sqliteOf(r).query<AdminPost, P>(ADMIN_SQL.thread).all(root, after, adminLimit(limit));
     },
     async messages(r, before, limit) {
       return sqliteOf(r).query<Omit<AdminMessage, "pending"> & { pending: number }, P>(ADMIN_SQL.messages)
