@@ -432,8 +432,9 @@ export const WHOAMI_TOOL = {
   inputSchema: { type: "object", properties: {} },
 };
 
-// `fresh`: the name has never existed, so binding it needs create: true.
-export type Candidate = { name: string; queued: number; claims: number; where: string | null; suggested?: true; fresh?: true };
+// `fresh`: the name has never existed, so binding it needs create: true, which `create` carries as bind's argument
+// (#1640: an agent reading the structure, not the instruction text, otherwise binds and is refused identity_unknown).
+export type Candidate = { name: string; queued: number; claims: number; where: string | null; suggested?: true; fresh?: true; create?: true };
 
 /** What a name has waiting, for ranking candidates. */
 export type NameStats = { name: string; queued: number; claims: number; last_seen: number; where: string | null };
@@ -452,7 +453,7 @@ export function orderCandidates(pool: NameStats[], suggested: string | null): Ca
   return [...first, ...rest].map((s) => ({
     name: s.name, queued: s.queued, claims: s.claims, where: s.where,
     ...("suggested" in s ? { suggested: true as const } : {}),
-    ...("fresh" in s ? { fresh: true as const } : {}),
+    ...("fresh" in s ? { fresh: true as const, create: true as const } : {}),
   }));
 }
 
