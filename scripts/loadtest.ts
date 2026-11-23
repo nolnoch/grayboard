@@ -86,7 +86,7 @@ import { HOSTED_CLIENT, HOSTED_SCOPES } from "../tests/support/hosted_session.ts
 import { devLogin, ServerProcess } from "../tests/support/server.ts";
 import { startDelayProxy, type DelayProxy } from "../tests/support/delay_proxy.ts";
 import { ADMIN_CLIENT_ID, ADMIN_SCOPE } from "../src/server/oauth-config.ts";
-import { dashSummary, judgeDashboard, startDashboard, type DashResult, type DashRow } from "./loadtest_dashboard.ts";
+import { dashSummary, judgeDashboard, optionalViews, startDashboard, type DashResult, type DashRow } from "./loadtest_dashboard.ts";
 import { BUCKETS, PROOF_OPS, SVC_READS, type DriverConfig, type DriverFinal, type DriverSession, type DriverWindow, type Hist, type ReadProof } from "./loadtest_driver.ts";
 
 const ROOT = resolve(import.meta.dir, "..");
@@ -686,7 +686,7 @@ export function judge(input: JudgeInput) {
   // The dashboard leg: held to the bar's edge, its cadence and the dedup window.
   if (o.dashPeriodS > 0) {
     if (!dashboard) fail("dashboard: the leg never ran");
-    else for (const f of judgeDashboard(dashboard.result, dashboard.rows, o.durationS * 1000, edge.le, edge.label, tooSlow)) fail(f, f.includes("% of") ? "p99" : undefined);
+    else for (const f of judgeDashboard(dashboard.result, dashboard.rows, o.durationS * 1000, edge.le, edge.label, tooSlow, optionalViews(o.serviceWorkers > 0, o.postShare > 0))) fail(f.text, f.item);
   }
   // The pilot gate's headroom: the share of the steady period in which writes were paused for an exclusive body. A run
   // whose server exports no write queue has no number, and fails.

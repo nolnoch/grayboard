@@ -15,7 +15,7 @@ import { runCli } from "../support/cli.ts";
 import { SdkError, SdkErrorCode, SdkHttpError } from "@modelcontextprotocol/client";
 import { ServerUnreachable } from "../../adapters/hosted-core/src/wire.ts";
 import { errorClass } from "../../scripts/loadtest_errors.ts";
-import { DASH_VIEWS, dedupBound, judgeDashboard, type DashResult, type DashRow } from "../../scripts/loadtest_dashboard.ts";
+import { DASH_VIEWS, dedupBound, judgeDashboard, optionalViews, type DashResult, type DashRow } from "../../scripts/loadtest_dashboard.ts";
 import { ADMIN_ROW_WINDOW_MS } from "../../src/server/admin_api.ts";
 
 const ROOT = resolve(import.meta.dir, "../..");
@@ -412,7 +412,7 @@ describe("loadtest dashboard leg (#1651)", () => {
   const gateRows = (n = 1): DashRow[] => [...new Set(DASH_VIEWS.map(v => `/api/admin/${v.route}`))].flatMap(route =>
     (route.endsWith("role-bindings") ? ["a", "b", "c"] : ["t"]).flatMap(target => Array.from({ length: n }, () => ({ action: "authz.decision" as const, target, route, view: null, allow: true }))));
   const reads = (n = 1): DashRow[] => ["thread", "conversation"].flatMap(view => Array.from({ length: n }, () => ({ action: "admin.read" as const, target: `${view}-target`, route: null, view, allow: null })));
-  const judged = (r: DashResult, rows: DashRow[] = [...gateRows(), ...reads()]) => judgeDashboard(r, rows, 20_000, 0.1, "≤ 100 ms", tooSlow);
+  const judged = (r: DashResult, rows: DashRow[] = [...gateRows(), ...reads()], optional?: Set<string>) => judgeDashboard(r, rows, 20_000, 0.1, "≤ 100 ms", tooSlow, optional).map(f => f.text);
 
   test("a dashboard that kept its cadence, answered fast and wrote one row per key passes", () => {
     expect(judged(result())).toEqual([]);
@@ -434,11 +434,35 @@ describe("loadtest dashboard leg (#1651)", () => {
     expect(judged(result(), gateRows())).toEqual(["dashboard: no admin.read row for the thread or conversation it opened"]);
   });
 
+  // A run without the service has no team, and one without posts no thread: those views go unanswered by design
+  // (audit M1). Mutation: every view required whatever the mix.
+  test("a view the run's mix can't give a target may go unanswered; any other may not", () => {
+    const { team: _t, "team-bindings": _b, ...noTeam } = result().views;
+    const teamless = result({ views: noTeam, skipped: { team: 20, "team-bindings": 20 } });
+    expect(judged(teamless, undefined, optionalViews(false, true))).toEqual([]);
+    expect(judged(teamless, undefined, optionalViews(true, true))).toEqual(["dashboard team: no request answered (no target in 20 polls)", "dashboard team-bindings: no request answered (no target in 20 polls)"]);
+    const { thread: _r, ...noThread } = result().views;
+    expect(judged(result({ views: noThread, skipped: { thread: 20 } }), undefined, optionalViews(true, false))).toEqual([]);
+    expect([...optionalViews(false, false)].sort()).toEqual(["team", "team-bindings", "thread"]);
+  });
+
+  // Only the latency pool is the pilot's p99 item; a missed cadence is another check (audit L1).
+  test("a missed cadence is an untagged failure, the latency pool a p99 one", () => {
+    const tags = (r: DashResult) => judgeDashboard(r, [...gateRows(), ...reads()], 20_000, 0.1, "≤ 100 ms", tooSlow).map(f => f.item ?? "other");
+    expect(tags(result({ polls: 15 }))).toEqual(["other"]);
+    expect(tags(result({ views: { ...result().views, users: hist(20, 15) } }))).toEqual(["p99"]);
+  });
+
   test("the dedup bound is one row per window the polling spans, plus its first", () => {
     expect([dedupBound(0), dedupBound(ADMIN_ROW_WINDOW_MS - 1), dedupBound(ADMIN_ROW_WINDOW_MS), dedupBound(3.5 * ADMIN_ROW_WINDOW_MS)]).toEqual([1, 1, 2, 4]);
     // An hour's run spans six windows: each route and target may write seven rows.
     expect(judged(result({ lastAt: 60 * 60_000 }), [...gateRows(7), ...reads(7)])).toEqual([]);
     expect(judged(result({ lastAt: 60 * 60_000 }), [...gateRows(8), ...reads()])[0]).toMatch(/over the dedup bound \(7 per route and target\)/);
+    // The span runs to the last poll's end: a last poll that started just short of a window and ended past it allows
+    // the row its late requests wrote (audit L3).
+    const lastAt = 2 * ADMIN_ROW_WINDOW_MS - 500;
+    expect(judged(result({ lastAt }), [...gateRows(3), ...reads()])[0]).toMatch(/over the dedup bound \(2 per route and target\)/);
+    expect(judged(result({ lastAt, lastEndAt: lastAt + 1000 }), [...gateRows(3), ...reads()])).toEqual([]);
   });
 
   test("the leg runs in every profile at the page's 10 s, and --dashboard-period 0 turns it off", () => {

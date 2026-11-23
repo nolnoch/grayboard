@@ -31,11 +31,15 @@ export const DASH_VIEWS: DashView[] = [
 ];
 
 // What the leg measured: polls run, requests per view (latency histogram, client seconds; errors: any answer but a
-// 200, or a fetch that threw), the first errors, and when its first and last polls started.
+// 200, or a fetch that threw), the first errors, when its first and last polls started, and when its last poll ended
+// (`lastEndAt`: a key's last request can land up to a poll's length after `lastAt`, so the dedup span runs to it).
 export type DashResult = {
   periodMs: number; polls: number; requests: number; views: Record<string, Hist>; errors: Record<string, number>; firstErrors: string[];
-  firstAt: number | null; lastAt: number | null; skipped: Record<string, number>;
+  firstAt: number | null; lastAt: number | null; lastEndAt?: number | null; skipped: Record<string, number>;
 };
+
+// A request the server never answers counts as a fetch error after this, so stop() (and the run's cleanup) can't hang on it.
+const FETCH_TIMEOUT_MS = 30_000;
 
 const newHist = (): Hist => ({ buckets: BUCKETS.map(() => 0), count: 0, sum: 0, errors: 0 });
 
@@ -51,7 +55,7 @@ export function startDashboard(base: string, token: string, periodMs: number, ta
     const t0 = performance.now();
     let status = 0, body = null as { rows?: unknown[] } | null;
     try {
-      const res = await fetch(url, { headers: { Authorization: `Bearer ${token}`, Accept: "application/json" } });
+      const res = await fetch(url, { headers: { Authorization: `Bearer ${token}`, Accept: "application/json" }, signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
       status = res.status;
       body = await res.json().catch(() => null) as typeof body;
     } catch (e) {
@@ -77,7 +81,7 @@ export function startDashboard(base: string, token: string, periodMs: number, ta
     r.firstAt ??= at; r.lastAt = at; r.polls++;
     // In turn, as one tab's views would be; a view's target comes from a list read earlier in this or a past poll.
     for (const v of DASH_VIEWS) {
-      if (stopped) return;
+      if (stopped) break;
       const params = v.params(t);
       if (!params) { r.skipped[v.view] = (r.skipped[v.view] ?? 0) + 1; continue; }
       const rows = await get(v, params);
@@ -88,6 +92,7 @@ export function startDashboard(base: string, token: string, periodMs: number, ta
         if (m) t.pair = [m.sender, m.recipient];
       }
     }
+    r.lastEndAt = Date.now();
   };
   let next = Date.now();
   const done = (async () => {
@@ -107,25 +112,31 @@ export type DashRow = { action: "authz.decision" | "admin.read"; target: string 
 // The dedup bound over a span (ms): one row per (admin, route, target) per window, so a key writes at most
 // floor(span / window) + 1 rows (its first, then one each time the window lapses while polling goes on).
 export const dedupBound = (spanMs: number, windowMs = ADMIN_ROW_WINDOW_MS) => Math.floor(Math.max(0, spanMs) / windowMs) + 1;
+// The leg's span for the bound: its first poll's start to its last poll's end (its start, for a result that has no end).
+const spanOf = (r: DashResult) => r.firstAt === null ? 0 : (r.lastEndAt ?? r.lastAt ?? r.firstAt) - r.firstAt;
 
-// The leg's failures, in the order the run reports them. `edge`: the bar's latency edge (s); `tooSlow`: the pooled
-// small-pool rule the run's other pools use; `spanMs`: from the leg's first poll to its last.
-export function judgeDashboard(r: DashResult, rows: DashRow[], durationMs: number, edge: number, label: string, tooSlow: (count: number, fast: number) => boolean): string[] {
-  const out: string[] = [];
+// The leg's failures, in the order the run reports them; `item: "p99"` marks the latency pool's (the pilot verdict's
+// p99 item), the rest are other checks. `edge`: the bar's latency edge (s); `tooSlow`: the pooled small-pool rule the
+// run's other pools use; `optional`: views the run's mix can't give a target (no team without the service, no thread
+// without posts), which may go unanswered.
+export type DashFailure = { text: string; item?: "p99" };
+export function judgeDashboard(r: DashResult, rows: DashRow[], durationMs: number, edge: number, label: string, tooSlow: (count: number, fast: number) => boolean, optional: ReadonlySet<string> = new Set()): DashFailure[] {
+  const failures: DashFailure[] = [];
+  const out = { push: (text: string) => failures.push({ text }) };
   const want = Math.floor(durationMs / r.periodMs);
   // The page's cadence: a poll every period, less one for the run's edges. A poll that ran past its period is one fewer.
   if (r.polls < Math.max(1, Math.floor(0.8 * want))) out.push(`dashboard: ${r.polls} polls; want ≥ 80% of ${want} (one per ${r.periodMs / 1000} s)`);
   // Every view ran, once its target existed (a thread and a conversation need the fleet's posts and DMs first).
-  for (const v of DASH_VIEWS) if (!r.views[v.view]?.count) out.push(`dashboard ${v.view}: no request answered${r.skipped[v.view] ? ` (no target in ${r.skipped[v.view]} polls)` : ""}`);
+  for (const v of DASH_VIEWS) if (!optional.has(v.view) && !r.views[v.view]?.count) out.push(`dashboard ${v.view}: no request answered${r.skipped[v.view] ? ` (no target in ${r.skipped[v.view]} polls)` : ""}`);
   if (Object.keys(r.errors).length) out.push(`dashboard errors: ${JSON.stringify(r.errors)}${r.firstErrors.length ? ` (e.g. ${r.firstErrors.slice(0, 3).join("; ")})` : ""}`);
   // The request budget: the dashboard's requests, pooled, at the bar's edge (at most 1% slower, rounded up).
   const i = BUCKETS.indexOf(edge);
   const pool = Object.values(r.views).reduce((a, h) => ({ count: a.count + h.count, fast: a.fast + h.buckets[i]! }), { count: 0, fast: 0 });
-  if (pool.count && tooSlow(pool.count, pool.fast)) out.push(`dashboard: ${(100 * pool.fast / pool.count).toFixed(2)}% of ${pool.count} requests at ${label}; want at most 1% slower, rounded up`);
+  if (pool.count && tooSlow(pool.count, pool.fast)) failures.push({ text: `dashboard: ${(100 * pool.fast / pool.count).toFixed(2)}% of ${pool.count} requests at ${label}; want at most 1% slower, rounded up`, item: "p99" });
   // The audit rows: no deny, and no more than the dedup bound per key.
   const denies = rows.filter(x => x.action === "authz.decision" && x.allow === false);
   if (denies.length) out.push(`dashboard: ${denies.length} gate denies for the dashboard admin (e.g. ${denies.slice(0, 3).map(x => x.route).join(", ")})`);
-  const bound = dedupBound(r.firstAt !== null && r.lastAt !== null ? r.lastAt - r.firstAt : 0);
+  const bound = dedupBound(spanOf(r));
   // Gate allows per route and target, admin.read rows per view and target: one per key per window.
   const gate = new Map<string, number>(), reads = new Map<string, number>();
   for (const x of rows) {
@@ -139,8 +150,12 @@ export function judgeDashboard(r: DashResult, rows: DashRow[], durationMs: numbe
   ];
   if (over.length) out.push(`dashboard: audit rows over the dedup bound (${bound} per route and target) in ${r.polls} polls: ${over.slice(0, 3).join("; ")}`);
   if (r.polls > 1 && !rows.some(x => x.action === "admin.read")) out.push("dashboard: no admin.read row for the thread or conversation it opened");
-  return out;
+  return failures;
 }
+
+// The views a run's mix can't give a target: the team views without the service's team, the thread without posts.
+export const optionalViews = (hasTeam: boolean, posts: boolean): Set<string> =>
+  new Set([...(hasTeam ? [] : ["team", "team-bindings"]), ...(posts ? [] : ["thread"])]);
 
 // The summary's view of the leg: polls, requests, per view count, p99 bucket edge and mean (ms), errors, row counts.
 export function dashSummary(r: DashResult, rows: DashRow[]) {
@@ -148,6 +163,6 @@ export function dashSummary(r: DashResult, rows: DashRow[]) {
   return {
     periodS: r.periodMs / 1000, polls: r.polls, requests: r.requests, errors: r.errors,
     views: Object.fromEntries(Object.entries(r.views).map(([v, h]) => [v, { count: h.count, p99Le: p99(h), meanMs: h.count ? 1000 * h.sum / h.count : null, errors: h.errors }])),
-    rows: { gate: rows.filter(x => x.action === "authz.decision").length, adminRead: rows.filter(x => x.action === "admin.read").length, bound: dedupBound(r.firstAt !== null && r.lastAt !== null ? r.lastAt - r.firstAt : 0) },
+    rows: { gate: rows.filter(x => x.action === "authz.decision").length, adminRead: rows.filter(x => x.action === "admin.read").length, bound: dedupBound(spanOf(r)) },
   };
 }
