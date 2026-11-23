@@ -19,7 +19,7 @@ jobs:
   # plugin-pin PR) runs the pin check below instead of the suites (#507). A PR
   # that changes only docs (files under docs/, or markdown outside adapters/
   # and plugins/, whose markdown ships in packages) runs the doc link check
-  # instead (#601). The diff is of the run's own head commit against its base;
+  # and the site-page test instead (#601, #1649). The diff is of the run's own head commit against its base;
   # pushes and tags always run everything.
   scope:
     runs-on: ubuntu-latest
@@ -54,7 +54,8 @@ jobs:
           echo "pin-only=$pin" | tee -a "$GITHUB_OUTPUT"
           echo "docs-only=$docs" | tee -a "$GITHUB_OUTPUT"
 
-  # The required "test" check. On a docs-only PR it runs the doc link check.
+  # The required "test" check. On a docs-only PR it runs the doc link check
+  # and the site-page test (a docs/site page's theme block and version).
   # On a pin-only PR it checks the pin instead:
   # the marketplace tests, that the file is exactly the base's re-pinned to a
   # newer release (nothing else changed), and that the pinned tag is a
@@ -108,9 +109,9 @@ jobs:
           GRAYBOARD_TEST_PG_REQUIRED: '1'   # a missing database fails the Postgres tests instead of skipping them
         run: bun run test
 
-      - name: Doc links
+      - name: Doc links and site pages
         if: needs.scope.outputs.docs-only == 'true'
-        run: bun test tests/integration/doc_links.test.ts
+        run: bun test tests/integration/doc_links.test.ts tests/integration/site.test.ts
 
       - name: Marketplace tests
         if: env.PIN_ONLY == 'true'
