@@ -3,7 +3,7 @@
 // no MCP), the gate still authorizes its user on each read, and every /admin response carries the page's CSP.
 import { afterEach, describe, expect, test } from "bun:test";
 import { createHash, randomBytes } from "node:crypto";
-import { hostedServer, upstreamLeg, type HostedServer } from "../support/hosted_oauth.ts";
+import { freePort, hostedServer, upstreamLeg, type HostedServer } from "../support/hosted_oauth.ts";
 import { Browser, consentForm, submitConsent } from "../support/oauth_browser.ts";
 import { row } from "../support/repo_sql.ts";
 import { ADMIN_CLIENT_ID, ADMIN_SCOPE, ADMIN_TOKEN_TTL, OAUTH_SCOPES, parseOAuthClients } from "../../src/server/oauth-config.ts";
@@ -30,7 +30,7 @@ async function adminCode(s: HostedServer, v: string): Promise<{ code: string; co
   expect(back.origin + back.pathname).toBe(`${s.issuer}/admin/callback`);
   return { code: back.searchParams.get("code")!, consent };
 }
-const redeem = (s: HostedServer, code: string, v: string) => fetch(`${s.issuer}/oauth/token`, { method: "POST", headers: { Origin: s.issuer, "Content-Type": "application/x-www-form-urlencoded" },
+const redeem = (s: HostedServer, code: string, v: string) => fetch(`${s.issuer}/oauth/token`, { method: "POST", headers: { Origin: new URL(s.issuer).origin, "Content-Type": "application/x-www-form-urlencoded" },
   body: new URLSearchParams({ grant_type: "authorization_code", client_id: ADMIN_CLIENT_ID, code, code_verifier: v, redirect_uri: `${s.issuer}/admin/callback` }) });
 async function adminToken(s: HostedServer): Promise<{ token: string; body: Record<string, unknown>; consent: string; before: number }> {
   const v = verifier();
@@ -122,5 +122,25 @@ describe("/admin", () => {
     }
     // A path that only begins with the word is not the page's.
     expect((await fetch(srv.issuer + "/administrator")).headers.get("Content-Security-Policy")).toBeNull();
+  });
+
+  test("under a path-prefixed public URL the page answers with the prefix kept or stripped, and sign-in lands on its callback", async () => {
+    const port = freePort();
+    const issuer = `http://127.0.0.1:${port}/gb`;
+    srv = Object.assign(await hostedServer({ admins: [ROOT], httpPort: port, publicUrl: issuer }, ROOT), { issuer });
+    const origin = new URL(issuer).origin;
+    for (const path of ["/gb/admin", "/gb/admin/callback?code=x&state=y", "/admin", "/admin/callback"]) {
+      const res = await fetch(origin + path);
+      expect([path, res.status, res.headers.get("Content-Security-Policy")]).toEqual([path, 200, ADMIN_CSP]);
+    }
+    for (const path of ["/gb/administrator", "/gbx/admin"]) expect([path, (await fetch(origin + path)).headers.get("Content-Security-Policy")]).toEqual([path, null]);
+    // adminCode asserts the redirect is <issuer>/admin/callback; the code redeems for a token that reads.
+    const v = verifier();
+    const { code } = await adminCode(srv, v);
+    const res = await redeem(srv, code, v);
+    expect(res.status).toBe(200);
+    const token = (await res.json() as { access_token: string }).access_token;
+    // /api is not prefix-aware (a proxy strips the prefix before it, as for the CLI), so the read goes to the root.
+    expect((await fetch(`${origin}/api/admin/users`, { headers: { Authorization: `Bearer ${token}` } })).status).toBe(200);
   });
 });
