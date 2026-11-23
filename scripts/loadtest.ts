@@ -54,6 +54,15 @@
 // Each is its own op, and each result must show the board (every board_read thread its invocation and reply, some
 // snapshot a post), or the run fails.
 //
+// The dashboard leg (#1651, admin-dashboard D6), in every profile unless --dashboard-period 0: one org_admin
+// (load-dash@example.com, on a grayboard-admin token seeded as the page's sign-in would issue it) polls every dashboard
+// view every --dashboard-period seconds (10, the page's cadence) for the load's whole span: page 1 of each list, a user's
+// grants, names and bindings, a team and its bindings, one thread and one conversation once the fleet has made them
+// (scripts/loadtest_dashboard.ts). The run fails on a missed cadence, a view that never answered, any answer but a 200,
+// its requests pooled past the bar's edge (at most 1% slower, rounded up), a gate deny, or more audit rows for one route
+// and target than one per dedup window (10 min). Its requests aren't tool calls: every other gate is judged as before,
+// with the dashboard polling throughout.
+//
 // The server runs with GRAYBOARD_DEV_AUTH=1 (tests/support/server.ts) on every interface, for as
 // long as the run: anyone who can reach this host's port can sign in to the scratch database.
 // Run it on a machine whose ports aren't reachable from untrusted networks.
@@ -76,6 +85,8 @@ import { issueOAuth } from "../tests/helpers/oauth.ts";
 import { HOSTED_CLIENT, HOSTED_SCOPES } from "../tests/support/hosted_session.ts";
 import { devLogin, ServerProcess } from "../tests/support/server.ts";
 import { startDelayProxy, type DelayProxy } from "../tests/support/delay_proxy.ts";
+import { ADMIN_CLIENT_ID, ADMIN_SCOPE } from "../src/server/oauth-config.ts";
+import { dashSummary, judgeDashboard, startDashboard, type DashResult, type DashRow } from "./loadtest_dashboard.ts";
 import { BUCKETS, PROOF_OPS, SVC_READS, type DriverConfig, type DriverFinal, type DriverSession, type DriverWindow, type Hist, type ReadProof } from "./loadtest_driver.ts";
 
 const ROOT = resolve(import.meta.dir, "..");
@@ -95,6 +106,8 @@ export type Options = {
   pgLatencyMs?: number;
   // The bar the run is judged by (judge): absent, the exit bar's latency target; "pilot", the pilot gate (#1537).
   gate?: "pilot";
+  // The dashboard leg's poll period, seconds; 0 runs without it.
+  dashPeriodS: number;
 };
 
 export function options(argv: string[]): Options {
@@ -105,7 +118,7 @@ export function options(argv: string[]): Options {
       "post-share": { type: "string" }, burst: { type: "string" }, churn: { type: "string" }, "churn-every": { type: "string" },
       "service-workers": { type: "string" }, teams: { type: "string" }, "svc-share": { type: "string" }, "peer-share": { type: "string" }, "read-share": { type: "string" }, "mention-share": { type: "string" },
       window: { type: "string" }, grace: { type: "string" }, server: { type: "string" }, out: { type: "string" }, "keep-db": { type: "boolean" }, pg: { type: "string" }, "pg-latency": { type: "string" },
-      gate: { type: "string" },
+      gate: { type: "string" }, "dashboard-period": { type: "string" },
       // Server env overrides, KEY=VALUE, applied after the caps the run computes.
       env: { type: "string", multiple: true },
     },
@@ -133,6 +146,7 @@ export function options(argv: string[]): Options {
     ...(v.pg ? { pg: v.pg } : {}),
     ...(v["pg-latency"] !== undefined ? { pgLatencyMs: n("pg-latency", 0, 0) } : {}),
     ...(v.gate === "pilot" ? { gate: "pilot" as const } : {}),
+    dashPeriodS: n("dashboard-period", 10, 10),
     env: Object.fromEntries((v.env ?? []).map((kv) => {
       const eq = kv.indexOf("=");
       if (eq < 1) throw new Error(`--env takes KEY=VALUE, not "${kv}"`);
@@ -464,6 +478,22 @@ async function serviceAudit(pgDbUrl: string | undefined, dbPath: string): Promis
   return { teamAllowed, rules, boardScope: board?.scope ?? null, boardKind: board?.kind ?? null };
 }
 
+// The rows the dashboard admin wrote: its gate decisions on /api/admin/ and its admin.read rows.
+async function dashRows(pgDbUrl: string | undefined, dbPath: string): Promise<DashRow[]> {
+  let raw: { action: string; target: string | null; detail: unknown }[];
+  if (pgDbUrl) {
+    const sql = openPg(pgDbUrl, { max: 1, applicationName: "gb-loadtest-dash" });
+    try { raw = await sql`SELECT action, target, detail FROM access_log WHERE actor = ${DASH_ADMIN} AND action IN ('authz.decision', 'admin.read') ORDER BY id`; } finally { await sql.close(); }
+  } else {
+    const ro = new Database(dbPath, { readonly: true });
+    try { raw = ro.query("SELECT action, target, detail FROM access_log WHERE actor = ? AND action IN ('authz.decision', 'admin.read') ORDER BY id").all(DASH_ADMIN) as typeof raw; } finally { ro.close(); }
+  }
+  return raw.map(r => {
+    const d = (typeof r.detail === "string" ? JSON.parse(r.detail) : r.detail) as Record<string, unknown> | null;
+    return { action: r.action as DashRow["action"], target: r.target, route: typeof d?.route === "string" ? d.route : null, view: typeof d?.view === "string" ? d.view : null, allow: typeof d?.allow === "boolean" ? d.allow : null };
+  });
+}
+
 // Every hosted_sessions row left once the fleet has closed, parked children included.
 async function hostedRows(pgDbUrl: string | undefined, dbPath: string): Promise<number> {
   if (pgDbUrl) {
@@ -474,7 +504,7 @@ async function hostedRows(pgDbUrl: string | undefined, dbPath: string): Promise<
   try { return (ro.query("SELECT count(*) AS n FROM hosted_sessions").get() as { n: number }).n; } finally { ro.close(); }
 }
 
-const ADMIN = "load-admin@example.com", SERVICE = "loadsvc", SVC_BOARD = "load-svc";
+const ADMIN = "load-admin@example.com", DASH_ADMIN = "load-dash@example.com", SERVICE = "loadsvc", SVC_BOARD = "load-svc";
 const SERVICE_OPS = new Set<string>(["svc_invoke", "svc_reply", "peer_list", ...SVC_READS]);
 
 // The service, as an admin and a launcher set one up (tests/support/service_token.ts): the service (owned by the first
@@ -521,12 +551,14 @@ export type JudgeInput = {
   refusedAll: Record<string, number>; drained: Record<string, number | undefined>; audit?: ServiceAudit;
   // The steady period's write queue (the pilot gate's world stop).
   queueSteady: QueueStats | null;
+  // The dashboard leg's measurements and the rows its admin's polling wrote; absent when the run had none.
+  dashboard?: { result: DashResult; rows: DashRow[] };
 };
 
 // Every gate, in the order the run reports them. Pure: the run's measurements in, its failures and the numbers its
 // summary reports out.
 export function judge(input: JudgeInput) {
-  const { o, windows, connected, connectErrors, finals, refusedAll, drained, audit, queueSteady } = input;
+  const { o, windows, connected, connectErrors, finals, refusedAll, drained, audit, queueSteady, dashboard } = input;
   const pilot = o.gate === "pilot", edge = GATE_EDGE[pilot ? "pilot" : "latency"];
   const tagged: Failure[] = [];
   const fail = (text: string, item?: PilotItem) => { tagged.push(item ? { text, item } : { text }); };
@@ -649,6 +681,11 @@ export function judge(input: JudgeInput) {
   const rssGrowth = rssSlope * steadyS;
   if (o.rssGate && rssGrowth > Math.max(0.1 * meanRss, 64 * 2 ** 20)) fail(`RSS grew ${(rssGrowth / 2 ** 20).toFixed(0)} MB over the steady ${steadyS} s (mean ${(meanRss / 2 ** 20).toFixed(0)} MB); want flat (< 10% or 64 MB)`);
   for (const [k, v] of Object.entries(drained)) if (v !== 0) fail(`after close, ${k} = ${v}; want 0`);
+  // The dashboard leg: held to the bar's edge, its cadence and the dedup window.
+  if (o.dashPeriodS > 0) {
+    if (!dashboard) fail("dashboard: the leg never ran");
+    else for (const f of judgeDashboard(dashboard.result, dashboard.rows, o.durationS * 1000, edge.le, edge.label, tooSlow)) fail(f, f.includes("% of") ? "p99" : undefined);
+  }
   // The pilot gate's headroom: the share of the steady period in which writes were paused for an exclusive body. A run
   // whose server exports no write queue has no number, and fails.
   if (pilot) {
@@ -696,7 +733,8 @@ async function main() {
 
   const caps = capsEnv(o);
   // The admin creates the service, its credential, the teams and their grants through the admin routes.
-  const env = { ...caps, ...o.env, GRAYBOARD_METRICS_ADDR: "127.0.0.1:0", GRAYBOARD_ADMINS: ADMIN, HOME: join(scratch, "home") };
+  // The dashboard leg's admin is a second bootstrap admin, so its rows are its polling's alone.
+  const env = { ...caps, ...o.env, GRAYBOARD_METRICS_ADDR: "127.0.0.1:0", GRAYBOARD_ADMINS: o.dashPeriodS > 0 ? `${ADMIN},${DASH_ADMIN}` : ADMIN, HOME: join(scratch, "home") };
   mkdirSync(env.HOME, { recursive: true });
   log(`server env: ${Object.entries(env).filter(([k]) => k !== "HOME").map(([k, v]) => `${k}=${v}`).join(" ")} (about ${perUserRate(o).tools.toFixed(1)} tool and ${perUserRate(o).subscriber.toFixed(1)} delivery requests/s per user)`);
   type Driver = { proc: ReturnType<typeof Bun.spawn>; windows: DriverWindow[]; ready?: { live: number; want: number; connectErrors?: Record<string, number> }; final?: DriverFinal; churned: number; quiesced: boolean; read: Promise<void> };
@@ -705,6 +743,7 @@ async function main() {
   const windows: Window[] = [];
   let exitCode = 0;
   let srv: ServerProcess | undefined;
+  let dash: ReturnType<typeof startDashboard> | undefined;
   let proxy: DelayProxy | undefined;
   // The steady period's write-queue deltas, kept outside the try so an aborted run still reports them.
   let steadyQueue: QueueCum = { wait: new Map(), hold: new Map(), keyed: new Map(), worldStop: 0, gate: new Map(), gateMethod: new Map(), statements: new Map(), roundTrips: new Map() }, steadyQueueS = 0;
@@ -741,6 +780,8 @@ async function main() {
       const email = `load${u}@example.com`;
       return { email, token: (await issueOAuth(repo, resource, email, HOSTED_SCOPES, issuedAt, HOSTED_CLIENT)).token };
     }));
+    // The dashboard's token: a grayboard-admin grant, as the page's sign-in leaves one (the run can't drive a browser).
+    const dashToken = o.dashPeriodS > 0 ? (await issueOAuth(repo, resource, DASH_ADMIN, [ADMIN_SCOPE], issuedAt, ADMIN_CLIENT_ID)).token : undefined;
     await repo.close();
     const svcToken = o.serviceWorkers ? await seedService(server.base, o, users.map(u => u.email), Math.ceil(runMs / 1000)) : undefined;
 
@@ -826,6 +867,7 @@ async function main() {
       log(`connect storm: ${bodies} bodies, ${bodies - keyed} exclusive, world stop ${prevQueue.worldStop.toFixed(1)} s; gate bodies by method:outcome: ${methods || "none"}`);
     }
     let nextChurn = start + o.churnEveryS * 1000, churnUntil = 0, churnsSent = 0;
+    dash = dashToken ? startDashboard(server.base, dashToken, o.dashPeriodS * 1000, { board: "load-0", user: users[0]!.email, team: o.serviceWorkers ? "loadteam-0" : null }) : undefined;
     // Each scrape asks every driver for its window since the last ask, so the two cover one span.
     // Report 0 opens the first window: what drivers did before the load started is dropped.
     let seq = 0;
@@ -887,6 +929,9 @@ async function main() {
       if (churnUntil === Infinity && drivers.every(d => d.churned >= churnsSent)) churnUntil = now + o.windowS * 1500;
     }
 
+    // The dashboard stops with the load, before the fleet quiesces.
+    const dashResult = dash ? await dash.stop() : undefined;
+    dash = undefined;
     // Quiesce: no new sends; the fleet drains what's in flight. Then close and account.
     send("quiesce");
     await waitAll("quiesce", d => d.quiesced, 30_000);
@@ -898,11 +943,12 @@ async function main() {
     const drained = { leases: one(after, "grayboard_delivery_leases"), listens: one(after, "grayboard_mcp_admissions", { kind: "listen" }), posts: one(after, "grayboard_mcp_admissions", { kind: "post" }), holding: one(after, "grayboard_hosted_sessions_holding"), watches: one(after, "grayboard_resource_watches"), exchanges: one(after, "grayboard_mcp_exchanges_in_flight") };
     const rows = await hostedRows(pgDbUrl, dbPath);
     const audit = o.serviceWorkers ? await serviceAudit(pgDbUrl, dbPath) : undefined;
+    const dashboard = dashResult ? { result: dashResult, rows: await dashRows(pgDbUrl, dbPath) } : undefined;
 
     // Gates.
     const queueSteady = steadyQueueS > 0 ? queueStats(steadyQueue, steadyQueueS) : null;
     const refusedAll = Object.fromEntries(Object.entries(refusalsTotal(after)).filter(([, n]) => n > 0));
-    const v = judge({ o, windows, connected, connectErrors, finals: drivers.map(d => d.final!), refusedAll, drained, audit, queueSteady });
+    const v = judge({ o, windows, connected, connectErrors, finals: drivers.map(d => d.final!), refusedAll, drained, audit, queueSteady, ...(dashboard ? { dashboard } : {}) });
     failures.push(...v.failures);
     const { steady, clean, toolSteady, toolPool, clientSteady, erroredAll, sent, recv, lost, misdelivered, posts, boardRecv, svcSent, svcGot, svcDone, svcLost, mentSent, mentGot, mentLost, svcReads, laneEchoes, heapSlope, meanRss, steadyS, rssGrowth } = v;
     // Every undelivered id ("sender:seq", the body's `lt|dm|<sender>|<seq>|...`), for classifying against a --keep-db database (#942).
@@ -919,11 +965,13 @@ async function main() {
       service: o.serviceWorkers ? { name: SERVICE, board: SVC_BOARD, workers: o.serviceWorkers, teams: o.teams, invocations: svcSent.size, reachedLane: svcGot.size, replied: svcDone.size, lost: svcLost.length, mentions: { sent: mentSent.size, received: mentGot.size, lost: mentLost.length }, laneEchoes, teamAllowed: audit!.teamAllowed.size, rules: audit!.rules, boardScope: audit!.boardScope, reads: svcReads } : null,
       rss: { meanMB: meanRss / 2 ** 20, growthMB: rssGrowth / 2 ** 20, gated: o.rssGate }, heapGrowthMB: heapSlope * steadyS / 2 ** 20,
       lag: { windows: lagP99.length, p99Max: Math.max(0, ...lagP99), p99Median: lagP99.sort((a, b) => a - b)[Math.floor(lagP99.length / 2)] ?? null },
+      dashboard: dashboard ? dashSummary(dashboard.result, dashboard.rows) : null,
       drained, hostedRowsAfter: rows, refusals: refusedAll, clientErrors: erroredAll, queueSteady, pgLatencyMs: o.pgLatencyMs ?? null, failures,
       // The pilot verdict (only under --gate pilot): the block the log prints, and every tool's steady p99, interpolated.
       ...(o.gate === "pilot" ? { pilot: { verdict: pilotBlock(o, v, connected, queueSteady, steadyTools), toolP99S: steadyTools ? quantile(steadyTools, 0.99) : null } } : {}),
     };
     writeFileSync(join(o.out, "summary.json"), JSON.stringify(summary, null, 2) + "\n");
+    if (summary.dashboard) log(`dashboard: ${JSON.stringify(summary.dashboard)}`);
     log(`summary: ${JSON.stringify({ connected, dms: summary.dms, posts, boardDeliveries: boardRecv, service: summary.service, rss: summary.rss, heapGrowthMB: summary.heapGrowthMB.toFixed(1), lag: summary.lag, hostedRowsAfter: rows })}`);
     if (queueSteady) {
       const q = queueSteady;
@@ -950,6 +998,7 @@ async function main() {
       queueSteady: steadyQueueS > 0 ? queueStats(steadyQueue, steadyQueueS) : null, pgLatencyMs: o.pgLatencyMs ?? null,
     }, null, 2) + "\n");
   } finally {
+    await dash?.stop();
     for (const d of drivers) if (!exited(d)) d.proc.kill("SIGKILL");
     if (srv) { await srv.stop(); writeFileSync(join(o.out, "server.log"), srv.log()); }
     proxy?.stop();
