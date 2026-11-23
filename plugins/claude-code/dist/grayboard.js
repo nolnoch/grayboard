@@ -35157,6 +35157,8 @@ function boardNotification(item) {
     addFiles(meta, p.attachments);
     if (item.deferred)
       meta.deferred = "true";
+    if (item.claim)
+      meta.claim = item.claim;
     return { content: p.body, meta };
   }
   const snippet = item.latest.body.replace(/\s+/g, " ").slice(0, 160);

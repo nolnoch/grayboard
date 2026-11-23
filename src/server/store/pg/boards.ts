@@ -313,10 +313,12 @@ export function makePgBoards({ clock }: { clock: () => number }): BoardsStore {
     },
     async pendingPushes(r, handle) {
       const sql = pgOf(r);
-      const rows: Row[] = await sql`SELECT o.reason, o.wake, ${postCols(sql)} FROM outbox o JOIN posts p ON p.id = o.post_id
+      // The post's queue claim key when `handle` holds it (core pendingPushes, #1640).
+      const rows: Row[] = await sql`SELECT o.reason, o.wake, c.key AS claim, ${postCols(sql)} FROM outbox o JOIN posts p ON p.id = o.post_id
+        LEFT JOIN claims c ON c.key = 'queue:' || p.board || ':' || p.id AND c.holder = o.handle
         WHERE o.handle = ${handle} AND o.delivered_at IS NULL ORDER BY p.id ASC`;
       const posts = await withAttachments(sql, "post", rows.map(x => toPost(x)));
-      return posts.map((post, n): PushRow => ({ reason: rows[n]!.reason as PushRow["reason"], wake: rows[n]!.wake === true, post }));
+      return posts.map((post, n): PushRow => ({ reason: rows[n]!.reason as PushRow["reason"], wake: rows[n]!.wake === true, post, ...(rows[n]!.claim ? { claim: rows[n]!.claim as string } : {}) }));
     },
     // core DIGEST_SQL with the latest post joined in, so a digest and its post come from one snapshot.
     async pendingDigests(r, handle) {

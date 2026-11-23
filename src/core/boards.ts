@@ -2175,7 +2175,8 @@ export function pendingFor(db: Database, handle: string, opts: { all?: boolean; 
 }
 
 // pendingFor's pieces, shared with the server's async drain (#807 P3 B5a1): its reads, then its rule over them.
-export type PushRow = { reason: "mention" | "thread" | "subscription"; wake: boolean; post: Post };
+// `claim`: the post's queue claim key, when `handle` holds it (#1640).
+export type PushRow = { reason: "mention" | "thread" | "subscription"; wake: boolean; post: Post; claim?: string };
 export type DigestRow = { board: string; unread: number; latest: Post };
 
 // The handle's undelivered pushes, oldest first, with their attachments.
@@ -2185,12 +2186,13 @@ export function pendingPushes(db: Database, handle: string): PushRow[] {
     "post",
     db
       .prepare(
-        `SELECT o.reason, o.wake, ${P_POST_COLS} FROM outbox o JOIN posts p ON p.id = o.post_id
+        `SELECT o.reason, o.wake, c.key AS claim, ${P_POST_COLS} FROM outbox o JOIN posts p ON p.id = o.post_id
+          LEFT JOIN claims c ON c.key = 'queue:' || p.board || ':' || p.id AND c.holder = o.handle
           WHERE o.handle = ? AND o.delivered_at IS NULL ORDER BY p.id ASC`,
       )
-      .all(handle) as (PostRow & { reason: PushRow["reason"]; wake: number })[],
+      .all(handle) as (PostRow & { reason: PushRow["reason"]; wake: number; claim: string | null })[],
   );
-  return rows.map(({ reason, wake, ...row }) => ({ reason, wake: !!wake, post: showPost(row) }));
+  return rows.map(({ reason, wake, claim, ...row }) => ({ reason, wake: !!wake, post: showPost(row), ...(claim ? { claim } : {}) }));
 }
 
 // The handle's digests due (DIGEST_SQL): unread exists and nothing was sent since its last catch-up, with the latest post.
@@ -2204,8 +2206,8 @@ export function pendingDigests(db: Database, handle: string): DigestRow[] {
 // Pushes on boards the reader sees become items, waking or deferred; the rest are lost and acknowledged.
 export function pushItems(rows: PushRow[], visible: (board: string) => boolean): { items: Pending[]; lost: PendingRef[] } {
   const items: Pending[] = [], lost: PendingRef[] = [];
-  for (const { reason, wake, post } of rows) {
-    if (visible(post.board)) items.push(wake ? { kind: "push", reason, post } : { kind: "push", reason, post, deferred: true });
+  for (const { reason, wake, post, claim } of rows) {
+    if (visible(post.board)) items.push({ kind: "push", reason, post, ...(wake ? {} : { deferred: true as const }), ...(claim ? { claim } : {}) });
     else lost.push({ kind: "push", post_id: post.id });
   }
   return { items, lost };

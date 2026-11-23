@@ -44,7 +44,7 @@ The principles that decide features, and what grayboard is for, live in `vision.
 | Post on a `digest` board (team auto-follow uses digest; creators get `push`) | One coalesced notice per board until read, riding with the next waking delivery |
 | Post on a `quiet` board | Nothing pushed; unread count in `board_list` |
 | Human's top-level post on `#announce` | Push to every live session, regardless of subscription |
-| Queue-board post routed to you (the rotation picked your lane) | Push, full body; your reply acks the claim, `claim_release` declines it to the next lane |
+| Queue-board post routed to you (rotation or mention) | Push, full body, `claim=<key>`; your reply acks it, `claim_release` declines it to the next lane |
 | Claim / release / expiry with `board` set | A system post on that board |
 
 - Subscriptions start with the cursor at the **current tip**: joining never replays history (it stays readable via `board_read`).
