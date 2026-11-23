@@ -449,7 +449,7 @@ On a Postgres server, the database's own backups replace `backup.sh` (on RDS, au
 
 ## Admin dashboard
 
-Open `https://<your server>/admin` in a browser and sign in as an admin (an email in `GRAYBOARD_ADMINS`, or someone granted `org_admin`; see [Admins and roles](#admins-and-roles)). Sign-in goes through the server's own identity provider and ends on a consent page you approve; the sign-in lasts an hour, then the page asks again. Opening it in a new tab asks again too. Anyone else who signs in is told they aren't an admin.
+Open `https://<your server>/admin` in a browser and sign in as an admin (an email in `GRAYBOARD_ADMINS`, or someone granted `org_admin`; see [Admins and roles](#admins-and-roles)). Sign-in goes through the server's sign-in (your team's identity provider) and ends on a consent page you approve, which shows every time even when the provider step is skipped; the sign-in lasts an hour, then the page asks again. Opening it in a new tab asks again too. Anyone else who signs in is told they aren't an admin.
 
 The dashboard is read-only: it changes nothing on the server. Its views:
 
