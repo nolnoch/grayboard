@@ -13,6 +13,7 @@ import { testPauseAsync } from "../../../shared/testpause.ts";
 import init from "./migrations/0001_init.sql" with { type: "text" };
 import postsAuthorRoot from "./migrations/0002_posts_author_root.sql" with { type: "text" };
 import usersIdpCheckedAt from "./migrations/0003_users_idp_checked_at.sql" with { type: "text" };
+import adminIndexes from "./migrations/0004_admin_indexes.sql" with { type: "text" };
 
 export type Migration = { version: number; name: string; sql: string };
 
@@ -21,6 +22,7 @@ export const MIGRATIONS: readonly Migration[] = [
   { version: 1, name: "0001_init", sql: init },
   { version: 2, name: "0002_posts_author_root", sql: postsAuthorRoot },
   { version: 3, name: "0003_users_idp_checked_at", sql: usersIdpCheckedAt },
+  { version: 4, name: "0004_admin_indexes", sql: adminIndexes },
 ];
 
 // pg_advisory_xact_lock's key: any constant; advisory locks are per database.

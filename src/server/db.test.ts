@@ -42,6 +42,8 @@ import { delegationContract } from "./store/delegation.contract.ts";
 import { sqliteIdsBackend } from "./store/session_end.contract.sqlite.ts";
 import { claimsContract } from "./store/claims.contract.ts";
 import { sqliteClaimsBackend } from "./store/claims.contract.sqlite.ts";
+import { adminContract } from "./store/admin.contract.ts";
+import { sqliteAdminBackend } from "./store/admin.contract.sqlite.ts";
 import { boardsContract } from "./store/boards.contract.ts";
 import { sqliteBoardsBackend } from "./store/boards.contract.sqlite.ts";
 import { NO_MEMBER_AUTHORITY } from "./store/identity.ts";
@@ -346,6 +348,7 @@ describe("Repo", () => {
 // The identity groups' rows (users, sessions, principals, teams, roles, services), shared with the Postgres store
 // (#807 P3 C3): the sign-in D4 branches, the name guards, the role refusals and the savepoint rows live there.
 describe("identity contract (SQLite)", () => identityContract(sqliteIdentityBackend));
+describe("admin contract (SQLite)", () => adminContract(sqliteAdminBackend));
 // The aliases and messages groups' rows, shared with the Postgres store (#807 P3 C5).
 describe("aliases contract (SQLite)", () => aliasesContract(sqliteAliasesBackend));
 describe("messages contract (SQLite)", () => messagesContract(sqliteMessagesBackend));

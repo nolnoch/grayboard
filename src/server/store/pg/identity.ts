@@ -48,7 +48,7 @@ type Row = Record<string, unknown>;
 const str = (v: unknown) => v as string;
 const strOrNull = (v: unknown) => v as string | null;
 
-const toUser = (r: Row): User => ({
+export const toUser = (r: Row): User => ({
   id: int8(r.id), email: str(r.email), display_name: strOrNull(r.display_name), created_at: int8(r.created_at),
   disabled_at: int8OrNull(r.disabled_at), idp_issuer: strOrNull(r.idp_issuer), idp_subject: strOrNull(r.idp_subject),
   idp_checked_at: int8OrNull(r.idp_checked_at), kind: r.kind as User["kind"],
@@ -61,7 +61,7 @@ const toPrincipal = (r: Row): PrincipalRow => ({
   id: int8(r.id), kind: r.kind as PrincipalRow["kind"], name: str(r.name), user_id: int8OrNull(r.user_id),
   team_id: int8OrNull(r.team_id), parent_id: int8OrNull(r.parent_id), created_at: int8(r.created_at),
 });
-const toTeam = (r: Row): Team => ({ id: int8(r.id), name: str(r.name), created_by: int8(r.created_by), policy: str(r.policy), created_at: int8(r.created_at) });
+export const toTeam = (r: Row): Team => ({ id: int8(r.id), name: str(r.name), created_by: int8(r.created_by), policy: str(r.policy), created_at: int8(r.created_at) });
 const toBinding = (r: Row): RoleBinding => ({
   id: int8(r.id), principal_id: int8(r.principal_id), principal: str(r.principal), role: str(r.role),
   scope_id: int8OrNull(r.scope_id), scope: strOrNull(r.scope), granted_by: int8OrNull(r.granted_by), granter: strOrNull(r.granter),
@@ -69,7 +69,7 @@ const toBinding = (r: Row): RoleBinding => ({
 });
 
 // db.ts USER_SQL: the kind is the service principal's, read with the row.
-const userFrom = (sql: PgSql) => sql.fragment`SELECT u.id, u.email, u.display_name, u.created_at, u.disabled_at, u.idp_issuer, u.idp_subject, u.idp_checked_at,
+export const userFrom = (sql: PgSql) => sql.fragment`SELECT u.id, u.email, u.display_name, u.created_at, u.disabled_at, u.idp_issuer, u.idp_subject, u.idp_checked_at,
   CASE WHEN p.id IS NULL THEN 'user' ELSE 'service' END AS kind
   FROM users u LEFT JOIN principals p ON p.user_id = u.id AND p.kind = 'service'`;
 // db.ts BINDING_SQL.
