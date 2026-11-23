@@ -141,8 +141,9 @@ test("a wire's suggested name reaches the server and is offered first while unbo
   const native = new NativeWire({ ...options(), suggested: id => { if (id === "raw-x") throw new Error("gone"); return id === "raw-s" ? "repo-name" : undefined; } }, { token: async () => token }, new AbortController().signal);
   wires.push(native);
   await native.connect();
-  const candidates = async (raw: string) => (JSON.parse(((await native.callTool("whoami", {}, raw)).content as Array<{ text: string }>)[0]!.text) as { candidates?: Array<{ name: string; suggested?: true }> }).candidates ?? [];
-  expect((await candidates("raw-s"))[0]).toMatchObject({ name: "repo-name", suggested: true });
+  const candidates = async (raw: string) => (JSON.parse(((await native.callTool("whoami", {}, raw)).content as Array<{ text: string }>)[0]!.text) as { candidates?: Array<Record<string, unknown> & { name: string; suggested?: true }> }).candidates ?? [];
+  // A name that has never existed says so in the structure, not only the instruction text (#1640): bind needs create.
+  expect((await candidates("raw-s"))[0]).toEqual({ name: "repo-name", queued: 0, claims: 0, where: null, suggested: true, fresh: true, create: true });
   expect((await candidates("raw-x")).some(c => c.suggested)).toBe(false);
   const wire = new Wire({ ...options(), suggested: () => "from-subscriber" }, { token: async () => token }, new AbortController().signal, "raw-w");
   wires.push(wire);
