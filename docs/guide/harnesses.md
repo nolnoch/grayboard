@@ -11,7 +11,7 @@ On local Claude Code resume, grayboard refreshes its bus instructions before del
 
 omp with a team server runs no `grayboard` process: `grayboard setup --server <url>` installs the hosted extension to `~/.omp/agent/extensions/grayboard.js` (removing the local `.ts`), removes omp's `grayboard` entry from `~/.omp/agent/mcp.json`, and writes the server's MCP URL to `~/.omp/agent/grayboard/config.json`. The URL rules, the `/grayboard login`, `logout`, `resume` and `status` commands, the sign-in link a signed-out tool call offers, and the sign-out when moving off a server are pi's (below), with omp's own grant as the built-in `grayboard-omp` client. The tools keep the names local omp shows (`mcp__grayboard_<tool>`). Only a top-level omp session receives pushes; a `task` subagent's calls count as a registered child of the top-level session that started the task, released when the subagent's run ends. omp rebuilds the system prompt only for a prompt you send; the extension brings every model request a push starts to the current grayboard instructions, so right after `bind`, or in a session you just forked, started or resumed, the model sees the name it holds. If a provider changed the prompt text on the way, that request keeps the previous prompt's instructions, and omp warns once per stale text. If the server takes longer than 2 s to give the instructions, or fails, the request keeps the instructions it has rather than wait, with pi's warning and backoff. Each delivery is recorded in the session file (`grayboard-delivery` entries: what was admitted and when the server took its receipt, never the message), for pi too.
 
-The local/V1 [opencode](https://opencode.ai) adapter ([hosted V2 setup](#opencode-v2-native-hosted-mcp-and-packaged-delivery) is separate) works the same way from the agent's side: same tools, same names, same `<channel>` messages, which start a turn (or join a running one at its next step); digests and deferred thread replies are added as context without a reply. opencode drops MCP notifications, so the plugin runs grayboard itself: one `grayboard mcp` per opencode process, whose tools the plugin serves as `grayboard_<tool>` (the names opencode always showed) and whose messages it delivers. It starts when the first root session opens, so messages wait in grayboard until something can receive them. The last root session you write in owns delivery and its own remembered names; a subagent cannot select another root. When `opencode` is on your PATH, `grayboard setup` adds `mcp.grayboard` to `~/.config/opencode/opencode.json` with `"enabled": false` (the plugin reads its command and environment from that entry) and installs the plugin to `~/.config/opencode/plugin/grayboard.ts`; from a checkout you can symlink `adapters/opencode/grayboard.ts` there instead. If you enable the entry, the plugin refuses to start, since opencode would run a second grayboard with the same tools, and says so.
+The local/V1 [opencode](https://opencode.ai) adapter ([hosted V2 setup](#opencode-v2-native-hosted-mcp-and-packaged-delivery) is separate) works the same way from the agent's side: same tools, same names, same `<channel>` messages, which start a turn (or join a running one at its next step); digests and deferred thread replies are added as context without a reply. opencode drops MCP notifications, so the plugin runs grayboard itself: one `grayboard mcp` per opencode process, whose tools the plugin serves as `grayboard_<tool>` (the names opencode always showed) and whose messages it delivers. It starts when the first root session opens, so messages wait in grayboard until something can receive them. The last root session you write in owns delivery and its own remembered names; a subagent cannot select another root. When `opencode` is on your PATH, `grayboard setup` adds `mcp.grayboard` to `~/.config/opencode/opencode.json` (under `$XDG_CONFIG_HOME/opencode` when that's set) with `"enabled": false` (the plugin reads its command and environment from that entry) and installs the plugin to `~/.config/opencode/plugin/grayboard.ts`; from a checkout you can symlink `adapters/opencode/grayboard.ts` there instead. If you enable the entry, the plugin refuses to start, since opencode would run a second grayboard with the same tools, and says so.
 
 Local/V1 opencode task subagents share that grayboard process but call as child sessions: they send under the root's current names, and their writes show their own child ID as `via`. They cannot bind or unbind the root's names, receive no pushes, and get child-scoped instructions instead of the root's. If grayboard is unavailable, a subagent's model turn continues without grayboard instructions and does not wait for restart backoff; a grayboard tool call still waits for recovery, supports cancellation, and reports failure when recovery is exhausted. Their local child session ends with the grayboard root, as omp's local children do.
 
@@ -29,7 +29,7 @@ For any other harness that can't receive MCP notifications, run the server with 
 
 For hosted OpenCode V2, use its native HTTPS MCP connection and the independent `grayboard-opencode` package, not the child-process adapter described above. Local/V1 OpenCode keeps its child-process setup; omp, pi and Claude Code have their own hosted setups (see [team server](team.md#claude-code-with-a-team-server)). Ordinary `grayboard setup` and updates preserve remote or unrecognized Grayboard OpenCode registrations rather than installing the child adapter over them.
 
-**Choose a plugin revision.** Use OpenCode 2.1.4 with Bun 1.4.4 and its Git/subdirectory package source with a reviewed, available full 40-character commit hash containing `adapters/opencode-v2`. The example below pins an available, tested source revision. When changing it, use another reviewed full hash containing that package, not a branch name or abbreviated hash. No Grayboard executable or separately installed plugin directory is needed. The package is not assumed to be published to npm, and the binary installer does not install it.
+**Choose a plugin revision.** Use OpenCode 2.1.4 with Bun 1.4.4 and its Git/subdirectory package source with a reviewed, available full 40-character commit hash containing `adapters/opencode-v2`. The examples below pin `e813827473ceea6de6b33921c994dbdc5bf09179`, the commit the `v3.0.0` release tag points to; pin the tag commit of the release your server runs (`git rev-list -n1 vX.Y.Z` in a clone prints it) and re-pin when the server is updated. When changing it, use another reviewed full hash containing that package, not a branch name or abbreviated hash. No Grayboard executable or separately installed plugin directory is needed. The package is not assumed to be published to npm, and the binary installer does not install it.
 
 **Installed-directory fallback.** For an offline/local package source, use Bun 1.4.4 and Node ≥22.19 with npm:
 
@@ -42,12 +42,12 @@ mkdir -p "$HOME/.local/share/grayboard-opencode"
 
 The installed directory is `$HOME/.local/share/grayboard-opencode/node_modules/grayboard-opencode`. Alternatively use the absolute `adapters/opencode-v2` directory after its frozen install. Git loading and directory wrappers run shipped TypeScript source; no `dist` or install/build lifecycle hook is required. Keep that directory and dependencies available to the OpenCode server. Do not pass a tarball to `opencode plugin add`; OpenCode loads the installed directory's root `index.js`, with its companion `./tui` export.
 
-**Configure without a Grayboard CLI.** The server's `/mcp` endpoint and OpenCode's client-metadata registration are always on; the operator only needs a server build that includes them and its sign-in provider set up ([Configure](server.md#3-configure)). Merge this into your selected `opencode.json` or `opencode.jsonc`, replacing the HTTPS endpoint with your server. Native OAuth discovers the client and scopes; do not add an OAuth block or fixed identity header. For the installed-directory fallback, replace the Git package reference with the absolute installed directory:
+**Configure without a Grayboard CLI.** The server's `/mcp` endpoint is always on, and it accepts OpenCode's client-metadata registration unless the operator has set `GRAYBOARD_OAUTH_CIMD_CLIENTS` to a list without it (or `off`); the operator only needs its sign-in provider set up ([Configure](server.md#3-configure), [Hosted MCP over HTTP](server.md#hosted-mcp-over-http)). Merge this into your selected `opencode.json` or `opencode.jsonc`, replacing the HTTPS endpoint with your server. Native OAuth discovers the client and scopes; do not add an OAuth block or fixed identity header. For the installed-directory fallback, replace the Git package reference with the absolute installed directory:
 
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
-  "plugins": [{ "package": "github:nolnoch/grayboard#fa07b36e2d1dfca9df3f11de6258d31d7a81ffac::path:adapters/opencode-v2" }],
+  "plugins": [{ "package": "github:nolnoch/grayboard#e813827473ceea6de6b33921c994dbdc5bf09179::path:adapters/opencode-v2" }],
   "mcp": {
     "servers": {
       "grayboard": {
@@ -76,12 +76,12 @@ OpenCode loads a server-configured package's `./tui` companion automatically. A 
 
 The companion uses the connected server's public RPC; it does not start Grayboard locally. Its controls are typechecked against the published API, but interactive TUI behavior is not claimed by the embedded-host tests.
 
-**Optional explicit configurator.** From a source checkout, the Grayboard CLI can safely edit one selected scope instead of manual merging:
+**Optional explicit configurator.** The Grayboard CLI (`grayboard setup-opencode`, or `bun src/cli/main.ts setup-opencode` from a source checkout) can safely edit one selected scope instead of manual merging:
 
 ```sh
-bun src/cli/main.ts setup-opencode \
+grayboard setup-opencode \
   --url https://grayboard.example.com/mcp \
-  --revision fa07b36e2d1dfca9df3f11de6258d31d7a81ffac \
+  --revision e813827473ceea6de6b33921c994dbdc5bf09179 \
   --config /absolute/selected/opencode.jsonc --dry-run
 ```
 
@@ -93,7 +93,7 @@ Delivery is at-least-once admission, not exactly-once processing. A hosted sessi
 
 A launcher (a CI step, a broker) can run OpenCode as a [service](server.md#admins-and-roles) with a run token instead of a person's sign-in. **Static mode trusts the repository OpenCode opens, and the agent itself, as much as the launcher:** either can read the run token and act as the service until it expires. Run it only on repositories you trust, or isolate the run (below).
 
-Add the credential with `--source opencode` and `--token-seconds` set to about one run's length, mint a token per run, and start OpenCode with a per-run global config directory the launcher writes:
+An admin adds the credential with `--source opencode` and `--token-seconds` set to about one run's length (`grayboard admin service credential add ingest --source opencode --token-seconds 3600`, which prints the client ID and secret once); then the launcher mints a token per run and starts OpenCode with a per-run global config directory it writes:
 
 ```sh
 TOKEN="$(curl -fsS -u "$CLIENT_ID:$CLIENT_SECRET" -d grant_type=client_credentials \
@@ -132,7 +132,7 @@ with `$RUN_DIR/config/opencode.json`:
 
 pi, omp and Claude Code joined to a server (`grayboard setup --server …`) take a run token the same way, from four environment variables the launcher sets; nothing goes in a config file. **The same trust statement applies:** the repository the agent opens, its plugins and local MCP servers, and the agent's own shell can read the token, so run it only on repositories you trust or isolate the run.
 
-Add the credential with `--source generic` and `--token-seconds` about one run's length, then per run:
+An admin adds the credential with `--source generic` and `--token-seconds` about one run's length (`grayboard admin service credential add ingest --source generic --token-seconds 3600`), then per run:
 
 ```sh
 TOKEN="$(curl -fsS -u "$CLIENT_ID:$CLIENT_SECRET" -d grant_type=client_credentials \

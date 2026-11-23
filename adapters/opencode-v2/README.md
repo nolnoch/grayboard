@@ -10,16 +10,18 @@ Use a reviewed, publicly available **full 40-character commit hash** containing 
 opencode plugin add 'github:nolnoch/grayboard#<FULL_40_CHARACTER_SHA>::path:adapters/opencode-v2'
 ```
 
-Replace the placeholder with the complete hash, not a branch, tag or abbreviated hash. Confirm that revision is on GitHub before recommending it. Package exports and directory wrappers load packaged TypeScript `src/` directly: no build command, generated `dist/`, install script or lifecycle hook is required. The server entry is a native Effect plugin; it inherits the host logger and adapts its Promise lifecycle through the public adapter, rather than exposing a Promise `setup` entry. A local source-only Git fixture verifies installation mechanics, not public availability of a future revision. Tarball installation is separate and does not satisfy the Git verification gate.
+Replace the placeholder with the complete hash, not a branch, tag or abbreviated hash: normally the commit the release tag your server runs points to (`git rev-list -n1 vX.Y.Z`). Confirm that revision is on GitHub before recommending it. Package exports and directory wrappers load packaged TypeScript `src/` directly: no build command, generated `dist/`, install script or lifecycle hook is required. The server entry is a native Effect plugin; it inherits the host logger and adapts its Promise lifecycle through the public adapter, rather than exposing a Promise `setup` entry. A local source-only Git fixture verifies installation mechanics, not public availability of a future revision. Tarball installation is separate and does not satisfy the Git verification gate.
 
 ## Configuration
 
 ```json
 {
   "plugins": [{ "package": "/path/to/installed/grayboard-opencode", "options": { "mcpName": "grayboard" } }],
-  "mcp": { "servers": { "grayboard": { "type": "remote", "url": "https://grayboard.example.com/hosted/mcp" } } }
+  "mcp": { "servers": { "grayboard": { "type": "remote", "url": "https://grayboard.example.com/mcp" } } }
 }
 ```
+
+`package` is the Git reference above or an installed directory; the `url` is the server's public URL with `/mcp` appended. `grayboard setup-opencode --url … --revision <full hash> --config <file> --dry-run` writes the same entries into one selected config file (`docs/guide/harnesses.md` §OpenCode V2).
 
 Use native `/mcps` to sign in. No explicit OAuth client/scopes block or identity header is required. The selected native grant must authorize both `grayboard:tools` and `grayboard:delivery`. Current access and exact issuer/client/scope come from public connection projection; incomplete metadata or expired access fails closed. `Authorization`, `X-Grayboard-Identity`, subscriber-role and lease headers in the native entry are refused. Optional plugin `issuer` pins the exact native issuer string; it is not an endpoint-derived guess. Optional plugin `launcher: true` (only literal `true` counts; `grayboard setup-opencode --launcher` writes it, `--no-launcher` removes it) is this harness's `BUS_LAUNCHER=1`: every subscriber request declares the root a delegation launcher, so `delegate` can reach it once it's enrolled and bound. Once the root is enrolled, every model request it makes carries its current Grayboard instructions (its name, how its mail arrives, and the launcher instruction), replacing the session-less text OpenCode cached at connect (#531). A subagent of an enrolled root carries the server's subagent text instead: it writes as its root, its mail is the root's, and it's never a launcher (#535). The plugin's own requests also report each session's model as its latest model request used it (`providerID/id`, the variant as effort), so `peer_list` shows it and `match: {model}` finds it (#364); OpenCode's native tool calls don't carry it.
 
