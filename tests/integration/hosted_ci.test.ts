@@ -83,7 +83,7 @@ test("PR runs cancel superseded ones, and the required test check fails closed o
   const suites = test.steps.filter((step: any) => step.name === "Typecheck" || step.name === "Test");
   expect(suites.map((step: any) => step.if)).toEqual(["env.SUITES == 'true'", "env.SUITES == 'true'"]);
   const docs = test.steps.filter((step: any) => step.if === "needs.scope.outputs.docs-only == 'true'");
-  expect(docs.map((step: any) => step.run)).toEqual(["bun test tests/integration/doc_links.test.ts"]);
+  expect(docs.map((step: any) => step.run)).toEqual(["bun test tests/integration/doc_links.test.ts tests/integration/site.test.ts"]);
   expect(workflow.jobs["deploy-lint"].if).toBe("needs.scope.outputs.pin-only != 'true' && needs.scope.outputs.docs-only != 'true'");
   const pinSteps = test.steps.filter((step: any) => step.if === "env.PIN_ONLY == 'true'");
   expect(pinSteps.map((step: any) => step.name)).toEqual(["Marketplace tests", "The file only moves the pin forward", "The pin names an immutable release at its commit"]);
