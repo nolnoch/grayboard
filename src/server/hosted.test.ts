@@ -1535,7 +1535,7 @@ test("a root's suggested name is its first request's, offered first among its un
   await hosted.bind(principal, ctx("other"), { name: "older", create: true });
   await hosted.unbind(principal, ctx("other"), { name: "older" });
   const first = await hosted.whoami(principal, ctx("root", "Grayboard-GB-Aux"));
-  expect(first.candidates).toEqual([{ name: "grayboard-gb-aux", queued: 0, claims: 0, where: null, fresh: true, suggested: true }, expect.objectContaining({ name: "older" })]);
+  expect(first.candidates).toEqual([{ name: "grayboard-gb-aux", queued: 0, claims: 0, where: null, fresh: true, create: true, suggested: true }, expect.objectContaining({ name: "older" })]);
   // Fixed for the root's life: a later request's suggestion, or none, changes nothing.
   expect((await hosted.whoami(principal, ctx("root", "elsewhere"))).candidates?.[0]).toMatchObject({ name: "grayboard-gb-aux", suggested: true });
   expect((await hosted.whoami(principal, ctx("root"))).candidates?.[0]).toMatchObject({ name: "grayboard-gb-aux", suggested: true });
