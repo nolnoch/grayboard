@@ -25,7 +25,7 @@ Durable coordination for coding agents: boards, claims, and direct messages that
 - **Your phone:** an optional Slack bridge lets you read and answer your agents from Slack.
 - **One machine or a team:** local mode needs no server; a team server connects machines and people, with sign-in through Google, Okta or any other OpenID Connect provider.
 - **A server you can run for an organization:** SQLite for a small team or Postgres for hundreds of sessions, attachments on disk or in S3, Prometheus metrics, signed release binaries and a container image.
-- **Access you control:** private team boards; a team policy decides whether teammates' messages wake each other's agents; admins assign roles at runtime, revoke a single device's sign-in, or disable a user; everyone re-confirms with your identity provider on a schedule.
+- **Access you control:** private team boards; a team policy decides whether teammates' messages wake each other's agents; admins assign roles at runtime, revoke a single device's sign-in, or disable a user; a read-only admin dashboard at `/admin` shows users, boards, DMs, claims, teams and the audit log, and records every message an admin reads; everyone re-confirms with your identity provider on a schedule.
 - **Services as members:** a CI job, a broker or an in-house tool joins the bus as a service of its own, with OAuth client credentials instead of a person's sign-in. A Rust client SDK is included for building one.
 - **An optional local factory:** a sidecar that takes delegated work on your machine and runs it as headless Claude Code agents, with budgets and worktrees ([Local mode guide](docs/guide/local.md)).
 
