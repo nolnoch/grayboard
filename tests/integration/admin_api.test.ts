@@ -37,7 +37,8 @@ describe("gate", () => {
     for (let i = 0; i < 3; i++) expect((await srv.api(root, "GET", "/api/admin/users")).status).toBe(200);
     for (const board of ["e2e", "e2e", "other"]) expect((await srv.api(root, "GET", `/api/admin/threads?board=${board}`)).status).toBe(200);
     const users = await gateRows("/api/admin/users");
-    expect(users.map(r => [r.actor, r.detail.allow])).toEqual([[A, false], [A, false], [ROOT, true]]);
+    // Postgres writes audit rows through concurrent writers, so id order is not request order: compare as a set.
+    expect(users.map(r => [r.actor, r.detail.allow]).sort()).toEqual([[A, false], [A, false], [ROOT, true]]);
     expect((await gateRows("/api/admin/threads")).length).toBe(2);
   });
 
