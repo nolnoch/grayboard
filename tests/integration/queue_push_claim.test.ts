@@ -1,6 +1,7 @@
 // #1640: a queue post's push to the lane holding it names the claim key (`queue:<board>:<post id>`), the key a
-// decline releases, so the lane needn't look it up; a push to anyone not holding it carries none. Hosted, so it runs
-// on the server's store (SQLite, and Postgres under GRAYBOARD_TEST_BACKEND=pg), and the channel render carries it.
+// decline releases, so the lane needn't look it up; a push of another post carries none (a non-holder's push of the
+// same post: the store contract, src/server/store/boards.contract.ts). Hosted, so it runs on the server's store
+// (SQLite, and Postgres under GRAYBOARD_TEST_BACKEND=pg), and the channel render carries it.
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { board } from "../support/events.ts";
 import { drained, rows } from "../support/repo_sql.ts";
@@ -45,7 +46,7 @@ test("a queue push names its claim key to the lane holding it, and to the next l
   expect(itemOf(second)).toMatchObject({ claim: key });
 });
 
-test("a push to a reader not holding the queue claim carries no key", async () => {
+test("a thread reply's push to the poster carries no key", async () => {
   const lane = await srv.hosted(A, "lane");
   await lane.call("board_create", { name: "jobs", purpose: "work", kind: "queue" });
   await lane.call("board_subscribe", { board: "jobs", mode: "push" });

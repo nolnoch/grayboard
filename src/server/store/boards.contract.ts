@@ -470,6 +470,22 @@ function delivery(it: It): void {
     expect(await b.pendingPushes(h.read, BE)).toEqual([]);
   });
 
+  // #1640: a push names its post's queue claim key only to the address holding it; a non-queue key on the post id's
+  // pattern never matches.
+  it("pendingPushes carries the post's queue claim key to its holder only", async h => {
+    const b = h.boards;
+    await board(h, "jobs");
+    const p = await write(h, np("jobs", BE, "a job", T0));
+    const q = await write(h, np("jobs", BE, "another", T0 + 1));
+    await h.claim({ key: `queue:jobs:${p}`, holder: FE, board: "jobs", at: T0 });
+    await h.claim({ key: `ticket:jobs:${q}`, holder: FE, board: "jobs", at: T0 });
+    await h.write(async tx => {
+      for (const id of [p, q]) await b.insertOutbox(tx, id, [[FE, target("subscription", true)], [QA, target("mention", true)]]);
+    });
+    expect((await b.pendingPushes(h.read, FE)).map(r => [r.post.id, r.claim])).toEqual([[p, `queue:jobs:${p}`], [q, undefined]]);
+    expect((await b.pendingPushes(h.read, QA)).map(r => [r.post.id, r.claim])).toEqual([[p, undefined], [q, undefined]]);
+  });
+
   it("acknowledge: a subscription push moves a push-mode cursor and notified_id up, never back; a digest moves notified_id", async h => {
     const b = h.boards;
     await board(h, "hall");
