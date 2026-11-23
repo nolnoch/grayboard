@@ -1,4 +1,4 @@
-// The admin dashboard's reads (#1651, docs/future/admin-dashboard.md D3, D6): keyset-paginated pages over users, teams,
+// The admin dashboard's reads (#1651, docs/server-admin-dashboard.md §2): keyset-paginated pages over users, teams,
 // claims, threads, messages and the access log, which Repo (db.ts) composes and the Postgres store (pg/admin.ts)
 // implements. Type-only imports, so a module under pg/ may import it (pg/isolation.test.ts).
 //

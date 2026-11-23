@@ -14,7 +14,7 @@ const ADMIN_HEADERS = {
   "Content-Security-Policy": ADMIN_CSP, "X-Frame-Options": "DENY", "X-Content-Type-Options": "nosniff",
   "Referrer-Policy": "no-referrer", "Cache-Control": "no-store",
 };
-// The nav's views, in the design's order: operations first (docs/future/admin-dashboard.md §Sequence).
+// The nav's views: operations first (overview, users, audit), then the content views.
 const NAV = [["overview", "Overview"], ["users", "Users"], ["audit", "Audit"], ["boards", "Boards"], ["dms", "DMs"], ["claims", "Claims"], ["teams", "Teams"]];
 
 // The markup for a public URL whose path is `prefix`: the assets' URLs are absolute, since the page answers at
