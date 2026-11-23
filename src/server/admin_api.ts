@@ -18,6 +18,8 @@ export const ADMIN_ROW_KEYS_MAX = 10_000;
 const DEFAULT_PAGE = 50;
 
 class BadParam extends Error {}
+// A route this server doesn't serve (overview without its getters): 501, not the caller's error.
+class NotServed extends Error {}
 
 // When each (kind, admin, route, target) last wrote its row, in memory: a restart forgets and writes one more (D5).
 export class AdminRows {
@@ -99,7 +101,7 @@ type Route = {
 // instead, in this shape, to the CLI too. The dashboard's versions of those lists carry their own names.
 const ROUTES: Record<string, Route> = {
   overview: { target: () => "", async run(_url, _repo, ctx) {
-    if (!ctx.overview) throw new BadParam("overview not served here");
+    if (!ctx.overview) throw new NotServed("overview not served here");
     return { rows: [await ctx.overview()], next: null };
   } },
   // Role bindings in id order, filtered by role, principal or scope as /api/admin/roles is; the first page leads with
@@ -128,15 +130,7 @@ const ROUTES: Record<string, Route> = {
   // once per harness and machine. No secret: ids, clients, labels and times.
   "user-grants": { target: url => url.searchParams.get("email") ?? "", async run(url, repo, ctx) {
     const user = await repo.users.findByEmail(repo.read, need(url, "email").toLowerCase());
-    if (!user) return { rows: [], next: null };
-    const now = repo.now(), idle = ctx.cliIdleDays ?? 0;
-    const [grants, sessions] = await Promise.all([repo.oauth.listGrants(repo.read, user.id, now),
-      repo.sessions.listLive(repo.read, user.id, idle > 0 ? now - idle * 86_400_000 - 1 : 0, GRANT_LIST_MAX)]);
-    const rows = [
-      ...grants.map(g => ({ id: g.id, kind: g.credential ? "credential" : "oauth", client_id: g.clientId, label: null, created_at: g.createdAt, last_used_at: g.lastUsedAt, expires_at: g.expiresAt })),
-      ...sessions.map(t => ({ id: `cli:${t.id}`, kind: "cli", client_id: null, label: t.label, created_at: t.created_at, last_used_at: t.last_used_at, expires_at: null })),
-    ].sort((a, b) => b.last_used_at - a.last_used_at);
-    return { rows, next: null };
+    return { rows: user ? await grantRows(repo, user.id, ctx.cliIdleDays ?? 0, repo.now()) : [], next: null };
   } },
   // One user's bound names (their person scope's aliases, bounded by the scope cap), each with the unended session holding it
   // now (held_by; whether it is connected right now is the hub's, not the store's), when it was last used and where; most recently used first.
@@ -235,6 +229,7 @@ export async function serveAdminRead(name: string, url: URL, repo: Repo, admin: 
   try { result = await route.run(url, repo, ctx); }
   catch (e) {
     if (e instanceof BadParam) return Response.json({ code: "bad_request", message: e.message }, { status: 400 });
+    if (e instanceof NotServed) return Response.json({ code: "not_implemented", message: e.message }, { status: 501 });
     throw e;
   }
   const { read, ...body } = result;
@@ -242,4 +237,17 @@ export async function serveAdminRead(name: string, url: URL, repo: Repo, admin: 
     writeAudit(repo, repo.read, "admin.read", admin, clipTarget(read), { view: route.content });
   }
   return Response.json(body);
+}
+
+// A user's live OAuth grants (one harness sign-in on one machine; a service's credential grants) and CLI tokens
+// (`cli:<session id>`), newest use first, each kind bounded by GRANT_LIST_MAX. A CLI token unused past idleDays is dead
+// and left out (0: no idle limit). No secret: ids, clients, labels and times. `current` marks the caller's own CLI
+// token. The own and admin grant lists (http.ts) and the dashboard's user-grants route all read through it (#930).
+export async function grantRows(repo: Repo, userId: number, idleDays: number, now: number, current: number | null = null) {
+  const usedAfter = idleDays > 0 ? now - idleDays * 86_400_000 - 1 : 0;
+  const [grants, sessions] = await Promise.all([repo.oauth.listGrants(repo.read, userId, now), repo.sessions.listLive(repo.read, userId, usedAfter, GRANT_LIST_MAX)]);
+  return [
+    ...grants.map(g => ({ id: g.id, kind: g.credential ? "credential" : "oauth", client_id: g.clientId, created_at: g.createdAt, last_used_at: g.lastUsedAt, expires_at: g.expiresAt })),
+    ...sessions.map(t => ({ id: `cli:${t.id}`, kind: "cli", label: t.label, created_at: t.created_at, last_used_at: t.last_used_at, expires_at: null, ...(t.id === current ? { current: true } : {}) })),
+  ].sort((a, b) => b.last_used_at - a.last_used_at);
 }

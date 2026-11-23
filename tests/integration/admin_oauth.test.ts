@@ -68,6 +68,17 @@ describe("grayboard-admin", () => {
     for (const path of ["/api/admin/users", "/api/admin/claims", "/api/admin/audit", "/api/admin/overview", "/api/admin/role-bindings", "/api/admin/service-list", `/api/admin/user-grants?email=${ROOT}`, `/api/admin/user-names?email=${ROOT}`]) expect((await bearer(srv, token, "GET", path)).status).toBe(200);
   });
 
+  test("the page's sign-out revokes its token at the issuer; the dashboard then refuses it", async () => {
+    srv = await hostedServer({ admins: [ROOT] }, ROOT);
+    const { token } = await adminToken(srv);
+    expect((await bearer(srv, token, "GET", "/api/admin/users")).status).toBe(200);
+    // What app.js signOut sends: the token and the client, form-encoded, same origin.
+    const res = await fetch(`${srv.issuer}/oauth/revoke`, { method: "POST", headers: { Origin: new URL(srv.issuer).origin, "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ token, client_id: ADMIN_CLIENT_ID }) });
+    expect(res.status).toBe(200);
+    expect((await bearer(srv, token, "GET", "/api/admin/users")).status).toBe(401);
+  });
+
   test("its token reads nothing else: no other /api route, no admin write or non-dashboard GET, no MCP", async () => {
     srv = await hostedServer({ admins: [ROOT] }, ROOT);
     const { token } = await adminToken(srv);

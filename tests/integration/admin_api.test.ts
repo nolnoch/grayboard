@@ -6,7 +6,7 @@ import { TestServer } from "../support/server.ts";
 import { until } from "../support/until.ts";
 import { accessAudits } from "../support/audit.ts";
 import { drained, exec, row } from "../support/repo_sql.ts";
-import { AdminRows, adminReadRoute } from "../../src/server/admin_api.ts";
+import { AdminRows, adminReadRoute, serveAdminRead } from "../../src/server/admin_api.ts";
 import pkg from "../../package.json" with { type: "json" };
 
 const A = "alice@example.com";
@@ -153,23 +153,51 @@ describe("reads", () => {
     expect((await srv.api(root, "GET", "/api/admin/role-bindings?role=nope")).status).toBe(400);
   });
 
-  test("service-list pages services with owners; user-grants lists a user's live CLI tokens and grants without secrets", async () => {
+  test("service-list pages services with their owners by id to the end", async () => {
+    const root = await srv.login(ROOT);
+    await srv.login(A);
+    for (const name of ["deployer", "indexer", "sweeper"]) expect((await srv.api(root, "POST", "/api/admin/services", { name, owners: [A] })).status).toBe(201);
+    const all = await srv.api(root, "GET", "/api/admin/service-list");
+    expect(all.body.rows.map((s: { name: string; owners: string[] }) => [s.name, s.owners])).toEqual([["deployer", [A]], ["indexer", [A]], ["sweeper", [A]]]);
+    expect(all.body.next).toBeNull();
+    const seen: string[] = [];
+    let after: number | null = 0;
+    for (let i = 0; after !== null && i < 5; i++) {
+      const page = await srv.api(root, "GET", `/api/admin/service-list?limit=2&after=${after}`);
+      seen.push(...page.body.rows.map((s: { name: string }) => s.name));
+      after = page.body.next;
+    }
+    expect(seen).toEqual(["deployer", "indexer", "sweeper"]);
+    expect(after).toBeNull();
+  });
+
+  test("user-grants lists a user's OAuth grants and live CLI tokens without secrets, leaving out one idle past cliIdleDays", async () => {
     const root = await srv.login(ROOT);
     await srv.login(A);
     await srv.login(A);
-    expect((await srv.api(root, "POST", "/api/admin/services", { name: "deployer", owners: [A] })).status).toBe(201);
-    const services = await srv.api(root, "GET", "/api/admin/service-list");
-    expect(services.body.rows.map((s: { name: string; owners: string[] }) => [s.name, s.owners])).toEqual([["deployer", [A]]]);
-    const grants = await srv.api(root, "GET", `/api/admin/user-grants?email=${A}`);
-    expect(grants.status).toBe(200);
-    expect(grants.body.rows.length).toBe(2);
-    for (const g of grants.body.rows) {
-      expect(g.kind).toBe("cli");
+    await srv.hosted(A, null);
+    const grants = async () => (await srv.api(root, "GET", `/api/admin/user-grants?email=${A}`)).body.rows as Record<string, unknown>[];
+    const rows = await grants();
+    const oauth = rows.filter(g => g.kind === "oauth"), cli = rows.filter(g => g.kind === "cli");
+    expect([oauth.length, cli.length]).toEqual([1, 2]);
+    expect(Object.keys(oauth[0]!).sort()).toEqual(["client_id", "created_at", "expires_at", "id", "kind", "last_used_at"]);
+    for (const g of cli) {
       expect(g.id).toMatch(/^cli:\d+$/);
-      expect(Object.keys(g).sort()).toEqual(["client_id", "created_at", "expires_at", "id", "kind", "label", "last_used_at"]);
+      expect(Object.keys(g).sort()).toEqual(["created_at", "expires_at", "id", "kind", "label", "last_used_at"]);
     }
+    // The default idle window is 30 days: a token last used 31 days ago is dead and left out.
+    const idle = Number(String(cli[0]!.id).slice(4));
+    await exec(srv, "UPDATE sessions SET last_used_at = ? WHERE id = ?", Date.now() - 31 * 86_400_000, idle);
+    expect((await grants()).map(g => g.id)).not.toContain(`cli:${idle}`);
+    expect((await grants()).filter(g => g.kind === "cli").length).toBe(1);
     expect((await srv.api(root, "GET", "/api/admin/user-grants?email=nobody@example.com")).body.rows).toEqual([]);
     expect((await srv.api(root, "GET", "/api/admin/user-grants")).status).toBe(400);
+  });
+
+  test("overview is a 501 where the server serves no overview getters", async () => {
+    const res = await serveAdminRead("overview", new URL("http://x/api/admin/overview"), srv.app.repo, ROOT);
+    expect(res.status).toBe(501);
+    expect(await res.json()).toMatchObject({ code: "not_implemented" });
   });
 
   test("user-names lists a user's bound names, a held one with its holding session, most recently used first", async () => {

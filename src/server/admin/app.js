@@ -87,13 +87,19 @@ function token() {
   return null;
 }
 
+// Set once a sign-in redirect is under way: the parallel requests of a composite view that all see the token
+// expire start one redirect, and none paints a refusal over it.
+let redirecting = false;
+
 async function signIn() {
+  if (redirecting) return;
   // A sign-in that comes straight back refused would loop: the second within 20 s stops and asks instead.
   const last = Number(store.get(K.tried) || 0);
   if (Date.now() - last < 20_000) {
     return fail("Sign-in didn't take", "The server refused the new token right after signing in. Check that this account is an admin and that the server's public URL matches this address.", true);
   }
   store.set(K.tried, String(Date.now()));
+  redirecting = true;
   const verifier = random(32), state = random(16);
   const challenge = b64url(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier)));
   store.set(K.pkce, JSON.stringify({ verifier, state, back: location.hash || "" }));
@@ -131,7 +137,18 @@ async function callback() {
   return true;
 }
 
-function signOut() {
+// Revokes the token at the issuer (RFC 7009; its failure is ignored, the token lapses within the hour anyway), then
+// forgets it.
+async function signOut() {
+  const t = token();
+  if (t) {
+    try {
+      await fetch(ISSUER + "/oauth/revoke", {
+        method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, credentials: "omit",
+        body: new URLSearchParams({ token: t.access_token, client_id: CLIENT_ID }),
+      });
+    } catch { /* ignored */ }
+  }
   store.del(K.token);
   store.del(K.tried);
   stopPoll();
@@ -400,14 +417,16 @@ const VIEWS = {
   thread(p) {
     const root = Number(p.root);
     let posts = [], next = null, done = false;
+    // Appends posts not already shown: a page that overlaps the last read adds nothing twice.
+    const append = rows => { const seen = new Set(posts.map(x => x.id)); posts = posts.concat(rows.filter(x => !seen.has(x.id))); };
     const model = {
       async load() { const b = await api("thread", { root }); posts = b.rows; next = b.next; done = b.next == null; },
-      async more() { const b = await api("thread", { root, after: next }); posts = posts.concat(b.rows); next = b.next; done = b.next == null; },
+      async more() { const b = await api("thread", { root, after: next }); append(b.rows); next = b.next; done = b.next == null; },
       // Only at the end of the thread: new replies arrive after the last post read.
       async poll() {
         if (!done || !posts.length) return posts.length ? undefined : this.load();
         const b = await api("thread", { root, after: posts[posts.length - 1].id });
-        posts = posts.concat(b.rows); next = b.next; done = b.next == null;
+        append(b.rows); next = b.next; done = b.next == null;
       },
       render() {
         if (!posts.length) return [h("div", { class: "notice" }, "This thread is gone: its root was removed, by retention or archive.")];
@@ -428,8 +447,14 @@ const VIEWS = {
         ];
       },
     };
-    const board = p.board || (posts[0] && posts[0].board) || "";
-    return { title: `Thread #${root}`, nav: "boards", crumbs: [link(hashOf("boards"), "boards"), board ? link(hashOf("threads", { board }), `#${board}`) : null], model, note: "Audited read." };
+    return {
+      title: `Thread #${root}`, nav: "boards", model, note: "Audited read.",
+      // Read at each paint: without a board in the hash, it is the posts' once they arrive.
+      get crumbs() {
+        const board = p.board || (posts[0] && posts[0].board) || "";
+        return [link(hashOf("boards"), "boards"), board ? link(hashOf("threads", { board }), `#${board}`) : null];
+      },
+    };
   },
 
   dms() {
@@ -520,9 +545,7 @@ const VIEWS = {
 
   team(p) {
     let data = null;
-    return {
-      title: p.name, nav: "teams", crumbs: [link(hashOf("teams"), "teams")],
-      model: {
+    const team = {
         async load() { data = (await api("team", { name: p.name })).rows[0] ?? null; }, poll() { return this.load(); },
         render() {
           if (!data) return [h("div", { class: "notice" }, "No such team.")];
@@ -536,7 +559,10 @@ const VIEWS = {
                 h("td", { class: "mono ink" }, a.name), h("td", { class: "mono" }, a.address), timeCell(a.created_at)])))),
           ];
         },
-      },
+    };
+    return {
+      title: p.name, nav: "teams", crumbs: [link(hashOf("teams"), "teams")],
+      model: composite([{ model: team }, { title: "Role bindings in this team", model: bindingsView({ scope: p.name }) }]),
     };
   },
 };
@@ -611,17 +637,22 @@ async function route() {
   startPoll();
 }
 
+// One poll at a time: the interval and a tab's return both come here, and a trigger while one is in flight is
+// skipped, so two polls never append the same posts or resolve out of order.
+let polling = false;
+async function pollNow() {
+  if (polling || document.hidden || !current || current.error?.status === 403) return;
+  polling = true;
+  try { await run(() => current.view.model.poll()); } finally { polling = false; }
+}
 function startPoll() {
   stopPoll();
-  timer = setInterval(() => {
-    if (document.hidden || !current || current.error?.status === 403) return;
-    run(() => current.view.model.poll());
-  }, POLL_MS);
+  timer = setInterval(pollNow, POLL_MS);
 }
 function stopPoll() { if (timer) clearInterval(timer); timer = null; }
 
 // A tab coming back to the front catches up at once rather than waiting out the interval.
-document.addEventListener("visibilitychange", () => { if (!document.hidden && current && timer) run(() => current.view.model.poll()); });
+document.addEventListener("visibilitychange", () => { if (timer) pollNow(); });
 window.addEventListener("hashchange", () => route());
 
 async function main() {

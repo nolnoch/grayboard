@@ -1,7 +1,7 @@
 import pkg from "../../package.json" with { type: "json" };
 import { randomBytes } from "node:crypto";
 import { mcpResource, SERVICE_CLIENT_PREFIX } from "./oauth-config.ts";
-import { CREDENTIAL_NO_EXPIRY, CREDENTIAL_SOURCES, DEFAULT_SERVICE_TOKEN_LIMITS, GRANT_LIST_MAX, OAUTH_TTL, newGrantId, SERVICE_TOKEN_MIN_SECONDS, type CredentialSource } from "./oauth-types.ts";
+import { CREDENTIAL_NO_EXPIRY, CREDENTIAL_SOURCES, DEFAULT_SERVICE_TOKEN_LIMITS, OAUTH_TTL, newGrantId, SERVICE_TOKEN_MIN_SECONDS, type CredentialSource } from "./oauth-types.ts";
 import { AuthorityLost, DEV_SESSION_LABEL, LastOwner, NO_MEMBER_AUTHORITY, PrincipalTaken, TEAM_POLICIES, type Repo, type RoleFilter, type Team, type TeamPolicy, type User } from "./db.ts";
 import { DEFAULT_CLI_TOKEN_IDLE_DAYS, DEFAULT_IDP_REAUTH_DAYS, type Config } from "./config.ts";
 import {
@@ -13,7 +13,7 @@ import { releaseStored, requestAttachment, storeUpload, type Guard } from "./att
 import type { Read, Tx } from "./store/tx.ts";
 import { UploadTimeout, readUploadBody, type UploadGate } from "./uploads.ts";
 import { writeAudit } from "./audit.ts";
-import { adminReadRoute, adminRows, serveAdminRead, type AdminContext } from "./admin_api.ts";
+import { adminReadRoute, adminRows, grantRows, serveAdminRead, type AdminContext } from "./admin_api.ts";
 import { isLoopbackIp } from "./client_addr.ts";
 import { DEFAULT_LAG_GATE, lagSampler, lagVerdict, lagWindows, type LagGate, type LagSampler, type LagWindow } from "./metrics.ts";
 import { ROLES, authorize, byAdmin, decidePure, isRole, recordDecision, type AuthzRequest, type Decision, type PureRequest } from "./policy.ts";
@@ -1020,13 +1020,7 @@ async function adminServiceCredentialRevoke(req: Request, authed: AuthedUser, re
 // routes act on the caller; the admin routes, behind the org_admin gate, on `email`.
 const CLI_GRANT = /^cli:(\d{1,15})$/;
 async function grantList(target: { id: number }, current: number | null, repo: Repo, idleDays: number): Promise<Response> {
-  const now = Date.now();
-  const usedAfter = idleDays > 0 ? now - idleDays * 86_400_000 - 1 : 0;
-  const [grants, sessions] = await Promise.all([repo.oauth.listGrants(repo.read, target.id, now), repo.sessions.listLive(repo.read, target.id, usedAfter, GRANT_LIST_MAX)]);
-  return json({ grants: [
-    ...grants.map(g => ({ id: g.id, kind: g.credential ? "credential" : "oauth", client_id: g.clientId, created_at: g.createdAt, last_used_at: g.lastUsedAt, expires_at: g.expiresAt })),
-    ...sessions.map(s => ({ id: `cli:${s.id}`, kind: "cli", label: s.label, created_at: s.created_at, last_used_at: s.last_used_at, expires_at: null, ...(s.id === current ? { current: true } : {}) })),
-  ].sort((a, b) => b.last_used_at - a.last_used_at) });
+  return json({ grants: await grantRows(repo, target.id, idleDays, Date.now(), current) });
 }
 async function grantRevoke(target: { id: number; email: string }, id: unknown, authed: AuthedUser, repo: Repo): Promise<Response> {
   if (typeof id !== "string" || id === "" || id.length > 200) return badRequest("id required (from grants list)");
