@@ -229,7 +229,7 @@ function bindingsView(params) {
       { h: "principal", f: b => h("td", { class: "mono ink" }, b.principal) },
       { h: "role", f: b => chip(b.role, b.role === "org_admin" ? "accent" : null) },
       { h: "scope", f: b => h("td", { class: "mono" }, b.scope ?? "org") },
-      { h: "source", f: b => b.source === "bootstrap" ? h("span", { title: "GRAYBOARD_ADMINS" }, chip("bootstrap", "warn")) : chip("binding") },
+      { h: "source", f: b => b.source === "bootstrap" ? h("span", { title: "GRAYBOARD_ADMINS" }, chip("bootstrap", "accent")) : chip("binding") },
       { h: "granted by", f: b => h("td", { class: "mono dim" }, b.granter ?? "") },
       { h: "granted", f: b => timeCell(b.granted_at) },
     ],
