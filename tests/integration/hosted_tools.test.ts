@@ -1109,3 +1109,22 @@ test("#523: a child's post and claim announcement are its root's own: none of th
   await fe.call("board_post", { board: "ops", body: "from fe" });
   expect(await unreadOn(be, "ops")).toBe(1);
 });
+
+// #1640 item 3: a held name's last_seen is its holder's last request, not its bind (docs/handles.md §3), in peer_list
+// and in the stale-recipient note a queued DM carries.
+test("a held name's last_seen follows its holder's requests, after bind and after release", async () => {
+  const b = await srv.hosted(B, "fe");
+  const a = await srv.hosted(A, "be");
+  // The bind two hours back: only the holder's requests since may move it.
+  const twoHoursAgo = Date.now() - 2 * 3_600_000;
+  await exec(srv, "UPDATE aliases SET last_seen = ? WHERE address = ?", twoHoursAgo, `${B}/fe`);
+  await b.call("board_list");
+  const before = Date.now() - 60_000;
+  const fe = (await a.call<WhoResult>("peer_list")).peers.find((p) => p.handle === `${B}/fe`)!;
+  expect(fe.online).toBe(true);
+  expect(fe.last_seen).toBeGreaterThan(before);
+  // Released: its last request before the release still counts, so a DM to it doesn't read as a misaddress.
+  await b.close();
+  const sent = await a.call<SendResult>("dm_send", { to: `${B}/fe`, body: "hi" });
+  expect(sent).toMatchObject({ delivered_now: false, note: "Recipient offline; will be delivered on their next session." });
+});

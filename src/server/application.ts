@@ -50,6 +50,7 @@ import { onAliasCreated } from "./teams.ts";
 import { boardAccess, ownScopeOn, seerIn, type BoardAccess } from "./access.ts";
 import { boardCatalog, boardSnapshot, pendingOf, readableBoard, visibleBoards } from "./board_reads.ts";
 import { callBoardTool, claimsSeen, serverBoardActor } from "./boards.ts";
+import { lastSeen as lastSeenOf } from "./presence.ts";
 import { PROMISE_DAYS, STALE_UNDELIVERED_MS, alreadyRetracted, historyLimit, inboxDays, promised, queuedNote, retractRefusal, showMessage, unanswered, undeliveredInstruction, type InboxItem, type PromiseItem } from "../shared/inbox.ts";
 import type { Pending } from "../shared/notifications.ts";
 
@@ -519,7 +520,7 @@ function helloFields(hub: Hub, authed: AuthedUser, f: HelloFacts): SessionFacts 
 async function noticesFor(hub: Hub, r: Read, addresses: string[], first: string[] = []): Promise<string[]> {
   const undelivered = await hub.repo.messages.undeliveredFrom(r, addresses, hub.now() - STALE_UNDELIVERED_MS);
   // Read before the synchronous helper (#807 P3 B1a), which asks per stale recipient.
-  const seen = await hub.repo.bindings.lastSeen(r, undelivered.map((u) => u.recipient));
+  const seen = await lastSeenOf(hub.repo, r, undelivered.map((u) => u.recipient));
   // A queue post's claim on a board none of `addresses` sees isn't named (claimsSeen, as claim_list's).
   const { rows: claims } = await claimsSeen(hub.repo, hub.access, r, addresses, await hub.repo.claims.list(r));
   return [
@@ -2001,21 +2002,22 @@ async function writeSend(hub: Hub, tx: Tx, session: ApplicationSession, p: Prepa
     // Named whenever it isn't the primary (S4).
     ...(p.from !== session.primary ? { sent_as: p.from } : {}),
   };
-  // Independent reads, in one flight on Postgres (#1537 C6): the recipient's last sight, the wake decision, and, when
-  // no live holder is there to take the message now, the sender's undelivered count for the queued answer.
+  // Independent reads, in one flight on Postgres (#1537 C6): the wake decision and, when no live holder is there to
+  // take the message now, the queued answer's two: the recipient's last sight (its holder's, #1640) and the sender's
+  // undelivered count. A holder that leaves meanwhile has them read after.
   const before = registry.get(p.to);
-  const [seenOf, decided, undeliveredEarly] = await Promise.all([
-    repo.bindings.lastSeen(tx, [p.to]),
+  const [seenEarly, decided, undeliveredEarly] = await Promise.all([
+    before?.active ? undefined : lastSeenOf(repo, tx, [p.to]),
     unwoken(repo, tx, session, before, p.to, find),
     before?.active ? undefined : repo.messages.undeliveredFrom(tx, session.addresses),
   ]);
-  const seen = seenOf.get(p.to) ?? null;
   await testPauseAsync("send:wake:decided");
   // Read after the await (#807 P3 A7f2, H-A): a wake note about a holder that closed meanwhile is dropped.
   const live = registry.get(p.to);
   // Snapshot with `live`: wakeUser may await an alias read (#807 P3 A7f3), and the payload must describe one instant.
   const liveActive = live?.active;
   const wake = (await wakeUser(repo, tx, live, p.to, find)) === decided.user ? decided.fields : {};
+  const seen = liveActive ? null : ((seenEarly ?? await lastSeenOf(repo, tx, [p.to])).get(p.to) ?? null);
   const payload: SendResult = liveActive
     ? { message_id: msg.id, delivered_now: true, ...f, ...wake }
     : {
@@ -2568,7 +2570,7 @@ async function handleInbox(hub: Hub, r: Read, session: ApplicationSession, days:
   const sentPending = await repo.messages.sentPending(r, mine, hub.now() - PROMISE_DAYS * 86_400_000);
   const promises = promised(mine, sentPending, await threadsOf(repo, r, sentPending));
   const undelivered = await repo.messages.undeliveredFrom(r, mine);
-  const lastSeenAt = await repo.bindings.lastSeen(r, undelivered.map((u) => u.recipient));
+  const lastSeenAt = await lastSeenOf(repo, r, undelivered.map((u) => u.recipient));
   const queued = undelivered.map((u) => {
     const seen = lastSeenAt.get(u.recipient);
     return { to: u.recipient, n: u.n, oldest_id: u.oldest_id, ...(seen ? { last_seen: `${age(hub.now() - seen)} ago` } : {}) };

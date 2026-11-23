@@ -19,6 +19,7 @@ import { seenAmong } from "./board_post.ts";
 import { callClaimTool, type Announced } from "./claims.ts";
 import { readableBoard, visibleBoards, type BoardViewer } from "./board_reads.ts";
 import type { Repo } from "./db.ts";
+import { holderSight } from "./presence.ts";
 import type { Read, Tx } from "./store/tx.ts";
 
 // core's ToolContext (its `reader` unset on the server), plus `principal`: an addressless
@@ -235,6 +236,12 @@ async function who(
   } else {
     rows = await repo.boards.roster(tx, null);
   }
+  // A held row's last_seen is its holder's last request (#1640, presence.ts): the alias row moves only at bind and end.
+  const sight = await holderSight(repo, tx, rows.flatMap((r) => (r.id !== null ? [r.id] : [])));
+  if (sight.size) rows = rows.map((r) => {
+    const at = r.id !== null ? sight.get(r.id) : undefined;
+    return at !== undefined && at > (r.last_seen ?? 0) ? { ...r, last_seen: at } : r;
+  });
   const viewer = ctx.session ?? actor;
   const scopes = new Map<string, AliasScopeOf>();
   for (const r of rows) {

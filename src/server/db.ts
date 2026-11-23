@@ -2721,6 +2721,8 @@ function hostedEnds(ended: { list: EndedChild[] }, port: () => SessionEndPort): 
       for (const { address } of db.query<{ address: string }, [string]>(`SELECT address FROM alias_holds WHERE id = ? ${HOLD_ORDER}`).all(session)) {
         dropHold(db, address, session);
         logBinding(db, session, address, "released", reason, now);
+        // Its last_seen is its holder's last request, never moved back (#1640, docs/handles.md §3; pg/hosted.ts).
+        db.run("UPDATE aliases SET last_seen = ? WHERE address = ? AND last_seen < ?", [row.last_seen_at, address, row.last_seen_at]);
       }
       for (const child of children) if (child.root_session_id) {
         hostedAudit(db, session, "hosted.child_released", { child: child.session_id, reason }, now);

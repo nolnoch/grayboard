@@ -240,6 +240,9 @@ export function makePgHosted({ sessionEnd }: { sessionEnd: PgSessionEndPort }): 
       for (const { address } of holds) {
         await sql`INSERT INTO binding_events (session_id, name, event, at, detail) VALUES (${session}, ${address}, 'released', ${now}, ${reason})`;
       }
+      // A released name's last_seen is its holder's last request, the row's, never moved back (#1640, docs/handles.md §3).
+      // After the delete, as unbind's touch; end is an exclusive body, so no bind's take holds an alias row meanwhile.
+      if (holds.length) await sql`UPDATE aliases SET last_seen = ${row.last_seen_at}::int8 WHERE address = ANY(${holds.map(h => h.address)}::text[]) AND last_seen < ${row.last_seen_at}::int8`;
       for (const child of children) if (child.root_session_id) {
         await audit(sql, session, "hosted.child_released", { child: child.session_id, reason }, now);
         await endChild(tx, sql, child.session_id, reason, now);
