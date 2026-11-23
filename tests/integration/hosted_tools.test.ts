@@ -1109,3 +1109,38 @@ test("#523: a child's post and claim announcement are its root's own: none of th
   await fe.call("board_post", { board: "ops", body: "from fe" });
   expect(await unreadOn(be, "ops")).toBe(1);
 });
+
+// #1640 item 3: a held name's last_seen is its holder's last request, not its bind (docs/handles.md §3), in peer_list
+// and in the stale-recipient note a queued DM carries.
+test("a held name's last_seen follows its holder's requests, after bind and after release", async () => {
+  const b = await srv.hosted(B, "fe");
+  const a = await srv.hosted(A, "be");
+  // The bind two hours back: only the holder's requests since may move it.
+  const twoHoursAgo = Date.now() - 2 * 3_600_000;
+  await exec(srv, "UPDATE aliases SET last_seen = ? WHERE address = ?", twoHoursAgo, `${B}/fe`);
+  await b.call("board_list");
+  const before = Date.now() - 60_000;
+  const fe = (await a.call<WhoResult>("peer_list")).peers.find((p) => p.handle === `${B}/fe`)!;
+  expect(fe.online).toBe(true);
+  expect(fe.last_seen).toBeGreaterThan(before);
+  // Released: its last request before the release still counts, so a DM to it doesn't read as a misaddress.
+  await b.close();
+  const sent = await a.call<SendResult>("dm_send", { to: `${B}/fe`, body: "hi" });
+  expect(sent).toMatchObject({ delivered_now: false, note: "Recipient offline; will be delivered on their next session." });
+});
+
+// #1640 item 3: a revoked name's last_seen is its holder's last request too, as at end (docs/handles.md §3).
+test("a team name revoked from a live holder keeps its holder's last request as its last_seen", async () => {
+  const bob = await srv.login(B);
+  await srv.login(A);
+  expect((await srv.api(bob, "POST", "/api/teams", { name: "eng" })).status).toBe(201);
+  expect((await srv.api(bob, "POST", "/api/teams/eng/add", { email: A })).status).toBe(200);
+  await srv.hosted(A, "eng/x");
+  const twoHoursAgo = Date.now() - 2 * 3_600_000;
+  await exec(srv, "UPDATE aliases SET last_seen = ? WHERE address = ?", twoHoursAgo, "eng/x");
+  const before = Date.now() - 60_000;
+  expect((await srv.api(bob, "POST", "/api/teams/eng/remove", { email: A })).status).toBe(200);
+  expect(await rows(srv, "SELECT count(*) AS n FROM alias_holds WHERE address = ?", "eng/x")).toEqual([{ n: 0 }]);
+  const [{ last_seen }] = await rows<{ last_seen: number }>(srv, "SELECT last_seen FROM aliases WHERE address = ?", "eng/x");
+  expect(Number(last_seen)).toBeGreaterThan(before);
+});

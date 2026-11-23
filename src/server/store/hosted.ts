@@ -103,4 +103,7 @@ export interface HostedStore {
   launcher(r: Read, id: string): Promise<boolean>;
   // Every session's holds, oldest first: the hosted sweep's and reconcile's.
   holds(r: Read): Promise<{ id: string; address: string }[]>;
+  // Of `addresses`, each held one's holder's hosted row's last_seen_at, in one statement (#1640, presence.ts): a name
+  // held by a non-hosted session, or by none, is absent. No addresses, no statement.
+  heldSight(r: Read, addresses: readonly string[]): Promise<Map<string, number>>;
 }
