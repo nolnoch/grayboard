@@ -1,15 +1,17 @@
-// Regenerates the theme custom properties in docs/site/index.html from docs/site/tokens.json,
-// so the page's colors never drift by hand. Dark-first: dark values on bare :root, light under
+// Regenerates the theme custom properties in every docs/site/*.html page from docs/site/tokens.json,
+// so the pages' colors never drift by hand. Dark-first: dark values on bare :root, light under
 // prefers-color-scheme (unless the viewer chose dark) and under data-theme="light", dark again
 // under data-theme="dark", and .dark-scope for surfaces that stay dark in both themes.
 //
 // Usage: bun scripts/site_tokens.ts          rewrite the block in place
-//        bun scripts/site_tokens.ts --check  exit 1 if the block differs from tokens.json
-import { readFileSync, writeFileSync } from "node:fs";
+//        bun scripts/site_tokens.ts --check  exit 1 if any page's block differs from tokens.json
+import { readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 const root = join(import.meta.dir, "..");
-export const PAGE = join(root, "docs/site/index.html");
+const SITE = join(root, "docs/site");
+/** Every page GitHub Pages serves from docs/site/. */
+export const PAGES = readdirSync(SITE).filter(f => f.endsWith(".html")).sort().map(f => join(SITE, f));
 export const TOKENS = join(root, "docs/site/tokens.json");
 const BEGIN = "/* BEGIN generated tokens: bun scripts/site_tokens.ts writes this block from docs/site/tokens.json; do not edit. */";
 const END = "/* END generated tokens */";
@@ -36,19 +38,22 @@ export function tokensCss(t: Tokens): string {
 }
 
 /** The page with its generated block replaced from tokens.json. Throws when the markers are missing. */
-export function regenerated(page: string, tokens: Tokens): string {
+export function regenerated(page: string, tokens: Tokens, name = "page"): string {
   const a = page.indexOf(BEGIN), b = page.indexOf(END);
-  if (a < 0 || b < a) throw new Error(`docs/site/index.html: generated-tokens markers missing or out of order`);
+  if (a < 0 || b < a) throw new Error(`${name}: generated-tokens markers missing or out of order`);
   return page.slice(0, a) + tokensCss(tokens) + page.slice(b + END.length);
 }
 
 if (import.meta.main) {
-  const page = readFileSync(PAGE, "utf8");
-  const next = regenerated(page, JSON.parse(readFileSync(TOKENS, "utf8")));
-  if (process.argv.includes("--check")) {
-    if (next !== page) { console.error("docs/site/index.html: theme block is stale; run bun scripts/site_tokens.ts"); process.exit(1); }
-  } else if (next !== page) {
-    writeFileSync(PAGE, next);
-    console.log("docs/site/index.html: theme block regenerated");
+  const tokens = JSON.parse(readFileSync(TOKENS, "utf8"));
+  let stale = false;
+  for (const path of PAGES) {
+    const name = path.slice(root.length + 1);
+    const page = readFileSync(path, "utf8");
+    const next = regenerated(page, tokens, name);
+    if (next === page) continue;
+    if (process.argv.includes("--check")) { console.error(`${name}: theme block is stale; run bun scripts/site_tokens.ts`); stale = true; }
+    else { writeFileSync(path, next); console.log(`${name}: theme block regenerated`); }
   }
+  if (stale) process.exit(1);
 }
