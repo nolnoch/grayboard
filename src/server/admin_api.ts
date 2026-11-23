@@ -93,7 +93,8 @@ const ROUTES: Record<string, Route> = {
   } },
   boards: { target: () => "", async run(url, repo) {
     const rows = await repo.boards.catalogPage(repo.read, str(url, "after") ?? "");
-    return { rows, next: rows.length > 0 ? rows[rows.length - 1]!.name : null };
+    // A short page is the last: both backends page the catalog by 100 (CATALOG_PAGE).
+    return { rows, next: rows.length >= 100 ? rows[rows.length - 1]!.name : null };
   } },
   threads: { target: url => url.searchParams.get("board") ?? "", async run(url, repo) {
     const limit = limitOf(url);
@@ -126,7 +127,7 @@ const ROUTES: Record<string, Route> = {
       const limit = Math.min(limitOf(url), ADMIN_PAGE_MAX);
       const before = int(url, "before");
       const rows = await repo.messages.history(repo.read, [a], b, Math.max(1, limit), before || undefined);
-      return { ...page(rows, limit, m => m.id), read: pair(a, b) };
+      return { ...page(rows, limit, m => m.id), read: rows.length ? pair(a, b) : null };
     },
   },
   audit: { target: url => ["action", "target", "actor"].map(k => url.searchParams.get(k) ?? "").join("\0"), async run(url, repo) {
@@ -140,12 +141,16 @@ const ROUTES: Record<string, Route> = {
 };
 
 const PREFIX = "/api/admin/";
+// A target is built from query parameters, so it's clipped before it keys the dedup map or lands in a row (a long
+// one would overflow Postgres's btree index on access_log's target).
+const MAX_TARGET = 256;
+const clipTarget = (t: string) => (t.length > MAX_TARGET ? t.slice(0, MAX_TARGET) : t);
 // The read route a GET path names, with its gate target, or undefined for any other /api/admin/ path.
 export function adminReadRoute(method: string, path: string, url: URL): { name: string; target: string } | undefined {
   if (method !== "GET" || !path.startsWith(PREFIX)) return undefined;
   const name = path.slice(PREFIX.length);
   const route = Object.hasOwn(ROUTES, name) ? ROUTES[name] : undefined;
-  return route ? { name, target: route.target(url) } : undefined;
+  return route ? { name, target: clipTarget(route.target(url)) } : undefined;
 }
 
 // Serves a read route the gate allowed. A content route writes its admin.read row once per window, and only when it
@@ -159,8 +164,8 @@ export async function serveAdminRead(name: string, url: URL, repo: Repo, admin: 
     throw e;
   }
   const { read, ...body } = result;
-  if (route.content && read && adminRows(repo).due("read", admin, name, route.target(url), repo.now())) {
-    writeAudit(repo, repo.read, "admin.read", admin, read, { view: route.content });
+  if (route.content && read && adminRows(repo).due("read", admin, name, clipTarget(route.target(url)), repo.now())) {
+    writeAudit(repo, repo.read, "admin.read", admin, clipTarget(read), { view: route.content });
   }
   return Response.json(body);
 }
