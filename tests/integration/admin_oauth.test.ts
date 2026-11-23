@@ -65,7 +65,7 @@ describe("grayboard-admin", () => {
     const grant = await row<{ expires_at: number }>(srv, "SELECT expires_at FROM oauth_grants WHERE revoked_at IS NULL ORDER BY expires_at DESC LIMIT 1");
     expect(Number(grant!.expires_at)).toBeGreaterThanOrEqual(before + ADMIN_TOKEN_TTL);
     expect(Number(grant!.expires_at)).toBeLessThanOrEqual(Date.now() + ADMIN_TOKEN_TTL);
-    for (const path of ["/api/admin/users", "/api/admin/claims", "/api/admin/audit", "/api/admin/overview", "/api/admin/role-bindings", "/api/admin/service-list", `/api/admin/user-grants?email=${ROOT}`]) expect((await bearer(srv, token, "GET", path)).status).toBe(200);
+    for (const path of ["/api/admin/users", "/api/admin/claims", "/api/admin/audit", "/api/admin/overview", "/api/admin/role-bindings", "/api/admin/service-list", `/api/admin/user-grants?email=${ROOT}`, `/api/admin/user-names?email=${ROOT}`]) expect((await bearer(srv, token, "GET", path)).status).toBe(200);
   });
 
   test("its token reads nothing else: no other /api route, no admin write or non-dashboard GET, no MCP", async () => {

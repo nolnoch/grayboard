@@ -3,6 +3,7 @@
 // body, and every list pages to its end.
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { TestServer } from "../support/server.ts";
+import { until } from "../support/until.ts";
 import { accessAudits } from "../support/audit.ts";
 import { drained, exec, row } from "../support/repo_sql.ts";
 import { AdminRows, adminReadRoute } from "../../src/server/admin_api.ts";
@@ -169,6 +170,25 @@ describe("reads", () => {
     }
     expect((await srv.api(root, "GET", "/api/admin/user-grants?email=nobody@example.com")).body.rows).toEqual([]);
     expect((await srv.api(root, "GET", "/api/admin/user-grants")).status).toBe(400);
+  });
+
+  test("user-names lists a user's bound names, a held one with its holding session, most recently used first", async () => {
+    const root = await srv.login(ROOT);
+    const a = await srv.login(A);
+    const live = await srv.connected(a, "be");
+    const other = await srv.connected(a, "fe");
+    await other.unbind("fe");
+    const names = () => srv.api(root, "GET", `/api/admin/user-names?email=${A.toUpperCase()}`);
+    const res = await until(async () => { const r = await names(); return r.status !== 200 || r.body.rows.some((x: { name: string; held_by: string | null }) => x.name === "fe" && x.held_by === null) ? r : null; });
+    expect(res.status).toBe(200);
+    const rows = res.body.rows as { name: string; held_by: string | null; last_seen: number | null }[];
+    expect(rows.map(r => r.name).sort()).toEqual(["be", "fe"]);
+    expect(rows.find(r => r.name === "be")!.held_by).toEqual(expect.any(String));
+    expect(rows.find(r => r.name === "fe")!.held_by).toBeNull();
+    for (let i = 1; i < rows.length; i++) expect(rows[i - 1]!.last_seen ?? 0).toBeGreaterThanOrEqual(rows[i]!.last_seen ?? 0);
+    expect((await srv.api(root, "GET", "/api/admin/user-names?email=nobody@example.com")).body.rows).toEqual([]);
+    live.close();
+    other.close();
   });
 
   test("no dashboard route shadows another /api/admin/ path: the CLI's GET lists keep their own shapes", async () => {

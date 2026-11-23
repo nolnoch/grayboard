@@ -322,11 +322,21 @@ const VIEWS = {
         { h: "id", f: g => h("td", { class: "mono dim wrap" }, g.id) },
       ],
     });
+    const names = listView({
+      route: "user-names", params: { email: p.email }, cursor: () => ({}), key: n => n.address,
+      cmp: (a, b) => (b.last_seen ?? 0) - (a.last_seen ?? 0), empty: "No bound names.",
+      columns: [
+        { h: "name", f: n => h("td", { class: "mono ink" }, n.name) },
+        { h: "session", f: n => n.held_by ? h("td", { class: "mono" }, chip("held", "ok"), " ", n.held_by) : h("td", { class: "dim" }, "free") },
+        { h: "last seen", f: n => n.last_seen ? h("td", { class: "time", title: when(n.last_seen) }, ago(n.last_seen)) : h("td", { class: "dim" }, "never") },
+        { h: "where", f: n => h("td", { class: "mono dim wrap" }, [n.place, n.cwd].filter(Boolean).join(" ")) },
+      ],
+    });
     return {
       title: p.email, nav: "users", crumbs: [link(hashOf("users"), "users")],
       controls: h("div", { class: "filters" }, link(hashOf("audit", { actor: p.email }), "audit rows by this user →")),
-      note: "Live sign-ins and roles.",
-      model: composite([{ title: "Grants and CLI tokens", model: grants }, { title: "Role bindings", model: bindingsView({ principal: p.email }) }]),
+      note: "Bound names and the unended sessions holding them, sign-ins and roles.",
+      model: composite([{ title: "Bound names", model: names }, { title: "Grants and CLI tokens", model: grants }, { title: "Role bindings", model: bindingsView({ principal: p.email }) }]),
     };
   },
 

@@ -138,6 +138,19 @@ const ROUTES: Record<string, Route> = {
     ].sort((a, b) => b.last_used_at - a.last_used_at);
     return { rows, next: null };
   } },
+  // One user's bound names (their person scope's aliases, bounded by the scope cap), each with the unended session holding it
+  // now (held_by; whether it is connected right now is the hub's, not the store's), when it was last used and where; most recently used first.
+  "user-names": { target: url => url.searchParams.get("email") ?? "", async run(url, repo) {
+    const email = need(url, "email").toLowerCase();
+    const aliases = await repo.aliases.listForScope(repo.read, "person", email);
+    const addresses = aliases.map(a => a.address);
+    const [seen, holders] = await Promise.all([repo.aliases.seen(repo.read, addresses), repo.bindings.holdersOf(repo.read, addresses)]);
+    const rows = aliases.map(a => {
+      const s = seen.get(a.address);
+      return { address: a.address, name: a.name, held_by: holders.get(a.address) ?? null, last_seen: s?.last_seen ?? null, cwd: s?.cwd ?? null, place: s?.place ?? null, created_at: a.created_at };
+    }).sort((a, b) => (b.last_seen ?? 0) - (a.last_seen ?? 0) || (a.address < b.address ? -1 : 1));
+    return { rows, next: null };
+  } },
   users: { target: () => "", async run(url, repo) {
     const limit = limitOf(url);
     return page(await repo.admin.users(repo.read, int(url, "after"), limit), limit, u => u.id);
