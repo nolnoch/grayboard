@@ -28,7 +28,9 @@ export type Post = {
 };
 
 export type Pending =
-  | { kind: "push"; reason: "mention" | "thread" | "subscription"; post: Post; deferred?: true }
+  // `claim`: the queue claim key (`queue:<board>:<post id>`) when the receiving address holds the post's queue claim
+  // (#1640): the key a decline releases, so the lane needn't look it up.
+  | { kind: "push"; reason: "mention" | "thread" | "subscription"; post: Post; deferred?: true; claim?: string }
   | { kind: "digest"; board: string; unread: number; latest: Post };
 
 export type DirectNotice = { id: number; sender: string; recipient?: string; via?: string | null; body: string; parent_id: number | null; created_at: number; kind?: "bounce" | null; attachments?: AttachmentInfo[]; other_user?: true; ungranted?: true; delegated?: true };
@@ -96,6 +98,7 @@ export function boardNotification(item: Pending): { content: string; meta: Recor
     if (p.ungranted) meta.ungranted = "true";
     addFiles(meta, p.attachments);
     if (item.deferred) meta.deferred = "true";
+    if (item.claim) meta.claim = item.claim;
     return { content: p.body, meta };
   }
   const snippet = item.latest.body.replace(/\s+/g, " ").slice(0, 160);

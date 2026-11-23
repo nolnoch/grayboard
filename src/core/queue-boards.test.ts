@@ -24,6 +24,7 @@ import {
 import { holdAlias } from "./bindings.ts";
 import { claim, logEvent, release, sweepExpired, listClaims, watch } from "./claims.ts";
 import { initCoreSchema } from "./schema.ts";
+import { boardNotification } from "../shared/notifications.ts";
 import { CoreError } from "./errors.ts";
 
 let db: Database;
@@ -90,6 +91,26 @@ test("TTL takeover redelivers the original post to the next lane, and the rotati
   // The redelivery re-woke sim, so the next post rotates to fe.
   const r2 = post(db, "be", "work", "second work item");
   expect(r2.wake).toEqual(["fe"]);
+});
+
+// #1640 item 2: a queue push names the claim key its lane holds, so a decline needn't look it up; a lane that no longer
+// holds it (redelivered elsewhere) gets the push without it, and a broadcast board's push never carries one.
+// Mutation: pendingPushes without its claims join (no claim on fe's push).
+test("a queue push carries its claim key while the lane holds it, in the item and the channel meta", () => {
+  const r = post(db, "be", "work", "work item");
+  const pushOf = (h: string) => pendingFor(db, h, { all: true }).find((i) => i.kind === "push" && i.post.id === r.post.id);
+  expect(pushOf("fe")).toMatchObject({ reason: "subscription", claim: claimKey(r.post.id) });
+  expect(boardNotification(pushOf("fe")!).meta.claim).toBe(claimKey(r.post.id));
+  sweepExpired(db, Date.now() + 31 * 60_000);
+  expect(pushOf("sim")).toMatchObject({ claim: claimKey(r.post.id) });
+  expect(pushOf("fe")).not.toHaveProperty("claim");
+  expect(boardNotification(pushOf("fe")!).meta).not.toHaveProperty("claim");
+  createBoard(db, "be", "news", "a broadcast board", null);
+  subscribe(db, "fe", "news", "push");
+  const b = post(db, "be", "news", "an update");
+  const news = pendingFor(db, "fe", { all: true }).find((i) => i.kind === "push" && i.post.id === b.post.id);
+  expect(news).toBeDefined();
+  expect(news).not.toHaveProperty("claim");
 });
 
 // #1387: a sweep that lapses several queue claims redelivers them in post id order, so it locks their posts in the
