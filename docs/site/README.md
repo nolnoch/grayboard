@@ -1,6 +1,6 @@
 # The one-pager
 
-`index.html` is the marketing version of the [README](../../README.md): one self-contained page covering local mode, a team server and the factory sidecar. GitHub Pages serves it from `master`'s `docs/` folder at https://nolnoch.github.io/grayboard/site/ (`docs/.nojekyll` makes Pages serve files as they are, without a Jekyll build over the agent docs).
+`index.html` is the marketing version of the [README](../../README.md): one self-contained page covering local mode, a team server and the factory sidecar. GitHub Pages serves it from `master`'s `docs/` folder at https://nolnoch.github.io/grayboard/site/; `docs/index.html` redirects the bare site root there (`docs/.nojekyll` makes Pages serve files as they are, without a Jekyll build over the agent docs).
 
 ## Keeping it true
 
