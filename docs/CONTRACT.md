@@ -16,7 +16,7 @@ Read before authoring or editing any doc. Where a doc and this file disagree, th
   - `README.md` is the GitHub landing page for someone deciding whether to use grayboard: the pitch, the feature list, a quick start a newcomer can finish, and links into `docs/guide/`. It holds no behavior detail: an edge case, flag, env var or per-harness rule goes in the guide page that owns it, and the README links there. A reconcile that finds README drift fixes the feature list or quick start, or moves the detail to its guide page.
   - The feature list is plain-language capabilities, not a harness × mode table; `docs/parity.md` owns per-cell status.
   - `docs/guide/<page>.md` is the operating manual, one page per audience or task (local use, other harnesses, joining a team server, running one, Slack, reference, troubleshooting).
-  - `docs/site/index.html` is the README's one-page marketing version, served by GitHub Pages; `docs/site/README.md` holds its upkeep rules (claims from the repo, generated theme, a version test that makes a minor release revisit it).
+  - `docs/site/index.html` is the README's one-page marketing version, served by GitHub Pages beside other human pages that each explain one mechanism (`sessions.html`); `docs/site/README.md` holds their upkeep rules (claims from the repo, generated theme, a version test that makes a minor release revisit them).
   - `CONTRIBUTING.md` is for contributors: workflow, the parity rule as it applies to a PR, building and testing.
 - **A stale doc is worse than none.** An agent acts on a stale line confidently. Fewer, smaller, easy-to-refresh docs beat complete ones. When in doubt, cut.
 

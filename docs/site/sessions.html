@@ -1,0 +1,513 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>grayboard v3.0 sessions</title>
+<meta name="description" content="How a grayboard v3.0 team server handles sessions: the request path, sign-in and tokens, and what an agent session holds.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=Inconsolata:wght@400;700&display=swap">
+<style>
+/* BEGIN generated tokens: bun scripts/site_tokens.ts writes this block from docs/site/tokens.json; do not edit. */
+:root {
+  --surface: #121219;
+  --surface-raised: #1c1c28;
+  --surface-focus: #1a1830;
+  --band: #090910;
+  --line: #2b2b3a;
+  --ink: #e6e6ee;
+  --text: #cccccc;
+  --mist: #7291b4;
+  --faint: #7c7c96;
+  --band-ink: #e6e6ee;
+  --band-text: #cccccc;
+  --band-mist: #7291b4;
+  --accent: #7eb0ea;
+  --accent-fill: #569cd6;
+  --teal: #4ec9b0;
+  --link: #7eb0ea;
+  --focus: #604eff;
+  --focus-dim: rgba(96,78,255,0.38);
+  --rose: #db7f99;
+  --rose-soft: #2a1820;
+  --scarlet: #d16969;
+  --scarlet-fill: #994141;
+  --scarlet-soft: #2a1416;
+  --code-bg: #090910;
+  --code-text: #cccccc;
+  --syntax-keyword: #569cd6;
+  --syntax-type: #4ec9b0;
+  --syntax-string: #ce9178;
+  --syntax-number: #b5cea8;
+  --syntax-function: #dcdcaa;
+  --syntax-variable: #9cdcfe;
+  --syntax-comment: #6a9955;
+  --font-sans: "Inter", "Segoe UI", system-ui, -apple-system, sans-serif;
+  --font-mono: "Inconsolata", "Cascadia Mono", Consolas, ui-monospace, monospace;
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --space-10: 40px;
+  --radius-sm: 3px;
+  --radius-md: 4px;
+  --radius-lg: 6px;
+  --stroke-hairline: 1px;
+  --stroke-focus: 2px;
+  --stroke-edge: 3px;
+  color-scheme: dark;
+}
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) {
+    --surface: #f7f7f9;
+    --surface-raised: #ececf2;
+    --surface-focus: #f0eeff;
+    --band: #121219;
+    --line: #d9d9e3;
+    --ink: #121219;
+    --text: #3a3a4e;
+    --mist: #56698a;
+    --faint: #6e6e84;
+    --band-ink: #e6e6ee;
+    --band-text: #cccccc;
+    --band-mist: #7291b4;
+    --accent: #21478d;
+    --accent-fill: #3d74b8;
+    --teal: #007082;
+    --link: #4636c8;
+    --focus: #604eff;
+    --focus-dim: rgba(96,78,255,0.30);
+    --rose: #b04868;
+    --rose-soft: #f7ebef;
+    --scarlet: #994141;
+    --scarlet-fill: #994141;
+    --scarlet-soft: #f5e9e9;
+    --code-bg: #121219;
+    --code-text: #cccccc;
+    --syntax-keyword: #569cd6;
+    --syntax-type: #4ec9b0;
+    --syntax-string: #ce9178;
+    --syntax-number: #b5cea8;
+    --syntax-function: #dcdcaa;
+    --syntax-variable: #9cdcfe;
+    --syntax-comment: #6a9955;
+    color-scheme: light;
+  }
+}
+:root[data-theme="light"] {
+  --surface: #f7f7f9;
+  --surface-raised: #ececf2;
+  --surface-focus: #f0eeff;
+  --band: #121219;
+  --line: #d9d9e3;
+  --ink: #121219;
+  --text: #3a3a4e;
+  --mist: #56698a;
+  --faint: #6e6e84;
+  --band-ink: #e6e6ee;
+  --band-text: #cccccc;
+  --band-mist: #7291b4;
+  --accent: #21478d;
+  --accent-fill: #3d74b8;
+  --teal: #007082;
+  --link: #4636c8;
+  --focus: #604eff;
+  --focus-dim: rgba(96,78,255,0.30);
+  --rose: #b04868;
+  --rose-soft: #f7ebef;
+  --scarlet: #994141;
+  --scarlet-fill: #994141;
+  --scarlet-soft: #f5e9e9;
+  --code-bg: #121219;
+  --code-text: #cccccc;
+  --syntax-keyword: #569cd6;
+  --syntax-type: #4ec9b0;
+  --syntax-string: #ce9178;
+  --syntax-number: #b5cea8;
+  --syntax-function: #dcdcaa;
+  --syntax-variable: #9cdcfe;
+  --syntax-comment: #6a9955;
+  color-scheme: light;
+}
+:root[data-theme="dark"] {
+  --surface: #121219;
+  --surface-raised: #1c1c28;
+  --surface-focus: #1a1830;
+  --band: #090910;
+  --line: #2b2b3a;
+  --ink: #e6e6ee;
+  --text: #cccccc;
+  --mist: #7291b4;
+  --faint: #7c7c96;
+  --band-ink: #e6e6ee;
+  --band-text: #cccccc;
+  --band-mist: #7291b4;
+  --accent: #7eb0ea;
+  --accent-fill: #569cd6;
+  --teal: #4ec9b0;
+  --link: #7eb0ea;
+  --focus: #604eff;
+  --focus-dim: rgba(96,78,255,0.38);
+  --rose: #db7f99;
+  --rose-soft: #2a1820;
+  --scarlet: #d16969;
+  --scarlet-fill: #994141;
+  --scarlet-soft: #2a1416;
+  --code-bg: #090910;
+  --code-text: #cccccc;
+  --syntax-keyword: #569cd6;
+  --syntax-type: #4ec9b0;
+  --syntax-string: #ce9178;
+  --syntax-number: #b5cea8;
+  --syntax-function: #dcdcaa;
+  --syntax-variable: #9cdcfe;
+  --syntax-comment: #6a9955;
+  color-scheme: dark;
+}
+.dark-scope {
+  --surface: #121219;
+  --surface-raised: #1c1c28;
+  --surface-focus: #1a1830;
+  --band: #090910;
+  --line: #2b2b3a;
+  --ink: #e6e6ee;
+  --text: #cccccc;
+  --mist: #7291b4;
+  --faint: #7c7c96;
+  --band-ink: #e6e6ee;
+  --band-text: #cccccc;
+  --band-mist: #7291b4;
+  --accent: #7eb0ea;
+  --accent-fill: #569cd6;
+  --teal: #4ec9b0;
+  --link: #7eb0ea;
+  --focus: #604eff;
+  --focus-dim: rgba(96,78,255,0.38);
+  --rose: #db7f99;
+  --rose-soft: #2a1820;
+  --scarlet: #d16969;
+  --scarlet-fill: #994141;
+  --scarlet-soft: #2a1416;
+  --code-bg: #090910;
+  --code-text: #cccccc;
+  --syntax-keyword: #569cd6;
+  --syntax-type: #4ec9b0;
+  --syntax-string: #ce9178;
+  --syntax-number: #b5cea8;
+  --syntax-function: #dcdcaa;
+  --syntax-variable: #9cdcfe;
+  --syntax-comment: #6a9955;
+  color-scheme: dark;
+}
+/* END generated tokens */
+/* Layout: dark cover band, then one reading column of four sections: three layers, each a figure plus short facts, and restart behavior. Violet (--focus) carries lines and borders only: kicker rules, the band's bottom edge, the one highlighted box per figure, focus outlines. */
+*, *::before, *::after { box-sizing: border-box; }
+body { margin: 0; background: var(--surface); color: var(--text); font-family: var(--font-sans); font-size: 15px; line-height: 1.62; -webkit-font-smoothing: antialiased; }
+a { color: var(--link); text-underline-offset: 3px; }
+a:focus-visible { outline: var(--stroke-focus) solid var(--focus); outline-offset: 3px; border-radius: var(--radius-sm); }
+code { font-family: var(--font-mono); font-size: .95em; background: var(--surface-raised); color: var(--accent); padding: 0 5px; border-radius: var(--radius-sm); }
+.wrap { max-width: 980px; margin: 0 auto; padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); }
+
+.band { background: var(--band); border-bottom: var(--stroke-focus) solid var(--focus); }
+.band .wrap { padding-block: 40px 32px; display: grid; gap: 12px; }
+.kicker { margin: 0; font-family: var(--font-mono); font-size: 12.5px; font-weight: 700; letter-spacing: .1em; text-transform: uppercase; color: var(--teal); display: flex; align-items: center; gap: 10px; }
+.kicker::before { content: ""; width: 22px; height: 2px; background: var(--focus); }
+.band .kicker { color: var(--band-mist); }
+h1 { margin: 0; color: var(--band-ink); font-size: clamp(28px, 4.4vw, 40px); line-height: 1.1; text-wrap: balance; }
+.band p { margin: 0; color: var(--band-text); max-width: 68ch; }
+.band nav { font-family: var(--font-mono); font-size: 13.5px; color: var(--band-mist); display: flex; flex-wrap: wrap; gap: 6px 20px; }
+.band nav a { color: var(--band-ink); }
+
+main .wrap { padding-block: var(--space-8) 56px; display: grid; gap: 48px; }
+section { display: grid; gap: var(--space-4); min-width: 0; }
+section > * { min-width: 0; }
+h2 { margin: 0; color: var(--ink); font-size: 21px; line-height: 1.3; text-wrap: balance; }
+p { margin: 0; max-width: 70ch; }
+figure { margin: 0; border: var(--stroke-hairline) solid var(--line); border-radius: var(--radius-lg); }
+.scroll { overflow-x: auto; padding: var(--space-4); }
+svg { display: block; width: 100%; height: auto; min-width: 640px; color: var(--mist); font-family: var(--font-sans); }
+figcaption { border-top: var(--stroke-hairline) solid var(--line); padding: var(--space-3) var(--space-4); font-size: 13.5px; color: var(--mist); }
+.facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: var(--space-3) var(--space-6); margin: 0; padding: 0; list-style: none; }
+.facts li { min-width: 0; padding-left: 14px; border-left: var(--stroke-hairline) solid var(--line); }
+.facts b { color: var(--ink); font-weight: 600; }
+.tablewrap { overflow-x: auto; border: var(--stroke-hairline) solid var(--line); border-radius: var(--radius-lg); }
+table { border-collapse: collapse; width: 100%; font-size: 14px; }
+th { font-family: var(--font-mono); font-size: 12px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; color: var(--mist); text-align: left; padding: var(--space-2) var(--space-3); border-bottom: var(--stroke-hairline) solid var(--line); }
+td { padding: 9px var(--space-3); border-bottom: var(--stroke-hairline) solid var(--line); vertical-align: top; }
+tr:last-child td { border-bottom: 0; }
+td:first-child { color: var(--ink); font-weight: 600; white-space: nowrap; }
+td.num { font-family: var(--font-mono); font-variant-numeric: tabular-nums; white-space: nowrap; color: var(--ink); }
+.note { background: var(--rose-soft); border-left: var(--stroke-edge) solid var(--rose); border-radius: var(--radius-md); padding: var(--space-3) var(--space-4); display: grid; gap: var(--space-2); }
+.note .kicker { color: var(--rose); }
+.note .kicker::before { background: var(--rose); }
+.note ul { margin: 0; padding-left: 18px; display: grid; gap: 4px; }
+footer { color: var(--faint); font-family: var(--font-mono); font-size: 13px; display: flex; flex-wrap: wrap; gap: 6px 20px; }
+footer a { color: var(--mist); }
+
+/* SVG roles */
+.box { fill: var(--surface-raised); stroke: var(--line); stroke-width: 1; }
+.box-focus { fill: var(--surface-focus); stroke: var(--focus); stroke-width: 2; }
+.box-plain { fill: var(--surface); stroke: var(--line); stroke-width: 1; }
+.t { fill: var(--ink); font-size: 14px; font-weight: 600; }
+.s { fill: var(--text); font-size: 12px; }
+.m { fill: var(--mist); font-family: var(--font-mono); font-size: 12px; }
+.lane { stroke: var(--line); stroke-width: 1; stroke-dasharray: 4 4; }
+.edge { stroke: currentColor; stroke-width: 1.4; fill: none; }
+.edge-dash { stroke: currentColor; stroke-width: 1.4; fill: none; stroke-dasharray: 5 4; }
+.edge-rose { stroke: var(--rose); stroke-width: 1.4; fill: none; stroke-dasharray: 5 4; }
+.lbl { fill: var(--mist); font-family: var(--font-mono); font-size: 12px; }
+.lbl-rose { fill: var(--rose); font-family: var(--font-mono); font-size: 12px; }
+.step { fill: var(--teal); font-family: var(--font-mono); font-size: 12px; font-weight: 700; }
+.zone { fill: none; stroke: var(--focus-dim); stroke-width: 1; stroke-dasharray: 3 4; }
+.zlbl { fill: var(--faint); font-family: var(--font-mono); font-size: 11.5px; letter-spacing: .06em; }
+.arrow { fill: var(--mist); }
+.arrow-rose { fill: var(--rose); }
+</style>
+</head>
+<body>
+
+<header class="band dark-scope">
+  <div class="wrap">
+    <p class="kicker">grayboard v3.0 · team server</p>
+    <h1>How grayboard handles sessions</h1>
+    <p>Three layers, each drawn on its own: the path a request takes to the server, how a person signs in and what credentials that leaves behind, and what an agent session is and how long its name lasts. The last section covers what a server restart does to all three. Numbers are the server's defaults; each names the setting that changes it.</p>
+    <nav aria-label="Related pages"><a href="./">The one-page overview</a><a href="https://github.com/nolnoch/grayboard/blob/master/docs/guide/server.md">Running a server</a><a href="https://github.com/nolnoch/grayboard">github.com/nolnoch/grayboard</a></nav>
+  </div>
+</header>
+
+<main>
+<div class="wrap">
+
+<section aria-labelledby="l1">
+  <p class="kicker">Layer 1 · Request path</p>
+  <h2 id="l1">Every client talks HTTPS to one server process</h2>
+  <p>Agents connect over hosted MCP (<code>/mcp</code>); the <code>grayboard</code> CLI uses the REST API (<code>/api</code>). Nothing runs on a user's machine except the harness extension and the CLI. The server is the only process holding live state; the database, attachment storage and Slack sit behind it.</p>
+  <figure>
+    <div class="scroll">
+    <svg viewBox="0 0 960 330" role="img" aria-label="Clients reach one grayboard server process through a TLS proxy or load balancer over HTTPS; the server writes to SQLite or Postgres, stores attachments on disk or in S3, and optionally holds an outbound Socket Mode connection to Slack.">
+      <defs>
+        <marker id="a1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrow" d="M0 0L10 5L0 10z"/></marker>
+      </defs>
+      <text class="zlbl" x="20" y="22">USER MACHINES</text>
+      <rect class="zone" x="282" y="34" width="658" height="282" rx="6"/>
+      <text class="zlbl" x="296" y="54">YOUR INFRASTRUCTURE</text>
+
+      <rect class="box" x="20" y="40" width="210" height="66" rx="6"/>
+      <text class="t" x="34" y="66">Claude Code plugin</text>
+      <text class="s" x="34" y="88">hosted client under Bun</text>
+      <rect class="box" x="20" y="132" width="210" height="66" rx="6"/>
+      <text class="t" x="34" y="158">pi, omp, OpenCode</text>
+      <text class="s" x="34" y="180">hosted extensions</text>
+      <rect class="box" x="20" y="224" width="210" height="66" rx="6"/>
+      <text class="t" x="34" y="250">grayboard CLI</text>
+      <text class="s" x="34" y="272">admin, claims, teams</text>
+
+      <rect class="box" x="320" y="122" width="140" height="86" rx="6"/>
+      <text class="t" x="390" y="152" text-anchor="middle">TLS proxy</text>
+      <text class="s" x="390" y="172" text-anchor="middle">Caddy, ingress</text>
+      <text class="s" x="390" y="190" text-anchor="middle">or load balancer</text>
+
+      <path class="edge" d="M230 73 H268 V150 H316" marker-end="url(#a1)"/>
+      <path class="edge" d="M230 165 H316" marker-end="url(#a1)"/>
+      <path class="edge" d="M230 257 H268 V180 H316" marker-end="url(#a1)"/>
+      <text class="lbl" x="238" y="66">/mcp</text>
+      <text class="lbl" x="238" y="158">/mcp</text>
+      <text class="lbl" x="238" y="250">/api</text>
+
+      <rect class="box-focus" x="510" y="84" width="200" height="162" rx="6"/>
+      <text class="t" x="528" y="112">grayboard-server</text>
+      <text class="m" x="528" y="132">one process, one replica</text>
+      <text class="s" x="528" y="160">hosted MCP + OAuth + API</text>
+      <text class="s" x="528" y="182">sessions and names</text>
+      <text class="s" x="528" y="204">delivery queue (memory)</text>
+      <text class="s" x="528" y="226">lease sweep every 250 ms</text>
+      <path class="edge" d="M460 165 H506" marker-end="url(#a1)"/>
+      <text class="lbl" x="466" y="158">HTTP</text>
+
+      <rect class="box" x="770" y="64" width="160" height="66" rx="6"/>
+      <text class="t" x="784" y="90">Database</text>
+      <text class="m" x="784" y="112">SQLite or Postgres</text>
+      <rect class="box" x="770" y="152" width="160" height="66" rx="6"/>
+      <text class="t" x="784" y="178">Attachments</text>
+      <text class="m" x="784" y="200">disk or S3</text>
+      <rect class="box" x="770" y="240" width="160" height="66" rx="6"/>
+      <text class="t" x="784" y="266">Slack (optional)</text>
+      <text class="m" x="784" y="288">outbound socket</text>
+
+      <path class="edge" d="M710 120 H740 V97 H766" marker-end="url(#a1)"/>
+      <text class="lbl" x="716" y="112">writes</text>
+      <path class="edge" d="M710 185 H766" marker-end="url(#a1)"/>
+      <text class="lbl" x="716" y="178">bytes</text>
+      <path class="edge" d="M710 225 H740 V273 H766" marker-end="url(#a1)"/>
+    </svg>
+    </div>
+    <figcaption>Clients reach the proxy over HTTPS, and the proxy forwards to the one server process. The server can reach S3 with an IAM role, so it needs no stored keys. It opens its own outbound connection to Slack, so Slack needs no inbound route.</figcaption>
+  </figure>
+  <ul class="facts">
+    <li><b>One process owns live state.</b> The delivery queue and pending pushes live in its memory; durable rows (messages, claims, names, token hashes) are in the database.</li>
+    <!-- source: src/server/store/queue.ts DEFAULT_DATABASE_WRITERS -->
+    <li><b>Postgres for larger teams,</b> with a pool of 8 writer connections by default (<code>GRAYBOARD_DATABASE_WRITERS</code>), or SQLite for a small one.</li>
+    <!-- source: src/server/hosted.ts TICK_MS -->
+    <li><b>Lease sweep:</b> a timer every 250 ms expires lapsed delivery leases, so a dead connection stops receiving pushes within a lease period.</li>
+  </ul>
+</section>
+
+<section aria-labelledby="l2">
+  <p class="kicker">Layer 2 · Sign-in and credentials</p>
+  <h2 id="l2">Your identity provider proves who you are; grayboard issues its own tokens</h2>
+  <p>Each harness install gets one OAuth grant through a browser sign-in with PKCE. The identity provider's tokens are checked and thrown away: grayboard never stores them and never passes them on. What the harness keeps is a grayboard token, and the server keeps only its SHA-256 hash.</p>
+  <figure>
+    <div class="scroll">
+    <svg viewBox="0 0 960 470" role="img" aria-label="Sign-in sequence: the harness starts a PKCE authorization, the browser signs in at the identity provider, the server verifies the ID token and discards it, then exchanges the code for a one-hour access token and a refresh token, storing only their hashes.">
+      <defs>
+        <marker id="a2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrow" d="M0 0L10 5L0 10z"/></marker>
+      </defs>
+      <rect class="box" x="40" y="16" width="160" height="44" rx="6"/><text class="t" x="120" y="43" text-anchor="middle">Harness</text>
+      <rect class="box" x="270" y="16" width="160" height="44" rx="6"/><text class="t" x="350" y="43" text-anchor="middle">Browser</text>
+      <rect class="box-focus" x="520" y="16" width="180" height="44" rx="6"/><text class="t" x="610" y="43" text-anchor="middle">grayboard server</text>
+      <rect class="box" x="770" y="16" width="170" height="44" rx="6"/><text class="t" x="855" y="43" text-anchor="middle">Identity provider</text>
+      <line class="lane" x1="120" y1="60" x2="120" y2="456"/>
+      <line class="lane" x1="350" y1="60" x2="350" y2="456"/>
+      <line class="lane" x1="610" y1="60" x2="610" y2="456"/>
+      <line class="lane" x1="855" y1="60" x2="855" y2="456"/>
+
+      <text class="step" x="20" y="104">1</text>
+      <path class="edge" d="M120 100 H346" marker-end="url(#a2)"/>
+      <text class="lbl" x="132" y="92">open /oauth/authorize (PKCE)</text>
+
+      <text class="step" x="20" y="154">2</text>
+      <path class="edge" d="M350 150 H851" marker-end="url(#a2)"/>
+      <text class="lbl" x="362" y="142">redirect to OpenID Connect sign-in</text>
+
+      <text class="step" x="20" y="204">3</text>
+      <path class="edge" d="M855 200 H614" marker-end="url(#a2)"/>
+      <text class="lbl" x="845" y="192" text-anchor="end">ID token</text>
+      <rect class="box-plain" x="460" y="212" width="300" height="34" rx="4"/>
+      <text class="s" x="610" y="234" text-anchor="middle">verify signature, issuer, audience → discard</text>
+
+      <text class="step" x="20" y="294">4</text>
+      <path class="edge" d="M610 290 H354" marker-end="url(#a2)"/>
+      <text class="lbl" x="598" y="282" text-anchor="end">consent page → one-time code</text>
+      <path class="edge" d="M350 304 H124" marker-end="url(#a2)"/>
+      <text class="lbl" x="338" y="322" text-anchor="end">loopback redirect</text>
+
+      <text class="step" x="20" y="366">5</text>
+      <path class="edge" d="M120 362 H606" marker-end="url(#a2)"/>
+      <text class="lbl" x="132" y="354">code + PKCE verifier</text>
+      <path class="edge" d="M610 384 H124" marker-end="url(#a2)"/>
+      <text class="lbl" x="598" y="402" text-anchor="end">access token (1 h) + refresh token</text>
+      <rect class="box-plain" x="640" y="356" width="270" height="34" rx="4"/>
+      <text class="s" x="775" y="378" text-anchor="middle">stores SHA-256 of each, never the token</text>
+
+      <text class="step" x="20" y="448">6</text>
+      <path class="edge" d="M120 444 H606" marker-end="url(#a2)"/>
+      <text class="lbl" x="132" y="436">every /mcp call: Bearer access token</text>
+    </svg>
+    </div>
+    <figcaption>Steps 1–5 happen once per harness install, and again whenever re-authentication is due. Step 6 is every request: the server looks up the token's hash and re-checks the grant and the user on each call, so a revocation takes effect on the next request.</figcaption>
+  </figure>
+  <div class="tablewrap">
+  <table>
+    <thead><tr><th>Credential</th><th>Lifetime</th><th>Notes</th></tr></thead>
+    <tbody>
+      <!-- source: src/server/oauth-types.ts OAUTH_TTL -->
+      <tr><td>OAuth grant</td><td class="num">≤ 90 d</td><td>One per harness install. Revocable on its own.</td></tr>
+      <tr><td>Access token</td><td class="num">1 h</td><td>Bearer on every <code>/mcp</code> call. The extension refreshes it without asking.</td></tr>
+      <tr><td>Refresh token</td><td class="num">30 d, rotates</td><td>Single use. Replaying a spent one revokes the whole grant.</td></tr>
+      <!-- source: src/server/config.ts DEFAULT_IDP_REAUTH_DAYS; docs/server-offboarding.md §2 -->
+      <tr><td>IdP re-authentication</td><td class="num">every 30 d</td><td>A refresh past it is refused until the person signs in at the identity provider again (<code>GRAYBOARD_IDP_REAUTH_DAYS</code>). With a directory check (Google, Okta, Keycloak), the server asks the directory every 24 h instead.</td></tr>
+      <!-- source: src/server/config.ts DEFAULT_CLI_TOKEN_IDLE_DAYS -->
+      <tr><td>CLI token</td><td class="num">30 d unused</td><td><code>gbrd_v1_…</code>, from <code>grayboard login</code>. Use keeps it alive; 30 days unused and it is refused (<code>GRAYBOARD_CLI_TOKEN_IDLE_DAYS</code>).</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <ul class="facts">
+    <li><b>Revoke one install:</b> revoke its grant. Its sessions are refused on their next call.</li>
+    <li><b>Offboard a person:</b> an admin disables the user. Every grant and session ends, and re-enabling does not bring the grants back.</li>
+  </ul>
+</section>
+
+<section aria-labelledby="l3">
+  <p class="kicker">Layer 3 · Agent session lifecycle</p>
+  <h2 id="l3">A session holds a name until it ends, not until it disconnects</h2>
+  <p>A harness session gets a session ID when it first connects. To be addressable it binds a name, usually its task (<code>auth-refactor</code>). To receive pushes it holds a delivery lease, which it renews. The name survives <code>/clear</code>, a dropped connection and a resumed session, because the session ID behind it stays the same through all three.</p>
+  <figure>
+    <div class="scroll">
+    <svg viewBox="0 0 960 330" role="img" aria-label="Session states: connected without a name, then bound to a name, then delivering with a 30-second lease that is renewed; clear, reconnect and resume keep the same name; the session ends and frees the name. An unbound session idle 15 minutes is retired; a second session asking for a held name is refused.">
+      <defs>
+        <marker id="a3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrow" d="M0 0L10 5L0 10z"/></marker>
+        <marker id="a3r" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrow-rose" d="M0 0L10 5L0 10z"/></marker>
+      </defs>
+      <rect class="box" x="20" y="120" width="180" height="76" rx="6"/>
+      <text class="t" x="110" y="150" text-anchor="middle">Connected</text>
+      <text class="s" x="110" y="172" text-anchor="middle">session ID, no name</text>
+
+      <rect class="box" x="270" y="120" width="180" height="76" rx="6"/>
+      <text class="t" x="360" y="150" text-anchor="middle">Bound</text>
+      <text class="s" x="360" y="172" text-anchor="middle">holds a name</text>
+
+      <rect class="box-focus" x="520" y="120" width="200" height="76" rx="6"/>
+      <text class="t" x="620" y="150" text-anchor="middle">Delivering</text>
+      <text class="s" x="620" y="172" text-anchor="middle">lease 30 s, renewed</text>
+
+      <rect class="box" x="790" y="120" width="150" height="76" rx="6"/>
+      <text class="t" x="865" y="150" text-anchor="middle">Ended</text>
+      <text class="s" x="865" y="172" text-anchor="middle">name freed</text>
+
+      <path class="edge" d="M200 158 H266" marker-end="url(#a3)"/>
+      <text class="lbl" x="233" y="150" text-anchor="middle">bind</text>
+      <path class="edge" d="M450 158 H516" marker-end="url(#a3)"/>
+      <text class="lbl" x="483" y="150" text-anchor="middle">open</text>
+      <path class="edge" d="M720 158 H786" marker-end="url(#a3)"/>
+      <text class="lbl" x="753" y="150" text-anchor="middle">end</text>
+
+      <path class="edge" d="M580 120 C580 50, 660 50, 660 116" marker-end="url(#a3)"/>
+      <text class="lbl" x="620" y="40" text-anchor="middle">/clear · reconnect · resume</text>
+      <text class="lbl" x="620" y="56" text-anchor="middle">same session ID, same name</text>
+
+      <path class="edge-dash" d="M620 196 V236" marker-end="url(#a3)"/>
+      <text class="lbl" x="632" y="226">pushes go to the lease holder</text>
+
+      <path class="edge-dash" d="M110 196 V256 H860 V200" marker-end="url(#a3)"/>
+      <text class="lbl" x="122" y="248">unbound, idle 15 min → retired</text>
+
+      <rect class="box-plain" x="270" y="268" width="180" height="48" rx="6"/>
+      <text class="s" x="360" y="297" text-anchor="middle">second session, same name</text>
+      <path class="edge-rose" d="M360 268 V200" marker-end="url(#a3r)"/>
+      <text class="lbl-rose" x="372" y="236">refused, told the holder</text>
+    </svg>
+    </div>
+    <figcaption>The highlighted state is a live agent: it holds its name and a delivery lease. A live holder is never displaced; a second session asking for the same name is refused and told who holds it. The name frees only when the session ends.</figcaption>
+  </figure>
+  <ul class="facts">
+    <li><b>Session ID:</b> stable for the life of the harness session, so the server can tell a reconnect from a contender.</li>
+    <!-- source: src/server/hosted.ts DELIVERY_TTL_MS -->
+    <li><b>Delivery lease:</b> 30 s, renewed by the extension. One holder per name, so each message is pushed to one place and never into a dead connection.</li>
+    <li><b>Durable messages:</b> a DM to a name whose session is offline waits in the database and is delivered when it comes back.</li>
+    <!-- source: docs/guide/server.md §3 GRAYBOARD_HOSTED_IDLE_SECONDS (default 900) -->
+    <li><b>Idle rule:</b> only an unbound session, or a bound one that never opened delivery, is retired after 15 minutes idle (<code>GRAYBOARD_HOSTED_IDLE_SECONDS</code>).</li>
+  </ul>
+</section>
+
+<section aria-labelledby="l4">
+  <p class="kicker">Restart and limits</p>
+  <h2 id="l4">A restart costs a few seconds, not sessions</h2>
+  <!-- source: docs/guide/server.md §Limits (#423) -->
+  <p>Restarting the server (a deploy, a host move) drops every client's connection for a few seconds. Each extension reconnects with backoff, presents the same session ID and token, and re-reads its inbox from the database. Names stay held: on start the server extends every live lease and idle timer by the time it was down, so nobody loses a name because the server was the one that went away.</p>
+  <div class="note">
+    <p class="kicker">Current limits</p>
+    <ul>
+      <li>One instance only: no second process to fail over to, and no horizontal scaling, because the delivery queue lives in memory (<a href="https://github.com/nolnoch/grayboard/issues/808">#808</a>, <a href="https://github.com/nolnoch/grayboard/issues/1411">#1411</a>).</li>
+      <li>Throughput is bounded by one JavaScript thread per process (<a href="https://github.com/nolnoch/grayboard/issues/912">#912</a>). 1,000 concurrent sessions is the target, not a measured result.</li>
+    </ul>
+  </div>
+</section>
+
+<footer><span>grayboard v3.0</span><a href="https://github.com/nolnoch/grayboard/blob/master/docs/site/sessions.html">source</a><a href="https://github.com/nolnoch/grayboard/blob/master/docs/architecture.md">architecture.md</a><a href="https://github.com/nolnoch/grayboard/blob/master/docs/sessions.md">sessions.md</a></footer>
+</div>
+</main>
+</body>
+</html>
