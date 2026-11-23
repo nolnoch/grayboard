@@ -13,6 +13,7 @@ import { releaseStored, requestAttachment, storeUpload, type Guard } from "./att
 import type { Read, Tx } from "./store/tx.ts";
 import { UploadTimeout, readUploadBody, type UploadGate } from "./uploads.ts";
 import { writeAudit } from "./audit.ts";
+import { adminReadRoute, adminRows, serveAdminRead } from "./admin_api.ts";
 import { isLoopbackIp } from "./client_addr.ts";
 import { DEFAULT_LAG_GATE, lagSampler, lagVerdict, lagWindows, type LagGate, type LagSampler, type LagWindow } from "./metrics.ts";
 import { ROLES, authorize, byAdmin, decidePure, isRole, recordDecision, type AuthzRequest, type Decision, type PureRequest } from "./policy.ts";
@@ -1141,8 +1142,14 @@ export async function handleHttp(
   if (path.startsWith("/api/admin/")) {
     const req: AuthzRequest = { verb: "admin", user: signedIn(authed) };
     const decision = await authorize(repo, repo.read, { admins: config.admins }, req);
-    recordDecision(repo, repo.read, { user: authed.user_email }, req, decision, { route: path });
+    // A dashboard read's allow is written once per admin, route and target per window (#1651 D5); a deny, and any
+    // other route's decision, every time. The check itself runs on every request (principle 11).
+    const read = adminReadRoute(method, path, url);
+    if (!decision.allow || !read || adminRows(repo).due("gate", authed.user_email, read.name, read.target, repo.now())) {
+      recordDecision(repo, repo.read, { user: authed.user_email }, req, decision, { route: path });
+    }
     if (!decision.allow) return forbidden(decision.reason);
+    if (read) return serveAdminRead(read.name, url, repo, authed.user_email);
     gate = decision;
   }
   if (path === "/api/admin/roles"          && method === "GET")  return adminRoleList(url, repo, config);
