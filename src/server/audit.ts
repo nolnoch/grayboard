@@ -34,6 +34,7 @@ export type AuditAction =
   | "auth.user_refused"
   | "bridge.notified"
   | "bridge.stopped"
+  | "admin.read"
   | "alias.created"
   | "alias.meta_set"
   | "alias.revoked"
