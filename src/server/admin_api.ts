@@ -6,6 +6,10 @@
 import { ADMIN_PAGE_MAX, type AuditCursor, type AuditFilter } from "./store/admin.ts";
 import { writeAudit } from "./audit.ts";
 import type { Repo } from "./db.ts";
+import type { LagWindow } from "./metrics.ts";
+import { GRANT_LIST_MAX } from "./oauth-types.ts";
+import { isRole, ROLES } from "./policy.ts";
+import { isValidEmail } from "../shared/addressing.ts";
 
 export const ADMIN_ROW_WINDOW_MS = 10 * 60_000;
 // The most (admin, route, target) keys remembered; past it, after a sweep, rows are written undeduplicated.
@@ -14,6 +18,8 @@ export const ADMIN_ROW_KEYS_MAX = 10_000;
 const DEFAULT_PAGE = 50;
 
 class BadParam extends Error {}
+// A route this server doesn't serve (overview without its getters): 501, not the caller's error.
+class NotServed extends Error {}
 
 // When each (kind, admin, route, target) last wrote its row, in memory: a restart forgets and writes one more (D5).
 export class AdminRows {
@@ -68,15 +74,77 @@ function auditFilter(url: URL): AuditFilter {
 // A DM pair in a fixed order, so (a, b) and (b, a) are one target.
 const pair = (a: string, b: string) => (a < b ? `${a} ${b}` : `${b} ${a}`);
 
+// The Overview's headline numbers (D6): in-process O(1) getters only, no store read, so `startServer` supplies them.
+export type AdminOverview = {
+  version: string; started_at: number; uptime_s: number;
+  // /healthz's verdict (its cached database probe and the lag gate): ok, or the code it fails with.
+  health: { ok: boolean; code: string | null };
+  lag: LagWindow | null; queue_waiters: number;
+  refusals: Record<string, number>;
+  gauges: { name: string; help: string; values: { value: number; labels?: Record<string, string> }[] }[];
+  slack: "up" | "down" | "off";
+};
+// What a read route may need beyond the store: the Overview's getters, the bootstrap admins (GRAYBOARD_ADMINS, listed
+// as org_admin bindings with no id, as /api/admin/roles lists them) and the CLI token idle window (a token unused
+// past it is dead, so the grants list leaves it out).
+export type AdminContext = { overview?: () => Promise<AdminOverview>; admins?: readonly string[]; cliIdleDays?: number };
+
 type Route = {
   // The target the gate's and admin.read's dedup key on: what the page is about, not where in it.
   target(url: URL): string;
   // The audited view's name, for a route that returns content.
   content?: string;
-  run(url: URL, repo: Repo): Promise<{ rows: unknown[]; next: unknown; read?: string | null }>;
+  run(url: URL, repo: Repo, ctx: AdminContext): Promise<{ rows: unknown[]; next: unknown; read?: string | null }>;
 };
 
+// A name here must not be an existing /api/admin/ path (roles, services, grants…): a GET on it would be served from here
+// instead, in this shape, to the CLI too. The dashboard's versions of those lists carry their own names.
 const ROUTES: Record<string, Route> = {
+  overview: { target: () => "", async run(_url, _repo, ctx) {
+    if (!ctx.overview) throw new NotServed("overview not served here");
+    return { rows: [await ctx.overview()], next: null };
+  } },
+  // Role bindings in id order, filtered by role, principal or scope as /api/admin/roles is; the first page leads with
+  // the bootstrap admins.
+  "role-bindings": { target: url => ["role", "principal", "scope"].map(k => url.searchParams.get(k) ?? "").join("\0"), async run(url, repo, ctx) {
+    const role = str(url, "role"), principal = str(url, "principal")?.toLowerCase(), scope = str(url, "scope")?.toLowerCase();
+    if (role !== undefined && !isRole(role)) throw new BadParam(`role must be one of ${Object.keys(ROLES).join(", ")}`);
+    const limit = Math.min(Math.max(limitOf(url), 1), ADMIN_PAGE_MAX), after = int(url, "after");
+    const bindings = await repo.roles.list(repo.read, { ...(role ? { role } : {}), ...(principal ? { principal } : {}), ...(scope ? { scope } : {}) }, after, limit);
+    const bootstrap = after === 0 && (role ?? "org_admin") === "org_admin" && scope === undefined
+      ? (ctx.admins ?? []).filter(e => isValidEmail(e) && (principal === undefined || e === principal))
+        .map(e => ({ id: null, principal: e, role: "org_admin", scope: null, granter: null, granted_at: null, source: "bootstrap" }))
+      : [];
+    return {
+      rows: [...bootstrap, ...bindings.map(b => ({ ...b, source: "binding" }))],
+      next: bindings.length === limit ? bindings[bindings.length - 1]!.id : null,
+    };
+  } },
+  // Service principals in id order, with their owners.
+  "service-list": { target: () => "", async run(url, repo) {
+    const limit = Math.min(Math.max(limitOf(url), 1), ADMIN_PAGE_MAX);
+    const rows = await repo.services.list(repo.read, int(url, "after"), limit);
+    return { rows, next: rows.length === limit ? rows[rows.length - 1]!.id : null };
+  } },
+  // One user's live OAuth grants and CLI tokens, newest use first: each bounded by GRANT_LIST_MAX, a user signs in
+  // once per harness and machine. No secret: ids, clients, labels and times.
+  "user-grants": { target: url => url.searchParams.get("email") ?? "", async run(url, repo, ctx) {
+    const user = await repo.users.findByEmail(repo.read, need(url, "email").toLowerCase());
+    return { rows: user ? await grantRows(repo, user.id, ctx.cliIdleDays ?? 0, repo.now()) : [], next: null };
+  } },
+  // One user's bound names (their person scope's aliases, bounded by the scope cap), each with the unended session holding it
+  // now (held_by; whether it is connected right now is the hub's, not the store's), when it was last used and where; most recently used first.
+  "user-names": { target: url => url.searchParams.get("email") ?? "", async run(url, repo) {
+    const email = need(url, "email").toLowerCase();
+    const aliases = await repo.aliases.listForScope(repo.read, "person", email);
+    const addresses = aliases.map(a => a.address);
+    const [seen, holders] = await Promise.all([repo.aliases.seen(repo.read, addresses), repo.bindings.holdersOf(repo.read, addresses)]);
+    const rows = aliases.map(a => {
+      const s = seen.get(a.address);
+      return { address: a.address, name: a.name, held_by: holders.get(a.address) ?? null, last_seen: s?.last_seen ?? null, cwd: s?.cwd ?? null, place: s?.place ?? null, created_at: a.created_at };
+    }).sort((a, b) => (b.last_seen ?? 0) - (a.last_seen ?? 0) || (a.address < b.address ? -1 : 1));
+    return { rows, next: null };
+  } },
   users: { target: () => "", async run(url, repo) {
     const limit = limitOf(url);
     return page(await repo.admin.users(repo.read, int(url, "after"), limit), limit, u => u.id);
@@ -155,12 +223,13 @@ export function adminReadRoute(method: string, path: string, url: URL): { name: 
 
 // Serves a read route the gate allowed. A content route writes its admin.read row once per window, and only when it
 // returned content.
-export async function serveAdminRead(name: string, url: URL, repo: Repo, admin: string): Promise<Response> {
+export async function serveAdminRead(name: string, url: URL, repo: Repo, admin: string, ctx: AdminContext = {}): Promise<Response> {
   const route = ROUTES[name]!;
   let result: Awaited<ReturnType<Route["run"]>>;
-  try { result = await route.run(url, repo); }
+  try { result = await route.run(url, repo, ctx); }
   catch (e) {
     if (e instanceof BadParam) return Response.json({ code: "bad_request", message: e.message }, { status: 400 });
+    if (e instanceof NotServed) return Response.json({ code: "not_implemented", message: e.message }, { status: 501 });
     throw e;
   }
   const { read, ...body } = result;
@@ -168,4 +237,17 @@ export async function serveAdminRead(name: string, url: URL, repo: Repo, admin: 
     writeAudit(repo, repo.read, "admin.read", admin, clipTarget(read), { view: route.content });
   }
   return Response.json(body);
+}
+
+// A user's live OAuth grants (one harness sign-in on one machine; a service's credential grants) and CLI tokens
+// (`cli:<session id>`), newest use first, each kind bounded by GRANT_LIST_MAX. A CLI token unused past idleDays is dead
+// and left out (0: no idle limit). No secret: ids, clients, labels and times. `current` marks the caller's own CLI
+// token. The own and admin grant lists (http.ts) and the dashboard's user-grants route all read through it (#930).
+export async function grantRows(repo: Repo, userId: number, idleDays: number, now: number, current: number | null = null) {
+  const usedAfter = idleDays > 0 ? now - idleDays * 86_400_000 - 1 : 0;
+  const [grants, sessions] = await Promise.all([repo.oauth.listGrants(repo.read, userId, now), repo.sessions.listLive(repo.read, userId, usedAfter, GRANT_LIST_MAX)]);
+  return [
+    ...grants.map(g => ({ id: g.id, kind: g.credential ? "credential" : "oauth", client_id: g.clientId, created_at: g.createdAt, last_used_at: g.lastUsedAt, expires_at: g.expiresAt })),
+    ...sessions.map(t => ({ id: `cli:${t.id}`, kind: "cli", label: t.label, created_at: t.created_at, last_used_at: t.last_used_at, expires_at: null, ...(t.id === current ? { current: true } : {}) })),
+  ].sort((a, b) => b.last_used_at - a.last_used_at);
 }

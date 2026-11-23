@@ -3,9 +3,11 @@
 // body, and every list pages to its end.
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { TestServer } from "../support/server.ts";
+import { until } from "../support/until.ts";
 import { accessAudits } from "../support/audit.ts";
 import { drained, exec, row } from "../support/repo_sql.ts";
-import { AdminRows } from "../../src/server/admin_api.ts";
+import { AdminRows, adminReadRoute, serveAdminRead } from "../../src/server/admin_api.ts";
+import pkg from "../../package.json" with { type: "json" };
 
 const A = "alice@example.com";
 const ROOT = "root@example.com";
@@ -35,7 +37,8 @@ describe("gate", () => {
     for (let i = 0; i < 3; i++) expect((await srv.api(root, "GET", "/api/admin/users")).status).toBe(200);
     for (const board of ["e2e", "e2e", "other"]) expect((await srv.api(root, "GET", `/api/admin/threads?board=${board}`)).status).toBe(200);
     const users = await gateRows("/api/admin/users");
-    expect(users.map(r => [r.actor, r.detail.allow])).toEqual([[A, false], [A, false], [ROOT, true]]);
+    // Postgres writes audit rows through concurrent writers, so id order is not request order: compare as a set.
+    expect(users.map(r => [r.actor, r.detail.allow]).sort()).toEqual([[A, false], [A, false], [ROOT, true]]);
     expect((await gateRows("/api/admin/threads")).length).toBe(2);
   });
 
@@ -103,6 +106,27 @@ describe("reads", () => {
     expect((await audits("admin.read")).map(r => [r.target, r.detail.view])).toEqual([["be fe", "conversation"]]);
   });
 
+  test("overview reports the in-process numbers, one page, and writes no row beyond the gate's", async () => {
+    const [a, root] = await Promise.all([srv.login(A), srv.login(ROOT)]);
+    expect((await srv.api(a, "GET", "/api/admin/overview")).status).toBe(403);
+    for (let i = 0; i < 2; i++) {
+      const r = await srv.api(root, "GET", "/api/admin/overview");
+      expect(r.status).toBe(200);
+      expect(r.body.next).toBeNull();
+      const o = r.body.rows[0];
+      expect(o.version).toBe(pkg.version);
+      expect(o.health).toEqual({ ok: true, code: null });
+      expect(o.slack).toBe("off");
+      expect(typeof o.uptime_s).toBe("number");
+      expect(typeof o.queue_waiters).toBe("number");
+      expect(Object.keys(o.refusals)).toContain("mcp_post");
+      expect(o.gauges.map((g: { name: string }) => g.name)).toContain("hosted_sessions_holding");
+    }
+    // The deny and the first allow, in either order: audit rows are written off the request path.
+    expect((await gateRows("/api/admin/overview")).map(r => [r.actor, r.detail.allow]).sort()).toEqual([[A, false], [ROOT, true]]);
+    expect(await audits("admin.read")).toEqual([]);
+  });
+
   test("an empty conversation writes no admin.read, and a long pair's gate target is clipped", async () => {
     const root = await srv.login(ROOT);
     const long = "x".repeat(5000);
@@ -112,6 +136,109 @@ describe("reads", () => {
     await drained(srv);
     expect(await audits("admin.read")).toEqual([]);
     for (const row of await audits("authz.decision")) expect(String(row.target ?? "").length).toBeLessThanOrEqual(256);
+  });
+
+  test("role-bindings lead with the bootstrap admins, page by id and filter; a bad role is a 400", async () => {
+    const root = await srv.login(ROOT);
+    await srv.login(A);
+    expect((await srv.api(root, "POST", "/api/admin/roles/grant", { role: "org_admin", principal: A })).status).toBe(201);
+    const all = await srv.api(root, "GET", "/api/admin/role-bindings");
+    expect(all.status).toBe(200);
+    expect(all.body.rows.map((b: { principal: string; role: string; source: string }) => [b.principal, b.role, b.source])).toEqual([[ROOT, "org_admin", "bootstrap"], [A, "org_admin", "binding"]]);
+    expect(all.body.next).toBeNull();
+    const mine = await srv.api(root, "GET", `/api/admin/role-bindings?principal=${A}`);
+    expect(mine.body.rows.map((b: { principal: string }) => b.principal)).toEqual([A]);
+    const paged = await srv.api(root, "GET", "/api/admin/role-bindings?limit=1");
+    expect(paged.body.next).toBe(all.body.rows[1].id);
+    expect((await srv.api(root, "GET", `/api/admin/role-bindings?after=${paged.body.next}`)).body.rows).toEqual([]);
+    expect((await srv.api(root, "GET", "/api/admin/role-bindings?role=nope")).status).toBe(400);
+  });
+
+  test("the team view's bindings query (scope plus team_owner): a service can't share a team's name, and the role filter holds anyway", async () => {
+    const root = await srv.login(ROOT);
+    const a = await srv.login(A);
+    expect((await srv.api(a, "POST", "/api/teams", { name: "deployer" })).status).toBe(201);
+    expect((await srv.api(root, "POST", "/api/admin/services", { name: "deployer", owners: [A] })).status).toBe(409);
+    expect((await srv.api(root, "POST", "/api/admin/services", { name: "indexer", owners: [A] })).status).toBe(201);
+    const team = await srv.api(root, "GET", "/api/admin/role-bindings?scope=deployer&role=team_owner");
+    expect(team.body.rows.map((b: { principal: string; role: string; scope: string }) => [b.principal, b.role, b.scope])).toEqual([[A, "team_owner", "deployer"]]);
+    expect((await srv.api(root, "GET", "/api/admin/role-bindings?scope=indexer&role=team_owner")).body.rows).toEqual([]);
+  });
+
+  test("service-list pages services with their owners by id to the end", async () => {
+    const root = await srv.login(ROOT);
+    await srv.login(A);
+    for (const name of ["deployer", "indexer", "sweeper"]) expect((await srv.api(root, "POST", "/api/admin/services", { name, owners: [A] })).status).toBe(201);
+    const all = await srv.api(root, "GET", "/api/admin/service-list");
+    expect(all.body.rows.map((s: { name: string; owners: string[] }) => [s.name, s.owners])).toEqual([["deployer", [A]], ["indexer", [A]], ["sweeper", [A]]]);
+    expect(all.body.next).toBeNull();
+    const seen: string[] = [];
+    let after: number | null = 0;
+    for (let i = 0; after !== null && i < 5; i++) {
+      const page = await srv.api(root, "GET", `/api/admin/service-list?limit=2&after=${after}`);
+      seen.push(...page.body.rows.map((s: { name: string }) => s.name));
+      after = page.body.next;
+    }
+    expect(seen).toEqual(["deployer", "indexer", "sweeper"]);
+    expect(after).toBeNull();
+  });
+
+  test("user-grants lists a user's OAuth grants and live CLI tokens without secrets, leaving out one idle past cliIdleDays", async () => {
+    const root = await srv.login(ROOT);
+    await srv.login(A);
+    await srv.login(A);
+    await srv.hosted(A, null);
+    const grants = async () => (await srv.api(root, "GET", `/api/admin/user-grants?email=${A}`)).body.rows as Record<string, unknown>[];
+    const rows = await grants();
+    const oauth = rows.filter(g => g.kind === "oauth"), cli = rows.filter(g => g.kind === "cli");
+    expect([oauth.length, cli.length]).toEqual([1, 2]);
+    expect(Object.keys(oauth[0]!).sort()).toEqual(["client_id", "created_at", "expires_at", "id", "kind", "last_used_at"]);
+    for (const g of cli) {
+      expect(g.id).toMatch(/^cli:\d+$/);
+      expect(Object.keys(g).sort()).toEqual(["created_at", "expires_at", "id", "kind", "label", "last_used_at"]);
+    }
+    // The default idle window is 30 days: a token last used 31 days ago is dead and left out.
+    const idle = Number(String(cli[0]!.id).slice(4));
+    await exec(srv, "UPDATE sessions SET last_used_at = ? WHERE id = ?", Date.now() - 31 * 86_400_000, idle);
+    expect((await grants()).map(g => g.id)).not.toContain(`cli:${idle}`);
+    expect((await grants()).filter(g => g.kind === "cli").length).toBe(1);
+    expect((await srv.api(root, "GET", "/api/admin/user-grants?email=nobody@example.com")).body.rows).toEqual([]);
+    expect((await srv.api(root, "GET", "/api/admin/user-grants")).status).toBe(400);
+  });
+
+  test("overview is a 501 where the server serves no overview getters", async () => {
+    const res = await serveAdminRead("overview", new URL("http://x/api/admin/overview"), srv.app.repo, ROOT);
+    expect(res.status).toBe(501);
+    expect(await res.json()).toMatchObject({ code: "not_implemented" });
+  });
+
+  test("user-names lists a user's bound names, a held one with its holding session, most recently used first", async () => {
+    const root = await srv.login(ROOT);
+    const a = await srv.login(A);
+    const live = await srv.connected(a, "be");
+    const other = await srv.connected(a, "fe");
+    await other.unbind("fe");
+    const names = () => srv.api(root, "GET", `/api/admin/user-names?email=${A.toUpperCase()}`);
+    const res = await until(async () => { const r = await names(); return r.status !== 200 || r.body.rows.some((x: { name: string; held_by: string | null }) => x.name === "fe" && x.held_by === null) ? r : null; });
+    expect(res.status).toBe(200);
+    const rows = res.body.rows as { name: string; held_by: string | null; last_seen: number | null }[];
+    expect(rows.map(r => r.name).sort()).toEqual(["be", "fe"]);
+    expect(rows.find(r => r.name === "be")!.held_by).toEqual(expect.any(String));
+    expect(rows.find(r => r.name === "fe")!.held_by).toBeNull();
+    for (let i = 1; i < rows.length; i++) expect(rows[i - 1]!.last_seen ?? 0).toBeGreaterThanOrEqual(rows[i]!.last_seen ?? 0);
+    expect((await srv.api(root, "GET", "/api/admin/user-names?email=nobody@example.com")).body.rows).toEqual([]);
+    live.close();
+    other.close();
+  });
+
+  test("no dashboard route shadows another /api/admin/ path: the CLI's GET lists keep their own shapes", async () => {
+    const source = await Bun.file(new URL("../../src/server/http.ts", import.meta.url)).text();
+    const paths = [...new Set([...source.matchAll(/path === "(\/api\/admin\/[a-z/-]+)"/g)].map(m => m[1]!))];
+    expect(paths).toContain("/api/admin/roles");
+    for (const path of paths) expect([path, adminReadRoute("GET", path, new URL(`http://x${path}`))]).toEqual([path, undefined]);
+    const root = await srv.login(ROOT);
+    expect(Object.keys((await srv.api(root, "GET", "/api/admin/roles")).body).sort()).toEqual(["bindings", "next"]);
+    expect(Object.keys((await srv.api(root, "GET", "/api/admin/services")).body).sort()).toEqual(["next", "services"]);
   });
 
   test("audit pages newest first under a filter with an (at, id) cursor", async () => {
