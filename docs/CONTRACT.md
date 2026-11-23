@@ -66,6 +66,7 @@ flowchart TD
 | The server's access policy: authorization seam, role bindings and admin, teams, attachment uploads and reads, retained HTTP routes | `docs/server-access.md` |
 | Ending access: logout, per-grant list and revoke, what revoke and disable end, the IdP re-auth clock | `docs/server-offboarding.md` |
 | The server's service principals: the principal's rows and admin routes, credentials' admin side, service boards' access and `service.invoke` | `docs/server-services.md` |
+| The read-only admin dashboard: the `/admin` page, its `grayboard-admin` sign-in, its read routes, their audit and cost | `docs/server-admin-dashboard.md` |
 | The server's rate limits: binds, authentication failures, the refused-token memo | `docs/server-rate-limits.md` |
 | Build, verified install, deploy files, metrics, backups, plugin distribution | `docs/server-deploy.md` |
 | The shared core's board side: boards, posts, subscriptions, attention and delivery policy, mentions, queue boards; local-mode wakeup; tool-surface rules; refused features | `docs/boards.md` |

@@ -1,4 +1,4 @@
-// The admin dashboard's read routes (#1651, docs/future/admin-dashboard.md D3, D5, D6): GET /api/admin/<view>, each a
+// The admin dashboard's read routes (#1651, docs/server-admin-dashboard.md §2): GET /api/admin/<view>, each a
 // page of one Repo read behind http.ts's /api/admin/ gate. Lists are body-free; `thread` and `conversation` return
 // content and write an `admin.read` row (D5). The gate's allow row and `admin.read` are written once per admin, route
 // and target per ADMIN_ROW_WINDOW_MS (`AdminRows`), so a polling page doesn't write a row per refresh; a deny is

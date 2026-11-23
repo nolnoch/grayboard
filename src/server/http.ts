@@ -1059,7 +1059,7 @@ export type SessionHooks = {
   // The admin dashboard's OAuth bearer (#1651 D4, the OAuth server's authenticateAdmin): tried only on a GET dashboard
   // read route whose token isn't a CLI session's; absent, those routes take CLI tokens alone.
   adminBearer?: (req: Request) => Promise<AuthedUser | undefined>;
-  // The dashboard Overview's in-process numbers (#1651 D6); absent, /api/admin/overview answers 400.
+  // The dashboard Overview's in-process numbers (#1651 D6); absent, /api/admin/overview answers 501.
   adminOverview?: AdminContext["overview"];
 };
 

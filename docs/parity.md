@@ -74,6 +74,8 @@ Rows 1–8: `parity-delivery.md`. Rows 9–16: `parity-access.md`. Rows 17–23:
 
 Harnesses without an adapter (any MCP client run with `BUS_PUSH=off`, tools only) and the Slack bridges themselves (slack-bridge.md) have no columns.
 
+The admin dashboard (`/admin`, #1651; `server-admin-dashboard.md`) is a browser page on a team server, not something a harness or mode does: no row. Local mode's equivalent is the inspector.
+
 The Rust client SDK (`sdk/rust`, #929) is a library for services, not a harness adapter: no column, no cell. Its envelope is proved equal to hosted-core's by `tests/integration/rust_fixtures.test.ts` and the Rust test `requests_match_the_reference_clients_recording`, and its round trip by `tests/integration/rust_sdk.test.ts` (`scripts/e2e.sh rust-sdk`); its push delivery stream (`sdk-rust.md` §2), a typed method per native tool (`sdk-rust.md` §3) and its conformance driver, which runs every hosted scenario of `tests/conformance/` as `hosted/rust` (`sdk-rust.md` §4), are built, and so is its use of the server's service credential (row 21): `ClientCredentials` mints its own run tokens with a `generic` credential, which the example and the conformance run use (`sdk-rust.md` §5).
 
 ### 17. Repo-name suggestion while unbound

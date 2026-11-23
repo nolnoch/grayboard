@@ -1,4 +1,4 @@
-/* The admin dashboard's stylesheet (#1651, docs/future/admin-dashboard.md §Visual design): the Anomander theme, dark
+/* The admin dashboard's stylesheet (#1651, docs/server-admin-dashboard.md §3): the site theme, dark
    first, light under prefers-color-scheme. Served same-origin at /admin/app.css under the page's CSP. */
 /* BEGIN generated tokens: bun scripts/site_tokens.ts writes this block from docs/site/tokens.json; do not edit. */
 :root {

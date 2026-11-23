@@ -1,4 +1,4 @@
-// The admin dashboard's client (#1651, docs/future/admin-dashboard.md D4, D7, §Views). Plain browser JS, served
+// The admin dashboard's client (#1651, docs/server-admin-dashboard.md §1, §3). Plain browser JS, served
 // same-origin at /admin/app.js under the page's CSP: no inline script, no eval, no third-party code.
 //
 // Sign-in: the server's own OAuth authorization-code flow with PKCE (S256) as the public client grayboard-admin, whose
