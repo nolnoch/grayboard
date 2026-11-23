@@ -353,8 +353,7 @@ describe("loadtest pilot gate (#1537)", () => {
     const on = ["--gate", "pilot", "--dashboard-period", "1"];
     expect(judge({ ...base(on) }).failures).toEqual(["dashboard: the leg never ran"]);
     const views = Object.fromEntries(DASH_VIEWS.map(v => [v.view, { buckets: BUCKETS.map(le => le < 1 ? 0 : 20), count: 20, sum: 0, errors: 0 }]));
-    const slow: DashResult = { periodMs: 1000, polls: 60, requests: 0, errors: {}, firstErrors: [], firstAt: 0, lastAt: 59_000, skipped: {}, views,
-      targets: Object.fromEntries(DASH_VIEWS.map(v => [`/api/admin/${v.route}`, ["t"]])) };
+    const slow: DashResult = { periodMs: 1000, polls: 60, requests: 0, errors: {}, firstErrors: [], firstAt: 0, lastAt: 59_000, skipped: {}, views };
     const reads: DashRow[] = [{ action: "admin.read", target: "x", route: null, view: "thread", allow: null }];
     // Every request at 1 s: within the pilot edge, past the latency bar's.
     expect(judge({ ...base(on), dashboard: { result: slow, rows: reads } }).failures).toEqual([]);
@@ -403,15 +402,15 @@ async function run(extra: string[]): Promise<{ code: number; out: string; summar
 describe("loadtest dashboard leg (#1651)", () => {
   // n requests: `fast` of them at 25 ms, the rest at 0.25 s.
   const hist = (n: number, fast: number): Hist => ({ buckets: BUCKETS.map(le => le < 0.025 ? 0 : le < 0.25 ? fast : n), count: n, sum: 0, errors: 0 });
-  // 20 polls at 1 s, every view answered at 25 ms, one target per route but role-bindings' three.
+  // 20 polls at 1 s, every view answered at 25 ms.
   const result = (over: Partial<DashResult> = {}): DashResult => ({
     periodMs: 1000, polls: 20, requests: 20 * DASH_VIEWS.length, errors: {}, firstErrors: [], firstAt: 0, lastAt: 19_000, skipped: {},
     views: Object.fromEntries(DASH_VIEWS.map(v => [v.view, hist(20, 20)])),
-    targets: Object.fromEntries([...new Set(DASH_VIEWS.map(v => `/api/admin/${v.route}`))].map(r => [r, r.endsWith("role-bindings") ? ["a", "b", "c"] : ["t"]])),
     ...over,
   });
+  // One gate allow per route and target (role-bindings asked for three targets).
   const gateRows = (n = 1): DashRow[] => [...new Set(DASH_VIEWS.map(v => `/api/admin/${v.route}`))].flatMap(route =>
-    Array.from({ length: n * (route.endsWith("role-bindings") ? 3 : 1) }, () => ({ action: "authz.decision" as const, target: null, route, view: null, allow: true })));
+    (route.endsWith("role-bindings") ? ["a", "b", "c"] : ["t"]).flatMap(target => Array.from({ length: n }, () => ({ action: "authz.decision" as const, target, route, view: null, allow: true }))));
   const reads = (n = 1): DashRow[] => ["thread", "conversation"].flatMap(view => Array.from({ length: n }, () => ({ action: "admin.read" as const, target: `${view}-target`, route: null, view, allow: null })));
   const judged = (r: DashResult, rows: DashRow[] = [...gateRows(), ...reads()]) => judgeDashboard(r, rows, 20_000, 0.1, "≤ 100 ms", tooSlow);
 
@@ -428,8 +427,9 @@ describe("loadtest dashboard leg (#1651)", () => {
     expect(judged(result({ views: { ...result().views, users: hist(20, 15) } }))[0]).toMatch(/^dashboard: 98\.53% of 340 requests at ≤ 100 ms/);
     expect(judged(result({ views: { ...result().views, users: hist(20, 16) } }))).toEqual([]);
     expect(judged(result(), [...gateRows(), ...reads(), { action: "authz.decision", target: null, route: "/api/admin/users", view: null, allow: false }])).toEqual(["dashboard: 1 gate denies for the dashboard admin (e.g. /api/admin/users)"]);
-    // A route asked for one target writes one row per window; a second is over. Three targets allow three.
-    expect(judged(result(), [...gateRows(), ...reads(), { action: "authz.decision", target: null, route: "/api/admin/users", view: null, allow: true }])[0]).toMatch(/gate \/api\/admin\/users: 2 rows for 1 targets/);
+    // One gate row per route and target per window: a second for the same key is over, one for another target isn't.
+    expect(judged(result(), [...gateRows(), ...reads(), { action: "authz.decision", target: "t", route: "/api/admin/users", view: null, allow: true }])[0]).toMatch(/gate \/api\/admin\/users t: 2 rows/);
+    expect(judged(result(), [...gateRows(), ...reads(), { action: "authz.decision", target: "u", route: "/api/admin/users", view: null, allow: true }])).toEqual([]);
     expect(judged(result(), [...gateRows(), ...reads(2)])[0]).toMatch(/admin\.read thread thread-target: 2 rows/);
     expect(judged(result(), gateRows())).toEqual(["dashboard: no admin.read row for the thread or conversation it opened"]);
   });

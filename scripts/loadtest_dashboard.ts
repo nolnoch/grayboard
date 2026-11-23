@@ -3,7 +3,7 @@
 // one board thread and one DM conversation once the fleet has made them), on a grayboard-admin token. The run holds
 // its requests to the bar's latency edge, wants every one answered 200, and counts the rows the dashboard admin's
 // polling wrote (the gate's authz.decision allow and admin.read): at most one per route and target per dedup window.
-import { ADMIN_ROW_WINDOW_MS, adminReadRoute } from "../src/server/admin_api.ts";
+import { ADMIN_ROW_WINDOW_MS } from "../src/server/admin_api.ts";
 import { BUCKETS, type Hist } from "./loadtest_driver.ts";
 
 // The views the page polls, each as the request its open view makes (src/server/admin/app.js). `need`: a view that
@@ -35,9 +35,6 @@ export const DASH_VIEWS: DashView[] = [
 export type DashResult = {
   periodMs: number; polls: number; requests: number; views: Record<string, Hist>; errors: Record<string, number>; firstErrors: string[];
   firstAt: number | null; lastAt: number | null; skipped: Record<string, number>;
-  // The distinct dedup targets the leg asked each route for (adminReadRoute's, as the gate keys them): a gate row names
-  // its route but not its target, so its bound is per route, one per target per window.
-  targets: Record<string, string[]>;
 };
 
 const newHist = (): Hist => ({ buckets: BUCKETS.map(() => 0), count: 0, sum: 0, errors: 0 });
@@ -45,15 +42,12 @@ const newHist = (): Hist => ({ buckets: BUCKETS.map(() => 0), count: 0, sum: 0, 
 // Starts the leg: a poll at once, then one per period; a poll that runs past its period delays the next rather than
 // overlapping it (the page's one-poll-at-a-time rule). stop() waits out the poll in flight.
 export function startDashboard(base: string, token: string, periodMs: number, targets: Omit<Targets, "root" | "pair">): { stop: () => Promise<DashResult> } {
-  const r: DashResult = { periodMs, polls: 0, requests: 0, views: {}, errors: {}, firstErrors: [], firstAt: null, lastAt: null, skipped: {}, targets: {} };
+  const r: DashResult = { periodMs, polls: 0, requests: 0, views: {}, errors: {}, firstErrors: [], firstAt: null, lastAt: null, skipped: {} };
   const t: Targets = { ...targets, root: null, pair: null };
   let stopped = false;
   const get = async (v: DashView, params: Record<string, string>) => {
     const h = r.views[v.view] ??= newHist();
     const url = new URL(`${base}/api/admin/${v.route}?${new URLSearchParams(params)}`);
-    const key = adminReadRoute("GET", url.pathname, url)!;
-    const seen = r.targets[url.pathname] ??= [];
-    if (!seen.includes(key.target)) seen.push(key.target);
     const t0 = performance.now();
     let status = 0, body = null as { rows?: unknown[] } | null;
     try {
@@ -106,8 +100,8 @@ export function startDashboard(base: string, token: string, periodMs: number, ta
   return { async stop() { stopped = true; await done; return r; } };
 }
 
-// The rows the dashboard admin's polling wrote: its gate allows (authz.decision with detail.route under /api/admin/) and
-// admin.read rows, each with its target. `deny`: any refusal of the admin, which the gate writes every time.
+// The rows the dashboard admin's polling wrote: its gate allows (authz.decision with detail.route under /api/admin/, its
+// target detail.target, the dedup key's) and admin.read rows, each with its target. `deny`: any refusal of the admin, which the gate writes every time.
 export type DashRow = { action: "authz.decision" | "admin.read"; target: string | null; route: string | null; view: string | null; allow: boolean | null };
 
 // The dedup bound over a span (ms): one row per (admin, route, target) per window, so a key writes at most
@@ -132,16 +126,15 @@ export function judgeDashboard(r: DashResult, rows: DashRow[], durationMs: numbe
   const denies = rows.filter(x => x.action === "authz.decision" && x.allow === false);
   if (denies.length) out.push(`dashboard: ${denies.length} gate denies for the dashboard admin (e.g. ${denies.slice(0, 3).map(x => x.route).join(", ")})`);
   const bound = dedupBound(r.firstAt !== null && r.lastAt !== null ? r.lastAt - r.firstAt : 0);
-  // Gate allows per route (a row names its route, not its target): one per target asked per window. admin.read rows
-  // per view and target (the row's target is the read's).
+  // Gate allows per route and target, admin.read rows per view and target: one per key per window.
   const gate = new Map<string, number>(), reads = new Map<string, number>();
   for (const x of rows) {
     if (x.allow === false) continue;
-    if (x.action === "authz.decision") gate.set(x.route ?? "", (gate.get(x.route ?? "") ?? 0) + 1);
+    if (x.action === "authz.decision") { const k = `${x.route} ${x.target ?? ""}`; gate.set(k, (gate.get(k) ?? 0) + 1); }
     else { const k = `${x.view} ${x.target ?? ""}`; reads.set(k, (reads.get(k) ?? 0) + 1); }
   }
   const over = [
-    ...[...gate].filter(([route, n]) => n > bound * (r.targets[route]?.length ?? 0)).map(([route, n]) => `gate ${route}: ${n} rows for ${r.targets[route]?.length ?? 0} targets`),
+    ...[...gate].filter(([, n]) => n > bound).map(([k, n]) => `gate ${k}: ${n} rows`),
     ...[...reads].filter(([, n]) => n > bound).map(([k, n]) => `admin.read ${k}: ${n} rows`),
   ];
   if (over.length) out.push(`dashboard: audit rows over the dedup bound (${bound} per route and target) in ${r.polls} polls: ${over.slice(0, 3).join("; ")}`);

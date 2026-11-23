@@ -41,6 +41,16 @@ describe("gate", () => {
     expect((await gateRows("/api/admin/threads")).length).toBe(2);
   });
 
+  test("a dashboard read's gate row names its target, allow and deny; another /api/admin/ route's names none", async () => {
+    const [a, root] = await Promise.all([srv.login(A), srv.login(ROOT)]);
+    const [r1, r2] = [await post("e2e", null, "one"), await post("e2e", null, "two")];
+    for (const r of [r1, r2, r1]) expect((await srv.api(root, "GET", `/api/admin/thread?root=${r}`)).status).toBe(200);
+    expect((await srv.api(a, "GET", `/api/admin/thread?root=${r1}`)).status).toBe(403);
+    expect((await gateRows("/api/admin/thread")).map(r => [r.actor, r.detail.allow, r.detail.target])).toEqual([[ROOT, true, String(r1)], [ROOT, true, String(r2)], [A, false, String(r1)]]);
+    expect((await srv.api(root, "GET", "/api/admin/roles")).status).toBe(200);
+    expect((await gateRows("/api/admin/roles")).map(r => "target" in r.detail)).toEqual([false]);
+  });
+
   test("a revoked org_admin is refused on the next read", async () => {
     const [a, root] = await Promise.all([srv.login(A), srv.login(ROOT)]);
     expect((await srv.api(root, "POST", "/api/admin/roles/grant", { role: "org_admin", principal: A })).status).toBe(201);

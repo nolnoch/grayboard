@@ -1148,7 +1148,8 @@ export async function handleHttp(
     // other route's decision, every time. The check itself runs on every request (principle 11).
     const read = adminReadRoute(method, path, url);
     if (!decision.allow || !read || adminRows(repo).due("gate", authed.user_email, read.name, read.target, repo.now())) {
-      recordDecision(repo, repo.read, { user: authed.user_email }, req, decision, { route: path });
+      // A dashboard read's row names its dedup target too (clipped, as the dedup key), so two threads' allows differ.
+      recordDecision(repo, repo.read, { user: authed.user_email }, req, decision, read ? { route: path, target: read.target } : { route: path });
     }
     if (!decision.allow) return forbidden(decision.reason);
     if (read) return serveAdminRead(read.name, url, repo, authed.user_email, { overview: sessions.adminOverview, admins: config.admins, cliIdleDays: config.cliTokenIdleDays ?? DEFAULT_CLI_TOKEN_IDLE_DAYS });

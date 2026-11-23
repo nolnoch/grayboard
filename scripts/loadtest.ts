@@ -490,7 +490,9 @@ async function dashRows(pgDbUrl: string | undefined, dbPath: string): Promise<Da
   }
   return raw.map(r => {
     const d = (typeof r.detail === "string" ? JSON.parse(r.detail) : r.detail) as Record<string, unknown> | null;
-    return { action: r.action as DashRow["action"], target: r.target, route: typeof d?.route === "string" ? d.route : null, view: typeof d?.view === "string" ? d.view : null, allow: typeof d?.allow === "boolean" ? d.allow : null };
+    // A gate row's target is its detail's (the dedup key's, which the gate records on a dashboard read route).
+    const target = r.action === "authz.decision" ? (typeof d?.target === "string" ? d.target : null) : r.target;
+    return { action: r.action as DashRow["action"], target, route: typeof d?.route === "string" ? d.route : null, view: typeof d?.view === "string" ? d.view : null, allow: typeof d?.allow === "boolean" ? d.allow : null };
   });
 }
 
