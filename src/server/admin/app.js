@@ -238,6 +238,9 @@ function composite(parts) {
     render() { return parts.flatMap(x => [...(x.title ? [h("h2", {}, x.title)] : []), ...x.model.render()]); },
   };
 }
+// A binding's scope is a bare name. Principal names are unique across users, teams and services today, but the team
+// view asks for the team role only anyway (policy.ts ROLES: team_owner is the one role scoped to a team).
+const TEAM_ROLE = "team_owner";
 function bindingsView(params) {
   return listView({
     route: "role-bindings", params, cursor: after => ({ after }), key: b => b.id ?? "bootstrap:" + b.principal,
@@ -562,7 +565,7 @@ const VIEWS = {
     };
     return {
       title: p.name, nav: "teams", crumbs: [link(hashOf("teams"), "teams")],
-      model: composite([{ model: team }, { title: "Role bindings in this team", model: bindingsView({ scope: p.name }) }]),
+      model: composite([{ model: team }, { title: "Role bindings in this team", model: bindingsView({ scope: p.name, role: TEAM_ROLE }) }]),
     };
   },
 };

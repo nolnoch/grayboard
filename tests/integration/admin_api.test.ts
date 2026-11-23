@@ -153,6 +153,17 @@ describe("reads", () => {
     expect((await srv.api(root, "GET", "/api/admin/role-bindings?role=nope")).status).toBe(400);
   });
 
+  test("the team view's bindings query (scope plus team_owner): a service can't share a team's name, and the role filter holds anyway", async () => {
+    const root = await srv.login(ROOT);
+    const a = await srv.login(A);
+    expect((await srv.api(a, "POST", "/api/teams", { name: "deployer" })).status).toBe(201);
+    expect((await srv.api(root, "POST", "/api/admin/services", { name: "deployer", owners: [A] })).status).toBe(409);
+    expect((await srv.api(root, "POST", "/api/admin/services", { name: "indexer", owners: [A] })).status).toBe(201);
+    const team = await srv.api(root, "GET", "/api/admin/role-bindings?scope=deployer&role=team_owner");
+    expect(team.body.rows.map((b: { principal: string; role: string; scope: string }) => [b.principal, b.role, b.scope])).toEqual([[A, "team_owner", "deployer"]]);
+    expect((await srv.api(root, "GET", "/api/admin/role-bindings?scope=indexer&role=team_owner")).body.rows).toEqual([]);
+  });
+
   test("service-list pages services with their owners by id to the end", async () => {
     const root = await srv.login(ROOT);
     await srv.login(A);
