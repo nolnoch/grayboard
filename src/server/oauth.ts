@@ -5,7 +5,7 @@ import { checkIdpConfig, recheckConfig, type Config } from "./config.ts";
 import { createIdpRecheck, type IdpRecheck } from "./idp_recheck.ts";
 import type { AuthPeek, Repo, User } from "./db.ts";
 import type { Read, Tx } from "./store/tx.ts";
-import { BUILTIN_CLIENT_IDS, BUILTIN_CLIENTS, CLI_CLIENT, CLI_CLIENT_ID, isServiceClientId, LOGIN_SCOPE, matchesRedirect, mcpResource, oauthPublicUrl, OAUTH_SCOPES, OPENCODE_CLIENT, parseOAuthClients, sourceKeyFor, type OAuthClient } from "./oauth-config.ts";
+import { ADMIN_CLIENT_ID, ADMIN_SCOPE, adminClient, BUILTIN_CLIENT_IDS, BUILTIN_CLIENTS, CLI_CLIENT, CLI_CLIENT_ID, isServiceClientId, LOGIN_SCOPE, matchesRedirect, mcpResource, oauthPublicUrl, OAUTH_SCOPES, OPENCODE_CLIENT, parseOAuthClients, sourceKeyFor, type OAuthClient } from "./oauth-config.ts";
 import { DEFAULT_SERVICE_TOKEN_LIMITS, OAUTH_TTL, newGrantId, type CredentialSource, type OAuthRequest, type OAuthAccess } from "./oauth-types.ts";
 import { isValidEmail } from "../shared/addressing.ts";
 import { testPauseAsync } from "../shared/testpause.ts";
@@ -81,14 +81,15 @@ const required = (p: URLSearchParams, key: string) => p.get(key) || fail();
 const optional = (p: URLSearchParams, key: string) => p.get(key) || null;
 const recognized = (p: URLSearchParams, keys: string[]) => new URLSearchParams([...p].filter(([k]) => keys.includes(k)));
 const withoutEmpty = (p: URLSearchParams) => new URLSearchParams([...p].filter(([, v]) => v !== ""));
-// LOGIN_SCOPE is recognized here and only alone (#928 D8, R3); the caller's per-client check
-// (client.scopes.includes) then refuses it for every client but grayboard-cli.
+// LOGIN_SCOPE (#928 D8, R3) and ADMIN_SCOPE (#1651 D4) are recognized here and only alone; the caller's per-client
+// check (client.scopes.includes) then refuses each for every client but its own (grayboard-cli, grayboard-admin).
+const SOLE_SCOPES: readonly string[] = [LOGIN_SCOPE, ADMIN_SCOPE];
 function scopes(raw: string | null, defaults?: string[]): string[] {
   if (raw === null && defaults) return [...defaults];
   if (!raw || !/^[a-zA-Z0-9:_-]+(?: [a-zA-Z0-9:_-]+)*$/.test(raw)) fail("invalid_scope");
   const list = raw!.split(" ");
-  if (new Set(list).size !== list.length || list.some(s => !(OAUTH_SCOPES as readonly string[]).includes(s) && s !== LOGIN_SCOPE)) fail("invalid_scope");
-  if (list.includes(LOGIN_SCOPE) && list.length > 1) fail("invalid_scope");
+  if (new Set(list).size !== list.length || list.some(s => !(OAUTH_SCOPES as readonly string[]).includes(s) && !SOLE_SCOPES.includes(s))) fail("invalid_scope");
+  if (list.some(s => SOLE_SCOPES.includes(s)) && list.length > 1) fail("invalid_scope");
   return list.sort();
 }
 async function form(req: Request): Promise<URLSearchParams> {
@@ -135,8 +136,8 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
   const endpoint = (path: string) => issuer + path;
   const metadataPath = "/.well-known/oauth-protected-resource" + prefix + "/mcp";
   const resourceMetadata = base.origin + metadataPath;
-  // Built-ins and the CLI first; parseOAuthClients refuses an operator entry that reuses one of their IDs.
-  const clients = new Map([...BUILTIN_CLIENTS, CLI_CLIENT, ...parseOAuthClients(JSON.stringify(config.oauthClients ?? []))].map(c => [c.clientId, c]));
+  // Built-ins, the CLI and the dashboard first; parseOAuthClients refuses an operator entry that reuses one of their IDs.
+  const clients = new Map([...BUILTIN_CLIENTS, CLI_CLIENT, adminClient(issuer), ...parseOAuthClients(JSON.stringify(config.oauthClients ?? []))].map(c => [c.clientId, c]));
   const now = options.now ?? Date.now;
   const recheck = options.recheck ?? createIdpRecheck(repo, providers, recheckConfig(config),
     { disconnectUser() {}, userChanged() {}, background: (what, run) => void run().catch(e => console.error(`[grayboard] ${what} failed:`, e)) }, now);
@@ -151,6 +152,10 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
     // The same once for grayboard-cli (#928 D8), under its own key: the cutover above already ran on most databases.
     atSite("oauth", () => repo.write(tx => repo.oauth.revokePreBuiltinGrants(tx, [CLI_CLIENT_ID], now(), "builtin_clients_cli"))).then(revokedCli => {
       if (revokedCli) console.error(`[grayboard] revoked ${revokedCli} OAuth grant(s) issued under ${CLI_CLIENT_ID} before this server reserved it for CLI sign-in`);
+    }),
+    // And for grayboard-admin (#1651 D4): an operator client's grant under that ID would otherwise refresh as its own.
+    atSite("oauth", () => repo.write(tx => repo.oauth.revokePreBuiltinGrants(tx, [ADMIN_CLIENT_ID], now(), "builtin_clients_admin"))).then(revokedAdmin => {
+      if (revokedAdmin) console.error(`[grayboard] revoked ${revokedAdmin} OAuth grant(s) issued under ${ADMIN_CLIENT_ID} before this server reserved it for the admin dashboard`);
     }),
   ]);
   const cimd = createCimdResolver({ ...options.cimd, now });
@@ -383,7 +388,9 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
     const host = clients.has(client.clientId) ? undefined : new URL(client.clientId).host;
     const headline = host ? `<h1>Authorize ${escapeHTML(host)}</h1><p>This client calls itself ${escapeHTML(client.name)}; that name is self-declared.</p>` : `<h1>Authorize ${escapeHTML(client.name)}</h1>`;
     // A login code mints a CLI token, not access to the resource it's stored with (#928 D8).
-    const grants = r.scopes.includes(LOGIN_SCOPE) ? "<p>Grants: a grayboard CLI sign-in (an API token on this machine)</p>" : `<p>Resource: ${escapeHTML(r.resource)}</p>`;
+    const grants = r.scopes.includes(LOGIN_SCOPE) ? "<p>Grants: a grayboard CLI sign-in (an API token on this machine)</p>"
+      : r.scopes.includes(ADMIN_SCOPE) ? "<p>Grants: read-only access to this server's admin dashboard, for one hour</p>"
+      : `<p>Resource: ${escapeHTML(r.resource)}</p>`;
     return html(`${headline}<p>Account: ${escapeHTML(user.email)}</p>${grants}<p>Redirect: ${escapeHTML(r.redirectUri)}</p><p>Permissions: ${escapeHTML(r.scopes.join(" "))}</p>${new URL(r.redirectUri).protocol === "http:" ? "<p>Local callback: only approve if you started this client.</p>" : ""}<form method="post" action="${escapeHTML(endpoint("/oauth/consent"))}"><input type="hidden" name="request" value="${escapeHTML(id)}"><input type="hidden" name="csrf" value="${escapeHTML(f.csrf)}"><button name="decision" value="approve">Approve</button><button name="decision" value="deny">Deny</button></form>`, 200, new URL(r.redirectUri).origin);
   };
 
@@ -637,8 +644,9 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
         }
         const access = random(), refresh = random();
         let result, t: number;
+        // A client with its own tokenTtl (the dashboard's) gets it for every lifetime here, the grant's included.
         const pair = (selected: string[], t: number) => ({ clientId: client.clientId, resource, scopes: selected, accessHash: hashToken(access), refreshHash: hashToken(refresh),
-          accessExpiresAt: t + OAUTH_TTL.access, refreshExpiresAt: t + OAUTH_TTL.refresh });
+          accessExpiresAt: t + (client.tokenTtl ?? OAUTH_TTL.access), refreshExpiresAt: t + (client.tokenTtl ?? OAUTH_TTL.refresh) });
         if (grantType === "authorization_code") {
           const verifier = required(p, "code_verifier");
           if (!/^[A-Za-z0-9._~-]{43,128}$/.test(verifier)) fail("invalid_grant");
@@ -654,7 +662,7 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
             if (optional(p, "scope") !== null && JSON.stringify(scopes(optional(p, "scope"))) !== JSON.stringify(selected)) fail("invalid_scope");
             const authorization = { clientId: client.clientId, resource, scopes: selected, redirectUri, codeChallenge: challenge(verifier), codeHash };
             if (selected.includes(LOGIN_SCOPE)) return { t, login: await repo.oauth.redeemLoginCode(tx, { ...authorization, tokenHash: hashToken(sessionToken), label: userAgent(req) }, t) };
-            return { t, grant: await repo.oauth.redeemCode(tx, { ...authorization, grantId: newGrantId(), grantExpiresAt: t + OAUTH_TTL.grant, tokens: pair(selected, t) }, t) };
+            return { t, grant: await repo.oauth.redeemCode(tx, { ...authorization, grantId: newGrantId(), grantExpiresAt: t + (client.tokenTtl ?? OAUTH_TTL.grant), tokens: pair(selected, t) }, t) };
           }));
           if (redeemed.login) {
             if (redeemed.login.status !== "ok") { if (redeemed.login.status === "replay") hostedFailure("oauth.replay", undefined, "warning"); fail("invalid_grant"); }
@@ -793,6 +801,17 @@ export function createOAuthServer(repo: Repo, config: Config, options: OAuthOpti
       // Closed while the read awaited: refused as bearer() refuses before it.
       if (closed) return bearerError(401, "invalid_token", requiredScopes);
       return principalOf(access, accessHash, requiredScopes);
+    },
+    // The dashboard's bearer (#1651 D4): a live access token of grayboard-admin's, for ADMIN_SCOPE, and its enabled
+    // user; undefined for any other token or none, which the caller answers as any unauthenticated /api request. It
+    // proves who is asking, nothing more: the caller authorizes (org_admin) on every request. Only the GET dashboard
+    // read routes call it.
+    async authenticateAdmin(req: Request): Promise<AuthedUser | undefined> {
+      const auth = req.headers.get("authorization");
+      if (closed || !auth || !/^Bearer [A-Za-z0-9_-]{43}$/i.test(auth)) return undefined;
+      const found = await activeAccess(hashToken(auth.slice(7)));
+      if (closed || !found || found.access.clientId !== ADMIN_CLIENT_ID || !found.access.scopes.includes(ADMIN_SCOPE)) return undefined;
+      return { user_id: found.access.userId, user_email: found.email, kind: found.kind, session_id: 0 };
     },
     async isGrantActive(grantId: string): Promise<boolean> { return !closed && await repo.oauth.isGrantActive(repo.read, grantId, now()) && !closed; },
     async isAuthorized(principal: OAuthPrincipal, r?: Read): Promise<boolean> {

@@ -99,10 +99,10 @@ export interface OAuthStore {
   // the grant is userId's and live; invalid for a service credential's grant, whose own revoke keeps
   // service.credential_revoked. The caller audits (it knows the actor).
   revokeUserGrant(tx: Tx, userId: number, grantId: string, now: number): Promise<OAuthResult<{ clientId: string }>>;
-  // Once per database and `key` (#429: builtin_clients; #928: builtin_clients_cli): revokes every unrevoked
+  // Once per database and `key` (#429: builtin_clients; #928: builtin_clients_cli; #1651: builtin_clients_admin): revokes every unrevoked
   // grant, and drops every unredeemed code, under `clientIds`, audits each grant, then records the cutover under
   // `key` so grants those clients issue later survive restarts. Returns the grants revoked; 0 after the first run.
-  revokePreBuiltinGrants(tx: Tx, clientIds: readonly string[], now: number, key?: "builtin_clients" | "builtin_clients_cli"): Promise<number>;
+  revokePreBuiltinGrants(tx: Tx, clientIds: readonly string[], now: number, key?: "builtin_clients" | "builtin_clients_cli" | "builtin_clients_admin"): Promise<number>;
   cleanup(tx: Tx, now: number): Promise<void>;
   // Service credentials (#270 D2). Each write is one transaction with its audit row where the store writes one.
   // add: the credential, its grant (expiry = the credential's) and its first secret; invalid unless userId is an

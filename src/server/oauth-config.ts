@@ -18,6 +18,11 @@ export type OAuthClient = {
   allowRefresh?: boolean;
   // Operator opt-in to the generic hosted session source key; never set for a CIMD client.
   sessionSource?: boolean;
+  // The lifetime of both the access token and the grant a code redeems to; absent, OAUTH_TTL's. Only adminClient sets it.
+  tokenTtl?: number;
+  // Its redirects match exactly: no RFC 8252 loopback port exception. Only adminClient sets it: on a loopback dev
+  // server its /admin/callback is a loopback URL, and any other local port must not receive its code.
+  exactRedirect?: boolean;
   // A service credential's client (#270 D2), read from the store: its live secrets, and once client authentication
   // has matched one, its ID (the secret a run token is minted with). Only such a client runs client_credentials.
   credential?: ServiceCredential & { secretId?: number };
@@ -59,6 +64,18 @@ export const CLI_CLIENT: OAuthClient = {
   clientId: CLI_CLIENT_ID, name: "Grayboard for the CLI", redirectUris: ["http://127.0.0.1/callback", "http://[::1]/callback"],
   scopes: [LOGIN_SCOPE], tokenEndpointAuthMethod: "none", allowRefresh: false,
 };
+// The admin dashboard's sign-in (#1651 D4): a public PKCE client whose one scope reads the GET /api/admin/ dashboard
+// routes and nothing else. Like LOGIN_SCOPE, ADMIN_SCOPE is never a member of OAUTH_SCOPES, so no other client can ask
+// for it and no MCP route accepts it. Its one redirect is this server's own /admin/callback, which needs the issuer, so
+// the server builds the client (adminClient); operator config can't reuse its ID. No refresh: its access token and
+// its grant both last ADMIN_TOKEN_TTL, and the page signs in again after.
+export const ADMIN_SCOPE = "grayboard:admin";
+export const ADMIN_CLIENT_ID = "grayboard-admin";
+export const ADMIN_TOKEN_TTL = 60 * 60_000;
+export const adminClient = (issuer: string): OAuthClient => ({
+  clientId: ADMIN_CLIENT_ID, name: "Grayboard admin dashboard", redirectUris: [issuer + "/admin/callback"],
+  scopes: [ADMIN_SCOPE], tokenEndpointAuthMethod: "none", allowRefresh: false, tokenTtl: ADMIN_TOKEN_TTL, exactRedirect: true,
+});
 // `source`: a service credential's (#270 D3), carried on the access read; it decides alone for such a client.
 export function sourceKeyFor(clientId: string, clients: ReadonlyMap<string, OAuthClient>, source: CredentialSource | null = null): string | null {
   if (source !== null) return source === "opencode" ? OPENCODE_SESSION_META : GRAYBOARD_SESSION_META;
@@ -115,6 +132,7 @@ export function matchesRedirect(client: OAuthClient, raw: string): boolean {
   try { actual = validateRedirect(raw); } catch { return false; }
   return client.redirectUris.some(registered => {
     if (registered === raw) return true;
+    if (client.exactRedirect) return false;
     const expected = new URL(registered);
     if (expected.protocol !== "http:" || !["127.0.0.1", "[::1]", "localhost"].includes(expected.hostname)) return false;
     // RFC 8252's port exception does not permit hostname, path, or query aliases.
@@ -142,6 +160,7 @@ export function parseOAuthClients(raw: string | undefined): OAuthClient[] {
       (v.sessionSource !== undefined && typeof v.sessionSource !== "boolean")) throw new Error("invalid OAuth client configuration");
     if (builtinHarness.has(v.clientId)) throw new Error(`OAuth client ID ${v.clientId} is reserved for a built-in client; rename that GRAYBOARD_OAUTH_CLIENTS entry`);
     if (v.clientId === CLI_CLIENT_ID) throw new Error(`OAuth client ID ${v.clientId} is reserved for the CLI's client; rename that GRAYBOARD_OAUTH_CLIENTS entry`);
+    if (v.clientId === ADMIN_CLIENT_ID) throw new Error(`OAuth client ID ${v.clientId} is reserved for the admin dashboard's client; rename that GRAYBOARD_OAUTH_CLIENTS entry`);
     // The startup map wins over the store, so a configured svc_ ID would shadow a service's credential (#270 D2).
     if (isServiceClientId(v.clientId)) throw new Error(`OAuth client ID ${v.clientId} is under the prefix ${SERVICE_CLIENT_PREFIX}, reserved for service credentials; rename that GRAYBOARD_OAUTH_CLIENTS entry`);
     // CIMD resolves only https: identifiers and grants keep only the client ID string, so an
