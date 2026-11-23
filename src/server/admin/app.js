@@ -213,6 +213,40 @@ function listView(spec) {
     },
   };
 }
+// Several models shown as one view, each under its own heading.
+function composite(parts) {
+  return {
+    async load() { await Promise.all(parts.map(x => x.model.load())); },
+    async poll() { await Promise.all(parts.map(x => x.model.poll())); },
+    render() { return parts.flatMap(x => [...(x.title ? [h("h2", {}, x.title)] : []), ...x.model.render()]); },
+  };
+}
+function bindingsView(params) {
+  return listView({
+    route: "role-bindings", params, cursor: after => ({ after }), key: b => b.id ?? "bootstrap:" + b.principal,
+    cmp: (a, b) => (a.id ?? -1) - (b.id ?? -1), empty: "No role bindings.",
+    columns: [
+      { h: "principal", f: b => h("td", { class: "mono ink" }, b.principal) },
+      { h: "role", f: b => chip(b.role, b.role === "org_admin" ? "accent" : null) },
+      { h: "scope", f: b => h("td", { class: "mono" }, b.scope ?? "org") },
+      { h: "source", f: b => b.source === "bootstrap" ? h("span", { title: "GRAYBOARD_ADMINS" }, chip("bootstrap", "warn")) : chip("binding") },
+      { h: "granted by", f: b => h("td", { class: "mono dim" }, b.granter ?? "") },
+      { h: "granted", f: b => timeCell(b.granted_at) },
+    ],
+  });
+}
+function servicesView() {
+  return listView({
+    route: "service-list", params: {}, cursor: after => ({ after }), key: x => x.id, cmp: (a, b) => a.id - b.id, empty: "No service principals.",
+    columns: [
+      { h: "service", f: x => h("td", { class: "mono ink" }, x.name) },
+      { h: "owners", f: x => h("td", { class: "mono wrap" }, x.owners.join(", ")) },
+      { h: "state", f: x => x.disabled_at ? chip("disabled", "bad") : chip("active", "ok") },
+      { h: "created", f: x => timeCell(x.created_at) },
+      { h: "", f: x => h("td", { class: "nowrap" }, link(hashOf("audit", { actor: x.name }), "audit")) },
+    ],
+  });
+}
 const byIdDesc = (a, b) => b.id - a.id;
 const byIdAsc = (a, b) => a.id - b.id;
 const byKey = f => (a, b) => (f(a) < f(b) ? -1 : f(a) > f(b) ? 1 : 0);
@@ -260,7 +294,7 @@ const VIEWS = {
       route: "users", params: {}, cursor: after => ({ after }), key: u => u.id, cmp: byIdAsc,
       columns: [
         { h: "id", num: true, f: u => h("td", { class: "num" }, String(u.id)) },
-        { h: "email", f: u => h("td", { class: "mono ink" }, u.email) },
+        { h: "email", f: u => h("td", { class: "mono ink" }, u.kind === "user" ? link(hashOf("user", { email: u.email }), u.email) : u.email) },
         { h: "name", f: u => u.display_name ?? "", cls: "wrap" },
         { h: "kind", f: u => chip(u.kind, u.kind === "service" ? "accent" : null) },
         { h: "state", f: u => u.disabled_at ? h("span", { title: `disabled ${when(u.disabled_at)}` }, chip("disabled", "bad")) : chip("active", "ok") },
@@ -269,7 +303,31 @@ const VIEWS = {
         { h: "", f: u => h("td", { class: "nowrap" }, link(hashOf("audit", { actor: u.email }), "audit")) },
       ],
     });
-    return { title: "Users", nav: "users", model, note: "Users and service principals in id order." };
+    return {
+      title: "Users", nav: "users", note: "Users and service principals in id order. Open a user for grants and roles.",
+      model: composite([{ model }, { title: "Role bindings", model: bindingsView({}) }, { title: "Services", model: servicesView() }]),
+    };
+  },
+
+  user(p) {
+    const grants = listView({
+      route: "user-grants", params: { email: p.email }, cursor: () => ({}), key: g => g.id, cmp: (a, b) => b.last_used_at - a.last_used_at,
+      empty: "No live grants or CLI tokens.",
+      columns: [
+        { h: "kind", f: g => chip(g.kind, g.kind === "credential" ? "accent" : null) },
+        { h: "client", f: g => h("td", { class: "mono ink" }, g.client_id ?? g.label ?? "") },
+        { h: "last used", f: g => h("td", { class: "time", title: when(g.last_used_at) }, ago(g.last_used_at)) },
+        { h: "created", f: g => timeCell(g.created_at) },
+        { h: "expires", f: g => g.expires_at ? h("td", { class: "time", title: when(g.expires_at) }, ago(g.expires_at)) : h("td", { class: "dim" }, "idle limit") },
+        { h: "id", f: g => h("td", { class: "mono dim wrap" }, g.id) },
+      ],
+    });
+    return {
+      title: p.email, nav: "users", crumbs: [link(hashOf("users"), "users")],
+      controls: h("div", { class: "filters" }, link(hashOf("audit", { actor: p.email }), "audit rows by this user →")),
+      note: "Live sign-ins and roles.",
+      model: composite([{ title: "Grants and CLI tokens", model: grants }, { title: "Role bindings", model: bindingsView({ principal: p.email }) }]),
+    };
   },
 
   audit(p) {
@@ -513,7 +571,7 @@ function paint() {
     h("button", { title: "Reload from the first page", on: { click: () => route() } }, "Refresh"));
   let body;
   try { body = v.model.render(); } catch (e) { body = [refusedNotice(e)]; }
-  $("main").replaceChildren(head, v.controls || "", ...(current.error ? [refusedNotice(current.error)] : []), ...body);
+  $("main").replaceChildren(...[head, v.controls, current.error ? refusedNotice(current.error) : null, ...body].filter(x => x != null));
   document.title = `${v.title} · Grayboard admin`;
 }
 

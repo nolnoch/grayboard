@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { TestServer } from "../support/server.ts";
 import { accessAudits } from "../support/audit.ts";
 import { drained, exec, row } from "../support/repo_sql.ts";
-import { AdminRows } from "../../src/server/admin_api.ts";
+import { AdminRows, adminReadRoute } from "../../src/server/admin_api.ts";
 import pkg from "../../package.json" with { type: "json" };
 
 const A = "alice@example.com";
@@ -48,7 +48,7 @@ describe("gate", () => {
     expect((await srv.api(a, "GET", "/api/admin/claims")).status).toBe(403);
   });
 
-  test("a write route under /api/admin/ still writes its allow every time", async () => {
+  test("a non-dashboard route under /api/admin/ still writes its allow every time", async () => {
     const root = await srv.login(ROOT);
     for (let i = 0; i < 2; i++) expect((await srv.api(root, "GET", `/api/admin/roles`)).status).toBe(200);
     expect((await gateRows("/api/admin/roles")).length).toBe(2);
@@ -123,6 +123,62 @@ describe("reads", () => {
     // The deny and the first allow, in either order: audit rows are written off the request path.
     expect((await gateRows("/api/admin/overview")).map(r => [r.actor, r.detail.allow]).sort()).toEqual([[A, false], [ROOT, true]]);
     expect(await audits("admin.read")).toEqual([]);
+  });
+
+  test("an empty conversation writes no admin.read, and a long pair's gate target is clipped", async () => {
+    const root = await srv.login(ROOT);
+    const long = "x".repeat(5000);
+    const r = await srv.api(root, "GET", `/api/admin/conversation?a=nobody&b=${long}`);
+    expect(r.status).toBe(200);
+    expect(r.body.rows).toEqual([]);
+    await drained(srv);
+    expect(await audits("admin.read")).toEqual([]);
+    for (const row of await audits("authz.decision")) expect(String(row.target ?? "").length).toBeLessThanOrEqual(256);
+  });
+
+  test("role-bindings lead with the bootstrap admins, page by id and filter; a bad role is a 400", async () => {
+    const root = await srv.login(ROOT);
+    await srv.login(A);
+    expect((await srv.api(root, "POST", "/api/admin/roles/grant", { role: "org_admin", principal: A })).status).toBe(201);
+    const all = await srv.api(root, "GET", "/api/admin/role-bindings");
+    expect(all.status).toBe(200);
+    expect(all.body.rows.map((b: { principal: string; role: string; source: string }) => [b.principal, b.role, b.source])).toEqual([[ROOT, "org_admin", "bootstrap"], [A, "org_admin", "binding"]]);
+    expect(all.body.next).toBeNull();
+    const mine = await srv.api(root, "GET", `/api/admin/role-bindings?principal=${A}`);
+    expect(mine.body.rows.map((b: { principal: string }) => b.principal)).toEqual([A]);
+    const paged = await srv.api(root, "GET", "/api/admin/role-bindings?limit=1");
+    expect(paged.body.next).toBe(all.body.rows[1].id);
+    expect((await srv.api(root, "GET", `/api/admin/role-bindings?after=${paged.body.next}`)).body.rows).toEqual([]);
+    expect((await srv.api(root, "GET", "/api/admin/role-bindings?role=nope")).status).toBe(400);
+  });
+
+  test("service-list pages services with owners; user-grants lists a user's live CLI tokens and grants without secrets", async () => {
+    const root = await srv.login(ROOT);
+    await srv.login(A);
+    await srv.login(A);
+    expect((await srv.api(root, "POST", "/api/admin/services", { name: "deployer", owners: [A] })).status).toBe(201);
+    const services = await srv.api(root, "GET", "/api/admin/service-list");
+    expect(services.body.rows.map((s: { name: string; owners: string[] }) => [s.name, s.owners])).toEqual([["deployer", [A]]]);
+    const grants = await srv.api(root, "GET", `/api/admin/user-grants?email=${A}`);
+    expect(grants.status).toBe(200);
+    expect(grants.body.rows.length).toBe(2);
+    for (const g of grants.body.rows) {
+      expect(g.kind).toBe("cli");
+      expect(g.id).toMatch(/^cli:\d+$/);
+      expect(Object.keys(g).sort()).toEqual(["client_id", "created_at", "expires_at", "id", "kind", "label", "last_used_at"]);
+    }
+    expect((await srv.api(root, "GET", "/api/admin/user-grants?email=nobody@example.com")).body.rows).toEqual([]);
+    expect((await srv.api(root, "GET", "/api/admin/user-grants")).status).toBe(400);
+  });
+
+  test("no dashboard route shadows another /api/admin/ path: the CLI's GET lists keep their own shapes", async () => {
+    const source = await Bun.file(new URL("../../src/server/http.ts", import.meta.url)).text();
+    const paths = [...new Set([...source.matchAll(/path === "(\/api\/admin\/[a-z/-]+)"/g)].map(m => m[1]!))];
+    expect(paths).toContain("/api/admin/roles");
+    for (const path of paths) expect([path, adminReadRoute("GET", path, new URL(`http://x${path}`))]).toEqual([path, undefined]);
+    const root = await srv.login(ROOT);
+    expect(Object.keys((await srv.api(root, "GET", "/api/admin/roles")).body).sort()).toEqual(["bindings", "next"]);
+    expect(Object.keys((await srv.api(root, "GET", "/api/admin/services")).body).sort()).toEqual(["next", "services"]);
   });
 
   test("audit pages newest first under a filter with an (at, id) cursor", async () => {

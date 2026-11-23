@@ -1157,7 +1157,7 @@ export async function handleHttp(
       recordDecision(repo, repo.read, { user: authed.user_email }, req, decision, { route: path });
     }
     if (!decision.allow) return forbidden(decision.reason);
-    if (read) return serveAdminRead(read.name, url, repo, authed.user_email, { overview: sessions.adminOverview });
+    if (read) return serveAdminRead(read.name, url, repo, authed.user_email, { overview: sessions.adminOverview, admins: config.admins, cliIdleDays: config.cliTokenIdleDays ?? DEFAULT_CLI_TOKEN_IDLE_DAYS });
     gate = decision;
   }
   if (path === "/api/admin/roles"          && method === "GET")  return adminRoleList(url, repo, config);
