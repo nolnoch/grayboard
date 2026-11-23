@@ -1118,6 +1118,8 @@ test("HTTP concurrent code/refresh consumes have one winner and committed strict
 test("OAuth global rate bounds distinct callers and audits once per refusal streak", async () => {
   service.close(); config.oauthGlobalLimit = { burst: 2, perSec: 1 };
   service = makeService();
+  // The startup cutovers first, as the server waits for them: the audit reads below are synchronous.
+  await service.ready;
   const request = new Request(base + "/oauth/unknown?access_token=private-value");
   expect((await service.fetch(request, { key: "first" }))!.status).toBe(400);
   expect((await service.fetch(request, { key: "second" }))!.status).toBe(400);

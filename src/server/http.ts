@@ -1062,6 +1062,9 @@ export type SessionHooks = {
   accessChanged: (h: Read, principal: string, by: string) => Promise<void>;
   // The server's IdP re-check (#930 A2), shared with the OAuth refresh path; absent, the bare fallback clock.
   recheck?: Pick<IdpRecheck, "cliVerdict">;
+  // The admin dashboard's OAuth bearer (#1651 D4, the OAuth server's authenticateAdmin): tried only on a GET dashboard
+  // read route whose token isn't a CLI session's; absent, those routes take CLI tokens alone.
+  adminBearer?: (req: Request) => Promise<AuthedUser | undefined>;
 };
 
 export async function handleHttp(
@@ -1090,6 +1093,9 @@ export async function handleHttp(
     if (!(e instanceof IdpUnavailable)) throw e;
     return json({ code: "temporarily_unavailable", message: "the identity provider is unreachable; retry in a minute" }, 503, { "Retry-After": "60" });
   }
+  // The dashboard's token reaches the read routes and nothing else: every other route, admin writes included, takes a
+  // CLI token alone. The /api/admin/ gate below still authorizes it (org_admin) on every request.
+  if (!authed && sessions.adminBearer && adminReadRoute(method, path, url)) authed = await sessions.adminBearer(req) ?? null;
   if (!authed) return jsonErr("unauthenticated", "invalid or missing token", 401);
 
   if (path === "/api/auth/logout" && method === "POST") return authLogout(authed, repo);

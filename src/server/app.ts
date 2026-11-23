@@ -1,3 +1,4 @@
+import { adminPage } from "./admin_page.ts";
 import { MAX_BODY_BYTES } from "../core/boards.ts";
 import { openDatabase, type Repo } from "./db.ts";
 import { sessionEndPort } from "./session_end.ts";
@@ -116,6 +117,7 @@ export function startServer(config: Config, opts: StartOptions = {}) {
   const oauth = createOAuthServer(repo, config, { ...opts.oauth, providers, recheck });
   const mcp = createHostedMcp(application, oauth, { trustedOrigin: new URL(config.publicUrl).origin, stopping: () => stopping, now: opts.now, limits: config.mcpLimits, caps: config.hostedCaps, ...(config.hostedIdleSeconds ? { idleSeconds: config.hostedIdleSeconds } : {}) });
   const mcpPath = new URL(oauth.resource).pathname;
+  const adminPrefix = new URL(oauth.issuer).pathname.replace(/\/$/, "");
 
   // A Slack outage or bad token mustn't take the bus down: log and run without it.
   slack = config.slack ? new SlackBridge({
@@ -205,6 +207,9 @@ export function startServer(config: Config, opts: StartOptions = {}) {
     const attachmentResponse = atSite("attachments", () => attachments.fetch(req));
     if (attachmentResponse) return attachmentResponse.then(res => authGate.chargeRefusedToken(caller, req, path, res));
     if (path === "/mcp" || path === mcpPath) return mcp.fetch(req, caller.ip ?? "unknown").then(res => authGate.chargeRefusedToken(caller, req, path, res));
+    // The dashboard's page reads nothing and takes no token; its data comes from the /api/admin/ read routes.
+    const page = adminPage(req, path, adminPrefix);
+    if (page) return page;
 
     // A sign-in costs a token up front, before its body is read. Only a
     // JSON body is accepted, uncharged otherwise: a cross-origin page can
@@ -213,7 +218,7 @@ export function startServer(config: Config, opts: StartOptions = {}) {
       if (!isJsonRequest(req)) return Response.json({ code: "unsupported_media_type", message: "sign-in takes Content-Type: application/json" }, { status: 415 });
       authGate.charge(caller, req, path, "sign-in");
     }
-    return atSite("admin", () => handleHttp(req, repo, application.access, config, touches, wake, slack, { disconnectUser, accessChanged, recheck }, caller.ip, application.boardsChanged, url)).then((res) => authGate.chargeRefusedToken(caller, req, path, res));
+    return atSite("admin", () => handleHttp(req, repo, application.access, config, touches, wake, slack, { disconnectUser, accessChanged, recheck, adminBearer: oauth.authenticateAdmin }, caller.ip, application.boardsChanged, url)).then((res) => authGate.chargeRefusedToken(caller, req, path, res));
   }
 
   // Every value an O(1) getter (vision P13): no row count, no walk over sessions.
