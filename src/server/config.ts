@@ -96,6 +96,9 @@ export type Config = {
   oktaDirectory?: OktaDirectoryConfig;
   // Emails allowed to run admin commands. Empty means nobody can.
   admins: string[];
+  // Who may create teams (GRAYBOARD_TEAM_CREATE, #1667): anyone signed in (the default), or org admins only. Boards stay
+  // open to everyone either way.
+  teamCreate?: "anyone" | "admins";
   oauthClients?: OAuthClient[];
   // Metadata-document (CIMD) client IDs the server resolves; default OpenCode's only (F-16).
   oauthCimdClients?: string[];
@@ -228,6 +231,7 @@ export function loadConfig(): Config {
     idpReauthDays: reauthDays(process.env.GRAYBOARD_IDP_REAUTH_DAYS),
     idpRecheck: parseRecheck(process.env),
     admins: parseList(process.env.GRAYBOARD_ADMINS),
+    teamCreate: parseTeamCreate(process.env.GRAYBOARD_TEAM_CREATE),
     oauthClients: parseOAuthClients(process.env.GRAYBOARD_OAUTH_CLIENTS),
     oauthCimdClients: parseCimdClients(process.env.GRAYBOARD_OAUTH_CIMD_CLIENTS),
     humanReach: parseReach(process.env.GRAYBOARD_SLACK_REACH),
@@ -472,6 +476,12 @@ function positiveInt(env: Record<string, string | undefined>, name: string, fall
   if (!/^[1-9][0-9]*$/.test(raw)) throw new Error(`${name} must be a positive whole number of ${unit}, not "${raw}"`);
   if (Number(raw) > ceiling) throw new Error(`${name} can be at most ${ceiling} ${unit}`);
   return Number(raw);
+}
+
+function parseTeamCreate(raw: string | undefined): "anyone" | "admins" {
+  if (raw === undefined || raw === "" || raw === "anyone") return "anyone";
+  if (raw === "admins") return "admins";
+  throw new Error(`GRAYBOARD_TEAM_CREATE must be "anyone" or "admins", not "${raw}"`);
 }
 
 function parseReach(raw: string | undefined): HumanReach {

@@ -450,7 +450,16 @@ async function teamList(authed: AuthedUser, repo: Repo): Promise<Response> {
   return json((await repo.teams.listForUser(repo.read, authed.user_id)).map(t => ({ name: t.name, created_at: t.created_at })));
 }
 
-async function teamCreate(req: Request, authed: AuthedUser, repo: Repo): Promise<Response> {
+async function teamCreate(req: Request, authed: AuthedUser, repo: Repo, config: Config): Promise<Response> {
+  if (config.teamCreate === "admins") {
+    // GRAYBOARD_TEAM_CREATE=admins (#1667): the admin verb decides, so org_admin role holders count as GRAYBOARD_ADMINS do.
+    const gate: AuthzRequest = { verb: "admin", user: signedIn(authed) };
+    const decision = await authorize(repo, repo.read, { admins: config.admins }, gate);
+    if (!decision.allow) {
+      recordDecision(repo, repo.read, { user: authed.user_email }, gate, decision, { route: "/api/teams" });
+      return forbidden("on this server only org admins create teams; ask one to create it, or post on a board instead");
+    }
+  }
   const body = await parseBody<{ name: string }>(req);
   if (!body?.name) return badRequest("name required");
   const name = body.name.toLowerCase();
@@ -1126,7 +1135,7 @@ export async function handleHttp(
   }
 
   if (path === "/api/teams" && method === "GET")  return teamList(authed, repo);
-  if (path === "/api/teams" && method === "POST") return teamCreate(req, authed, repo);
+  if (path === "/api/teams" && method === "POST") return teamCreate(req, authed, repo, config);
 
   const teamOp = path.match(/^\/api\/teams\/([^/]+)\/([^/]+)$/);
   if (teamOp) {
