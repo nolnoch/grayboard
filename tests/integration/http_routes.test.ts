@@ -37,6 +37,29 @@ const audits = async (where: string) => {
     .map((r) => ({ ...r, detail: JSON.parse(r.detail) as Record<string, unknown> }));
 };
 
+// #1667: GRAYBOARD_TEAM_CREATE=admins limits team creation to org admins, GRAYBOARD_ADMINS and org_admin holders alike;
+// boards stay open to everyone.
+test("with team creation limited to admins, a member is refused and makes nothing; admins and org_admin holders create", async () => {
+  await restart({ admins: ["root@example.com"], teamCreate: "admins" });
+  const [root, alice, bob] = [await login("root@example.com"), await login("alice@example.com"), await login("bob@example.com")];
+
+  const refused = await api(alice, "POST", "/api/teams", { name: "everyone" });
+  expect(refused).toMatchObject({ status: 403, body: { code: "forbidden", message: expect.stringContaining("only org admins create teams") } });
+  expect(await row(srv, `SELECT COUNT(*) AS n FROM teams WHERE name = 'everyone'`)).toEqual({ n: 0 });
+  expect(await row(srv, `SELECT COUNT(*) AS n FROM boards WHERE name = 'everyone'`)).toEqual({ n: 0 });
+  expect((await audits(`action = 'authz.decision' AND actor = 'alice@example.com'`)).at(-1)?.detail).toMatchObject({ verb: "admin", allow: false, route: "/api/teams" });
+
+  expect((await api(root, "POST", "/api/teams", { name: "eng" })).status).toBe(201);
+  expect((await api(root, "POST", "/api/admin/roles/grant", { role: "org_admin", principal: "bob@example.com" })).status).toBe(201);
+  expect((await api(bob, "POST", "/api/teams", { name: "ops" })).status).toBe(201);
+  expect(await rows(srv, `SELECT name FROM teams ORDER BY name`)).toEqual([{ name: "eng" }, { name: "ops" }]);
+});
+
+test("team creation stays open to anyone by default", async () => {
+  const alice = await login("alice@example.com");
+  expect((await api(alice, "POST", "/api/teams", { name: "eng" })).status).toBe(201);
+});
+
 // #284 decision 5 (audit W8): a team can't take another principal's name.
 test("team create on another principal's name is a 409, and no team or board is made", async () => {
   const alice = await login("alice@example.com");

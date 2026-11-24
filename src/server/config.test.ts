@@ -7,7 +7,7 @@ import { checkIdpConfig, describeBlobs, describeReauth, describeStore, FILE_SECR
 
 const KEYS = [
   "GRAYBOARD_DEV_AUTH", "GRAYBOARD_DB_PATH", "GRAYBOARD_DATABASE_URL", "GRAYBOARD_PUBLIC_URL", "GRAYBOARD_ORG_DOMAIN",
-  "GOOGLE_OAUTH_CLIENT_ID", "GOOGLE_OAUTH_CLIENT_SECRET", "GRAYBOARD_ADMINS",
+  "GOOGLE_OAUTH_CLIENT_ID", "GOOGLE_OAUTH_CLIENT_SECRET", "GRAYBOARD_ADMINS", "GRAYBOARD_TEAM_CREATE",
   "GRAYBOARD_MCP_GOOGLE_CLIENT_ID", "GRAYBOARD_MCP_GOOGLE_CLIENT_SECRET",
   "GRAYBOARD_IDPS", "GRAYBOARD_OKTA_ISSUER", "GRAYBOARD_OKTA_CLIENT_ID", "GRAYBOARD_OKTA_CLIENT_SECRET", "GRAYBOARD_OKTA_ALLOWED_DOMAINS",
   "GRAYBOARD_OIDC_ISSUER", "GRAYBOARD_OIDC_CLIENT_ID", "GRAYBOARD_OIDC_CLIENT_SECRET", "GRAYBOARD_OIDC_ALLOWED_DOMAINS", "GRAYBOARD_OIDC_LABEL",
@@ -130,6 +130,16 @@ describe("loadConfig", () => {
       }
       delete process.env[prefix + "_BURST"]; delete process.env[prefix + "_PER_SEC"];
     }
+  });
+
+  // #1667: anyone by default; admins only when set; anything else refuses to start rather than leaving creation open.
+  test("GRAYBOARD_TEAM_CREATE is anyone or admins", () => {
+    process.env.GRAYBOARD_DEV_AUTH = "1";
+    expect(loadConfig().teamCreate).toBe("anyone");
+    process.env.GRAYBOARD_TEAM_CREATE = "admins";
+    expect(loadConfig().teamCreate).toBe("admins");
+    process.env.GRAYBOARD_TEAM_CREATE = "admin";
+    expect(() => loadConfig()).toThrow(/GRAYBOARD_TEAM_CREATE must be "anyone" or "admins"/);
   });
 
   // #807: one of the path and the URL; the URL only with a blob directory.
