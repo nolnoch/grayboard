@@ -398,6 +398,14 @@ export function lastWasRelease(db: Database, name: string): boolean {
   return row?.event === "released";
 }
 
+// The bind/unbind param text, shared with hosted's zod inputs (src/server/mcp-resources.ts) so the two can't drift.
+export const BIND_NAME_RULE = "The name: 1-32 chars of a-z 0-9 _ -, specific to the work (eng-142-idle-anim, not fe)";
+export const BIND_PARAM_TEXT = {
+  create: "Optional. true to create a name that has never existed (a guard against typos).",
+  meta: 'Optional. One-line labels peers see in peer_list: task, owner, source_board, spec_hash, description; "" clears one.',
+  unbindName: "A name this session holds.",
+};
+
 export const BIND_TOOL = {
   name: "bind",
   _meta: { "anthropic/alwaysLoad": true },
@@ -406,9 +414,9 @@ export const BIND_TOOL = {
   inputSchema: {
     type: "object",
     properties: {
-      name: { type: "string", description: "The name: 1-32 chars of a-z 0-9 _ -, specific to the work (eng-142-idle-anim, not fe)." },
-      create: { type: "boolean", description: "Optional. true to create a name that has never existed (a guard against typos)." },
-      meta: { type: "object", description: 'Optional. One-line labels peers see in peer_list: task, owner, source_board, spec_hash, description; "" clears one.' },
+      name: { type: "string", description: `${BIND_NAME_RULE}.` },
+      create: { type: "boolean", description: BIND_PARAM_TEXT.create },
+      meta: { type: "object", description: BIND_PARAM_TEXT.meta },
     },
     required: ["name"],
   },
@@ -420,7 +428,7 @@ export const UNBIND_TOOL = {
   inputSchema: {
     type: "object",
     properties: {
-      name: { type: "string", description: "A name this session holds." },
+      name: { type: "string", description: BIND_PARAM_TEXT.unbindName },
     },
     required: ["name"],
   },

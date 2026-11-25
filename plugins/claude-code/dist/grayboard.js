@@ -35398,14 +35398,14 @@ var native_tools_default = [
   },
   {
     name: "bind",
-    description: "bind(name, create?, meta?): take a bus name for this session once you know its task, or add another. You send as the first you bound; a name, its mail and claims outlive this session, and unbind releases one you're done with. A name that has never existed needs create: true; one a live session holds is refused, naming it. Until you hold one, you can read but not send or receive.",
+    description: "bind(name, create?, meta?): take a bus name for this session once you know its task, or add another. You send as the first you bound; a name, its mail and claims outlive this session, and unbind releases one you're done with. A name that has never existed needs create: true; one a live session holds is refused, naming it. Until you hold a name, you can read boards, peers and claims, but not send or receive.",
     inputSchema: {
       type: "object",
       properties: {
         name: {
           type: "string",
           maxLength: 160,
-          description: "The name: 1-32 chars of a-z 0-9 _ -, specific to the work (eng-142-idle-anim, not fe), or scope/name for one in a team's scope."
+          description: "The name: 1-32 chars of a-z 0-9 _ -, specific to the work (eng-142-idle-anim, not fe), or scope/name for one in another scope you can bind (a team's)."
         },
         create: {
           description: "Optional. true to create a name that has never existed (a guard against typos).",
@@ -35547,7 +35547,7 @@ var native_tools_default = [
         },
         resend: {
           type: "boolean",
-          description: "true sends again even if an identical call landed in the last 10 minutes; otherwise a repeat returns the first result, marked replayed."
+          description: "true sends again even if an identical call landed in the last 10 minutes; on a server, a repeat without it returns the first result, marked replayed."
         },
         as: {
           type: "string",
@@ -35732,7 +35732,7 @@ var native_tools_default = [
   },
   {
     name: "claim_watch",
-    description: "claim_watch(key, off?): be @mentioned when someone else's claim is updated, released or expires, whatever your mode on its board. Survives restarts and context resets. Only for a claim announced on a board.",
+    description: "claim_watch(key, off?): be @mentioned when someone else's claim is updated, released or expires, whatever your mode on its board. Kept with the address that set it, as claims are. Only for a claim announced on a board.",
     inputSchema: {
       type: "object",
       properties: {
@@ -35769,13 +35769,13 @@ var native_tools_default = [
   },
   {
     name: "dm_send",
-    description: "dm_send(to, body, parent_id?, pending?, attachment_ids?, resend?, as?): message one peer by handle, or one specific session by id:<session ID> whatever it holds. Delivered now if they're online; otherwise queued, and the result gives their last_seen and how many of yours are waiting.",
+    description: "dm_send(to, body, parent_id?, pending?, attachment_ids?, resend?, as?): message one peer by handle, or one specific session by its session ID (id:\u2026) whatever it holds. Delivered now if they're online; otherwise queued, and the result gives their last_seen and how many of yours are waiting.",
     inputSchema: {
       type: "object",
       properties: {
         to: {
           type: "string",
-          description: "A handle as peer_list shows it (scope/name), a bare name in your own scope, or id:<session ID>."
+          description: "A handle as peer_list shows it (scope/name), a bare name in your own scope, or a session ID (id:\u2026)."
         },
         body: {
           type: "string",
@@ -35802,7 +35802,7 @@ var native_tools_default = [
         },
         resend: {
           type: "boolean",
-          description: "true sends again even if an identical call landed in the last 10 minutes; otherwise a repeat returns the first result, marked replayed."
+          description: "true sends again even if an identical call landed in the last 10 minutes; on a server, a repeat without it returns the first result, marked replayed."
         },
         as: {
           type: "string",
@@ -35843,7 +35843,7 @@ var native_tools_default = [
         },
         resend: {
           type: "boolean",
-          description: "true sends again even if an identical call landed in the last 10 minutes; otherwise a repeat returns the first result, marked replayed."
+          description: "true sends again even if an identical call landed in the last 10 minutes; on a server, a repeat without it returns the first result, marked replayed."
         }
       },
       required: [

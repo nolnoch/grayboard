@@ -48,7 +48,7 @@ const BOARD = { type: "string", description: 'Board name, with or without the "#
 // On the append writes (dm_send, board_post, delegate): a server answers an
 // identical call within its dedup window with the first one's result (#254,
 // src/server/write_dedup.ts). Local mode accepts it and has nothing to skip.
-export const RESEND_PARAM = { type: "boolean", description: `true sends again even if an identical call landed in the last ${WRITE_DEDUP_WINDOW_TEXT}; otherwise a repeat returns the first result, marked replayed.` };
+export const RESEND_PARAM = { type: "boolean", description: `true sends again even if an identical call landed in the last ${WRITE_DEDUP_WINDOW_TEXT}; on a server, a repeat without it returns the first result, marked replayed.` };
 
 // On the writes a session can make as another of its addresses (#284 S3).
 export const AS_PARAM = { type: "string", description: "Optional. Act as another of your addresses: a name you hold, or your session ID." };
@@ -73,15 +73,15 @@ export function dmTools(opts: { attachments: AttachmentForm }): ToolDef[] {
       // Claude Code otherwise defers MCP tools behind ToolSearch, and agents have
       // missed that the reply tool exists. Same for dm_inbox, dm_ack and board_post.
       _meta: { "anthropic/alwaysLoad": true },
-      description: `dm_send(to, body, parent_id?, pending?, ${files}?, resend?, as?): message one peer by handle, or one specific session by id:<session ID> whatever it holds. Delivered now if they're online; otherwise queued, and the result gives their last_seen and how many of yours are waiting.`,
+      description: `dm_send(to, body, parent_id?, pending?, ${files}?, resend?, as?): message one peer by handle, or one specific session by its session ID (id:…) whatever it holds. Delivered now if they're online; otherwise queued, and the result gives their last_seen and how many of yours are waiting.`,
       inputSchema: {
         type: "object",
         properties: {
           to: {
             type: "string",
             description: opts.attachments === "ids"
-              ? "A handle as peer_list shows it (scope/name), a bare name in your own scope, or id:<session ID>."
-              : "A handle as peer_list shows it, or id:<session ID>.",
+              ? "A handle as peer_list shows it (scope/name), a bare name in your own scope, or a session ID (id:…)."
+              : "A handle as peer_list shows it, or a session ID (id:…).",
           },
           body: { type: "string", description: "Message body. Plain text or markdown." },
           parent_id: messageId("Optional. message_id this is replying to; sets the thread parent."),
@@ -283,7 +283,7 @@ export function boardTools(opts: { teams: boolean; attachments: AttachmentForm }
     {
       name: "claim_watch",
       description:
-        "claim_watch(key, off?): be @mentioned when someone else's claim is updated, released or expires, whatever your mode on its board. Survives restarts and context resets. Only for a claim announced on a board.",
+        "claim_watch(key, off?): be @mentioned when someone else's claim is updated, released or expires, whatever your mode on its board. Kept with the address that set it, as claims are. Only for a claim announced on a board.",
       inputSchema: {
         type: "object",
         properties: {
