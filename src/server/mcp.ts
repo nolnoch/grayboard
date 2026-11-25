@@ -1376,7 +1376,7 @@ function registerNativeTools(server: McpServer, application: Application, hosted
   };
   const run = (ctx: ServerContext, tool: string, call: (session: ApplicationSession, tx: Tx) => unknown) =>
     runAs(ctx, tool, (context, told) => hosted.run(context.principal, context.sessionContext, tool, call, told, context.verdict, context.request.signal));
-  server.registerTool("whoami", { description: "This request's current session binding, or unbound candidates.", inputSchema: WHOAMI_INPUT }, async (_, ctx) => {
+  server.registerTool("whoami", { description: "whoami(): your session ID, the names you hold (held; you send as primary) and, while unbound, names you can bind.", inputSchema: WHOAMI_INPUT }, async (_, ctx) => {
     let notice: string | undefined;
     try {
       return said(text(await timeTool("whoami", async () => { const context = await current(ctx); return hosted.whoami(context.principal, context.sessionContext, n => { notice = n; }); })), notice);
@@ -1390,7 +1390,7 @@ function registerNativeTools(server: McpServer, application: Application, hosted
     return { ...text({ code: data.code, message: shown(e), ...(e instanceof ApplicationError && e.code !== "internal" ? e.extra : {}) }), structuredContent: data, isError: true };
   };
   // The shared bind/unbind definitions (BIND_TOOL, UNBIND_TOOL), with the hosted input both roles take.
-  server.registerTool(BIND_TOOL.name, { description: BIND_TOOL.description, _meta: BIND_TOOL._meta,
+  server.registerTool(BIND_TOOL.name, { description: `${BIND_TOOL.description} Until you hold a name, you can read boards, peers and claims, but not send or receive.`, _meta: BIND_TOOL._meta,
     inputSchema: HOSTED_BIND_INPUT }, async (args, ctx) => {
     try { return await timeTool("bind", async () => { const context = await current(ctx); return hosted.bind(context.principal, context.sessionContext, args, context.declared, context.request.signal, context.verdict); }); }
     catch (e) { return bindRefusal(e, "bind"); }

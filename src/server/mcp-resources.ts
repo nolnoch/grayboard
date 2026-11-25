@@ -10,11 +10,17 @@ import type { HostedSession } from "./hosted-types.ts";
 import { parseBoardResourceUri, type Resources } from "./resources.ts";
 import { hostedFailure } from "./hosted-diagnostics.ts";
 import { isValidIdentityName } from "../shared/addressing.ts";
+import { BIND_NAME_RULE, BIND_PARAM_TEXT } from "../core/bindings.ts";
 
 // bind and unbind inputs for both hosted roles, the native agent's and the subscriber's (#454): BIND_TOOL's and
 // UNBIND_TOOL's fields (src/core/bindings.ts) plus hosted's `where`, the place the session reports.
-export const HOSTED_BIND_INPUT = z.strictObject({ name: z.string().max(160), create: z.boolean().optional(), meta: z.record(z.string(), z.unknown()).optional(), where: z.string().max(1024).optional() });
-export const HOSTED_UNBIND_INPUT = z.strictObject({ name: z.string().max(160) });
+export const HOSTED_BIND_INPUT = z.strictObject({
+  name: z.string().max(160).describe(`${BIND_NAME_RULE}, or scope/name for one in another scope you can bind (a team's).`),
+  create: z.boolean().optional().describe(BIND_PARAM_TEXT.create),
+  meta: z.record(z.string(), z.unknown()).optional().describe(BIND_PARAM_TEXT.meta),
+  where: z.string().max(1024).optional().describe("Set by your adapter to where the session runs; don't pass it yourself."),
+});
+export const HOSTED_UNBIND_INPUT = z.strictObject({ name: z.string().max(160).describe(BIND_PARAM_TEXT.unbindName) });
 // The subscriber role's tool schemas, built once per process: zod schema construction per request was
 // ~6% of server CPU at 1000 sessions (#912), since every hosted request builds its own McpServer.
 const EMPTY_INPUT = z.strictObject({});
