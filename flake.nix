@@ -23,28 +23,26 @@
 
           # Only what bun reads at install/build time: manifests, lockfile,
           # sources. src/cli/adapters.ts is a build-time macro that reads
-          # adapters/<harness>/grayboard.ts, so adapters/ must be present.
+          # adapters/<harness>/grayboard.ts, so adapters/ must be present. An
+          # allow-list, not an exclusion list: a directory added to the root
+          # (nix/, docs/) must not enter the source and rehash the package.
           src = lib.cleanSourceWith {
             src = self;
             filter =
               path: type:
               let
                 rel = lib.removePrefix (self.outPath + "/") (toString path);
+                inTree =
+                  rel == "src"
+                  || rel == "adapters"
+                  || lib.hasPrefix "src/" rel
+                  || lib.hasPrefix "adapters/" rel;
+                noModules = !lib.hasInfix "/node_modules" rel;
               in
-              if type == "directory" then
-                !builtins.elem rel [
-                  ".git"
-                  ".direnv"
-                  ".e2e-cache"
-                  ".e2e-runs"
-                  ".github"
-                  ".claude"
-                  "node_modules"
-                  "dist"
-                  "docs"
-                  "tests"
-                  "scripts"
-                ]
+              if toString path == self.outPath then
+                true
+              else if type == "directory" then
+                inTree && noModules && baseNameOf path != "node_modules"
               else
                 builtins.elem rel [
                   "package.json"
@@ -52,8 +50,7 @@
                   "tsconfig.json"
                   "LICENSE"
                 ]
-                || lib.hasPrefix "src/" rel
-                || lib.hasPrefix "adapters/" rel;
+                || inTree;
           };
 
           # Fixed-output deps: `bun install` from the lockfile (the only step
@@ -126,15 +123,71 @@
         default = grayboard;
       });
 
-      checks = forAllSystems (pkgs: {
-        version = pkgs.runCommand "grayboard-check-version"
-          { }
-          ''
-            v="$(${self.packages.${pkgs.system}.grayboard}/bin/grayboard --version)"
-            grep -q "${version}" <<< "$v" || { echo "expected ${version}, got $v" >&2; exit 1; }
-            touch "$out"
-          '';
-      });
+      overlays.default = final: prev: {
+        grayboard = self.packages.${final.stdenv.hostPlatform.system}.grayboard;
+      };
+
+      # The module's default package follows the evaluating system, so the
+      # output stays one module for every system.
+      nixosModules.default =
+        { pkgs, ... }:
+        {
+          imports = [ ./nix/module.nix ];
+          _module.args.grayboard-package = self.packages.${pkgs.stdenv.hostPlatform.system}.grayboard;
+        };
+
+      # The version check runs everywhere; the NixOS VM test that starts the
+      # server through the module needs Linux. `nix flake check` builds and
+      # runs these, and that run is the gate for bunDeps' hash: a store that
+      # already holds the old output can't tell a stale one (AGENTS.md).
+      checks = forAllSystems (
+        pkgs:
+        {
+          version = pkgs.runCommand "grayboard-check-version"
+            { }
+            ''
+              v="$(${self.packages.${pkgs.system}.grayboard}/bin/grayboard --version)"
+              grep -q "${version}" <<< "$v" || { echo "expected ${version}, got $v" >&2; exit 1; }
+              touch "$out"
+            '';
+        }
+        // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+          module = pkgs.testers.runNixOSTest {
+            name = "grayboard-server-module";
+            nodes.machine =
+              { pkgs, ... }:
+              {
+                imports = [ self.nixosModules.default ];
+                services.grayboard-server = {
+                  enable = true;
+                  # Dev auth: the server accepts it only from a loopback public
+                  # URL, which is what a VM has. No secrets, so no env file
+                  # (the default /etc/grayboard/env would have to exist).
+                  environmentFile = null;
+                  environment = {
+                    GRAYBOARD_DEV_AUTH = "1";
+                    GRAYBOARD_DB_PATH = "/var/lib/grayboard/bus.db";
+                    GRAYBOARD_PUBLIC_URL = "http://localhost:8080";
+                  };
+                };
+                environment.systemPackages = [ pkgs.curl ];
+              };
+            testScript = ''
+              import json
+
+              machine.wait_for_unit("grayboard")
+              machine.wait_for_open_port(8080)
+              health = json.loads(machine.succeed("curl -s http://localhost:8080/healthz"))
+              assert health["ok"] is True, health
+              assert health["version"] == "${version}", health
+              # Under ProtectSystem=strict the state directory is the one
+              # writable place, and the service user owns it.
+              machine.succeed("test -f /var/lib/grayboard/bus.db")
+              machine.succeed("stat -c %U /var/lib/grayboard/bus.db | grep -q '^grayboard$'")
+            '';
+          };
+        }
+      );
 
       devShells = forAllSystems (pkgs: {
         default = pkgs.mkShell { packages = [ pkgs.bun ]; };
