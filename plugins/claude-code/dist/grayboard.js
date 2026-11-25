@@ -14178,6 +14178,7 @@ var package_default = {
     "build:server": 'bash scripts/build_scratch.sh bun build --compile "$PWD/src/server/main.ts" --outfile "$PWD/dist/grayboard-server"'
   },
   dependencies: {
+    "@modelcontextprotocol/client": "2.4.0",
     "@modelcontextprotocol/core": "2.4.0",
     "@modelcontextprotocol/server": "2.4.0",
     "@modelcontextprotocol/sdk": "1.32.1",
@@ -14188,7 +14189,6 @@ var package_default = {
   },
   devDependencies: {
     "@earendil-works/pi-coding-agent": "1.5.2",
-    "@modelcontextprotocol/client": "2.4.0",
     "@oh-my-pi/pi-coding-agent": "18.14.0",
     "@opencode-ai/plugin": "1.19.4",
     "@types/bun": "latest",
