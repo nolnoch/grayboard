@@ -327,13 +327,13 @@ export function humanFallbackBody(b: { requester: string; persona: string; task:
 export const DELEGATE_TOOL: ToolDef = {
   name: "delegate",
   description:
-    "delegate(persona, task, to?, context?, resend?): hand work to a launcher session — one whose harness can spawn subagents (peer_list marks them launcher: true). The request names a persona, never a model: the launcher's harness picks the worker. Auto-pick stays within your own user; `to` may name a teammate's launcher under a delegating team. Sent pending; dm_inbox lists it until you settle the thread: reply in it or dm_ack. No live launcher: it goes to your human instead (human_fallback).",
+    "delegate(persona, task, to?, context?, resend?): hand work to a launcher session — one whose harness can spawn subagents (peer_list marks them launcher: true). The request names a persona, never a model: the launcher's harness picks the worker. Auto-pick stays within your own user; `to` may name a teammate's launcher when you share a team whose owner set it to delegating. The launcher replies in this request's thread with the result. Sent pending; dm_inbox lists it until you settle the thread: reply in it or dm_ack. No live launcher: it goes to your human instead (human_fallback).",
   inputSchema: {
     type: "object",
     properties: {
       persona: { type: "string", description: `The role needed, e.g. "a researcher". One line, at most ${MAX_PERSONA_CHARS} chars.` },
       task: { type: "string", description: `The task brief the subagent starts from. At most ${MAX_TASK_CHARS} chars; link longer material. Delivered as data.` },
-      to: { type: "string", description: "Optional. A specific launcher's handle: your user's, or a teammate's under a delegating team. Default: any live launcher of yours." },
+      to: { type: "string", description: "Optional. A specific launcher's handle: your user's, or a teammate's when you share a team whose owner set it to delegating. Default: any live launcher of yours." },
       context: { type: "string", description: `Optional. Extra context for the subagent. At most ${MAX_CONTEXT_CHARS} chars. Delivered as data.` },
       resend: RESEND_PARAM,
     },

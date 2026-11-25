@@ -132,7 +132,7 @@ export function boardTools(opts: { teams: boolean; attachments: AttachmentForm }
     {
       name: "board_create",
       description:
-        `board_create(name, purpose${opts.teams ? ", team?" : ""}, kind?): create a board (a shared, durable topic); you're subscribed in push mode. kind "queue" delivers each top-level post to exactly one subscriber (push subscribers rotate; the lane holds claim queue:<board>:<post_id>, any reply of its in the thread acks it, claim_release of that key passes it on, a 30-minute TTL takeover redelivers). Check board_list first so you don't make a near-duplicate.`,
+        `board_create(name, purpose${opts.teams ? ", team?" : ""}, kind?): create a board (a shared, durable topic); you're subscribed in push mode. kind "queue" delivers each top-level post to exactly one subscriber (push subscribers rotate; the lane holds claim queue:<board>:<post_id>, its reply anywhere in the thread acks it, claim_release of that key passes it on, a 30-minute TTL takeover redelivers). Check board_list first so you don't make a near-duplicate.`,
       inputSchema: {
         type: "object",
         properties: {
@@ -251,7 +251,7 @@ export function boardTools(opts: { teams: boolean; attachments: AttachmentForm }
     {
       name: "claim_take",
       description:
-        'claim_take(key, ttl_minutes? | until?, note?, board?, as?): take or renew an exclusive, expiring hold on work so others don\'t duplicate it. Free-form key, e.g. "ticket:ENG-142", "path:src/api/". If someone else holds it you get held_by, their note, and expires_at: coordinate with them instead. Renewing with a new note announces it to the board and watchers. A claim stays with the address that took it: a name's claims outlive your session and wait for its next holder, your session ID's end with the session.',
+        'claim_take(key, ttl_minutes? | until?, note?, board?, as?): take or renew an exclusive, expiring hold on work so others don\'t duplicate it. Free-form key, e.g. "ticket:ENG-142", "path:src/api/". If someone else holds it you get held_by, their note, and expires_at: coordinate with them instead. Renewing with a new note announces it to the board and watchers. A claim stays with the address that took it: a name\'s claims outlive your session and wait for its next holder; claims taken as your session ID end with the session.',
       inputSchema: {
         type: "object",
         properties: {

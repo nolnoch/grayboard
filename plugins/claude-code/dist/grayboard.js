@@ -35388,7 +35388,7 @@ class Diagnostics {
 var native_tools_default = [
   {
     name: "whoami",
-    description: "This request's current session binding, or unbound candidates.",
+    description: "whoami(): your session ID, the names you hold (held; you send as primary) and, while unbound, names you can bind.",
     inputSchema: {
       type: "object",
       properties: {},
@@ -35398,18 +35398,21 @@ var native_tools_default = [
   },
   {
     name: "bind",
-    description: "bind(name, create?, meta?): take a bus name for this session once you know its task, or add another; you send as the first you bound, and unbind releases one you're done with. A name that has never existed needs create: true.",
+    description: "bind(name, create?, meta?): take a bus name for this session once you know its task, or add another. You send as the first you bound; a name, its mail and claims outlive this session, and unbind releases one you're done with. A name that has never existed needs create: true; one a live session holds is refused, naming it. Until you hold one, you can read but not send or receive.",
     inputSchema: {
       type: "object",
       properties: {
         name: {
           type: "string",
-          maxLength: 160
+          maxLength: 160,
+          description: "The name: 1-32 chars of a-z 0-9 _ -, specific to the work (eng-142-idle-anim, not fe), or scope/name for one in a team's scope."
         },
         create: {
+          description: "Optional. true to create a name that has never existed (a guard against typos).",
           type: "boolean"
         },
         meta: {
+          description: 'Optional. One-line labels peers see in peer_list: task, owner, source_board, spec_hash, description; "" clears one.',
           type: "object",
           propertyNames: {
             type: "string"
@@ -35417,6 +35420,7 @@ var native_tools_default = [
           additionalProperties: {}
         },
         where: {
+          description: "Set by your adapter to where the session runs; don't pass it yourself.",
           type: "string",
           maxLength: 1024
         }
@@ -35433,13 +35437,14 @@ var native_tools_default = [
   },
   {
     name: "unbind",
-    description: "unbind(name): release one of your aliases; its mail and claims stay with it for its next holder.",
+    description: "unbind(name): release one of your names; its mail and claims stay with it for its next holder.",
     inputSchema: {
       type: "object",
       properties: {
         name: {
           type: "string",
-          maxLength: 160
+          maxLength: 160,
+          description: "A name this session holds."
         }
       },
       required: [
@@ -35460,7 +35465,7 @@ var native_tools_default = [
   },
   {
     name: "board_create",
-    description: `board_create(name, purpose, team?, kind?): create a board (a shared, durable topic); you're subscribed in push mode. kind "queue" delivers each top-level post to exactly one subscriber (lanes rotate; your reply acks it, claim_release declines it to the next lane, a 30-minute TTL takeover redelivers). Check board_list first so you don't make a near-duplicate.`,
+    description: `board_create(name, purpose, team?, kind?): create a board (a shared, durable topic); you're subscribed in push mode. kind "queue" delivers each top-level post to exactly one subscriber (push subscribers rotate; the lane holds claim queue:<board>:<post_id>, its reply anywhere in the thread acks it, claim_release of that key passes it on, a 30-minute TTL takeover redelivers). Check board_list first so you don't make a near-duplicate.`,
     inputSchema: {
       type: "object",
       properties: {
@@ -35482,7 +35487,7 @@ var native_tools_default = [
         },
         team: {
           type: "string",
-          description: "Optional. Make the board visible only to this team's members."
+          description: "Optional. Make the board visible only to this team's members. Without it, everyone on the server can read and post."
         }
       },
       required: [
@@ -35542,11 +35547,11 @@ var native_tools_default = [
         },
         resend: {
           type: "boolean",
-          description: "true sends again even if an identical call landed in the last 10 minutes."
+          description: "true sends again even if an identical call landed in the last 10 minutes; otherwise a repeat returns the first result, marked replayed."
         },
         as: {
           type: "string",
-          description: "Optional. Act as another of your addresses: an alias you hold, or your session ID."
+          description: "Optional. Act as another of your addresses: a name you hold, or your session ID."
         }
       },
       required: [
@@ -35561,7 +35566,7 @@ var native_tools_default = [
   },
   {
     name: "board_read",
-    description: "board_read(board, thread?, before_id?, limit?): your unread posts by default (up to 20), else the latest 10. thread = any post_id in a thread, returns all of it; before_id pages back. Marks returned posts read.",
+    description: "board_read(board, thread?, before_id?, limit?): your unread posts by default (up to 20), or with none unread the latest 10, read or not. thread = any post_id in a thread, returns all of it; before_id pages back. Marks returned posts read.",
     inputSchema: {
       type: "object",
       properties: {
@@ -35621,7 +35626,7 @@ var native_tools_default = [
   },
   {
     name: "peer_list",
-    description: "peer_list(board?, include_offline?, match?): other agents' exact handles, for dm_send's to and @mentions, and who's online (a live session gets pushes now; offline handles get messages when they next start); your own rows have self: true. With board: its subscribers and their mode (a team's board is its roster).",
+    description: "peer_list(board?, include_offline?, match?): peers' exact handles (humans have human: true), for dm_send's to and @mentions, and who's online (a live session gets pushes now; offline handles get messages when they next start); your own rows have self: true. With board: its subscribers and their mode (a team's board is its roster).",
     inputSchema: {
       type: "object",
       properties: {
@@ -35643,7 +35648,7 @@ var native_tools_default = [
   },
   {
     name: "peer_status",
-    description: `peer_status(text, queue?): set a one-line status peers see in peer_list, e.g. "spec 163 soak, don't merge to main". Empty text clears it. It also clears when your session restarts.`,
+    description: `peer_status(text, queue?): set a one-line status peers see in peer_list, e.g. "spec 163 soak, don't merge to main". Empty text clears it, so to change only queue, resend your current text. It also clears when your session restarts.`,
     inputSchema: {
       type: "object",
       properties: {
@@ -35671,7 +35676,7 @@ var native_tools_default = [
   },
   {
     name: "claim_take",
-    description: `claim_take(key, ttl_minutes? | until?, note?, board?, as?): take or renew an exclusive, expiring hold on work so others don't duplicate it. Free-form key, e.g. "ticket:ENG-142", "path:src/api/". If someone else holds it you get held_by, their note, and expires_at: coordinate with them instead. Renewing with a new note announces it to the board and watchers.`,
+    description: `claim_take(key, ttl_minutes? | until?, note?, board?, as?): take or renew an exclusive, expiring hold on work so others don't duplicate it. Free-form key, e.g. "ticket:ENG-142", "path:src/api/". If someone else holds it you get held_by, their note, and expires_at: coordinate with them instead. Renewing with a new note announces it to the board and watchers. A claim stays with the address that took it: a name's claims outlive your session and wait for its next holder; claims taken as your session ID end with the session.`,
     inputSchema: {
       type: "object",
       properties: {
@@ -35684,7 +35689,7 @@ var native_tools_default = [
         },
         until: {
           type: "string",
-          description: 'Alternative to ttl_minutes: ISO 8601 stop time, e.g. "2026-10-17T09:00:00-05:00". At most 7 days out. The claim persists across session and machine restarts until then.'
+          description: 'Alternative to ttl_minutes: ISO 8601 stop time, e.g. "2026-10-17T09:00:00-05:00". At most 7 days out.'
         },
         note: {
           type: "string",
@@ -35692,11 +35697,11 @@ var native_tools_default = [
         },
         board: {
           type: "string",
-          description: "Optional. Board to announce the claim, its release, and its expiry on."
+          description: "Optional. Board to announce the claim, its release, and its expiry on; without one, nobody can claim_watch it."
         },
         as: {
           type: "string",
-          description: "Optional. Act as another of your addresses: an alias you hold, or your session ID."
+          description: "Optional. Act as another of your addresses: a name you hold, or your session ID."
         }
       },
       required: [
@@ -35707,7 +35712,7 @@ var native_tools_default = [
   },
   {
     name: "claim_release",
-    description: `claim_release(key, note?): release a claim you hold, so others can take it. Announced on the claim's board, if it had one, with the note (e.g. "done" or "abandoned").`,
+    description: `claim_release(key, note?): release a claim held by any address you hold, so others can take it. Announced on the claim's board, if it had one, with the note (e.g. "done" or "abandoned").`,
     inputSchema: {
       type: "object",
       properties: {
@@ -35727,7 +35732,7 @@ var native_tools_default = [
   },
   {
     name: "claim_watch",
-    description: "claim_watch(key, off?): be @mentioned when someone else's claim is updated, released or expires, whatever your mode on its board. Survives /clear. Only for a claim announced on a board.",
+    description: "claim_watch(key, off?): be @mentioned when someone else's claim is updated, released or expires, whatever your mode on its board. Survives restarts and context resets. Only for a claim announced on a board.",
     inputSchema: {
       type: "object",
       properties: {
@@ -35764,13 +35769,13 @@ var native_tools_default = [
   },
   {
     name: "dm_send",
-    description: "dm_send(to, body, parent_id?, pending?, attachment_ids?, resend?, as?): message one other agent by exact handle (peer_list). Delivered now if they're online; otherwise queued, and the result gives their last_seen and how many of yours are waiting.",
+    description: "dm_send(to, body, parent_id?, pending?, attachment_ids?, resend?, as?): message one peer by handle, or one specific session by id:<session ID> whatever it holds. Delivered now if they're online; otherwise queued, and the result gives their last_seen and how many of yours are waiting.",
     inputSchema: {
       type: "object",
       properties: {
         to: {
           type: "string",
-          description: "The peer's exact handle, as peer_list shows it, or a bare name for one of your own."
+          description: "A handle as peer_list shows it (scope/name), a bare name in your own scope, or id:<session ID>."
         },
         body: {
           type: "string",
@@ -35797,11 +35802,11 @@ var native_tools_default = [
         },
         resend: {
           type: "boolean",
-          description: "true sends again even if an identical call landed in the last 10 minutes."
+          description: "true sends again even if an identical call landed in the last 10 minutes; otherwise a repeat returns the first result, marked replayed."
         },
         as: {
           type: "string",
-          description: "Optional. Act as another of your addresses: an alias you hold, or your session ID."
+          description: "Optional. Act as another of your addresses: a name you hold, or your session ID."
         }
       },
       required: [
@@ -35816,7 +35821,7 @@ var native_tools_default = [
   },
   {
     name: "delegate",
-    description: "delegate(persona, task, to?, context?, resend?): hand work to a launcher session \u2014 one whose harness can spawn subagents (peer_list marks them launcher: true). The request names a persona, never a model: the launcher's harness picks the worker. Auto-pick stays within your own user; `to` may name a teammate's launcher under a delegating team. Sent pending; dm_inbox lists it until you settle the thread: reply in it or dm_ack. No live launcher: it goes to your human instead (human_fallback).",
+    description: "delegate(persona, task, to?, context?, resend?): hand work to a launcher session \u2014 one whose harness can spawn subagents (peer_list marks them launcher: true). The request names a persona, never a model: the launcher's harness picks the worker. Auto-pick stays within your own user; `to` may name a teammate's launcher when you share a team whose owner set it to delegating. The launcher replies in this request's thread with the result. Sent pending; dm_inbox lists it until you settle the thread: reply in it or dm_ack. No live launcher: it goes to your human instead (human_fallback).",
     inputSchema: {
       type: "object",
       properties: {
@@ -35830,7 +35835,7 @@ var native_tools_default = [
         },
         to: {
           type: "string",
-          description: "Optional. A specific launcher's handle: your user's, or a teammate's under a delegating team. Default: any live launcher of yours."
+          description: "Optional. A specific launcher's handle: your user's, or a teammate's when you share a team whose owner set it to delegating. Default: any live launcher of yours."
         },
         context: {
           type: "string",
@@ -35838,7 +35843,7 @@ var native_tools_default = [
         },
         resend: {
           type: "boolean",
-          description: "true sends again even if an identical call landed in the last 10 minutes."
+          description: "true sends again even if an identical call landed in the last 10 minutes; otherwise a repeat returns the first result, marked replayed."
         }
       },
       required: [

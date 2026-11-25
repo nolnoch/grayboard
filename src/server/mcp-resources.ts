@@ -13,8 +13,13 @@ import { isValidIdentityName } from "../shared/addressing.ts";
 
 // bind and unbind inputs for both hosted roles, the native agent's and the subscriber's (#454): BIND_TOOL's and
 // UNBIND_TOOL's fields (src/core/bindings.ts) plus hosted's `where`, the place the session reports.
-export const HOSTED_BIND_INPUT = z.strictObject({ name: z.string().max(160), create: z.boolean().optional(), meta: z.record(z.string(), z.unknown()).optional(), where: z.string().max(1024).optional() });
-export const HOSTED_UNBIND_INPUT = z.strictObject({ name: z.string().max(160) });
+export const HOSTED_BIND_INPUT = z.strictObject({
+  name: z.string().max(160).describe("The name: 1-32 chars of a-z 0-9 _ -, specific to the work (eng-142-idle-anim, not fe), or scope/name for one in a team's scope."),
+  create: z.boolean().optional().describe("Optional. true to create a name that has never existed (a guard against typos)."),
+  meta: z.record(z.string(), z.unknown()).optional().describe('Optional. One-line labels peers see in peer_list: task, owner, source_board, spec_hash, description; "" clears one.'),
+  where: z.string().max(1024).optional().describe("Set by your adapter to where the session runs; don't pass it yourself."),
+});
+export const HOSTED_UNBIND_INPUT = z.strictObject({ name: z.string().max(160).describe("A name this session holds.") });
 // The subscriber role's tool schemas, built once per process: zod schema construction per request was
 // ~6% of server CPU at 1000 sessions (#912), since every hosted request builds its own McpServer.
 const EMPTY_INPUT = z.strictObject({});
