@@ -27,6 +27,7 @@ jobs:
     outputs:
       pin-only: ${{ steps.files.outputs.pin-only }}
       docs-only: ${{ steps.files.outputs.docs-only }}
+      nix: ${{ steps.files.outputs.nix }}
     steps:
       - if: github.event_name == 'pull_request'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -41,7 +42,7 @@ jobs:
         # A fork PR names its files, so they're printed with workflow
         # commands off: a name can't be read as one.
         run: |
-          pin=false docs=false
+          pin=false docs=false nix=false
           if [ -n "$HEAD" ]; then
             files="$(git diff --name-only "$BASE...$HEAD")"
             token="$(openssl rand -hex 16)"
@@ -50,9 +51,13 @@ jobs:
             echo "::$token::"
             [ "$files" = ".claude-plugin/marketplace.json" ] && pin=true
             if [ -n "$files" ] && ! printf '%s\n' "$files" | grep -qvE '^docs/|^[^/]*\.md$|^(\.github|\.claude|tests)/.*\.md$'; then docs=true; fi
+            # What flake.nix builds from: the flake, its lock, the module,
+            # the manifest and the lockfile.
+            if printf '%s\n' "$files" | grep -qE '^(flake\.nix|flake\.lock|nix/|package\.json|bun\.lock)$'; then nix=true; fi
           fi
           echo "pin-only=$pin" | tee -a "$GITHUB_OUTPUT"
           echo "docs-only=$docs" | tee -a "$GITHUB_OUTPUT"
+          echo "nix=$nix" | tee -a "$GITHUB_OUTPUT"
 
   # The required "test" check. On a docs-only PR it runs the doc link check
   # and the site-page test (a docs/site page's theme block and version).
@@ -218,3 +223,31 @@ jobs:
           sed 's/^Restart=always$/Restart=always\nRestartBogus=1/' deploy/grayboard.service > "$bad"
           grep -q RestartBogus "$bad"
           if lint "$bad"; then echo "::error::the lint passed a unit with an unknown key"; exit 1; fi
+
+  # The Nix build from a clean store (#628). flake.nix builds the same two
+  # binaries from the lockfile through a fixed-output `bun install`, and a
+  # stale outputHash passes locally against the old store path it already
+  # holds, so this job is where it fails. `nix flake check` adds the version
+  # check and the NixOS VM test that starts the server through the module.
+  # A PR that touches the flake or the dependency set runs it; a push to
+  # master always does.
+  nix:
+    needs: scope
+    if: needs.scope.outputs.pin-only != 'true' && needs.scope.outputs.docs-only != 'true' && (needs.scope.outputs.nix == 'true' || github.event_name != 'pull_request')
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
+      - uses: DeterminateSystems/magic-nix-cache-action@84c0677f58dcedf3b91f8223ce36a9ea5b3c84b7 # v15
+        with:
+          use-gha-cache: true
+
+      - name: nix build
+        run: nix build .#grayboard -L
+
+      - name: nix flake check
+        run: nix flake check -L
