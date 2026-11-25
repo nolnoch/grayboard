@@ -80,6 +80,41 @@ conformance("boards", [
     },
   },
   {
+    // #1671: the cursor is one read point, so a thread read stops it below the first unread post it skipped. The
+    // thread's own posts past that point show again: shown twice rather than never.
+    name: "board_read with thread leaves other threads' unread posts unread",
+    peers: ["be", "fe"],
+    async run(ctx) {
+      const { ok, peers } = ctx;
+      await create(ctx);
+      ok(await peers.fe!.call("board_subscribe", { board: "e2e", mode: "digest" }));
+      const a = ok(await peers.be!.call("board_post", { board: "e2e", body: "a" }));
+      ok(await peers.be!.call("board_post", { board: "e2e", body: "b" }));
+      ok(await peers.be!.call("board_post", { board: "e2e", body: "a-reply", parent_id: a.post_id }));
+      const thread = ok(await peers.fe!.call("board_read", { board: "e2e", thread: a.post_id }));
+      expect(thread.posts.map((p: any) => p.body)).toEqual(["a", "a-reply"]);
+      expect(thread.unread_remaining).toBe(2);
+      const unread = ok(await peers.fe!.call("board_read", { board: "e2e" }));
+      expect({ posts: unread.posts.map((p: any) => p.body), remaining: unread.unread_remaining }).toEqual({ posts: ["b", "a-reply"], remaining: 0 });
+    },
+  },
+  {
+    // #1671: paging back past unread posts leaves the older ones unread too.
+    name: "board_read with before_id leaves the unread posts below its page unread",
+    peers: ["be", "fe"],
+    async run(ctx) {
+      const { ok, peers } = ctx;
+      await create(ctx);
+      ok(await peers.fe!.call("board_subscribe", { board: "e2e", mode: "digest" }));
+      const ids: number[] = [];
+      for (const body of ["p1", "p2", "p3", "p4", "p5"]) ids.push(ok(await peers.be!.call("board_post", { board: "e2e", body })).post_id);
+      const page = ok(await peers.fe!.call("board_read", { board: "e2e", before_id: ids[3], limit: 2 }));
+      expect(page.posts.map((p: any) => p.body)).toEqual(["p2", "p3"]);
+      const unread = ok(await peers.fe!.call("board_read", { board: "e2e" }));
+      expect({ posts: unread.posts.map((p: any) => p.body), remaining: unread.unread_remaining }).toEqual({ posts: ["p1", "p2", "p3", "p4", "p5"], remaining: 0 });
+    },
+  },
+  {
     name: "board_subscribe sets the caller's mode on the board, and leaves the creator's push subscription alone",
     peers: ["be", "fe"],
     async run(ctx) {

@@ -606,6 +606,9 @@ const NOT_PUSHED_YET = `NOT EXISTS (SELECT 1 FROM outbox o WHERE o.handle = ? AN
 const NOT_OWN = `NOT (p.author = ? OR p.author_id IS NOT NULL AND COALESCE((SELECT id FROM alias_holds WHERE address = ?), ?)
   IN (p.author_id, COALESCE(p.author_root, (SELECT root_id FROM ids WHERE id = p.author_id), p.author_id)))`;
 
+// readRows' skipped-unread test with its handle as ?4: both predicates bind only the reader's handle.
+const SKIPPED_UNREAD = `${NOT_OWN} AND ${NOT_PUSHED_YET}`.replaceAll("?", "?4");
+
 export type BoardSummary = Board & { mode: SubMode | null; unread: number; posts: number };
 
 // What a board call without `as` acts for (#284 S14, #366): "read"
@@ -2041,7 +2044,8 @@ export type ReadResult = { board: string; posts: Post[]; unread_remaining: numbe
 // (default 10: a reader with nothing unread is orienting, and a full page sits
 // in its context for the rest of the session).
 // With before_id: page back through history. With thread: the whole thread.
-// Advances your cursor to the newest post returned. A predicate viewer has
+// Advances your cursor to the newest post returned, but never past an unread
+// post a thread or before_id read didn't return (#1671). A predicate viewer has
 // no cursor: it gets the latest page and changes nothing. Nor does `peek` (a
 // child session's read, #523): the board is judged by the viewer, but the read
 // state is its root's, so it reads as a predicate viewer does.
@@ -2106,9 +2110,19 @@ export function readRows(db: Database, board: string, handle: string | null, opt
   // A server read by a session that no longer holds `handle` (#1466) shows the posts and changes nothing: the read
   // state is the new holder's.
   if (maxId > 0 && (receiver === undefined || heldBy(db, handle, receiver))) {
-    db.prepare(
-      `UPDATE subscriptions SET cursor = MAX(cursor, ?) WHERE board = ? AND handle = ?`,
-    ).run(maxId, board, handle);
+    if (opts.thread === undefined && opts.before_id === undefined) {
+      // The default read returned the oldest unread run without a gap (or, with none unread, skipped nothing).
+      db.prepare(
+        `UPDATE subscriptions SET cursor = MAX(cursor, ?) WHERE board = ? AND handle = ?`,
+      ).run(maxId, board, handle);
+    } else {
+      // A thread or before_id read can skip unread posts elsewhere on the board: the cursor stops below the first.
+      db.prepare(
+        `UPDATE subscriptions SET cursor = MAX(cursor, COALESCE((SELECT MIN(p.id) - 1 FROM posts p WHERE p.board = ?1
+           AND p.id > subscriptions.cursor AND p.id <= ?2 AND p.id NOT IN (SELECT value FROM json_each(?3))
+           AND ${SKIPPED_UNREAD}), ?2)) WHERE board = ?1 AND handle = ?4`,
+      ).run(board, maxId, JSON.stringify(posts.map((p) => p.id)), handle);
+    }
     // What you've now read no longer needs pushing; what this read skipped
     // (a pending push it filters out, a post outside the thread) still does.
     // The pushes it delivers are credited to the session reading them: `receiver`, else the one holding `handle` now
