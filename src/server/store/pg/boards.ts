@@ -511,7 +511,11 @@ export function makePgBoards({ clock }: { clock: () => number }): BoardsStore {
           refuseKeyed(tx, "boards.read's queue take credit (a claim_events write)", queueBoardKey(`queue:${board}:${fresh[0]!.post_id}`));
           await creditQueueTakes(sql, handle, board, fresh.map(x => int8(x.post_id)), receiver);
         }
-        await sql`UPDATE subscriptions SET cursor = GREATEST(cursor, ${maxId}::int8) WHERE board = ${board} AND handle = ${handle} AND ${held}`;
+        // core: a thread or before_id read stops the cursor below the first unread post it skipped (#1671).
+        const point = opts.thread === undefined && opts.before_id === undefined ? sql.fragment`${maxId}::int8`
+          : sql.fragment`COALESCE((SELECT MIN(p.id) - 1 FROM posts p WHERE p.board = ${board} AND p.id > subscriptions.cursor AND p.id <= ${maxId}::int8
+              AND NOT (p.id = ANY(${posts.map(p => p.id)}::int8[])) AND ${notOwn(sql, h)} AND ${notPushedYet(sql, h)}), ${maxId}::int8)`;
+        await sql`UPDATE subscriptions SET cursor = GREATEST(cursor, ${point}) WHERE board = ${board} AND handle = ${handle} AND ${held}`;
       }
       const [n] = await sql`SELECT COUNT(*) AS n FROM posts p JOIN subscriptions s ON s.board = p.board AND s.handle = ${handle}
         WHERE p.board = ${board} AND p.id > s.cursor AND ${notOwn(sql, h)} AND ${notPushedYet(sql, h)}`;
