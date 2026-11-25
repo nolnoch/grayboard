@@ -48,10 +48,10 @@ const BOARD = { type: "string", description: 'Board name, with or without the "#
 // On the append writes (dm_send, board_post, delegate): a server answers an
 // identical call within its dedup window with the first one's result (#254,
 // src/server/write_dedup.ts). Local mode accepts it and has nothing to skip.
-export const RESEND_PARAM = { type: "boolean", description: `true sends again even if an identical call landed in the last ${WRITE_DEDUP_WINDOW_TEXT}.` };
+export const RESEND_PARAM = { type: "boolean", description: `true sends again even if an identical call landed in the last ${WRITE_DEDUP_WINDOW_TEXT}; otherwise a repeat returns the first result, marked replayed.` };
 
 // On the writes a session can make as another of its addresses (#284 S3).
-export const AS_PARAM = { type: "string", description: "Optional. Act as another of your addresses: an alias you hold, or your session ID." };
+export const AS_PARAM = { type: "string", description: "Optional. Act as another of your addresses: a name you hold, or your session ID." };
 
 // How a write names its files: local paths it reads (local mode), or the IDs
 // of files already uploaded over the attachment HTTP API (a server's hosted MCP).
@@ -73,15 +73,15 @@ export function dmTools(opts: { attachments: AttachmentForm }): ToolDef[] {
       // Claude Code otherwise defers MCP tools behind ToolSearch, and agents have
       // missed that the reply tool exists. Same for dm_inbox, dm_ack and board_post.
       _meta: { "anthropic/alwaysLoad": true },
-      description: `dm_send(to, body, parent_id?, pending?, ${files}?, resend?, as?): message one other agent by exact handle (peer_list). Delivered now if they're online; otherwise queued, and the result gives their last_seen and how many of yours are waiting.`,
+      description: `dm_send(to, body, parent_id?, pending?, ${files}?, resend?, as?): message one peer by handle, or one specific session by id:<session ID> whatever it holds. Delivered now if they're online; otherwise queued, and the result gives their last_seen and how many of yours are waiting.`,
       inputSchema: {
         type: "object",
         properties: {
           to: {
             type: "string",
             description: opts.attachments === "ids"
-              ? "The peer's exact handle, as peer_list shows it, or a bare name for one of your own."
-              : "The peer's exact handle, as peer_list shows it.",
+              ? "A handle as peer_list shows it (scope/name), a bare name in your own scope, or id:<session ID>."
+              : "A handle as peer_list shows it, or id:<session ID>.",
           },
           body: { type: "string", description: "Message body. Plain text or markdown." },
           parent_id: messageId("Optional. message_id this is replying to; sets the thread parent."),
@@ -132,7 +132,7 @@ export function boardTools(opts: { teams: boolean; attachments: AttachmentForm }
     {
       name: "board_create",
       description:
-        `board_create(name, purpose${opts.teams ? ", team?" : ""}, kind?): create a board (a shared, durable topic); you're subscribed in push mode. kind "queue" delivers each top-level post to exactly one subscriber (lanes rotate; your reply acks it, claim_release declines it to the next lane, a 30-minute TTL takeover redelivers). Check board_list first so you don't make a near-duplicate.`,
+        `board_create(name, purpose${opts.teams ? ", team?" : ""}, kind?): create a board (a shared, durable topic); you're subscribed in push mode. kind "queue" delivers each top-level post to exactly one subscriber (push subscribers rotate; the lane holds claim queue:<board>:<post_id>, any reply of its in the thread acks it, claim_release of that key passes it on, a 30-minute TTL takeover redelivers). Check board_list first so you don't make a near-duplicate.`,
       inputSchema: {
         type: "object",
         properties: {
@@ -147,7 +147,7 @@ export function boardTools(opts: { teams: boolean; attachments: AttachmentForm }
             ? {
                 team: {
                   type: "string",
-                  description: "Optional. Make the board visible only to this team's members.",
+                  description: "Optional. Make the board visible only to this team's members. Without it, everyone on the server can read and post.",
                 },
               }
             : {}),
@@ -189,7 +189,7 @@ export function boardTools(opts: { teams: boolean; attachments: AttachmentForm }
     {
       name: "board_read",
       description:
-        "board_read(board, thread?, before_id?, limit?): your unread posts by default (up to 20), else the latest 10. thread = any post_id in a thread, returns all of it; before_id pages back. Marks returned posts read.",
+        "board_read(board, thread?, before_id?, limit?): your unread posts by default (up to 20), or with none unread the latest 10, read or not. thread = any post_id in a thread, returns all of it; before_id pages back. Marks returned posts read.",
       inputSchema: {
         type: "object",
         properties: {
@@ -221,7 +221,7 @@ export function boardTools(opts: { teams: boolean; attachments: AttachmentForm }
     {
       name: "peer_list",
       description:
-        "peer_list(board?, include_offline?, match?): other agents' exact handles, for dm_send's to and @mentions, and who's online (a live session gets pushes now; offline handles get messages when they next start); your own rows have self: true. With board: its subscribers and their mode (a team's board is its roster).",
+        "peer_list(board?, include_offline?, match?): peers' exact handles (humans have human: true), for dm_send's to and @mentions, and who's online (a live session gets pushes now; offline handles get messages when they next start); your own rows have self: true. With board: its subscribers and their mode (a team's board is its roster).",
       inputSchema: {
         type: "object",
         properties: {
@@ -238,7 +238,7 @@ export function boardTools(opts: { teams: boolean; attachments: AttachmentForm }
       name: "peer_status",
       _meta: { "anthropic/alwaysLoad": true },
       description:
-        'peer_status(text, queue?): set a one-line status peers see in peer_list, e.g. "spec 163 soak, don\'t merge to main". Empty text clears it. It also clears when your session restarts.',
+        'peer_status(text, queue?): set a one-line status peers see in peer_list, e.g. "spec 163 soak, don\'t merge to main". Empty text clears it, so to change only queue, resend your current text. It also clears when your session restarts.',
       inputSchema: {
         type: "object",
         properties: {
@@ -251,7 +251,7 @@ export function boardTools(opts: { teams: boolean; attachments: AttachmentForm }
     {
       name: "claim_take",
       description:
-        'claim_take(key, ttl_minutes? | until?, note?, board?, as?): take or renew an exclusive, expiring hold on work so others don\'t duplicate it. Free-form key, e.g. "ticket:ENG-142", "path:src/api/". If someone else holds it you get held_by, their note, and expires_at: coordinate with them instead. Renewing with a new note announces it to the board and watchers.',
+        'claim_take(key, ttl_minutes? | until?, note?, board?, as?): take or renew an exclusive, expiring hold on work so others don\'t duplicate it. Free-form key, e.g. "ticket:ENG-142", "path:src/api/". If someone else holds it you get held_by, their note, and expires_at: coordinate with them instead. Renewing with a new note announces it to the board and watchers. A claim stays with the address that took it: a name's claims outlive your session and wait for its next holder, your session ID's end with the session.',
       inputSchema: {
         type: "object",
         properties: {
@@ -259,10 +259,10 @@ export function boardTools(opts: { teams: boolean; attachments: AttachmentForm }
           ttl_minutes: { type: "number", description: "Default 30, max 10080 (7 days); a renewal without it or until keeps the current expiry if later. Renew before it lapses." },
           until: {
             type: "string",
-            description: 'Alternative to ttl_minutes: ISO 8601 stop time, e.g. "2026-10-17T09:00:00-05:00". At most 7 days out. The claim persists across session and machine restarts until then.',
+            description: 'Alternative to ttl_minutes: ISO 8601 stop time, e.g. "2026-10-17T09:00:00-05:00". At most 7 days out.',
           },
           note: { type: "string", description: "Optional. What you're doing with it." },
-          board: { type: "string", description: "Optional. Board to announce the claim, its release, and its expiry on." },
+          board: { type: "string", description: "Optional. Board to announce the claim, its release, and its expiry on; without one, nobody can claim_watch it." },
           as: AS_PARAM,
         },
         required: ["key"],
@@ -270,7 +270,7 @@ export function boardTools(opts: { teams: boolean; attachments: AttachmentForm }
     },
     {
       name: "claim_release",
-      description: "claim_release(key, note?): release a claim you hold, so others can take it. Announced on the claim's board, if it had one, with the note (e.g. \"done\" or \"abandoned\").",
+      description: "claim_release(key, note?): release a claim held by any address you hold, so others can take it. Announced on the claim's board, if it had one, with the note (e.g. \"done\" or \"abandoned\").",
       inputSchema: {
         type: "object",
         properties: {
@@ -283,7 +283,7 @@ export function boardTools(opts: { teams: boolean; attachments: AttachmentForm }
     {
       name: "claim_watch",
       description:
-        "claim_watch(key, off?): be @mentioned when someone else's claim is updated, released or expires, whatever your mode on its board. Survives /clear. Only for a claim announced on a board.",
+        "claim_watch(key, off?): be @mentioned when someone else's claim is updated, released or expires, whatever your mode on its board. Survives restarts and context resets. Only for a claim announced on a board.",
       inputSchema: {
         type: "object",
         properties: {

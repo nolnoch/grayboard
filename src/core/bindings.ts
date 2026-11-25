@@ -402,7 +402,7 @@ export const BIND_TOOL = {
   name: "bind",
   _meta: { "anthropic/alwaysLoad": true },
   description:
-    "bind(name, create?, meta?): take a bus name for this session once you know its task, or add another; you send as the first you bound, and unbind releases one you're done with. A name that has never existed needs create: true.",
+    "bind(name, create?, meta?): take a bus name for this session once you know its task, or add another. You send as the first you bound; a name, its mail and claims outlive this session, and unbind releases one you're done with. A name that has never existed needs create: true; one a live session holds is refused, naming it.",
   inputSchema: {
     type: "object",
     properties: {
@@ -416,7 +416,7 @@ export const BIND_TOOL = {
 
 export const UNBIND_TOOL = {
   name: "unbind",
-  description: "unbind(name): release one of your aliases; its mail and claims stay with it for its next holder.",
+  description: "unbind(name): release one of your names; its mail and claims stay with it for its next holder.",
   inputSchema: {
     type: "object",
     properties: {
@@ -428,7 +428,7 @@ export const UNBIND_TOOL = {
 
 export const WHOAMI_TOOL = {
   name: "whoami",
-  description: "whoami(): your session ID, the aliases you hold (oldest first; you send as the first) and your principal.",
+  description: "whoami(): your session ID, the names you hold (oldest first; you send as the first) and your principal.",
   inputSchema: { type: "object", properties: {} },
 };
 
